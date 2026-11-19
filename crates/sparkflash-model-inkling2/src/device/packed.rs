@@ -125,6 +125,7 @@ impl Shared {
         self.launch_call(
             Entry {
                 kernel: self.kernels.packed.gemv,
+                precision: sparkflash_ops::plan::Precision::Bf16,
             },
             &call,
         )
@@ -143,6 +144,7 @@ impl Shared {
         self.launch_call(
             Entry {
                 kernel: self.kernels.packed.gemv4,
+                precision: sparkflash_ops::plan::Precision::Bf16,
             },
             &call,
         )
@@ -163,6 +165,7 @@ impl Shared {
             self.launch_call(
                 Entry {
                     kernel: self.kernels.packed.unpack,
+                    precision: sparkflash_ops::plan::Precision::Bf16,
                 },
                 &call,
             )?;

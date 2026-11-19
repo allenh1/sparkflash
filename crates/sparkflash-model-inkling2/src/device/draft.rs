@@ -97,24 +97,24 @@ const PICK_SLOT: usize = 4;
 /// The drafter's kernels.
 struct DraftKernels {
     _modules: Vec<Module>,
-    capture: Entry,
-    mix_norm: Entry,
-    masks: Entry,
-    round: Entry,
-    norm: Entry,
-    add_round: Entry,
-    swiglu: Entry,
-    rope: Entry,
-    context: Entry,
-    markov_input: Entry,
-    markov_gates: Entry,
-    markov_logits: Entry,
-    markov_local: Entry,
-    markov_last: Entry,
+    capture: Bound,
+    mix_norm: Bound,
+    masks: Bound,
+    round: Bound,
+    norm: Bound,
+    add_round: Bound,
+    swiglu: Bound,
+    rope: Bound,
+    context: Bound,
+    markov_input: Bound,
+    markov_gates: Bound,
+    markov_logits: Bound,
+    markov_local: Bound,
+    markov_last: Bound,
     /// DFlash 2's block attention over one span of the rings: every query's walks, and their
     /// merge.
-    attention_part: Entry,
-    attention_merge: Entry,
+    attention_part: Bound,
+    attention_merge: Bound,
 }
 
 // SAFETY: as for the target's Kernels: driver function handles, launched only on the process's
@@ -135,28 +135,112 @@ impl DraftKernels {
             );
         }
         let mut modules = Vec::new();
-        let mut load = |cubin: &'static [u8], name: &'static str| -> Result<Entry, String> {
-            let (module, kernel) = cuda.load_named(cubin, name)?;
+        let mut load = |image: Image,
+                        cubin: &'static [u8],
+                        name: &'static str,
+                        precision: Precision|
+         -> Result<Bound, String> {
+            let (module, bound) = Bound::new(cuda, image, cubin, name, precision)?;
             modules.push(module);
-            Ok(Entry { kernel })
+            Ok(bound)
         };
         Ok(Self {
-            capture: load(inkling, "inkling_draft_capture")?,
-            mix_norm: load(inkling, "inkling_draft_mix_norm")?,
-            masks: load(inkling, "inkling_draft_masks")?,
-            round: load(inkling, "inkling_draft_round")?,
-            norm: load(inkling, "inkling_draft_norm")?,
-            add_round: load(inkling, "inkling_draft_add_round")?,
-            swiglu: load(inkling, "inkling_draft_swiglu")?,
-            rope: load(inkling, "inkling_draft_rope")?,
-            context: load(inkling, "inkling_draft_context")?,
-            markov_input: load(inkling, "inkling_draft_markov_input")?,
-            markov_gates: load(inkling, "inkling_draft_markov_gates")?,
-            markov_logits: load(inkling, "inkling_draft_markov_logits")?,
-            markov_local: load(inkling, "inkling_draft_markov_local")?,
-            markov_last: load(inkling, "inkling_draft_markov_last")?,
-            attention_part: load(dflash, "q4d_attn_span_chunk")?,
-            attention_merge: load(dflash, "q4d_attn_span_merge")?,
+            capture: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_capture",
+                Precision::F32,
+            )?,
+            mix_norm: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_mix_norm",
+                Precision::Bf16,
+            )?,
+            masks: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_masks",
+                Precision::Bf16,
+            )?,
+            round: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_round",
+                Precision::F32,
+            )?,
+            norm: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_norm",
+                Precision::F32,
+            )?,
+            add_round: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_add_round",
+                Precision::F32,
+            )?,
+            swiglu: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_swiglu",
+                Precision::F32,
+            )?,
+            rope: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_rope",
+                Precision::F32,
+            )?,
+            context: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_context",
+                Precision::F32,
+            )?,
+            markov_input: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_markov_input",
+                Precision::F32,
+            )?,
+            markov_gates: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_markov_gates",
+                Precision::F32,
+            )?,
+            markov_logits: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_markov_logits",
+                Precision::F32,
+            )?,
+            markov_local: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_markov_local",
+                Precision::F32,
+            )?,
+            markov_last: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_markov_last",
+                Precision::F32,
+            )?,
+            attention_part: load(
+                Image::Dflash2,
+                dflash,
+                "q4d_attn_span_chunk",
+                Precision::Bf16,
+            )?,
+            attention_merge: load(
+                Image::Dflash2,
+                dflash,
+                "q4d_attn_span_merge",
+                Precision::Bf16,
+            )?,
             _modules: modules,
         })
     }
@@ -230,7 +314,7 @@ pub(super) struct DraftModel {
 /// target layers whose pre-layer partials it keeps.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TapSink {
-    capture: Entry,
+    capture: Bound,
     taps: Deviceptr,
     layers: [usize; FINAL_TAP],
     /// The rows the buffer holds.
@@ -1138,7 +1222,7 @@ impl DraftState {
                 &[input.0, weight.0, out.0, group as u64, bits(model.eps)],
             )
         };
-        let elementwise = |entry: Entry, args: &[u64], count: usize| {
+        let elementwise = |entry: Bound, args: &[u64], count: usize| {
             shared.launch(entry, (flat(count), 1, 1), (ELEMENT_BLOCK, 1, 1), args)
         };
 

@@ -42,10 +42,13 @@
 //! the released bf16 ops round. The tower is held to the f32 host reference by a test rather
 //! than to bit equality: a bf16 walk and an f32 one cannot agree to the last bit.
 
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, Module};
-use sparkflash_kernels::images::inkling_cubin;
+use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Module};
+use sparkflash_kernels::images::{Image, inkling_cubin};
+use sparkflash_ops::plan::Precision;
 use sparkflash_weights::quant::f32_to_bf16_bits;
 use sparkflash_weights::{DType, WeightSource};
+
+use super::Bound;
 
 use crate::config::InklingVisionConfig;
 use crate::vision::{
@@ -75,13 +78,13 @@ const BLOCK: u32 = 256;
 /// The tower's kernels, from the Inkling image (which carries DeepSeek's tower kernels too).
 #[derive(Clone, Copy)]
 struct Kernels {
-    patchify: Kernel,
-    layernorm: Kernel,
-    rope: Kernel,
-    scale_add: Kernel,
-    gemm: Kernel,
-    attention: Kernel,
-    widen: Kernel,
+    patchify: Bound,
+    layernorm: Bound,
+    rope: Bound,
+    scale_add: Bound,
+    gemm: Bound,
+    attention: Bound,
+    widen: Bound,
 }
 
 /// One block's tensors in the arena.
@@ -280,19 +283,19 @@ impl InklingVisionTower {
             );
         }
         let mut modules = Vec::new();
-        let mut kernel = |name: &'static str| -> Result<Kernel, String> {
-            let (module, kernel) = cuda.load_named(cubin, name)?;
+        let mut kernel = |name: &'static str, precision: Precision| -> Result<Bound, String> {
+            let (module, bound) = Bound::new(cuda, Image::Inkling, cubin, name, precision)?;
             modules.push(module);
-            Ok(kernel)
+            Ok(bound)
         };
         let kernels = Kernels {
-            patchify: kernel("inkling_vision_patchify")?,
-            layernorm: kernel("inkling_vision_layernorm")?,
-            rope: kernel("inkling_vision_rope")?,
-            scale_add: kernel("inkling_vision_scale_add")?,
-            gemm: kernel("opt_vision_gemm")?,
-            attention: kernel("opt_vision_attn")?,
-            widen: kernel("inkling_widen_f32")?,
+            patchify: kernel("inkling_vision_patchify", Precision::F32)?,
+            layernorm: kernel("inkling_vision_layernorm", Precision::F32)?,
+            rope: kernel("inkling_vision_rope", Precision::F32)?,
+            scale_add: kernel("inkling_vision_scale_add", Precision::F32)?,
+            gemm: kernel("opt_vision_gemm", Precision::Bf16)?,
+            attention: kernel("opt_vision_attn", Precision::Bf16)?,
+            widen: kernel("inkling_widen_f32", Precision::F32)?,
         };
 
         let prefix = "model.visual";
@@ -551,7 +554,7 @@ impl InklingVisionTower {
         cuda.copy_htod(&sin_d, &f32_bytes(&sin))?;
         cuda.copy_htod(&canvas_d, canvas)?;
         cuda.launch(
-            k.patchify,
+            k.patchify.kernel,
             (blocks(patches * PATCH_STRIDE), 1, 1),
             (BLOCK, 1, 1),
             &[
@@ -596,13 +599,13 @@ impl InklingVisionTower {
                 0,
             )?;
             cuda.launch(
-                k.rope,
+                k.rope.kernel,
                 (blocks(rows * 2 * HEADS * (HEAD_DIM / 2)), 1, 1),
                 (BLOCK, 1, 1),
                 &[qkv.0, cos_d.0, sin_d.0, rows as u64, cells_w as u64],
             )?;
             cuda.launch(
-                k.attention,
+                k.attention.kernel,
                 (rows.div_ceil(64) as u32, HEADS as u32, 1),
                 (128, 1, 1),
                 &[qkv.0, h.0, rows as u64],
@@ -687,7 +690,7 @@ impl InklingVisionTower {
         )?;
         let count = tokens * out_hidden;
         cuda.launch(
-            k.widen,
+            k.widen.kernel,
             (blocks(count).min(65_535), 1, 1),
             (BLOCK, 1, 1),
             &[mlp.0, out.0, count as u64],
@@ -732,7 +735,7 @@ impl InklingVisionTower {
         epsilon: f32,
     ) -> Result<(), String> {
         cuda.launch(
-            self.kernels.layernorm,
+            self.kernels.layernorm.kernel,
             (m.div_ceil(8) as u32, 1, 1),
             (BLOCK, 1, 1),
             &[
@@ -755,7 +758,7 @@ impl InklingVisionTower {
         m: usize,
     ) -> Result<(), String> {
         cuda.launch(
-            self.kernels.scale_add,
+            self.kernels.scale_add.kernel,
             (blocks(m * WIDTH / 2), 1, 1),
             (BLOCK, 1, 1),
             &[x.0, gamma.0, h.0, m as u64],
@@ -778,7 +781,7 @@ impl InklingVisionTower {
         flags: u64,
     ) -> Result<(), String> {
         cuda.launch(
-            self.kernels.gemm,
+            self.kernels.gemm.kernel,
             (n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1),
             (BLOCK, 1, 1),
             &[

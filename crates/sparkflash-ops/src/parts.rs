@@ -1228,6 +1228,19 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             dec("inkling_attn_decode", &[Precision::Bf16]),
             pre("inkling_attn_prefill", &[Precision::Bf16]),
+            // The split walks, the clustered window, the tensor-core body and the cache rows.
+            sym("inkling_attn_key_scales", &[Precision::Bf16]),
+            sym("inkling_attn_scores", &[Precision::Bf16]),
+            sym("inkling_attn_mix", &[Precision::Bf16]),
+            sym("inkling_attn_part", &[Precision::Bf16]),
+            sym("inkling_attn_scored_part", &[Precision::Bf16]),
+            sym("inkling_attn_merge", &[Precision::Bf16]),
+            sym("inkling_attn_prepare", &[Precision::Bf16]),
+            sym("inkling_attn_mma", &[Precision::Bf16]),
+            sym("inkling_attn_window", &[Precision::Bf16]),
+            sym("inkling_kv_store", &[Precision::Bf16]),
+            sym("inkling_summary_push", &[Precision::Bf16]),
+            sym("inkling_widen_f32", &[Precision::F32]),
         ],
         true,
     ),
@@ -1248,16 +1261,25 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "inkling_short_conv_dynamic_decode",
                 &[Precision::Bf16, Precision::F32],
             ),
+            // The convolution history's two moves between the decode and chunk layouts.
+            sym("inkling_conv_history_copy", &[Precision::F32]),
+            sym("inkling_conv_history_restore", &[Precision::F32]),
         ],
         true,
     ),
     sm121(
         Part::BlockAttentionResidual,
         Image::Inkling,
-        &[sym(
-            "inkling_block_residual",
-            &[Precision::Bf16, Precision::F32],
-        )],
+        &[
+            sym("inkling_block_residual", &[Precision::Bf16, Precision::F32]),
+            // The two-launch form, the chained form's statistics and mix, the plain residual
+            // add, the row-split join and the exact f32 widening.
+            sym("inkling_block_residual_stats", &[Precision::Bf16]),
+            sym("inkling_block_residual_mix", &[Precision::Bf16]),
+            sym("inkling_residual_add", &[Precision::Bf16]),
+            sym("inkling_join_pieces", &[Precision::F32]),
+            sym("inkling_widen_f32", &[Precision::F32]),
+        ],
         true,
     ),
     sm121(
@@ -1269,6 +1291,7 @@ pub const CATALOGUE: &[PartKernel] = &[
                 &[Precision::Bf16, Precision::F32],
             ),
             sym("inkling_logit_softcap", &[Precision::Bf16, Precision::F32]),
+            sym("inkling_band_shares", &[Precision::F32]),
         ],
         true,
     ),
@@ -1348,6 +1371,31 @@ pub const CATALOGUE: &[PartKernel] = &[
                 &[Precision::MxFp8, Precision::F32],
             ),
             sym("inkling_router_topk", &[Precision::F32]),
+            // The band, pair and item walks over the same stored experts.
+            row_all(
+                "inkling_nvfp4_expert_band",
+                &[Precision::NvFp4, Precision::F32],
+            ),
+            row_all(
+                "inkling_mxfp8_expert_band",
+                &[Precision::MxFp8, Precision::F32],
+            ),
+            row_all(
+                "inkling_nvfp4_expert_pairs",
+                &[Precision::NvFp4, Precision::F32],
+            ),
+            row_all(
+                "inkling_mxfp8_expert_pairs",
+                &[Precision::MxFp8, Precision::F32],
+            ),
+            row_all(
+                "inkling_nvfp4_expert_items",
+                &[Precision::NvFp4, Precision::F32],
+            ),
+            row_all(
+                "inkling_mxfp8_expert_items",
+                &[Precision::MxFp8, Precision::F32],
+            ),
         ],
         false,
     ),
@@ -1486,7 +1534,10 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::MoeCombine,
         Image::Inkling,
-        &[sym("inkling_expert_mix", &[Precision::F32])],
+        &[
+            sym("inkling_expert_mix", &[Precision::F32]),
+            sym("inkling_sum_slots", &[Precision::Bf16]),
+        ],
         false,
     ),
     sm121(
@@ -1923,6 +1974,43 @@ pub const CATALOGUE: &[PartKernel] = &[
             ),
         ],
         true,
+    ),
+    // Inkling's drafter: a DFlash block drafter over its own fused taps.
+    sm121(
+        Part::Mtp,
+        Image::Inkling,
+        &[
+            sym("inkling_draft_capture", &[Precision::F32]),
+            sym("inkling_draft_mix_norm", &[Precision::Bf16]),
+            sym("inkling_draft_masks", &[Precision::Bf16]),
+            sym("inkling_draft_round", &[Precision::F32]),
+            sym("inkling_draft_norm", &[Precision::F32]),
+            sym("inkling_draft_add_round", &[Precision::F32]),
+            sym("inkling_draft_swiglu", &[Precision::F32]),
+            sym("inkling_draft_rope", &[Precision::F32]),
+            sym("inkling_draft_context", &[Precision::F32]),
+            sym("inkling_draft_markov_input", &[Precision::F32]),
+            sym("inkling_draft_markov_gates", &[Precision::F32]),
+            sym("inkling_draft_markov_logits", &[Precision::F32]),
+            sym("inkling_draft_markov_local", &[Precision::F32]),
+            sym("inkling_draft_markov_last", &[Precision::F32]),
+        ],
+        false,
+    ),
+    // The Inkling vision tower's kernels, from the Inkling image.
+    sm121(
+        Part::Vision,
+        Image::Inkling,
+        &[
+            sym("inkling_vision_patchify", &[Precision::F32]),
+            sym("inkling_vision_layernorm", &[Precision::F32]),
+            sym("inkling_vision_rope", &[Precision::F32]),
+            sym("inkling_vision_scale_add", &[Precision::F32]),
+            sym("opt_vision_gemm", &[Precision::Bf16]),
+            sym("opt_vision_attn", &[Precision::Bf16]),
+            sym("inkling_widen_f32", &[Precision::F32]),
+        ],
+        false,
     ),
     sm121(
         Part::RmsNorm,
