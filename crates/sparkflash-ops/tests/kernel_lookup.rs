@@ -91,7 +91,9 @@ const EXEMPTIONS: &[Exemption] = &[
     Exemption {
         crate_name: "sparkflash-model-glm5-next",
         file: "src/device.rs",
-        sites: 12,
+        // Two more than before the walk moved onto `Runtime`: the runtime owns the
+        // strategy, and the arm's device file still binds the kernels it launches.
+        sites: 14,
         why: "not converted yet: phase 7 runs by arm",
     },
     Exemption {
