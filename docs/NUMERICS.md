@@ -149,12 +149,22 @@ reset it. A reference's `server` card is what the capturing binary reported, and
 fingerprint: the registry can name a capture's fingerprint only after the capture exists, so a
 first capture reads `unregistered`, and a recapture names the version and fingerprint it replaced.
 The registry entry is the record; `check` and `ci` accept the card's shape but never compare it.
-The card names the build the capture came from: `binary_sha256` is the sha256 of the server binary
-and `commit` is the git revision of the tree it was built from, taken from `capture --binary` (or
-`SPARKFLASH_BIN`) and `capture --repo` (default: the checkout the tool runs from). When either
-cannot be determined the card records null and `build_note` gives the one-line reason; a value is
-never invented. A reference captured before those fields existed simply has neither, and the card
-is outside the fingerprint, so naming a build changes no bits. `text` evidence is weaker than
+The card names the build the capture came from. `binary_sha256` is the sha256 of the server
+binary named by `capture --binary` (or `SPARKFLASH_BIN`). `commit` is the served card's
+`build.id`: the commit the binary was compiled from, with `-dirty` appended when the source tree
+was dirty at build time, so a dirty build is recorded as dirty rather than silently named exact.
+`capture --repo` (default: the checkout the tool runs from) is consulted only when the served card
+names no commit - including a card that reports `unknown` - and `server.build_source` says which
+of the two the commit came from (`card`, `repo`, or `null` when neither named one). `capture`
+warns on stderr when the served card names no build commit, and `build_note` gives the one-line
+reason a value is null; a value is never invented. The card stays outside the fingerprint, so
+naming a build changes no bits.
+
+`server.build_source` is also the build record's version note. A reference that predates it has no
+such key and is grandfathered: the declaration check judges only a reference or `[[anchor]]` that
+this change adds, and a new one whose card carries `build_source` but no commit (or says
+`unknown`) is refused. The capture command writes the key unconditionally, so a new capture is
+always judged; an old reference is accepted without it. `text` evidence is weaker than
 `logprobs`: an arithmetic change that flips no greedy token is invisible to it. DeepSeek's TP=4
 device path is the only `text` configuration.
 
@@ -166,7 +176,10 @@ The binary embeds the registry. At boot every serve path prints one line:
 sparkflash numerics: <model> world=4 profile=reference plan=tp arch=sm_121a status=registered registered_version=1 fingerprint=<16 hex> evidence=logprobs overrides=none
 ```
 
-and `/v1/models` carries the same as `numerics` beside `build`. When the served entry records an
+and `/v1/models` carries the same as `numerics` beside `build`. `build.id` is the commit
+`crates/sparkflash-api/build.rs` embeds at compile time (with `-dirty` when the tree was dirty, or
+`unknown` when the build ran without a git HEAD), `build.version` stays the package version, and
+the serve boot line names the same commit. When the served entry records an
 approval, the line appends `approved=<date>` and the card's `numerics` carries the `approved`
 object (`decision`, `date`, `report`). The status is one of:
 
@@ -208,6 +221,9 @@ the push's previous tip, or the merge base with `main`). It fails:
 - a bump on `text` evidence, which has no token ids to teacher-force;
 - a bump without a new report;
 - any change to an anchor, its removal, or a change to its file;
+- a reference this change adds whose server card records a build (`server.build_source`) but
+  names no commit or says `unknown`, or a `[[anchor]]` this change adds whose reference does the
+  same. A reference without `build_source` predates the build record and is grandfathered;
 - a fingerprint that does not match its file, or a reference file no entry names;
 - a removed configuration without a `[[retired]]` entry;
 - an edited or deleted file under `numerics/captures/`, which holds the evidence behind reports;
@@ -776,8 +792,9 @@ valid within one numerics version; across versions the teacher-forced comparison
 ## 6. Running it
 
 ```bash
-# Capture a reference from a running server (prints the registry entry to paste). --binary and
-# --repo record the build in the server card; both are optional and never change the fingerprint.
+# Capture a reference from a running server (prints the registry entry to paste). The served
+# card's build.id supplies server.commit; --binary and --repo name the binary and the fallback
+# tree, and neither changes the fingerprint.
 python3 scripts/numerics.py capture --url http://127.0.0.1:8000 \
   --binary target/release/sparkflash --repo . \
   --out numerics/references/qwen38-tp4-sm121a.json
