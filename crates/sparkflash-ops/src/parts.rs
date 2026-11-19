@@ -1314,6 +1314,8 @@ pub const CATALOGUE: &[PartKernel] = &[
             tc_tile("q4p_moe_gate_up", &[Precision::NvFp4]),
             tc_tile("q4p_moe_down", &[Precision::NvFp4]),
             tc_rows("q4p_moe_rows_gate_up", &[Precision::NvFp4]),
+            // Inkling's interleaved w13 and softcapped SwiGLU, the same body's arguments.
+            tc_rows("q4p_moe_rows_gate_up_capped", &[Precision::NvFp4]),
             tc_rows("q4p_moe_rows_down", &[Precision::NvFp4]),
             tc_tile("q4p_moe_gate_up_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_moe_swiglu_fp8", &[Precision::Fp8E4M3]),
@@ -1322,8 +1324,10 @@ pub const CATALOGUE: &[PartKernel] = &[
             // softcapped SwiGLU; its down pass is q4p_moe_down.
             tc_tile("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
             // The same two passes over Inkling's MXFP8 layers (E4M3 bytes, a ue8m0 code a 32).
-            tc_tile("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
-            tc_tile("q4p_moe_down_mx8", &[Precision::MxFp8]),
+            // The MXFP8 grouped tile is also the decode rows' body (Inkling's one-to-eight-row
+            // band takes it as it stands; the catalogue has no MXFP8 few-row form).
+            tc("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
+            tc("q4p_moe_down_mx8", &[Precision::MxFp8]),
             // The down passes over the row split's gathered runs, with no join before them.
             tc_tile("q4p_moe_down_runs", &[Precision::NvFp4]),
             tc_tile("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
@@ -1453,6 +1457,8 @@ pub const CATALOGUE: &[PartKernel] = &[
             tc_tile("q4p_moe_gate_up", &[Precision::NvFp4]),
             tc_tile("q4p_moe_down", &[Precision::NvFp4]),
             tc_rows("q4p_moe_rows_gate_up", &[Precision::NvFp4]),
+            // Inkling's interleaved w13 and softcapped SwiGLU, the same body's arguments.
+            tc_rows("q4p_moe_rows_gate_up_capped", &[Precision::NvFp4]),
             tc_rows("q4p_moe_rows_down", &[Precision::NvFp4]),
             tc_tile("q4p_moe_gate_up_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_moe_swiglu_fp8", &[Precision::Fp8E4M3]),
@@ -1461,8 +1467,10 @@ pub const CATALOGUE: &[PartKernel] = &[
             // softcapped SwiGLU; its down pass is q4p_moe_down.
             tc_tile("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
             // The same two passes over Inkling's MXFP8 layers (E4M3 bytes, a ue8m0 code a 32).
-            tc_tile("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
-            tc_tile("q4p_moe_down_mx8", &[Precision::MxFp8]),
+            // The MXFP8 grouped tile is also the decode rows' body (Inkling's one-to-eight-row
+            // band takes it as it stands; the catalogue has no MXFP8 few-row form).
+            tc("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
+            tc("q4p_moe_down_mx8", &[Precision::MxFp8]),
             // The down passes over the row split's gathered runs, with no join before them.
             tc_tile("q4p_moe_down_runs", &[Precision::NvFp4]),
             tc_tile("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
@@ -1918,42 +1926,32 @@ pub const WAIVERS: &[Waiver] = &[
         measurement: "Qwen's FP8 head is the row body q4e_argmax_prob_slices; no tensor-core \
                       head body and no measurement recorded",
     },
-    // GLM's block-scaled FP8 decode rows take the tile's few-row body
-    // (glm_decode_fp8b128_rows, the Image::DECODE entry above); its BF16 parts have no few-row
-    // body yet and keep the row GEMV, as Inkling's do. Their prompt tiles start at nine rows
-    // (MAX_ROWS/BATCH_ROWS = 8), so the token band is the gap that remains. The numbers are the
-    // row-count thresholds, not a speed measurement; none is recorded.
+    // The BF16 decode rows now split three ways. GLM's BF16 parts keep their row GEMV (its
+    // FP8 rows take glm_decode_fp8b128_rows), and Inkling's non-head dense projections keep
+    // BATCH_ROWS (8) row GEMV rows before its tile. Dory's projections and Inkling's head take
+    // the wide tile's few-row body (q4p_dense_rows), whose row is dory_mma_wide's and
+    // glm_prefill_bf16_wide's; the numbers are the row-count thresholds, not a speed
+    // measurement, and none is recorded.
     Waiver {
         part: Some(Part::DenseGemm),
         precision: Some(Precision::Bf16),
         phase: KernelPhase::Decode,
         rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
         measurement: "GLM's BF16 parts keep MAX_ROWS (8) row GEMV rows before \
-                      glm_prefill_bf16_*, now that its FP8 rows take the tile's few-row body \
-                      (glm_decode_fp8b128_rows); Inkling keeps BATCH_ROWS (8) before its tile. \
-                      Row band from the released constants; no one-row measurement recorded",
+                      glm_prefill_bf16_*, and Inkling's non-head dense projections keep \
+                      BATCH_ROWS (8); Dory's projections and Inkling's head take the wide \
+                      tile's few-row body (q4p_dense_rows). Row band from the released \
+                      constants; no one-row measurement recorded",
     },
     Waiver {
         part: Some(Part::DenseMlp),
         precision: None,
         phase: KernelPhase::Decode,
         rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
-        measurement: "Inkling (BATCH_ROWS = 8) and Dory (TOKEN_ROWS = 8) keep the row GEMV \
-                      on this band; GLM's MLP rows are FP8 and now take the tile's few-row body \
-                      (glm_decode_fp8b128_rows). Dory's dory_mma_wide starts at nine rows \
-                      (crates/sparkflash-model-dory/src/device.rs:60-62). No one-row \
-                      measurement recorded",
-    },
-    // Dory's attention and head are outside this assertion's GEMM parts; its MLP gap is the
-    // DenseMlp line above. Its projections take q4e_gemv_bf16 on the same band.
-    Waiver {
-        part: Some(Part::DenseGemm),
-        precision: Some(Precision::Bf16),
-        phase: KernelPhase::Decode,
-        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
-        measurement: "Dory's projections keep q4e_gemv_bf16 on at most TOKEN_ROWS = 8 rows \
-                      (crates/sparkflash-model-dory/src/device.rs:1910, 2265-2296); no \
-                      tensor-core few-row body and no one-row measurement recorded",
+        measurement: "Inkling's MLP rows keep BATCH_ROWS (8) row GEMV rows; Dory's take the \
+                      wide tile's few-row body (q4p_dense_rows, whose row is dory_mma_wide's), \
+                      and GLM's MLP rows are FP8 and take the tile's few-row body \
+                      (glm_decode_fp8b128_rows). No one-row measurement recorded",
     },
     // DeepSeek's row-GEMV decode bodies are the shared token bodies phase 3b will make common;
     // today the catalogue has the m1 bodies beside the tile bodies.
@@ -1987,13 +1985,19 @@ pub const WAIVERS: &[Waiver] = &[
                       (crates/sparkflash-ops/src/parts.rs:1035-1038). No one-row measurement \
                       recorded",
     },
+    // Inkling's one-to-eight-row MXFP8 experts take the grouped tile itself
+    // (q4p_moe_gate_up_capped_mx8 / q4p_moe_down_mx8, now catalogued on both passes); the
+    // steered band above that, up to its 64-row limit, still walks the row matvecs.
     Waiver {
         part: Some(Part::GroupedMoeGemm),
         precision: Some(Precision::MxFp8),
         phase: KernelPhase::Decode,
-        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
-        measurement: "Inkling's MXFP8 experts are row matvecs; the grouped MXFP8 bodies \
-                      (q4p_moe_*_mx8) are prefill-only. No one-row measurement recorded",
+        // Inkling's steered band covers a decode step, a verify and up to 64 fused rows.
+        rows: RowBand::new(crate::gemv::GEMV_MAX_BATCH + 1, 64),
+        measurement: "Inkling's nine-to-64-row steered band keeps the row matvecs \
+                      (inkling_mxfp8_expert_band / _items); its one-to-eight-row band takes \
+                      the grouped MXFP8 tile body (q4p_moe_gate_up_capped_mx8 / \
+                      q4p_moe_down_mx8). No one-row measurement recorded",
     },
     Waiver {
         part: Some(Part::Moe),
@@ -2008,9 +2012,11 @@ pub const WAIVERS: &[Waiver] = &[
         part: Some(Part::Moe),
         precision: Some(Precision::MxFp8),
         phase: KernelPhase::Decode,
-        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
-        measurement: "Inkling's MXFP8 experts are row matvecs; the grouped MXFP8 bodies are \
-                      prefill-only. No one-row measurement recorded",
+        rows: RowBand::new(crate::gemv::GEMV_MAX_BATCH + 1, 64),
+        measurement: "Inkling's nine-to-64-row steered band keeps the row matvecs \
+                      (inkling_mxfp8_expert_band / _items); its one-to-eight-row band takes \
+                      the grouped MXFP8 tile body (q4p_moe_gate_up_capped_mx8 / \
+                      q4p_moe_down_mx8). No one-row measurement recorded",
     },
     // DeepSeek's three bit dependences: documented properties of its paths, not missing bodies.
     Waiver {
@@ -4309,11 +4315,9 @@ mod tests {
         assert!(has(Part::DenseGemm, KernelPhase::Decode));
         assert!(has(Part::DenseMlp, KernelPhase::Decode));
         assert!(has(Part::Moe, KernelPhase::Decode));
-        // Dory's decode is the DenseMlp/DenseGemm row band above.
+        // Dory's decode rows take q4p_dense_rows, the wide tile's few-row body.
         assert!(WAIVERS.iter().any(|waiver| {
-            waiver
-                .measurement
-                .contains("dory_mma_wide starts at nine rows")
+            waiver.part == Some(Part::DenseGemm) && waiver.measurement.contains("q4p_dense_rows")
         }));
         // The heads on row GEMVs.
         assert!(has(Part::LmHead, KernelPhase::Both));
