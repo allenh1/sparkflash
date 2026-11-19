@@ -25,11 +25,11 @@
 //! arm's speculative decode: a sequence whose last verify already holds the token answers from
 //! it, and one that does not batches its token and drafts through the same kernels as before.
 //!
-//! Qwen serves through this walk: `Qwen4ExpDeviceBackend::enable_fusion` starts the tick engine
-//! ([sparkflash_runtime::TickServe]) over it, and `enable_group_fusion` the fused engine as rank
-//! 0 of a group, so the fragment is the serving path. The engine chooses when a chunk or a step
-//! runs; the rows and the shape are the runtime's, which is what keeps the arm's chunk boundaries
-//! and its verify width.
+//! Qwen serves through this walk: `Qwen4ExpDeviceBackend::enable_fusion` and
+//! `enable_group_fusion` start the tick engine ([sparkflash_runtime::TickServe]) over it, alone
+//! or as rank 0 of a tensor-parallel group, so the fragment is the serving path. The engine
+//! chooses when a chunk or a step runs; the rows and the shape are the runtime's, which is what
+//! keeps the arm's chunk boundaries and its verify width.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

@@ -65,7 +65,7 @@ pub(super) struct BatchBuffers {
 }
 
 // SAFETY: the buffers hold device pointers and stream events of one CUDA context. They are made by
-// the arm and used only from the fused engine's thread, which binds that context (`make_current`)
+// the arm and used only from the serving engine's thread, which binds that context (`make_current`)
 // before every launch; nothing else dereferences them, and the handles are not shared.
 unsafe impl Send for BatchBuffers {}
 

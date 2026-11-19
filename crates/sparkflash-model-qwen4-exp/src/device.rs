@@ -2496,26 +2496,27 @@ pub struct Qwen4ExpDeviceBackend {
     shared: Arc<SequenceShared>,
     context_limit: usize,
     /// The sessions-stepped-together engine, when the operator asked for one. Unset means every
-    /// session runs its own forward on its own stream, the one-row-a-session path.
-    /// The engine sessions are handles on, once [Qwen4ExpDeviceBackend::enable_fusion] or
-    /// [Qwen4ExpDeviceBackend::enable_group_fusion] ran.
+    /// session runs its own forward on its own stream, the one-row-a-session path. Set by
+    /// [Qwen4ExpDeviceBackend::enable_fusion] or
+    /// [Qwen4ExpDeviceBackend::enable_group_fusion], after which sessions are handles on it.
+    ///
+    /// It is the tick engine ([sparkflash_runtime::TickServe]) over [walk::QwenWalk]: rank 0 of a
+    /// tensor-parallel group when the backend was opened as one, and alone otherwise. The frames
+    /// differ, the engine does not.
     fused: Option<QwenServing>,
 }
 
 /// What a fused Qwen backend's sessions open on.
 enum QwenServing {
-    /// The fused engine: rank 0 of a tensor-parallel group and its workers' mirror. The group's
-    /// lane frames carry a prompt and a part, not the rows a tick decided, so the group is not on
-    /// the tick engine.
-    Fused(sparkflash_runtime::Fusion<sparkflash_runtime::Runtime<walk::QwenWalk>>),
-    /// The tick engine: DeepSeek's scheduler over the Qwen walk, for the single-process path.
+    /// The tick engine: DeepSeek's scheduler over the Qwen walk. It is rank 0 of a
+    /// tensor-parallel group when the backend was opened as one, and alone otherwise; the frames
+    /// differ, the engine does not.
     Tick(Arc<sparkflash_runtime::TickServe<walk::QwenWalk>>),
 }
 
 impl QwenServing {
     fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
         match self {
-            Self::Fused(fusion) => fusion.open(),
             Self::Tick(engine) => Ok(Box::new(engine.open()?)),
         }
     }
@@ -3239,12 +3240,17 @@ impl Qwen4ExpDeviceBackend {
         Ok(())
     }
 
-    /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group: every lane's prompt, step,
-    /// give-back and release is broadcast through `hub` before it runs here, and each worker
-    /// replays them ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same
-    /// sequence on every rank and the collectives inside a step line up. A worker whose socket
-    /// closes ends this process, and so does a failure here after a frame went out
-    /// ([sparkflash_runtime::watched_hub], [sparkflash_runtime::end_group]).
+    /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group: every prompt's start, every
+    /// prompt chunk's rows, every decode step's shape, every give-back and every release is
+    /// broadcast through `hub` before it runs here, and each worker replays them
+    /// ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same sequence on
+    /// every rank and the collectives inside a step line up. The scheduler stays rank 0's: the
+    /// lane, the hold, the chunk boundary, the verify width and the tick-ahead plan are decided
+    /// once. The row exchange is on for the group, so a prompt takes the prefill plan's chunks as
+    /// bulk passes.
+    ///
+    /// A worker whose socket closes ends this process, and so does a failure here after a frame
+    /// went out ([sparkflash_runtime::watched_hub], [sparkflash_runtime::end_group]).
     ///
     /// # Errors
     /// A backend that is not a group's rank, then as [Self::enable_fusion], or a watch that
@@ -3255,18 +3261,18 @@ impl Qwen4ExpDeviceBackend {
         hub: sparkflash_comm::control::Tp4ControlHub,
     ) -> Result<(), BackendError> {
         self.group_rank()?;
-        self.fused = Some(QwenServing::Fused(sparkflash_runtime::Fusion::group(
-            self.lanes(capacity)?,
-            hub,
-            self.wire(),
-            capacity,
-        )?));
+        let walk = walk::QwenWalk::new(Arc::clone(&self.shared), self.context_limit, capacity)?;
+        self.fused = Some(QwenServing::Tick(
+            sparkflash_runtime::TickServe::start_group(walk, capacity, hub, self.wire())?,
+        ));
         Ok(())
     }
 
-    /// A worker of an [Self::open_rank] group: replays rank 0's lane frames over `capacity`
+    /// A worker of an [Self::open_rank] group: replays rank 0's tick frames over `capacity`
     /// lanes of this rank's own until the group can no longer serve, then ends the process
-    /// ([sparkflash_runtime::mirror_until_the_group_ends]).
+    /// ([sparkflash_runtime::mirror_ticks_until_the_group_ends]). A prompt frame's start is
+    /// checked against this rank's own, a rows frame runs exactly those rows, and a step frame
+    /// runs the runtime's plain or round entry with rank 0's shape.
     ///
     /// # Errors
     /// A backend that is not a group's rank, or the arm's configuration, before any frame.
@@ -3276,8 +3282,13 @@ impl Qwen4ExpDeviceBackend {
         capacity: usize,
     ) -> Result<std::convert::Infallible, String> {
         self.group_rank().map_err(|error| error.to_string())?;
-        let lanes = self.lanes(capacity).map_err(|error| error.to_string())?;
-        sparkflash_runtime::mirror_until_the_group_ends(control, &lanes, &self.wire(), capacity)
+        let runtime = self.lanes(capacity).map_err(|error| error.to_string())?;
+        sparkflash_runtime::mirror_ticks_until_the_group_ends(
+            control,
+            &runtime,
+            &self.wire(),
+            capacity,
+        )
     }
 
     /// The runtime over this backend's sequences, with room for `capacity` in one pass.
@@ -6803,7 +6814,7 @@ impl ModelSession for DeviceSequence {
 
 impl DeviceSequence {
     /// A prompt on the direct (unfused) session path: take up the held prefix or the rewind
-    /// point, then forward the prefill plan's chunks. The fused engine drives the same chunks
+    /// point, then forward the prefill plan's chunks. The tick engine drives the same chunks
     /// through [sparkflash_runtime::Walk] instead, where the runtime owns the prefix match and
     /// the parts; this path stays for a session the engine was not started for.
     ///

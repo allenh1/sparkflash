@@ -242,7 +242,9 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
             ),
             (
                 Strategy::Group,
-                State::Native("a tensor-parallel group over the shared RDMA exchange"),
+                State::Native(
+                    "a tensor-parallel group on the tick engine: rank 0 decides each tick and the workers replay its rows",
+                ),
             ),
         ],
     },
