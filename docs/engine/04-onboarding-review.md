@@ -180,6 +180,34 @@ drafts**, and `Runtime<W>` refuses a walk that has a `Drafter` but no round path
 impossible by construction. This follows the plan's regression clause (an arm that measures slower
 stays where it is) and keeps phase 1's guarantee honest while the drafting phase is still ahead.
 
+**Superseded by the contract.** `Drafter<W>` now carries the round (`open_round`, `verify`,
+`settle`, `budget`, `ready`, `give_back`, `speculation`, the wall and an arm-owned `Rows`),
+`HeadInput::Verify` heads rows in order and stops at the first mismatch, `Pass::prompt_end`
+carries what a bulk chunk could not, `Limits` separates rows a pass from members a batch, and the
+ledger derives its drafting rows from the drafter and the joint switch. A drafting walk that does
+not declare the verify pass is refused at boot. GLM and Qwen now serve on `Runtime<Walk>` with
+their own drafters and their fusion code deleted (960 and 561 lines out); Inkling is the last arm
+still on its own shape.
+
+The device-only differences left for the cluster gate, reported by the two moves rather than
+measured:
+
+* GLM with no spec configured now takes a one-row `verify_batch` + `settle` where the frozen path
+  used `forward_batch_greedy` + a host choose. The documentation says a one-row verify is the same
+  bits; that is the thing to confirm on a GPU.
+* GLM's ledger row for drafting is type-derived, so an instance with no drafts configured prints
+  "the round path with no drafts configured" rather than off. The path does run the round.
+* A profile prompt chunk outside `ChunkPolicy`'s documented set (for example 5000) now runs
+  4096-row chunks, which can move block-drafter bits; a chunk below `MIN_PREFILL_ROWS` takes the
+  token path per runtime chunk.
+* After a give-back the runtime reports a reusable history and rewinds to the point, where the old
+  session reported no reusable prefix: same tokens expected, different reuse decision.
+* Qwen's joint-off now walks each lane's round alone, as the contract says, where its fusion
+  stepped one plain N-row batch over all members. Same tokens expected, one one-row batch a lane.
+* `Runtime::room` reserves `1 + budget(1)` = depth + 2 positions a step, not the fusion's
+  `verify_rows` = depth + 1, and counts history rather than the arm's position while verified
+  drafts are queued. It matters at the context boundary.
+
 What the runtime must gain before GLM, Inkling or Qwen can leave their fusion — the next phase-1
 commit, shared by all three arms rather than designed from one:
 
