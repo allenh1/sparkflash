@@ -259,9 +259,10 @@ non-zero on the first refusal.
 #### The monitor dump
 
 A monitor run samples the reference forward and the candidate forward on the same probe. Each
-dump records, for every decoder layer and every expert the probe routed to, the values at a fixed
-set of hidden indices, so `monitors` can compute a relative L2 error without shipping whole
-activations. The format is versioned as `sparkflash-numerics-monitors/1`:
+dump records, for every MoE decoder layer the probe reached and every expert it routed to, the
+values at a fixed set of hidden indices, so `monitors` can compute a relative L2 error without
+shipping whole activations. A dense layer has no routed expert and is not recorded. The format is
+versioned as `sparkflash-numerics-monitors/1`:
 
 ```json
 {
@@ -291,6 +292,72 @@ any layer exceeds `--layer-bar` or any expert exceeds `--expert-bar`, printing e
 writing the per-layer and per-expert result when asked. The bars are supplied by the run: this
 page does not invent a bar the data has not measured.
 
+The Rust writer is `sparkflash_model::numerics_monitors::Recorder`. It is off unless
+`SPARKFLASH_NUMERICS_MONITORS` names an output path; `SPARKFLASH_NUMERICS_SAMPLE` sets the number
+of evenly spaced hidden indices (default 8) and `SPARKFLASH_NUMERICS_MODEL` overrides the model
+id. The document declares the exact indices it sampled, and the judge refuses two dumps whose
+indices differ. The recorder merges a document across forwards only when model, probe and sample
+all match and the values agree; a different probe or sample is refused. A monitor run is **one
+probe per process**: the first forward that reaches a MoE layer is the probe, and a later forward
+(the decode token, another request) is a different probe. The recorder reports that as
+`AlreadyExists`; the serving wrapper logs it and stops recording that forward rather than failing
+the request. Use a fresh path per run and send the probe first.
+
+A real reference/candidate pair needs two builds. The echo of one process is not a candidate, and
+`[prerequisites] monitors` stays false until a pair from a reference build and a candidate build
+is committed. On the cluster, with the wired Qwen3.8 host reference:
+
+```bash
+W=/home/allenh1/cluster-tests/$(date +%Y%m%dT%H%M)-monitors
+mkdir -p "$W"
+cat > "$W/one.json" <<'JSON'
+{"schema": "sparkflash-numerics-prompts/1",
+ "prompts": [{"name": "probe", "prompt": "<the fixed probe prompt>"}]}
+JSON
+
+# Reference build, into reference.json.
+SPARKFLASH_MODEL=qwen3.8-flash-next-nvfp4 \
+SPARKFLASH_CHECKPOINT="$QWEN_CHECKPOINT" \
+SPARKFLASH_TOKENIZER="$QWEN_TOKENIZER" \
+SPARKFLASH_CONTEXT=65536 \
+SPARKFLASH_HTTP_BIND=127.0.0.1:8002 \
+SPARKFLASH_BIN="$REFERENCE_BIN" \
+SPARKFLASH_NUMERICS_MONITORS="$W/qwen38-monitors-reference.json" \
+SPARKFLASH_NUMERICS_SAMPLE=8 \
+SPARKFLASH_NUMERICS_MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  scripts/serve-single-node.sh launch
+python3 scripts/numerics.py capture --url http://127.0.0.1:8002 \
+  --suite "$W/one.json" --out "$W/reference-drive.json" --max-tokens 1
+scripts/serve-single-node.sh stop
+
+# Candidate build, into candidate.json. Same checkpoint, tokenizer, context and probe.
+SPARKFLASH_MODEL=qwen3.8-flash-next-nvfp4 \
+SPARKFLASH_CHECKPOINT="$QWEN_CHECKPOINT" \
+SPARKFLASH_TOKENIZER="$QWEN_TOKENIZER" \
+SPARKFLASH_CONTEXT=65536 \
+SPARKFLASH_HTTP_BIND=127.0.0.1:8002 \
+SPARKFLASH_BIN="$CANDIDATE_BIN" \
+SPARKFLASH_NUMERICS_MONITORS="$W/qwen38-monitors-candidate.json" \
+SPARKFLASH_NUMERICS_SAMPLE=8 \
+SPARKFLASH_NUMERICS_MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  scripts/serve-single-node.sh launch
+python3 scripts/numerics.py capture --url http://127.0.0.1:8002 \
+  --suite "$W/one.json" --out "$W/candidate-drive.json" --max-tokens 1
+scripts/serve-single-node.sh stop
+
+# The run's declared bars; this page does not invent them.
+python3 scripts/numerics.py monitors \
+  --reference "$W/qwen38-monitors-reference.json" \
+  --candidate "$W/qwen38-monitors-candidate.json" \
+  --layer-bar <declared> --expert-bar <declared> \
+  --json "$W/qwen38-monitors-result.json"
+```
+
+The first forward's chunk is the probe. The reference and candidate must run the same prompt with
+the same tokenizer and context so the probe's ids and position match; a different chunking is
+refused by the judge. Check the document's `probe` before judging it: a boot warmup that reaches a
+MoE layer first becomes the probe, so use a fresh path and send the probe after `/readyz`.
+
 #### Emission sites
 
 The dump is written by the serving side, never reconstructed from a report. The Rust writer is
@@ -304,12 +371,15 @@ for another model or expert layout is replaced by the new run, not merged.
 
 | Model | Coverage emission site | Monitor emission site |
 | :-- | :-- | :-- |
-| Qwen3.8-Flash-Next | `crates/sparkflash-model-qwen4-exp/src/forward.rs`, `moe_forward` (the host reference forward; **wired**, test `the_reference_forward_can_record_routing_for_a_coverage_dump`), and the device arm's `crates/sparkflash-model-qwen4-exp/src/device/blocks.rs`, `Blocks::routed_experts` | the same device arm, `Blocks::routed_experts`'s `expert_accumulator`; the host reference's expert body in `moe_forward` |
+| Qwen3.8-Flash-Next | `crates/sparkflash-model-qwen4-exp/src/forward.rs`, `moe_forward` (the host reference forward; **wired**, test `the_reference_forward_can_record_routing_for_a_coverage_dump`), and the device arm's `crates/sparkflash-model-qwen4-exp/src/device/blocks.rs`, `Blocks::routed_experts` | the same host reference `moe_forward` (**wired**, test `the_reference_forward_can_record_a_monitor_dump`), and the device arm's `Blocks::routed_experts` `expert_accumulator` |
 | GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/src/forward.rs`, `Moe::apply`, and the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `Glm5NextDevice::moe` / `bulk_moe` | `crates/sparkflash-model-glm5-next/src/device.rs`, `combine_experts`; the host reference's `Moe::apply` |
 | DeepSeek-V4.1-Flash | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn` (the selected ids are already copied to the host at `moe_device.rs:643`) | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn`'s routed combine |
 
-Only the Qwen host reference is wired in this change. The device sites are named, not wired: they
-need a device context and a cluster window, and the first real dump is still ahead.
+The Qwen host reference is wired for **both** dumps and is covered by the two CPU tests named
+above; the cross-language test `the_dump_round_trips_through_the_python_monitor_command` writes a
+monitor document and judges it with `scripts/numerics.py monitors`. The device sites are named,
+not wired: they need a device context and a cluster window, and the first real dumps are still
+ahead.
 
 ### Across architectures and versions
 

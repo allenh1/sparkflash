@@ -33,6 +33,7 @@
 //! is why the tensor plan has no model.norm weight.
 
 use sparkflash_model::numerics_coverage::Recorder as CoverageRecorder;
+use sparkflash_model::numerics_monitors::{Probe as MonitorProbe, Recorder as MonitorRecorder};
 use sparkflash_weights::linear_attention::{self, Decay};
 use sparkflash_weights::topk;
 
@@ -432,7 +433,9 @@ fn moe_forward(
     config: &Qwen4ExpConfig,
     input: &[f32],
     layer: usize,
+    row: usize,
     coverage: Option<&mut CoverageRecorder>,
+    mut monitors: Option<&mut MonitorRecorder>,
 ) -> Vec<f32> {
     let hidden = config.hidden_size;
     let shared = expert_forward(&weights.shared, input);
@@ -465,12 +468,22 @@ fn moe_forward(
     let mut out = vec![0.0f32; hidden];
     for (expert, weight) in selected {
         let body = expert_forward(&weights.experts[expert], input);
+        if row == 0
+            && let Some(recorder) = monitors.as_mut()
+        {
+            recorder.record_expert(layer, expert, &body);
+        }
         for column in 0..hidden {
             out[column] += weight * body[column];
         }
     }
     for column in 0..hidden {
         out[column] += gate * shared[column];
+    }
+    if row == 0
+        && let Some(recorder) = monitors.as_mut()
+    {
+        recorder.record_layer(layer, &out);
     }
     out
 }
@@ -1001,6 +1014,33 @@ impl Qwen4ExpWeights {
         if let Some(recorder) = coverage.as_mut() {
             recorder.input_auto(tokens.len());
         }
+        // A monitor dump is one probe. The probe is this forward's token chunk at its absolute
+        // position; the reference and candidate runs must feed the same chunk.
+        let mut monitors = match MonitorRecorder::from_env(
+            crate::MODEL_ID,
+            MonitorProbe {
+                name: format!("position-{start_position}"),
+                prompt_ids: tokens.to_vec(),
+                position: start_position,
+            },
+            config.hidden_size,
+        ) {
+            Ok(recorder) => recorder,
+            // A monitor dump is one probe. The first forward in this process wrote it; a later
+            // forward (the decode token, another request) is a different probe. The recorder
+            // refuses to merge it; the serving forward stops recording rather than failing the
+            // request, and the log says why.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!("sparkflash numerics: {error}; not recording later forwards");
+                });
+                None
+            }
+            Err(error) => {
+                return Err(ForwardError::new(format!("monitor dump: {error}")));
+            }
+        };
         let mut hyper: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
         for token in tokens {
             let embedding = &self.embed.data
@@ -1071,13 +1111,15 @@ impl Qwen4ExpWeights {
                 injections.push(injection);
             }
             let mut moe_rows: Vec<Vec<f32>> = Vec::with_capacity(mixed_rows.len());
-            for row in &mixed_rows {
+            for (row, row_values) in mixed_rows.iter().enumerate() {
                 moe_rows.push(moe_forward(
                     &layer.moe,
                     config,
-                    row,
+                    row_values,
                     index,
+                    row,
                     coverage.as_mut(),
+                    monitors.as_mut(),
                 ));
             }
             for (row, (moe_row, injection)) in
@@ -1097,6 +1139,11 @@ impl Qwen4ExpWeights {
             recorder
                 .write()
                 .map_err(|error| ForwardError::new(format!("coverage dump: {error}")))?;
+        }
+        if let Some(mut recorder) = monitors {
+            recorder
+                .write()
+                .map_err(|error| ForwardError::new(format!("monitor dump: {error}")))?;
         }
         Ok(logits)
     }
@@ -1383,7 +1430,9 @@ mod tests {
             &config,
             &input,
             0,
+            0,
             Some(&mut recorder),
+            None,
         );
         recorder.write().expect("the dump writes");
         let text = std::fs::read_to_string(&path).expect("the dump is readable");
@@ -1401,6 +1450,55 @@ mod tests {
             .filter(|hit| hit.as_u64().expect("a hit count") > 0)
             .count();
         assert_eq!(reached, config.num_experts_per_tok);
+    }
+
+    #[test]
+    fn the_reference_forward_can_record_a_monitor_dump() {
+        let (config, weights, _ple) = tiny_model();
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("monitors.json");
+        let mut recorder = MonitorRecorder::new(
+            "toy/qwen",
+            MonitorProbe {
+                name: "probe".to_owned(),
+                prompt_ids: vec![1, 2],
+                position: 0,
+            },
+            config.hidden_size,
+            vec![0, 1],
+            &path,
+        )
+        .expect("the sample is valid");
+        let input = vec![0.01f32; config.hidden_size];
+        let _ = moe_forward(
+            &weights.layers[0].moe,
+            &config,
+            &input,
+            0,
+            0,
+            None,
+            Some(&mut recorder),
+        );
+        recorder.write().expect("the dump writes");
+        let text = std::fs::read_to_string(&path).expect("the dump is readable");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("the dump is JSON");
+        assert_eq!(
+            document["schema"],
+            sparkflash_model::numerics_monitors::SCHEMA
+        );
+        let values = document["layers"][0]["values"]
+            .as_array()
+            .expect("the layer has sampled values");
+        assert_eq!(values.len(), 2);
+        let experts = document["layers"][0]["experts"]
+            .as_array()
+            .expect("the layer has expert values");
+        assert_eq!(experts.len(), config.num_experts_per_tok);
+        assert!(experts.iter().all(|expert| {
+            expert["values"]
+                .as_array()
+                .is_some_and(|values| values.len() == 2)
+        }));
     }
 
     #[test]

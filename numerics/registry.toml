@@ -49,8 +49,10 @@ declaration_check = true
 # numerics/layouts/. False because no real dump is committed yet; flip it with the first one.
 coverage = false
 # Per-layer and per-expert relative error against the reference forward. Implemented:
-# `scripts/numerics.py monitors --reference ... --candidate ... --layer-bar X --expert-bar Y`.
-# False because no real reference/candidate pair is committed yet; flip it with the first one.
+# `scripts/numerics.py monitors --reference ... --candidate ... --layer-bar X --expert-bar Y`, and
+# the Qwen host reference writes the dump under SPARKFLASH_NUMERICS_MONITORS. False because no real
+# reference/candidate pair is committed yet: one process's echo is not a candidate. Flip it with
+# the first pair from a reference build and a candidate build.
 monitors = false
 
 # Qwen3.8-Flash-Next: the host driver at world 1, the TP driver at 2 and 4. Each world sums in its
