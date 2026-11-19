@@ -32,6 +32,7 @@
 //! LM head scores it. There is deliberately no final RMSNorm: the released model has none, which
 //! is why the tensor plan has no model.norm weight.
 
+use sparkflash_model::numerics_coverage::Recorder as CoverageRecorder;
 use sparkflash_weights::linear_attention::{self, Decay};
 use sparkflash_weights::topk;
 
@@ -426,7 +427,13 @@ fn inject_branch(
     out
 }
 
-fn moe_forward(weights: &MoeWeights, config: &Qwen4ExpConfig, input: &[f32]) -> Vec<f32> {
+fn moe_forward(
+    weights: &MoeWeights,
+    config: &Qwen4ExpConfig,
+    input: &[f32],
+    layer: usize,
+    coverage: Option<&mut CoverageRecorder>,
+) -> Vec<f32> {
     let hidden = config.hidden_size;
     let shared = expert_forward(&weights.shared, input);
     let gate = sigmoid(weights.shared_gate.matvec(input)[0]);
@@ -450,6 +457,11 @@ fn moe_forward(weights: &MoeWeights, config: &Qwen4ExpConfig, input: &[f32]) -> 
         1.0,
         &mut selected,
     );
+    if let Some(recorder) = coverage {
+        for (expert, _) in &selected {
+            recorder.hit(layer, *expert);
+        }
+    }
     let mut out = vec![0.0f32; hidden];
     for (expert, weight) in selected {
         let body = expert_forward(&weights.experts[expert], input);
@@ -980,6 +992,15 @@ impl Qwen4ExpWeights {
                 .map_err(ForwardError::new)?;
         }
         let start_position = state.position;
+        // Off unless SPARKFLASH_NUMERICS_COVERAGE names a path. The recorder is a local, so the
+        // unset case costs one environment lookup per forward and nothing per expert.
+        let mut coverage = CoverageRecorder::from_env(
+            crate::MODEL_ID,
+            self.layers.iter().map(|_| config.num_experts).collect(),
+        );
+        if let Some(recorder) = coverage.as_mut() {
+            recorder.input(format!("position-{start_position}"), tokens.len());
+        }
         let mut hyper: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
         for token in tokens {
             let embedding = &self.embed.data
@@ -1049,10 +1070,16 @@ impl Qwen4ExpWeights {
                 mixed_rows.push(mixed);
                 injections.push(injection);
             }
-            let moe_rows: Vec<Vec<f32>> = mixed_rows
-                .iter()
-                .map(|row| moe_forward(&layer.moe, config, row))
-                .collect();
+            let mut moe_rows: Vec<Vec<f32>> = Vec::with_capacity(mixed_rows.len());
+            for row in &mixed_rows {
+                moe_rows.push(moe_forward(
+                    &layer.moe,
+                    config,
+                    row,
+                    index,
+                    coverage.as_mut(),
+                ));
+            }
             for (row, (moe_row, injection)) in
                 hyper.iter_mut().zip(moe_rows.into_iter().zip(injections))
             {
@@ -1066,6 +1093,11 @@ impl Qwen4ExpWeights {
             logits.push(self.lm_head.matvec(&mixed));
         }
         state.position += tokens.len();
+        if let Some(recorder) = coverage {
+            recorder
+                .write()
+                .map_err(|error| ForwardError::new(format!("coverage dump: {error}")))?;
+        }
         Ok(logits)
     }
 
@@ -1332,6 +1364,43 @@ mod tests {
             )
             .expect_err("the token is out of range");
         assert!(error.to_string().contains("vocabulary"));
+    }
+
+    #[test]
+    fn the_reference_forward_can_record_routing_for_a_coverage_dump() {
+        let (config, weights, _ple) = tiny_model();
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("coverage.json");
+        let mut recorder = CoverageRecorder::new(
+            "toy/qwen",
+            vec![config.num_experts; weights.layers.len()],
+            &path,
+        );
+        recorder.input("probe", 1);
+        let input = vec![0.01f32; config.hidden_size];
+        let _ = moe_forward(
+            &weights.layers[0].moe,
+            &config,
+            &input,
+            0,
+            Some(&mut recorder),
+        );
+        recorder.write().expect("the dump writes");
+        let text = std::fs::read_to_string(&path).expect("the dump is readable");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("the dump is JSON");
+        assert_eq!(
+            document["schema"],
+            sparkflash_model::numerics_coverage::SCHEMA
+        );
+        let hits = document["layers"][0]["hits"]
+            .as_array()
+            .expect("the layer has a hit list");
+        assert_eq!(hits.len(), config.num_experts);
+        let reached = hits
+            .iter()
+            .filter(|hit| hit.as_u64().expect("a hit count") > 0)
+            .count();
+        assert_eq!(reached, config.num_experts_per_tok);
     }
 
     #[test]

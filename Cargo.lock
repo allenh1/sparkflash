@@ -2528,6 +2528,7 @@ dependencies = [
  "serde_json",
  "sparkflash-trace",
  "sparkflash-weights",
+ "tempfile",
  "thiserror 2.0.21",
  "toml",
 ]

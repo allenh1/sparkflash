@@ -41,6 +41,7 @@ pub mod engine;
 pub mod gumbel;
 pub mod ledger;
 pub mod numerics;
+pub mod numerics_coverage;
 pub mod parts;
 pub mod prof;
 pub mod profile;
