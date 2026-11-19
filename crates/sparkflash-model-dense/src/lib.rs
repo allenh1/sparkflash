@@ -1677,6 +1677,11 @@ impl Uploads<'_> {
         Ok(typed)
     }
 
+    /// A BF16 vector (a norm, a rotary table, a conv filter).
+    ///
+    /// A vector stays a `Deviceptr`: [Mat] is a matrix with a row stride and a format's scale
+    /// plane, and these tensors have neither. Its stored and arithmetic formats and its bytes a
+    /// token are still ledger rows.
     fn vector(&mut self, name: &str, width: usize) -> Result<Deviceptr, String> {
         bf16(self.source, name, &[width])?;
         let pointer = self.uploader.vector(name, width)?;
@@ -1810,6 +1815,10 @@ impl Uploads<'_> {
     /// depthwise filter's channels or a per-head vector's heads.
     /// An f32 vector of `elements` on the device, from an F32 tensor or a BF16 one widened (a
     /// router's correction bias, which every rank holds whole).
+    ///
+    /// This is the one widen-line waiver: a vector is not a [Mat], and the stored BF16 tensor is
+    /// read at f32 arithmetic. The `widen` record below is what boot accepts, and the ledger row
+    /// says what was stored and what is read.
     fn floats(&mut self, name: &str, elements: usize) -> Result<Deviceptr, String> {
         let spec = self.source.spec(name).map_err(|error| error.to_string())?;
         if spec.elements() != elements as u128 {
