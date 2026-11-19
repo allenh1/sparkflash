@@ -564,7 +564,7 @@ run, not merged.
 | Model | Coverage emission site | Monitor emission site |
 | :-- | :-- | :-- |
 | Qwen3.8-Flash-Next | `crates/sparkflash-model-qwen4-exp/src/forward.rs`, `moe_forward` (the host reference forward; **wired**, test `the_reference_forward_can_record_routing_for_a_coverage_dump`), and the world-1 device arm's `crates/sparkflash-model-qwen4-exp/src/device/blocks.rs`, `DeviceSequence::mlp_branch` after the router launch (**wired**, `DeviceSequence::record_routing`) | the same host reference `moe_forward` (**wired**, test `the_reference_forward_can_record_a_monitor_dump`), and the world-1 device arm's `DeviceSequence::record_probe` after `moe_combine` (**wired**, sampling `branch` and each slot of `expert_accumulator`); the TP arm is named |
-| GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/src/forward.rs`, `Moe::apply`, and the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `Glm5NextDevice::moe` / `bulk_moe` — **named** | the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `combine_experts` after its combine kernel (**wired**, `DeviceRank::record_layer` and `crates/sparkflash-model-glm5-next/src/device/numerics.rs`, sampling `partial` and each slot of `expert_out` on rank 0); the host reference's `Moe::apply` — **named** |
+| GLM-5.3-Flash | the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `DeviceRank::combine_experts` after its combine kernel (**wired**, `DeviceRank::record_routing` reads the router's `expert_indices` back into `crates/sparkflash-model-glm5-next/src/device/numerics.rs`, `record_routing`; the MTP draft passes `None` and records nothing); the host reference's `crates/sparkflash-model-glm5-next/src/forward.rs`, `Moe::apply` — **named** | the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `combine_experts` after its combine kernel (**wired**, `DeviceRank::record_layer` and `crates/sparkflash-model-glm5-next/src/device/numerics.rs`, sampling `partial` and each slot of `expert_out` on rank 0); the host reference's `Moe::apply` — **named** |
 | DeepSeek-V4.1-Flash | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn` (the selected ids are already copied to the host at `moe_device.rs:643`) — **named** | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn`'s routed combine — **named** |
 
 The Qwen host reference is wired for **both** dumps and is covered by the two CPU tests named
@@ -584,20 +584,28 @@ arm — the path the cluster window exercised — is wired for both as well:
   expert's `expert_accumulator` slot, divided by its routing weight — the expert kernels write
   `weight * body` there. The MTP layer is a draft pass and is not recorded.
 
-GLM's device arm is wired for the monitor dump too:
+GLM's device arm is wired for both dumps:
 
-- `DeviceRank::begin_monitor` opens the recorder once a step from the step's first run
-  (`crates/sparkflash-model-glm5-next/src/device/numerics.rs`, `Switches::begin`), and
-  `DeviceRank::combine_experts` records each routed layer after its combine kernel.
-- `combine_experts` now takes the decoder layer as a parameter (`Option<usize>`): the token and
-  bulk paths pass the layer's index, and the MTP layer's draft pass passes `None`, so the draft is
-  not recorded. The parameter changes no arithmetic.
-- `record_layer` copies back the probe row's routed ids and weights, the layer's `partial` row and
-  each slot's `expert_out` row, and `numerics::record_probe` divides each expert row by its routing
-  weight and samples at the document's indices. The dump is rank 0's slot of the tensor-parallel
-  expert sum — the shared and routed experts' columns are split, so `partial` and `expert_out` hold
-  this rank's partial products — and the rank gate keeps one writer a launch. A reference build
-  and a candidate run the same split, so the judge compares like with like.
+- `DeviceRank::begin_numerics` opens the recorders once a step from the step's first run
+  (`crates/sparkflash-model-glm5-next/src/device/numerics.rs`, `Switches::begin`). Coverage opens
+  one content-addressed input on every forward, the prompt's prefill included, and on every rank:
+  the router's chosen ids are the same view of the layer on every rank and the coverage format has
+  no rank field. The monitor recorder takes only a decode step, and `DeviceRank` passes its rank
+  so only rank 0 opens one.
+- `DeviceRank::combine_experts` counts each routed layer's chosen ids after its combine kernel:
+  `record_routing` copies the router's `[rows][top-k]` ids back from `expert_indices` and hands
+  them to `numerics::record_routing`, one `hit` a selected expert. `combine_experts` takes the
+  decoder layer as an `Option<usize>`: the token and bulk paths pass the layer's index, and the
+  MTP layer's draft pass passes `None`, so the draft's routing is not recorded. The parameter
+  changes no arithmetic.
+- The monitor half is unchanged: `record_layer` copies back the probe row's routed ids and
+  weights, the layer's `partial` row and each slot's `expert_out` row, and
+  `numerics::record_probe` divides each expert row by its routing weight and samples at the
+  document's indices. The dump is rank 0's slot of the tensor-parallel expert sum — the shared and
+  routed experts' columns are split, so `partial` and `expert_out` hold this rank's partial
+  products — and the rank gate keeps one writer a launch. A reference build and a candidate run
+  the same split, so the judge compares like with like. A read-back or write failure is logged
+  once and serving continues.
 
 Both switches read **once** when a session is made: `SPARKFLASH_NUMERICS_COVERAGE` and
 `SPARKFLASH_NUMERICS_MONITORS` name output paths, `SPARKFLASH_NUMERICS_MODEL` overrides the dump's
@@ -606,7 +614,11 @@ count (default 8). With them unset a forward pays one `Option` check and a layer
 environment read, no formatting, no allocation. A recorder that cannot open or write logs once and
 serving continues; a request never fails for a diagnostic. The rules — the document shapes, the
 input naming and accumulation, and the one-probe rule — are unit-tested with a synthetic table in
-`crates/sparkflash-model-qwen4-exp/src/device/numerics.rs`, so they need no GPU.
+each wired device arm's `device/numerics.rs`
+(`crates/sparkflash-model-qwen4-exp/src/device/numerics.rs` and
+`crates/sparkflash-model-glm5-next/src/device/numerics.rs`), so they need no GPU. The GLM
+coverage recorder is seeded from `mlp_layer_types`: a dense decoder layer has no routed experts,
+so it is listed with an empty hit list, as `numerics/layouts/glm53.json` declares it.
 
 The other arms are **named, not wired**. DeepSeek's `ffn` does have its ids on the host, but the
 forward crate calls the backend one layer at a time with no per-forward boundary, so a recorder
@@ -714,6 +726,46 @@ GEMM runs on both builds — that pair's dumps came out byte-identical and the j
 must not be used. Before judging a dump, check that `probe.rows` is 1 and `probe.position` is the
 probe prompt's length. A boot warmup that generates a token first can still become the probe, so a
 fresh path and a post-`/readyz` request are what name the forward the two runs share.
+
+**A GLM-5.3-Flash coverage sweep.** The GLM arm serves only at world 4, so a coverage window is one
+run of the tip, not a pair. `SPARK_LOCAL_RANKS=0` keeps rank 0 on the launching node, and rank 0's
+file is the suite the operator collects: every rank records its own routing view, and the router's
+chosen ids are the same on all of them, but the monitor dump's rank-sharing caveat does not apply
+to coverage and the format has no rank field. Use a fresh window directory and send the sweep after
+`/readyz`; a run against the committed layout and the declared `--min-inputs` of eight is:
+
+```bash
+W=/home/allenh1/cluster-tests/$(date +%Y%m%dT%H%M)-glm53-coverage
+mkdir -p "$W"
+
+SPARK_NODES="$GLM_NODES" SPARK_LOCAL_RANKS=0 \
+SPARKFLASH_MODEL=zai-org/GLM-5.3-Flash \
+SPARKFLASH_CHECKPOINT="$GLM_CHECKPOINT" \
+SPARKFLASH_TOKENIZER="$GLM_TOKENIZER" \
+SPARKFLASH_CONVERTED_DIR="$GLM_CONVERTED_DIR" \
+SPARKFLASH_CONTEXT=131072 \
+SPARKFLASH_HTTP_BIND=127.0.0.1:8002 \
+SPARKFLASH_NUMERICS_COVERAGE="$W/glm53-coverage.json" \
+SPARKFLASH_NUMERICS_MODEL=zai-org/GLM-5.3-Flash \
+  scripts/serve-four-node.sh launch
+# Wait for /readyz.
+python3 scripts/numerics.py coverage-sweep \
+  --url http://127.0.0.1:8002 \
+  --dump "$W/glm53-coverage.json" \
+  --layout numerics/layouts/glm53.json \
+  --corpus numerics/coverage/corpus.json \
+  --generate 2000 --seed 20261119 --order shuffled \
+  --batch 64 --max-candidates 256 \
+  --out "$W/next-batch.json" --json "$W/sweep.json"
+scripts/serve-four-node.sh stop
+
+python3 scripts/numerics.py coverage-gaps --dump "$W/glm53-coverage.json" --json "$W/gaps.json"
+python3 scripts/numerics.py coverage --dump "$W/glm53-coverage.json" \
+  --layout numerics/layouts/glm53.json --min-inputs 8
+```
+
+Rerun the same command until `--max-candidates` exhausts the corpus, then raise `--generate` or
+change `--seed`, as for Qwen3.8.
 
 ### Across architectures and versions
 
@@ -861,7 +913,8 @@ guard, not a quality claim. Neither flag was flipped on synthetic data. The cove
 growable: `coverage-gaps` names the missing experts, `coverage-sweep` measures a deterministic
 corpus and writes the kept prompts as the next batch, and the corpus and generator live under
 `numerics/coverage/`. The commands that wrote the coverage dump and the monitor pair are in §5;
-the other arms' device sites are still named there. The sweep's estimate for Qwen3.8's remaining
+DeepSeek's device site and the GLM host reference are still named there; the GLM device arm now
+counts coverage, but no GLM coverage dump has been run yet. The sweep's estimate for Qwen3.8's remaining
 gap is 650-750
 contributing prompts (1,500-2,500 measured candidates); that is an estimate from the two runs'
 marginal rate, not a measured coverage claim.

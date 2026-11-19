@@ -160,7 +160,7 @@ use sparkflash_weights::rank_file::SlotCursor;
 use sparkflash_weights::tp::{BitGatherHandle, TpLayout, TpRuntime, Wire};
 use sparkflash_weights::{DType, TensorSpec, WeightSource, check_length};
 
-use crate::config::{Glm5NextConfig, IndexerKind, LayerKind};
+use crate::config::{Glm5NextConfig, IndexerKind, LayerKind, MlpKind};
 use crate::convert::{ConvertedIndex, ConvertedSpecs};
 use crate::forward::{INDEX_KEY_NORM_EPS, inverse_sqrt};
 use crate::tensor::{Glm5NextTensorPlan, LM_PREFIX, Split};
@@ -2651,10 +2651,12 @@ pub struct DeviceRank {
     steps: u64,
     /// LM heads this rank has run, a step's or a draft's: each overwrites the last one's logits.
     heads: AtomicU64,
-    /// The numerics monitor switch, read once when the rank loads (docs/NUMERICS.md section 5).
-    monitors: numerics::Switches,
-    /// This step's monitor recorder; `None` between steps and with the switch off.
+    /// The numerics switches, read once when the rank loads (docs/NUMERICS.md section 5).
+    numerics: numerics::Switches,
+    /// This step's recorders; `None` between steps and with both switches off.
     record: RefCell<Option<numerics::Forward>>,
+    /// Whether `SPARKFLASH_NUMERICS_COVERAGE` names a path, checked a layer without a borrow.
+    covering: bool,
     /// Whether `SPARKFLASH_NUMERICS_MONITORS` names a path, checked a layer without a borrow.
     monitoring: bool,
     /// The side stream [Self::prefetch] warms the L2 from, unless SPARKFLASH_L2_PREFETCH=0.
@@ -2877,10 +2879,21 @@ impl DeviceRank {
         let prefetch = Prefetch::new(&cuda)?;
         let tokens_staged = TokenFence(cuda.stream_event().map_err(cuda_error)?);
         let kda_scan = Self::kda_scan_plan(config, layout)?;
-        // The monitor switch is read once, when the rank loads: a forward then pays one `Option`
-        // check and a layer one, and off does no formatting or allocation.
-        let monitors = numerics::Switches::from_env(crate::MODEL_ID, config.hidden_size);
-        let monitoring = !monitors.is_off();
+        // The numerics switches are read once, when the rank loads: a forward then pays one
+        // `Option` check and a layer one, and off does no formatting or allocation. The coverage
+        // recorder is seeded with the model's per-layer routed-expert counts: a dense layer is
+        // listed with none, as the committed layout is.
+        let experts = config
+            .mlp_layer_types
+            .iter()
+            .map(|kind| match kind {
+                MlpKind::Moe => config.n_routed_experts,
+                MlpKind::Dense => 0,
+            })
+            .collect();
+        let numerics = numerics::Switches::from_env(crate::MODEL_ID, experts, config.hidden_size);
+        let covering = numerics.coverage_enabled();
+        let monitoring = numerics.monitors_enabled();
         let mut rank = Self {
             cuda,
             stream,
@@ -2921,8 +2934,9 @@ impl DeviceRank {
                 .unwrap_or(1.0 / config.hc_mult as f32),
             steps: 0,
             heads: AtomicU64::new(0),
-            monitors,
+            numerics,
             record: RefCell::new(None),
+            covering,
             monitoring,
             prefetch,
             prof: Mutex::new(sparkflash_model::StageProfiler::new(
@@ -5669,33 +5683,83 @@ impl DeviceRank {
                 config.hc_mult as u64,
             ],
         )?;
+        // Coverage counts each layer's routed ids after its router launch; the monitor samples
+        // the layer's row after the combine kernel. Both are diagnostics, and both read-backs
+        // leave the layer's arithmetic untouched.
+        self.record_routing(layer, rows);
         if let Some(layer) = layer {
             self.record_layer(layer);
         }
         Ok(())
     }
 
-    /// Open this forward's monitor recorder, when the switch names a path and this is rank 0.
+    /// Open this forward's recorders, when a switch names a path.
     ///
-    /// The dump is rank 0's slot of the tensor-parallel expert sum: the shared expert and the
+    /// Coverage opens an input on every forward, rank 0 or not: the router's chosen ids are the
+    /// same view of the layer on every rank, and the coverage format has no rank field. The
+    /// monitor dump is rank 0's slot of the tensor-parallel expert sum: the shared expert and the
     /// routed experts' columns are split, so `partial` and `expert_out` hold this rank's partial
     /// products. Every rank computes its slot the same way, and a reference build and a candidate
     /// run the same split, so the judge compares like with like. `rows` is this step's row count:
     /// only a decode step can be the probe, so a prompt's prefill leaves it for the first decode
-    /// step after it. With the switch off, this is one `bool` check.
-    fn begin_monitor(&self, tokens: &[u32], position: usize, rows: usize) {
-        if !self.monitoring || self.layout.rank != 0 {
-            return;
-        }
-        self.record
-            .replace(self.monitors.begin(tokens, position, rows));
+    /// step after it. With a switch off, this is one `Option` check.
+    fn begin_numerics(&self, tokens: &[u32], position: usize, rows: usize) {
+        self.record.replace(
+            self.numerics
+                .begin(tokens, position, rows, self.layout.rank == 0),
+        );
     }
 
-    /// Write the monitor dump this step filled, if it had one. A write that fails is logged once
-    /// and serving continues; the dump is a diagnostic, not part of the answer.
-    fn finish_monitor(&self) {
+    /// Write the dumps this step filled, if it had any. A write that fails is logged once and
+    /// serving continues; the dumps are diagnostics, not part of the answer.
+    fn finish_numerics(&self) {
         if let Some(forward) = self.record.replace(None) {
             forward.finish();
+        }
+    }
+
+    /// Count this layer's chosen experts in the coverage dump: copy the router's
+    /// `[rows][top-k]` ids back and hand them to [numerics::record_routing].
+    ///
+    /// With the switch off this is one `bool` check a layer. `layer` is the decoder layer; the
+    /// MTP layer's draft pass passes `None` and records nothing, not even the ids' read-back. A
+    /// read-back failure is a diagnostic's failure: it is logged once, the recorder is dropped and
+    /// the layer's arithmetic is untouched.
+    fn record_routing(&self, layer: Option<usize>, rows: usize) {
+        let Some(layer) = layer else {
+            return;
+        };
+        if !self.covering {
+            return;
+        }
+        {
+            let record = self.record.borrow();
+            let Some(forward) = record.as_ref() else {
+                return;
+            };
+            if !forward.coverage_enabled() {
+                return;
+            }
+        }
+        let count = rows * self.config.num_experts_per_tok;
+        let mut bytes = vec![0u8; count * 4];
+        match self
+            .cuda
+            .copy_dtoh_on(&self.stream, &mut bytes, &self.scratch.expert_indices)
+        {
+            Ok(()) => {
+                numerics::record_routing(
+                    &mut self.record.borrow_mut(),
+                    Some(layer),
+                    &numerics::experts(&bytes),
+                );
+            }
+            Err(error) => {
+                numerics::warn_coverage_read_back(&format!(
+                    "layer {layer}: the router ids: {error}"
+                ));
+                self.record.replace(None);
+            }
         }
     }
 
@@ -5720,7 +5784,7 @@ impl DeviceRank {
                 );
             }
             Err(error) => {
-                numerics::warn_read_back(&error);
+                numerics::warn_monitor_read_back(&error);
                 self.record.replace(None);
             }
         }
@@ -6354,12 +6418,12 @@ impl DeviceRank {
         let config = &self.config;
         let (hc, hidden) = (config.hc_mult, config.hidden_size);
         let rows = tokens.len();
-        // The first decode step through the rank is the monitor probe (docs/NUMERICS.md
-        // section 5): a prompt's prefill is wider than the few-row band and does not consume it,
-        // so the step after it is what a pair measures. With the switch off, this is one `bool`
-        // check a forward.
+        // This forward is one named coverage input, and the first decode step through the rank is
+        // the monitor probe (docs/NUMERICS.md section 5): a prompt's prefill is wider than the
+        // few-row band and does not consume it, so the step after it is what a pair measures.
+        // With both switches off, this is one `Option` check a forward.
         if let Some(run) = runs.first() {
-            self.begin_monitor(&tokens[run.first..run.first + run.len], run.position, rows);
+            self.begin_numerics(tokens, run.position, rows);
         }
         // A sequence-parallel step widens, mixes and folds this rank's rows alone.
         let share = self.sequence_parallel(tp, runs, rows, device_leg);
@@ -6417,7 +6481,7 @@ impl DeviceRank {
             )?;
             self.capture(index, runs)?;
         }
-        self.finish_monitor();
+        self.finish_numerics();
         self.prof_mark("tail");
         self.launch(
             self.kernels.fold.kernel,
