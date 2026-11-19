@@ -1676,42 +1676,16 @@ pub(super) const STEP_COST: StepCost = StepCost {
     prior_tokens_per_ms: 0.06,
 };
 
-/// The rows the shared step's cost model bends at: a step of up to this many rows is the
-/// narrow body, past it the wide one (the bucket split the model is fit over).
-pub(super) const BAND_ROWS: usize = 16;
-
-/// What a shared step costs for each sequence past the first, besides its anchor row (ms): its
-/// draft block, its segment's seam and select, its head row. This is the term the step model
-/// carried before it was measured; a four-number profile value keeps it, so a value that does not
-/// name it cannot move the per-sequence part of a step.
-pub(super) const SEQ_MS: f64 = 2.3;
-
-/// A shared step's cost model: a0 + a1 * rows up to [BAND_ROWS] rows, b0 + b1 * rows above,
-/// and seq_ms for each sequence past the first (ms). The trace's per-tick decode line (rows and
-/// milliseconds) is this model's target: one shared step, in rows and in sequences.
-pub(super) type StepModel = (f64, f64, f64, f64, f64);
+// The shared step's band model and its defaults moved to `sparkflash_runtime::tick`; the
+// forward's profile plumbing and cost policy stay here.
+#[cfg(test)]
+pub(super) use sparkflash_runtime::tick::BAND_ROWS;
+pub(super) use sparkflash_runtime::tick::{SEQ_MS, StepModel, band};
 
 /// The modelled wall of a shared step over the given number of verified rows (ms), for the tests
 /// that pin the model.
 #[cfg(test)]
-#[must_use]
-pub(super) fn batch_step_ms(model: StepModel, rows: usize) -> f64 {
-    band(model).rows_ms(rows)
-}
-
-/// The step model as the shared row share's wall ([sparkflash_runtime::BandWall]).
-#[must_use]
-pub(super) fn band(model: StepModel) -> sparkflash_runtime::BandWall {
-    let (a0, a1, b0, b1, seq_ms) = model;
-    sparkflash_runtime::BandWall {
-        a0,
-        a1,
-        b0,
-        b1,
-        seq_ms,
-        band_rows: BAND_ROWS,
-    }
-}
+pub(super) use sparkflash_runtime::tick::batch_step_ms;
 
 /// [batch_step_cost] over one profile value: a0,a1,b0,b1[,seq_ms], or the flat band that
 /// reproduces [STEP_COST] over the step's actual rows when the value is absent. (A malformed

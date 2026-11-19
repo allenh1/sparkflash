@@ -43,6 +43,7 @@ pub mod resume;
 pub mod rounds;
 pub mod runtime;
 pub mod share;
+pub mod tick;
 pub mod walk;
 
 pub use chunk::{CHUNK_SIZES, ChunkPolicy, quantise};

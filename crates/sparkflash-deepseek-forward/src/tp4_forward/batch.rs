@@ -68,6 +68,12 @@ use sparkflash_engine::forward::engram::HASH_SENTINEL;
 use sparkflash_kernels::cuda_driver::HostMapped;
 use sparkflash_model::speculation::DepthPolicy;
 use sparkflash_model::vision::ImageSpan;
+use sparkflash_runtime::tick::{
+    ADOPT_MIN, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, QUEUE,
+    SHARE_MIN_ROWS, TickRows, bulk_budget, bulk_from, bulk_rows, common_prefix, decode_plan,
+    decoder_resume, hold_prefill, pick_lane, prefill_order, reusable_shared, runs_decoder,
+    skip_end_after, tick_rows, whole_chunk_fits,
+};
 use sparkflash_vision::IMAGE_TOKEN_ID;
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,11 +81,6 @@ use std::time::Instant;
 /// A tick's call to rank 0's link with the next tick's room and hold, made once the decode
 /// step's device work is queued ([`crate::device_link::DeviceLink::ahead`]).
 pub(super) type Ahead<'a> = &'a mut dyn FnMut(usize, bool) -> Result<(), String>;
-
-/// Sequences that may wait for a lane, past the lanes themselves.
-const QUEUE: usize = 64;
-/// The fewest positions a sequence takes from another lane ([`Batch::adopt`]).
-const ADOPT_MIN: usize = 64;
 
 /// A bulk prefill chunk's rows while another sequence decodes (SPARKFLASH_PREFILL_CHUNK_BUSY).
 /// Every chunk reads every expert's weights (about a quarter second), so a smaller one stalls the
@@ -117,35 +118,6 @@ pub(super) const DECODER_WARM: usize = (sparkflash_kernels::flash_mla_csa2_seq_l
     * (sparkflash_kv::layout::SWA_LAYERS - ENCODER_LAYERS)
     + sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW;
 
-/// The fewest shared rows a match on a lane holding a long prefix must have to be reused
-/// (SPARKFLASH_PREFIX_REUSE_MIN_ROWS): below it the lane is kept for a turn that shares more of
-/// it, unless no lane holds less. `0` reuses every match.
-pub(super) const PREFIX_REUSE_MIN_ROWS: usize = 256;
-
-/// Whether prompt rows p..p+n of a prefill to `target` run the decoder layers: the chunks that
-/// reach into its last [`DECODER_WARM`] rows.
-fn runs_decoder(p: usize, n: usize, target: usize) -> bool {
-    p + n + DECODER_WARM > target
-}
-
-/// A lane's [`Lane::skip_end`] once rows p..p+n ran the decoder layers (`decoder`) or skipped
-/// them. A decoder row below the old end starts a run of its own.
-fn skip_end_after(skip_end: usize, p: usize, n: usize, decoder: bool) -> usize {
-    if decoder { skip_end.min(p) } else { p + n }
-}
-
-/// Where a prefill to `target` resumes a lane whose prefix it shares up to `start`, given the
-/// lane's [`Lane::skip_end`]. It resumes at `start` when the lane's decoder windows there are the
-/// full run's, or when its own decoder rows begin [`DECODER_WARM`] rows before the end anyway.
-/// Otherwise it resumes that many rows before the end.
-fn decoder_resume(skip_end: usize, start: usize, target: usize) -> usize {
-    if skip_end == 0 || start >= skip_end + DECODER_WARM || target - start >= DECODER_WARM {
-        start
-    } else {
-        target.saturating_sub(DECODER_WARM)
-    }
-}
-
 /// The least calibrated chain probability a draft needs for a verify row of a shared speculative
 /// step (SPARKFLASH_BATCH_SPEC_FLOOR); SPARKFLASH_BATCH_SPEC=0 gives several sequences the plain
 /// step instead.
@@ -157,47 +129,14 @@ fn batch_spec_floor() -> Option<f64> {
     Some(profile.speculation.batch_spec_floor.unwrap_or(0.2))
 }
 
-/// A prefill with at most this many rows left never waits for the decoders (an agent's turn after
-/// its cached prefix): [`DecodeShare`] spaces out the chunks of long prompts only.
-const SHARE_MIN_ROWS: usize = 16384;
-
-/// The decoders' share of the device's time while long prompts prefill. A chunk stalls every
-/// decoding sequence for its whole length (a second or more), so one decode step a chunk leaves
-/// them at ~2 tokens/s for the minutes a cold 200K prompt takes. They get up to `most` of the time
-/// (SPARKFLASH_DECODE_SHARE, default 0.5; 0 runs a chunk every tick), but no more than lets every
-/// prompt still prefilling reach its first token `deadline_ms` after its admission
-/// (SPARKFLASH_PREFILL_DEADLINE_MS, default 200 s: an agent client gives a request up after 300 s
-/// without a token), at the last chunk's cost per row.
-#[derive(Clone, Copy, Debug)]
-struct DecodeShare {
-    most: f64,
-    deadline_ms: f64,
-}
-
-impl DecodeShare {
-    fn from_env() -> Self {
-        let profile = sparkflash_model::active_profile();
-        Self {
-            most: profile.prefill.decode_share.unwrap_or(0.5).clamp(0.0, 0.9),
-            deadline_ms: profile.prefill.deadline_ms.unwrap_or(200_000.0),
-        }
-    }
-
-    /// The share of time the decoders may take: `prefills` are the prompts still prefilling in the
-    /// order they run, each as (rows left, ms since admission), at `row_ms` a row.
-    fn allowed(&self, prefills: &[(usize, f64)], row_ms: f64) -> f64 {
-        let mut need = 0.0;
-        let mut share = self.most;
-        for &(left, age_ms) in prefills {
-            need += left as f64 * row_ms;
-            let budget = self.deadline_ms - age_ms;
-            if budget <= need {
-                return 0.0;
-            }
-            share = share.min(1.0 - need / budget);
-        }
-        share
-    }
+/// The decoders' share of the device's time while long prompts prefill
+/// ([sparkflash_runtime::tick::DecodeShare]).
+fn decode_share_from_env() -> DecodeShare {
+    let profile = sparkflash_model::active_profile();
+    DecodeShare::new(
+        profile.prefill.decode_share.unwrap_or(0.5),
+        profile.prefill.deadline_ms.unwrap_or(200_000.0),
+    )
 }
 
 /// The modelled wall of a shared speculative step over several sequences that verify drafted rows
@@ -513,7 +452,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             busy_chunk: busy_chunk(),
             busy_exact_steps: busy_exact_steps(),
             spec_floor: batch_spec_floor(),
-            share: DecodeShare::from_env(),
+            share: decode_share_from_env(),
             chunk_ms: 0.0,
             row_ms: 0.0,
             since_chunk_ms: 0.0,
@@ -813,19 +752,17 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     /// fewest rows left first (ties to the oldest), so a turn that reuses a cached prefix does not
     /// wait behind a long cold prompt.
     fn prefill_order(&self) -> Vec<(usize, usize)> {
-        let mut order: Vec<(usize, usize)> = self
-            .seqs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, seq)| match seq.phase {
-                Phase::Prefill { target, .. } if !seq.done => {
-                    Some((target.saturating_sub(seq.pos), index))
-                }
-                _ => None,
-            })
-            .collect();
-        order.sort_unstable();
-        order
+        prefill_order(
+            self.seqs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, seq)| match seq.phase {
+                    Phase::Prefill { target, .. } if !seq.done => {
+                        Some((target.saturating_sub(seq.pos), index))
+                    }
+                    _ => None,
+                }),
+        )
     }
 
     /// This rank's answer for the next tick's [`DeviceTick::hold_prefill`] (rank 0's is the one
@@ -851,25 +788,15 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     /// last long chunk.
     fn hold_since(&self, since_ms: f64) -> bool {
         let order = self.prefill_order();
-        if self.row_ms == 0.0
-            || order
-                .first()
-                .is_none_or(|&(left, _)| left <= SHARE_MIN_ROWS)
-            || !self.decoding()
-        {
-            return false;
-        }
-        let prefills: Vec<(usize, f64)> = order
-            .iter()
-            .map(|&(left, index)| {
-                (
-                    left,
-                    self.seqs[index].admitted.elapsed().as_secs_f64() * 1e3,
-                )
-            })
-            .collect();
-        let share = self.share.allowed(&prefills, self.row_ms);
-        share > 0.0 && since_ms < self.chunk_ms * share / (1.0 - share)
+        hold_prefill(
+            &self.share,
+            &order,
+            |index| self.seqs[index].admitted.elapsed().as_secs_f64() * 1e3,
+            self.decoding(),
+            self.row_ms,
+            self.chunk_ms,
+            since_ms,
+        )
     }
 
     /// Hands rank 0's link the next tick's room and hold under this step's device work, so the
@@ -1225,36 +1152,32 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             let wanted = &self.seqs[index].tokens[..target];
             let images = &self.seqs[index].images;
             let free = (0..self.lanes.len()).filter(|&lane| self.lanes[lane].seq.is_none());
-            let Some((lane, shared)) = free
-                .map(|lane| {
-                    let held = &self.lanes[lane];
-                    let raw_shared = if self.reuse {
-                        common_prefix(&held.resident, &held.spans, wanted, images)
-                    } else {
-                        0
-                    };
-                    // A short match against a lane holding a long prefix keeps the prefix: that
-                    // lane is passed over (the least recently used empty lane takes the sequence)
-                    // so the next turn that does share the prefix still finds it. A match of
-                    // [`PREFIX_REUSE_MIN_ROWS`] rows or more is always used, and so is any match
-                    // on a lane holding fewer. SPARKFLASH_PREFIX_REUSE_MIN_ROWS moves the floor
-                    // (`0` reuses every match).
-                    let effective_shared = reusable_shared(
+            // The longest shared prefix, else the least recently used lane. A short match against
+            // a lane holding a long prefix keeps the prefix: that lane is passed over (the least
+            // recently used empty lane takes the sequence) so the next turn that does share the
+            // prefix still finds it. A match of [`PREFIX_REUSE_MIN_ROWS`] rows or more is always
+            // used, and so is any match on a lane holding fewer.
+            // SPARKFLASH_PREFIX_REUSE_MIN_ROWS moves the floor (`0` reuses every match).
+            let Some(picked) = pick_lane(free.map(|lane| {
+                let held = &self.lanes[lane];
+                let raw_shared = if self.reuse {
+                    common_prefix(&held.resident, &held.spans, wanted, images)
+                } else {
+                    0
+                };
+                LaneCandidate {
+                    lane,
+                    shared: reusable_shared(
                         raw_shared,
                         held.resident.len(),
                         self.prefix_reuse_min_rows,
-                    );
-                    (lane, effective_shared)
-                })
-                .max_by(|a, b| {
-                    // The longest shared prefix, else the least recently used lane.
-                    a.1.cmp(&b.1)
-                        .then_with(|| self.lanes[b.0].used.cmp(&self.lanes[a.0].used))
-                        .then_with(|| b.0.cmp(&a.0))
-                })
-            else {
+                    ),
+                    used: held.used,
+                }
+            })) else {
                 return Ok(());
             };
+            let (lane, shared) = (picked.lane, picked.shared);
             // At least the prompt's last row runs, for the first token's logits.
             let cap = if self.seqs[index].emitted() == 0 {
                 target - 1
@@ -1267,6 +1190,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                     self.lanes[lane].skip_end,
                     start,
                     target,
+                    DECODER_WARM,
                 ));
             }
             // A lane whose window rings slid past the resume point cannot resume there (the rows
@@ -1322,17 +1246,21 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
 
     /// Whether a prefill from `start` to `target` takes the bulk chunks.
     fn bulk_from(&self, target: usize, start: usize) -> bool {
-        self.inputs.bulk.is_some()
-            && self.exchange.is_some()
-            && !self.exact_prefill
-            && target - start >= bulk_min()
+        bulk_from(
+            target,
+            start,
+            self.inputs.bulk.is_some(),
+            self.exchange.is_some(),
+            self.exact_prefill,
+            bulk_min(),
+        )
     }
 
     /// The layers prompt rows p..p+n of a prefill to `target` on `lane` (entered) run: all of them,
     /// or the encoder's when the rows end before the last [`DECODER_WARM`]. Notes the choice on the
     /// lane; rows that skip the decoder layers still count as appended to their caches.
     fn prefill_layers(&mut self, lane: usize, p: usize, n: usize, target: usize) -> usize {
-        let decoder = !self.decoder_skip || runs_decoder(p, n, target);
+        let decoder = !self.decoder_skip || runs_decoder(p, n, target, DECODER_WARM);
         let skip_end = &mut self.lanes[lane].skip_end;
         *skip_end = skip_end_after(*skip_end, p, n, decoder);
         if decoder {
@@ -1393,9 +1321,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let mut start = self.device.resume_boundary(shared.min(cap));
         let skip_end = self.lanes[src].skip_end;
         if self.decoder_skip {
-            start = self
-                .device
-                .resume_boundary(decoder_resume(skip_end, start, target));
+            start =
+                self.device
+                    .resume_boundary(decoder_resume(skip_end, start, target, DECODER_WARM));
         }
         if start < seq.pos + ADOPT_MIN {
             return Ok(());
@@ -1422,21 +1350,28 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     /// its lane is backed that far ahead. A busy chunk may take a tail too short for a chunk of
     /// its own ([`bulk_rows`]).
     fn tick_rows(&self, bulk: bool, decoding: bool) -> usize {
-        match self.inputs.bulk {
-            Some(state) if bulk && decoding => (self.busy_chunk + bulk_min()).min(state.cap),
-            Some(state) if bulk => state.cap,
-            _ if decoding => self.busy_exact_steps * R_MAX,
-            _ => EXACT_TICK_ROWS,
+        tick_rows(&self.tick_rows_config(), self.bulk_cap(), bulk, decoding)
+    }
+
+    /// The row caps [tick_rows] and [bulk_budget] read.
+    fn tick_rows_config(&self) -> TickRows {
+        TickRows {
+            busy_chunk: self.busy_chunk,
+            busy_exact_steps: self.busy_exact_steps,
+            exact_tick_rows: EXACT_TICK_ROWS,
+            rows_max: R_MAX,
+            chunk_min: bulk_min(),
         }
+    }
+
+    /// The bulk rows state's capacity, when the run has one.
+    fn bulk_cap(&self) -> Option<usize> {
+        self.inputs.bulk.map(|state| state.cap)
     }
 
     /// The bulk chunk a tick runs and the most it may stretch to ([`bulk_rows`]).
     fn bulk_budget(&self, decoding: bool) -> (usize, usize) {
-        let most = self.tick_rows(true, decoding);
-        match self.inputs.bulk {
-            Some(state) if decoding => (self.busy_chunk.min(state.cap), most),
-            _ => (most, most),
-        }
+        bulk_budget(&self.tick_rows_config(), self.bulk_cap(), decoding)
     }
 
     /// Backs lane `lane` for `rows` positions, taking memory back from free lanes (least recently
@@ -1737,7 +1672,13 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         };
         let split = self.decoder_skip.then_some(DECODER_WARM);
         let chunk = move |p: usize, slot: usize| {
-            bulk_rows(target - p, budget, most, split.filter(|_| slot + 1 < ways))
+            bulk_rows(
+                target - p,
+                budget,
+                most,
+                split.filter(|_| slot + 1 < ways),
+                R_MAX,
+            )
         };
         let pending = match self.prefill_next.take() {
             Some(next) if next.seq == id && next.p == p => Some(next),
@@ -2021,13 +1962,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             return None;
         };
         let left = target - seq.pos;
-        let most = if self.decoder_skip {
-            budget.min(DECODER_WARM + R_MAX)
-        } else {
-            budget
-        };
-        (!seq.done && seq.images.is_empty() && left > R_MAX && left <= most)
-            .then_some((left, lane, target))
+        (!seq.done
+            && seq.images.is_empty()
+            && whole_chunk_fits(left, budget, self.decoder_skip, DECODER_WARM, R_MAX))
+        .then_some((left, lane, target))
     }
 
     /// The rests of sequences `picked` ([`Self::together`]) as one bulk tick: each one's rest a
@@ -2201,29 +2139,23 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let constrained = decoding
             .iter()
             .any(|&index| self.seqs[index].constraint.is_some());
-        match decoding.as_slice() {
-            [] => Ok(0),
-            [index] => self.spec_step(*index, out, ahead),
-            many if constrained => {
+        match decode_plan(
+            decoding.len(),
+            constrained,
+            self.spec_floor,
+            self.exchange.is_some(),
+            R_MAX,
+        ) {
+            DecodePlan::None => Ok(0),
+            DecodePlan::Spec => self.spec_step(decoding[0], out, ahead),
+            DecodePlan::Plain { .. } => {
                 let mut rows = 0;
-                for group in many.chunks(R_MAX) {
+                for group in decoding.chunks(R_MAX) {
                     rows += self.plain_step(group, out, &mut *ahead)?;
                 }
                 Ok(rows)
             }
-            many if self.spec_floor.is_some()
-                && self.exchange.is_some()
-                && 2 * many.len() <= R_MAX =>
-            {
-                self.spec_multi_step(many, out, ahead)
-            }
-            many => {
-                let mut rows = 0;
-                for group in many.chunks(R_MAX) {
-                    rows += self.plain_step(group, out, &mut *ahead)?;
-                }
-                Ok(rows)
-            }
+            DecodePlan::Shared => self.spec_multi_step(&decoding, out, ahead),
         }
     }
 
@@ -2797,55 +2729,6 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     }
 }
 
-/// The rows of the next bulk chunk with `left` rows of the prompt to go: `budget`, or all of them
-/// when they fit `most`, so no short tail takes a chunk (and a read of every expert's weights) of
-/// its own. With `split` (the decoder's [`DECODER_WARM`] rows, when the tick runs another chunk
-/// after this one), the rows before the prompt's last `split` take this chunk once they fit it, so
-/// they stop after the encoder layers and only the last `split` rows, in the chunk beside them,
-/// run the decoder's.
-fn bulk_rows(left: usize, budget: usize, most: usize, split: Option<usize>) -> usize {
-    let early = split.map_or(0, |warm| left.saturating_sub(warm));
-    if early > R_MAX && early <= budget {
-        early
-    } else if left <= most {
-        left
-    } else {
-        budget
-    }
-}
-
-/// The shared rows [`Batch::place`] credits a lane with: a match below `min_rows` against a
-/// lane holding at least that many rows is worth more kept for a longer turn, so it counts as no
-/// match. `0` credits every match (the pre-`!197` behaviour).
-fn reusable_shared(raw_shared: usize, resident_len: usize, min_rows: usize) -> usize {
-    if raw_shared < min_rows && resident_len >= min_rows {
-        0
-    } else {
-        raw_shared
-    }
-}
-
-/// How many leading positions of `wanted` a lane holding `held` (its image spans `spans`) holds
-/// alike: the common prefix, cut at the first of the prompt's `images` the lane does not hold alike
-/// (equal span tokens are not equal images).
-fn common_prefix(
-    held: &[u32],
-    spans: &[ImageSpan],
-    wanted: &[u32],
-    images: &[VisionImage],
-) -> usize {
-    let shared = held
-        .iter()
-        .zip(wanted)
-        .take_while(|(held, want)| held == want)
-        .count();
-    images
-        .iter()
-        .map(|image| image.span)
-        .find(|span| span.start < shared && !spans.contains(span))
-        .map_or(shared, |span| span.start)
-}
-
 /// A bulk chunk's reads in flight and the pinned buffer they land in.
 fn chunk_reads<'c, 'r, 's>(
     current: Option<&'c PrefillReads<'r>>,
@@ -2965,10 +2848,7 @@ mod tests {
 
     #[test]
     fn the_decoders_get_what_the_prefill_deadlines_leave() {
-        let share = DecodeShare {
-            most: 0.5,
-            deadline_ms: 200_000.0,
-        };
+        let share = DecodeShare::new(0.5, 200_000.0);
         let allowed = |prefills: &[(usize, f64)], row_ms| share.allowed(prefills, row_ms);
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
         // 100K rows at 0.75 ms need 75 s of the 200 s: capped at half.
@@ -2991,10 +2871,10 @@ mod tests {
 
     #[test]
     fn a_short_tail_rides_with_the_chunk_before_it() {
-        assert_eq!(bulk_rows(540, 512, 768, None), 540);
-        assert_eq!(bulk_rows(769, 512, 768, None), 512);
-        assert_eq!(bulk_rows(5000, 4096, 4096, None), 4096);
-        assert_eq!(bulk_rows(100, 4096, 4096, None), 100);
+        assert_eq!(bulk_rows(540, 512, 768, None, R_MAX), 540);
+        assert_eq!(bulk_rows(769, 512, 768, None, R_MAX), 512);
+        assert_eq!(bulk_rows(5000, 4096, 4096, None, R_MAX), 4096);
+        assert_eq!(bulk_rows(100, 4096, 4096, None, R_MAX), 100);
     }
 
     #[test]
@@ -3009,7 +2889,7 @@ mod tests {
                 if left == 0 {
                     break;
                 }
-                let n = bulk_rows(left, 4096, 4096, split.filter(|_| slot < 2));
+                let n = bulk_rows(left, 4096, 4096, split.filter(|_| slot < 2), R_MAX);
                 chunks.push(n);
                 left -= n;
             }
@@ -3034,7 +2914,7 @@ mod tests {
         // A 32K prompt in 4096-row chunks: the last chunk runs them.
         let target = 8 * 4096;
         let decoder: Vec<bool> = (0..8)
-            .map(|chunk| runs_decoder(chunk * 4096, 4096, target))
+            .map(|chunk| runs_decoder(chunk * 4096, 4096, target, DECODER_WARM))
             .collect();
         assert_eq!(
             decoder,
@@ -3042,13 +2922,13 @@ mod tests {
         );
         // A short last chunk: the chunk before it reaches into the last rows too.
         let target = 8 * 4096 + 100;
-        assert!(runs_decoder(7 * 4096, 4096, target));
-        assert!(!runs_decoder(6 * 4096, 4096, target));
+        assert!(runs_decoder(7 * 4096, 4096, target, DECODER_WARM));
+        assert!(!runs_decoder(6 * 4096, 4096, target, DECODER_WARM));
         // Rows that end DECODER_WARM rows before the end skip them; one more row does not.
-        assert!(!runs_decoder(0, 1000, 1000 + DECODER_WARM));
-        assert!(runs_decoder(0, 1001, 1000 + DECODER_WARM));
+        assert!(!runs_decoder(0, 1000, 1000 + DECODER_WARM, DECODER_WARM));
+        assert!(runs_decoder(0, 1001, 1000 + DECODER_WARM, DECODER_WARM));
         // A prompt shorter than that runs every layer.
-        assert!(runs_decoder(0, 64, DECODER_WARM));
+        assert!(runs_decoder(0, 64, DECODER_WARM, DECODER_WARM));
     }
 
     #[test]
@@ -3071,18 +2951,24 @@ mod tests {
     fn a_resume_reads_only_the_full_run_s_windows() {
         let warm = DECODER_WARM;
         // A lane that never skipped resumes anywhere.
-        assert_eq!(decoder_resume(0, 100, 200), 100);
+        assert_eq!(decoder_resume(0, 100, 200, DECODER_WARM), 100);
         // An agent's next turn: its last prompt's last rows and the decoded tokens ran every
         // layer, so the lane resumes where it stopped.
         let skip_end = 30_000;
         let end = skip_end + warm + 500;
-        assert_eq!(decoder_resume(skip_end, end, end + 300), end);
+        assert_eq!(decoder_resume(skip_end, end, end + 300, warm), end);
         // A long new part runs decoder rows of its own from far enough back.
-        assert_eq!(decoder_resume(skip_end, 10_000, 10_000 + warm), 10_000);
+        assert_eq!(
+            decoder_resume(skip_end, 10_000, 10_000 + warm, warm),
+            10_000
+        );
         // A short new part after skipped rows backs up DECODER_WARM rows from the end, or to the
         // start.
-        assert_eq!(decoder_resume(skip_end, 20_000, 20_500), 20_500 - warm);
-        assert_eq!(decoder_resume(skip_end, 1000, 2000), 0);
+        assert_eq!(
+            decoder_resume(skip_end, 20_000, 20_500, warm),
+            20_500 - warm
+        );
+        assert_eq!(decoder_resume(skip_end, 1000, 2000, warm), 0);
     }
 
     #[test]
