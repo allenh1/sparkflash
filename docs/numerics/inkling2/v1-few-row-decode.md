@@ -16,12 +16,12 @@ limitations under the License.
 
 # Inkling-2-Small, numerics version 1: the decode rows on the tile bodies
 
-**Registry state: version 1, uncaptured.** The registry entry names the world-4 sm_121a
-configuration and leaves `reference` and `fingerprint` out: no checkpoint has been captured for
-this arm, so there is no earlier reference to move and no fingerprint to invent. Version 1 is the
-configuration's first reference, and it is the arithmetic this change lands, which is why the
-registry entry keeps version 1 and gains this report instead of a bump. The first capture is
-`scripts/numerics.py capture` on the served world-4 configuration, and it is phase 5's.
+**Registry state: version 1, captured on 2026-11-19.** The entry names the world-4 sm_121a
+configuration and now points at `numerics/references/inkling2-tp4-sm121a.json`,
+`387647bcc3268572…`. It is the configuration's first reference, so there is no earlier reference
+to move and no bump: version 1 is the arithmetic this change lands, and the first capture pins
+it. Two captures on the served group are bit-identical and the served gate's lanes check passed;
+the numbers are below.
 
 This is the first declared change to Inkling's arithmetic: its decode rows move from the row
 GEMV/matvec bodies to the prompt tile's bodies.
@@ -81,12 +81,34 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 Both compare bits. Neither is a speed measurement, and neither runs the released checkpoint.
 
-## What could not be measured
+## Measured on the cluster, 2026-11-19
 
-- **The served delta.** No cluster window and no released Inkling checkpoint were available, so
-  the change was not captured against a reference: the mean NLL delta, top-1 agreement and greedy
-  text flips of this arithmetic against the row-GEMV decode are **unmeasured**. The registry's
-  entry stays uncaptured until the world-4 group takes its first reference.
+Served at world 4 on the four DGX Sparks from the branch built at `f1f86bf4` (release,
+`5a092d5a`), Inkling-2-Small over 1,048,576 tokens, launched by `scripts/inkling-serve-group.sh`
+with `BIN` pointing at that binary and `LANES=4`. The group answered `/readyz` in 22 s. The
+server reported its identity as `world=4 profile=reference plan=tp arch=sm_121a`, status
+`unregistered` before the capture, registered at version 1.
+
+Two captures are bit-identical, so the served configuration is deterministic:
+
+```text
+387647bcc3268572b2c4023978692fad7b150bcf63a0cfc12c7d5dfaaab23f16  inkling2-tp4-v1-a.json
+387647bcc3268572b2c4023978692fad7b150bcf63a0cfc12c7d5dfaaab23f16  inkling2-tp4-v1-b.json
+```
+
+The served gate's lanes check passed on the same boot: four prompts together equal each alone,
+twice, in 58 s.
+
+There is **no delta** to report, and that is the honest shape of a first reference: the entry
+had no reference to move from, so version 1 does not declare a change, it pins the arithmetic.
+The measurement of this change against the row-GEMV decode would need a capture on a build that
+still runs those bodies, which no longer exists on this branch.
+
+## What is still not measured
+
+- **The change against the row-GEMV arithmetic.** The bodies are the tiles' rows bit for bit
+  (the device tests above), but how far the served logits move from the row GEMV's was never
+  captured, and this first reference cannot supply it.
 - **The speed A/B.** Whether the one-row step is flat or slower and whether the several-row step
   is faster are both **unmeasured**. The plan expects flat-to-slightly-slower at one row and
   faster at several, as on DeepSeek and Qwen; that expectation is not evidence. The MXFP8 rows
@@ -96,21 +118,22 @@ Both compare bits. Neither is a speed measurement, and neither runs the released
 - **The released layers' MXFP8 scale codes.** The MXFP8 test is generated operands; the released
   checkpoint's per-32 ue8m0 codes have not been read on a device here.
 
-To measure the served configuration, on the cluster with Inkling served at world 4:
+The reference is checked by recapturing it on a freshly booted group:
 
 ```bash
-# The first reference, then the bit check against it.
-python3 scripts/numerics.py capture --url http://127.0.0.1:8001 --out numerics/references/inkling2-tp4-sm121a.json
-python3 scripts/numerics.py check --url http://127.0.0.1:8001 --reference numerics/references/inkling2-tp4-sm121a.json
+python3 scripts/numerics.py check --url http://127.0.0.1:8000 \
+    --reference numerics/references/inkling2-tp4-sm121a.json
 ```
 
-The declaration check (`python3 scripts/numerics.py ci`) reports the missing prerequisites
-(`anchor`, `coverage`, `monitors`) for every configuration until that work lands; this entry has
-no reference to compare, which is its registered state.
+The declaration check (`python3 scripts/numerics.py ci`) still reports the missing prerequisites
+(`anchor`, `coverage`, `monitors`) for every configuration until that work lands, but this entry
+is no longer one of its uncaptured ones: it has a reference and a fingerprint.
 
 ## Reading
 
-The property this change establishes is the one the device tests measure: the head's row and the
-NVFP4 experts' rows are the prompt tiles' rows, and the MXFP8 rows are the tile itself. What it
-does not establish, until the cluster capture, is how far the served logits move and whether the
-step got faster. There is no Inkling reference yet; this is the arithmetic the first one measures.
+The device tests establish that the head's row and the NVFP4 experts' rows are the prompt tiles'
+rows, and that the MXFP8 rows are the tile itself. The cluster capture establishes the rest of
+what a first reference can: on the released checkpoint the group serves deterministically, four
+lanes together compute what each alone computes, and the bits are pinned by a fingerprint the
+declaration check can hold. Whether the step got faster, and how far these rows sit from the row
+GEMV's logits, remain open and are named above.

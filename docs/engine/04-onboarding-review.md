@@ -458,6 +458,20 @@ Two operational facts the plan's gate should carry:
 Both windows' reports and artifacts are under `/home/allenh1/cluster-tests/2026111*` on the head
 node. The cluster was over its window for 4 m 07 s, 5 m 23 s and 4 m 30 s respectively, and was
 verified serving the production model card, build and four ranks after each.
+### Inkling's first reference
+
+The fourth window pinned Inkling-2-Small's version 1 instead of moving it. The arm was launched
+by its site's own `scripts/inkling-serve-group.sh` with `BIN` at the branch tip (`5a092d5a`),
+`LANES=4`, over 1,048,576 tokens; the group answered `/readyz` in 22 s and reported
+`world=4 profile=reference plan=tp arch=sm_121a`, which is the configuration the registry had
+registered but left uncaptured. Two captures are bit-identical (`387647bc…`), so the served
+arithmetic is deterministic, and `served-gate.py lanes` passed twice on the same boot.
+
+Because there was no earlier reference, the capture declares no change: it fills the entry at
+version 1 and pins the arithmetic the decode change lands. The report says exactly that, and keeps
+the two things it cannot show - the distance from the row-GEMV decode and the speed - in an
+explicit list rather than implying them. `numerics.py ci` now reports Dory as the only uncaptured
+configuration.
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:

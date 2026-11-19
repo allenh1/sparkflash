@@ -126,12 +126,13 @@ report = "docs/numerics/glm53/v2-fp8-token-body.md"
 captured = "2026-11-03"
 note = "Version 1's reference, captured before decode moved to the tile's few-row body. The 1..=8-row FP8 token body is wired (glm_decode_fp8b128_rows) and its served delta is now measured at world 4: numerics/captures/glm53/e4m3-token-body-v2.json and its forced capture, +1.373e-01 mean NLL with 93.38% top-1 agreement against this reference, deterministic over two runs (docs/numerics/glm53/v2-fp8-token-body.md). The bump to version 2 still waits on the anchor, coverage and monitors prerequisites; until then this entry keeps version 1 and its reference."
 
-# Inkling-2-Small and Dory1.0-4B are registered before their first capture: both entries name the
-# configuration, version and evidence, and leave `reference` and `fingerprint` out. That is the
+# Inkling-2-Small and Dory1.0-4B were registered before their first capture: both entries named
+# the configuration, version and evidence and left `reference` and `fingerprint` out. That is the
 # registry's uncaptured state (docs/NUMERICS.md §5): the binary reports them unregistered and
 # `scripts/numerics.py check` says no reference has been captured, rather than comparing against
 # one. Phase 5 of docs/engine/04-onboarding.md takes their first reference after tensor-core
-# decode, so each entry is registered at the arithmetic it will be measured on.
+# decode, so each entry was registered at the arithmetic it will be measured on. Inkling's was
+# taken on 2026-11-19; Dory's is still owed and its entry is the registry's only uncaptured one.
 [[config]]
 model = "thinkingmachines/Inkling-2-Small"
 world = 4
@@ -140,9 +141,11 @@ plan = "tp"
 arch = "sm_121a"
 version = 1
 evidence = "logprobs"
-captured = "2026-11-18"
+reference = "references/inkling2-tp4-sm121a.json"
+fingerprint = "387647bcc3268572b2c4023978692fad7b150bcf63a0cfc12c7d5dfaaab23f16"
+captured = "2026-11-19"
 report = "docs/numerics/inkling2/v1-few-row-decode.md"
-note = "Registered, not yet captured; the four-rank device group's first reference is phase 5's. Its decode head and its one-to-eight-row experts now run the prompt tiles' bodies (q4p_dense_rows; q4p_moe_rows_gate_up_capped/_down, and the MXFP8 tile), which v1-few-row-decode.md declares. Version 1 is the first reference and is that arithmetic; no reference or fingerprint is invented until the capture."
+note = "The four-rank group's first reference, captured on the branch at 5a092d5a with the arm launched by scripts/inkling-serve-group.sh: two runs bit-identical and the served gate's lanes check PASS. It pins the arithmetic the decode change lands (head and one-to-eight-row experts on the prompt tiles' bodies: q4p_dense_rows; q4p_moe_rows_gate_up_capped/_down, and the MXFP8 tile), so version 1 is the change itself and not a bump. Its speed and its distance from the row-GEMV decode are unmeasured (docs/numerics/inkling2/v1-few-row-decode.md)."
 
 [[config]]
 model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
