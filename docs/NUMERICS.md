@@ -93,7 +93,9 @@ monitors flag) and the rarity of these changes are the mitigations.
   position's score instead of derailing the rest of the text, and both arms are deterministic,
   so the result is too.
 - **Per-layer and per-expert error monitors.** Relative error against the reference at every
-  layer and expert, so a bug in one expert shows as a spike when the end-to-end KL looks fine.
+  layer and every shared routed expert, so a bug in one expert shows as a spike when the
+  end-to-end KL looks fine; a row that reached a different expert is reported beside the error,
+  because the router's choice is itself a measured fact.
 - **Coverage inputs.** Prompts that reach at least the registry's `coverage_slots` of the
   routed (layer, expert) slots, chunk boundaries, 32k+ contexts, several batch shapes and
   speculation depths. The suite is grown and measured by `coverage-sweep` (§5): the generator
@@ -242,8 +244,8 @@ flags but nothing else:
 | :-- | :-- |
 | `anchor`: the frozen anchor and the teacher-forced comparison | per model. Qwen3.8, GLM-5.3 and Dory1.0 have a `[[anchor]]` and a committed capture teacher-forced from it; Inkling-2 does not, so its configuration cannot bump until it is anchored; DeepSeek is exempt (its device path serves no logprobs, so a text reference has no token ids and cannot teacher-force), and a text-evidence change is refused rather than excused. The aggregate flag is **false** because not every `logprobs` model is anchored; `scripts/numerics.py ci` prints the covered, exempt and uncovered models, and refuses a true flag whose coverage is incomplete. The flag reports coverage; it does not gate a model that has its own anchor. |
 | `declaration_check`: the CI check above | **done** |
-| `coverage`: inputs that reach at least `coverage_slots` of the routed (layer, expert) slots, with hit counts | **implemented**, no dump committed: the bar is declared at **0.93**, `coverage` judges one against it, `coverage-gaps` reports what a partial one misses, and `coverage-sweep` measures a corpus and selects the next suite; the flag stays false until a real dump is committed and named |
-| `monitors`: per-layer and per-expert relative error against the reference | **implemented**, no dump committed: the `monitors` command below compares two, and the flag stays false until a real pair is in the repository |
+| `coverage`: inputs that reach at least `coverage_slots` of the routed (layer, expert) slots, with hit counts | **done**: Qwen3.8 world 1's swept dump reaches **24,494 of 24,576** slots (99.67%) over 416 inputs, and `ci` judges it at the declared **0.93**; `coverage-gaps` reports what a partial dump misses and `coverage-sweep` grows the suite |
+| `monitors`: per-layer and per-shared-expert relative error against the reference, with any routing divergence reported | **implemented and measured**, the flag is **false**: the committed GLM-5.3 pair is judged at layer bar **0.5** and expert bar **0.5**, and passes with maxima **3.158e-01** per layer and **3.511e-01** per shared expert. 7 of 42 layers routed one row to a different expert, leaving 14 experts unshared (7 reference-only, 7 candidate-only) and 329 shared. The flag is flipped only by a reviewed edit; `ci` then judges the pair named in `monitors_pair` |
 
 `[prerequisites]` also states the coverage bar, `coverage_slots`, and — when the flag is true —
 `coverage_dump`. `coverage_slots` is the fraction of (layer, routed-expert) slots a committed dump
@@ -254,6 +256,21 @@ made the prerequisite unattainable. `coverage = true` is a claim that the dump n
 `scripts/numerics.py ci` judges exactly that dump and fails a true flag whose dump is missing,
 belongs to another model, or is below the bar. Turning it on is a reviewed edit adding both the
 pointer and the dump in the same change; a false flag names no dump and makes no claim.
+
+`[prerequisites]` also states the monitor pair:
+
+```toml
+monitors_pair = { reference = "numerics/monitors/glm53-tp4-v1-reference.json", candidate = "numerics/monitors/glm53-tp4-v2-candidate.json", layer_bar = 0.5, expert_bar = 0.5 }
+```
+
+The two paths must be JSON dumps under `numerics/monitors/`, and the bars finite and positive; a
+missing key, an unknown
+key, a path elsewhere or a bar outside those rules is refused when the registry is parsed. The
+table may be present while `monitors` is false — it is the pointer a reviewed flip uses — but a
+true flag without it is refused at parse. `monitors = true` is a claim that both dumps are
+committed, parse, name the same model and probe, share their sampled indices and layer set, and
+meet the declared layer and expert bars over the experts both routed to; `scripts/numerics.py ci`
+judges exactly that and fails a true flag whose pair is missing, mismatched or over a bar.
 
 An `approved` record accepts that one bump when its `decision` is a non-empty one line, its
 `date` is the day the decision was taken, and its `report` exists and is new or changed in the same
@@ -410,18 +427,37 @@ versioned as `sparkflash-numerics-monitors/1`:
 ```
 
 ```bash
-python3 scripts/numerics.py monitors --reference numerics/monitors/glm53-tp4-reference.json \
-    --candidate numerics/monitors/glm53-tp4-candidate.json --layer-bar 2e-3 --expert-bar 5e-3
+python3 scripts/numerics.py monitors \
+    --reference numerics/monitors/glm53-tp4-v1-reference.json \
+    --candidate numerics/monitors/glm53-tp4-v2-candidate.json \
+    --layer-bar 0.5 --expert-bar 0.5
 ```
 
 The error is `||candidate - reference|| / ||reference||` on the sampled values. The command refuses
-two dumps that name different models, probes or sampled indices, that do not hold the same layers
-and the same routed experts (a routing change is a coverage question, not a like-for-like monitor),
-that hold a non-finite value, or whose reference sample is all zeros (the relative error is
-undefined); it refuses a bar that is not finite and positive; and it exits non-zero when
-any layer exceeds `--layer-bar` or any expert exceeds `--expert-bar`, printing every failure and
-writing the per-layer and per-expert result when asked. The bars are supplied by the run: this
-page does not invent a bar the data has not measured.
+two dumps that name different models, probes or sampled indices, that do not hold the same layers,
+that hold a non-finite or duplicate value, or whose reference sample is all zeros on a layer or a
+shared expert (the relative error is undefined); it refuses a bar that is not finite and positive;
+and it exits non-zero when any layer exceeds `--layer-bar` or any shared expert exceeds
+`--expert-bar`, printing every failure and writing the per-layer, per-expert and routing result
+when asked.
+
+A routing difference is **reported, not refused**. A slightly different hidden state can change
+the router's top-k choice, so a candidate may send a row to an expert the reference did not. The
+command intersects each layer's expert ids and judges the expert bar over the experts both dumps
+hold; it counts, per layer and in total, the experts only one dump holds (`reference_only` and
+`candidate_only`), prints each differing layer's ids, and carries the same in `routing`
+(`layers_differing`, `experts_unshared`, `experts_shared`, `per_layer`). The layer bar is
+judged unchanged, and the exit code follows the bars alone. A divergence is itself a quality
+signal — the candidate's router made a different choice on that row — and it is reported beside
+the error, never hidden in a pass.
+
+The committed GLM-5.3 pair is judged at layer bar **0.5** and expert bar **0.5**. It passes with
+maxima **3.158e-01** per layer and **3.511e-01** per shared expert; 7 of 42 layers routed one row
+to a different expert, leaving 14 experts unshared (7 reference-only, 7 candidate-only) and 329
+shared. The bars are a **regression guard, not a quality claim**: they sit above the measured
+maxima so a future pair that moves further is caught, and they say nothing about whether the
+candidate is good enough to ship. The registry's `monitors_pair` names this pair and these bars;
+`[prerequisites] monitors` remains false until the reviewed edit that flips it.
 
 The Rust writer is `sparkflash_model::numerics_monitors::Recorder`. It is off unless
 `SPARKFLASH_NUMERICS_MONITORS` names an output path; `SPARKFLASH_NUMERICS_SAMPLE` sets the number
@@ -447,12 +483,16 @@ This rule is why the probe can see a decode-only change. Before it the probe was
 first forward, which on a real request is the prompt's prefill; a prefill runs the bulk GEMM on
 both builds, so a pair taken then was blind to a difference confined to the decode body. The first
 GLM-5.3 pair — one build with `SPARKFLASH_DECODE_MMA=off`, one with the shipped default — came out
-byte-identical and the judge passed at 0.000e+00 without measuring the body. That pair has to be
-retaken; the retake below now probes the first decode step.
+byte-identical and the judge passed at 0.000e+00 without measuring the body. It was retaken; the
+committed pair probes the first decode step and measures the FP8 few-row body, as the numbers
+above record.
 
-A real reference/candidate pair needs two builds. The echo of one process is not a candidate, and
-`[prerequisites] monitors` stays false until a pair from a reference build and a candidate build
-is committed. On the cluster, with the wired Qwen3.8 host reference:
+A real reference/candidate pair needs two builds. The echo of one process is not a candidate. The
+first real pair is committed under `numerics/monitors/` — GLM-5.3's reference build
+(`SPARKFLASH_DECODE_MMA=off`, the tiled row GEMV) against the shipped default (the FP8 few-row
+body) — and `numerics/registry.toml` names it in `monitors_pair`. `[prerequisites] monitors`
+stays false until the reviewed edit that flips it. On the cluster, with the wired Qwen3.8 host
+reference:
 
 ```bash
 W=/home/allenh1/cluster-tests/$(date +%Y%m%dT%H%M)-monitors
@@ -712,8 +752,12 @@ python3 scripts/numerics.py coverage-sweep --url http://127.0.0.1:8002 \
   --corpus numerics/coverage/corpus.json --generate 2000 --seed 20261119 \
   --out "$W/next-batch.json" --json "$W/sweep.json"
 
-# Compare a candidate monitor dump with the reference forward, per layer and per expert.
-python3 scripts/numerics.py monitors --reference numerics/monitors/glm53-tp4-reference.json --candidate numerics/monitors/glm53-tp4-candidate.json --layer-bar 2e-3 --expert-bar 5e-3 --json numerics/monitors/glm53-tp4-result.json
+# Compare the committed GLM-5.3 monitor pair at its declared bars, over the experts both routed
+# to; a routing divergence is reported beside the errors.
+python3 scripts/numerics.py monitors \
+  --reference numerics/monitors/glm53-tp4-v1-reference.json \
+  --candidate numerics/monitors/glm53-tp4-v2-candidate.json \
+  --layer-bar 0.5 --expert-bar 0.5 --json "$W/glm53-tp4-result.json"
 ```
 
 The prompt suite is [`numerics/prompts/reference.json`](../numerics/prompts/reference.json). A
@@ -807,13 +851,18 @@ the exemption ends with it, and an anchor capture would be the first requirement
 The aggregate `anchor` flag is **false**, and that is the honest value: Inkling-2 and Dory1.0
 have captured `logprobs` references but no `[[anchor]]`, so they are not covered and cannot bump.
 The flag reports that aggregate; it is not a gate on a model that has its own anchor. A true flag
-with an uncovered model fails `ci`. The coverage bar is declared at 0.93, but no real coverage or
-monitor dump is committed, so `coverage` and `monitors` are also false; they are not flipped on
-synthetic data. The coverage suite is now growable: `coverage-gaps` names the missing experts,
-`coverage-sweep` measures a deterministic corpus and writes the kept prompts as the next batch,
-and the corpus and generator live under `numerics/coverage/`. The first real dumps still need the
-cluster command in §5, which writes both from the Qwen3.8 world-1 device arm; the other arms'
-device sites are still named in §5. The sweep's estimate for Qwen3.8's remaining gap is 650-750
+with an uncovered model fails `ci`. The coverage bar is declared at 0.93 and the swept Qwen3.8
+dump is committed at 24,494 of 24,576 slots (99.67%), so `coverage` is true. The first real
+monitor pair — the GLM-5.3 reference/candidate retake — is committed under `numerics/monitors/`
+and judged at layer bar 0.5 and expert bar 0.5: 7 of 42 layers routed one row to a different
+expert (14 experts unshared, 329 shared), with maxima 3.158e-01 per layer and 3.511e-01 per shared
+expert. `monitors` remains false until the reviewed edit that flips it; the bars are a regression
+guard, not a quality claim. Neither flag was flipped on synthetic data. The coverage suite is now
+growable: `coverage-gaps` names the missing experts, `coverage-sweep` measures a deterministic
+corpus and writes the kept prompts as the next batch, and the corpus and generator live under
+`numerics/coverage/`. The commands that wrote the coverage dump and the monitor pair are in §5;
+the other arms' device sites are still named there. The sweep's estimate for Qwen3.8's remaining
+gap is 650-750
 contributing prompts (1,500-2,500 measured candidates); that is an estimate from the two runs'
 marginal rate, not a measured coverage claim.
 
