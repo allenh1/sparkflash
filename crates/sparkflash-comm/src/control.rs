@@ -129,9 +129,9 @@ pub enum Tp4ControlFrame {
         /// The canvas bytes after the frame.
         bytes: u64,
     },
-    /// Rank 0 -> every worker of a fused group: lane `lane` takes a request's prompt. A lane that
-    /// still holds an earlier request forgets it first, on every rank alike, unless `keep` says
-    /// rank 0's lane kept it to continue.
+    /// Rank 0 -> every worker of a fused or tick group: lane `lane` takes a request's prompt. A
+    /// lane that still holds an earlier request forgets it first, on every rank alike, unless
+    /// `keep` says rank 0's lane kept it to continue.
     LaneRequest {
         /// The lane, `0..lanes`, in the order rank 0's pool opened them.
         lane: u32,
@@ -147,6 +147,13 @@ pub enum Tp4ControlFrame {
         /// The request's sampler, as [Tp4ControlFrame::Request] carries it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sampler: Option<Tp4FrameSampler>,
+        /// The position rank 0's `start_prompt_slot` chose: where the prompt resumes from its
+        /// lane's history, or zero. A tick group's worker starts its own prompt the same way and
+        /// refuses a start that differs, because every row frame after this one is a position
+        /// from this start. A fused group's worker runs the arm's own prompt path, so its frames
+        /// leave this absent; a frame from a rank 0 that predates the field is the same.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<u32>,
     },
     /// Rank 0 -> every worker of a fused group: lane `lane` is idle and gives up what it holds,
     /// so another lane can grow; its next request starts over.
@@ -175,6 +182,26 @@ pub enum Tp4ControlFrame {
         /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
         lane: u32,
     },
+    /// Rank 0 -> every worker of a tick group: lane `lane` runs exactly `rows` rows of the prompt
+    /// its `LaneRequest` began. The count is rank 0's scheduler decision (the tick engine's
+    /// bulk-rows and exact-rows functions), not a chunk a worker derives from its
+    /// own policy: the worker calls the runtime's rows entry with this number.
+    LaneRows {
+        /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
+        lane: u32,
+        /// The rows to run, from the start the request frame named.
+        rows: u32,
+    },
+    /// Rank 0 -> every worker of a tick group: one decode step of these lanes, each consuming the
+    /// token rank 0 fed for it, in this order - the order is the step's row order on every rank.
+    /// `mode` is the shape rank 0's plan chose, so a worker runs the runtime's plain or round
+    /// entry with the same shape instead of choosing one of its own.
+    LaneStepMode {
+        /// `(lane, token)` a member.
+        members: Vec<(u32, u32)>,
+        /// The shape rank 0's engine ran.
+        mode: Tp4FrameStepMode,
+    },
     /// The request ended normally; every worker leaves the request loop.
     End,
     /// The request or the group failed; every worker leaves the process.
@@ -201,10 +228,26 @@ impl Tp4ControlFrame {
             Self::LaneStep { .. } => "LaneStep",
             Self::LaneGiveBack { .. } => "LaneGiveBack",
             Self::LanePart { .. } => "LanePart",
+            Self::LaneRows { .. } => "LaneRows",
+            Self::LaneStepMode { .. } => "LaneStepMode",
             Self::End => "End",
             Self::Error { .. } => "Error",
         }
     }
+}
+
+/// The shape of a tick group's decode step, as [Tp4ControlFrame::LaneStepMode] carries it: `StepMode`'s
+/// wire form. The runtime is the consumer, so the frame stays a transport type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tp4FrameStepMode {
+    /// One row a member: a plain token pass.
+    Plain,
+    /// The arm's round path. `joint` says whether the members' chains verify in one pass or one
+    /// member at a time; a worker runs the same runtime entry either way.
+    Round {
+        /// Whether the members' chains share one verify.
+        joint: bool,
+    },
 }
 
 /// A request's sampler as [Tp4ControlFrame::Request] carries it, in [Tp4DeviceAdmit]'s fields.

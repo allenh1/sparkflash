@@ -388,8 +388,9 @@ fn control_frames_round_trip_on_a_loopback_socket() {
             }],
             keep: false,
             sampler: None,
+            start: None,
         },
-        // A kept lane's next turn, with its sampler.
+        // A kept lane's next turn, with its sampler and the start rank 0 chose.
         Tp4ControlFrame::LaneRequest {
             lane: 1,
             prompt_ids: vec![5, 6, 7],
@@ -404,6 +405,21 @@ fn control_frames_round_trip_on_a_loopback_socket() {
                 presence_penalty_bits: 0.5f32.to_bits(),
                 frequency_penalty_bits: 0.0f32.to_bits(),
             }),
+            start: Some(3),
+        },
+        // A tick group's chunk and step frames: the rows rank 0 decided and the shape it ran.
+        Tp4ControlFrame::LaneRows {
+            lane: 0,
+            rows: 4_096,
+        },
+        Tp4ControlFrame::LaneStepMode {
+            members: vec![(0, 7), (1, 9)],
+            mode: sparkflash_comm::control::Tp4FrameStepMode::Round { joint: true },
+        },
+        Tp4ControlFrame::LaneRows { lane: 1, rows: 8 },
+        Tp4ControlFrame::LaneStepMode {
+            members: vec![(1, 9)],
+            mode: sparkflash_comm::control::Tp4FrameStepMode::Plain,
         },
         Tp4ControlFrame::Token { token_id: 7 },
         Tp4ControlFrame::End,
