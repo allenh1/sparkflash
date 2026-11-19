@@ -47,7 +47,10 @@ pub mod tick;
 pub mod walk;
 
 pub use chunk::{CHUNK_SIZES, ChunkPolicy, quantise};
-pub use conformance::{CONFORMANCE_CHECKS, ConformanceCheck, check_claims, checks_for, run_check};
+pub use conformance::{
+    CONFORMANCE_CHECKS, CheckOutcome, ConformanceCheck, Fixture, FormatRule, WalkFixture,
+    check_claims, checks_for, run_check, run_generated,
+};
 pub use fused::{
     FusedArm, FusedEngine, FusedSession, PREFILL_BYPASS_MAX_TOKENS, PREFILL_DECODE_INTERVAL,
     PROMPT_PARTS_ENV, Part, REWIND_ENV, Resume, extends, prompt_parts, resume, rewind,
