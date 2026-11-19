@@ -174,7 +174,7 @@ profile = "reference"
 plan = "tp"
 arch = "sm_121a"
 version = 1
-note = "Registered before the arm was wired; the release carries two recurrent loops, so a group of four cannot split them (DoryStage::of_rank). Replaced by the world-1 entry."
+reason = "Registered before the arm was wired; the release carries two recurrent loops, so a group of four cannot split them (DoryStage::of_rank). Replaced by the world-1 entry."
 
 [[anchor]]
 model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
