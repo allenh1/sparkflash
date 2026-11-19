@@ -55,11 +55,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use sparkflash_comm::control::Tp4ControlHub;
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
 use crate::chunk::ChunkPolicy;
 use crate::fused::Part;
+use crate::group::{GroupWire, TickGroup, watched_hub};
 use crate::ledger::{Ledger, Mode, Strategy};
 use crate::runtime::{Runtime, RuntimeSlot, StepMode};
 use crate::tick::{
@@ -378,6 +380,28 @@ fn plan_for(
     }
 }
 
+/// Rank 0 gives up a lane: the release frame first (so a grouped worker gives up the same lane
+/// before rank 0's half does), then the runtime's slot. A failure after the frame leaves the
+/// workers past rank 0, so it ends the group ([TickGroup::out_of_step]).
+fn release_lane<W: Walk>(
+    group: Option<&TickGroup>,
+    runtime: &Runtime<W>,
+    lane: usize,
+    slot: &mut RuntimeSlot<W>,
+) -> bool {
+    if let Some(group) = group {
+        if let Err(error) = group.release(lane) {
+            group.out_of_step(&error.to_string());
+        }
+        if let Err(error) = runtime.release_slot(slot) {
+            group.out_of_step(&error.to_string());
+        }
+        true
+    } else {
+        runtime.release_slot(slot).is_ok()
+    }
+}
+
 /// DeepSeek's tick over one Walk.
 pub struct TickEngine<W: Walk> {
     runtime: Runtime<W>,
@@ -398,6 +422,10 @@ pub struct TickEngine<W: Walk> {
     /// The next tick's decode plan, computed under the last prefill walk (the tick-ahead
     /// hook): the row count it was decided for, and the plan.
     ahead: Option<(usize, DecodePlan)>,
+    /// Rank 0's group, when this engine serves a tensor-parallel group: every prompt, chunk,
+    /// step, give-back and release is broadcast before it runs ([TickGroup]). The workers replay
+    /// the rows and the step shape; the decisions stay here.
+    group: Option<TickGroup>,
     /// The clock every decision is timed by.
     clock: Box<dyn Clock>,
     trace: Option<TraceSink>,
@@ -448,6 +476,7 @@ impl<W: Walk> TickEngine<W> {
             admissions: VecDeque::new(),
             fed: Vec::new(),
             ahead: None,
+            group: None,
             clock: Box::new(WallClock::new()),
             trace,
             tick: 0,
@@ -527,6 +556,26 @@ impl<W: Walk> TickEngine<W> {
         self
     }
 
+    /// The same engine as rank 0 of a [TickGroup]: every prompt, chunk, step, give-back and release is
+    /// broadcast before it runs, and the row exchange is on, so the group's prompt path takes the
+    /// arm's bulk chunks.
+    ///
+    /// The workers run the same tick on the same rows ([crate::mirror_tick_lanes]); what stays
+    /// rank 0's is every decision - the lane, the hold, the chunk boundary, the step shape and
+    /// the tick-ahead plan.
+    #[must_use]
+    pub fn with_group(mut self, group: TickGroup) -> Self {
+        self.group = Some(group);
+        self.config.exchange = true;
+        self
+    }
+
+    /// Whether this engine is rank 0 of a group.
+    #[must_use]
+    pub fn grouped(&self) -> bool {
+        self.group.is_some()
+    }
+
     /// The arm.
     #[must_use]
     pub fn walk(&self) -> &W {
@@ -577,6 +626,15 @@ impl<W: Walk> TickEngine<W> {
                 Mode::off("the arm's walk takes no bulk chunk"),
             );
         }
+        if let Some(group) = self.group.as_ref() {
+            ledger.set(
+                Strategy::Group,
+                Mode::native(format!(
+                    "{}: rank 0 decides the tick and the workers replay its rows and step shape",
+                    group.name()
+                )),
+            );
+        }
         ledger.require_complete()?;
         Ok(ledger)
     }
@@ -609,6 +667,11 @@ impl<W: Walk> TickEngine<W> {
                     self.runtime.limits().context
                 ),
             ));
+        }
+        // The group's own refusal runs before anything is queued, so a prompt no rank can take
+        // never becomes a frame a worker has to abandon.
+        if let Some(group) = self.group.as_ref() {
+            group.admit(tokens, images)?;
         }
         let id = RequestId(self.next_id);
         self.next_id += 1;
@@ -691,7 +754,15 @@ impl<W: Walk> TickEngine<W> {
         let Some(slot) = self.slots[lane].as_mut() else {
             return Ok(());
         };
-        self.runtime.give_back_slot(slot, count)
+        // Rank 0's own half first: an arm that refuses the give-back refuses on every rank, so
+        // a refusal must not leave the workers past rank 0 (as GroupLanes' does).
+        self.runtime.give_back_slot(slot, count)?;
+        if let Some(group) = self.group.as_ref()
+            && let Err(error) = group.give_back(lane, count)
+        {
+            group.out_of_step(&error.to_string());
+        }
+        Ok(())
     }
 
     /// Whether the engine has work for a tick: a prompt to place or prefill, or a decode row to
@@ -944,6 +1015,14 @@ impl<W: Walk> TickEngine<W> {
                 );
                 continue;
             }
+            // The request frame carries the start rank 0 chose, so it follows rank 0's own
+            // start_prompt_slot and precedes every row frame; the worker's own start is checked
+            // against it there. Nothing has run a row yet.
+            if let Some(group) = self.group.as_ref()
+                && let Err(error) = group.place(lane, &wanted, &new_images, start, &sampling)
+            {
+                group.out_of_step(&error.to_string());
+            }
             let bulk = bulk_from(
                 target,
                 start,
@@ -1000,13 +1079,14 @@ impl<W: Walk> TickEngine<W> {
             let Some(slot) = self.slots[victim].as_mut() else {
                 return false;
             };
-            let released = self.runtime.release_slot(slot);
+            // Every rank gives up the same lane before rank 0's own half does: a worker that
+            // kept it would hold a lane rank 0 is about to reuse for a different prompt.
+            if !release_lane(self.group.as_ref(), &self.runtime, victim, slot) {
+                return false;
+            }
             self.lanes[victim].resident.clear();
             self.lanes[victim].spans.clear();
             self.lanes[victim].skip_end = 0;
-            if released.is_err() {
-                return false;
-            }
         }
     }
 
@@ -1015,7 +1095,10 @@ impl<W: Walk> TickEngine<W> {
         if let Some(lane) = self.requests[index].lane
             && let Some(slot) = self.slots[lane].as_mut()
         {
-            let _ = self.runtime.release_slot(slot);
+            // The prompt failed before any of its rows ran, so its request frame may never have
+            // gone out; a release still keeps the lane the same on every rank (fresh on rank 0,
+            // fresh on a worker that held an older sequence).
+            release_lane(self.group.as_ref(), &self.runtime, lane, slot);
             self.lanes[lane].resident.clear();
             self.lanes[lane].spans.clear();
             self.lanes[lane].seq = None;
@@ -1081,6 +1164,13 @@ impl<W: Walk> TickEngine<W> {
                 || crate::tick::runs_decoder(from, rows, target, self.config.decoder_warm);
             self.lanes[lane].skip_end =
                 crate::tick::skip_end_after(self.lanes[lane].skip_end, from, rows, decoder);
+            // The exact rows this chunk runs travel before it does; every rank runs this many,
+            // not its own ChunkPolicy's chunk.
+            if let Some(group) = self.group.as_ref()
+                && let Err(error) = group.rows(lane, rows)
+            {
+                group.out_of_step(&error.to_string());
+            }
             let mut ahead = self.ahead();
             let slot = self.slots[lane]
                 .as_mut()
@@ -1099,7 +1189,14 @@ impl<W: Walk> TickEngine<W> {
                         self.finish_prompt(index, step, events);
                     }
                 }
-                Err(error) => self.fail(index, error, events),
+                Err(error) => {
+                    // The frame went out before the rows ran: the worker is inside the same walk,
+                    // so rank 0 cannot serve on past its failure.
+                    if let Some(group) = self.group.as_ref() {
+                        group.out_of_step(&error.to_string());
+                    }
+                    self.fail(index, error, events);
+                }
             }
         } else {
             let steps = tick_rows(
@@ -1129,6 +1226,11 @@ impl<W: Walk> TickEngine<W> {
                     || crate::tick::runs_decoder(p, n, target, self.config.decoder_warm);
                 self.lanes[lane].skip_end =
                     crate::tick::skip_end_after(self.lanes[lane].skip_end, p, n, decoder);
+                if let Some(group) = self.group.as_ref()
+                    && let Err(error) = group.rows(lane, n)
+                {
+                    group.out_of_step(&error.to_string());
+                }
                 let mut ahead = self.ahead();
                 let slot = self.slots[lane]
                     .as_mut()
@@ -1147,6 +1249,9 @@ impl<W: Walk> TickEngine<W> {
                         }
                     }
                     Err(error) => {
+                        if let Some(group) = self.group.as_ref() {
+                            group.out_of_step(&error.to_string());
+                        }
                         self.fail(index, error, events);
                         return ran;
                     }
@@ -1295,6 +1400,15 @@ impl<W: Walk> TickEngine<W> {
             members.push((slot, fed.token));
         }
         let seqs = members.len();
+        // The shape rank 0's plan chose, and the members in this step's row order, travel before
+        // the step: a worker runs the runtime's plain or round entry with the same shape instead
+        // of deciding one of its own.
+        if let Some(rank0) = self.group.as_ref() {
+            let tokens: Vec<u32> = stepping.iter().map(|fed| fed.token).collect();
+            if let Err(error) = rank0.step_mode(&lanes, &tokens, mode) {
+                rank0.out_of_step(&error.to_string());
+            }
+        }
         let answer = self.runtime.step_mode_slots(&mut members, mode);
         // A step that ran appends the fed token to the history; the request's token list
         // follows it. A step that failed appended nothing.
@@ -1365,6 +1479,11 @@ impl<W: Walk> TickEngine<W> {
                 }
             }
             Err(error) => {
+                // The step frame went out: the workers are inside the same walk, so a failure
+                // here ends the group rather than serving the other requests on.
+                if let Some(rank0) = self.group.as_ref() {
+                    rank0.out_of_step(&error.to_string());
+                }
                 for fed in group {
                     self.fail_by_id(fed.id, error.clone(), events);
                 }
@@ -1447,7 +1566,32 @@ where
     /// # Errors
     /// A lane the arm cannot open, an incomplete boot ledger, or a thread that cannot start.
     pub fn start(walk: W, capacity: usize) -> Result<Arc<Self>, BackendError> {
-        let engine = TickEngine::new(walk, capacity)?;
+        Self::start_engine(TickEngine::new(walk, capacity)?, capacity)
+    }
+
+    /// Allocates capacity lanes and starts the thread as rank 0 of a tensor-parallel group.
+    ///
+    /// The engine is the tick engine; every prompt start, chunk, step, give-back and release is
+    /// broadcast through `hub` before it runs, and each worker replays it
+    /// ([crate::mirror_tick_lanes]) over its own `capacity` lanes, so lane `n` is the same sequence
+    /// on every rank. The row
+    /// exchange is on ([TickEngine::with_group]), so the prompt path takes the arm's bulk chunks;
+    /// what stays rank 0's is every scheduler decision.
+    ///
+    /// # Errors
+    /// As [Self::start], or a watch that cannot start.
+    pub fn start_group(
+        walk: W,
+        capacity: usize,
+        hub: Tp4ControlHub,
+        wire: impl GroupWire,
+    ) -> Result<Arc<Self>, BackendError> {
+        let group = TickGroup::new(watched_hub(hub)?, Box::new(wire));
+        Self::start_engine(TickEngine::new(walk, capacity)?.with_group(group), capacity)
+    }
+
+    /// [Self::start] with the engine already built: the serving thread and its handle table.
+    fn start_engine(engine: TickEngine<W>, capacity: usize) -> Result<Arc<Self>, BackendError> {
         let ledger = engine
             .ledger()
             .map_err(|why| BackendError::new("tick", why))?;

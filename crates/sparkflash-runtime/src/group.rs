@@ -39,13 +39,15 @@ use std::sync::{Arc, Mutex};
 
 use sparkflash_comm::control::{
     Tp4ControlFrame, Tp4ControlHub, Tp4ControlWorker, Tp4DeviceImage, Tp4FrameSampler,
-    control_read_is_idle, exit_now, watch_leader, watch_workers,
+    Tp4FrameStepMode, control_read_is_idle, exit_now, watch_leader, watch_workers,
 };
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
 use crate::fused::{FusedArm, FusedEngine, Part};
 use crate::ledger::{Ledger, Mode, Strategy};
+use crate::runtime::{Runtime, RuntimeSlot, StepMode};
+use crate::walk::Walk;
 
 /// What an arm decides about its group's frames.
 pub trait GroupWire: Send + Sync + 'static {
@@ -333,6 +335,7 @@ pub fn mirror_lanes<A: FusedArm, W: GroupWire>(
                 images,
                 keep,
                 sampler,
+                start: _,
             } => {
                 let images = wire
                     .images(images)
@@ -415,6 +418,439 @@ pub fn mirror_lanes<A: FusedArm, W: GroupWire>(
             }
         }
     }
+}
+
+/// Rank 0's side of a tick group: the frames a [crate::TickEngine]'s decisions produce, each
+/// broadcast before the runtime call it names.
+///
+/// The engine keeps every decision (which lane, which rows, which step shape, when to give back
+/// or release) and calls this once per decision. The frames are the same lane frames a fused
+/// group uses, plus the two a tick decides: [Tp4ControlFrame::LaneRows] carries the rows
+/// [crate::Runtime::run_part_rows] must run, and [Tp4ControlFrame::LaneStepMode] carries the
+/// shape [crate::Runtime::step_mode_slots] must run, with the members in rank 0's row order.
+/// [Tp4ControlFrame::LaneRequest] carries the start rank 0's `start_prompt_slot` chose, so its
+/// rows are a position from a start both ranks agree on.
+///
+/// A worker replays it with [mirror_tick_lanes]. A failure of rank 0's own half after a frame
+/// has gone out leaves the workers past rank 0, so [Self::out_of_step] tells them why and ends
+/// the process ([Split]); a refusal before any frame is an ordinary error.
+pub struct TickGroup {
+    hub: Arc<Mutex<Tp4ControlHub>>,
+    wire: Box<dyn GroupWire>,
+    /// What a failure after a broadcast does ([end_group] unless [Self::with_split]).
+    split: Split,
+}
+
+impl TickGroup {
+    /// Rank 0's frames through `hub`, refused and described by `wire`.
+    #[must_use]
+    pub fn new(hub: Arc<Mutex<Tp4ControlHub>>, wire: Box<dyn GroupWire>) -> Self {
+        Self {
+            hub,
+            wire,
+            split: end_group,
+        }
+    }
+
+    /// Splits the group with `split` instead of ending the process, for a test.
+    #[must_use]
+    pub fn with_split(mut self, split: Split) -> Self {
+        self.split = split;
+        self
+    }
+
+    /// The arm's name in trace lines.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        self.wire.name()
+    }
+
+    /// Rank 0's refusal of a prompt every rank would refuse, before any frame for it.
+    ///
+    /// # Errors
+    /// The refusal.
+    pub fn admit(&self, tokens: &[u32], images: &[VisionImage]) -> Result<(), BackendError> {
+        self.wire.admit(tokens, images)
+    }
+
+    /// Broadcast: lane `lane` begins this prompt at rank 0's start, with rank 0's sampler.
+    ///
+    /// The frame follows rank 0's own start because it carries the start; no row has run yet,
+    /// so the worker's check is against every row the frames after it name.
+    ///
+    /// # Errors
+    /// A count the frame cannot carry, or a frame that could not be sent (the group is split).
+    pub fn place(
+        &self,
+        lane: usize,
+        tokens: &[u32],
+        images: &[VisionImage],
+        start: usize,
+        sampling: &Sampling,
+    ) -> Result<(), BackendError> {
+        let lane = u32::try_from(lane)
+            .map_err(|_| BackendError::new("group", format!("lane {lane} does not fit a frame")))?;
+        let start = u32::try_from(start).map_err(|_| {
+            BackendError::new("group", format!("a start of {start} does not fit a frame"))
+        })?;
+        if self.wire.trace() {
+            eprintln!(
+                "[{}] serve rank 0 lane {lane} prefill {} rows at {start}",
+                self.wire.name(),
+                tokens.len()
+            );
+        }
+        self.in_step(self.send(&Tp4ControlFrame::LaneRequest {
+            lane,
+            prompt_ids: tokens.to_vec(),
+            images: image_frames(images),
+            // The tick worker starts from the frame's start, not from this: the lane's history
+            // on the worker is what rank 0's was, so its own resume reaches the same start, and a
+            // frame that disagrees is refused rather than obeyed.
+            keep: true,
+            sampler: self.wire.sampler(sampling),
+            start: Some(start),
+        }))
+    }
+
+    /// Broadcast: lane `lane` runs exactly `rows` rows of the prompt its request frame began.
+    ///
+    /// # Errors
+    /// A row count the frame cannot carry, or a frame that could not be sent (the group is
+    /// split).
+    pub fn rows(&self, lane: usize, rows: usize) -> Result<(), BackendError> {
+        let lane = u32::try_from(lane)
+            .map_err(|_| BackendError::new("group", format!("lane {lane} does not fit a frame")))?;
+        let rows = u32::try_from(rows)
+            .map_err(|_| BackendError::new("group", format!("{rows} rows do not fit a frame")))?;
+        if self.wire.trace() {
+            eprintln!(
+                "[{}] serve rank 0 lane {lane} rows {rows}",
+                self.wire.name()
+            );
+        }
+        self.in_step(self.send(&Tp4ControlFrame::LaneRows { lane, rows }))
+    }
+
+    /// Broadcast: one step of `lanes` in this order, each consuming the token in `tokens`, in
+    /// `mode`. The order is the step's row order on every rank.
+    ///
+    /// # Errors
+    /// A member count the frame cannot carry, mismatched member lists, or a frame that could not
+    /// be sent (the group is split).
+    pub fn step_mode(
+        &self,
+        lanes: &[usize],
+        tokens: &[u32],
+        mode: StepMode,
+    ) -> Result<(), BackendError> {
+        if lanes.len() != tokens.len() {
+            return Err(BackendError::new(
+                "group",
+                format!(
+                    "{} lanes step {} tokens: every member needs one",
+                    lanes.len(),
+                    tokens.len()
+                ),
+            ));
+        }
+        let mut members = Vec::with_capacity(lanes.len());
+        for (&lane, &token) in lanes.iter().zip(tokens) {
+            let lane = u32::try_from(lane).map_err(|_| {
+                BackendError::new("group", format!("lane {lane} does not fit a frame"))
+            })?;
+            members.push((lane, token));
+        }
+        let mode = match mode {
+            StepMode::Plain => Tp4FrameStepMode::Plain,
+            StepMode::Round { joint } => Tp4FrameStepMode::Round { joint },
+        };
+        if self.wire.trace() {
+            eprintln!(
+                "[{}] serve rank 0 step {members:?} {mode:?}",
+                self.wire.name()
+            );
+        }
+        self.in_step(self.send(&Tp4ControlFrame::LaneStepMode { members, mode }))
+    }
+
+    /// Broadcast: lane `lane` rolls back `count` answers, after rank 0's own lane did.
+    ///
+    /// # Errors
+    /// A count the frame cannot carry, or a frame that could not be sent (the group is split).
+    pub fn give_back(&self, lane: usize, count: usize) -> Result<(), BackendError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let lane = u32::try_from(lane)
+            .map_err(|_| BackendError::new("group", format!("lane {lane} does not fit a frame")))?;
+        let count = u32::try_from(count)
+            .map_err(|_| BackendError::new("group", format!("{count} answers to give back")))?;
+        if self.wire.trace() {
+            eprintln!(
+                "[{}] serve rank 0 lane {lane} gives back {count}",
+                self.wire.name()
+            );
+        }
+        self.in_step(self.send(&Tp4ControlFrame::LaneGiveBack { lane, count }))
+    }
+
+    /// Broadcast: lane `lane` gives up what it holds, before rank 0's own lane does.
+    ///
+    /// # Errors
+    /// A frame that could not be sent (the group is split).
+    pub fn release(&self, lane: usize) -> Result<(), BackendError> {
+        let lane = u32::try_from(lane)
+            .map_err(|_| BackendError::new("group", format!("lane {lane} does not fit a frame")))?;
+        if self.wire.trace() {
+            eprintln!("[{}] serve rank 0 lane {lane} release", self.wire.name());
+        }
+        self.in_step(self.send(&Tp4ControlFrame::LaneRelease { lane }))
+    }
+
+    /// Rank 0's own half of a frame failed after the frame went out: the workers are past rank 0
+    /// and cannot be caught up. Tells them why and ends the group.
+    pub fn out_of_step(&self, why: &str) -> ! {
+        let _ = self.send(&Tp4ControlFrame::Error {
+            code: "group_out_of_step".to_owned(),
+            message: why.to_owned(),
+        });
+        (self.split)(why)
+    }
+
+    fn send(&self, frame: &Tp4ControlFrame) -> Result<(), BackendError> {
+        broadcast(&self.hub, frame)
+    }
+
+    /// `result` of an operation that may have reached the workers: a failure leaves them past
+    /// rank 0, so the group ends ([Split]) once it has been told why.
+    fn in_step<T>(&self, result: Result<T, BackendError>) -> Result<T, BackendError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => self.out_of_step(&error.to_string()),
+        }
+    }
+}
+
+/// Mirrors rank 0's tick frames onto this rank's own pool of runtime slots, until the control
+/// channel ends.
+///
+/// The pool is opened up front, as rank 0's engine opens its own, so lane `n` is the same slot
+/// on every rank. A request frame starts the lane's prompt on this rank and refuses a start that
+/// differs from rank 0's; a rows frame runs exactly the rows it names through
+/// [crate::Runtime::run_part_rows]; a step frame takes its member lanes in the frame's order and
+/// runs [crate::Runtime::step_mode_slots] with the frame's shape, then drains the answers the
+/// arm already holds exactly as rank 0's engine does (those rows run no device work, so they
+/// travel as no frame, but their history bookkeeping must happen on every rank).
+///
+/// # Errors
+/// A frame for a lane outside the pool (the ranks are out of step), a start that differs, an arm
+/// failure, or the channel's end.
+pub fn mirror_tick_lanes<W: Walk>(
+    control: &mut Tp4ControlWorker,
+    runtime: &Runtime<W>,
+    wire: &dyn GroupWire,
+    lanes: usize,
+) -> Result<(), String> {
+    mirror_tick_lanes_seen(control, runtime, wire, lanes, &mut |_| {})
+}
+
+/// [mirror_tick_lanes], handing every frame that arrived to `seen` before it runs. The CPU gate
+/// uses it to pin the message order a worker was given; a serving process passes a no-op.
+///
+/// # Errors
+/// As [mirror_tick_lanes].
+pub fn mirror_tick_lanes_seen<W: Walk>(
+    control: &mut Tp4ControlWorker,
+    runtime: &Runtime<W>,
+    wire: &dyn GroupWire,
+    lanes: usize,
+    seen: &mut dyn FnMut(&Tp4ControlFrame),
+) -> Result<(), String> {
+    let mut pool: Vec<Option<RuntimeSlot<W>>> = Vec::with_capacity(lanes);
+    for _ in 0..lanes {
+        pool.push(Some(
+            runtime
+                .open_slot()
+                .map_err(|error| format!("open a lane: {error}"))?,
+        ));
+    }
+    let name = wire.name();
+    let out_of_step = |lane: u32| {
+        format!(
+            "lane {lane} is outside this rank's {lanes} lanes or already stepping: the ranks are out \
+             of step (every rank must be given the same --concurrency)"
+        )
+    };
+    loop {
+        let frame = match control.next_frame() {
+            Ok(frame) => frame,
+            Err(error) if control_read_is_idle(&error) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        seen(&frame);
+        match frame {
+            Tp4ControlFrame::LaneRequest {
+                lane,
+                prompt_ids,
+                images,
+                keep: _,
+                sampler,
+                start,
+            } => {
+                let images = wire
+                    .images(images)
+                    .map_err(|error| format!("lane {lane}: {error}"))?;
+                let slot = pool
+                    .get_mut(lane as usize)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| out_of_step(lane))?;
+                // The lane's sampler travels whole, as it does for a fused group: every rank's
+                // picks decide what a verify keeps. The request's start does not travel through
+                // it - the arm counts from the prompt it prefills.
+                runtime
+                    .walk()
+                    .set_sampling(slot.seq_mut(), wire.sampling(sampler));
+                if wire.trace() {
+                    eprintln!(
+                        "[{name}] serve worker lane {lane} prefill {} rows",
+                        prompt_ids.len()
+                    );
+                }
+                let at = runtime
+                    .start_prompt_slot(slot, &prompt_ids, &images)
+                    .map_err(|error| format!("lane {lane}: start: {error}"))?;
+                if let Some(start) = start {
+                    let start = start as usize;
+                    if at != start {
+                        return Err(format!(
+                            "lane {lane}: rank 0 starts the prompt at {start}, this rank starts it \
+                             at {at}: the ranks are out of step"
+                        ));
+                    }
+                }
+            }
+            Tp4ControlFrame::LaneRows { lane, rows } => {
+                let slot = pool
+                    .get_mut(lane as usize)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| out_of_step(lane))?;
+                if wire.trace() {
+                    eprintln!("[{name}] serve worker lane {lane} rows {rows}");
+                }
+                runtime
+                    .run_part_rows(slot, rows as usize)
+                    .map_err(|error| format!("lane {lane}: rows {rows}: {error}"))?;
+            }
+            Tp4ControlFrame::LaneStepMode { members, mode } => {
+                let mode = match mode {
+                    Tp4FrameStepMode::Plain => StepMode::Plain,
+                    Tp4FrameStepMode::Round { joint } => StepMode::Round { joint },
+                };
+                let mut stepping = Vec::with_capacity(members.len());
+                for &(lane, token) in &members {
+                    let slot = pool
+                        .get_mut(lane as usize)
+                        .and_then(Option::take)
+                        .ok_or_else(|| out_of_step(lane))?;
+                    stepping.push((slot, token));
+                }
+                if wire.trace() {
+                    eprintln!("[{name}] serve worker step {members:?} {mode:?}");
+                }
+                let answer = runtime.step_mode_slots(&mut stepping, mode);
+                for ((slot, _), &(lane, _)) in stepping.into_iter().zip(&members) {
+                    pool[lane as usize] = Some(slot);
+                }
+                let (steps, _) = answer.map_err(|error| format!("step {members:?}: {error}"))?;
+                // The answers the arm already holds cost no row, so rank 0 runs them without a
+                // frame; this rank runs the same runtime entry for the same tokens, whose only
+                // effect is the history the next prompt's start is read from.
+                for (&(lane, _), mut step) in members.iter().zip(steps) {
+                    while let Some(token) = step.next_token {
+                        let ready = pool[lane as usize]
+                            .as_ref()
+                            .is_some_and(|slot| runtime.ready_slot(slot, token));
+                        if !ready {
+                            break;
+                        }
+                        let slot = pool[lane as usize]
+                            .take()
+                            .ok_or_else(|| out_of_step(lane))?;
+                        let mut member = [(slot, token)];
+                        let held = runtime.step_slots(&mut member);
+                        let [(slot, _)] = member;
+                        pool[lane as usize] = Some(slot);
+                        match held {
+                            Ok(mut steps) => match steps.pop() {
+                                Some(next) => step = next,
+                                None => break,
+                            },
+                            Err(error) => {
+                                return Err(format!("lane {lane}: held answer: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+            Tp4ControlFrame::LaneGiveBack { lane, count } => {
+                let slot = pool
+                    .get_mut(lane as usize)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| out_of_step(lane))?;
+                if wire.trace() {
+                    eprintln!("[{name}] serve worker lane {lane} gives back {count}");
+                }
+                runtime
+                    .give_back_slot(slot, count as usize)
+                    .map_err(|error| format!("lane {lane}: give back {count}: {error}"))?;
+            }
+            Tp4ControlFrame::LaneRelease { lane } => {
+                let slot = pool
+                    .get_mut(lane as usize)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| out_of_step(lane))?;
+                if wire.trace() {
+                    eprintln!("[{name}] serve worker lane {lane} release");
+                }
+                runtime
+                    .release_slot(slot)
+                    .map_err(|error| format!("lane {lane}: release: {error}"))?;
+            }
+            Tp4ControlFrame::Error { code, message } => {
+                return Err(format!("rank 0 ended the group ({code}): {message}"));
+            }
+            other => {
+                return Err(format!(
+                    "the tick worker expected LaneRequest, LaneRows, LaneStepMode, LaneGiveBack, \
+                     LaneRelease or Error, not {}",
+                    other.kind()
+                ));
+            }
+        }
+    }
+}
+
+/// Runs a worker's [mirror_tick_lanes] and then ends its process: a tick mirror only ever stops
+/// when the group can no longer serve. A watch on rank 0's control socket ends the process too
+/// while it waits in a collective rank 0 will never join.
+pub fn mirror_ticks_until_the_group_ends<W: Walk>(
+    control: &mut Tp4ControlWorker,
+    runtime: &Runtime<W>,
+    wire: &dyn GroupWire,
+    lanes: usize,
+) -> ! {
+    let rank = control.rank;
+    if let Err(error) = watch_leader(&control.stream, rank as usize, &NO_END, || {}) {
+        eprintln!("sparkflash serve: rank {rank}: {error}");
+        exit_now(1);
+    }
+    let error = match mirror_tick_lanes(control, runtime, wire, lanes) {
+        Ok(()) => "the control channel ended".to_owned(),
+        Err(error) => error,
+    };
+    eprintln!("sparkflash serve: rank {rank}: the group cannot serve, exiting: {error}");
+    exit_now(1)
 }
 
 /// The engine a fused backend's sessions are handles on: its own lanes, or rank 0 of a group's,
@@ -629,6 +1065,9 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
                 images: image_frames(images),
                 keep,
                 sampler,
+                // The fused arm's prompt path decides its own start on the worker; only a tick
+                // group's request frame carries one for the worker to check.
+                start: None,
             })
             .and_then(|()| self.arm.begin_prompt(inner, tokens, images)),
         )

@@ -61,7 +61,8 @@ pub use fused::{
     rewind_request,
 };
 pub use group::{
-    Fusion, GroupLane, GroupLanes, GroupWire, Split, TextWire, end_group, mirror_lanes,
+    Fusion, GroupLane, GroupLanes, GroupWire, Split, TextWire, TickGroup, end_group, mirror_lanes,
+    mirror_tick_lanes, mirror_tick_lanes_seen, mirror_ticks_until_the_group_ends,
     mirror_until_the_group_ends, watched_hub,
 };
 pub use layout::{LaneState, Limits, Region, StateKind, StateLayout};
