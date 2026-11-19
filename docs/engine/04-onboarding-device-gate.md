@@ -111,7 +111,7 @@ The seven checks above were stubs at that tip. Now each arm supplies a `WalkFixt
 | GLM | `cargo test -p sparkflash-model-glm5-next --lib conformance:: -- --ignored --nocapture` | 7 passed: whole prompt / alone = four / continued = cold / rewound = cold / no unrecorded widening / drafted = plain PASS; TP SKIP for the missing group |
 | Qwen | `cargo test -p sparkflash-model-qwen4-exp --lib conformance:: -- --ignored --nocapture` | 7 passed, same five plus drafted = plain PASS; TP SKIP for the missing group |
 | Inkling | `cargo test -p sparkflash-model-inkling2 --lib conformance:: -- --ignored --nocapture` | 7 passed, same five plus drafted = plain PASS; TP SKIP for the missing group |
-| dense | `SPARKFLASH_CONFORMANCE_CHECKPOINT=... cargo test -p sparkflash-model-dense --lib conformance:: -- --ignored --nocapture` | 5 PASS; drafted = plain SKIP (dense declares no drafter); TP SKIP |
+| dense | `cargo test -p sparkflash-model-dense --lib conformance:: -- --ignored --nocapture` | 5 PASS; drafted = plain SKIP (dense declares no drafter); TP SKIP |
 | GLM builder | `cargo test -p sparkflash-model-glm5-next --test engine_builder a_serving_fixture_passes_the_boot_check_and_opens -- --nocapture` | PASS: `serving_fixture` passes `PartsDeviceRank::open` and opens the arm on the same plan |
 
 The fixture notes that matter:
@@ -123,9 +123,11 @@ The fixture notes that matter:
   still runs the round through its MTP stage.
 * Inkling's fixture is `TinySource`; its bytes-per-token floor is the uploaded weight bytes,
   because the shared tensor plan does not spell Inkling's block-attention residual.
-* dense's fixture is the checkpoint `scripts/dense-synthetic-checkpoint.py` writes, named by
-  `SPARKFLASH_CONFORMANCE_CHECKPOINT`. Without it the check prints `NEEDS-FIXTURE` and
-  `onboard-gate.sh` fails; it does not pass silently.
+* dense's fixture is the checkpoint `scripts/dense-synthetic-checkpoint.py` writes. When
+  `SPARKFLASH_CONFORMANCE_CHECKPOINT` is unset the fixture writes it itself into
+  `target/conformance/dense-synthetic` (the same path the gate uses) and names the path; a named
+  path that is not a checkpoint is a `NEEDS-FIXTURE` error naming the exact command that writes
+  one, and it never passes silently.
 * The tiny/small engine-builder fixtures were below the catalogue's released geometry. The check
   was right and the fixture was wrong: `Glm5NextConfig::serving_fixture` and
   `Qwen4ExpConfig::serving_fixture` are one decoder layer at the boots' widths and routed

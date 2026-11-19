@@ -388,8 +388,10 @@ Each arm supplies its own: GLM's and Qwen's are their existing synthetic checkpo
 through the arm's TP=1 constructor (Qwen's is the 3.5-MoE spelling, because the hub cache's
 2,560-wide DFlash-2 drafter is refused by the 128-wide fixture), Inkling's is `TinySource`, and
 dense's is the checkpoint `scripts/dense-synthetic-checkpoint.py` writes, named by
-`SPARKFLASH_CONFORMANCE_CHECKPOINT`. `scripts/onboard-gate.sh` writes that fixture when absent,
-runs the checks, and reports PASS / SKIP / FAIL / NEEDS-FIXTURE, exiting non-zero on the last two.
+`SPARKFLASH_CONFORMANCE_CHECKPOINT`, or written by the fixture itself when the switch is unset
+(see [the device window's two gaps](#the-device-windows-two-gaps-a-catalogue-hole-and-a-fixture-checklist)).
+`scripts/onboard-gate.sh` also writes that fixture when absent, runs the checks, and reports
+PASS / SKIP / FAIL / NEEDS-FIXTURE, exiting non-zero on the last two.
 
 The `engine_builder` device failure was the fixture, not the check. `hidden 256` and `vocab 64`
 are correctly refused by the released-image boot check, so the fix is
@@ -878,6 +880,67 @@ tick form, and the existing `Fusion::group` path for Qwen, Inkling, Dory and den
 stays as it is. It was not added here because it is a new wire protocol and a second mirror,
 and its TP>1 bits cannot be checked on this host; moving it without the cluster gate would
 make an unverified bit claim for a released arm, which phase 6 forbids.
+
+### The device window's two gaps: a catalogue hole and a fixture checklist
+
+The four-DGX-Spark window at `a6091608` (sm_121a, the branch's ignored tests) passed every arm
+except two arms' generated conformance checks, which panicked with `NEEDS-FIXTURE` instead of
+serving. Both were real gaps, not flakes:
+
+* **Inkling-2-Small could not resolve six of its own kernels.** The image exports
+  `inkling_block_residual_chain_q1_n0`, `_q1_n1`, `_q1_n3`, `_q3_n0`, `_q3_n1` and `_q3_n3`
+  (`crates/sparkflash-kernels/src/images.rs`), and the chunk walk loads all six by name through
+  the typed `Bound::carried` lookup (`crates/sparkflash-model-inkling2/src/device.rs`), but the
+  `Part::BlockAttentionResidual, Image::Inkling` catalogue entry named only the one-block and
+  two-launch bodies. The boot refused the first with "the catalogue carries no
+  inkling_block_residual_chain_q1_n0 in inkling_sm121 accepting bf16"; `run_generated` maps the
+  boot's `fixture` code to `NEEDS-FIXTURE`, so the check panicked rather than ran. The catalogue
+  had a hole in a released arm: the kernel, the image export, the loader and the call site were
+  all present, and only the entry the typed lookup reads was missing.
+  The six are one template (`kernels/inkling_conv_sm121.cu`, `INKLING_CHAIN_ENTRY(NQ, NEXT)`)
+  differing only in the compile-time query and next-call counts. The template takes f32
+  summaries, partial, queries, out, carry and next queries (`const float*` throughout), so the
+  entry is `ComputeClass::Elementwise` at BF16 - the precision the walk loads and the precision
+  of the sibling `inkling_block_residual_stats` / `_mix` bodies - in the bulk-prefill pass, over
+  the nine-or-more rows the walk chains (`rows > RESIDUAL_SPLIT_PAIRS`, 8). The six are
+  catalogued as instantiations of one `chain` helper inside the part's existing entry, the way
+  the GDN scan entry names its `q4p_gdn_scan_64_64` / `_128_256` instantiations. The new CPU
+  test `every_chained_residual_the_arm_launches_is_in_the_catalogue` runs each
+  `RESIDUAL_CHAIN_PAIRS` entry through the same `Bound::carried` lookup the boot runs; it
+  prevents another launched symbol from reaching a device uncatalogued. That is the rule dense
+  already stated in `every_kernel_the_arm_loads_is_in_the_catalogue`, applied to Inkling.
+
+* **Dense's conformance checks could not run unattended.** `DenseWalk::fixture` required
+  `SPARKFLASH_CONFORMANCE_CHECKPOINT`. `scripts/onboard-gate.sh dense` already wrote the
+  synthetic checkpoint when the switch was unset, but the window ran the tests directly, so the
+  checks panicked `NEEDS-FIXTURE` and the fixture stayed a checklist item - the thing phase 8
+  exists to remove. The fixture now writes the checkpoint itself when the switch is unset, into
+  the same `target/conformance/dense-synthetic` directory the gate uses, prints the path, and
+  stages the write in a sibling directory published by rename so parallel checks never open a
+  half-written checkpoint. The fixture errors name the exact command that writes one:
+  `python3 scripts/dense-synthetic-checkpoint.py reference target/conformance/dense-synthetic
+  --layers 2 --hidden 1024 --intermediate 2816 --context 512`. Writing needs no device:
+  `the_dense_fixture_writes_itself_on_the_cpu` writes it and parses the config back on this
+  host, and only the checks that boot the walk need the device. `onboard-gate.sh` now rewrites
+  a directory missing either file instead of trusting any existing directory; the other arms'
+  behaviour is unchanged.
+
+**The device window must rerun these four commands** on the branch tip, with the cubins and
+`SPARKFLASH_KERNEL_DIR` the original run used:
+
+```sh
+cargo test -p sparkflash-model-dense --lib -- --include-ignored --test-threads=1
+cargo test -p sparkflash-model-dense --lib conformance:: -- --ignored --nocapture
+cargo test -p sparkflash-model-inkling2 --lib -- --include-ignored --test-threads=1
+cargo test -p sparkflash-model-inkling2 --lib conformance:: -- --ignored --nocapture
+```
+
+A pass is: dense's generated checks report five PASS and two SKIP (`drafted = plain`, because
+dense declares no drafter, and `TP 1 = TP 2 = TP 4`, because the fixture is one rank), with no
+`NEEDS-FIXTURE` line; Inkling's report six PASS and one SKIP (TP, one rank), including
+`whole_prompt_equals_chunked`, the check that failed first. The two new CPU tests also run in
+the `--include-ignored` forms and need no GPU. `scripts/onboard-gate.sh dense` and
+`scripts/onboard-gate.sh inkling` are the script forms of the same gate.
 
 ## Order and ownership
 
