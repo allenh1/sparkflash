@@ -2014,6 +2014,36 @@ clean row where the degenerate one put probability ~1 on `200001`); and the chec
 matches the packed-form capture bit for bit. Soup, a zero or negative delta, or a body/GEMV
 mismatch is a failed fix.
 
+### The version-1 tail checks: Dory is precision, Inkling was a defect
+
+The owner's rule for a tensor-core decode change is that a shift is expected and only a defect is
+a reason to hold. Both arms were checked the same way: the pre-change build's forced capture
+against the registered reference, then the 20 worst positions inspected.
+
+**Dory1.0: an unstructured precision tail; version 1 stands.** The pre-change build (`84f07db7`,
+Dory's decode still on the row GEMV) against the world-1 reference (`99715d…`): 1024 positions,
+mean NLL delta −3.062e-05, mean absolute 4.962e-04, p99 6.610e-03, max **1.006e-02**, top-1
+agreement **100%**, mean KL lower bound 2.586e-06. The worst twenty spread over six of the eight
+prompts, their positions are scattered (no position-0 or boundary clustering, flat by position
+bucket, uniform mod 16), the signs are mixed and the magnitude tracks the anchor's sharpness - an
+accumulation-order tail, not a broken part. The reference's own text is coherent ("The user wants
+me to solve a word problem step by step…"), which is what the Inkling check taught us to verify.
+
+**Inkling-2-Small: structured, at the first decode row; a defect.** The same comparison gives mean
+NLL +5.824, top-1 **29.49%**, max 47.09, and the divergence is the *first decode position of
+every prompt* - the pre-change build puts essentially all mass on `<|message_model|>` (200001,
+logprob ~0) where the reference's argmax is content token 125148 at −1.156 and 200001 sits at
+−48.25. And the reference's eight generations decode to multilingual token soup, while the parent
+build produces a clean chat opener. So version 1 pinned degenerate output and `check` passing only
+proved the tip equals that capture. The fix and its GPU proof are the next section; version 1 will
+be re-declared from a clean build.
+
+**A blocker the GLM coverage sweep found.** The GLM recorder was wired (the `combine_experts`
+site) but the sweep wrote no dump at all: `scripts/serve-four-node.sh` starts every rank with an
+explicit environment allow-list, and `SPARKFLASH_NUMERICS_*` was not on it, so rank 0's recorder
+was never told where to write. The allow-list now carries `NUMERICS` (`885f5edf`), and the sweep
+is owed a rerun on a binary built after the recorder landed.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
