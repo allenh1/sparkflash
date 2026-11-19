@@ -82,13 +82,34 @@ fn the_released_plan_resolves_every_part_at_every_world() {
     }
 }
 
+/// The tiny fixture is below the catalogue's Qwen geometry, so the boot check is right to refuse
+/// it; the fixture used for a serving boot is [Qwen4ExpConfig::serving_fixture].
 #[test]
-fn a_tiny_checkpoint_opens_through_the_engine_builder() {
+fn the_tiny_fixture_is_refused_by_the_serving_boot_check() {
+    let config = Qwen4ExpConfig::tiny();
+    let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
+        .expect("the tiny plan builds");
+    let tensors = ArchitectureTensorPlan::served_and_mtp(&config.architecture, plan.tp())
+        .expect("the shared tensor plan builds");
+    let source = Specs::new(tensors.plan().specs());
+    let error = PartsDeviceRank::open(&plan, &source, PlanContext::SM121_CATALOGUE)
+        .expect_err("the 32-wide fixture is not a serving shape");
+    let text = error.to_string();
+    assert!(
+        text.contains("vocab 64 is not a multiple of 128")
+            || text.contains("hidden 32 is not a multiple of 256")
+            || text.contains("hidden 32 does not equal 2560"),
+        "the refusal names the fixture's width: {text}"
+    );
+}
+
+#[test]
+fn a_serving_fixture_opens_through_the_engine_builder() {
     if sparkflash_kernels::cuda_driver::Cuda::load().is_err() {
         eprintln!("skipped: no CUDA driver");
         return;
     }
-    let config = Qwen4ExpConfig::tiny();
+    let config = Qwen4ExpConfig::serving_fixture();
     let checkpoint = tempfile::tempdir().expect("a temporary directory");
     write_synthetic_checkpoint(checkpoint.path(), &config, 7).expect("the fixture writes");
     let source = SafeTensorsSource::open(checkpoint.path(), &checkpoint.path().join(INDEX_NAME))

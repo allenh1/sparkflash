@@ -736,6 +736,51 @@ impl Qwen4ExpConfig {
         }
     }
 
+    /// The synthetic fixture at the serving catalogue's geometry, for the shared
+    /// `EngineBuilder` boot.
+    ///
+    /// [Self::tiny] is the smallest geometry the reference tests use, but the catalogue's Qwen
+    /// entries name the released 2,560-wide bodies and the released routed shapes, so the boot
+    /// check is right to refuse it. This keeps the tiny layer schedule and widens every tensor
+    /// the boot check names.
+    #[must_use]
+    pub fn serving_fixture() -> Self {
+        let mut config = Self::tiny();
+        config.hidden_size = 2560;
+        config.vocab_size = 256;
+        config.head_dim = 128;
+        config.linear_key_head_dim = 128;
+        config.linear_value_head_dim = 128;
+        config.num_experts = 512;
+        config.num_experts_per_tok = 10;
+        config.moe_intermediate_size = 128;
+        config.shared_expert_intermediate_size = 128;
+        config.ple_embed_dim = 128;
+        config.indexer_head_dim = 128;
+        let architecture = &mut config.architecture;
+        architecture.hidden_size = 2560;
+        architecture.vocab_size = 256;
+        for layer in &mut architecture.layers {
+            layer.attention.head_dim = 128;
+            if let sparkflash_model::architecture::AttentionKind::Gdn(gdn) =
+                &mut layer.attention.kind
+            {
+                gdn.key_dim = 128;
+                gdn.value_dim = 128;
+            }
+            if let Some(indexer) = &mut layer.attention.indexer {
+                indexer.head_dim = 128;
+            }
+            if let sparkflash_model::architecture::Ffn::Moe(moe) = &mut layer.ffn {
+                moe.routed_experts = 512;
+                moe.active_experts = 10;
+                moe.intermediate = 128;
+                moe.shared_intermediate = 128;
+            }
+        }
+        config
+    }
+
     /// Render this configuration back to the released HF `config.json` schema.
     ///
     /// The round trip is exact: parsing the output reproduces the same [Qwen4ExpConfig], which is

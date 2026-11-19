@@ -82,13 +82,32 @@ fn the_released_plan_resolves_every_part_at_every_world() {
     }
 }
 
+/// The tiny fixture is below the catalogue's GLM geometry, so the boot check is right to refuse
+/// it; the fixture used for a serving boot is [Glm5NextConfig::serving_fixture].
 #[test]
-fn a_small_checkpoint_opens_through_the_engine_builder() {
+fn the_small_fixture_is_refused_by_the_serving_boot_check() {
+    let config = Glm5NextConfig::small();
+    let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
+        .expect("the small plan builds");
+    let tensors = ArchitectureTensorPlan::served_and_mtp(&config.architecture, plan.tp())
+        .expect("the shared tensor plan builds");
+    let source = Specs::new(tensors.plan().specs());
+    let error = PartsDeviceRank::open(&plan, &source, PlanContext::SM121_CATALOGUE)
+        .expect_err("the 256-wide fixture is not a serving shape");
+    let text = error.to_string();
+    assert!(
+        text.contains("hidden 256 does not equal 4096") && text.contains("glm_prefill_sm121"),
+        "the refusal names the fixture's width and the body it is short of: {text}"
+    );
+}
+
+#[test]
+fn a_serving_fixture_opens_through_the_engine_builder() {
     if sparkflash_kernels::cuda_driver::Cuda::load().is_err() {
         eprintln!("skipped: no CUDA driver");
         return;
     }
-    let config = Glm5NextConfig::small();
+    let config = Glm5NextConfig::serving_fixture();
     let checkpoint = tempfile::tempdir().expect("a temporary directory");
     write_synthetic_checkpoint(checkpoint.path(), &config, 7, 1).expect("the fixture writes");
     let source = SafeTensorsSource::open(checkpoint.path(), &checkpoint.path().join(INDEX_NAME))

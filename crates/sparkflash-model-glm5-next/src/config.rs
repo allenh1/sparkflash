@@ -570,6 +570,42 @@ impl Glm5NextConfig {
         config
     }
 
+    /// The synthetic fixture at the serving catalogue's geometry, for the generated conformance
+    /// checks and the shared `EngineBuilder` boot: [Self::small]'s four layers at the widths
+    /// the catalogue's GLM entries are compiled for.
+    ///
+    /// [Self::small] is the smallest geometry the arm's own kernels take, but the shared boot
+    /// check is stricter: GLM's dense and expert entries are the released 4,096-wide bodies.
+    #[must_use]
+    pub fn serving_fixture() -> Self {
+        let mut config = Self::small();
+        config.hidden_size = 4096;
+        config.vocab_size = 256;
+        config.n_routed_experts = 288;
+        config.num_experts_per_tok = 8;
+        let architecture = &mut config.architecture;
+        architecture.hidden_size = 4096;
+        architecture.vocab_size = 256;
+        for layer in &mut architecture.layers {
+            layer.attention.head_dim = 128;
+            if let sparkflash_model::architecture::AttentionKind::Mla { v_head_dim, .. } =
+                &mut layer.attention.kind
+            {
+                *v_head_dim = 128;
+            }
+            if let Some(indexer) = &mut layer.attention.indexer {
+                indexer.head_dim = 128;
+            }
+            if let sparkflash_model::architecture::Ffn::Moe(moe) = &mut layer.ffn {
+                moe.routed_experts = 288;
+                moe.active_experts = 8;
+                moe.intermediate = 512;
+                moe.shared_intermediate = 512;
+            }
+        }
+        config
+    }
+
     /// The decoder layers as the shared layer walk, in forward order.
     ///
     /// This is the plan the device uploader selects each layer's branch and FFN from; it reads
