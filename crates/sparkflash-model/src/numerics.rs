@@ -410,6 +410,22 @@ impl fmt::Display for ConfigKey {
     }
 }
 
+/// An owner's recorded approval of one declared change (docs/NUMERICS.md §5).
+///
+/// It sits beside the version it let land and is part of the record, like the version:
+/// `scripts/numerics.py ci` refuses its removal, and a bump that lands under it still needs the
+/// declared change, the report and the model's anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approval {
+    /// The decision the approval records, one line naming it.
+    pub decision: String,
+    /// The day it was taken (YYYY-MM-DD).
+    pub date: String,
+    /// The report that justifies the change, relative to the repository root.
+    pub report: String,
+}
+
 /// A configuration's declared numerics: the version it serves and the reference that proves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -444,6 +460,9 @@ pub struct ConfigEntry {
     /// What a reader should know about this entry.
     #[serde(default)]
     pub note: Option<String>,
+    /// The owner's recorded approval of the change this version declared, if it landed under one.
+    #[serde(default)]
+    pub approved: Option<Approval>,
 }
 
 impl ConfigEntry {
@@ -614,6 +633,9 @@ impl Registry {
                     "{key}: report {report:?} is not under docs/numerics/"
                 )));
             }
+            if let Some(approved) = &entry.approved {
+                check_approval(&key, approved)?;
+            }
             if let Some(retired) = self.retired.iter().find(|retired| retired.key() == key)
                 && entry.version <= retired.version
             {
@@ -734,17 +756,48 @@ fn check_reference(
             )));
         }
     }
-    let date = captured.as_bytes();
-    let well_formed = date.len() == 10
+    if !is_date(captured) {
+        return Err(NumericsError::Invalid(format!(
+            "{key}: captured {captured:?} is not a YYYY-MM-DD date"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a string is a YYYY-MM-DD date: the shape both `captured` and an approval's `date` take.
+fn is_date(text: &str) -> bool {
+    let date = text.as_bytes();
+    date.len() == 10
         && date[4] == b'-'
         && date[7] == b'-'
         && date
             .iter()
             .enumerate()
-            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit());
-    if !well_formed {
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+}
+
+/// Refuse an approval that is not a usable record.
+fn check_approval(key: &ConfigKey, approval: &Approval) -> Result<(), NumericsError> {
+    if approval.decision.trim().is_empty() {
         return Err(NumericsError::Invalid(format!(
-            "{key}: captured {captured:?} is not a YYYY-MM-DD date"
+            "{key}: approved.decision is empty"
+        )));
+    }
+    if approval.decision.contains('\n') {
+        return Err(NumericsError::Invalid(format!(
+            "{key}: approved.decision is not one line"
+        )));
+    }
+    if !is_date(&approval.date) {
+        return Err(NumericsError::Invalid(format!(
+            "{key}: approved.date {:?} is not a YYYY-MM-DD date",
+            approval.date
+        )));
+    }
+    if !approval.report.starts_with("docs/numerics/") {
+        return Err(NumericsError::Invalid(format!(
+            "{key}: approved.report {:?} is not under docs/numerics/",
+            approval.report
         )));
     }
     Ok(())
@@ -854,6 +907,11 @@ impl NumericsIdentity {
                     evidence_name(entry.evidence)
                 ));
             }
+            // Appended: the existing fields keep their order, and a reader sees that this version
+            // landed under an owner's approval and when it was taken.
+            if let Some(approved) = &entry.approved {
+                line.push_str(&format!(" approved={}", approved.date));
+            }
         }
         if !self.overrides.is_empty() {
             line.push_str(&format!(" overrides={}", self.overrides.join(",")));
@@ -875,6 +933,7 @@ impl NumericsIdentity {
             "registered_version": entry.map(|entry| entry.version),
             "fingerprint": entry.and_then(|entry| entry.fingerprint.as_deref()),
             "evidence": entry.map(|entry| evidence_name(entry.evidence)),
+            "approved": entry.and_then(|entry| entry.approved.as_ref()),
             "world": self.key.world,
             "plan": self.key.plan,
             "arch": self.key.arch,
@@ -931,7 +990,74 @@ mod tests {
         assert_eq!(card["status"], "registered");
         assert_eq!(card["version"], 1);
         assert_eq!(card["fingerprint"], FINGERPRINT);
+        assert_eq!(card["approved"], Value::Null);
         assert!(identity.boot_line().contains("status=registered"));
+        assert!(!identity.boot_line().contains("approved="));
+    }
+
+    #[test]
+    fn a_recorded_approval_parses_and_is_reported() {
+        let approved = "approved = { decision = \"The owner's recorded decision\", \
+                        date = \"2026-11-18\", report = \"docs/numerics/qwen/v2-approval.md\" }\n";
+        let registry = Registry::from_toml(&registry_with(&entry(
+            2,
+            &format!("report = \"docs/numerics/qwen/v2.md\"\n{approved}"),
+        )))
+        .expect("an entry may carry its owner's approval");
+        let key = ConfigKey::tp(QWEN, 4, NumericsProfile::Reference, "sm_121a");
+        let identity = NumericsIdentity::resolve(&registry, key, |_| None);
+        let card = identity.card();
+        assert_eq!(card["approved"]["date"], "2026-11-18");
+        assert_eq!(
+            card["approved"]["decision"],
+            "The owner's recorded decision"
+        );
+        assert_eq!(
+            card["approved"]["report"],
+            "docs/numerics/qwen/v2-approval.md"
+        );
+        assert!(
+            identity.boot_line().ends_with(" approved=2026-11-18"),
+            "{}",
+            identity.boot_line()
+        );
+        assert!(identity.boot_line().contains("fingerprint="));
+    }
+
+    #[test]
+    fn a_malformed_approval_is_refused() {
+        let key = ConfigKey::tp(QWEN, 4, NumericsProfile::Reference, "sm_121a");
+        let refusal = |decision: &str, date: &str, report: &str| {
+            format!(
+                "report = \"docs/numerics/qwen/v2.md\"\n\
+                 approved = {{ decision = {decision:?}, date = {date:?}, report = {report:?} }}\n"
+            )
+        };
+        let cases = [
+            (
+                refusal("  ", "2026-11-18", "docs/numerics/qwen/a.md"),
+                "approved.decision is empty",
+            ),
+            (
+                refusal("a\nb", "2026-11-18", "docs/numerics/qwen/a.md"),
+                "one line",
+            ),
+            (
+                refusal("a decision", "18-11-2026", "docs/numerics/qwen/a.md"),
+                "YYYY-MM-DD",
+            ),
+            (
+                refusal("a decision", "2026-11-18", "numerics/a.md"),
+                "under docs/numerics/",
+            ),
+        ];
+        for (extra, needle) in cases {
+            let error = Registry::from_toml(&registry_with(&entry(2, &extra)))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{needle}: {error}");
+            assert!(error.contains(&key.to_string()), "{error}");
+        }
     }
 
     #[test]
