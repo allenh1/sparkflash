@@ -385,6 +385,35 @@ impl Clock for InjectedClock {
     }
 }
 
+/// A monotonic wall clock since it was constructed: the live path's clock when a trace is asked
+/// for. The trace stores what this returns, never `Instant::elapsed` itself, so a replay can
+/// supply [InjectedClock] in its place and the decisions compare as decisions.
+#[derive(Debug)]
+pub struct WallClock {
+    origin: std::time::Instant,
+}
+
+impl WallClock {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for WallClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for WallClock {
+    fn now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+}
+
 /// One scheduler decision, as the trace records it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -507,6 +536,52 @@ impl TickTrace {
             );
         }
         out
+    }
+}
+
+/// A live trace: the scheduler's decisions, the `Clock` that timed them, and the file they are
+/// written to. The live path holds one only when `SPARKFLASH_TICK_TRACE` names a path; when it is
+/// absent there is no allocation, no clock read and one `Option` branch a decision.
+pub struct TraceSink {
+    trace: TickTrace,
+    clock: Box<dyn Clock>,
+    path: std::path::PathBuf,
+    failed: bool,
+}
+
+impl TraceSink {
+    #[must_use]
+    pub fn new(path: impl Into<std::path::PathBuf>, clock: Box<dyn Clock>) -> Self {
+        Self {
+            trace: TickTrace::new(),
+            clock,
+            path: path.into(),
+            failed: false,
+        }
+    }
+
+    /// Records a decision at the clock's reading. The tick number is the caller's (the scheduler's
+    /// own tick counter), not the trace's entry index.
+    pub fn record(&mut self, tick: u64, decision: Decision) {
+        let clock_ms = self.clock.now_ms();
+        self.trace.record(tick, clock_ms, decision);
+    }
+
+    #[must_use]
+    pub fn trace(&self) -> &TickTrace {
+        &self.trace
+    }
+
+    /// Writes the trace as it stands, once a tick: a serving epoch that is still up has a file
+    /// that matches the decisions it has already made, and a crash loses at most the tick in
+    /// flight. A write failure is reported once, not once a tick.
+    pub fn flush(&mut self) {
+        if let Err(error) = std::fs::write(&self.path, self.trace.render())
+            && !self.failed
+        {
+            self.failed = true;
+            eprintln!("sparkflash: tick trace {}: {error}", self.path.display());
+        }
     }
 }
 
@@ -1091,6 +1166,43 @@ mod tests {
             decode_plan(2, false, Some(0.2), false, 64),
             DecodePlan::Plain { groups: 1 }
         );
+    }
+
+    #[test]
+    fn a_trace_sink_takes_the_clock_it_is_given_and_writes_what_it_recorded() {
+        let path = std::env::temp_dir().join(format!(
+            "sparkflash-tick-trace-{}-{}.txt",
+            std::process::id(),
+            0
+        ));
+        let mut sink = TraceSink::new(&path, Box::new(InjectedClock::new(100)));
+        sink.record(7, Decision::Hold { hold: true });
+        sink.record(
+            8,
+            Decision::Place {
+                seq: 1,
+                lane: 2,
+                shared: 3,
+                start: 4,
+                target: 5,
+                bulk: true,
+            },
+        );
+        let entries = sink.trace().entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].tick, 7);
+        // The clock is the injected one, not the host's wall time.
+        assert_eq!(entries[0].clock_ms, 100);
+        assert_eq!(entries[1].clock_ms, 100);
+        sink.flush();
+        let written = std::fs::read_to_string(&path).expect("the sink wrote its file");
+        assert_eq!(written, sink.trace().render());
+        assert!(written.contains("t=7 clock=100 hold 1"));
+        assert!(
+            written
+                .contains("t=8 clock=100 place seq=1 lane=2 shared=3 start=4 target=5 path=bulk")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
