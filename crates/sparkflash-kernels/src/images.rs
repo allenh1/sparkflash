@@ -289,7 +289,9 @@ impl Image {
             ],
             Self::Qwen4Prefill => &[
                 "q4p_dense_fp8",
+                "q4p_dense_fp8_rows",
                 "q4p_dense_mma",
+                "q4p_dense_packed_rows",
                 "q4p_dense_rows",
                 "q4p_epilogue",
                 "q4p_gemm_rows",
@@ -363,6 +365,7 @@ impl Image {
                 "glm_moe_swiglu_q8",
             ],
             Self::GlmDecode => &[
+                "glm_decode_fp8b128_rows",
                 "q4e_expert_gemv_e4m3_block",
                 "q4e_gemv_tiled_bf16_parts",
                 "q4e_gemv_tiled_e4m3_block",

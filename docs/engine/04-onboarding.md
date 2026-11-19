@@ -629,8 +629,9 @@ yet. The rank openers did not leave `serve.rs` in this commit; that is phase 6.
 
 * The compute class, the catalogue assertion and its first `WAIVERS` table.
 * Row dispatch in `sparkflash-ops`, with each released arm's thresholds as its legacy policy.
-* The shared token bodies: Qwen's BF16 and NVFP4, DeepSeek's MX FP8, and the two to write (FP8
-  E4M3, packed BF16).
+* The shared token bodies: Qwen's BF16 and NVFP4, DeepSeek's MX FP8, and the two written in
+  this phase's kernel half (FP8 E4M3, packed BF16); see
+  [The two token bodies that were missing](#the-two-token-bodies-that-were-missing) below.
 * `Mat<F>`, the checking uploader, bound handles and the boot format ledger, used by all new
   shared code.
 * DeepSeek's uncatalogued symbols enter the catalogue (mechanism 7, step 2).
@@ -671,6 +672,38 @@ with real weights is a better test bed for it than a fixture.
 Expect the one-row step to be flat or slightly slower and the several-row step to be faster, as
 on DeepSeek and Qwen. An arm whose one-row step loses more than its few-row twin can win back
 keeps a waiver for that row band, with the number.
+
+#### The two token bodies that were missing
+
+The phase-3 bullet's FP8 E4M3 and packed BF16 token bodies are written and catalogued:
+
+* `q4p_dense_fp8_rows` (Qwen's bf16 128 x 128 block scales) and `glm_decode_fp8b128_rows`
+  (GLM's f32 ones) instantiate the shared tile's few-row form
+  (`shared_prefill_mma_rows_body` in `kernels/shared_prefill_mma_sm121.cuh`): one CTA of
+  four warps, an m16 x n8 tile each, over one to eight token rows. The chain is
+  `shared_prefill_mma_body`'s: the same E4M3 to bf16 words, the head MMA and then the
+  remainder MMA for each 16-column step with K ascending, and the 128-column block's scale
+  folded into the total in ascending block order. The GLM body is in the GLM decode image; the
+  Qwen body is in the prefill image beside `q4p_dense_fp8`.
+* `q4p_dense_packed_rows` stages the packed form's tiled layout (plane A, plane B, the step's
+  top, the escape list) chunk by chunk into the same few-row tile, so a packed row is the BF16
+  tile's row from three quarters of the bytes.
+
+The catalogue carries them as `ComputeClass::TensorCore` on the token pass's one-to-eight row
+band (`tc_token`), on the `DenseGemm` entries of `Qwen4Prefill` and `GlmDecode`. The first
+`WAIVERS` table's row-GEMV lines are unchanged: they name the arms' present dispatch, and the
+new bodies are token-pass only, not the both-pass body a waiver line could be deleted for.
+
+`crates/sparkflash-kernels/tests/token_bodies_device.rs` is the gate: at 1, 2, 4 and 8 rows,
+on a shape the tile covers (256 x 512, and a 96-column partial tile) and one it does not (40
+columns, where the tile's 32-column grid loses columns 32..39), the token body's row is the
+tile's row bit for bit. The packed case also checks the copy unpacks to the BF16 rows word for
+word. Both pass on the sm_121a device (CUDA 13.4).
+
+**Speed: unmeasured.** Whether the one-, two-, four- or eight-row launch is faster, slower or
+equal to the row GEMV it replaces is not known: no cluster was available for an A/B, so no
+number is recorded rather than an invented one. Phase 5's per-arm change is where that
+measurement is taken; the gate here is the bits.
 
 ### Phase 6: DeepSeek's scheduler becomes the runtime's engine. Bit-neutral. L
 
