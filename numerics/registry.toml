@@ -141,7 +141,8 @@ arch = "sm_121a"
 version = 1
 evidence = "logprobs"
 captured = "2026-11-18"
-note = "Registered, not yet captured; the four-rank device group's first reference is phase 5's."
+report = "docs/numerics/inkling2/v1-few-row-decode.md"
+note = "Registered, not yet captured; the four-rank device group's first reference is phase 5's. Its decode head and its one-to-eight-row experts now run the prompt tiles' bodies (q4p_dense_rows; q4p_moe_rows_gate_up_capped/_down, and the MXFP8 tile), which v1-few-row-decode.md declares. Version 1 is the first reference and is that arithmetic; no reference or fingerprint is invented until the capture."
 
 [[config]]
 model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
@@ -152,7 +153,8 @@ arch = "sm_121a"
 version = 1
 evidence = "logprobs"
 captured = "2026-11-18"
-note = "Registered, not yet captured; the four-rank recurrence ring's first reference is phase 5's."
+report = "docs/numerics/dory10/v1-few-row-decode.md"
+note = "Registered, not yet captured; the four-rank recurrence ring's first reference is phase 5's. Its one-to-eight-row projections now run the wide tile's few-row body (q4p_dense_rows, packed copies included), which v1-few-row-decode.md declares. Version 1 is the first reference and is that arithmetic; no reference or fingerprint is invented until the capture."
 
 [[anchor]]
 model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
