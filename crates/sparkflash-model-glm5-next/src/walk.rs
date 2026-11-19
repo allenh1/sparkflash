@@ -865,9 +865,92 @@ impl GlmWalk {
 #[cfg(test)]
 mod tests {
     use sparkflash_model::ledger::Strategy;
-    use sparkflash_runtime::{Mode, Walk, ledger_for};
+    use sparkflash_runtime::{Fixture, Mode, Walk, WalkFixture, ledger_for};
 
     use super::*;
+
+    /// The stored bytes a token pass must read at this rank, and the bytes the fixture's plan
+    /// says a token reads once the routed experts pay their top-k share. The floor is every
+    /// non-expert weight, which a token reads whatever it routes.
+    fn token_bytes(
+        architecture: &sparkflash_model::Architecture,
+        experts: usize,
+        top_k: usize,
+    ) -> Result<(u64, u64), BackendError> {
+        let tp = sparkflash_model::TpPlan::new(1, 0)
+            .map_err(|error| BackendError::new("fixture", error.detail))?;
+        let tensors =
+            sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served_and_mtp(architecture, tp)
+                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+        let total = u64::try_from(tensors.rank_bytes()).unwrap_or(u64::MAX);
+        let expert = u64::try_from(tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts))
+            .unwrap_or(u64::MAX);
+        let floor = total.saturating_sub(expert);
+        let share = if experts == 0 {
+            0
+        } else {
+            expert.saturating_mul(top_k as u64) / experts as u64
+        };
+        Ok((floor.saturating_add(share), floor))
+    }
+
+    /// The stored format names the fixture's classes use.
+    fn format_rule(
+        format: sparkflash_model::architecture::WeightFormat,
+    ) -> sparkflash_runtime::FormatRule {
+        use sparkflash_model::architecture::WeightFormat;
+        let name = match format {
+            WeightFormat::Bf16 => "BF16",
+            WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
+            WeightFormat::MxFp8 { .. } => "MX FP8",
+            WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
+        };
+        sparkflash_runtime::FormatRule::stored(name)
+    }
+
+    /// The GLM fixture: the synthetic `small` checkpoint, opened through the arm's own TP=1
+    /// constructor. It is a real checkpoint in the released storage formats, not a served image.
+    impl WalkFixture for GlmWalk {
+        fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
+            if world > 1 {
+                return Err(BackendError::new(
+                    "group",
+                    "the GLM fixture is one rank; TP 2 and TP 4 need a four-rank group",
+                ));
+            }
+            let config = crate::Glm5NextConfig::small();
+            let directory = tempfile::tempdir()
+                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+            crate::checkpoint::write_synthetic_checkpoint(directory.path(), &config, 7, 1)
+                .map_err(|error| BackendError::new("fixture", error))?;
+            let cuda = sparkflash_kernels::cuda_driver::Cuda::load()
+                .map_err(|error| BackendError::new("fixture", format!("CUDA: {error}")))?;
+            let backend = crate::Glm5NextDeviceBackend::open_single_rank(
+                std::sync::Arc::new(crate::device::CudaHandle::new(cuda)),
+                config.clone(),
+                directory.path(),
+                config.max_position_embeddings,
+            )?;
+            let walk = backend.walk_arm()?;
+            let (bytes, floor) = token_bytes(
+                &config.architecture,
+                config.n_routed_experts,
+                config.num_experts_per_tok,
+            )?;
+            let formats = vec![
+                format_rule(config.architecture.quantization.dense_format),
+                format_rule(config.architecture.quantization.expert_format),
+            ];
+            Ok(Fixture::new(
+                walk,
+                "the GLM-5.3 synthetic small checkpoint",
+                bytes,
+                floor,
+                formats,
+                Some(Box::new(directory)),
+            ))
+        }
+    }
 
     /// The four compute rows the walk declares are the arm's static declaration, so the boot
     /// ledger and **sparkflash arms --ledger** cannot drift.

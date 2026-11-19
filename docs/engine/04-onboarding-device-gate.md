@@ -98,3 +98,39 @@ Every command ran with `--test-threads=1`. Logs and exit codes are in
 The device only changes the runner: the one-row GLM verify, the joint-member verify, Qwen's
 joint-off lane walk, dense's head and the two token bodies are all confirmed. The arm-level
 claims that need weights (registry-exact tokens, speed A/B) remain for a checkpoint-backed host.
+
+## The conformance runner, after mechanism 6
+
+The seven checks above were stubs at that tip. Now each arm supplies a `WalkFixture`, and
+`run_check` boots it. The run at `84f8e1e8` on the same aarch64 host, every command with
+`--test-threads=1`:
+
+| Arm | Command | Result |
+|---|---|---|
+| runtime | `cargo test -p sparkflash-runtime --lib conformance:: -- --ignored --nocapture` | 5 PASS; `drafted = plain` SKIP (the toy walk has no drafter); `TP 1 = TP 2 = TP 4` SKIP: `TP 2: the toy walk has one rank; there is no TP group` |
+| GLM | `cargo test -p sparkflash-model-glm5-next --lib conformance:: -- --ignored --nocapture` | 7 passed: whole prompt / alone = four / continued = cold / rewound = cold / no unrecorded widening / drafted = plain PASS; TP SKIP for the missing group |
+| Qwen | `cargo test -p sparkflash-model-qwen4-exp --lib conformance:: -- --ignored --nocapture` | 7 passed, same five plus drafted = plain PASS; TP SKIP for the missing group |
+| Inkling | `cargo test -p sparkflash-model-inkling2 --lib conformance:: -- --ignored --nocapture` | 7 passed, same five plus drafted = plain PASS; TP SKIP for the missing group |
+| dense | `SPARKFLASH_CONFORMANCE_CHECKPOINT=... cargo test -p sparkflash-model-dense --lib conformance:: -- --ignored --nocapture` | 5 PASS; drafted = plain SKIP (dense declares no drafter); TP SKIP |
+| GLM builder | `cargo test -p sparkflash-model-glm5-next --test engine_builder a_serving_fixture_passes_the_boot_check_and_opens -- --nocapture` | PASS: `serving_fixture` passes `PartsDeviceRank::open` and opens the arm on the same plan |
+
+The fixture notes that matter:
+
+* GLM's and Qwen's conformance fixtures are their existing synthetic checkpoints, opened through
+  the arm's own TP=1 constructor. Qwen's is the Qwen3.5-MoE spelling: the Qwen3.8 spelling is
+  the canonical target, so the hub cache's 2,560-wide DFlash 2 drafter was loaded into the
+  128-wide fixture and refused. The Qwen3.5 spelling with FP8 experts has no cache drafter and
+  still runs the round through its MTP stage.
+* Inkling's fixture is `TinySource`; its bytes-per-token floor is the uploaded weight bytes,
+  because the shared tensor plan does not spell Inkling's block-attention residual.
+* dense's fixture is the checkpoint `scripts/dense-synthetic-checkpoint.py` writes, named by
+  `SPARKFLASH_CONFORMANCE_CHECKPOINT`. Without it the check prints `NEEDS-FIXTURE` and
+  `onboard-gate.sh` fails; it does not pass silently.
+* The tiny/small engine-builder fixtures were below the catalogue's released geometry. The check
+  was right and the fixture was wrong: `Glm5NextConfig::serving_fixture` and
+  `Qwen4ExpConfig::serving_fixture` are one decoder layer at the boots' widths and routed
+  shapes, and the tiny refusal is pinned by its own test.
+
+Still not shown: TP 2 and TP 4 (one GPU, no group), and a released checkpoint's bits (none on
+the host). The Qwen serving-builder rerun was in flight when the host became unreachable; the CPU
+half (the tiny refusal and the serving fixture's plan) is green.

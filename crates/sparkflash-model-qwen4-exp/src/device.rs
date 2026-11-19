@@ -2858,6 +2858,16 @@ impl Qwen4ExpDeviceBackend {
         Ok(self.lanes(batch::MAX_BATCH)?.limits().members)
     }
 
+    /// The same rank as a bare walk, for the generated conformance checks: they open the
+    /// runtime themselves so a check can drive a prompt, a continued turn and a rewind.
+    ///
+    /// # Errors
+    /// A configuration the walk cannot honour, or a token pass whose buffers have no room.
+    #[cfg(test)]
+    fn walk_arm(&self, capacity: usize) -> Result<walk::QwenWalk, BackendError> {
+        walk::QwenWalk::new(Arc::clone(&self.shared), self.context_limit, capacity)
+    }
+
     /// What the group's frames carry and rank 0 refuses: the arm serves text.
     fn wire(&self) -> sparkflash_runtime::TextWire {
         sparkflash_runtime::TextWire::new("qwen", "Qwen", self.context_limit)

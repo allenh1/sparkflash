@@ -361,6 +361,16 @@ impl Glm5NextDeviceBackend {
         Ok(self.lanes()?.limits().members)
     }
 
+    /// The same rank as a bare walk, for the generated conformance checks: they open the
+    /// runtime themselves so a check can drive a prompt, a continued turn and a rewind.
+    ///
+    /// # Errors
+    /// A poisoned rank lock, or a rank whose cache plan cannot be read.
+    #[cfg(test)]
+    pub(crate) fn walk_arm(&self) -> Result<GlmWalk, BackendError> {
+        GlmWalk::new(Arc::clone(&self.shared), self.context_limit)
+    }
+
     /// Whether this backend steps its sessions together.
     #[must_use]
     pub fn fused(&self) -> bool {

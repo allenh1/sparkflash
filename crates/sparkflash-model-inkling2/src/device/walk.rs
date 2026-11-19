@@ -983,13 +983,67 @@ impl Walk for InklingWalk {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use sparkflash_model::ledger::Strategy;
-    use sparkflash_runtime::{ChunkPolicy, Walk, ledger_for};
+    use sparkflash_runtime::{ChunkPolicy, Fixture, Walk, WalkFixture, ledger_for};
 
     use super::super::{
         DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, MAX_PREFILL_CHUNK,
     };
     use super::*;
+
+    /// The stored format names the fixture's classes use.
+    fn format_rule(
+        format: sparkflash_model::architecture::WeightFormat,
+    ) -> sparkflash_runtime::FormatRule {
+        use sparkflash_model::architecture::WeightFormat;
+        let name = match format {
+            WeightFormat::Bf16 => "BF16",
+            WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
+            WeightFormat::MxFp8 { .. } => "MX FP8",
+            WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
+        };
+        sparkflash_runtime::FormatRule::stored(name)
+    }
+
+    /// The Inkling fixture: the tiny host fixture the device tests share, opened through the
+    /// arm's own TP=1 constructor.
+    impl WalkFixture for InklingWalk {
+        fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
+            if world > 1 {
+                return Err(BackendError::new(
+                    "group",
+                    "the Inkling fixture is one rank; TP 2 and TP 4 need a group",
+                ));
+            }
+            let config = crate::config::Inkling2Config::tiny();
+            let source = Arc::new(crate::fixture::tiny_source(&config));
+            let backend = crate::device::InklingDeviceBackend::open(
+                crate::descriptor(),
+                config.clone(),
+                source,
+                16,
+            )
+            .map_err(|error| BackendError::new("fixture", error))?;
+            let walk = backend.walk_arm()?;
+            // The shared tensor plan does not spell Inkling's block-attention residual, so the
+            // fixture's floor is the weights it uploaded: every dense weight is read a token.
+            let bytes = backend.weight_bytes() as u64;
+            let formats = vec![
+                format_rule(config.architecture.quantization.dense_format),
+                format_rule(config.architecture.quantization.expert_format),
+            ];
+            Ok(Fixture::new(
+                walk,
+                "the Inkling-2 tiny synthetic checkpoint",
+                bytes,
+                bytes,
+                formats,
+                None,
+            ))
+        }
+    }
 
     fn widths() -> ChunkWidths {
         ChunkWidths {

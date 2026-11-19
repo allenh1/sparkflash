@@ -1207,6 +1207,16 @@ impl DenseDeviceBackend {
         self.shared.weight_bytes
     }
 
+    /// The same rank as a bare walk, for the generated conformance checks: they open the
+    /// runtime themselves so a check can drive a prompt, a continued turn and a rewind.
+    ///
+    /// # Errors
+    /// A scratch allocation the device refuses.
+    #[cfg(test)]
+    pub(crate) fn walk_arm(&self, capacity: usize) -> Result<DenseWalk, BackendError> {
+        DenseWalk::new(Arc::clone(&self.shared), capacity)
+    }
+
     /// A session of its concrete type, for a caller that reads its per-layer trace.
     ///
     /// # Errors

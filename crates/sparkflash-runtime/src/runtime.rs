@@ -2469,5 +2469,72 @@ mod tests {
         drop(engine);
     }
 
+    /// The toy walk's fixture: the runtime's CPU walk, with no group on this host.
+    impl crate::WalkFixture for ToyWalk {
+        fn fixture(world: usize) -> Result<crate::Fixture<Self>, BackendError> {
+            if world > 1 {
+                return Err(BackendError::new(
+                    "group",
+                    "the toy walk has one rank; there is no TP group",
+                ));
+            }
+            Ok(crate::Fixture::new(
+                Self::new(8, 64),
+                "the runtime's toy walk",
+                4,
+                4,
+                Vec::new(),
+                None,
+            ))
+        }
+    }
+
+    /// The drafting toy's fixture: the rejecting chain, so the check covers a rejected draft.
+    impl crate::WalkFixture for DraftWalk {
+        fn fixture(world: usize) -> Result<crate::Fixture<Self>, BackendError> {
+            if world > 1 {
+                return Err(BackendError::new(
+                    "group",
+                    "the drafting toy walk has one rank; there is no TP group",
+                ));
+            }
+            Ok(crate::Fixture::new(
+                Self::rejecting(),
+                "the runtime's drafting toy walk (a rejected draft)",
+                4,
+                4,
+                Vec::new(),
+                None,
+            ))
+        }
+    }
+
+    /// Every generated check runs on the toy fixture; TP names its missing group rather than
+    /// passing vacuously.
+    #[test]
+    fn the_generated_checks_run_on_the_toy_fixture() {
+        use crate::{CheckOutcome, ConformanceCheck, run_check};
+        for check in [
+            ConformanceCheck::WholePromptEqualsChunked,
+            ConformanceCheck::AloneEqualsFour,
+            ConformanceCheck::ContinuedEqualsCold,
+            ConformanceCheck::RewoundEqualsCold,
+            ConformanceCheck::NoUnrecordedWidening,
+        ] {
+            let outcome = run_check::<ToyWalk>(check)
+                .unwrap_or_else(|error| panic!("{}: {}", check.name(), error.message()));
+            assert_eq!(outcome, CheckOutcome::Passed, "{}", check.name());
+        }
+        let tp = run_check::<ToyWalk>(ConformanceCheck::TpWithinExactness)
+            .expect("the TP check skips, it does not fail");
+        assert!(
+            matches!(&tp, CheckOutcome::Skipped(reason) if reason.contains("no TP group")),
+            "the TP check names its missing group: {tp:?}"
+        );
+        let drafted = run_check::<DraftWalk>(ConformanceCheck::DraftedEqualsPlain)
+            .expect("the drafting toy fixture runs");
+        assert_eq!(drafted, CheckOutcome::Passed);
+    }
+
     crate::conformance!(ToyWalk);
 }

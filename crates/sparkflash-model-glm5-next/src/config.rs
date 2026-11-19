@@ -570,6 +570,52 @@ impl Glm5NextConfig {
         config
     }
 
+    /// The synthetic fixture at the serving catalogue's geometry, for the generated conformance
+    /// checks and the shared `EngineBuilder` boot: [Self::small]'s four layers at the widths
+    /// the catalogue's GLM entries are compiled for.
+    ///
+    /// [Self::small] is the smallest geometry the arm's own kernels take, but the shared boot
+    /// check is stricter: GLM's dense and expert entries are the released 4,096-wide bodies.
+    #[must_use]
+    pub fn serving_fixture() -> Self {
+        let mut config = Self::tiny();
+        config.hidden_size = 4096;
+        config.vocab_size = 256;
+        config.num_hidden_layers = 1;
+        config.num_nextn_predict_layers = 0;
+        config.linear_head_dim = 128;
+        config.num_attention_heads = 4;
+        config.q_lora_rank = 128;
+        config.kv_lora_rank = 128;
+        config.qk_nope_head_dim = 128;
+        config.v_head_dim = 128;
+        config.intermediate_size = 512;
+        config.moe_intermediate_size = 512;
+        config.fp8_block = Some(128);
+        config.layer_types = vec![LayerKind::Linear];
+        config.mlp_layer_types = vec![MlpKind::Dense];
+        config.indexer_types = vec![IndexerKind::Full];
+        let architecture = &mut config.architecture;
+        architecture.hidden_size = 4096;
+        architecture.vocab_size = 256;
+        architecture.mtp = None;
+        architecture.quantization.block = Some(128);
+        architecture.layers.truncate(1);
+        for layer in &mut architecture.layers {
+            layer.attention.head_dim = 128;
+            if let sparkflash_model::architecture::AttentionKind::Kda(kda) =
+                &mut layer.attention.kind
+            {
+                kda.heads = 4;
+                kda.head_dim = 128;
+            }
+            if let sparkflash_model::architecture::Ffn::Dense(mlp) = &mut layer.ffn {
+                mlp.intermediate = 512;
+            }
+        }
+        config
+    }
+
     /// The decoder layers as the shared layer walk, in forward order.
     ///
     /// This is the plan the device uploader selects each layer's branch and FFN from; it reads
