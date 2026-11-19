@@ -2034,12 +2034,19 @@ me to solve a word problem step by step…"), which is what the Inkling check ta
 
 **Inkling-2-Small: structured, at the first decode row; a defect.** The same comparison gives mean
 NLL +5.824, top-1 **29.49%**, max 47.09, and the divergence is the *first decode position of
-every prompt* - the pre-change build puts essentially all mass on `<|message_model|>` (200001,
-logprob ~0) where the reference's argmax is content token 125148 at −1.156 and 200001 sits at
-−48.25. And the reference's eight generations decode to multilingual token soup, while the parent
-build produces a clean chat opener. So version 1 pinned degenerate output and `check` passing only
-proved the tip equals that capture. The fix and its GPU proof are the next section; version 1 will
-be re-declared from a clean build.
+every prompt*: the pre-change build puts essentially all mass on `<|message_model|>` (200001,
+logprob ~0) and puts content token 125148 at −48.25, while the reference's argmax is 125148 at
+−1.156. And the reference's eight generations decode to multilingual token soup, while the
+pre-change build produces a clean chat opener. So version 1 pinned degenerate output and `check`
+passing only proved the tip equals that capture. **Cause, found in `p5id-decode`:** Inkling packs
+its weights in place in the *row walk's* layout, but the few-row BF16 body decodes the *tiled*
+layout, and the head was routed to that body by shape alone (`Shared::dense_rows` filtered on
+columns, rows and alignment, never on the copy's layout). Plane A's walk offsets are
+`32·lane + 8·chunk` against the tiled `256·chunk + 8·lane`, so every head row rebuilt its chunks
+from another chunk's bytes - only lane 0, chunk 0 coincides - and the logits were garbage. The fix
+routes on the copy's layout and refuses the body for a walk-layout copy, so the head returns to
+`q4e_gemv_packed`; a same-class guard makes the few-row band's down grid tile the output rows.
+The GPU proof and version 1's re-declaration from a clean build are the next window's.
 
 **A blocker the GLM coverage sweep found.** The GLM recorder was wired (the `combine_experts`
 site) but the sweep wrote no dump at all: `scripts/serve-four-node.sh` starts every rank with an
