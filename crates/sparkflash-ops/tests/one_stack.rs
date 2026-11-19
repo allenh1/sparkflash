@@ -123,13 +123,14 @@ fn the_ops_crate_is_a_workspace_member() {
 /// Phase 4 moved DeepSeek's device forward out of the CLI and set the gate at 30k. Phase 5's
 /// zero-code dynamic HF seam (`serve/dynamic_host.rs`, `serve/dynamic.rs` and `dynamic.rs`,
 /// about 2.4k lines) landed inside `sparkflash-cli/src` because it reads `ServeOptions`, the
-/// pack registry and the shared architecture directly. The gate is 36,695 as measured at the
-/// phase-8 tip: 36,694 lines, one below the ratchet. The tip's own additions (the `arms`
-/// preview and ledger, the `onboard` command's 653 lines, the two leak tests and the `Arm`
-/// table's tests) are included. Phases 2 and 6 bring it down: the serving dispatch leaves the
+/// pack registry and the shared architecture directly. The gate is 36,981 as measured at the
+/// phase-1/5/7 tip: 36,980 lines, one below the ratchet. The tip's own additions (the `arms`
+/// preview and ledger, the `onboard` command's 653 lines, the two leak tests, the `Arm`
+/// table's tests, and the one pack identity and lane table that replaced the family variants,
+/// 285 lines) are included. Phases 2 and 6 bring it down: the serving dispatch leaves the
 /// CLI, and DeepSeek's 14,545-line serving path folds into the common entry. This is a raise
 /// with a named end, not a licence to grow.
-const CLI_SOURCE_LINE_LIMIT: usize = 36_695;
+const CLI_SOURCE_LINE_LIMIT: usize = 36_981;
 
 #[test]
 fn the_deepseek_forward_is_out_of_the_cli_and_the_cli_is_below_34k_lines() {
