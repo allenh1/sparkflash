@@ -35,17 +35,22 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
-use sparkflash_kernels::images::{dory_cubin, qwen4_exp_cubin, qwen4_prefill_cubin};
+use sparkflash_kernels::images::{Image, dory_cubin, qwen4_exp_cubin, qwen4_prefill_cubin};
 use sparkflash_model::ModelDescriptor;
 use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+use sparkflash_ops::formats::{Bf16, FormatKind, Mat, Scales, Tensor, upload as upload_format};
 use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement};
+use sparkflash_ops::plan::Precision;
+use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog};
 // dory_mma_wide's tile is the shared wide tile: its geometry, launch and when a projection
 // takes it are the dispatcher's.
 use sparkflash_ops::projection::{
     Route, WIDE_COLUMNS, WIDE_SHARED, WidePolicy, WideTile, route_bf16,
 };
 use sparkflash_ops::sampler::Sampler;
+#[cfg(test)]
+use sparkflash_weights::TensorSpec;
 use sparkflash_weights::safetensors::open_checkpoint;
 use sparkflash_weights::{DType, WeightSource};
 
@@ -62,10 +67,11 @@ const DEVICE: &str = "dory_device";
 /// kernel's bits. A prefill of one token keeps the token-at-a-time path.
 pub(crate) const PREFILL_BATCH: usize = 4096;
 
-/// One uploaded BF16 matrix.
-#[derive(Debug, Clone, Copy)]
+/// One uploaded BF16 matrix, with the typed upload that checked its stored dtype and shape.
+#[derive(Debug, Clone)]
 struct DeviceMat {
-    pointer: Deviceptr,
+    /// The typed matrix the launch arguments read their address from.
+    matrix: Mat<Bf16>,
     rows: usize,
     columns: usize,
     /// The same rows in the packed form ([sparkflash_ops::packed]), beside the BF16 rows the
@@ -73,8 +79,68 @@ struct DeviceMat {
     packed: Option<Packed>,
 }
 
+impl DeviceMat {
+    /// The device address the launch arguments carry: the typed matrix's data plane.
+    fn pointer(&self) -> Deviceptr {
+        self.matrix.data()
+    }
+
+    /// A matrix the tests place by hand, with a typed upload that agrees with its shape.
+    #[cfg(test)]
+    fn from_parts(pointer: Deviceptr, rows: usize, columns: usize, packed: Option<Packed>) -> Self {
+        let spec = TensorSpec {
+            name: "test".to_owned(),
+            dtype: DType::BF16,
+            shape: vec![rows, columns],
+        };
+        let matrix = upload_format::<Bf16>(Tensor {
+            stored: &spec,
+            shape: &[rows, columns],
+            data: pointer,
+            stride: columns * 2,
+            scales: Scales::none(),
+        })
+        .expect("the test matrix is BF16");
+        Self {
+            matrix,
+            rows,
+            columns,
+            packed,
+        }
+    }
+}
+
+/// The upload's running total and the boot format ledger's rows, in upload order.
+#[derive(Default)]
+struct Upload {
+    bytes: usize,
+    ledger: Vec<LedgerRow>,
+}
+
+impl std::ops::Deref for Upload {
+    type Target = usize;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl std::ops::DerefMut for Upload {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.bytes
+    }
+}
+
+impl Upload {
+    /// One part's ledger row: it was read at the format it is stored as.
+    fn record(&mut self, name: &str, format: FormatKind, bytes: u128) {
+        self.ledger
+            .push(LedgerRow::new(name, format, format, bytes));
+    }
+}
+
 /// One attention sublayer's device weights.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DeviceAttention {
     q: DeviceMat,
     k: DeviceMat,
@@ -87,7 +153,7 @@ struct DeviceAttention {
 }
 
 /// One MLP sublayer's device weights.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DeviceMlp {
     gate: DeviceMat,
     up: DeviceMat,
@@ -98,7 +164,7 @@ struct DeviceMlp {
 }
 
 /// One physical block's device weights.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DeviceBlock {
     attention: DeviceAttention,
     mlp: DeviceMlp,
@@ -236,26 +302,109 @@ impl DoryStage {
     }
 }
 
+/// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
+/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
+/// than a name it looked up.
+#[derive(Clone, Copy)]
+struct Bound {
+    /// The loaded driver function.
+    kernel: Kernel,
+}
+
+impl Bound {
+    /// Resolve a symbol in an image at a precision and load it.
+    ///
+    /// # Errors
+    /// A symbol the image does not export, one the catalogue does not carry at this precision,
+    /// or the driver's load refusal.
+    fn new(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+    ) -> Result<Self, String> {
+        if !image.exported_symbols().contains(&symbol) {
+            return Err(format!("{} does not export {symbol}", image.name()));
+        }
+        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
+            entry.image == image
+                && entry
+                    .symbols
+                    .iter()
+                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
+        });
+        if !carried {
+            return Err(format!(
+                "the catalogue carries no {symbol} in {} accepting {}",
+                image.name(),
+                precision.name()
+            ));
+        }
+        let (_, kernel) = cuda.load_named(cubin, symbol)?;
+        Ok(Self { kernel })
+    }
+
+    /// Self::new for a body loaded with a dynamic shared-memory reservation.
+    ///
+    /// # Errors
+    /// As Self::new, or the driver's attribute call.
+    fn shared(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+        shared_bytes: u32,
+    ) -> Result<Self, String> {
+        if !image.exported_symbols().contains(&symbol) {
+            return Err(format!("{} does not export {symbol}", image.name()));
+        }
+        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
+            entry.image == image
+                && entry
+                    .symbols
+                    .iter()
+                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
+        });
+        if !carried {
+            return Err(format!(
+                "the catalogue carries no {symbol} in {} accepting {}",
+                image.name(),
+                precision.name()
+            ));
+        }
+        let (_, kernel) = cuda.load_named_shared(cubin, symbol, shared_bytes)?;
+        Ok(Self { kernel })
+    }
+}
+
+impl From<Bound> for Kernel {
+    fn from(bound: Bound) -> Self {
+        bound.kernel
+    }
+}
+
 /// The kernels this arm launches, loaded once.
 struct Kernels {
-    embed: Kernel,
-    gemv_bf16: Kernel,
-    gemv4_bf16: Kernel,
+    embed: Bound,
+    gemv_bf16: Bound,
+    gemv4_bf16: Bound,
     /// The wide tile's few-row BF16 body (`q4p_dense_rows`): a decode row is
     /// `dory_mma_wide`'s row, and the body takes the matrix's packed copy where there is one.
-    dense_rows: Kernel,
-    mma_wide: Kernel,
-    mma_wide4: Kernel,
-    rope_norm: Kernel,
-    rope_norm_lanes: Kernel,
-    attn_split: Kernel,
-    attn_combine: Kernel,
-    attn_mma: Kernel,
-    mlp_epilogue: Kernel,
-    slerp: Kernel,
-    loop_combine: Kernel,
-    justnorm: Kernel,
-    logit_scale: Kernel,
+    dense_rows: Bound,
+    mma_wide: Bound,
+    mma_wide4: Bound,
+    rope_norm: Bound,
+    rope_norm_lanes: Bound,
+    attn_split: Bound,
+    attn_combine: Bound,
+    attn_mma: Bound,
+    mlp_epilogue: Bound,
+    slerp: Bound,
+    loop_combine: Bound,
+    justnorm: Bound,
+    logit_scale: Bound,
     packed: packed::Kernels,
 }
 
@@ -452,8 +601,11 @@ impl DeviceShared {
         let form = Form::from_env()?;
         let kernels = Kernels::load(&cuda, config.head_dim)?;
         let source = open_checkpoint(directory).map_err(|error| error.to_string())?;
-        let mut total = 0usize;
+        let mut total = Upload::default();
         let weights = DeviceWeights::upload(&cuda, &config, &stage, &source, &mut total)?;
+        let ledger = FormatLedger::boot(total.ledger, &WidenLog::new())
+            .map_err(|error| error.to_string())?;
+        eprintln!("[dory] {ledger}");
         let mut shared = Self {
             cuda,
             kernels,
@@ -462,7 +614,7 @@ impl DeviceShared {
             config,
             stage,
             context,
-            allocated_bytes: total,
+            allocated_bytes: total.bytes,
         };
         shared.pack()?;
         Ok(shared)
@@ -475,14 +627,14 @@ impl DeviceShared {
         let matrices: Vec<_> = self
             .weights
             .projections()
-            .map(|matrix| (matrix.pointer, matrix.rows, matrix.columns))
+            .map(|matrix| (matrix.pointer(), matrix.rows, matrix.columns))
             .collect();
         let (_, packed_bytes) = self
             .packed
             .pack(&self.cuda, &self.kernels.packed, &matrices, 0)?;
         self.allocated_bytes += packed_bytes;
         for matrix in self.weights.projections() {
-            matrix.packed = self.packed.get(matrix.pointer);
+            matrix.packed = self.packed.get(matrix.pointer());
         }
         eprintln!("[dory] {}", self.packed.summary());
         Ok(())
@@ -513,8 +665,36 @@ impl Kernels {
     /// Every kernel, with the prefill attention instance for `head_dim` (one of
     /// PREFILL_HEAD_DIMS; attention_fits refuses the rest first).
     fn load(cuda: &Cuda, head_dim: usize) -> Result<Self, String> {
-        let named = |image: &'static [u8], name: &'static str| {
-            cuda.load_named(image, name).map(|(_, kernel)| kernel)
+        let token = |symbol: &'static str| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Exp,
+                qwen4_exp_cubin(),
+                symbol,
+                Precision::Bf16,
+            )
+        };
+        let prefill = |symbol: &'static str| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Prefill,
+                qwen4_prefill_cubin(),
+                symbol,
+                Precision::Bf16,
+            )
+        };
+        let dory = |symbol: &'static str| {
+            Bound::new(cuda, Image::Dory, dory_cubin(), symbol, Precision::Bf16)
+        };
+        let dory_shared = |symbol: &'static str, bytes: u32| {
+            Bound::shared(
+                cuda,
+                Image::Dory,
+                dory_cubin(),
+                symbol,
+                Precision::Bf16,
+                bytes,
+            )
         };
         let attn_mma = match head_dim {
             16 => "dory_attn_mma16",
@@ -526,28 +706,22 @@ impl Kernels {
         let shared = u32::try_from(prefill_attention_shared(head_dim))
             .map_err(|_| format!("{attn_mma}: shared memory past u32"))?;
         Ok(Self {
-            embed: named(qwen4_exp_cubin(), "q4e_embed")?,
-            gemv_bf16: named(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
-            gemv4_bf16: named(qwen4_exp_cubin(), "q4e_gemv4_bf16")?,
-            dense_rows: named(qwen4_prefill_cubin(), "q4p_dense_rows")?,
-            mma_wide: cuda
-                .load_named_shared(dory_cubin(), "dory_mma_wide", WIDE_SHARED)
-                .map(|(_, kernel)| kernel)?,
-            mma_wide4: cuda
-                .load_named_shared(dory_cubin(), "dory_mma_wide4", WIDE_SHARED)
-                .map(|(_, kernel)| kernel)?,
-            rope_norm: named(dory_cubin(), "dory_rope_norm")?,
-            rope_norm_lanes: named(dory_cubin(), "dory_rope_norm_lanes")?,
-            attn_split: named(dory_cubin(), "dory_attn_split")?,
-            attn_combine: named(dory_cubin(), "dory_attn_combine")?,
-            attn_mma: cuda
-                .load_named_shared(dory_cubin(), attn_mma, shared)
-                .map(|(_, kernel)| kernel)?,
-            mlp_epilogue: named(dory_cubin(), "dory_mlp_epilogue")?,
-            slerp: named(dory_cubin(), "dory_slerp")?,
-            loop_combine: named(dory_cubin(), "dory_loop_combine")?,
-            justnorm: named(dory_cubin(), "dory_justnorm")?,
-            logit_scale: named(dory_cubin(), "dory_logit_scale")?,
+            embed: token("q4e_embed")?,
+            gemv_bf16: token("q4e_gemv_bf16")?,
+            gemv4_bf16: token("q4e_gemv4_bf16")?,
+            dense_rows: prefill("q4p_dense_rows")?,
+            mma_wide: dory_shared("dory_mma_wide", WIDE_SHARED)?,
+            mma_wide4: dory_shared("dory_mma_wide4", WIDE_SHARED)?,
+            rope_norm: dory("dory_rope_norm")?,
+            rope_norm_lanes: dory("dory_rope_norm_lanes")?,
+            attn_split: dory("dory_attn_split")?,
+            attn_combine: dory("dory_attn_combine")?,
+            attn_mma: dory_shared(attn_mma, shared)?,
+            mlp_epilogue: dory("dory_mlp_epilogue")?,
+            slerp: dory("dory_slerp")?,
+            loop_combine: dory("dory_loop_combine")?,
+            justnorm: dory("dory_justnorm")?,
+            logit_scale: dory("dory_logit_scale")?,
             packed: packed::Kernels::load(cuda)?,
         })
     }
@@ -575,8 +749,8 @@ impl DeviceWeights {
 
     fn pointers(&self) -> Vec<Deviceptr> {
         let mut pointers: Vec<Deviceptr> = [
-            self.embed.map(|embed| embed.pointer),
-            self.lm_head.map(|head| head.pointer),
+            self.embed.as_ref().map(|embed| embed.pointer()),
+            self.lm_head.as_ref().map(|head| head.pointer()),
             self.logit_scale,
         ]
         .into_iter()
@@ -584,17 +758,17 @@ impl DeviceWeights {
         .collect();
         for block in self.blocks.iter().flatten() {
             pointers.extend([
-                block.attention.q.pointer,
-                block.attention.k.pointer,
-                block.attention.v.pointer,
-                block.attention.g.pointer,
-                block.attention.o.pointer,
+                block.attention.q.pointer(),
+                block.attention.k.pointer(),
+                block.attention.v.pointer(),
+                block.attention.g.pointer(),
+                block.attention.o.pointer(),
                 block.attention.sqk,
                 block.attention.s_gate,
                 block.attention.alpha,
-                block.mlp.gate.pointer,
-                block.mlp.up.pointer,
-                block.mlp.down.pointer,
+                block.mlp.gate.pointer(),
+                block.mlp.up.pointer(),
+                block.mlp.down.pointer(),
                 block.mlp.suv_gate,
                 block.mlp.suv_up,
                 block.mlp.alpha,
@@ -608,7 +782,7 @@ impl DeviceWeights {
         config: &DoryConfig,
         stage: &DoryStage,
         source: &dyn WeightSource,
-        total: &mut usize,
+        total: &mut Upload,
     ) -> Result<Self, String> {
         let hidden = config.hidden_size;
         let query_width = config.num_attention_heads * config.head_dim;
@@ -785,7 +959,7 @@ fn upload_matrix(
     name: &str,
     rows: usize,
     columns: usize,
-    total: &mut usize,
+    total: &mut Upload,
 ) -> Result<DeviceMat, String> {
     let spec = source.spec(name).map_err(|error| error.to_string())?;
     if spec.dtype != DType::BF16 || spec.shape != [rows, columns] {
@@ -804,8 +978,19 @@ fn upload_matrix(
     }
     let pointer = cuda.alloc(bytes.len(), total)?;
     cuda.copy_htod(&pointer, &bytes)?;
+    // The typed upload checks the container's stored dtype and shape again, and gives the
+    // format ledger row the matrix's own byte count.
+    let matrix = upload_format::<Bf16>(Tensor {
+        stored: &spec,
+        shape: &[rows, columns],
+        data: pointer,
+        stride: columns * 2,
+        scales: Scales::none(),
+    })
+    .map_err(|error| error.to_string())?;
+    total.record(name, FormatKind::Bf16, matrix.bytes_per_token());
     Ok(DeviceMat {
-        pointer,
+        matrix,
         rows,
         columns,
         packed: None,
@@ -817,7 +1002,7 @@ fn upload_vector(
     source: &dyn WeightSource,
     name: &str,
     width: usize,
-    total: &mut usize,
+    total: &mut Upload,
 ) -> Result<Deviceptr, String> {
     let spec = source.spec(name).map_err(|error| error.to_string())?;
     if spec.dtype != DType::BF16 || spec.shape != [width] {
@@ -836,6 +1021,9 @@ fn upload_vector(
     }
     let pointer = cuda.alloc(bytes.len(), total)?;
     cuda.copy_htod(&pointer, &bytes)?;
+    // A vector stays a Deviceptr: Mat has a row stride and a format's scale plane, and a
+    // one-dimensional norm, scale or alpha has neither. It is still a ledger row.
+    total.record(name, FormatKind::Bf16, (width * 2) as u128);
     Ok(pointer)
 }
 
@@ -2077,10 +2265,10 @@ fn embed_rows(
     cuda.make_current()
         .map_err(|error| BackendError::new(DEVICE, error))?;
     let config = &shared.config;
-    let embed = shared
-        .weights
-        .embed
-        .ok_or_else(|| BackendError::new(DEVICE, "the embedding belongs to recurrence rank 0"))?;
+    let embed =
+        shared.weights.embed.as_ref().ok_or_else(|| {
+            BackendError::new(DEVICE, "the embedding belongs to recurrence rank 0")
+        })?;
     for token in tokens {
         if *token as usize >= config.vocab_size {
             return Err(BackendError::new(
@@ -2095,7 +2283,7 @@ fn embed_rows(
     let hidden = config.hidden_size;
     for (offset, token) in tokens.iter().enumerate() {
         let call = sparkflash_ops::calls::embed(
-            embed.pointer.0,
+            embed.pointer().0,
             scratch.hidden.offset(offset * hidden * 4).0,
             *token,
             (hidden, hidden),
@@ -2202,7 +2390,7 @@ fn walk(
         }
         if let Some(head) = head {
             let (Some(lm_head), Some(logit_scale)) =
-                (shared.weights.lm_head, shared.weights.logit_scale)
+                (shared.weights.lm_head.as_ref(), shared.weights.logit_scale)
             else {
                 return Err(head_refusal());
             };
@@ -2215,7 +2403,7 @@ fn walk(
             gemv_batch(
                 cuda,
                 &shared.kernels,
-                &lm_head,
+                lm_head,
                 scratch.hidden.offset(head.start * hidden * 4),
                 scratch.logits,
                 head.len(),
@@ -2264,7 +2452,7 @@ fn dense_rows_fits(matrix: &DeviceMat, input: Deviceptr, batch: usize) -> bool {
         && matrix.rows.is_multiple_of(8)
         && matrix.columns.is_multiple_of(32)
         && input.0.is_multiple_of(8)
-        && matrix.pointer.0.is_multiple_of(8)
+        && matrix.pointer().0.is_multiple_of(8)
 }
 
 /// One to four projections of one `input` of `batch` rows through `q4p_dense_rows`, the wide
@@ -2289,7 +2477,7 @@ fn dense_rows(
     let mut columns = 0usize;
     for (slot, (matrix, output)) in projections.iter().enumerate() {
         args[7 + slot * 5..7 + slot * 5 + 5].copy_from_slice(&[
-            matrix.pointer.0,
+            matrix.pointer().0,
             output.0,
             output.0,
             matrix.rows as u64,
@@ -2325,7 +2513,7 @@ fn gemv_batch(
         // bits.
         Route::Wide => {
             let tile = WideTile::call(
-                matrix.pointer.0,
+                matrix.pointer().0,
                 input.0,
                 output.0,
                 matrix.rows,
@@ -2362,7 +2550,7 @@ fn gemv_batch(
         return launch(cuda, kernels.packed.gemv, call.grid, call.block, &call.args);
     }
     let call = sparkflash_ops::calls::gemv_bf16(
-        matrix.pointer.0,
+        matrix.pointer().0,
         input.0,
         output.0,
         (matrix.rows, matrix.columns),
@@ -2424,8 +2612,8 @@ fn gemv_group(
     let slot = |index: usize| {
         projections
             .get(index)
-            .map_or((first.pointer, 0, first_output), |(matrix, output)| {
-                (matrix.pointer, matrix.rows, *output)
+            .map_or((first.pointer(), 0, first_output), |(matrix, output)| {
+                (matrix.pointer(), matrix.rows, *output)
             })
     };
     let slots = [slot(0), slot(1), slot(2), slot(3)];
@@ -2557,11 +2745,12 @@ fn rope_norm(
 
 fn launch(
     cuda: &Cuda,
-    kernel: Kernel,
+    kernel: impl Into<Kernel>,
     grid: (u32, u32, u32),
     block: (u32, u32, u32),
     args: &[u64],
 ) -> Result<(), BackendError> {
+    let kernel = kernel.into();
     cuda.launch_async(kernel, grid, block, args)
         .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
 }
@@ -2584,12 +2773,7 @@ mod tests {
     /// activation keep the packed or BF16 row GEMV.
     #[test]
     fn the_decode_band_takes_the_wide_tiles_few_row_body_from_one_to_eight() {
-        let mat = |rows, columns| DeviceMat {
-            pointer: Deviceptr(0),
-            rows,
-            columns,
-            packed: None,
-        };
+        let mat = |rows, columns| DeviceMat::from_parts(Deviceptr(0), rows, columns, None);
         for rows in 1..=TOKEN_ROWS {
             assert!(
                 dense_rows_fits(&mat(4096, 4096), Deviceptr(0), rows),
@@ -3013,12 +3197,7 @@ mod tests {
                     let pointer = alloc(weights.len() * 2);
                     cuda.copy_htod(&pointer, &u16_bytes(&weights))
                         .expect("a matrix");
-                    DeviceMat {
-                        pointer,
-                        rows,
-                        columns,
-                        packed: None,
-                    }
+                    DeviceMat::from_parts(pointer, rows, columns, None)
                 })
                 .collect();
             let grouped: Vec<Deviceptr> = shape
@@ -3054,15 +3233,15 @@ mod tests {
             let mut set = PackedSet::new(Form::Packed, Placement::Beside);
             let list: Vec<_> = matrices
                 .iter()
-                .map(|matrix| (matrix.pointer, matrix.rows, matrix.columns))
+                .map(|matrix| (matrix.pointer(), matrix.rows, matrix.columns))
                 .collect();
             set.pack(&cuda, &kernels.packed, &list, 0)
                 .expect("the matrices pack");
             let packed: Vec<DeviceMat> = matrices
                 .iter()
                 .map(|matrix| DeviceMat {
-                    packed: set.get(matrix.pointer),
-                    ..*matrix
+                    packed: set.get(matrix.pointer()),
+                    ..matrix.clone()
                 })
                 .collect();
             assert!(packed.iter().all(|matrix| matrix.packed.is_some()));

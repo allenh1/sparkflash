@@ -41,6 +41,7 @@ use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, Kernel, Module,
     SideStream, StreamEvent,
 };
+use sparkflash_kernels::images::Image;
 use sparkflash_kernels::images::{
     glm_prefill_cubin, inkling_cubin, moe_plan_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
 };
@@ -50,11 +51,15 @@ use sparkflash_model::{
     Capabilities, DepthPolicy, ModelDescriptor, Speculator, StepCost, TpPlan, lookup_draft,
 };
 use sparkflash_ops::calls::{self, Call, RmsNorm};
+use sparkflash_ops::formats::{
+    Bf16, F32 as F32Format, FormatKind, MxFp8, NvFp4, ScaleLayout, Scales, Tensor,
+    upload as upload_format,
+};
 use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::projection::{WIDE_SHARED, WideTile};
 use sparkflash_runtime::{ExpertUnionWall, Opened, RuntimeSession};
-use sparkflash_weights::WeightSource;
 use sparkflash_weights::quant::bf16_to_f32;
+use sparkflash_weights::{DType, WeightSource};
 
 use crate::collective::{Exchange, Solo};
 use crate::config::Inkling2Config;
@@ -82,6 +87,8 @@ pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 use packed::pack_dense;
 use sparkflash_ops::packed::{Form as DenseForm, PackedSet};
+use sparkflash_ops::plan::Precision;
+use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 pub use tower::InklingVisionTower;
 
 /// The backend name the diagnostics use.
@@ -746,121 +753,188 @@ fn from_bytes(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// One loaded symbol.
+/// One loaded symbol and the catalogue entry it was resolved from: the image's symbol list and
+/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
+/// than a name it looked up.
 #[derive(Debug, Clone, Copy)]
-struct Entry {
+struct Bound {
+    /// The loaded driver function.
     kernel: Kernel,
+    /// The arithmetic the catalogue entry accepts this body at.
+    precision: Precision,
 }
+
+impl Bound {
+    /// Whether the image exports the symbol and the catalogue carries it at this precision.
+    fn carried(image: Image, symbol: &'static str, precision: Precision) -> Result<(), String> {
+        if !image.exported_symbols().contains(&symbol) {
+            return Err(format!("{} does not export {symbol}", image.name()));
+        }
+        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
+            entry.image == image
+                && entry
+                    .symbols
+                    .iter()
+                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
+        });
+        if !carried {
+            return Err(format!(
+                "the catalogue carries no {symbol} in {} accepting {}",
+                image.name(),
+                precision.name()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve a symbol in an image at a precision and load it, with the module that must stay
+    /// loaded for its handle to launch.
+    ///
+    /// # Errors
+    /// A symbol the image does not export, one the catalogue does not carry at this precision,
+    /// or the driver's load refusal.
+    fn new(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+    ) -> Result<(Module, Self), String> {
+        Self::carried(image, symbol, precision)?;
+        let (module, kernel) = cuda.load_named(cubin, symbol)?;
+        Ok((module, Self { kernel, precision }))
+    }
+
+    /// Self::new for a body loaded with a dynamic shared-memory reservation.
+    ///
+    /// # Errors
+    /// As Self::new, or the driver's attribute call.
+    fn shared(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+        shared_bytes: u32,
+    ) -> Result<(Module, Self), String> {
+        Self::carried(image, symbol, precision)?;
+        let (module, kernel) = cuda.load_named_shared(cubin, symbol, shared_bytes)?;
+        Ok((module, Self { kernel, precision }))
+    }
+}
+
+/// The former name of [Bound] in the submodules that launch a loaded symbol.
+type Entry = Bound;
 
 /// Every kernel the walk launches, loaded by the name the plan records.
 struct Kernels {
     /// The modules the symbols came from. A dropped module unloads its symbols, so the backend
     /// keeps them for as long as it launches.
     _modules: Vec<Module>,
-    embed: Entry,
-    rmsnorm: Entry,
-    gemv: Entry,
+    embed: Bound,
+    rmsnorm: Bound,
+    gemv: Bound,
     /// A decode row's run of projections over one input, up to [GEMV_FUSED] in one launch.
-    gemv4: Entry,
+    gemv4: Bound,
     /// The same two walks over packed matrices ([packed]), and the form's packer and unpacker.
     packed: sparkflash_ops::packed::Kernels,
     /// The wide tile's few-row BF16 body (q4p_dense_rows): a decode head's row is the prompt
     /// tile's, and the catalogued body for the precision the head stores.
-    dense_rows: Entry,
+    dense_rows: Bound,
     /// The grouped experts' few-row bodies, the tile's chain over one to eight item rows:
     /// Inkling's interleaved w13 and softcapped SwiGLU (q4p_moe_rows_gate_up_capped) and the
     /// same passes over its MXFP8 layers (q4p_moe_rows_gate_up_capped_mx8 / _down_mx8).
-    moe_rows_gate_up: Entry,
-    moe_rows_down: Entry,
-    block_residual: Entry,
+    moe_rows_gate_up: Bound,
+    moe_rows_down: Bound,
+    block_residual: Bound,
     /// The residual's two-launch form: every stack row's statistics in a block of its own,
     /// then the softmax and the mix.
-    block_residual_stats: Entry,
-    block_residual_mix: Entry,
+    block_residual_stats: Bound,
+    block_residual_mix: Bound,
     /// The chunk walk's chained form: one block a row for every query, the stack read once; one
     /// entry a pair of [RESIDUAL_CHAIN_PAIRS], in its order.
-    block_residual_chain: Vec<Entry>,
-    short_conv: Entry,
-    short_conv_dynamic: Entry,
-    kv_store: Entry,
-    router: Entry,
-    expert_nvfp4: Entry,
-    expert_mxfp8: Entry,
+    block_residual_chain: Vec<Bound>,
+    short_conv: Bound,
+    short_conv_dynamic: Bound,
+    kv_store: Bound,
+    router: Bound,
+    expert_nvfp4: Bound,
+    expert_mxfp8: Bound,
     /// A chunk's projections of one expert over every pair that chose it, a weight run decoded
     /// once a group of pairs.
-    expert_nvfp4_pairs: Entry,
-    expert_mxfp8_pairs: Entry,
+    expert_nvfp4_pairs: Bound,
+    expert_mxfp8_pairs: Bound,
     /// The decode band's projections, reading the router's choice on the device.
-    expert_nvfp4_band: Entry,
-    expert_mxfp8_band: Entry,
+    expert_nvfp4_band: Bound,
+    expert_mxfp8_band: Bound,
     /// A band of a few rows over moe_plan's items: the pair walk, an expert read once for every
     /// slot that picked it, with the plan made on the device.
-    expert_nvfp4_items: Entry,
-    expert_mxfp8_items: Entry,
+    expert_nvfp4_items: Bound,
+    expert_mxfp8_items: Bound,
     /// The decode band's mix shares: the router's weight for an owned slot, zero otherwise.
-    band_shares: Entry,
+    band_shares: Bound,
     /// The device leg's sum: this rank's partial and every peer's slot, ascending rank from zero.
-    sum_slots: Entry,
-    swiglu: Entry,
-    expert_mix: Entry,
+    sum_slots: Bound,
+    swiglu: Bound,
+    expert_mix: Bound,
     /// The row expert split's gathered runs side by side: [world][rows][piece] to
     /// [rows][world * piece].
-    join_pieces: Entry,
-    residual_add: Entry,
-    logit_softcap: Entry,
-    widen: Entry,
+    join_pieces: Bound,
+    residual_add: Bound,
+    logit_softcap: Bound,
+    widen: Bound,
     /// The reordered tiled GEMM the `gemm` walk's projections take.
-    gemm: Entry,
+    gemm: Bound,
     /// The tensor-core wide tile the `tensor` walk's projections take (GLM's prefill image).
-    wide: Entry,
+    wide: Bound,
     /// The `tensor` walk's NVFP4 routed experts, Qwen's grouped W4A16 MMA (its prefill image):
     /// the activation split into bf16 head and remainder planes, the gate_up pass with the
     /// interleaved rows and softcapped SwiGLU, and the down pass as Qwen runs it.
-    split_bf16: Entry,
-    moe_gate_up: Entry,
-    moe_down: Entry,
+    split_bf16: Bound,
+    moe_gate_up: Bound,
+    moe_down: Bound,
     /// The same two passes over the MXFP8 layers' E4M3 bytes and ue8m0 codes ([Mxfp8Walk::Mma]).
-    moe_gate_up_mx8: Entry,
-    moe_down_mx8: Entry,
+    moe_gate_up_mx8: Bound,
+    moe_down_mx8: Bound,
     /// The two down passes over the row split's gathered activation runs, unjoined.
-    moe_down_runs: Entry,
-    moe_down_runs_mx8: Entry,
+    moe_down_runs: Bound,
+    moe_down_runs_mx8: Bound,
     /// The shared routed-expert plan (kernels/moe_plan_sm121.cu): the chunk's slots sorted by
     /// this rank's expert into the items the MMA passes walk.
-    moe_plan: Entry,
+    moe_plan: Bound,
     /// The stride-carrying row RMSNorm both passes use at a chunk's width.
-    rmsnorm_rows: Entry,
+    rmsnorm_rows: Bound,
     /// The per-row attention: a chunk's rows against the prefix the step has stored.
-    attention_prefill: Entry,
+    attention_prefill: Bound,
     /// The split walk: each key's clip gain and value scale, the scores of a pass, and the
     /// recurrence over them.
-    attention_scales: Entry,
-    attention_scores: Entry,
-    attention_mix: Entry,
+    attention_scales: Bound,
+    attention_scores: Bound,
+    attention_mix: Bound,
     /// The split-key decode walk: a run of a row's keys a block after the split walk's scores,
     /// then the runs merged in order. `attention_scored` is a long pass's scores and parts in
     /// one launch.
-    attention_part: Entry,
-    attention_scored: Entry,
-    attention_merge: Entry,
+    attention_part: Bound,
+    attention_scored: Bound,
+    attention_merge: Bound,
     /// A sliding layer's split-key walk in one launch: a cluster a (KV head, row), a block a run.
-    attention_window: Entry,
+    attention_window: Bound,
     /// The tensor-core prompt walk: each row's query side as the exact walks compute it, then the
     /// shared MMA body over it. `attention_mma` is loaded only when the walk runs
     /// ([AttentionWalk::fast]), sized to the rank's group.
-    attention_prepare: Entry,
-    attention_mma: Option<Entry>,
+    attention_prepare: Bound,
+    attention_mma: Option<Bound>,
     /// The static short convolution over a chunk, reading its taps across the chunk's rows.
-    short_conv_rows: Entry,
+    short_conv_rows: Bound,
     /// The dynamic (static taps plus a per-row projection) short convolution over a chunk.
-    short_conv_dynamic_rows: Entry,
+    short_conv_dynamic_rows: Bound,
     /// Append a chunk's rows to their summary stacks.
-    summary_push: Entry,
+    summary_push: Bound,
     /// Convert a convolution history between the decode layout and a chunk's row layout.
-    conv_history: Entry,
+    conv_history: Bound,
     /// Every one of a verify's histories back to the decode layout from its kept rows, in one
     /// launch ([InklingDeviceSession::settle]).
-    conv_restore: Entry,
+    conv_restore: Bound,
 }
 
 impl Kernels {
@@ -912,106 +986,324 @@ impl Kernels {
             );
         }
         let mut modules = Vec::new();
-        let (wide_module, wide) =
-            cuda.load_named_shared(prefill, "glm_prefill_bf16_wide", WIDE_SHARED)?;
-        modules.push(wide_module);
-        let (window_module, window) =
-            cuda.load_named_shared(inkling, "inkling_attn_window", WINDOW_SHARED)?;
-        modules.push(window_module);
+        let mut shared = |image: Image,
+                          cubin: &'static [u8],
+                          name: &'static str,
+                          precision: Precision,
+                          bytes: u32|
+         -> Result<Bound, String> {
+            let (module, bound) = Bound::shared(cuda, image, cubin, name, precision, bytes)?;
+            modules.push(module);
+            Ok(bound)
+        };
+        let wide = shared(
+            Image::GlmPrefill,
+            prefill,
+            "glm_prefill_bf16_wide",
+            Precision::Bf16,
+            WIDE_SHARED,
+        )?;
+        let window = shared(
+            Image::Inkling,
+            inkling,
+            "inkling_attn_window",
+            Precision::Bf16,
+            WINDOW_SHARED,
+        )?;
         let attention_mma = match mma_shared {
-            Some(bytes) => {
-                let (module, kernel) =
-                    cuda.load_named_shared(inkling, "inkling_attn_mma", bytes)?;
-                modules.push(module);
-                Some(Entry { kernel })
-            }
+            Some(bytes) => Some(shared(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_mma",
+                Precision::Bf16,
+                bytes,
+            )?),
             None => None,
         };
-        let mut load = |cubin: &'static [u8], name: &'static str| -> Result<Entry, String> {
-            let (module, kernel) = cuda.load_named(cubin, name)?;
+        let mut load = |image: Image,
+                        cubin: &'static [u8],
+                        name: &'static str,
+                        precision: Precision|
+         -> Result<Bound, String> {
+            let (module, bound) = Bound::new(cuda, image, cubin, name, precision)?;
             modules.push(module);
-            Ok(Entry { kernel })
+            Ok(bound)
         };
         Ok(Self {
-            wide: Entry { kernel: wide },
-            split_bf16: load(experts, "q4p_split_bf16")?,
-            dense_rows: load(experts, "q4p_dense_rows")?,
-            moe_rows_gate_up: load(experts, "q4p_moe_rows_gate_up_capped")?,
-            moe_rows_down: load(experts, "q4p_moe_rows_down")?,
+            wide,
+            split_bf16: load(
+                Image::Qwen4Prefill,
+                experts,
+                "q4p_split_bf16",
+                Precision::Bf16,
+            )?,
+            dense_rows: load(
+                Image::Qwen4Prefill,
+                experts,
+                "q4p_dense_rows",
+                Precision::Bf16,
+            )?,
+            moe_rows_gate_up: load(
+                Image::Qwen4Prefill,
+                experts,
+                "q4p_moe_rows_gate_up_capped",
+                Precision::NvFp4,
+            )?,
+            moe_rows_down: load(
+                Image::Qwen4Prefill,
+                experts,
+                "q4p_moe_rows_down",
+                Precision::NvFp4,
+            )?,
             moe_gate_up: load(
+                Image::Qwen4Prefill,
                 experts,
                 planes.pick("q4p_moe_gate_up_capped", "q4p_moe_gate_up_capped_head"),
+                Precision::NvFp4,
             )?,
-            moe_down: load(experts, planes.pick("q4p_moe_down", "q4p_moe_down_head"))?,
+            moe_down: load(
+                Image::Qwen4Prefill,
+                experts,
+                planes.pick("q4p_moe_down", "q4p_moe_down_head"),
+                Precision::NvFp4,
+            )?,
             moe_gate_up_mx8: load(
+                Image::Qwen4Prefill,
                 experts,
                 planes.pick(
                     "q4p_moe_gate_up_capped_mx8",
                     "q4p_moe_gate_up_capped_mx8_head",
                 ),
+                Precision::MxFp8,
             )?,
             moe_down_mx8: load(
+                Image::Qwen4Prefill,
                 experts,
                 planes.pick("q4p_moe_down_mx8", "q4p_moe_down_mx8_head"),
+                Precision::MxFp8,
             )?,
             moe_down_runs: load(
+                Image::Qwen4Prefill,
                 experts,
                 planes.pick("q4p_moe_down_runs", "q4p_moe_down_runs_head"),
+                Precision::NvFp4,
             )?,
             moe_down_runs_mx8: load(
+                Image::Qwen4Prefill,
                 experts,
                 planes.pick("q4p_moe_down_runs_mx8", "q4p_moe_down_runs_mx8_head"),
+                Precision::MxFp8,
             )?,
-            moe_plan: load(moe_plan, "moe_plan")?,
-            embed: load(token, "q4e_embed")?,
-            rmsnorm: load(token, "q4e_rmsnorm")?,
-            gemv: load(token, "q4e_gemv_bf16")?,
-            gemv4: load(token, "q4e_gemv4_bf16")?,
+            moe_plan: load(Image::MoePlan, moe_plan, "moe_plan", Precision::Bf16)?,
+            embed: load(Image::Qwen4Exp, token, "q4e_embed", Precision::Bf16)?,
+            rmsnorm: load(Image::Qwen4Exp, token, "q4e_rmsnorm", Precision::Bf16)?,
+            gemv: load(Image::Qwen4Exp, token, "q4e_gemv_bf16", Precision::Bf16)?,
+            gemv4: load(Image::Qwen4Exp, token, "q4e_gemv4_bf16", Precision::Bf16)?,
             packed: sparkflash_ops::packed::Kernels::load(cuda)?,
-            block_residual: load(inkling, "inkling_block_residual")?,
-            block_residual_stats: load(inkling, "inkling_block_residual_stats")?,
-            block_residual_mix: load(inkling, "inkling_block_residual_mix")?,
+            block_residual: load(
+                Image::Inkling,
+                inkling,
+                "inkling_block_residual",
+                Precision::Bf16,
+            )?,
+            block_residual_stats: load(
+                Image::Inkling,
+                inkling,
+                "inkling_block_residual_stats",
+                Precision::Bf16,
+            )?,
+            block_residual_mix: load(
+                Image::Inkling,
+                inkling,
+                "inkling_block_residual_mix",
+                Precision::Bf16,
+            )?,
             block_residual_chain: RESIDUAL_CHAIN_PAIRS
                 .iter()
-                .map(|&(_, _, name)| load(inkling, name))
+                .map(|&(_, _, name)| load(Image::Inkling, inkling, name, Precision::Bf16))
                 .collect::<Result<_, _>>()?,
-            short_conv: load(inkling, "inkling_short_conv_decode")?,
-            short_conv_dynamic: load(inkling, "inkling_short_conv_dynamic_decode")?,
-            kv_store: load(inkling, "inkling_kv_store")?,
-            router: load(inkling, "inkling_router_topk")?,
-            expert_nvfp4: load(inkling, "inkling_nvfp4_expert_matvec")?,
-            expert_mxfp8: load(inkling, "inkling_mxfp8_expert_matvec")?,
-            expert_nvfp4_pairs: load(inkling, "inkling_nvfp4_expert_pairs")?,
-            expert_mxfp8_pairs: load(inkling, "inkling_mxfp8_expert_pairs")?,
-            expert_nvfp4_band: load(inkling, "inkling_nvfp4_expert_band")?,
-            expert_mxfp8_band: load(inkling, "inkling_mxfp8_expert_band")?,
-            expert_nvfp4_items: load(inkling, "inkling_nvfp4_expert_items")?,
-            expert_mxfp8_items: load(inkling, "inkling_mxfp8_expert_items")?,
-            band_shares: load(inkling, "inkling_band_shares")?,
-            sum_slots: load(token, "q4e_sum_slots")?,
-            swiglu: load(inkling, "inkling_softcapped_swiglu")?,
-            expert_mix: load(inkling, "inkling_expert_mix")?,
-            join_pieces: load(inkling, "inkling_join_pieces")?,
-            residual_add: load(inkling, "inkling_residual_add")?,
-            logit_softcap: load(inkling, "inkling_logit_softcap")?,
-            widen: load(inkling, "inkling_widen_f32")?,
-            gemm: load(token, "q4e_gemm_bf16")?,
-            rmsnorm_rows: load(token, "q4e_rmsnorm_rows")?,
-            attention_prefill: load(inkling, "inkling_attn_prefill")?,
-            attention_scales: load(inkling, "inkling_attn_key_scales")?,
-            attention_scores: load(inkling, "inkling_attn_scores")?,
-            attention_mix: load(inkling, "inkling_attn_mix")?,
-            attention_part: load(inkling, "inkling_attn_part")?,
-            attention_scored: load(inkling, "inkling_attn_scored_part")?,
-            attention_merge: load(inkling, "inkling_attn_merge")?,
-            attention_window: Entry { kernel: window },
-            attention_prepare: load(inkling, "inkling_attn_prepare")?,
+            short_conv: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv_decode",
+                Precision::Bf16,
+            )?,
+            short_conv_dynamic: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv_dynamic_decode",
+                Precision::Bf16,
+            )?,
+            kv_store: load(Image::Inkling, inkling, "inkling_kv_store", Precision::Bf16)?,
+            router: load(
+                Image::Inkling,
+                inkling,
+                "inkling_router_topk",
+                Precision::F32,
+            )?,
+            expert_nvfp4: load(
+                Image::Inkling,
+                inkling,
+                "inkling_nvfp4_expert_matvec",
+                Precision::NvFp4,
+            )?,
+            expert_mxfp8: load(
+                Image::Inkling,
+                inkling,
+                "inkling_mxfp8_expert_matvec",
+                Precision::MxFp8,
+            )?,
+            expert_nvfp4_pairs: load(
+                Image::Inkling,
+                inkling,
+                "inkling_nvfp4_expert_pairs",
+                Precision::NvFp4,
+            )?,
+            expert_mxfp8_pairs: load(
+                Image::Inkling,
+                inkling,
+                "inkling_mxfp8_expert_pairs",
+                Precision::MxFp8,
+            )?,
+            expert_nvfp4_band: load(
+                Image::Inkling,
+                inkling,
+                "inkling_nvfp4_expert_band",
+                Precision::NvFp4,
+            )?,
+            expert_mxfp8_band: load(
+                Image::Inkling,
+                inkling,
+                "inkling_mxfp8_expert_band",
+                Precision::MxFp8,
+            )?,
+            expert_nvfp4_items: load(
+                Image::Inkling,
+                inkling,
+                "inkling_nvfp4_expert_items",
+                Precision::NvFp4,
+            )?,
+            expert_mxfp8_items: load(
+                Image::Inkling,
+                inkling,
+                "inkling_mxfp8_expert_items",
+                Precision::MxFp8,
+            )?,
+            band_shares: load(
+                Image::Inkling,
+                inkling,
+                "inkling_band_shares",
+                Precision::F32,
+            )?,
+            sum_slots: load(Image::Qwen4Exp, token, "q4e_sum_slots", Precision::Bf16)?,
+            swiglu: load(
+                Image::Inkling,
+                inkling,
+                "inkling_softcapped_swiglu",
+                Precision::Bf16,
+            )?,
+            expert_mix: load(
+                Image::Inkling,
+                inkling,
+                "inkling_expert_mix",
+                Precision::F32,
+            )?,
+            join_pieces: load(
+                Image::Inkling,
+                inkling,
+                "inkling_join_pieces",
+                Precision::F32,
+            )?,
+            residual_add: load(
+                Image::Inkling,
+                inkling,
+                "inkling_residual_add",
+                Precision::Bf16,
+            )?,
+            logit_softcap: load(
+                Image::Inkling,
+                inkling,
+                "inkling_logit_softcap",
+                Precision::Bf16,
+            )?,
+            widen: load(Image::Inkling, inkling, "inkling_widen_f32", Precision::F32)?,
+            gemm: load(Image::Qwen4Exp, token, "q4e_gemm_bf16", Precision::Bf16)?,
+            rmsnorm_rows: load(Image::Qwen4Exp, token, "q4e_rmsnorm_rows", Precision::Bf16)?,
+            attention_prefill: load(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_prefill",
+                Precision::Bf16,
+            )?,
+            attention_scales: load(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_key_scales",
+                Precision::Bf16,
+            )?,
+            attention_scores: load(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_scores",
+                Precision::Bf16,
+            )?,
+            attention_mix: load(Image::Inkling, inkling, "inkling_attn_mix", Precision::Bf16)?,
+            attention_part: load(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_part",
+                Precision::Bf16,
+            )?,
+            attention_scored: load(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_scored_part",
+                Precision::Bf16,
+            )?,
+            attention_merge: load(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_merge",
+                Precision::Bf16,
+            )?,
+            attention_window: window,
+            attention_prepare: load(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_prepare",
+                Precision::Bf16,
+            )?,
             attention_mma,
-            short_conv_rows: load(inkling, "inkling_short_conv")?,
-            short_conv_dynamic_rows: load(inkling, "inkling_short_conv_dynamic")?,
-            summary_push: load(inkling, "inkling_summary_push")?,
-            conv_history: load(inkling, "inkling_conv_history_copy")?,
-            conv_restore: load(inkling, "inkling_conv_history_restore")?,
+            short_conv_rows: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv",
+                Precision::Bf16,
+            )?,
+            short_conv_dynamic_rows: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv_dynamic",
+                Precision::Bf16,
+            )?,
+            summary_push: load(
+                Image::Inkling,
+                inkling,
+                "inkling_summary_push",
+                Precision::Bf16,
+            )?,
+            conv_history: load(
+                Image::Inkling,
+                inkling,
+                "inkling_conv_history_copy",
+                Precision::F32,
+            )?,
+            conv_restore: load(
+                Image::Inkling,
+                inkling,
+                "inkling_conv_history_restore",
+                Precision::F32,
+            )?,
             _modules: modules,
         })
     }
@@ -1035,6 +1327,10 @@ struct Slot {
 /// The rank's weights, in the served plan's order.
 struct Weights {
     slots: Vec<Slot>,
+    /// Every uploaded part's format ledger row, in the plan's order.
+    ledger: Vec<LedgerRow>,
+    /// The exact widenings the arm records, for the boot ledger.
+    widen: WidenLog,
     /// The device allocations the slots point into, which are what is freed: one a slot from a
     /// checkpoint source ([upload]), one for the whole data section of a rank file
     /// ([upload_rank_file]).
@@ -1244,20 +1540,26 @@ impl Shared {
     }
 
     /// Launch a typed call of the shared token kernels ([sparkflash_ops::calls]).
-    fn call<const N: usize>(&self, entry: Entry, call: Call<N>) -> Result<(), String> {
+    fn call<const N: usize>(&self, entry: Bound, call: Call<N>) -> Result<(), String> {
         self.launch(entry, call.grid, call.block, &call.args)
     }
 
     fn launch(
         &self,
-        entry: Entry,
+        entry: Bound,
         grid: (u32, u32, u32),
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), String> {
         self.cuda
             .launch(entry.kernel, grid, block, args)
-            .map_err(|error| format!("{}: {error}", entry.kernel.name()))
+            .map_err(|error| {
+                format!(
+                    "{} ({}): {error}",
+                    entry.kernel.name(),
+                    entry.precision.name()
+                )
+            })
     }
 
     /// One dense BF16 projection of one row (a packed matrix's through the packed walk, the same
@@ -2906,6 +3208,9 @@ impl InklingDeviceBackend {
         let cuda = CudaHandle::new(Cuda::load()?);
         let kernels = Kernels::load(&cuda, mma_shared, planes)?;
         let weights = weights(&cuda, plan.served())?;
+        let ledger = FormatLedger::boot(weights.ledger.clone(), &weights.widen)
+            .map_err(|error| error.to_string())?;
+        eprintln!("[inkling] rank {}: {ledger}", tp.rank());
         let dense = pack_dense(&cuda, &kernels, &[&plan, &prefill], &weights, dense_form)?;
         eprintln!("[inkling] rank {}: {}", tp.rank(), dense.summary());
         let (clip, clip_arena) = widen_clips(&cuda, &kernels, &plan, &weights)?;
@@ -3170,6 +3475,150 @@ const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
     top_k: 0,
 };
 
+/// The boot format ledger's rows, and the exact widenings they take.
+///
+/// Each matrix is uploaded once more through the typed API, which checks the container's dtype
+/// and its format's scale count: a BF16 or F32 matrix through [Mat], an MXFP8 or NVFP4 expert
+/// through the scale plane its checkpoint keeps beside it. A vector stays a [Deviceptr], since a
+/// [Mat] has a row stride and a format's scale plane and a norm or a scale has neither; its
+/// stored and arithmetic formats are still rows.
+fn type_slots(
+    _source: &dyn WeightSource,
+    plan: &InklingTensorPlan,
+    slots: &[Slot],
+) -> Result<(Vec<LedgerRow>, WidenLog), String> {
+    let specs = plan.plan().specs();
+    let pointer_of = |name: &str| {
+        specs
+            .iter()
+            .position(|spec| spec.name == name)
+            .map(|index| slots[index].pointer)
+    };
+    let mut rows = Vec::new();
+    let mut widen_log = WidenLog::new();
+    for (index, spec) in specs.iter().enumerate() {
+        let name = spec.name.as_str();
+        // A scale plane or a per-expert amax is part of its weight's row, not a part of its own.
+        if name.ends_with("_scale")
+            || name.ends_with("_amax")
+            || name.ends_with("_outer_scale_denominator")
+        {
+            continue;
+        }
+        let pointer = slots[index].pointer;
+        let bytes = slots[index].bytes;
+        match spec.dtype {
+            DType::BF16 if spec.shape.len() >= 2 => {
+                let (rows_, columns) = flat_matrix(&spec.shape);
+                let typed = upload_format::<Bf16>(Tensor {
+                    stored: spec,
+                    shape: &[rows_, columns],
+                    data: pointer,
+                    stride: columns * 2,
+                    scales: Scales::none(),
+                })
+                .map_err(|error| format!("{name}: {error}"))?;
+                if name.ends_with(".q_l2_clip.scale") || name.ends_with(".rel_l2_clip.scale") {
+                    // The attention body's gain is f32; the checkpoint stores it BF16 and the
+                    // widening is exact.
+                    widen::<Bf16, F32Format>(
+                        name,
+                        "the attention body's gain is f32 and the checkpoint stores it BF16; \
+                         the widening is exact",
+                        &mut widen_log,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    rows.push(LedgerRow::new(
+                        name,
+                        FormatKind::Bf16,
+                        FormatKind::F32,
+                        typed.bytes_per_token(),
+                    ));
+                } else {
+                    rows.push(LedgerRow::new(
+                        name,
+                        FormatKind::Bf16,
+                        FormatKind::Bf16,
+                        typed.bytes_per_token(),
+                    ));
+                }
+            }
+            DType::F8E4M3 if spec.shape.len() >= 2 => {
+                let (rows_, columns) = flat_matrix(&spec.shape);
+                let scale = pointer_of(&format!("{name}_scale"))
+                    .ok_or_else(|| format!("{name} has no MXFP8 scale plane beside it"))?;
+                let entries = ScaleLayout::MxFp8 {
+                    rows: 32,
+                    columns: 32,
+                }
+                .entries(rows_, columns);
+                let typed = upload_format::<MxFp8>(Tensor {
+                    stored: spec,
+                    shape: &[rows_, columns],
+                    data: pointer,
+                    stride: columns,
+                    scales: Scales::mxfp8(scale, entries),
+                })
+                .map_err(|error| format!("{name}: {error}"))?;
+                rows.push(LedgerRow::new(
+                    name,
+                    FormatKind::MxFp8,
+                    FormatKind::MxFp8,
+                    typed.bytes_per_token(),
+                ));
+            }
+            DType::U8 if spec.shape.len() >= 2 => {
+                // The stored last dimension is bytes: two E2M1 values a byte.
+                let columns = spec.shape[spec.shape.len() - 1] * 2;
+                let rows_ = spec.shape[..spec.shape.len() - 1].iter().product();
+                let scale = pointer_of(&format!("{name}_scale"))
+                    .ok_or_else(|| format!("{name} has no NVFP4 scale plane beside it"))?;
+                let entries = ScaleLayout::NvFp4 { group: 16 }.entries(rows_, columns);
+                // The per-expert amax rides on the expert's output, so this upload checks the
+                // container and scale count; its one global is not the arithmetic's.
+                let typed = upload_format::<NvFp4>(Tensor {
+                    stored: spec,
+                    shape: &[rows_, columns],
+                    data: pointer,
+                    stride: spec.shape[spec.shape.len() - 1],
+                    scales: Scales::nvfp4(scale, entries, 1.0),
+                })
+                .map_err(|error| format!("{name}: {error}"))?;
+                rows.push(LedgerRow::new(
+                    name,
+                    FormatKind::NvFp4,
+                    FormatKind::NvFp4,
+                    typed.bytes_per_token(),
+                ));
+            }
+            DType::BF16 | DType::F32 => {
+                let format = if spec.dtype == DType::F32 {
+                    FormatKind::F32
+                } else {
+                    FormatKind::Bf16
+                };
+                rows.push(LedgerRow::new(name, format, format, bytes as u128));
+            }
+            other => {
+                return Err(format!(
+                    "{name} is stored as {}, which the arm's ledger does not describe",
+                    other.name()
+                ));
+            }
+        }
+    }
+    Ok((rows, widen_log))
+}
+
+/// A stored matrix's logical rows and columns: every dimension but the last, then the last.
+fn flat_matrix(shape: &[usize]) -> (usize, usize) {
+    let columns = *shape.last().unwrap_or(&1);
+    (
+        shape[..shape.len().saturating_sub(1)].iter().product(),
+        columns,
+    )
+}
+
 /// Upload every served slot, refusing a source whose bytes disagree with the plan.
 fn upload(
     cuda: &Cuda,
@@ -3198,9 +3647,12 @@ fn upload(
         slots.push(Slot { pointer, bytes });
     }
     let allocations = slots.iter().map(|slot| slot.pointer).collect();
+    let (ledger, widen) = type_slots(source, plan, &slots)?;
     let zeros = zeros(cuda, plan, &mut total)?;
     Ok(Weights {
         slots,
+        ledger,
+        widen,
         allocations,
         zeros,
         total_bytes: total,
@@ -3251,16 +3703,19 @@ fn upload_rank_file(
         cuda.free_buffers(&[&arena]);
         return Err(format!("{}: {error}", path.display()));
     }
-    let slots = spans
+    let slots: Vec<Slot> = spans
         .into_iter()
         .map(|(start, bytes)| Slot {
             pointer: arena.offset(start),
             bytes,
         })
         .collect();
+    let (ledger, widen) = type_slots(file, plan, &slots)?;
     let zeros = zeros(cuda, plan, &mut total)?;
     Ok(Weights {
         slots,
+        ledger,
+        widen,
         allocations: vec![arena],
         zeros,
         total_bytes: total,
