@@ -56,9 +56,11 @@ use sparkflash_ops::{OpPlan, gdn};
 use sparkflash_ops::moe::{MAX_EXPERTS as MOE_MAX_EXPERTS, MoePlanCall, grouped};
 use sparkflash_ops::projection::{Fp8Tile, SPLIT_STAGE, SplitTile, fp8_tile_fits, split_k_slices};
 
+use sparkflash_ops::formats::{Bf16, Fp8E4m3, Mat};
+
 use super::{
-    Bound, DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMat,
-    GpuMatE4m3Tile, split_tickets,
+    Bound, DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMatE4m3Tile,
+    split_tickets,
 };
 use crate::config::Qwen4ExpConfig;
 
@@ -127,7 +129,7 @@ const DENSE_ROWS_TILE: usize = 16;
 const DENSE_ROWS_COLUMNS: usize = 32;
 
 /// One matrix of a q4p_dense_rows launch: `matrix` into `output`, split `segments` ways.
-type DenseRows<'a> = (&'a GpuMat, Deviceptr, usize);
+type DenseRows<'a> = (&'a Mat<Bf16>, Deviceptr, usize);
 
 /// The partials and tickets a q4p_dense_rows launch of `group` over `batch` rows takes: none for
 /// an unsplit matrix, whose CTAs store their own finished outputs.
@@ -136,9 +138,9 @@ fn dense_rows_need(group: &[DenseRows], batch: usize) -> (usize, usize) {
         (0, 0),
         |(partials, tickets), (matrix, _, segments)| {
             (
-                partials + segments * batch * matrix.rows,
+                partials + segments * batch * matrix.rows(),
                 tickets
-                    + matrix.rows.div_ceil(DENSE_ROWS_COLUMNS) * batch.div_ceil(DENSE_ROWS_TILE),
+                    + matrix.rows().div_ceil(DENSE_ROWS_COLUMNS) * batch.div_ceil(DENSE_ROWS_TILE),
             )
         },
     )
@@ -149,7 +151,7 @@ fn dense_rows_need(group: &[DenseRows], batch: usize) -> (usize, usize) {
 /// the sum).
 #[derive(Clone, Copy)]
 pub(super) struct Projection<'a> {
-    pub(super) matrix: &'a GpuMat,
+    pub(super) matrix: &'a Mat<Bf16>,
     pub(super) output: Deviceptr,
     pub(super) epilogue: u32,
     pub(super) scale: f32,
@@ -157,7 +159,7 @@ pub(super) struct Projection<'a> {
 
 impl<'a> Projection<'a> {
     /// `matrix` into `output`, the sum itself.
-    pub(super) fn plain(matrix: &'a GpuMat, output: Deviceptr) -> Self {
+    pub(super) fn plain(matrix: &'a Mat<Bf16>, output: Deviceptr) -> Self {
         Self {
             matrix,
             output,
@@ -515,7 +517,7 @@ impl DeviceSequence {
     /// split for its own width, as it did before the decode steps came here.
     pub(super) fn dense_mma(
         &self,
-        matrix: &GpuMat,
+        matrix: &Mat<Bf16>,
         input: Deviceptr,
         output: Deviceptr,
         batch: usize,
@@ -533,15 +535,15 @@ impl DeviceSequence {
             let rows = if piece < DENSE_ROWS {
                 piece
             } else if segments > 1 {
-                let fit = GEMM_PARTIAL_FLOATS / (segments * DENSE_ROWS * matrix.rows);
+                let fit = GEMM_PARTIAL_FLOATS / (segments * DENSE_ROWS * matrix.rows());
                 DENSE_ROWS * (left / DENSE_ROWS).min(fit).max(1)
             } else {
                 DENSE_ROWS * (left / DENSE_ROWS)
             };
             self.dense_launch(
                 matrix,
-                input.offset(done * matrix.columns * 4),
-                output.offset(done * matrix.rows * 4),
+                input.offset(done * matrix.columns() * 4),
+                output.offset(done * matrix.rows() * 4),
                 rows,
                 segments,
                 epilogue,
@@ -560,11 +562,17 @@ impl DeviceSequence {
     /// matrix, so a row has the same bits at any row count.
     pub(super) fn dense_fp8_mma(
         &self,
-        matrix: &GpuMatE4m3Tile,
+        matrix: &Mat<Fp8E4m3>,
         input: Deviceptr,
         output: Deviceptr,
         batch: usize,
     ) -> Result<bool, BackendError> {
+        let matrix = GpuMatE4m3Tile {
+            weight: matrix.data(),
+            scales: matrix.scales().blocks().unwrap_or(Deviceptr(0)),
+            rows: matrix.rows(),
+            columns: matrix.columns(),
+        };
         if !self.backend.prefill.tensor_cores
             || !part("dense")
             || !fp8_tile_fits(matrix.rows, matrix.columns)
@@ -594,28 +602,28 @@ impl DeviceSequence {
     /// Whether `batch` rows of `matrix` from `input` into `output` take the dense MMA.
     fn dense_fits(
         &self,
-        matrix: &GpuMat,
+        matrix: &Mat<Bf16>,
         input: Deviceptr,
         output: Deviceptr,
         batch: usize,
     ) -> bool {
         self.chunk_path(batch)
             && part("dense")
-            && matrix.rows.is_multiple_of(32)
-            && matrix.columns.is_multiple_of(32)
-            && [matrix.pointer, input, output].into_iter().all(aligned)
+            && matrix.rows().is_multiple_of(32)
+            && matrix.columns().is_multiple_of(32)
+            && [matrix.data(), input, output].into_iter().all(aligned)
     }
 
     /// The K split of `matrix` for a piece of `piece` rows ([Self::dense_mma]).
-    fn dense_split(&self, matrix: &GpuMat, piece: usize) -> usize {
+    fn dense_split(&self, matrix: &Mat<Bf16>, piece: usize) -> usize {
         let reference = if self.backend.prefill.decode {
             DENSE_ROWS
         } else {
             piece
         };
         split_k_slices(
-            matrix.rows,
-            matrix.columns / SPLIT_STAGE,
+            matrix.rows(),
+            matrix.columns() / SPLIT_STAGE,
             reference,
             GEMM_PARTIAL_FLOATS,
         )
@@ -642,7 +650,7 @@ impl DeviceSequence {
         let mut off_tile = Vec::new();
         for projection in projections {
             let (matrix, output) = (projection.matrix, projection.output);
-            if batch >= GEMM_MIN_BATCH || matrix.columns != projections[0].matrix.columns {
+            if batch >= GEMM_MIN_BATCH || matrix.columns() != projections[0].matrix.columns() {
                 self.gemm(
                     matrix,
                     input,
@@ -720,7 +728,7 @@ impl DeviceSequence {
     /// streams are more than its four warps; the caller then runs the pair.
     pub(super) fn hyper_up_rows(
         &self,
-        up: &GpuMat,
+        up: &Mat<Bf16>,
         low: Deviceptr,
         normed: Deviceptr,
         mixed: Deviceptr,
@@ -732,8 +740,8 @@ impl DeviceSequence {
             || !self.dense_fits(up, low, normed, batch)
             || !aligned(mixed)
             || hc > 4
-            || up.rows != hc * hidden
-            || up.columns != config.hc_lowrank
+            || up.rows() != hc * hidden
+            || up.columns() != config.hc_lowrank
             || !hidden.is_multiple_of(8)
             || self.dense_split(up, batch) != 1
         {
@@ -749,10 +757,10 @@ impl DeviceSequence {
             (128, 1, 1),
             &[
                 low.0,
-                up.pointer.0,
+                up.data().0,
                 normed.0,
                 mixed.0,
-                up.columns as u64,
+                up.columns() as u64,
                 hidden as u64,
                 hc as u64,
                 batch as u64,
@@ -762,9 +770,9 @@ impl DeviceSequence {
     }
 
     /// The partials and tickets a q4p_gemm_rows launch of `matrix` over `batch` rows takes.
-    fn rider_need(&self, matrix: &GpuMat, batch: usize) -> (usize, usize) {
+    fn rider_need(&self, matrix: &Mat<Bf16>, batch: usize) -> (usize, usize) {
         let split = self.token_split(matrix, batch);
-        let count = batch * matrix.rows;
+        let count = batch * matrix.rows();
         if split > 1 {
             (split * count, count.div_ceil(128))
         } else {
@@ -793,8 +801,8 @@ impl DeviceSequence {
             if let Some(copy) = self
                 .backend
                 .packed
-                .get(matrix.pointer)
-                .filter(|copy| copy.admits(matrix.rows, matrix.columns, input).is_ok())
+                .get(matrix.data())
+                .filter(|copy| copy.admits(matrix.rows(), matrix.columns(), input).is_ok())
             {
                 let [rows, offsets, entries] = copy.planes();
                 packed[slot * 4..slot * 4 + 4].copy_from_slice(&[
@@ -810,13 +818,13 @@ impl DeviceSequence {
                 output
             };
             matrices[slot * 5..slot * 5 + 5].copy_from_slice(&[
-                matrix.pointer.0,
+                matrix.data().0,
                 target.0,
                 output.0,
-                matrix.rows as u64,
+                matrix.rows() as u64,
                 segments as u64,
             ]);
-            columns += matrix.rows.div_ceil(DENSE_ROWS_COLUMNS) * segments;
+            columns += matrix.rows().div_ceil(DENSE_ROWS_COLUMNS) * segments;
             let (more, counters) = dense_rows_need(&[(matrix, output, segments)], batch);
             partials += more;
             tiles += counters;
@@ -825,11 +833,11 @@ impl DeviceSequence {
         let mut ctas = 0usize;
         for (slot, rider) in riders.iter().enumerate().take(2) {
             let split = self.token_split(rider.matrix, batch);
-            let count = batch * rider.matrix.rows;
+            let count = batch * rider.matrix.rows();
             riding[slot * 8..slot * 8 + 8].copy_from_slice(&[
-                rider.matrix.pointer.0,
+                rider.matrix.data().0,
                 rider.output.0,
-                rider.matrix.rows as u64,
+                rider.matrix.rows() as u64,
                 u64::from(rider.epilogue),
                 u64::from(rider.scale.to_bits()),
                 split as u64,
@@ -862,7 +870,7 @@ impl DeviceSequence {
         let planes = batch.div_ceil(DENSE_ROWS_TILE);
         let mut args = vec![
             input.0,
-            group[0].0.columns as u64,
+            group[0].0.columns() as u64,
             batch as u64,
             split_tickets(self.gemm_partials).0,
             u64::from(epilogue),
@@ -890,7 +898,7 @@ impl DeviceSequence {
     #[allow(clippy::too_many_arguments)]
     fn dense_launch(
         &self,
-        matrix: &GpuMat,
+        matrix: &Mat<Bf16>,
         input: Deviceptr,
         output: Deviceptr,
         batch: usize,
@@ -899,7 +907,7 @@ impl DeviceSequence {
         scale: f32,
     ) -> Result<(), BackendError> {
         let kernels = &self.backend.kernels;
-        let count = batch * matrix.rows;
+        let count = batch * matrix.rows();
         let target = if segments > 1 {
             self.gemm_partials
         } else {
@@ -918,11 +926,11 @@ impl DeviceSequence {
             );
         }
         let tile = SplitTile::call(
-            matrix.pointer.0,
+            matrix.data().0,
             input.0,
             target.0,
-            matrix.rows,
-            matrix.columns,
+            matrix.rows(),
+            matrix.columns(),
             batch,
             segments,
         );

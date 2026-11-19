@@ -93,7 +93,12 @@ impl DeviceSequence {
         let kv_width = config.kv_proj_width();
         let attn_width = config.attn_out_width();
         self.dense4(
-            [*q_proj, *k_proj, *v_proj, Dense::Bf16(*index_qk)],
+            [
+                q_proj.clone(),
+                k_proj.clone(),
+                v_proj.clone(),
+                Dense::Bf16(index_qk.clone()),
+            ],
             mixed,
             [self.qg, self.kv_row, self.value_row, self.index_row],
             batch,
@@ -483,7 +488,12 @@ impl DeviceSequence {
             ));
         };
         self.dense4(
-            [*in_qkv, *in_z, Dense::Bf16(*in_b), Dense::Bf16(*in_a)],
+            [
+                in_qkv.clone(),
+                in_z.clone(),
+                Dense::Bf16(in_b.clone()),
+                Dense::Bf16(in_a.clone()),
+            ],
             mixed,
             [self.linear_qkv, self.linear_z, b_out, a_out],
             batch,
@@ -941,9 +951,9 @@ impl DeviceSequence {
                     ((intermediate + 1).div_ceil(WARPS) as u32, 1, 1),
                     ((WARPS * 32) as u32, 1, 1),
                     &[
-                        shared.pointer.0,
-                        shared_up.pointer.0,
-                        moe.shared_gate.pointer.0,
+                        shared.data().0,
+                        shared_up.data().0,
+                        moe.shared_gate.data().0,
                         mixed.offset(base * config.hidden_size * 4).0,
                         self.shared_up.offset(base * intermediate * 4).0,
                         self.expert_gate.offset(base * 4).0,

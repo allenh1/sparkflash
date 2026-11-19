@@ -349,7 +349,7 @@ impl DeviceSequence {
             self.call(
                 kernels.embed,
                 sparkflash_ops::calls::embed(
-                    weights.embed.pointer.0,
+                    weights.embed.data().0,
                     self.hyper.offset(row * width * 4).0,
                     token,
                     (config.hidden_size, width),

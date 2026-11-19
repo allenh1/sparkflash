@@ -71,12 +71,17 @@ use sparkflash_model::{
     BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
     PackIdentity, Part as SharedPart, Sampling, Speculation, StepOutput,
 };
+use sparkflash_ops::formats::{
+    Bf16, FormatKind, Fp8E4m3, Mat, NvFp4, PackedBf16, PackedOrder, Scales, Tensor,
+    upload as upload_format,
+};
 pub(crate) use sparkflash_ops::gemv::CudaHandle;
+use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog};
 use sparkflash_weights::linalg::ScaleGrid;
 use sparkflash_weights::rank_file::fnv1a;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{TpLayout, TpRuntime};
-use sparkflash_weights::{WeightSource, check_length};
+use sparkflash_weights::{DType, TensorSpec, WeightSource, check_length};
 
 use crate::config::{DenseQuant, ExpertQuant, LayerKind, Qwen4ExpConfig};
 use crate::ple::PleTable;
@@ -345,43 +350,42 @@ pub use sparkflash_ops::gemv::{GpuMat, GpuMatE4m3, GpuMatE4m3Tile};
 ///
 /// Every launch matches on the kind, so a kernel with no FP8 form refuses an FP8 projection
 /// ([Dense::bf16]) instead of reading its codes as BF16 weights.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum Dense {
-    Bf16(GpuMat),
-    Fp8(GpuMatE4m3Tile),
+    Bf16(Mat<Bf16>),
+    Fp8(Mat<Fp8E4m3>),
 }
 
 impl Dense {
     /// Output rows.
     pub(crate) fn rows(&self) -> usize {
         match self {
-            Self::Bf16(matrix) => matrix.rows,
-            Self::Fp8(matrix) => matrix.rows,
+            Self::Bf16(matrix) => matrix.rows(),
+            Self::Fp8(matrix) => matrix.rows(),
         }
     }
 
     /// The BF16 matrix, or why a BF16-only path cannot take this one.
-    pub(crate) fn bf16(&self, what: &str) -> Result<&GpuMat, BackendError> {
+    pub(crate) fn bf16(&self, what: &str) -> Result<&Mat<Bf16>, BackendError> {
         match self {
             Self::Bf16(matrix) => Ok(matrix),
             Self::Fp8(matrix) => Err(BackendError::new(
                 "qwen4_device",
                 format!(
                     "{what} has no block-scaled FP8 form, and was given a [{}, {}] FP8 matrix",
-                    matrix.rows, matrix.columns
+                    matrix.rows(),
+                    matrix.columns()
                 ),
             )),
         }
     }
 }
 
-/// One uploaded NVFP4 expert matrix and its two per-tensor scales.
-#[derive(Debug, Clone, Copy)]
+/// One uploaded NVFP4 expert matrix and its activation scale.
+#[derive(Debug, Clone)]
 struct GpuNvfp4 {
-    weight: Deviceptr,
-    scales: Deviceptr,
-    /// The per-tensor weight scale the checkpoint applies on top of the E4M3 block scales.
-    scale_2: f32,
+    /// The typed matrix: its packed codes, per-16 E4M3 scale plane and per-tensor global.
+    matrix: Mat<NvFp4>,
     /// The checkpoint's static activation scale.
     ///
     /// Carried so the uploaded description is complete, and deliberately not applied: this arm
@@ -392,7 +396,27 @@ struct GpuNvfp4 {
     input_scale: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+impl GpuNvfp4 {
+    /// The packed E2M1 codes.
+    fn weight(&self) -> Deviceptr {
+        self.matrix.data()
+    }
+
+    /// The per-16 E4M3 scale plane.
+    fn blocks(&self) -> Deviceptr {
+        self.matrix.scales().blocks().unwrap_or(Deviceptr(0))
+    }
+
+    /// The matrix's per-tensor f32 multiplier (`weight_scale_2`).
+    fn global(&self) -> f32 {
+        match self.matrix.scales() {
+            Scales::NvFp4 { global, .. } => *global,
+            _ => 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct GpuExpert {
     gate: GpuNvfp4,
     up: GpuNvfp4,
@@ -406,22 +430,22 @@ struct GpuHyper {
     norm: Deviceptr,
     /// `None` on a plain residual (Qwen3.5/3.6): the branch reads the normed stream itself.
     mix: Option<GpuHyperMix>,
-    inject: Option<GpuMat>,
+    inject: Option<Mat<Bf16>>,
 }
 
 #[derive(Debug)]
 struct GpuHyperMix {
-    down: GpuMat,
-    up: GpuMat,
+    down: Mat<Bf16>,
+    up: Mat<Bf16>,
 }
 
 #[derive(Debug)]
 struct GpuMoe {
-    router: GpuMat,
+    router: Mat<Bf16>,
     shared: Dense,
     shared_up: Dense,
     shared_down: Dense,
-    shared_gate: GpuMat,
+    shared_gate: Mat<Bf16>,
     experts: GpuExperts,
 }
 
@@ -445,8 +469,8 @@ enum GpuBranch {
     Linear {
         in_qkv: Dense,
         in_z: Dense,
-        in_b: GpuMat,
-        in_a: GpuMat,
+        in_b: Mat<Bf16>,
+        in_a: Mat<Bf16>,
         out_proj: Dense,
         conv: Deviceptr,
         a_log: Deviceptr,
@@ -460,7 +484,7 @@ enum GpuBranch {
         o_proj: Dense,
         q_norm: Deviceptr,
         k_norm: Deviceptr,
-        index_qk: GpuMat,
+        index_qk: Mat<Bf16>,
         index_q_norm: Deviceptr,
         index_k_norm: Deviceptr,
     },
@@ -468,8 +492,8 @@ enum GpuBranch {
 
 #[derive(Debug)]
 struct GpuPle {
-    key_proj: GpuMat,
-    value_proj: GpuMat,
+    key_proj: Mat<Bf16>,
+    value_proj: Mat<Bf16>,
     norm_key: Deviceptr,
     norm_query: Deviceptr,
     norm_conv: Deviceptr,
@@ -494,8 +518,8 @@ struct GpuLayer {
 /// layer's expert table is the FP8 kind ([GpuExperts::Fp8]).
 #[derive(Debug)]
 struct GpuMtp {
-    fc_embedding: GpuMat,
-    fc_hidden: GpuMat,
+    fc_embedding: Mat<Bf16>,
+    fc_hidden: Mat<Bf16>,
     pre_norm_embedding: Deviceptr,
     pre_norm_hidden: Deviceptr,
     mixer: GpuHyper,
@@ -507,11 +531,15 @@ struct GpuMtp {
 
 #[derive(Debug)]
 pub(crate) struct GpuWeights {
-    embed: GpuMat,
-    lm_head: GpuMat,
+    embed: Mat<Bf16>,
+    lm_head: Mat<Bf16>,
     mixer: GpuHyper,
     layers: Vec<GpuLayer>,
     mtp: Option<GpuMtp>,
+    /// Every uploaded part's format ledger row, in upload order.
+    ledger: Vec<LedgerRow>,
+    /// Each uploaded matrix's device address and its checkpoint name, for the packed copies.
+    labels: Vec<(u64, String)>,
 }
 
 /// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
@@ -776,7 +804,7 @@ impl Kernels {
             hyper_down_tiled: token("q4e_hyper_down_tiled", Precision::Bf16)?,
             hyper_up_tiled: token("q4e_hyper_up_tiled", Precision::Bf16)?,
             hyper_mix: token("q4e_hyper_mix", Precision::Bf16)?,
-            hyper_inject: token("q4e_hyper_inject", Precision::F32)?,
+            hyper_inject: token("q4e_hyper_inject", Precision::Bf16)?,
             inject: token("q4e_inject", Precision::F32)?,
             sum_slots: token("q4e_sum_slots", Precision::Bf16)?,
             swiglu: token("q4e_swiglu", Precision::Bf16)?,
@@ -870,6 +898,102 @@ fn bytes_bf16_scalar(bytes: &[u8], name: &str) -> Result<f32, String> {
     Ok(half::bf16::from_le_bytes(array).to_f32())
 }
 
+/// The typed matrix of a stored BF16 tensor: [upload] checks the container's dtype and shape
+/// and the scale count of the format (none here).
+fn typed_bf16(
+    spec: &TensorSpec,
+    rows: usize,
+    columns: usize,
+    data: Deviceptr,
+    stride: usize,
+    scales: Scales,
+) -> Result<Mat<Bf16>, String> {
+    let stored = TensorSpec {
+        name: spec.name.clone(),
+        dtype: spec.dtype,
+        shape: vec![rows, columns],
+    };
+    upload_format::<Bf16>(Tensor {
+        stored: &stored,
+        shape: &[rows, columns],
+        data,
+        stride,
+        scales,
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// The typed matrix of a stored FP8 E4M3 tensor: [upload] checks the stored dtype and that the
+/// inverse-scale plane has exactly one entry a 128 x 128 tile.
+#[allow(clippy::too_many_arguments)]
+fn typed_fp8(
+    spec: &TensorSpec,
+    rows: usize,
+    columns: usize,
+    data: Deviceptr,
+    stride: usize,
+    blocks: Deviceptr,
+    entries: usize,
+    dtype: DType,
+) -> Result<Mat<Fp8E4m3>, String> {
+    let stored = TensorSpec {
+        name: spec.name.clone(),
+        dtype: spec.dtype,
+        shape: vec![rows, columns],
+    };
+    upload_format::<Fp8E4m3>(Tensor {
+        stored: &stored,
+        shape: &[rows, columns],
+        data,
+        stride,
+        scales: Scales::fp8_e4m3(blocks, entries, dtype),
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// The typed matrix of a stored NVFP4 expert weight: [upload] checks the packed U8 container
+/// against the logical shape and that the per-16 scale plane has one entry a group.
+fn typed_nvfp4(
+    spec: &TensorSpec,
+    rows: usize,
+    columns: usize,
+    data: Deviceptr,
+    blocks: Deviceptr,
+    entries: usize,
+    global: f32,
+) -> Result<Mat<NvFp4>, String> {
+    // A safetensors source may report the logical FP4 view (one code an element) or
+    // ModelOpt's packed U8 container, two codes a byte along the last axis.
+    let stored_shape = if spec.dtype == DType::F4E2M1 {
+        vec![rows, columns]
+    } else {
+        vec![rows, columns.div_ceil(2)]
+    };
+    let stored = TensorSpec {
+        name: spec.name.clone(),
+        dtype: spec.dtype,
+        shape: stored_shape,
+    };
+    upload_format::<NvFp4>(Tensor {
+        stored: &stored,
+        shape: &[rows, columns],
+        data,
+        stride: columns.div_ceil(2),
+        scales: Scales::nvfp4(blocks, entries, global),
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// An absent projection: a zero-row BF16 matrix, which every launch skips.
+fn empty_bf16(columns: usize) -> Result<Mat<Bf16>, String> {
+    let spec = TensorSpec {
+        name: "absent".to_owned(),
+        dtype: DType::BF16,
+        shape: vec![0, columns],
+    };
+    typed_bf16(&spec, 0, columns, Deviceptr(0), columns * 2, Scales::none())
+}
+
 /// Where the weight walk puts each upload: a device allocation per weight ([Direct], the
 /// checkpoint path), or a converted rank file's slots ([crate::convert]).
 pub(crate) trait Sink {
@@ -928,6 +1052,12 @@ pub(crate) struct Uploader<'a> {
     /// The context [Uploader::mat_e4m3] quantizes on; unset for the host-only convert walks.
     cuda: Option<&'a Cuda>,
     sink: RefCell<&'a mut dyn Sink>,
+    /// Every uploaded part's stored and arithmetic format and the bytes it reads for one
+    /// token, in upload order: the boot format ledger's rows.
+    rows: RefCell<Vec<LedgerRow>>,
+    /// Each uploaded matrix's device address and its checkpoint name, so the packed copies
+    /// built after the upload can be named in the ledger.
+    labels: RefCell<Vec<(u64, String)>>,
 }
 
 /// The rows or the columns `first..first + count` of a matrix: what one rank of a
@@ -979,6 +1109,8 @@ impl<'a> Uploader<'a> {
         Self {
             cuda: Some(cuda),
             sink: RefCell::new(sink),
+            rows: RefCell::new(Vec::new()),
+            labels: RefCell::new(Vec::new()),
         }
     }
 
@@ -987,7 +1119,21 @@ impl<'a> Uploader<'a> {
         Self {
             cuda: None,
             sink: RefCell::new(sink),
+            rows: RefCell::new(Vec::new()),
+            labels: RefCell::new(Vec::new()),
         }
+    }
+
+    /// The ledger rows and packed-copy labels this walk recorded.
+    fn ledger(&self) -> (Vec<LedgerRow>, Vec<(u64, String)>) {
+        (self.rows.borrow().clone(), self.labels.borrow().clone())
+    }
+
+    /// One ledger row for a typed matrix, with the bytes one token reads from it.
+    fn record(&self, name: &str, stored: FormatKind, arithmetic: FormatKind, bytes: u128) {
+        self.rows
+            .borrow_mut()
+            .push(LedgerRow::new(name, stored, arithmetic, bytes));
     }
 
     fn wants_bytes(&self) -> bool {
@@ -1000,7 +1146,7 @@ impl<'a> Uploader<'a> {
         name: &str,
         rows: usize,
         columns: usize,
-    ) -> Result<GpuMat, String> {
+    ) -> Result<Mat<Bf16>, String> {
         self.mat_part(source, name, (rows, columns), Part::Rows(0, rows))
     }
 
@@ -1011,7 +1157,7 @@ impl<'a> Uploader<'a> {
         name: &str,
         (rows, columns): (usize, usize),
         part: Part,
-    ) -> Result<GpuMat, String> {
+    ) -> Result<Mat<Bf16>, String> {
         let (part_rows, part_columns) = part.shape((rows, columns))?;
         let len = part_rows * part_columns * 2;
         let bytes = if self.wants_bytes() {
@@ -1027,11 +1173,24 @@ impl<'a> Uploader<'a> {
         } else {
             Vec::new()
         };
-        Ok(GpuMat {
-            pointer: self.sink.borrow_mut().weight(name, len, bytes)?,
-            rows: part_rows,
-            columns: part_columns,
-        })
+        let spec = source.spec(name).map_err(|error| error.to_string())?;
+        let pointer = self.sink.borrow_mut().weight(name, len, bytes)?;
+        let typed = typed_bf16(
+            &spec,
+            part_rows,
+            part_columns,
+            pointer,
+            part_columns * 2,
+            Scales::none(),
+        )?;
+        self.record(
+            name,
+            typed.format(),
+            typed.format(),
+            typed.bytes_per_token(),
+        );
+        self.labels.borrow_mut().push((pointer.0, name.to_owned()));
+        Ok(typed)
     }
 
     /// The row runs `ranges` (first, count) of the BF16 checkpoint matrix `name`, `[rows,
@@ -1043,20 +1202,33 @@ impl<'a> Uploader<'a> {
         name: &str,
         (rows, columns): (usize, usize),
         ranges: &[(usize, usize)],
-    ) -> Result<GpuMat, String> {
+    ) -> Result<Mat<Bf16>, String> {
         if let [(first, count)] = ranges {
             return self.mat_part(source, name, (rows, columns), Part::Rows(*first, *count));
         }
         let bytes = self.rows_of(source, name, (rows, columns * 2), ranges)?;
         let part_rows = ranges.iter().map(|(_, count)| count).sum();
-        Ok(GpuMat {
-            pointer: self
-                .sink
-                .borrow_mut()
-                .weight(name, part_rows * columns * 2, bytes)?,
-            rows: part_rows,
+        let spec = source.spec(name).map_err(|error| error.to_string())?;
+        let pointer = self
+            .sink
+            .borrow_mut()
+            .weight(name, part_rows * columns * 2, bytes)?;
+        let typed = typed_bf16(
+            &spec,
+            part_rows,
             columns,
-        })
+            pointer,
+            columns * 2,
+            Scales::none(),
+        )?;
+        self.record(
+            name,
+            typed.format(),
+            typed.format(),
+            typed.bytes_per_token(),
+        );
+        self.labels.borrow_mut().push((pointer.0, name.to_owned()));
+        Ok(typed)
     }
 
     /// `part` of the dense projection `prefix` (`[rows, columns]`) as `quant` stores it: the BF16
@@ -1077,16 +1249,7 @@ impl<'a> Uploader<'a> {
                 shape,
                 part,
             )?)),
-            DenseQuant::Fp8Block => {
-                let (rows, columns) = part.shape(shape)?;
-                let (weight, scales) = self.fp8_part(source, prefix, shape, part)?;
-                Ok(Dense::Fp8(GpuMatE4m3Tile {
-                    weight,
-                    scales,
-                    rows,
-                    columns,
-                }))
-            }
+            DenseQuant::Fp8Block => Ok(Dense::Fp8(self.fp8_part(source, prefix, shape, part)?)),
         }
     }
 
@@ -1151,15 +1314,29 @@ impl<'a> Uploader<'a> {
             .weight(&name, part_rows * columns, codes)?;
         let scales = self.sink.borrow_mut().weight(
             &scale_name,
-            part_rows / TILE * (columns / TILE) * 2,
+            part_rows.div_ceil(TILE) * columns.div_ceil(TILE) * 2,
             scales,
         )?;
-        Ok(Dense::Fp8(GpuMatE4m3Tile {
-            weight,
-            scales,
-            rows: part_rows,
+        let spec = source.spec(&name).map_err(|error| error.to_string())?;
+        let entries = part_rows.div_ceil(TILE) * columns.div_ceil(TILE);
+        let typed = typed_fp8(
+            &spec,
+            part_rows,
             columns,
-        }))
+            weight,
+            columns,
+            scales,
+            entries,
+            DType::BF16,
+        )?;
+        self.record(
+            &name,
+            typed.format(),
+            typed.format(),
+            typed.bytes_per_token(),
+        );
+        self.labels.borrow_mut().push((weight.0, name));
+        Ok(Dense::Fp8(typed))
     }
 
     /// The row runs `ranges` of the tensor `name`, `rows` rows of `row_bytes` each, one after
@@ -1206,8 +1383,13 @@ impl<'a> Uploader<'a> {
             .cuda
             .ok_or_else(|| "the E4M3 quantization needs a device".to_owned())?;
         let matrix = self.mat(source, name, rows, columns)?;
-        let quantized = GpuMatE4m3::quantize(cuda, quantize, &matrix, &mut 0);
-        cuda.free_buffers(&[&matrix.pointer]);
+        let gpu = GpuMat {
+            pointer: matrix.data(),
+            rows: matrix.rows(),
+            columns: matrix.columns(),
+        };
+        let quantized = GpuMatE4m3::quantize(cuda, quantize, &gpu, &mut 0);
+        cuda.free_buffers(&[&gpu.pointer]);
         quantized
     }
 
@@ -1252,6 +1434,11 @@ impl<'a> Uploader<'a> {
         })
     }
 
+    /// A BF16 vector (a norm, a rotary table, a conv filter, a per-head decay).
+    ///
+    /// A vector stays a `Deviceptr`: [Mat] is a matrix with a row stride and a format's scale
+    /// plane, and these tensors have neither. Its stored and arithmetic formats and its bytes a
+    /// token are still ledger rows.
     fn vector(
         &self,
         source: &dyn WeightSource,
@@ -1271,7 +1458,14 @@ impl<'a> Uploader<'a> {
         } else {
             Vec::new()
         };
-        self.sink.borrow_mut().weight(name, len, bytes)
+        let pointer = self.sink.borrow_mut().weight(name, len, bytes)?;
+        self.record(
+            name,
+            FormatKind::Bf16,
+            FormatKind::Bf16,
+            (elements * 2) as u128,
+        );
+        Ok(pointer)
     }
 
     /// The row runs `ranges` of the BF16 tensor `name`, `rows` rows of `row_len` values, one
@@ -1289,8 +1483,11 @@ impl<'a> Uploader<'a> {
             return self.vector(source, name, rows * row_len);
         }
         let bytes = self.rows_of(source, name, (rows, row_len * 2), ranges)?;
-        let len = ranges.iter().map(|(_, count)| count).sum::<usize>() * row_len * 2;
-        self.sink.borrow_mut().weight(name, len, bytes)
+        let count = ranges.iter().map(|(_, count)| count).sum::<usize>();
+        let len = count * row_len * 2;
+        let pointer = self.sink.borrow_mut().weight(name, len, bytes)?;
+        self.record(name, FormatKind::Bf16, FormatKind::Bf16, len as u128);
+        Ok(pointer)
     }
 
     /// `part` of one block-scaled FP8 matrix (an expert, or a Qwen3.5/3.6 dense projection): the
@@ -1306,7 +1503,7 @@ impl<'a> Uploader<'a> {
         prefix: &str,
         (rows, columns): (usize, usize),
         part: Part,
-    ) -> Result<(Deviceptr, Deviceptr), String> {
+    ) -> Result<Mat<Fp8E4m3>, String> {
         const TILE: usize = 128;
         let (part_rows, part_columns) = part.shape((rows, columns))?;
         let (first, count, total) = match part {
@@ -1368,7 +1565,27 @@ impl<'a> Uploader<'a> {
             scale_len,
             scales,
         )?;
-        Ok((weight_pointer, scale_pointer))
+        let name = format!("{prefix}.weight");
+        let spec = source.spec(&name).map_err(|error| error.to_string())?;
+        let entries = part_rows.div_ceil(TILE) * part_columns.div_ceil(TILE);
+        let typed = typed_fp8(
+            &spec,
+            part_rows,
+            part_columns,
+            weight_pointer,
+            part_columns,
+            scale_pointer,
+            entries,
+            DType::BF16,
+        )?;
+        self.record(
+            &name,
+            typed.format(),
+            typed.format(),
+            typed.bytes_per_token(),
+        );
+        self.labels.borrow_mut().push((weight_pointer.0, name));
+        Ok(typed)
     }
 
     /// One block-scaled FP8 expert matrix: the codes and the BF16 inverse-scale grid.
@@ -1378,7 +1595,7 @@ impl<'a> Uploader<'a> {
         prefix: &str,
         rows: usize,
         columns: usize,
-    ) -> Result<(Deviceptr, Deviceptr), String> {
+    ) -> Result<Mat<Fp8E4m3>, String> {
         let weight_len = rows * columns;
         let scale_len = ScaleGrid::Tile(128).len(rows, columns) * 2;
         let (weight, scales) = if self.wants_bytes() {
@@ -1413,7 +1630,27 @@ impl<'a> Uploader<'a> {
             scale_len,
             scales,
         )?;
-        Ok((weight_pointer, scale_pointer))
+        let name = format!("{prefix}.weight");
+        let spec = source.spec(&name).map_err(|error| error.to_string())?;
+        let entries = rows.div_ceil(128) * columns.div_ceil(128);
+        let typed = typed_fp8(
+            &spec,
+            rows,
+            columns,
+            weight_pointer,
+            columns,
+            scale_pointer,
+            entries,
+            DType::BF16,
+        )?;
+        self.record(
+            &name,
+            typed.format(),
+            typed.format(),
+            typed.bytes_per_token(),
+        );
+        self.labels.borrow_mut().push((weight_pointer.0, name));
+        Ok(typed)
     }
 
     /// `part` of the NVFP4 checkpoint matrix at `prefix`, `[rows, columns]`, its rows or columns
@@ -1535,10 +1772,27 @@ impl<'a> Uploader<'a> {
             (0.0, 0.0)
         };
         let (scale_2, input_scale) = self.sink.borrow_mut().nvfp4_scalars(scale_2, input_scale)?;
-        Ok(GpuNvfp4 {
-            weight: weight_pointer,
-            scales: scale_pointer,
+        let name = format!("{prefix}.weight");
+        let spec = source.spec(&name).map_err(|error| error.to_string())?;
+        let entries = out_rows * out_columns.div_ceil(16);
+        let matrix = typed_nvfp4(
+            &spec,
+            out_rows,
+            out_columns,
+            weight_pointer,
+            scale_pointer,
+            entries,
             scale_2,
+        )?;
+        self.record(
+            &name,
+            matrix.format(),
+            matrix.format(),
+            matrix.bytes_per_token(),
+        );
+        self.labels.borrow_mut().push((weight_pointer.0, name));
+        Ok(GpuNvfp4 {
+            matrix,
             input_scale,
         })
     }
@@ -1807,11 +2061,7 @@ pub(crate) fn build_shard(
                     // Full attention stores no indexer: an empty projection, which dense4
                     // skips, and no norms, which only the QSA selection reads.
                     index_qk: if config.full_attention() {
-                        GpuMat {
-                            pointer: Deviceptr(0),
-                            rows: 0,
-                            columns: hidden,
-                        }
+                        empty_bf16(hidden)?
                     } else {
                         uploader.mat(
                             source,
@@ -1890,19 +2140,23 @@ pub(crate) fn build_shard(
                 let mut pointers = Vec::with_capacity(experts.len() * 6 * 8);
                 for expert in &experts {
                     for pointer in [
-                        expert.gate.weight.0,
-                        expert.gate.scales.0,
-                        expert.up.weight.0,
-                        expert.up.scales.0,
-                        expert.down.weight.0,
-                        expert.down.scales.0,
+                        expert.gate.weight().0,
+                        expert.gate.blocks().0,
+                        expert.up.weight().0,
+                        expert.up.blocks().0,
+                        expert.down.weight().0,
+                        expert.down.blocks().0,
                     ] {
                         pointers.extend_from_slice(&pointer.to_le_bytes());
                     }
                 }
                 let mut scalars = Vec::with_capacity(experts.len() * 3 * 4);
                 for expert in &experts {
-                    for scale in [expert.gate.scale_2, expert.up.scale_2, expert.down.scale_2] {
+                    for scale in [
+                        expert.gate.global(),
+                        expert.up.global(),
+                        expert.down.global(),
+                    ] {
                         scalars.extend_from_slice(&scale.to_le_bytes());
                     }
                 }
@@ -1941,14 +2195,21 @@ pub(crate) fn build_shard(
                             columns(fp8_share, 1),
                         ),
                     ] {
-                        let (weight, scales) = uploader.fp8_part(
+                        let matrix = uploader.fp8_part(
                             source,
                             &format!("{prefix}.{name}"),
                             (expert_rows, expert_columns),
                             part,
                         )?;
-                        pointers.extend_from_slice(&weight.0.to_le_bytes());
-                        pointers.extend_from_slice(&scales.0.to_le_bytes());
+                        pointers.extend_from_slice(&matrix.data().0.to_le_bytes());
+                        pointers.extend_from_slice(
+                            &matrix
+                                .scales()
+                                .blocks()
+                                .unwrap_or(Deviceptr(0))
+                                .0
+                                .to_le_bytes(),
+                        );
                     }
                 }
                 (pointers, None)
@@ -2139,7 +2400,15 @@ pub(crate) fn build_shard(
                 hidden,
                 config.moe_intermediate_size,
             )?;
-            for pointer in [gate.0, gate.1, up.0, up.1, down.0, down.1] {
+            let blocks = |matrix: &Mat<Fp8E4m3>| matrix.scales().blocks().unwrap_or(Deviceptr(0));
+            for pointer in [
+                gate.data(),
+                blocks(&gate),
+                up.data(),
+                blocks(&up),
+                down.data(),
+                blocks(&down),
+            ] {
                 pointers.extend_from_slice(&pointer.0.to_le_bytes());
             }
         }
@@ -2209,12 +2478,15 @@ pub(crate) fn build_shard(
     } else {
         None
     };
+    let (ledger, labels) = uploader.ledger();
     Ok(GpuWeights {
         embed,
         lm_head,
         mixer,
         layers,
         mtp,
+        ledger,
+        labels,
     })
 }
 
@@ -2872,7 +3144,15 @@ impl Qwen4ExpDeviceBackend {
         }
         let rewind = sparkflash_runtime::rewind()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
-        let packed = pack_dense(&cuda, &weights)?;
+        let (packed, packed_rows) = pack_dense(&cuda, &weights)?;
+        // Every uploaded part and every packed copy is one ledger row; boot refuses an
+        // arithmetic format the checkpoint does not store unless a widen record names it. This
+        // arm reads every weight at its stored format, so the log is empty.
+        let mut ledger_rows = weights.ledger.clone();
+        ledger_rows.extend(packed_rows);
+        let ledger = FormatLedger::boot(ledger_rows, &WidenLog::new())
+            .map_err(|error| BackendError::new("qwen4_device", error.to_string()))?;
+        eprintln!("[qwen] {ledger}");
         let shared = Arc::new(SequenceShared {
             cuda: CudaHandle::new(cuda),
             kernels: KernelSet(kernels),
@@ -3739,16 +4019,19 @@ const PACK_MIN_WEIGHTS: usize = 1 << 20;
 /// keep reading the BF16 rows, which stay. Every packed matrix is unpacked and compared with its
 /// BF16 rows here, and one differing word refuses the load. `SPARKFLASH_DENSE_WEIGHTS=checkpoint` packs
 /// nothing.
-fn pack_dense(cuda: &Cuda, weights: &GpuWeights) -> Result<PackedSet, BackendError> {
+fn pack_dense(
+    cuda: &Cuda,
+    weights: &GpuWeights,
+) -> Result<(PackedSet, Vec<LedgerRow>), BackendError> {
     let refusal = |error: String| BackendError::new("qwen4_device", error);
     let mut set = PackedSet::new(Form::from_env().map_err(refusal)?, Placement::Beside).tiled();
-    fn bf16(matrix: &Dense) -> Option<&GpuMat> {
+    fn bf16(matrix: &Dense) -> Option<&Mat<Bf16>> {
         match matrix {
             Dense::Bf16(matrix) => Some(matrix),
             Dense::Fp8(_) => None,
         }
     }
-    let mut candidates: Vec<&GpuMat> = Vec::new();
+    let mut candidates: Vec<&Mat<Bf16>> = Vec::new();
     for layer in &weights.layers {
         match &layer.branch {
             GpuBranch::Linear {
@@ -3785,20 +4068,62 @@ fn pack_dense(cuda: &Cuda, weights: &GpuWeights) -> Result<PackedSet, BackendErr
     let matrices: Vec<(Deviceptr, usize, usize)> = candidates
         .into_iter()
         .filter(|matrix| {
-            matrix.rows.is_multiple_of(32)
-                && matrix.rows * matrix.columns >= PACK_MIN_WEIGHTS
-                && sparkflash_ops::packed::packable(matrix.rows, matrix.columns)
+            matrix.rows().is_multiple_of(32)
+                && matrix.rows() * matrix.columns() >= PACK_MIN_WEIGHTS
+                && sparkflash_ops::packed::packable(matrix.rows(), matrix.columns())
         })
-        .map(|matrix| (matrix.pointer, matrix.rows, matrix.columns))
+        .map(|matrix| (matrix.data(), matrix.rows(), matrix.columns()))
         .collect();
     if matrices.is_empty() || Form::from_env().map_err(refusal)? == Form::Checkpoint {
         eprintln!("qwen4: {}", set.summary());
-        return Ok(set);
+        return Ok((set, Vec::new()));
     }
     let kernels = sparkflash_ops::packed::Kernels::load(cuda).map_err(refusal)?;
     set.pack(cuda, &kernels, &matrices, 0).map_err(refusal)?;
+    // The packed copies are typed BF16 matrices too, with the form's word layout as their
+    // scales, so the boot ledger names each one and the uploader checks its row geometry.
+    let mut rows = Vec::new();
+    for (pointer, packed_rows, columns) in &matrices {
+        let Some(copy) = set.get(*pointer) else {
+            continue;
+        };
+        let planes = copy.planes();
+        let name = weights
+            .labels
+            .iter()
+            .find(|(address, _)| address == &pointer.0)
+            .map_or_else(
+                || format!("packed {packed_rows} x {columns} BF16 projection"),
+                |(_, name)| format!("packed {name}"),
+            );
+        let spec = TensorSpec {
+            name: name.clone(),
+            dtype: DType::BF16,
+            shape: vec![*packed_rows, *columns],
+        };
+        let typed = typed_bf16(
+            &spec,
+            *packed_rows,
+            *columns,
+            Deviceptr(planes[0]),
+            copy.row_bytes(),
+            Scales::packed_bf16(PackedBf16 {
+                escapes: Deviceptr(planes[2]),
+                offsets: Deviceptr(planes[1]),
+                row_bytes: copy.row_bytes(),
+                order: PackedOrder::Tiled,
+            }),
+        )
+        .map_err(refusal)?;
+        rows.push(LedgerRow::new(
+            typed.spec().name.clone(),
+            typed.format(),
+            typed.format(),
+            typed.bytes_per_token(),
+        ));
+    }
     eprintln!("qwen4: {}", set.summary());
-    Ok(set)
+    Ok((set, rows))
 }
 
 impl DeviceSequence {
@@ -3990,7 +4315,7 @@ impl DeviceSequence {
     /// launch and the remainder in its own.
     fn gemm(
         &self,
-        matrix: &GpuMat,
+        matrix: &Mat<Bf16>,
         input: Deviceptr,
         output: Deviceptr,
         batch: usize,
@@ -4016,8 +4341,8 @@ impl DeviceSequence {
         if base < batch {
             self.gemm_tokens(
                 matrix,
-                input.offset(base * matrix.columns * 4),
-                output.offset(base * matrix.rows * 4),
+                input.offset(base * matrix.columns() * 4),
+                output.offset(base * matrix.rows() * 4),
                 batch - base,
                 1,
                 epilogue,
@@ -4028,7 +4353,7 @@ impl DeviceSequence {
     }
 
     /// The K split [Self::gemm_tokens] gives `matrix` over a run of `batch` tokens.
-    pub(super) fn token_split(&self, matrix: &GpuMat, batch: usize) -> usize {
+    pub(super) fn token_split(&self, matrix: &Mat<Bf16>, batch: usize) -> usize {
         // A block computes an 8 x 8 tile of (row, token) per thread, so a matrix with few rows
         // leaves the GPU almost entirely idle: the hyper-connection's 320-row down projection is
         // 640 threads, five blocks on forty-eight SMs, and measured 0.67 ms for a 6.5 MiB read
@@ -4039,10 +4364,10 @@ impl DeviceSequence {
         } else {
             batch
         };
-        let price = (matrix.rows.div_ceil(64) * split_for.div_ceil(64)).max(1);
-        let budget = (GEMM_PARTIAL_FLOATS / (split_for * matrix.rows).max(1)).max(1);
+        let price = (matrix.rows().div_ceil(64) * split_for.div_ceil(64)).max(1);
+        let budget = (GEMM_PARTIAL_FLOATS / (split_for * matrix.rows()).max(1)).max(1);
         (96 / price)
-            .clamp(1, (matrix.columns / 32).max(1))
+            .clamp(1, (matrix.columns() / 32).max(1))
             .min(budget)
     }
 
@@ -4055,7 +4380,7 @@ impl DeviceSequence {
     #[allow(clippy::too_many_arguments)]
     fn gemm_tokens(
         &self,
-        matrix: &GpuMat,
+        matrix: &Mat<Bf16>,
         input: Deviceptr,
         output: Deviceptr,
         batch: usize,
@@ -4069,7 +4394,7 @@ impl DeviceSequence {
         } else {
             0_u64
         };
-        let count = batch * matrix.rows;
+        let count = batch * matrix.rows();
         // A few rows take q4p_gemm_rows, the same sums a thread an output, whose split tiles add
         // their slices themselves: one ticket a 128-output tile of a run.
         let rows_kernel = batch < GEMM_MIN_BATCH;
@@ -4094,14 +4419,14 @@ impl DeviceSequence {
             let (kernel, blocks) = if rows_kernel {
                 (self.backend.kernels.prefill.gemm_rows, count.div_ceil(128))
             } else {
-                (self.backend.kernels.gemm_bf16, matrix.rows.div_ceil(64))
+                (self.backend.kernels.gemm_bf16, matrix.rows().div_ceil(64))
             };
             let args = [
-                matrix.pointer.0,
-                input.offset(done * batch * matrix.columns * 4).0,
+                matrix.data().0,
+                input.offset(done * batch * matrix.columns() * 4).0,
                 output.0,
-                matrix.rows as u64,
-                matrix.columns as u64,
+                matrix.rows() as u64,
+                matrix.columns() as u64,
                 batch as u64,
                 epilogue as u64,
                 u64::from(scale.to_bits()),
@@ -4144,7 +4469,7 @@ impl DeviceSequence {
     /// matches the work.
     fn gemv_grouped(
         &self,
-        matrix: &GpuMat,
+        matrix: &Mat<Bf16>,
         input: Deviceptr,
         output: Deviceptr,
         batch: usize,
@@ -4155,10 +4480,10 @@ impl DeviceSequence {
             self.call(
                 self.backend.kernels.gemv_bf16,
                 sparkflash_ops::calls::gemv_bf16(
-                    matrix.pointer.0,
-                    input.offset(base * matrix.columns * 4).0,
-                    output.offset(base * matrix.rows * 4).0,
-                    (matrix.rows, matrix.columns),
+                    matrix.data().0,
+                    input.offset(base * matrix.columns() * 4).0,
+                    output.offset(base * matrix.rows() * 4).0,
+                    (matrix.rows(), matrix.columns()),
                     count,
                 ),
             )?;
@@ -4169,7 +4494,7 @@ impl DeviceSequence {
 
     fn gemv(
         &self,
-        matrix: &GpuMat,
+        matrix: &Mat<Bf16>,
         input: Deviceptr,
         output: Deviceptr,
         batch: usize,
@@ -4182,24 +4507,24 @@ impl DeviceSequence {
         if batch > GEMV_MAX_BATCH {
             return self.gemv_grouped(matrix, input, output, batch);
         }
-        if matrix.columns >= TILED_GEMV_MIN_COLUMNS
-            && tiled_operands(&[matrix.pointer, input], matrix.columns)
+        if matrix.columns() >= TILED_GEMV_MIN_COLUMNS
+            && tiled_operands(&[matrix.data(), input], matrix.columns())
         {
-            let tiles = matrix.rows.div_ceil(32);
+            let tiles = matrix.rows().div_ceil(32);
             return self.launch(
                 self.backend.kernels.gemv_tiled_bf16,
                 (
                     tiles as u32,
-                    tiled_gemv_splits(tiles, matrix.columns) as u32,
+                    tiled_gemv_splits(tiles, matrix.columns()) as u32,
                     1,
                 ),
                 (256, 1, 1),
                 &[
-                    matrix.pointer.0,
+                    matrix.data().0,
                     input.0,
                     output.0,
-                    matrix.rows as u64,
-                    matrix.columns as u64,
+                    matrix.rows() as u64,
+                    matrix.columns() as u64,
                     batch as u64,
                     self.gemm_partials.0,
                     self.tiled_counters.0,
@@ -4209,13 +4534,40 @@ impl DeviceSequence {
         self.call(
             self.backend.kernels.gemv_bf16,
             sparkflash_ops::calls::gemv_bf16(
-                matrix.pointer.0,
+                matrix.data().0,
                 input.0,
                 output.0,
-                (matrix.rows, matrix.columns),
+                (matrix.rows(), matrix.columns()),
                 batch,
             ),
         )
+    }
+
+    /// [Self::gemv] over a bare [GpuMat], for [sparkflash_ops::gemv::GemvDevice]'s trait,
+    /// which the shared drafter calls with its own head. The matrix is checked as a BF16
+    /// `Mat` on the way in, so a caller cannot present another format.
+    fn gemv_gpu(
+        &self,
+        matrix: &GpuMat,
+        input: Deviceptr,
+        output: Deviceptr,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        let spec = TensorSpec {
+            name: "dflash head".to_owned(),
+            dtype: DType::BF16,
+            shape: vec![matrix.rows, matrix.columns],
+        };
+        let typed = typed_bf16(
+            &spec,
+            matrix.rows,
+            matrix.columns,
+            matrix.pointer,
+            matrix.columns * 2,
+            Scales::none(),
+        )
+        .map_err(|error| BackendError::new("qwen4_device", error))?;
+        self.gemv(&typed, input, output, batch)
     }
 
     /// output = matrix input over `batch` rows for a dense projection in either storage.
@@ -4239,15 +4591,21 @@ impl DeviceSequence {
         if batch >= GEMM_MIN_BATCH && self.dense_fp8_mma(matrix, input, output, batch)? {
             return Ok(());
         }
+        let tile = GpuMatE4m3Tile {
+            weight: matrix.data(),
+            scales: matrix.scales().blocks().unwrap_or(Deviceptr(0)),
+            rows: matrix.rows(),
+            columns: matrix.columns(),
+        };
         let mut base = 0usize;
         while base < batch {
             let count = GEMV_MAX_BATCH.min(batch - base);
             gemv_e4m3_tile(
                 self,
                 self.backend.kernels.gemv_tiled_e4m3_tile.kernel,
-                matrix,
-                input.offset(base * matrix.columns * 4),
-                output.offset(base * matrix.rows * 4),
+                &tile,
+                input.offset(base * matrix.columns() * 4),
+                output.offset(base * matrix.rows() * 4),
                 count,
             )?;
             base += count;
@@ -4287,10 +4645,10 @@ impl DeviceSequence {
     #[allow(clippy::too_many_arguments)]
     fn gemv4(
         &self,
-        m0: &GpuMat,
-        m1: &GpuMat,
-        m2: &GpuMat,
-        m3: &GpuMat,
+        m0: &Mat<Bf16>,
+        m1: &Mat<Bf16>,
+        m2: &Mat<Bf16>,
+        m3: &Mat<Bf16>,
         input: Deviceptr,
         y0: Deviceptr,
         y1: Deviceptr,
@@ -4319,27 +4677,27 @@ impl DeviceSequence {
             return Ok(());
         }
         const WARPS: usize = 8;
-        let total_rows = m0.rows + m1.rows + m2.rows + m3.rows;
+        let total_rows = m0.rows() + m1.rows() + m2.rows() + m3.rows();
         let rows_per_block = if batch > 1 { WARPS * 2 } else { WARPS };
         self.launch(
             self.backend.kernels.gemv4_bf16,
             (total_rows.div_ceil(rows_per_block) as u32, 1, 1),
             ((WARPS * 32) as u32, 1, 1),
             &[
-                m0.pointer.0,
-                m1.pointer.0,
-                m2.pointer.0,
-                m3.pointer.0,
+                m0.data().0,
+                m1.data().0,
+                m2.data().0,
+                m3.data().0,
                 input.0,
                 y0.0,
                 y1.0,
                 y2.0,
                 y3.0,
-                m0.rows as u64,
-                m1.rows as u64,
-                m2.rows as u64,
-                m3.rows as u64,
-                m0.columns as u64,
+                m0.rows() as u64,
+                m1.rows() as u64,
+                m2.rows() as u64,
+                m3.rows() as u64,
+                m0.columns() as u64,
                 batch as u64,
             ],
         )
@@ -4417,7 +4775,7 @@ impl DeviceSequence {
                 .inject
                 .as_ref()
                 .ok_or_else(|| BackendError::new("qwen4_device", "missing block_inject weight"))?;
-            (weights.pointer.0, config.hc_lowrank + config.hc_count)
+            (weights.data().0, config.hc_lowrank + config.hc_count)
         } else {
             (0u64, config.hc_lowrank)
         };
@@ -4506,12 +4864,12 @@ impl DeviceSequence {
         // The tiled passes take four streams, a warp's four rows; the shape alone decides, so a
         // verify's rows and the one-token step always go the same way.
         let tiled = config.hc_count == 4
-            && tiled_operands(&[mix.down.pointer, mix.up.pointer], width)
-            && tiled_operands(&[mix.up.pointer], config.hc_lowrank)
+            && tiled_operands(&[mix.down.data(), mix.up.data()], width)
+            && tiled_operands(&[mix.up.data()], config.hc_lowrank)
             && block
                 .inject
                 .as_ref()
-                .is_none_or(|weights| tiled_operands(&[weights.pointer], width));
+                .is_none_or(|weights| tiled_operands(&[weights.data()], width));
         let mut base = first;
         while base < first + batch {
             let count = GEMV_MAX_BATCH.min(first + batch - base);
@@ -4537,7 +4895,7 @@ impl DeviceSequence {
                     (256, 1, 1),
                     &[
                         normed.0,
-                        mix.down.pointer.0,
+                        mix.down.data().0,
                         inject_ptr,
                         low.0,
                         injection.0,
@@ -4555,7 +4913,7 @@ impl DeviceSequence {
                     (256, 1, 1),
                     &[
                         normed.0,
-                        mix.up.pointer.0,
+                        mix.up.data().0,
                         low.0,
                         mixed.0,
                         config.hc_count as u64,
@@ -4573,7 +4931,7 @@ impl DeviceSequence {
                 ((WARPS * 32) as u32, 1, 1),
                 &[
                     normed.0,
-                    mix.down.pointer.0,
+                    mix.down.data().0,
                     inject_ptr,
                     low.0,
                     injection.0,
@@ -4589,7 +4947,7 @@ impl DeviceSequence {
                 ((WARPS * 32) as u32, 1, 1),
                 &[
                     normed.0,
-                    mix.up.pointer.0,
+                    mix.up.data().0,
                     low.0,
                     mixed.0,
                     config.hc_count as u64,
@@ -4700,7 +5058,7 @@ impl DeviceSequence {
             self.call(
                 kernels.embed,
                 calls::embed(
-                    weights.embed.pointer.0,
+                    weights.embed.data().0,
                     self.mtp_embed.offset(t * hidden * 4).0,
                     token,
                     (hidden, hidden),
@@ -5058,7 +5416,7 @@ impl DeviceSequence {
         self.call(
             kernels.embed,
             calls::embed_rows(
-                weights.embed.pointer.0,
+                weights.embed.data().0,
                 self.hyper.0,
                 self.token_staging.device().0,
                 (config.hidden_size, width),
@@ -6609,6 +6967,165 @@ pub fn device_self_test() -> Result<(), BackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every (image, symbol, precision) [Kernels::load], [PrefillKernels::load] and the
+    /// drafter's quantiser resolve. Kept beside the loaders so a symbol that drifts out of the
+    /// catalogue fails on the CPU, before a device boots.
+    const LOADED_SYMBOLS: &[(Image, &str, Precision)] = &[
+        (Image::Qwen4Exp, "q4e_embed", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemv_bf16", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemv_tiled_bf16", Precision::Bf16),
+        (
+            Image::Qwen4Exp,
+            "q4e_gemv_tiled_e4m3_tile",
+            Precision::Fp8E4M3,
+        ),
+        (Image::Qwen4Exp, "q4e_gemv4_bf16", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemm_bf16", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemm_reduce", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_shared_gate_up", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_rmsnorm", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_zero", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_add", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_hyper_down", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_hyper_up", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_hyper_down_tiled", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_hyper_up_tiled", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_hyper_mix", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_hyper_inject", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_inject", Precision::F32),
+        (Image::Qwen4Exp, "q4e_sum_slots", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_swiglu", Precision::Bf16),
+        (Image::Qwen4Moe, "q4e_router", Precision::Bf16),
+        (Image::MoePlan, "moe_plan", Precision::Bf16),
+        (Image::Qwen4Moe, "q4e_expert_gate_up", Precision::NvFp4),
+        (Image::Qwen4Moe, "q4e_expert_down", Precision::NvFp4),
+        (
+            Image::Qwen4Moe,
+            "q4e_expert_gate_up_fp8",
+            Precision::Fp8E4M3,
+        ),
+        (Image::Qwen4Moe, "q4e_expert_down_fp8", Precision::Fp8E4M3),
+        (Image::Qwen4Exp, "q4e_fold_streams", Precision::F32),
+        (Image::Qwen4Exp, "q4e_widen_streams", Precision::F32),
+        (Image::Qwen4Moe, "q4e_moe_combine", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gdn_conv", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gdn_recur", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_rope", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_qsa_pool", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_qsa_scores", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_qsa_pick", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_attn", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_attn_group", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_attn_group6", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_attn_full", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_attn_full_combine", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_ple_gate", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_ple_conv", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_deinterleave", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_rmsnorm_rows", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_copy_flat", Precision::F32),
+        (Image::Qwen4Attn, "q4e_cache_bf16", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_cache_rows_bf16", Precision::Bf16),
+        (Image::Qwen4Prefill, "q4p_dense_mma", Precision::Bf16),
+        (Image::Qwen4Prefill, "q4p_dense_fp8", Precision::Fp8E4M3),
+        (Image::Qwen4Prefill, "q4p_dense_rows", Precision::Bf16),
+        (Image::Qwen4Prefill, "q4p_hyper_up_rows", Precision::Bf16),
+        (Image::Qwen4Prefill, "q4p_gemm_rows", Precision::Bf16),
+        (Image::Qwen4Prefill, "q4p_epilogue", Precision::Bf16),
+        (Image::Qwen4Prefill, "q4p_split_bf16", Precision::Bf16),
+        (Image::Qwen4Prefill, "q4p_moe_gate_up", Precision::NvFp4),
+        (Image::Qwen4Prefill, "q4p_moe_down", Precision::NvFp4),
+        (
+            Image::Qwen4Prefill,
+            "q4p_moe_rows_gate_up",
+            Precision::NvFp4,
+        ),
+        (Image::Qwen4Prefill, "q4p_moe_rows_down", Precision::NvFp4),
+        (
+            Image::Qwen4Prefill,
+            "q4p_moe_gate_up_fp8",
+            Precision::Fp8E4M3,
+        ),
+        (
+            Image::Qwen4Prefill,
+            "q4p_moe_swiglu_fp8",
+            Precision::Fp8E4M3,
+        ),
+        (Image::Qwen4Prefill, "q4p_moe_down_fp8", Precision::Fp8E4M3),
+        (Image::Qwen4Scan, "q4p_gdn_conv", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_conv_state", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_prep", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_scan", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_scan_64_64", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_scan_128_256", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_gate", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_quantize_e4m3_rows", Precision::Bf16),
+    ];
+
+    #[test]
+    fn every_kernel_the_arm_loads_is_in_the_catalogue() {
+        for (image, symbol, precision) in LOADED_SYMBOLS {
+            Bound::carried(*image, symbol, *precision).unwrap_or_else(|error| {
+                panic!("{image:?} {symbol} at {}: {error}", precision.name())
+            });
+        }
+    }
+
+    /// A bound handle names a symbol the image exports and carries at the handle's precision.
+    #[test]
+    fn a_bound_handle_names_a_catalogued_symbol_and_precision() {
+        Bound::carried(Image::Qwen4Exp, "q4e_gemv_bf16", Precision::Bf16)
+            .expect("the catalogue carries q4e_gemv_bf16 at bf16");
+        let error = Bound::carried(Image::Qwen4Exp, "q4e_gemv_bf16", Precision::Fp8E4M3)
+            .expect_err("q4e_gemv_bf16 is a bf16 body, not an FP8 one");
+        assert!(error.contains("accepting e4m3"), "{error}");
+        let error = Bound::carried(Image::Qwen4Exp, "q4e_not_a_kernel", Precision::Bf16)
+            .expect_err("the image does not export it");
+        assert!(error.contains("does not export"), "{error}");
+    }
+
+    /// The load path checks the stored dtype and the scale count, not only the pointer.
+    #[test]
+    fn the_load_path_checks_the_stored_dtype_and_the_scale_count() {
+        let bf16 = TensorSpec {
+            name: "layers.0.mlp.up_proj.weight".to_owned(),
+            dtype: DType::BF16,
+            shape: vec![4, 256],
+        };
+        let typed = typed_bf16(&bf16, 4, 256, Deviceptr(0x1000), 512, Scales::none())
+            .expect("a BF16 projection");
+        assert_eq!(typed.format(), FormatKind::Bf16);
+        assert_eq!(typed.bytes_per_token(), 4 * 512);
+
+        let quantized = TensorSpec {
+            dtype: DType::U8,
+            ..bf16.clone()
+        };
+        let error = typed_bf16(&quantized, 4, 256, Deviceptr(0x1000), 512, Scales::none())
+            .expect_err("a U8 tensor is not a BF16 Mat");
+        assert!(error.contains("bf16"), "{error}");
+        assert!(error.contains("U8"), "{error}");
+
+        let fp8 = TensorSpec {
+            dtype: DType::F8E4M3,
+            shape: vec![4, 256],
+            ..bf16.clone()
+        };
+        let short = typed_fp8(
+            &fp8,
+            4,
+            256,
+            Deviceptr(0x2000),
+            256,
+            Deviceptr(0x3000),
+            1,
+            DType::BF16,
+        )
+        .expect_err("a 4 x 256 FP8 matrix has two 128 x 128 tiles");
+        assert!(short.contains("needs 2"), "{short}");
+        assert!(short.contains("has 1"), "{short}");
+    }
 
     #[test]
     fn the_open_config_reads_the_merged_generation_stop_set() {

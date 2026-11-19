@@ -40,7 +40,7 @@ pub fn embedded_dflash2_cubin() -> &'static [u8] {
 pub(super) fn load_dflash_from_env(
     cuda: &sparkflash_kernels::cuda_driver::Cuda,
     target: &Qwen4ExpConfig,
-    head: &GpuMat,
+    head: &sparkflash_ops::formats::Mat<sparkflash_ops::formats::Bf16>,
 ) -> Result<Option<GpuDflash2>, BackendError> {
     let Some(directory) = crate::dflash::drafter_directory(target) else {
         return Ok(None);
@@ -52,7 +52,14 @@ pub(super) fn load_dflash_from_env(
         "q4e_quantize_e4m3_rows",
         sparkflash_ops::plan::Precision::Bf16,
     )
-    .and_then(|quantize| GpuMatE4m3::quantize(cuda, quantize.kernel, head, &mut 0))
+    .and_then(|quantize| {
+        let head = GpuMat {
+            pointer: head.data(),
+            rows: head.rows(),
+            columns: head.columns(),
+        };
+        GpuMatE4m3::quantize(cuda, quantize.kernel, &head, &mut 0)
+    })
     .and_then(|head| {
         GpuDflash2::load(cuda, &directory, target, &head, (0, 1)).inspect_err(|_| head.free(cuda))
     });
@@ -82,7 +89,7 @@ impl GemvDevice for DeviceSequence {
         output: Deviceptr,
         rows: usize,
     ) -> Result<(), BackendError> {
-        DeviceSequence::gemv(self, matrix, input, output, rows)
+        self.gemv_gpu(matrix, input, output, rows)
     }
 
     fn tiled_scratch(&self) -> (Deviceptr, Deviceptr) {
@@ -174,7 +181,7 @@ impl DeviceSequence {
         if base + block > self.context_limit {
             return Ok(());
         }
-        let embed = backend.weights.embed.pointer;
+        let embed = backend.weights.embed.data();
         let candidates = GpuDflash2::candidates(&scratch);
         draft.score(self, &scratch, embed, anchor, base, 0, candidates)?;
         draft.select(self, &scratch, anchor)?;
