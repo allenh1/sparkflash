@@ -104,6 +104,30 @@ impl<W: Walk> RuntimeSlot<W> {
     pub fn history(&self) -> &[u32] {
         &self.history
     }
+
+    /// Whether a prompt is still running a part at a time.
+    #[must_use]
+    pub fn prompt_pending(&self) -> bool {
+        self.prompt.is_some()
+    }
+
+    /// The end of the last prompt, when the slot keeps one to go back to.
+    #[must_use]
+    pub fn rewind_point(&self) -> Option<usize> {
+        self.point
+    }
+
+    /// How many of the last prompt's tokens the sequence already held.
+    #[must_use]
+    pub fn cached(&self) -> usize {
+        self.cached
+    }
+
+    /// The image spans the reusable history holds.
+    #[must_use]
+    pub fn held_image_spans(&self) -> &[ImageSpan] {
+        &self.held_images
+    }
 }
 
 /// Every strategy over one [`Walk`].
@@ -212,11 +236,28 @@ impl<W: Walk> Runtime<W> {
 
     /// Runs the next chunk of `slot`'s prompt, then its head when the prompt ends.
     fn run_part(&self, slot: &mut RuntimeSlot<W>) -> Result<Part, BackendError> {
+        self.run_part_rows(slot, self.chunk.rows())
+    }
+
+    /// Runs the next `rows` rows of `slot`'s prompt, then its head when the prompt ends.
+    ///
+    /// The tick engine decides a chunk's size itself ([crate::tick::bulk_rows],
+    /// [crate::tick::tick_rows]) and calls this with that number, so the runtime keeps the
+    /// execution and the engine keeps the decision. [Self::run_part] is this with the
+    /// [ChunkPolicy]'s size.
+    ///
+    /// # Errors
+    /// A backend failure, or a slot with no prompt in parts.
+    pub fn run_part_rows(
+        &self,
+        slot: &mut RuntimeSlot<W>,
+        rows: usize,
+    ) -> Result<Part, BackendError> {
         let prompt = slot
             .prompt
             .take()
             .ok_or_else(|| BackendError::new("runtime", "the sequence has no prompt in parts"))?;
-        let end = (prompt.next + self.chunk.rows()).min(prompt.tokens.len());
+        let end = (prompt.next + rows).min(prompt.tokens.len());
         let rows = &prompt.tokens[prompt.next..end];
         let hidden = {
             let mut segments = [Segment::with_images(&mut slot.seq, rows, &prompt.fresh)];
@@ -496,6 +537,25 @@ impl<W: Walk> Runtime<W> {
         tokens: &[u32],
         images: &[VisionImage],
     ) -> Result<Part, BackendError> {
+        self.start_prompt_slot(slot, tokens, images)?;
+        self.run_part(slot)
+    }
+
+    /// Starts a prompt on `slot` without running any of its rows: the resume or rewind, the
+    /// history and image bookkeeping, and the prompt in parts. Returns the position the prompt
+    /// resumes from, which the tick engine records as its placement.
+    ///
+    /// The tick engine calls this when it places a sequence on a lane and runs its chunks later,
+    /// in [crate::tick::prefill_order]; [Self::begin_prompt_slot] is this plus the first chunk.
+    ///
+    /// # Errors
+    /// An empty prompt, an image the arm does not take, or a backend failure.
+    pub fn start_prompt_slot(
+        &self,
+        slot: &mut RuntimeSlot<W>,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<usize, BackendError> {
         if tokens.is_empty() {
             return Err(BackendError::new("runtime", "the prompt has no tokens"));
         }
@@ -576,7 +636,7 @@ impl<W: Walk> Runtime<W> {
             images: images.to_vec(),
             fresh,
         });
-        self.run_part(slot)
+        Ok(start)
     }
 
     /// The next part of a prompt ([FusedArm::next_part], without the join bounds).
@@ -646,6 +706,96 @@ impl<W: Walk> Runtime<W> {
             slot.history.push(*token);
         }
         Ok(steps)
+    }
+
+    /// Clears `slot` for another request, keeping the request's sampler ([FusedArm::release]).
+    ///
+    /// # Errors
+    /// An exhausted lane pool, or a sequence the arm cannot open.
+    pub fn release_slot(&self, slot: &mut RuntimeSlot<W>) -> Result<(), BackendError> {
+        let fresh = self.open_slot()?;
+        let sampling = slot.sampling;
+        let old = std::mem::replace(slot, fresh);
+        slot.sampling = sampling;
+        self.walk.set_sampling(&mut slot.seq, sampling);
+        self.release_lane(old.lane);
+        Ok(())
+    }
+
+    /// Whether `slot` can take a prompt (or, for `None`, its next step) with the memory the arm
+    /// has spare now ([FusedArm::room]).
+    #[must_use]
+    pub fn room_slot(&self, slot: &RuntimeSlot<W>, prompt: Option<&[u32]>) -> bool {
+        // A prompt's final position is its own length: it either extends the history or rewinds
+        // to the point and forwards the rest. A step adds its anchor and, for a drafting walk,
+        // the widest chain it may verify, so the reservation is the verify's rows and not one.
+        let step_rows = if W::Drafter::PRESENT && self.walk.drafter().drafts() {
+            1 + self.walk.drafter().budget(1)
+        } else {
+            1
+        };
+        let positions = match prompt {
+            Some(prompt) => prompt.len(),
+            None => slot.history.len().saturating_add(step_rows),
+        };
+        if positions > self.limits.context {
+            return false;
+        }
+        // The arm answers the physical question: its lane memory may be narrower than the
+        // context, and a prompt that starts over uses the chunks a fresh lane needs.
+        match prompt {
+            Some(prompt) => {
+                let point = slot
+                    .point
+                    .filter(|point| *point <= slot.history.len())
+                    .map(|point| &slot.history[..point]);
+                let continues = crate::fused::extends(&slot.history, prompt)
+                    || point.is_some_and(|point| crate::fused::extends(point, prompt));
+                slot.seq.room(prompt.len(), !continues)
+            }
+            None => slot.seq.room(positions, false),
+        }
+    }
+
+    /// Rolls back `count` answers the caller never used ([FusedArm::give_back]).
+    ///
+    /// # Errors
+    /// A count past the history, or an arm that cannot give the rows back.
+    pub fn give_back_slot(
+        &self,
+        slot: &mut RuntimeSlot<W>,
+        count: usize,
+    ) -> Result<(), BackendError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let to = slot.history.len().checked_sub(count).ok_or_else(|| {
+            BackendError::new(
+                "runtime",
+                format!(
+                    "the slot holds {} tokens and was asked to give {count} back",
+                    slot.history.len()
+                ),
+            )
+        })?;
+        self.walk.drafter().give_back(&mut slot.seq, to)?;
+        slot.history.truncate(to);
+        slot.point = slot.point.filter(|point| *point <= to);
+        slot.cached = slot.cached.min(to);
+        slot.held_images.retain(|span| span.end() <= to);
+        Ok(())
+    }
+
+    /// Whether `slot` already holds the answer to a step fed `token` ([FusedArm::ready]).
+    #[must_use]
+    pub fn ready_slot(&self, slot: &RuntimeSlot<W>, token: u32) -> bool {
+        self.walk.drafter().ready(&slot.seq, token)
+    }
+
+    /// A slot's speculative counters for the request it serves ([FusedArm::speculation]).
+    #[must_use]
+    pub fn speculation_slot(&self, slot: &RuntimeSlot<W>) -> Speculation {
+        self.walk.drafter().speculation(&slot.seq)
     }
 }
 
@@ -866,13 +1016,7 @@ where
     }
 
     fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
-        let fresh = self.open_slot()?;
-        let sampling = slot.sampling;
-        let old = std::mem::replace(slot, fresh);
-        slot.sampling = sampling;
-        self.walk.set_sampling(&mut slot.seq, sampling);
-        self.release_lane(old.lane);
-        Ok(())
+        self.release_slot(slot)
     }
 
     fn set_sampling(&self, slot: &mut Self::Slot, sampling: Sampling) {
@@ -902,11 +1046,11 @@ where
     }
 
     fn ready(&self, slot: &Self::Slot, token: u32) -> bool {
-        self.walk.drafter().ready(&slot.seq, token)
+        self.ready_slot(slot, token)
     }
 
     fn speculation(&self, slot: &Self::Slot) -> Speculation {
-        self.walk.drafter().speculation(&slot.seq)
+        self.speculation_slot(slot)
     }
 
     fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
@@ -931,60 +1075,15 @@ where
     }
 
     fn room(&self, slot: &Self::Slot, prompt: Option<&[u32]>) -> bool {
-        // A prompt's final position is its own length: it either extends the history or rewinds
-        // to the point and forwards the rest. A step adds its anchor and, for a drafting walk,
-        // the widest chain it may verify, so the reservation is the verify's rows and not one.
-        let step_rows = if W::Drafter::PRESENT && self.walk.drafter().drafts() {
-            1 + self.walk.drafter().budget(1)
-        } else {
-            1
-        };
-        let positions = match prompt {
-            Some(prompt) => prompt.len(),
-            None => slot.history.len().saturating_add(step_rows),
-        };
-        if positions > self.limits.context {
-            return false;
-        }
-        // The arm answers the physical question: its lane memory may be narrower than the
-        // context, and a prompt that starts over uses the chunks a fresh lane needs.
-        match prompt {
-            Some(prompt) => {
-                let point = slot
-                    .point
-                    .filter(|point| *point <= slot.history.len())
-                    .map(|point| &slot.history[..point]);
-                let continues = crate::fused::extends(&slot.history, prompt)
-                    || point.is_some_and(|point| crate::fused::extends(point, prompt));
-                slot.seq.room(prompt.len(), !continues)
-            }
-            None => slot.seq.room(positions, false),
-        }
+        self.room_slot(slot, prompt)
     }
 
     fn release(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
-        self.renew(slot)
+        self.release_slot(slot)
     }
 
     fn give_back(&self, slot: &mut Self::Slot, count: usize) -> Result<(), BackendError> {
-        if count == 0 {
-            return Ok(());
-        }
-        let to = slot.history.len().checked_sub(count).ok_or_else(|| {
-            BackendError::new(
-                "runtime",
-                format!(
-                    "the slot holds {} tokens and was asked to give {count} back",
-                    slot.history.len()
-                ),
-            )
-        })?;
-        self.walk.drafter().give_back(&mut slot.seq, to)?;
-        slot.history.truncate(to);
-        slot.point = slot.point.filter(|point| *point <= to);
-        slot.cached = slot.cached.min(to);
-        slot.held_images.retain(|span| span.end() <= to);
-        Ok(())
+        self.give_back_slot(slot, count)
     }
 
     fn max_batch(&self) -> usize {
