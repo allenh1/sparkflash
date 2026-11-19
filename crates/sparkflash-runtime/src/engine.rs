@@ -37,6 +37,10 @@
 //!   prompt that finishes its prefill in a tick is headed in that tick and decoded in the next,
 //!   not both.
 //!
+//! The decode plan is decided ahead. A WalkHook between the last layer and the head of the
+//! tick's prefill chunk computes it (Ahead), and that tick's decode uses it; when no chunk runs,
+//! it is decided at the decode point.
+//!
 //! Neither changes a bit: the engine is the dense arm's serving path, and its own trace is
 //! pinned in tests/tick_engine_trace.rs. The device-only decisions DeepSeek's Batch still makes
 //! (lane memory and growth, adoption from another lane, paired prompt chunks, preemption, the

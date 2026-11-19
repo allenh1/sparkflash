@@ -592,6 +592,157 @@ Two build facts this run exposed, both now checked before any window stops the c
 binary embeds `numerics/registry.toml`, so a stale build can ship a registry that disagrees with
 the tree - here an invalid `[[retired]]` field stopped the binary at boot - and the launcher `cd`s
 into the repo tree on every rank, so the tree must exist on all four.
+### The tick engine: dense on DeepSeek's scheduler
+
+Commits `ededb08b`, `0807eed5`, `27328381` and `ee722ef6` land phase 6 step 4's remaining part
+and step 5's first arm. `crates/sparkflash-runtime/src/engine.rs` is the engine; dense's
+single-process serving path is the first arm on it. `FusedEngine` and `GroupLanes` are not
+deleted: every other arm still serves through them, and so does dense's tensor-parallel group.
+
+**Shape.** `TickEngine<W: Walk>` owns the scheduler's state:
+
+* the pool's `RuntimeSlot`s, one a lane, and the list of free lanes; a lane given back keeps its
+  history for the next prompt;
+* each lane's bookkeeping - the prompt tokens it holds, the image spans those rows carry, the
+  request it serves, when it was last given up, and where its decoder-layer skip ends;
+* the admission queue (prompts waiting for a lane), the decode rows callers have fed, the clock,
+  the cost model (`chunk_ms`, `row_ms`, `since_chunk_ms`) and the tick counter;
+* the trace sink (`SPARKFLASH_TICK_TRACE`; one flush a tick; nothing recorded when unset) and
+  the tick-ahead plan.
+
+`Runtime<W>` stays the executor. The engine drives it with `start_prompt_slot` (resume and
+prompt bookkeeping, no rows), `run_part_rows_hooked` (one chunk of exactly the rows the engine
+decided), `step_mode_slots` (plain rows or the drafter's round, with the rows it walked),
+`give_back_slot` and `release_slot`. `Walk`, `Drafter` and `Pass` are unchanged: no arm has a
+new item to supply. `TickServe`/`TickSession` are the serving thread and the handle: the host
+driver still opens one session a request, a session posts a prompt or a decode row and blocks,
+and the thread turns each wave of jobs into one tick.
+
+**What is shared with `tick.rs`.** Every decision is the function's, called with the same
+inputs the old scheduler passed; none is restated in `engine.rs`:
+
+| Decision | Function |
+| :-- | :-- |
+| which free lane, and its shared prefix | `pick_lane`, `common_prefix`, `reusable_shared` |
+| the prompt order and the decoders' share | `prefill_order`, `hold_prefill`, `DecodeShare` |
+| the prompt path and the chunk boundary | `bulk_from`, `tick_rows`, `bulk_budget`, `whole_chunk_fits`, `bulk_rows` |
+| the decoder-layer skip | `runs_decoder`, `skip_end_after`, `decoder_resume` (DeepSeek's config only; dense has no decoder stack) |
+| the step's shape | `decode_plan`, and `share_rows` through `Runtime`'s round |
+| the cost model | `StepModel`, `band` |
+| the trace | `Decision`, `TickTrace`, `TraceSink`, `Clock` |
+
+`TickConfig` carries the values. `TickConfig::deepseek` is the replay's profile;
+`TickConfig::for_walk` narrows it to an arm - the arm's `ChunkPolicy` chunk and
+`Limits::rows`, no decoder skip (only DeepSeek has the layers), no row exchange. Dense's chunk
+is still 256 rows because `for_walk` reads the same `ChunkPolicy` its runtime read, and
+`run_part_rows` is given that number; a CPU test holds a 600-row prompt to the 256/256/88
+chunks the old runtime ran.
+
+**Tick-ahead.** The decode plan is decided in a `WalkHook` between the last layer and the head
+of the tick's prefill chunk (`Ahead`), then used by that tick's decode. This is the first user
+of `Pass::hook`, and the CPU walking test asserts the hook is reached. When no chunk runs in a
+tick, the plan is decided at the decode point instead. It is the host decision DeepSeek overlaps
+with device work; it is not DeepSeek's device-link `Ahead` (reading ahead of the device link),
+which stays in its forward crate.
+
+**What moved for dense.** `DenseDeviceBackend::enable_fusion` starts a `TickServe` over
+`DenseWalk` instead of a `FusedEngine` over `Runtime<DenseWalk>`. The walk, its kernels, its
+256-row chunk, its profile switches and its ledger rows are unchanged. Its generated checks
+drive the tick engine: `WalkFixture::tick_engine` says so for dense, so
+`whole = chunked = token`, `alone = four`, `continued = cold`, `rewound = cold` and the TP check
+run the engine (and the token-by-token comparison still checks the engine against the arm's
+direct chunks).
+
+**Named deviations**, rather than implied:
+
+1. **The grouped path is not on the tick engine.** `enable_group_fusion` and `mirror_group`
+   still build `Fusion::group` over `Runtime`, so dense at TP>1 has the old schedule. The
+   worker frames carry a prompt and a part, not the rows the engine decided, and
+   `mirror_lanes` runs `begin_prompt`'s `ChunkPolicy` chunk on every worker. A frame that
+   carries a chunk's rows (or a part that carries a row count) is the next slice. TP=1 is the
+   path this branch actually moved.
+2. **The resume position is `resume`'s, not `pick_lane`'s arbitrary prefix.** DeepSeek can
+   restart a lane at any shared prefix because its state is positional; a walk with a recurrent
+   region can only go back to a checkpoint. The engine chooses the *lane* by `pick_lane`'s
+   shared prefix and records the *start* `start_prompt_slot` chose (history end, rewind point,
+   or zero). The committed engine trace shows this: seq 4 shares 16,384 rows with seq 1's lane
+   and still starts at 0, because the lane's checkpoint is at its prompt's end. Making that
+   arbitrary start work is a device decision, and it is not claimed.
+3. **A decode row runs only when its caller fed it.** `tick::replay` decodes every sequence in
+   its decode phase each tick because the device scheduler owns the token. The engine's plan
+   counts the rows that can run. This is the one structural difference from the replay, and it
+   is why the engine has its own committed trace rather than the replay's: a prompt that
+   finishes its prefill is headed in that tick and decoded in the next.
+4. **A `Spec` plan on a non-drafting arm runs one plain row and is traced `plain`.** There is no
+   speculative row to take; calling it `spec` would name a row the arm never walked.
+5. **Adoption, lane growth, paired prompt chunks and preemption are not implemented.** Dense's
+   pool is its concurrency, and the runtime has no way to copy another lane's cache. They are
+   DeepSeek device decisions in the same list as the unverified items.
+
+**Measured on this host (CPU; it has no GPU).**
+
+* `crates/sparkflash-runtime/tests/tick_engine_trace.rs`: the engine's fixed 30-tick workload
+  produces **73 decisions**, pinned in `tests/data/tick_engine_trace.txt`: 4 `place`, 30
+  `hold`, 19 `prefill` and 20 `decode`. It exercises the bulk path (30,000- and 25,000-row
+  prompts at 2,048/4,096 rows a chunk), the exact path (the 80-row prompt at 64 + 16), the hold
+  (9 `hold 1`), prefix reuse across lanes (16,384 shared rows) and the chunk sizes the scripted
+  costs select. A second test drives `TickServe` with two sessions: each answers, a parked
+  lane's four tokens are resumed by the next prompt, and the walk was asked for the tick-ahead
+  plan.
+* The generated checks, forced onto the tick engine through a CPU fixture
+  (`conformance::tests::the_generated_checks_drive_the_tick_engine`): whole = chunked = token,
+  alone = four, continued = cold, rewound = cold and no unrecorded widening **pass**; TP is a
+  named skip (the fixture is one rank).
+* Dense's chunk test: `the_tick_engine_hands_dense_256_row_chunks` holds a 600-row prompt to
+  `256/256/88` and the config's chunk to `CHUNK_ROWS`.
+* `cargo test -p sparkflash-runtime -p sparkflash-model-dense`: runtime, 77 library tests (7
+  conformance stubs ignored) plus 2 engine-trace, 2 sealed and 1 tick-trace integration tests;
+  dense, 24 library tests (7 conformance stubs ignored); 0 failed. `cargo clippy
+  -p sparkflash-runtime -p sparkflash-model-dense --all-targets -- -D warnings` and
+  `cargo fmt --all -- --check` are clean.
+
+**Unverified without a cluster.**
+
+* The device walk: dense's kernels, its bits, and prompt = chunked = token on the GPU.
+* Lane memory on the device: `room_slot`, eviction of an idle lane, and dense's lane mapper.
+* Prefix reuse and rewind on a device sequence: `Sequence::rewind`/`checkpoint` and the resumed
+  start; only the CPU walk exercised it here.
+* The live trace: `WallClock` readings, the per-tick flush and the rank-0 rule; the engine is
+  constructed only on the single-process path, so no live trace was produced.
+* Speed: no tokens/s, no time to first token, no step time. Nothing here is a measurement of
+  whether the tick engine is faster than `FusedEngine`; that is the A/B the regression clause
+  asks for.
+* The group: no TP2/TP4 boot ran, and the group is not on the engine anyway.
+
+**The gate a window must run.**
+
+1. `scripts/onboard-gate.sh dense` on the GPU host: writes the synthetic checkpoint, runs the
+   six generated checks through the tick engine, and reports PASS/SKIP/FAIL/NEEDS-FIXTURE.
+2. Dense's served gate at one and four lanes (`served-gate.py lanes`), then a numerics check on
+   a freshly booted server as `NUMERICS.md` requires.
+3. Alternated launches of the pre-move dense build and this one at 1 and 8 streams and at 2K and
+   16K prompts, several reps each, comparing token streams and each request's reported
+   `cached_tokens`; a live `SPARKFLASH_TICK_TRACE` from each launch, diffed as decisions. A pair
+   that differs only in an admission tick is reported, not excused.
+4. Only if the group is to be claimed: a TP2 or TP4 boot. That needs the rows frame first.
+
+**What the next arm (GLM) needs.**
+
+1. The grouped path's rows: a frame (or a `next_part_rows`) that carries the rows rank 0's tick
+   decided, so `mirror_lanes` runs the same chunk on every rank; otherwise GLM's group stays on
+   `FusedEngine` and only TP=1 moves.
+2. `TickConfig` from GLM's profile: its 4,096-row prompt chunks, `rows_max` as its verify
+   width, `decoder_skip = false`, `exchange = true` for a group, and `batch_spec` from its MTP
+   or DFlash drafter.
+3. The drafter plan: the engine already calls `decode_plan` and records the rows
+   `Runtime::step_mode_slots` walked; GLM needs a fixture that pins `Spec`/`Shared`/`Plain`
+   selection and the held-run drain, and its `Drafter::wall` feeds `share_rows`.
+4. A group mirror for the tick engine: rank 0 broadcasts `LaneRequest`, `LanePart`,
+   `LaneStep`, `LaneGiveBack` and `LaneRelease` (plus the rows frame) before running; the
+   workers already replay through `Runtime`.
+5. Its own A/B. Under the regression clause, an arm that measures slower stays on
+   `FusedEngine`, and the plan records why.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
