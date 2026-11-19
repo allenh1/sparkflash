@@ -39,7 +39,7 @@ use sparkflash_model::{
     PackIdentity,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
-use sparkflash_runtime::{Fusion, Runtime, TextWire, mirror_until_the_group_ends};
+use sparkflash_runtime::{Fusion, Runtime, TextWire, TickServe, mirror_until_the_group_ends};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
@@ -56,7 +56,26 @@ pub struct Glm5NextDeviceBackend {
     context_limit: usize,
     /// Set by [Glm5NextDeviceBackend::enable_fusion] or [Glm5NextDeviceBackend::enable_group_fusion]:
     /// sessions become handles on this engine.
-    fused: Option<Fusion<Runtime<GlmWalk>>>,
+    fused: Option<GlmServing>,
+}
+
+/// What a fused GLM backend's sessions open on.
+enum GlmServing {
+    /// The fused engine: rank 0 of a tensor-parallel group and its workers' mirror. The group's
+    /// lane frames carry a prompt and a part, not the rows a tick decided, so the group is not
+    /// on the tick engine.
+    Fused(Fusion<Runtime<GlmWalk>>),
+    /// The tick engine: DeepSeek's scheduler over the GLM walk, for the single-process path.
+    Tick(Arc<TickServe<GlmWalk>>),
+}
+
+impl GlmServing {
+    fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        match self {
+            Self::Fused(fusion) => fusion.open(),
+            Self::Tick(engine) => Ok(Box::new(engine.open()?)),
+        }
+    }
 }
 
 impl std::fmt::Debug for Glm5NextDeviceBackend {
@@ -304,7 +323,12 @@ impl Glm5NextDeviceBackend {
     /// A slot the rank cannot allocate, a thread that cannot start, or a
     /// [sparkflash_runtime::JOINT_ROUNDS_ENV] that is neither on nor off.
     pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
-        self.fused = Some(Fusion::local(self.lanes()?, capacity)?);
+        // The single-process path serves on the tick engine: DeepSeek's scheduler over the GLM
+        // walk. Its config is GLM's profile - the 4,096-row prompt chunk, the verify width as
+        // the member cap, no decoder-layer skip and no row exchange - and its round path is the
+        // runtime's, so a speculative step is the same verify the fused engine ran.
+        let walk = GlmWalk::new(Arc::clone(&self.shared), self.context_limit)?;
+        self.fused = Some(GlmServing::Tick(TickServe::start(walk, capacity)?));
         Ok(())
     }
 
@@ -323,7 +347,12 @@ impl Glm5NextDeviceBackend {
         hub: Tp4ControlHub,
     ) -> Result<(), BackendError> {
         let wire = TextWire::new("glm", "GLM", self.context_limit);
-        self.fused = Some(Fusion::group(self.lanes()?, hub, wire, capacity)?);
+        self.fused = Some(GlmServing::Fused(Fusion::group(
+            self.lanes()?,
+            hub,
+            wire,
+            capacity,
+        )?));
         Ok(())
     }
 
@@ -531,7 +560,7 @@ impl ModelBackend for Glm5NextDeviceBackend {
                     "the GLM arm serves on the shared runtime: call enable_fusion before opening                      a session",
                 ))
             },
-            Fusion::open,
+            GlmServing::open,
         )
     }
 }

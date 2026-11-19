@@ -950,6 +950,13 @@ mod tests {
                 Some(Box::new(directory)),
             ))
         }
+
+        /// GLM's single-process path serves on the tick engine, so its generated checks drive
+        /// that engine exactly as dense's do. Its group is still the fused engine's; the TP leg
+        /// of the check skips because the fixture is one rank.
+        fn tick_engine() -> bool {
+            true
+        }
     }
 
     /// The four compute rows the walk declares are the arm's static declaration, so the boot
@@ -1150,18 +1157,25 @@ mod tests {
         layout: StateLayout,
         limits: Limits,
         walks: Mutex<Vec<Vec<usize>>>,
+        /// Every prompt chunk the walk was handed, in order.
+        chunks: Mutex<Vec<usize>>,
         drafter: ShapeDrafter,
     }
 
     impl ShapeWalk {
         fn new(depth: usize) -> Self {
+            Self::with_limits(depth, walk_limits(64, 4_096))
+        }
+
+        fn with_limits(depth: usize, limits: Limits) -> Self {
             Self {
                 layout: StateLayout::new(vec![Region::Positional {
                     name: "shape",
                     bytes_per_row: 4,
                 }]),
-                limits: walk_limits(64, 4_096),
+                limits,
                 walks: Mutex::new(Vec::new()),
+                chunks: Mutex::new(Vec::new()),
                 drafter: ShapeDrafter { depth },
             }
         }
@@ -1206,6 +1220,12 @@ mod tests {
                     .lock()
                     .expect("the walk record")
                     .push(segments.iter().map(|segment| segment.rows.len()).collect());
+            }
+            if matches!(pass.kind, PassKind::Bulk { .. }) {
+                self.chunks
+                    .lock()
+                    .expect("the chunk record")
+                    .extend(segments.iter().map(|segment| segment.rows.len()));
             }
             let mut rows = 0;
             for segment in segments {
@@ -1397,6 +1417,131 @@ mod tests {
             .collect();
         runtime.step_slots(&mut members).expect("two lone rounds");
         assert_eq!(verifies(&runtime), vec![vec![4], vec![4]]);
+    }
+
+    /// The generated checks drive the path GLM serves TP=1 on, as dense's do.
+    #[test]
+    fn the_generated_checks_drive_the_tick_engine() {
+        assert!(<GlmWalk as WalkFixture>::tick_engine());
+    }
+
+    /// The tick engine's config is GLM's profile, not DeepSeek's and not dense's: the 4,096-row
+    /// prompt chunk, the rank's verify width as the member cap, no decoder-layer skip, no row
+    /// exchange, and the drafter's own depth.
+    #[test]
+    fn the_tick_config_is_the_glm_profile() {
+        let walk = ShapeWalk::with_limits(
+            3,
+            walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 1_048_576),
+        );
+        let config = sparkflash_runtime::TickConfig::for_walk(&walk, MAX_ROWS);
+        assert_eq!(config.rows_max, crate::device::DEFAULT_PREFILL_ROWS);
+        assert_eq!(config.chunk_rows, crate::device::DEFAULT_PREFILL_ROWS);
+        assert_eq!(config.members, MAX_ROWS);
+        assert_eq!(config.k, 3, "the drafter's depth");
+        assert!(config.batch_spec.is_some());
+        assert!(config.shared_rounds);
+        assert!(!config.decoder_skip, "GLM has no decoder layers to skip");
+        assert!(!config.exchange, "TP=1 has no row exchange");
+    }
+
+    /// GLM's prompt chunks through the tick engine are the 4,096-row chunks it ran before.
+    #[test]
+    fn the_tick_engine_hands_glm_4096_row_chunks() {
+        use sparkflash_model::backend::Sampling;
+        use sparkflash_runtime::{TickEngine, TickEvent};
+
+        let walk = ShapeWalk::with_limits(
+            0,
+            walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 1_048_576),
+        );
+        let mut engine = TickEngine::new(walk, 1).expect("the tick engine starts");
+        assert_eq!(
+            engine.config().chunk_rows,
+            crate::device::DEFAULT_PREFILL_ROWS
+        );
+        assert_eq!(
+            engine.config().rows_max,
+            crate::device::DEFAULT_PREFILL_ROWS
+        );
+        let id = engine
+            .admit(&vec![7u32; 5_000], &[], Sampling::default())
+            .expect("the prompt");
+        loop {
+            let events = engine.tick().expect("the tick");
+            if events
+                .iter()
+                .any(|event| matches!(event, TickEvent::Prompt { id: got, .. } if *got == id))
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            *engine.walk().chunks.lock().expect("the chunk record"),
+            vec![
+                crate::device::DEFAULT_PREFILL_ROWS,
+                5_000 - crate::device::DEFAULT_PREFILL_ROWS
+            ],
+            "a 5,000-row prompt runs 4,096 then 904, as the old runtime ran it"
+        );
+    }
+
+    /// Several decoding lanes still verify in one shared round: the old fused engine's joint
+    /// round is the tick engine's shared plan, and one verify holds every member's chain.
+    #[test]
+    fn the_tick_engine_keeps_glms_joint_round() {
+        use sparkflash_model::backend::Sampling;
+        use sparkflash_runtime::{TickEngine, TickEvent};
+
+        let walk =
+            ShapeWalk::with_limits(3, walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 65_536));
+        let mut engine = TickEngine::new(walk, 3)
+            .expect("the tick engine starts")
+            .with_trace();
+        let mut ids = Vec::new();
+        let mut firsts = Vec::new();
+        for at in 0..3u32 {
+            let prompt: Vec<u32> = (0..7).map(|i| 1 + at * 13 + i).collect();
+            let id = engine
+                .admit(&prompt, &[], Sampling::default())
+                .expect("a prompt");
+            let mut first = None;
+            while first.is_none() {
+                for event in engine.tick().expect("the tick") {
+                    if let TickEvent::Prompt { id: got, step } = event
+                        && got == id
+                    {
+                        first = Some(step.next_token.expect("a token"));
+                    }
+                }
+            }
+            assert_eq!(engine.kept(id).and_then(|kept| kept.history), Some(7));
+            ids.push(id);
+            firsts.push(first.expect("the first step"));
+        }
+        for (id, token) in ids.iter().zip(&firsts) {
+            engine.feed(*id, *token).expect("the row is fed");
+        }
+        let mut answered = 0;
+        while answered < ids.len() {
+            for event in engine.tick().expect("the shared tick") {
+                if matches!(event, TickEvent::Decode { .. }) {
+                    answered += 1;
+                }
+            }
+        }
+        let trace = engine.trace().expect("the trace").render();
+        assert!(
+            trace.contains("plan=shared"),
+            "three lanes share one verify: {trace}"
+        );
+        let passes = engine.walk().walks.lock().expect("the walk record").clone();
+        assert_eq!(passes.len(), 1, "one shared verify, not one a lane");
+        assert_eq!(passes[0].len(), 3);
+        assert!(
+            passes[0].iter().sum::<usize>() <= MAX_ROWS,
+            "the shared verify is one rank step: {passes:?}"
+        );
     }
 
     sparkflash_runtime::conformance!(super::GlmWalk);
