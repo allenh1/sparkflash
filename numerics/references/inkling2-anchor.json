@@ -17,9 +17,9 @@
       "id": null,
       "version": "0.1.0"
     },
-    "build_note": "the tree named by --repo is not a git work tree with a HEAD",
+    "build_note": "the tree named by --repo is not a git work tree with a HEAD; the binary's own card could not name its build, so commit a6ef32e490589660f33159c7370ed2f068a42dcb is inferred from the staged source tree, whose Cargo.toml, crates/sparkflash-model-glm5-next/src/lib.rs and crates/sparkflash-cli/src/serve.rs match it byte for byte",
     "checkpoint": "ckpt",
-    "commit": null,
+    "commit": "a6ef32e490589660f33159c7370ed2f068a42dcb",
     "numerics": {
       "approved": null,
       "arch": "sm_121a",
