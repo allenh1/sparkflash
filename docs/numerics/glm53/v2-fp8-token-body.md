@@ -1,5 +1,12 @@
 # GLM-5.3-Flash, numerics version 2: decode on the FP8 E4M3 token body
 
+**Registry state: version 1 is still the captured entry.** The body is wired and the change is
+declared here, but `numerics/registry.toml` keeps version 1 and its captured reference until a
+cluster capture of version 2 exists: a capture cannot be withdrawn, and a bump that names the old
+reference is a declared non-change (`scripts/numerics.py ci`). Landing version 2 means bumping the
+entry and committing the new reference in the same diff, after `scripts/numerics.py capture` on the
+served world-4 configuration.
+
 Version 2 of the world-4 sm_121a configuration moves GLM's one-to-eight-row block-scaled FP8
 projections from the tiled row GEMV (`q4e_gemv_tiled_e4m3_block`) to the shared tile's few-row
 body (`glm_decode_fp8b128_rows`). It is the first declared change to GLM's arithmetic after the
