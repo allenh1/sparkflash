@@ -20,6 +20,12 @@
 //! `scripts/numerics.py monitors` computes the relative L2 error between a reference dump and a
 //! candidate dump.
 //!
+//! The probe is the first *decode step*, not the process's first forward: a forward whose row
+//! count is at most [TOKEN_BAND], which is the few-row body's widest forward. A prompt's prefill
+//! is wider and must not consume the probe. That matters because a prefill runs the bulk GEMM on
+//! every build: a probe taken on one cannot see a decode-only change, and two builds that differ
+//! only in their decode body would dump identical values.
+//!
 //! It is opt-in. Nothing is recorded unless `SPARKFLASH_NUMERICS_MONITORS` names an output path.
 //! `SPARKFLASH_NUMERICS_MODEL` overrides the model id for a tiny fixture, and
 //! `SPARKFLASH_NUMERICS_SAMPLE` sets how many evenly spaced hidden indices the document
@@ -45,15 +51,39 @@ pub const SAMPLE_ENV: &str = "SPARKFLASH_NUMERICS_SAMPLE";
 /// The default number of evenly spaced hidden indices.
 pub const DEFAULT_SAMPLE: usize = 8;
 
+/// The widest forward that is a decode step.
+///
+/// This is the tiled GEMV's batch and the few-row tile bodies' widest forward
+/// (`sparkflash_ops::gemv::GEMV_MAX_BATCH`, eight rows). A forward wider than this runs the bulk
+/// GEMM on every build, so it is a prefill chunk, not a decode step.
+pub const TOKEN_BAND: usize = 8;
+
+/// Whether a forward of `rows` rows is the decode step the monitor probe takes.
+///
+/// The probe is the first *decode step*, not the process's first forward. A prefill forward is
+/// wider than [TOKEN_BAND] and runs the bulk GEMM on every build, so it must not consume the
+/// probe; the first decode step after it is the probe.
+#[must_use]
+pub const fn probe_eligible(rows: usize) -> bool {
+    rows <= TOKEN_BAND
+}
+
 /// The probe both dumps must share.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Probe {
-    /// The input's name.
+    /// The input's name: `decode-position-<position>` for a probe a run writes.
     pub name: String,
     /// The input's token ids.
     pub prompt_ids: Vec<u32>,
     /// The absolute position of the first row.
     pub position: usize,
+    /// The forward's row count: at most [TOKEN_BAND], because the probe is a decode step.
+    ///
+    /// A run never writes `0`; a document written before the probe named its row count reads back
+    /// with zero, which makes that document a different probe, so it is never merged with a new
+    /// one.
+    #[serde(default)]
+    pub rows: usize,
 }
 
 /// The fixed hidden-index sample both dumps must share.
@@ -112,8 +142,9 @@ impl Recorder {
     /// A recorder for a probe, hidden width and explicit sample indices.
     ///
     /// # Errors
-    /// A zero width, an empty or non-increasing sample, an index outside the width, or an invalid
-    /// probe.
+    /// A zero width, an empty or non-increasing sample, an index outside the width, a probe with
+    /// no name, or a probe that is not a decode step ([probe_eligible]). The last refusal is what
+    /// keeps a prefill forward from becoming the probe at every call site at once.
     pub fn new(
         model: impl Into<String>,
         probe: Probe,
@@ -126,6 +157,13 @@ impl Recorder {
         }
         if probe.name.is_empty() {
             return Err(invalid("the probe has no name"));
+        }
+        if !probe_eligible(probe.rows) {
+            return Err(invalid(format!(
+                "the probe names {} rows: a monitor probe is a decode step of at most {TOKEN_BAND} \
+                 rows, so a prefill forward must not consume it",
+                probe.rows
+            )));
         }
         if indices.is_empty() {
             return Err(invalid("the sample holds no indices"));
@@ -420,9 +458,10 @@ mod tests {
 
     fn probe() -> Probe {
         Probe {
-            name: "probe".to_owned(),
+            name: "decode-position-0".to_owned(),
             prompt_ids: vec![1, 2],
             position: 0,
+            rows: 1,
         }
     }
 
@@ -455,6 +494,61 @@ mod tests {
     }
 
     #[test]
+    fn the_probe_is_a_decode_step() {
+        assert!(probe_eligible(1), "a one-row decode step is the probe");
+        assert!(
+            probe_eligible(TOKEN_BAND),
+            "the widest few-row forward is still a decode step"
+        );
+        assert!(
+            !probe_eligible(TOKEN_BAND + 1),
+            "a forward wider than the band is a prefill chunk"
+        );
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("monitors.json");
+        let prefill = Probe {
+            name: "decode-position-0".to_owned(),
+            prompt_ids: vec![1, 2, 3],
+            position: 0,
+            rows: 63,
+        };
+        let error = Recorder::new("toy/model", prefill, 2, vec![0, 1], &path)
+            .expect_err("a prefill probe is refused");
+        assert!(error.to_string().contains("decode step"), "{error}");
+        assert!(!path.exists(), "a refused probe writes nothing");
+    }
+
+    #[test]
+    fn an_old_probe_reads_back_as_a_different_one() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("monitors.json");
+        recorder(&path).write().expect("the first dump writes");
+        // A document written before the probe named its row count has none; it reads back with
+        // zero rows, which is a different probe, so a new run never merges it.
+        let text = std::fs::read_to_string(&path).expect("the dump is readable");
+        let mut document: serde_json::Value =
+            serde_json::from_str(&text).expect("the dump is JSON");
+        document["probe"]
+            .as_object_mut()
+            .expect("the probe is an object")
+            .remove("rows");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&document).expect("the old dump serialises"),
+        )
+        .expect("the old dump writes");
+        let error = Recorder::from_lookup(
+            |name| (name == ENV).then(|| path.to_string_lossy().into_owned()),
+            "toy/model",
+            probe(),
+            2,
+        )
+        .expect_err("a probe without a row count is a different probe");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("different probe"), "{error}");
+    }
+
+    #[test]
     fn the_written_document_has_the_shape_the_judge_reads() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("nested/monitors.json");
@@ -464,7 +558,9 @@ mod tests {
         let document: serde_json::Value = serde_json::from_str(&text).expect("the dump is JSON");
         assert_eq!(document["schema"], SCHEMA);
         assert_eq!(document["model"], "toy/model");
+        assert_eq!(document["probe"]["name"], "decode-position-0");
         assert_eq!(document["probe"]["prompt_ids"], serde_json::json!([1, 2]));
+        assert_eq!(document["probe"]["rows"], 1);
         assert_eq!(document["sample"]["width"], 2);
         assert_eq!(document["sample"]["indices"], serde_json::json!([0, 1]));
         assert_eq!(

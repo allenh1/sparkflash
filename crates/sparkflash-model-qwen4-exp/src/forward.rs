@@ -33,7 +33,9 @@
 //! is why the tensor plan has no model.norm weight.
 
 use sparkflash_model::numerics_coverage::Recorder as CoverageRecorder;
-use sparkflash_model::numerics_monitors::{Probe as MonitorProbe, Recorder as MonitorRecorder};
+use sparkflash_model::numerics_monitors::{
+    Probe as MonitorProbe, Recorder as MonitorRecorder, probe_eligible,
+};
 use sparkflash_weights::linear_attention::{self, Decay};
 use sparkflash_weights::topk;
 
@@ -1014,32 +1016,39 @@ impl Qwen4ExpWeights {
         if let Some(recorder) = coverage.as_mut() {
             recorder.input_auto_ids(tokens);
         }
-        // A monitor dump is one probe. The probe is this forward's token chunk at its absolute
-        // position; the reference and candidate runs must feed the same chunk.
-        let mut monitors = match MonitorRecorder::from_env(
-            crate::MODEL_ID,
-            MonitorProbe {
-                name: format!("position-{start_position}"),
-                prompt_ids: tokens.to_vec(),
-                position: start_position,
-            },
-            config.hidden_size,
-        ) {
-            Ok(recorder) => recorder,
-            // A monitor dump is one probe. The first forward in this process wrote it; a later
-            // forward (the decode token, another request) is a different probe. The recorder
-            // refuses to merge it; the serving forward stops recording rather than failing the
-            // request, and the log says why.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    eprintln!("sparkflash numerics: {error}; not recording later forwards");
-                });
-                None
+        // A monitor dump is one probe, and the probe is the first *decode step*: this forward's
+        // token chunk at its absolute position, when the chunk is at most the few-row band. A
+        // prompt's prefill is wider, runs the bulk GEMM on every build, and must not consume the
+        // probe. The reference and candidate runs must feed the same chunk.
+        let mut monitors = if probe_eligible(tokens.len()) {
+            match MonitorRecorder::from_env(
+                crate::MODEL_ID,
+                MonitorProbe {
+                    name: format!("decode-position-{start_position}"),
+                    prompt_ids: tokens.to_vec(),
+                    position: start_position,
+                    rows: tokens.len(),
+                },
+                config.hidden_size,
+            ) {
+                Ok(recorder) => recorder,
+                // A monitor dump is one probe. The first decode step in this process wrote it; a
+                // later decode step (the next token, another request) is a different probe. The
+                // recorder refuses to merge it; the serving forward stops recording rather than
+                // failing the request, and the log says why.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        eprintln!("sparkflash numerics: {error}; not recording later forwards");
+                    });
+                    None
+                }
+                Err(error) => {
+                    return Err(ForwardError::new(format!("monitor dump: {error}")));
+                }
             }
-            Err(error) => {
-                return Err(ForwardError::new(format!("monitor dump: {error}")));
-            }
+        } else {
+            None
         };
         let mut hyper: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
         for token in tokens {
@@ -1460,9 +1469,10 @@ mod tests {
         let mut recorder = MonitorRecorder::new(
             "toy/qwen",
             MonitorProbe {
-                name: "probe".to_owned(),
-                prompt_ids: vec![1, 2],
+                name: "decode-position-0".to_owned(),
+                prompt_ids: vec![1],
                 position: 0,
+                rows: 1,
             },
             config.hidden_size,
             vec![0, 1],

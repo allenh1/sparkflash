@@ -35,6 +35,7 @@ use sparkflash_model::numerics_coverage::{
 };
 use sparkflash_model::numerics_monitors::{
     ENV as MONITOR_ENV, Probe as MonitorProbe, Recorder as MonitorRecorder, SAMPLE_ENV,
+    probe_eligible,
 };
 
 /// The numerics switches a session reads once, when it is made; both off is the default.
@@ -99,16 +100,20 @@ impl Switches {
         self.coverage.is_none() && self.monitors.is_none()
     }
 
-    /// Open the recorders for one forward over `tokens` at `position`, or None when both
-    /// switches are off (or neither recorder could be opened).
+    /// Open the recorders for one forward of `rows` rows over `tokens` at `position`, or None
+    /// when both switches are off (or neither recorder could be opened).
     ///
     /// The coverage recorder opens one content-addressed input, `input-<digest>`, named from
     /// this forward's token ids, so a serving process accumulates a suite across forwards exactly
-    /// as the host reference does and a repeated input adds no second entry. The monitor recorder
-    /// takes this forward as the probe; a later forward is a different probe, which the recorder
-    /// reports as AlreadyExists. That is logged once and this forward serves on without a monitor
-    /// dump.
-    pub(crate) fn begin(&self, tokens: &[u32], position: usize) -> Option<Forward> {
+    /// as the host reference does and a repeated input adds no second entry.
+    ///
+    /// The monitor recorder takes this forward as the probe only when it is the first *decode
+    /// step*: a forward of at most [probe_eligible]'s few-row band. A prompt's prefill is wider,
+    /// runs the bulk GEMM on every build, and must not consume the probe, so it opens no monitor
+    /// recorder; the first decode step after it becomes the probe. A later decode step is a
+    /// different probe, which the recorder reports as AlreadyExists. That is logged once and this
+    /// forward serves on without a monitor dump.
+    pub(crate) fn begin(&self, tokens: &[u32], position: usize, rows: usize) -> Option<Forward> {
         if self.is_off() {
             return None;
         }
@@ -127,33 +132,38 @@ impl Switches {
             }
             recorder
         });
-        let monitors = self.monitors.as_ref().and_then(|switch| {
-            let probe = MonitorProbe {
-                name: format!("position-{position}"),
-                prompt_ids: tokens.to_vec(),
-                position,
-            };
-            let recorder = MonitorRecorder::from_lookup(
-                |name| match name {
-                    MODEL_ENV => Some(switch.model.clone()),
-                    MONITOR_ENV => Some(switch.path.to_string_lossy().into_owned()),
-                    SAMPLE_ENV => switch.sample.clone(),
-                    _ => None,
-                },
-                &switch.model,
-                probe,
-                switch.width,
-            );
-            match recorder {
-                Ok(recorder) => recorder,
-                Err(error) => {
-                    // A diagnostic must never fail a request: say once why the dump is not
-                    // happening and keep serving.
-                    warn(&MONITOR_WARNED, "monitor", &error);
-                    None
+        let monitors = self
+            .monitors
+            .as_ref()
+            .filter(|_| probe_eligible(rows))
+            .and_then(|switch| {
+                let probe = MonitorProbe {
+                    name: format!("decode-position-{position}"),
+                    prompt_ids: tokens.to_vec(),
+                    position,
+                    rows,
+                };
+                let recorder = MonitorRecorder::from_lookup(
+                    |name| match name {
+                        MODEL_ENV => Some(switch.model.clone()),
+                        MONITOR_ENV => Some(switch.path.to_string_lossy().into_owned()),
+                        SAMPLE_ENV => switch.sample.clone(),
+                        _ => None,
+                    },
+                    &switch.model,
+                    probe,
+                    switch.width,
+                );
+                match recorder {
+                    Ok(recorder) => recorder,
+                    Err(error) => {
+                        // A diagnostic must never fail a request: say once why the dump is not
+                        // happening and keep serving.
+                        warn(&MONITOR_WARNED, "monitor", &error);
+                        None
+                    }
                 }
-            }
-        });
+            });
         if coverage.is_none() && monitors.is_none() {
             return None;
         }
@@ -287,8 +297,17 @@ mod tests {
     fn an_unset_switch_opens_no_recorder() {
         let switches = Switches::from_lookup(|_| None, "toy/qwen", vec![0, 2], 8);
         assert!(switches.is_off());
-        assert!(switches.begin(&[1, 2], 0).is_none());
+        assert!(switches.begin(&[1, 2], 0, 2).is_none());
         record_routing(&mut None, 0, &[0]);
+    }
+
+    #[test]
+    fn the_token_band_is_the_arm_s_decode_band() {
+        assert_eq!(
+            sparkflash_model::numerics_monitors::TOKEN_BAND,
+            super::super::GEMV_MAX_BATCH,
+            "the shared probe rule's band is the arm's tiled GEMV batch"
+        );
     }
 
     #[test]
@@ -302,11 +321,13 @@ mod tests {
             4,
         );
         assert!(!switches.is_off());
-        let mut first = switches.begin(&[1, 2, 3], 0).expect("a recorder");
+        // Coverage opens on every forward, the prompt's 3-row prefill included; only the monitor
+        // recorder takes a probe, and this switch is off.
+        let mut first = switches.begin(&[1, 2, 3], 0, 3).expect("a recorder");
         first.routing(1, &[0, 1]);
         first.routing(1, &[1]);
         first.finish();
-        let mut second = switches.begin(&[4], 3).expect("a second recorder");
+        let mut second = switches.begin(&[4], 3, 1).expect("a second recorder");
         second.routing(1, &[0]);
         second.finish();
         let document = read(&path);
@@ -335,7 +356,32 @@ mod tests {
     }
 
     #[test]
-    fn monitors_take_the_first_forward_as_the_probe() {
+    fn a_prefill_forward_does_not_consume_the_probe() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("monitors.json");
+        let switches = Switches::from_lookup(
+            |name| (name == MONITOR_ENV).then(|| path.to_string_lossy().into_owned()),
+            "toy/qwen",
+            vec![1],
+            4,
+        );
+        // The prompt's prefill is wider than the few-row band: it opens no monitor recorder and
+        // writes nothing.
+        assert!(switches.begin(&[1, 2, 3], 0, 63).is_none());
+        assert!(!path.exists(), "a prefill forward writes no dump");
+        // The first decode step after it is the probe.
+        let mut probe = switches.begin(&[9], 63, 1).expect("the first decode step");
+        probe.probe(0, &values(4), &[(0, values(4))]);
+        probe.finish();
+        let document = read(&path);
+        assert_eq!(document["probe"]["name"], "decode-position-63");
+        assert_eq!(document["probe"]["prompt_ids"], json!([9]));
+        assert_eq!(document["probe"]["position"], 63);
+        assert_eq!(document["probe"]["rows"], 1);
+    }
+
+    #[test]
+    fn monitors_take_the_first_decode_step_as_the_probe() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("monitors.json");
         let switches = Switches::from_lookup(
@@ -348,7 +394,7 @@ mod tests {
             vec![2, 2],
             8,
         );
-        let mut probe = switches.begin(&[1, 2], 0).expect("the probe");
+        let mut probe = switches.begin(&[1], 0, 1).expect("the probe");
         probe.probe(0, &values(8), &[(0, values(8)), (1, values(8))]);
         probe.finish();
         let document = read(&path);
@@ -357,9 +403,10 @@ mod tests {
             sparkflash_model::numerics_monitors::SCHEMA
         );
         assert_eq!(document["model"], "toy/qwen");
-        assert_eq!(document["probe"]["name"], "position-0");
-        assert_eq!(document["probe"]["prompt_ids"], json!([1, 2]));
+        assert_eq!(document["probe"]["name"], "decode-position-0");
+        assert_eq!(document["probe"]["prompt_ids"], json!([1]));
         assert_eq!(document["probe"]["position"], 0);
+        assert_eq!(document["probe"]["rows"], 1);
         assert_eq!(document["sample"]["width"], 8);
         assert_eq!(
             document["sample"]["indices"].as_array().map(Vec::len),
@@ -375,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_forward_is_a_different_probe_and_records_nothing() {
+    fn a_later_decode_step_is_a_different_probe_and_records_nothing() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("monitors.json");
         let switches = Switches::from_lookup(
@@ -384,15 +431,54 @@ mod tests {
             vec![1],
             4,
         );
-        let mut probe = switches.begin(&[1], 0).expect("the probe");
+        let mut probe = switches.begin(&[1], 0, 1).expect("the probe");
         probe.probe(0, &values(4), &[(0, values(4))]);
         probe.finish();
-        // A second forward is a different probe; the recorder reports AlreadyExists, which
+        // A later decode step is a different probe; the recorder reports AlreadyExists, which
         // begin logs once and drops, so this forward has no monitor dump.
-        assert!(switches.begin(&[2], 1).is_none());
+        assert!(switches.begin(&[2], 1, 1).is_none());
         let document = read(&path);
         assert_eq!(document["probe"]["prompt_ids"], json!([1]));
         assert_eq!(document["probe"]["position"], 0);
+        assert_eq!(document["probe"]["rows"], 1);
+    }
+
+    #[test]
+    fn the_dumped_values_come_from_the_decode_step() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("monitors.json");
+        let switches = Switches::from_lookup(
+            |name| match name {
+                MONITOR_ENV => Some(path.to_string_lossy().into_owned()),
+                SAMPLE_ENV => Some("4".to_owned()),
+                _ => None,
+            },
+            "toy/qwen",
+            vec![1],
+            8,
+        );
+        // The prompt's prefill row is a table of nines: recording it would be visible.
+        let prefill = vec![9.0f32; 8];
+        assert!(
+            switches.begin(&[1, 2, 3], 0, 63).is_none(),
+            "a prefill is not the probe"
+        );
+        // A forward the rule did not make the probe opened no monitor recorder, so it records
+        // nothing.
+        let mut monitors = None;
+        record_probe(&mut monitors, 0, &prefill, &[(0, prefill.clone())]);
+        // The first decode step's row is the sampled table, and only it is recorded.
+        let decode = values(8);
+        let mut forward = switches.begin(&[4], 3, 1).expect("the first decode step");
+        forward.probe(0, &decode, &[(0, decode.clone())]);
+        forward.finish();
+        let document = read(&path);
+        assert_eq!(document["probe"]["rows"], 1);
+        assert_eq!(document["layers"][0]["values"], json!([0.5, 2.5, 4.5, 6.5]));
+        assert_eq!(
+            document["layers"][0]["experts"][0]["values"],
+            json!([0.5, 2.5, 4.5, 6.5])
+        );
     }
 
     #[test]
@@ -400,7 +486,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("coverage.json");
         let switches = Switches::from_lookup(|_| None, "toy/qwen", vec![2], 4);
-        assert!(switches.begin(&[1], 0).is_none());
+        assert!(switches.begin(&[1], 0, 1).is_none());
         assert!(!path.exists());
     }
 }

@@ -4339,11 +4339,15 @@ impl DeviceSequence {
 
     /// Open this forward's numerics recorders, when a switch names a path (docs/NUMERICS.md §5).
     ///
+    /// `rows` is the forward's row count: the monitor recorder takes only a decode step (at most
+    /// the few-row band) as the probe, so this prompt's prefill leaves the probe for the first
+    /// decode step after it.
+    ///
     /// Off is the default: both switches unset leaves `None`, and the layer hooks below then cost
     /// one `Option` check each.
-    fn begin_numerics(&self, tokens: &[u32]) {
+    fn begin_numerics(&self, tokens: &[u32], rows: usize) {
         self.record
-            .replace(self.numerics.begin(tokens, self.position));
+            .replace(self.numerics.begin(tokens, self.position, rows));
     }
 
     /// Write the dumps this forward filled, if it had any. A write that fails is logged once by
@@ -5516,9 +5520,10 @@ impl DeviceSequence {
         let batch = tokens.len();
         self.back(self.position + batch)?;
         self.probe_rows = batch;
-        // This forward is one named coverage input and the monitor probe, when either switch
-        // names a path; off, `begin` is an `Option` check (docs/NUMERICS.md §5).
-        self.begin_numerics(tokens);
+        // This forward is one named coverage input, and the monitor probe when it is a decode
+        // step, when either switch names a path; off, `begin` is an `Option` check
+        // (docs/NUMERICS.md §5).
+        self.begin_numerics(tokens, batch);
         debug_assert!((1..=self.backend.prefill.chunk).contains(&batch));
         debug_assert!(
             logit_rows == usize::MAX

@@ -5680,13 +5680,15 @@ impl DeviceRank {
     /// The dump is rank 0's slot of the tensor-parallel expert sum: the shared expert and the
     /// routed experts' columns are split, so `partial` and `expert_out` hold this rank's partial
     /// products. Every rank computes its slot the same way, and a reference build and a candidate
-    /// run the same split, so the judge compares like with like. With the switch off, this is one
-    /// `Option` check.
-    fn begin_monitor(&self, tokens: &[u32], position: usize) {
+    /// run the same split, so the judge compares like with like. `rows` is this step's row count:
+    /// only a decode step can be the probe, so a prompt's prefill leaves it for the first decode
+    /// step after it. With the switch off, this is one `bool` check.
+    fn begin_monitor(&self, tokens: &[u32], position: usize, rows: usize) {
         if !self.monitoring || self.layout.rank != 0 {
             return;
         }
-        self.record.replace(self.monitors.begin(tokens, position));
+        self.record
+            .replace(self.monitors.begin(tokens, position, rows));
     }
 
     /// Write the monitor dump this step filled, if it had one. A write that fails is logged once
@@ -5724,8 +5726,8 @@ impl DeviceRank {
         }
     }
 
-    /// Read back the first forward's probe row: `(expert id, combine weight)` and each slot's row
-    /// as the down projection wrote it, `weight * body`.
+    /// Read back the probe row: `(expert id, combine weight)` and each slot's row as the down
+    /// projection wrote it, `weight * body`.
     fn read_probe_row(&self, layer: usize) -> Result<numerics::ProbeRow, String> {
         let s = &self.scratch;
         let config = &self.config;
@@ -6352,10 +6354,12 @@ impl DeviceRank {
         let config = &self.config;
         let (hc, hidden) = (config.hc_mult, config.hidden_size);
         let rows = tokens.len();
-        // The first forward through the rank is the monitor probe (docs/NUMERICS.md section 5).
-        // With the switch off, this is one `Option` check a forward.
+        // The first decode step through the rank is the monitor probe (docs/NUMERICS.md
+        // section 5): a prompt's prefill is wider than the few-row band and does not consume it,
+        // so the step after it is what a pair measures. With the switch off, this is one `bool`
+        // check a forward.
         if let Some(run) = runs.first() {
-            self.begin_monitor(&tokens[run.first..run.first + run.len], run.position);
+            self.begin_monitor(&tokens[run.first..run.first + run.len], run.position, rows);
         }
         // A sequence-parallel step widens, mixes and folds this rank's rows alone.
         let share = self.sequence_parallel(tp, runs, rows, device_leg);

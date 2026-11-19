@@ -16,7 +16,8 @@
 //!
 //! The writer is [sparkflash_model::numerics_monitors], the same one Qwen3.8's device arm uses.
 //! This module is the GLM arm's side of it: the switch is read once when the rank loads, the first
-//! forward through the rank is the probe, and [record_probe] turns a layer's routed ids and weights
+//! *decode step* through the rank is the probe (a forward of at most the few-row band's rows, so a
+//! prompt's prefill does not consume it), and [record_probe] turns a layer's routed ids and weights
 //! and the sampled rows the device read back into the calls the recorder takes.
 //!
 //! Off is the default, and the cost of off is one `Option` check a forward and one a layer: no
@@ -29,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 
 use sparkflash_model::numerics_monitors::{
-    ENV as MONITOR_ENV, MODEL_ENV, Probe, Recorder, SAMPLE_ENV,
+    ENV as MONITOR_ENV, MODEL_ENV, Probe, Recorder, SAMPLE_ENV, probe_eligible,
 };
 
 /// The numerics monitor switches a rank reads once, when it loads; unset is the default.
@@ -73,18 +74,24 @@ impl Switches {
         self.path.is_none()
     }
 
-    /// Open this forward's recorder, or `None` when the switch is unset or the recorder refuses
-    /// the document at the path.
+    /// Open this forward's recorder, or `None` when the switch is unset, this forward is not a
+    /// decode step, or the recorder refuses the document at the path.
     ///
-    /// The first forward through the rank is the probe; a later forward is a different probe, which
-    /// the recorder reports as `AlreadyExists`. That is logged once and the forward serves on
-    /// without a monitor dump.
-    pub(super) fn begin(&self, tokens: &[u32], position: usize) -> Option<Forward> {
+    /// The first *decode step* through the rank is the probe: a forward of at most
+    /// [probe_eligible]'s few-row band. A prompt's prefill is wider, runs the bulk GEMM on every
+    /// build, and must not consume the probe, so the first decode step after it becomes the probe.
+    /// A later decode step is a different probe, which the recorder reports as `AlreadyExists`.
+    /// That is logged once and the forward serves on without a monitor dump.
+    pub(super) fn begin(&self, tokens: &[u32], position: usize, rows: usize) -> Option<Forward> {
         self.path.as_ref()?;
+        if !probe_eligible(rows) {
+            return None;
+        }
         let probe = Probe {
-            name: format!("position-{position}"),
+            name: format!("decode-position-{position}"),
             prompt_ids: tokens.to_vec(),
             position,
+            rows,
         };
         let recorder = Recorder::from_lookup(
             |name| match name {
@@ -224,14 +231,14 @@ mod tests {
         switches: &Switches,
         tokens: &[u32],
         position: usize,
+        rows: usize,
         layer: usize,
         routed: &[(usize, f32)],
     ) -> Option<Forward> {
-        let mut forward = Some(
-            switches
-                .begin(tokens, position)
-                .expect("the switch is set and the document is fresh"),
-        );
+        let mut forward =
+            Some(switches.begin(tokens, position, rows).expect(
+                "the switch is set, the forward is a decode step and the document is fresh",
+            ));
         record_probe(
             &mut forward,
             layer,
@@ -246,8 +253,68 @@ mod tests {
     fn an_unset_switch_opens_no_recorder() {
         let switches = Switches::from_lookup(|_| None, "toy/glm", 16);
         assert!(switches.is_off());
-        assert!(switches.begin(&[1, 2], 0).is_none());
+        assert!(switches.begin(&[1, 2], 0, 1).is_none());
         record_probe(&mut None, 0, &[(1, 0.5)], &values(16), &[values(16)]);
+    }
+
+    #[test]
+    fn the_token_band_is_the_arm_s_decode_band() {
+        assert_eq!(
+            sparkflash_model::numerics_monitors::TOKEN_BAND,
+            crate::device::MAX_ROWS,
+            "the shared probe rule's band is the arm's widest decode step"
+        );
+    }
+
+    #[test]
+    fn a_prefill_forward_does_not_consume_the_probe() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("monitors.json");
+        let switches = switches(&path, None);
+        // The prompt's prefill is wider than the few-row band: this step opens no monitor
+        // recorder and writes nothing.
+        assert!(switches.begin(&[1, 2, 3], 0, 63).is_none());
+        assert!(!path.exists(), "a prefill forward writes no dump");
+        // The first decode step after it is the probe.
+        let mut forward = probe(&switches, &[9], 63, 1, 0, &[(0, 1.0)]);
+        forward.take().expect("the first decode step").finish();
+        let document = read(&path);
+        assert_eq!(document["probe"]["name"], "decode-position-63");
+        assert_eq!(document["probe"]["prompt_ids"], json!([9]));
+        assert_eq!(document["probe"]["position"], 63);
+        assert_eq!(document["probe"]["rows"], 1);
+    }
+
+    #[test]
+    fn the_dumped_values_come_from_the_decode_step() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("monitors.json");
+        let switches = switches(&path, Some("4"));
+        // The prompt's prefill row is a table of nines: recording it would be visible.
+        let prefill = vec![9.0f32; 16];
+        assert!(
+            switches.begin(&[1, 2, 3], 0, 63).is_none(),
+            "a prefill is not the probe"
+        );
+        // A step the rule did not make the probe opened no monitor recorder, so it records
+        // nothing.
+        let mut monitors = None;
+        record_probe(
+            &mut monitors,
+            0,
+            &[(0, 1.0)],
+            &prefill,
+            std::slice::from_ref(&prefill),
+        );
+        // The first decode step's row is the sampled table, and only it is recorded.
+        let mut forward = probe(&switches, &[4], 3, 1, 0, &[(0, 1.0)]);
+        forward.take().expect("the first decode step").finish();
+        let document = read(&path);
+        assert_eq!(document["probe"]["rows"], 1);
+        assert_eq!(
+            document["layers"][0]["values"],
+            json!([0.5, 4.5, 8.5, 12.5])
+        );
     }
 
     #[test]
@@ -256,7 +323,7 @@ mod tests {
         let path = directory.path().join("nested/monitors.json");
         let switches = switches(&path, Some("4"));
         assert!(!switches.is_off());
-        let mut forward = probe(&switches, &[1, 2, 3], 0, 3, &[(5, 0.25), (9, 0.5)]);
+        let mut forward = probe(&switches, &[7], 3, 1, 3, &[(5, 0.25), (9, 0.5)]);
         forward.take().expect("the probe").finish();
 
         let document = read(&path);
@@ -265,9 +332,10 @@ mod tests {
             sparkflash_model::numerics_monitors::SCHEMA
         );
         assert_eq!(document["model"], "toy/glm");
-        assert_eq!(document["probe"]["name"], "position-0");
-        assert_eq!(document["probe"]["prompt_ids"], json!([1, 2, 3]));
-        assert_eq!(document["probe"]["position"], 0);
+        assert_eq!(document["probe"]["name"], "decode-position-3");
+        assert_eq!(document["probe"]["prompt_ids"], json!([7]));
+        assert_eq!(document["probe"]["position"], 3);
+        assert_eq!(document["probe"]["rows"], 1);
         assert_eq!(document["sample"]["width"], 16);
         assert_eq!(
             document["sample"]["indices"],
@@ -304,24 +372,25 @@ mod tests {
             "toy/glm",
             16,
         );
-        let mut forward = probe(&switches, &[1], 0, 0, &[(1, 1.0)]);
+        let mut forward = probe(&switches, &[1], 0, 1, 0, &[(1, 1.0)]);
         forward.take().expect("the probe").finish();
         assert_eq!(read(&path)["model"], "fixture/glm");
     }
 
     #[test]
-    fn a_later_forward_is_a_different_probe_and_records_nothing() {
+    fn a_later_decode_step_is_a_different_probe_and_records_nothing() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("monitors.json");
         let switches = switches(&path, None);
-        let mut first = probe(&switches, &[1], 0, 0, &[(0, 1.0)]);
+        let mut first = probe(&switches, &[1], 0, 1, 0, &[(0, 1.0)]);
         first.take().expect("the probe").finish();
-        // A second forward is a different probe; the recorder reports AlreadyExists, which begin
-        // logs once and drops, so this forward has no monitor dump.
-        assert!(switches.begin(&[2], 1).is_none());
+        // A later decode step is a different probe; the recorder reports AlreadyExists, which
+        // begin logs once and drops, so this step has no monitor dump.
+        assert!(switches.begin(&[2], 1, 1).is_none());
         let document = read(&path);
         assert_eq!(document["probe"]["prompt_ids"], json!([1]));
         assert_eq!(document["probe"]["position"], 0);
+        assert_eq!(document["probe"]["rows"], 1);
     }
 
     #[test]
@@ -329,9 +398,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("monitors.json");
         let switches = switches(&path, None);
-        let mut first = probe(&switches, &[1], 0, 0, &[(0, 1.0)]);
+        let mut first = probe(&switches, &[1], 0, 1, 0, &[(0, 1.0)]);
         first.take().expect("the probe").finish();
-        let mut second = probe(&switches, &[1], 0, 1, &[(2, 1.0)]);
+        let mut second = probe(&switches, &[1], 0, 1, 1, &[(2, 1.0)]);
         second.take().expect("the same probe merges").finish();
         let document = read(&path);
         let layers = document["layers"].as_array().expect("the layers");
@@ -347,7 +416,7 @@ mod tests {
         let switches = switches(&path, None);
         let mut forward = Some(
             switches
-                .begin(&[1], 0)
+                .begin(&[1], 0, 1)
                 .expect("the switch is set and the document is fresh"),
         );
         let routed = [(3, 0.0), (4, 0.5)];
@@ -372,7 +441,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("monitors.json");
         let switches = switches(&path, None);
-        let mut forward = probe(&switches, &[1], 0, 0, &[(0, 1.0)]);
+        let mut forward = probe(&switches, &[1], 0, 1, 0, &[(0, 1.0)]);
         // The path a directory is now: the recorder cannot write a file there.
         std::fs::create_dir(&path).expect("a directory where the dump would go");
         forward.take().expect("the probe").finish();

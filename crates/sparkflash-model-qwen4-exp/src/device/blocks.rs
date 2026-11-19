@@ -792,8 +792,9 @@ impl DeviceSequence {
             self.branch,
             batch * config.hidden_size,
         )?;
-        // The first forward is the monitor probe; a later one is a different probe and the
-        // recorder's own rule stops it, once, in `begin` (docs/NUMERICS.md §5).
+        // The first decode step is the monitor probe; a prefill forward and a later decode step
+        // are different probes, which the recorder's own rule stops, once, in `begin`
+        // (docs/NUMERICS.md §5).
         self.record_probe(layer)
     }
 
