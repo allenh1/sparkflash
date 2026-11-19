@@ -1184,13 +1184,18 @@ async fn models_card_reports_the_served_checkpoint_rather_than_the_requested_id(
     assert_eq!(card["build"]["id"], "03317f96");
     assert!(card["build"]["version"].is_string());
 
-    // With no checkpoint declared, the card falls back to the model id and says so with null.
+    // With no checkpoint declared, the card falls back to the model id and says so with null;
+    // the build id falls back to the commit the build script embedded rather than to null.
     let (status, _, bytes) = send(app(), get_request("/v1/models")).await;
     assert_eq!(status, StatusCode::OK);
     let body = body_json(&bytes);
     assert_eq!(body["data"][0]["root"], MODEL);
     assert_eq!(body["data"][0]["checkpoint"], Value::Null);
-    assert_eq!(body["data"][0]["build"]["id"], Value::Null);
+    assert_eq!(body["data"][0]["build"]["id"], sparkflash_api::build::id());
+    assert_eq!(
+        body["data"][0]["build"]["version"],
+        sparkflash_api::build::version()
+    );
 }
 
 #[tokio::test]

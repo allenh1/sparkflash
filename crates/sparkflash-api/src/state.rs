@@ -180,7 +180,7 @@ pub struct AppState {
     /// Without it the card echoes only the requested model id, which says nothing about the
     /// weights on disk: a finetune served under the base model's id would look identical.
     served_checkpoint: Option<Arc<str>>,
-    /// An operator-supplied identifier for the build serving these weights.
+    /// The build serving these weights: the commit `build.rs` embedded, or an operator override.
     build_id: Option<Arc<str>>,
     /// The numerics identity this process claims (docs/NUMERICS.md), for the card.
     numerics: Option<Arc<NumericsIdentity>>,
@@ -210,7 +210,7 @@ impl AppState {
             draining: Arc::new(AtomicBool::new(false)),
             model_aliases: Vec::new(),
             served_checkpoint: None,
-            build_id: None,
+            build_id: Some(crate::build::id().into()),
             numerics: None,
             settings: Arc::from(Vec::new()),
         }
@@ -221,10 +221,12 @@ impl AppState {
     /// `sparkflash serve` passes its `--checkpoint` argument, so a client sees the snapshot that
     /// actually answered beside the model id it requested.
     ///
-    /// Every `AppState` a serve command builds must call this and [Self::with_build_id]: the
-    /// reference engine, the host TP=4 path (`run_tp4`) and the device TP=4 path
-    /// (`serve/device.rs`) each construct their own state, and a site that forgets reports the
-    /// released model id for a served finetune (DECISIONS.md D38, D61).
+    /// Every `AppState` a serve command builds must call this: the reference engine, the host
+    /// TP=4 path (`run_tp4`) and the device TP=4 path (`serve/device.rs`) each construct their own
+    /// state, and a site that forgets reports the released model id for a served finetune
+    /// (DECISIONS.md D38, D61). The build identity needs no such call: [Self::new] starts at the
+    /// commit `build.rs` embedded, and [Self::with_build_id] only replaces it when an operator
+    /// names one.
     #[must_use]
     pub fn with_served_checkpoint(mut self, checkpoint: Option<String>) -> Self {
         self.served_checkpoint = checkpoint.map(Into::into);
@@ -238,13 +240,20 @@ impl AppState {
     }
 
     /// Records an operator-supplied build identifier (a commit sha or image tag), for the card.
+    ///
+    /// The default is the commit `build.rs` embedded (with `-dirty` when the tree was dirty at
+    /// build time). `None` keeps that default rather than clearing it: the environment variable
+    /// this overrides is optional, and a serve path must not lose the build identity by naming no
+    /// replacement.
     #[must_use]
     pub fn with_build_id(mut self, build_id: Option<String>) -> Self {
-        self.build_id = build_id.map(Into::into);
+        if let Some(build_id) = build_id {
+            self.build_id = Some(build_id.into());
+        }
         self
     }
 
-    /// The operator-supplied build identifier, if one was declared.
+    /// The build identifier the card reports: the embedded commit unless an operator overrode it.
     #[must_use]
     pub fn build_id(&self) -> Option<&str> {
         self.build_id.as_deref()
@@ -563,6 +572,19 @@ mod tests {
             state.max_output_tokens(),
             sparkflash_model::V41_MAX_OUTPUT_TOKENS
         );
+    }
+
+    #[test]
+    fn the_build_identity_defaults_to_the_embedded_commit_and_an_override_replaces_it() {
+        let state = AppState::new(Arc::new(MockEngine::new("m")));
+        assert_eq!(state.build_id(), Some(crate::build::id().as_str()));
+        // The serve paths pass the optional SPARKFLASH_BUILD_ID override; unset is `None`, which
+        // must keep the embedded commit rather than clear it.
+        let state = AppState::new(Arc::new(MockEngine::new("m"))).with_build_id(None);
+        assert_eq!(state.build_id(), Some(crate::build::id().as_str()));
+        let state = AppState::new(Arc::new(MockEngine::new("m")))
+            .with_build_id(Some("operator-build".to_owned()));
+        assert_eq!(state.build_id(), Some("operator-build"));
     }
 
     #[test]

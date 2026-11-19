@@ -137,7 +137,7 @@ use sparkflash_api::telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
-use sparkflash_api::{AppState, Metrics};
+use sparkflash_api::{AppState, Metrics, build_id};
 #[cfg(feature = "cuda")]
 use sparkflash_device::CudaSession;
 use sparkflash_device::{DeviceEngine, DeviceSession, FakeSession};
@@ -6108,7 +6108,7 @@ async fn bind_and_serve(router: axum::Router, state: AppState, requested: Socket
     crate::bootlog::info(
         "APIServer",
         "serve.rs:5250",
-        format!("Starting server on http://{bound}"),
+        format!("Starting server on http://{bound} build={}", build_id()),
     );
     crate::bootlog::info(
         "APIServer",
