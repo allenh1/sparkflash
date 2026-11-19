@@ -77,10 +77,14 @@ pub(super) fn profile_toml_for_family(family: &str) -> Option<&'static str> {
     sparkflash_model::arm_for_family(family).and_then(|arm| arm.profile_toml())
 }
 
-/// Opens one rank of a pack's group stepping `lanes` fused lanes ([`PackArm::OPEN_LANES`]).
+/// Opens one rank of a pack's group stepping `lanes` fused lanes ([`PackArm::open_lanes`]).
+///
+/// `lanes` is the operator's `--concurrency` when given, else `None` and the arm's own
+/// [sparkflash_runtime::Limits] names the width. The answer is rank 0's backend (a worker
+/// answers `None` once its mirror ends) and the lane count the group actually opened.
 #[cfg(feature = "tp4-serve")]
 pub(super) type GroupLanesOpen =
-    fn(&Tp4RankConfig, usize) -> Result<Option<Box<dyn ModelBackend>>, String>;
+    fn(&Tp4RankConfig, Option<usize>) -> Result<(Option<Box<dyn ModelBackend>>, usize), String>;
 
 /// What one pack's serving arm supplies; [`serve_host`] and [`serve_group`] are the rest.
 pub(super) trait PackArm {
@@ -108,12 +112,19 @@ pub(super) trait PackArm {
     /// Opens this process's rank of a tensor-parallel group.
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String>;
-    /// The group's fused lanes under `--fuse-batch` (sparkflash_runtime::GroupLanes): opens
-    /// this process's rank stepping that many lanes, and answers rank 0's backend, or `None` once
-    /// a worker's mirror of rank 0's lanes ends. `None` here: the group serves one request at a
-    /// time, and `--fuse-batch` is refused.
+    /// Opens this process's rank of the group's fused lanes under `--fuse-batch`
+    /// (sparkflash_runtime::GroupLanes): the operator's lane count, or the count the arm's
+    /// [sparkflash_runtime::Limits] states when the operator gave none. Every pack arm opens
+    /// lanes, so this has no default: a group either steps its arm's walk or says which world
+    /// it cannot serve.
+    ///
+    /// # Errors
+    /// A rank that cannot load the checkpoint, open its collective, or mirror rank 0's lanes.
     #[cfg(feature = "tp4-serve")]
-    const OPEN_LANES: Option<GroupLanesOpen> = None;
+    fn open_lanes(
+        config: &Tp4RankConfig,
+        lanes: Option<usize>,
+    ) -> Result<(Option<Box<dyn ModelBackend>>, usize), String>;
 
     /// Writes the tiny fixture `--synthetic` serves into `directory`.
     fn write_fixture(directory: &Path) -> Result<Self::Config, String>;
@@ -202,7 +213,12 @@ impl PackArm for QwenArm {
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = open_qwen_tp4_rank;
     #[cfg(feature = "tp4-serve")]
-    const OPEN_LANES: Option<GroupLanesOpen> = Some(open_qwen_lanes);
+    fn open_lanes(
+        config: &Tp4RankConfig,
+        lanes: Option<usize>,
+    ) -> Result<(Option<Box<dyn ModelBackend>>, usize), String> {
+        open_qwen_lanes(config, lanes)
+    }
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         let config = Qwen4ExpConfig::tiny();
@@ -334,7 +350,12 @@ impl PackArm for QwenFp8Arm {
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
     #[cfg(feature = "tp4-serve")]
-    const OPEN_LANES: Option<GroupLanesOpen> = QwenArm::OPEN_LANES;
+    fn open_lanes(
+        config: &Tp4RankConfig,
+        lanes: Option<usize>,
+    ) -> Result<(Option<Box<dyn ModelBackend>>, usize), String> {
+        <QwenArm as PackArm>::open_lanes(config, lanes)
+    }
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         <QwenArm as PackArm>::write_fixture(directory)
@@ -412,7 +433,12 @@ impl PackArm for Qwen36Arm {
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
     #[cfg(feature = "tp4-serve")]
-    const OPEN_LANES: Option<GroupLanesOpen> = QwenArm::OPEN_LANES;
+    fn open_lanes(
+        config: &Tp4RankConfig,
+        lanes: Option<usize>,
+    ) -> Result<(Option<Box<dyn ModelBackend>>, usize), String> {
+        <QwenArm as PackArm>::open_lanes(config, lanes)
+    }
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         let config = Qwen4ExpConfig::tiny_qwen35_moe(
@@ -492,7 +518,12 @@ impl PackArm for GlmArm {
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = open_glm_tp4_rank;
     #[cfg(feature = "tp4-serve")]
-    const OPEN_LANES: Option<GroupLanesOpen> = Some(open_glm_lanes);
+    fn open_lanes(
+        config: &Tp4RankConfig,
+        lanes: Option<usize>,
+    ) -> Result<(Option<Box<dyn ModelBackend>>, usize), String> {
+        open_glm_lanes(config, lanes)
+    }
 
     fn check_profile(profile: &ModelProfile) -> Result<(), String> {
         // The ledger's tensor-core decode row, the serving walk's capability and this refusal
@@ -655,61 +686,139 @@ pub(super) fn qwen35_on_device(directory: &Path) -> bool {
         .is_some_and(|config| sparkflash_model_qwen4_exp::device::identity_for(&config).is_ok())
 }
 
-/// The lanes a `--tp4-rank` group whose arm opens lanes ([Pack::opens_group_lanes]) steps when
-/// neither `--concurrency` nor `--fuse-batch` is given: four, as the Inkling group serves.
+/// The lane count the options record before an arm answers, and the dynamic dense arm's own
+/// default: four.
+///
+/// A pack group's real width is its arm's [sparkflash_runtime::Limits], read when the rank
+/// opens ([PackArm::open_lanes]); this is what `ServeOptions` holds when the operator gave no
+/// `--concurrency`, so flag validation has a number before any device is opened.
 pub(super) const GROUP_LANES: usize = 4;
+
+/// One typed pack: a [PackArm] this build carries, selected by its registry weights selector.
+struct TypedPack {
+    /// The weights selector that names this entry's [sparkflash_model::Arm].
+    weights: &'static str,
+    /// Whether the single-node arm steps its sessions as one batch under `--fuse-batch`.
+    fused_batch: bool,
+    /// Whether the single-node arm sizes its caches against `--kv-budget-gib`.
+    kv_budget: bool,
+    /// Serves this pack through [serve_arm] or [serve_arm_identity].
+    serve: fn(&ServeOptions) -> Result<ExitCode, String>,
+}
+
+/// The typed packs this build serves, one entry a [PackArm].
+///
+/// A new family adds an [sparkflash_model::ARMS] entry and, when it brings its own arithmetic and
+/// boot, one entry here plus its `PackArm` impl. The [Pack] identity is the descriptor's weights
+/// selector, so a second release of one arm (Qwen's FP8 snapshot) is a selector, not a variant.
+static TYPED_PACKS: &[TypedPack] = &[
+    TypedPack {
+        weights: sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID,
+        fused_batch: QwenArm::FUSED_BATCH,
+        kv_budget: QwenArm::KV_BUDGET,
+        serve: serve_arm::<QwenArm>,
+    },
+    TypedPack {
+        weights: sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
+        fused_batch: QwenFp8Arm::FUSED_BATCH,
+        kv_budget: QwenFp8Arm::KV_BUDGET,
+        serve: serve_arm::<QwenFp8Arm>,
+    },
+    TypedPack {
+        weights: sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
+        fused_batch: Qwen36Arm::FUSED_BATCH,
+        kv_budget: Qwen36Arm::KV_BUDGET,
+        serve: serve_arm::<Qwen36Arm>,
+    },
+    TypedPack {
+        weights: sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID,
+        fused_batch: GlmArm::FUSED_BATCH,
+        kv_budget: GlmArm::KV_BUDGET,
+        serve: serve_arm::<GlmArm>,
+    },
+];
+
+/// The typed pack a weights selector names, if this build carries its [PackArm].
+fn typed_pack(weights: &str) -> Option<&'static TypedPack> {
+    TYPED_PACKS
+        .iter()
+        .find(|entry| entry.weights.eq_ignore_ascii_case(weights))
+}
+
+/// How a pack's process is served.
+///
+/// The variants are serving shapes, not families: every family is a descriptor and an
+/// [sparkflash_model::Arm] entry, and only the shape changes which code boots it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Route {
+    /// The V4.1 reference/TP4 engine, which serves the default DeepSeek arm.
+    Reference,
+    /// A typed [PackArm] behind the generic host driver (the Qwen releases and GLM).
+    Typed,
+    /// The dynamic path: a checkpoint's own arm (Dory, Inkling, or a novel family).
+    Dynamic,
+}
 
 /// The packs the model registry knows, including the default DeepSeek arm.
 ///
-/// The variants are the registry's families; every id, weights selector, model type, label,
-/// context and vocabulary is read from [sparkflash_model::MODELS], never from a second table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Pack {
-    /// The default DeepSeek-V4.1-Flash arm, which the reference/TP4 path serves.
-    Deepseek,
-    Qwen,
-    /// The official FP8 release of the same Qwen arm: one family, two weight selectors.
-    QwenFp8,
-    /// Qwen3.6-35B-A3B FP8, the Qwen arm over the Qwen3.5-MoE family.
-    Qwen36,
-    Glm,
-    /// Dory1.0-4B, served by the dynamic path's device arm or host reference.
-    Dory,
-    /// Inkling-2-Small, served by its pack's host/device arm.
-    Inkling,
+/// A pack is a registry descriptor and the [sparkflash_model::Arm] that answers for its weights;
+/// every id, weights selector, model type, label, context and vocabulary is read from
+/// [sparkflash_model::MODELS] and [sparkflash_model::ARMS], never from a second table. A new
+/// family is an entry there, not a variant here.
+#[derive(Clone, Copy)]
+pub(super) struct Pack {
+    descriptor: &'static ModelDescriptor,
+    route: Route,
 }
+
+impl std::fmt::Debug for Pack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pack")
+            .field("model", &self.model_id())
+            .field("route", &self.route)
+            .finish()
+    }
+}
+
+impl PartialEq for Pack {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor.weights_id == other.descriptor.weights_id
+    }
+}
+
+impl Eq for Pack {}
 
 impl Pack {
     /// This pack's descriptor in [sparkflash_model::MODELS].
-    ///
-    /// # Panics
-    /// Only if the registry loses the family this binary was built to serve.
-    fn descriptor(self) -> &'static ModelDescriptor {
-        let weights = match self {
-            Self::Deepseek => sparkflash_model::descriptor::DEFAULT_WEIGHTS_ID,
-            Self::Qwen => sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID,
-            Self::QwenFp8 => sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
-            Self::Qwen36 => sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
-            Self::Glm => sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID,
-            Self::Dory => sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID,
-            Self::Inkling => sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID,
-        };
-        sparkflash_model::find_model_by_weights(weights)
-            .expect("the model registry carries every pack's weight selector")
+    #[cfg(test)]
+    pub(super) fn descriptor(self) -> &'static ModelDescriptor {
+        self.descriptor
     }
 
-    /// The variant serving a registry descriptor, or `None` for a family with no arm here.
-    fn from_descriptor(descriptor: &ModelDescriptor) -> Option<Self> {
-        match descriptor.weights_id.as_str() {
-            sparkflash_model::descriptor::DEFAULT_WEIGHTS_ID => Some(Self::Deepseek),
-            sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID => Some(Self::Qwen),
-            sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID => Some(Self::QwenFp8),
-            sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID => Some(Self::Qwen36),
-            sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID => Some(Self::Glm),
-            sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID => Some(Self::Dory),
-            sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID => Some(Self::Inkling),
-            _ => None,
-        }
+    /// The [sparkflash_model::Arm] entry that answers for this pack's weights.
+    #[cfg(test)]
+    pub(super) fn arm(self) -> &'static dyn sparkflash_model::Arm {
+        sparkflash_model::arm_for_weights(&self.descriptor.weights_id)
+            .expect("a pack's weights name an ARMS entry")
+    }
+
+    /// The serving shape this pack's descriptor has.
+    #[cfg(test)]
+    pub(super) fn route(self) -> Route {
+        self.route
+    }
+
+    /// The pack serving a registry descriptor, or `None` for a weights selector with no arm.
+    fn from_descriptor(descriptor: &'static ModelDescriptor) -> Option<Self> {
+        sparkflash_model::arm_for_weights(&descriptor.weights_id)?;
+        let route = if descriptor.weights_id == sparkflash_model::descriptor::DEFAULT_WEIGHTS_ID {
+            Route::Reference
+        } else if typed_pack(&descriptor.weights_id).is_some() {
+            Route::Typed
+        } else {
+            Route::Dynamic
+        };
+        Some(Self { descriptor, route })
     }
 
     /// The pack a checkpoint's own `config.json` names, if this build has its arm.
@@ -724,10 +833,17 @@ impl Pack {
         let architecture = sparkflash_model::Architecture::from_json(&text).ok()?;
         let descriptor = sparkflash_model::find_model_by_type(&architecture.family)?;
         let pack = Self::from_descriptor(descriptor)?;
-        if pack == Self::Qwen36 && !qwen35_on_device(directory) {
+        if pack.has_weights(sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID)
+            && !qwen35_on_device(directory)
+        {
             return None;
         }
         Some(pack)
+    }
+
+    /// Whether this pack serves the registry selector `weights`.
+    fn has_weights(self, weights: &str) -> bool {
+        self.descriptor.weights_id == weights
     }
 
     /// The parts a checkpoint's own `config.json` names that this build cannot load.
@@ -753,18 +869,23 @@ impl Pack {
         let served = match Self::detect(directory) {
             // Without a Dory/Qwen cubin the dynamic route opens Dory's CPU host reference,
             // which needs no kernel image. With a device arm, the catalogue is the gate.
-            Some(Self::Dory) if !sparkflash_model_dory::DoryDeviceBackend::available() => {
+            Some(pack)
+                if pack.has_weights(sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID)
+                    && !sparkflash_model_dory::DoryDeviceBackend::available() =>
+            {
                 return Vec::new();
             }
             // The Inkling pack's host reference is the initial serving path; its device arm is
             // gated by the same catalogue once it lands.
-            Some(Self::Inkling) => return Vec::new(),
-            Some(Self::Dory) | Some(Self::Deepseek) | None => {
-                sparkflash_ops::parts::serving(sparkflash_model::Target::Sm121)
+            Some(pack)
+                if pack.has_weights(sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID) =>
+            {
+                return Vec::new();
             }
-            Some(Self::Qwen | Self::QwenFp8 | Self::Qwen36 | Self::Glm) => {
+            Some(pack) if pack.route == Route::Typed => {
                 sparkflash_ops::parts::serving_language(sparkflash_model::Target::Sm121)
             }
+            Some(_) | None => sparkflash_ops::parts::serving(sparkflash_model::Target::Sm121),
         };
         sparkflash_ops::parts::missing_loadable(&architecture, sparkflash_model::Target::Sm121)
             .into_iter()
@@ -772,14 +893,29 @@ impl Pack {
             .collect()
     }
 
-    /// Whether this variant has a [PackArm] (the DeepSeek arm is the default serving path).
-    pub(super) const fn is_arm(self) -> bool {
-        !matches!(self, Self::Deepseek | Self::Dory | Self::Inkling)
+    /// Whether this pack has a typed [PackArm] (the DeepSeek arm is the reference path).
+    pub(super) const fn has_pack_arm(self) -> bool {
+        matches!(self.route, Route::Typed)
+    }
+
+    /// Whether this pack is served by the V4.1 reference/TP4 engine.
+    pub(super) const fn is_reference(self) -> bool {
+        matches!(self.route, Route::Reference)
+    }
+
+    /// Whether this pack is Inkling-2-Small, whose `--rank` device group is its own path.
+    pub(super) fn is_inkling(self) -> bool {
+        self.has_weights(sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID)
+    }
+
+    /// Whether this pack is Dory1.0-4B, whose `--recurrence-rank` ring is its own path.
+    pub(super) fn is_dory(self) -> bool {
+        self.has_weights(sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID)
     }
 
     /// The served id of this pack.
     pub(super) fn model_id(self) -> &'static str {
-        self.descriptor().id.as_str()
+        self.descriptor.id.as_str()
     }
 
     /// The context one sequence of this arm allocates when the operator gave no `--context`.
@@ -787,7 +923,7 @@ impl Pack {
     /// It is the arm's own default from the registry, not another model's: the `--tp4-rank`
     /// group used to take GLM's window whatever arm it served.
     pub(super) fn default_context(self) -> usize {
-        self.descriptor().context_tokens
+        self.descriptor.context_tokens
     }
 
     /// The pack `model` names: a registry model id, weights id, family or id leaf, in any case.
@@ -797,17 +933,14 @@ impl Pack {
     }
 
     /// Whether this pack's `--tp4-rank` group opens its ranks as fused lanes
-    /// ([PackArm::OPEN_LANES]); such a group steps [GROUP_LANES] of them unless the operator says
-    /// otherwise, and `--concurrency 1` serves one request at a time.
+    /// ([PackArm::open_lanes]). Every typed pack arm opens lanes; such a group steps the
+    /// operator's `--concurrency` or the arm's [sparkflash_runtime::Limits] otherwise, and
+    /// `--concurrency 1` serves one request at a time.
     pub(super) fn opens_group_lanes(self) -> bool {
         #[cfg(feature = "tp4-serve")]
-        return match self {
-            Self::Qwen => QwenArm::OPEN_LANES.is_some(),
-            Self::QwenFp8 => QwenFp8Arm::OPEN_LANES.is_some(),
-            Self::Qwen36 => Qwen36Arm::OPEN_LANES.is_some(),
-            Self::Glm => GlmArm::OPEN_LANES.is_some(),
-            Self::Deepseek | Self::Dory | Self::Inkling => false,
-        };
+        {
+            self.has_pack_arm()
+        }
         #[cfg(not(feature = "tp4-serve"))]
         {
             let _ = self;
@@ -831,15 +964,12 @@ impl Pack {
         fuse_batch: bool,
         kv_budget: bool,
     ) -> Vec<&'static str> {
-        let (fuses, budgets) = match self {
-            Self::Qwen | Self::QwenFp8 | Self::Qwen36 => (QwenArm::FUSED_BATCH, QwenArm::KV_BUDGET),
-            Self::Glm => (GlmArm::FUSED_BATCH, GlmArm::KV_BUDGET),
-            Self::Deepseek | Self::Dory | Self::Inkling => (false, false),
-        };
+        let (fuses, budgets) = typed_pack(self.descriptor.weights_id.as_str())
+            .map_or((false, false), |pack| (pack.fused_batch, pack.kv_budget));
         // The groups that step concurrent requests as fused lanes: the Inkling device group, and a
-        // `--tp4-rank` group whose arm opens its ranks as lanes ([PackArm::OPEN_LANES]).
+        // `--tp4-rank` group whose arm opens its ranks as lanes ([PackArm::open_lanes]).
         let tp4_lanes = !device_group && self.opens_group_lanes();
-        let lanes = tp4_lanes || (device_group && matches!(self, Self::Inkling));
+        let lanes = tp4_lanes || (device_group && self.is_inkling());
         let mut unapplied = Vec::new();
         if group && concurrency != 1 && !(lanes && fuse_batch) {
             unapplied.push("--concurrency");
@@ -855,15 +985,16 @@ impl Pack {
 
     /// Serves this pack: its group arm under `--tp4-rank`, else its single-node arm.
     pub(super) fn serve(self, options: &ServeOptions) -> ExitCode {
-        let served = match self {
-            Self::Deepseek => {
+        let served = match self.route {
+            Route::Reference => {
                 unreachable!("the DeepSeek pack is served by the default reference path")
             }
-            Self::Qwen => serve_arm::<QwenArm>(options),
-            Self::QwenFp8 => serve_arm::<QwenFp8Arm>(options),
-            Self::Qwen36 => serve_arm::<Qwen36Arm>(options),
-            Self::Glm => serve_arm::<GlmArm>(options),
-            Self::Dory | Self::Inkling => {
+            Route::Typed => {
+                let pack = typed_pack(self.descriptor.weights_id.as_str())
+                    .expect("a typed pack is in TYPED_PACKS");
+                (pack.serve)(options)
+            }
+            Route::Dynamic => {
                 return super::dynamic::serve(options).unwrap_or_else(|message| {
                     eprintln!("sparkflash serve: {message}");
                     ExitCode::from(EXIT_REFUSED)
@@ -1268,6 +1399,7 @@ fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
         1,
         respond,
         &banner,
+        options.concurrency,
     )
 }
 
@@ -1278,6 +1410,9 @@ type Respond = fn(Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine>;
 /// session a concurrent request, `respond`'s dialect over it when given, and the numerics key of
 /// a group of `world` ranks. Every arm that serves a [`ModelBackend`] serves it here, on one
 /// node or as rank 0 of a group's fused lanes; `banner` announces what is served.
+// One argument a piece of the boot line and its driver: keep the call sites shaped like the
+// serving surface rather than packing them into a struct no caller reuses.
+#[allow(clippy::too_many_arguments)]
 fn serve_backend(
     options: &ServeOptions,
     backend: Box<dyn ModelBackend>,
@@ -1286,6 +1421,7 @@ fn serve_backend(
     world: usize,
     respond: Option<Respond>,
     banner: &str,
+    concurrency: usize,
 ) -> Result<ExitCode, String> {
     let descriptor = backend.descriptor().clone();
     let driver = sparkflash_serve::HostDriver::start(
@@ -1293,7 +1429,7 @@ fn serve_backend(
         Arc::clone(&seam),
         sparkflash_serve::HostOptions {
             max_tokens,
-            concurrency: options.concurrency,
+            concurrency,
             ..sparkflash_serve::HostOptions::default()
         }
         .with_env()?,
@@ -1392,6 +1528,7 @@ pub(super) fn serve_arm_identity<A: PackArm>(
         1,
         Some(respond),
         &banner,
+        options.concurrency,
     )
 }
 
@@ -1463,14 +1600,7 @@ fn serve_group<A: PackArm>(
         );
     }
     if options.fuse_batch {
-        let open = A::OPEN_LANES.ok_or_else(|| {
-            format!(
-                "{} TP={} serves one request at a time: --fuse-batch has no lanes to fuse",
-                A::NAME,
-                tp4.world_size
-            )
-        })?;
-        return serve_group_lanes::<A>(options, tp4, &directory, &config, context, open);
+        return serve_group_lanes::<A>(options, tp4, &directory, &config, context, A::open_lanes);
     }
     if tp4.rank != 0 {
         pack_tp4_worker(options, tp4, context, A::OPEN_RANK)
@@ -1516,8 +1646,9 @@ fn serve_group<A: PackArm>(
     ))
 }
 
-/// A pack's group under `--fuse-batch`: every rank opens `--concurrency` lanes
-/// ([`PackArm::OPEN_LANES`]), rank 0 serves its backend through the host driver as one node
+/// A pack's group under `--fuse-batch`: every rank opens the operator's lane count, or the
+/// count its arm's [sparkflash_runtime::Limits] states when the operator gave none
+/// ([`PackArm::open_lanes`]), rank 0 serves its backend through the host driver as one node
 /// does, and each worker mirrors rank 0's lanes until the group ends.
 #[cfg(feature = "tp4-serve")]
 fn serve_group_lanes<A: PackArm>(
@@ -1530,15 +1661,17 @@ fn serve_group_lanes<A: PackArm>(
 ) -> Result<ExitCode, String> {
     let mut rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
     rank_config.context = context;
+    // `--concurrency` names the lanes when the operator gave it; `None` asks the arm for the
+    // width its Limits state, so the group is not stuck at one placeholder count.
+    let requested = options.concurrency_set.then_some(options.concurrency);
     if tp4.rank != 0 {
-        open(&rank_config, options.concurrency)
-            .map_err(|message| format!("rank {}: {message}", tp4.rank))?;
+        open(&rank_config, requested).map_err(|message| format!("rank {}: {message}", tp4.rank))?;
         return Ok(ExitCode::SUCCESS);
     }
     // The tokenizer before the rank upload, as the one-request group loads it.
     let (_, seam) = pack_seam::<A>(options, directory, config)?;
-    let backend = open(&rank_config, options.concurrency)?
-        .ok_or_else(|| format!("{} rank 0 opened no lanes", A::NAME))?;
+    let (backend, lanes) = open(&rank_config, requested)?;
+    let backend = backend.ok_or_else(|| format!("{} rank 0 opened no lanes", A::NAME))?;
     let banner = format!(
         "sparkflash serve: {} TP={} rank 0 on {}; control {}; {} fused lanes; workers never \
          detokenize",
@@ -1546,7 +1679,7 @@ fn serve_group_lanes<A: PackArm>(
         tp4.world_size,
         tp4.peers[0],
         tp4.control_port,
-        options.concurrency
+        lanes
     );
     serve_backend(
         options,
@@ -1556,6 +1689,7 @@ fn serve_group_lanes<A: PackArm>(
         tp4.world_size,
         Some(A::respond),
         &banner,
+        lanes,
     )
 }
 
@@ -1659,14 +1793,23 @@ mod tests {
     #[test]
     fn every_released_config_is_detected_by_its_own_family() {
         for (config, expected) in [
-            (DEEPSEEK_CONFIG, Pack::Deepseek),
-            (QWEN_CONFIG, Pack::Qwen),
-            (GLM_CONFIG, Pack::Glm),
+            (
+                DEEPSEEK_CONFIG,
+                sparkflash_model::descriptor::DEFAULT_MODEL_ID,
+            ),
+            (
+                QWEN_CONFIG,
+                sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID,
+            ),
+            (GLM_CONFIG, sparkflash_model::descriptor::GLM53_FLASH_ID),
         ] {
             let directory = tempfile::tempdir().expect("a temporary checkpoint");
             std::fs::write(directory.path().join(CHECKPOINT_CONFIG_NAME), config)
                 .expect("the carried config is written");
-            assert_eq!(Pack::detect(directory.path()), Some(expected));
+            assert_eq!(
+                Pack::detect(directory.path()).map(Pack::model_id),
+                Some(expected)
+            );
         }
     }
 
@@ -1690,8 +1833,14 @@ mod tests {
             flat.to_string(),
         )
         .expect("the text-only config is written");
-        assert_eq!(Pack::detect(directory.path()), Some(Pack::Qwen));
-        assert_eq!(Pack::named("qwen4_exp_text"), Some(Pack::Qwen));
+        assert_eq!(
+            Pack::detect(directory.path()).map(Pack::model_id),
+            Some(sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID)
+        );
+        assert_eq!(
+            Pack::named("qwen4_exp_text").map(Pack::model_id),
+            Some(sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID)
+        );
     }
 
     #[test]
@@ -1702,8 +1851,15 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary checkpoint");
         std::fs::write(directory.path().join(CHECKPOINT_CONFIG_NAME), CONFIG)
             .expect("the Dory config is written");
-        assert_eq!(Pack::detect(directory.path()), Some(Pack::Dory));
-        assert!(!Pack::Dory.is_arm());
+        assert_eq!(
+            Pack::detect(directory.path()).map(Pack::model_id),
+            Some(sparkflash_model::descriptor::DORY1_0_4B_BF16_ID)
+        );
+        assert!(
+            !Pack::named(sparkflash_model::descriptor::DORY1_0_4B_BF16_ID)
+                .expect("Dory is a pack")
+                .has_pack_arm()
+        );
         assert!(Pack::missing_parts(directory.path()).is_empty());
     }
 
@@ -1720,8 +1876,15 @@ mod tests {
             sparkflash_model_inkling2::carried_quant(),
         )
         .expect("the quant groups are written");
-        assert_eq!(Pack::detect(directory.path()), Some(Pack::Inkling));
-        assert!(!Pack::Inkling.is_arm());
+        assert_eq!(
+            Pack::detect(directory.path()).map(Pack::model_id),
+            Some(sparkflash_model::descriptor::INKLING2_SMALL_ID)
+        );
+        assert!(
+            !Pack::named(sparkflash_model::descriptor::INKLING2_SMALL_ID)
+                .expect("Inkling is a pack")
+                .has_pack_arm()
+        );
         assert!(Pack::missing_parts(directory.path()).is_empty());
     }
 
@@ -1737,10 +1900,113 @@ mod tests {
         }
         // Qwen3.6-35B-A3B FP8 is the Qwen arm's device backend over the Qwen3.5-MoE family.
         assert_eq!(
-            Pack::named(sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID),
-            Some(Pack::Qwen36)
+            Pack::named(sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID)
+                .map(Pack::model_id),
+            Some(sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID)
         );
         assert_eq!(Pack::named("example/no-arm"), None);
+    }
+
+    #[test]
+    fn every_carried_arm_opens_a_group_at_world_two() {
+        const QWEN36_FP8: &str =
+            include_str!("../../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json");
+        const DORY: &str = include_str!(
+            "../../../sparkflash-model-dory/config/nvidia_nemotron_labs_dory1_0_4b_bf16.hf.json"
+        );
+        for arm in sparkflash_model::ARMS
+            .iter()
+            .filter(|arm| arm.profile_toml().is_some())
+        {
+            let pack =
+                Pack::named(arm.model_id()).unwrap_or_else(|| panic!("{} names no pack", arm.id()));
+            assert_eq!(pack.model_id(), arm.model_id());
+            let architecture = match arm.id() {
+                "DeepSeek" => sparkflash_model::Architecture::from_json(DEEPSEEK_CONFIG),
+                "Qwen" | "Qwen (FP8)" => sparkflash_model::Architecture::from_json(QWEN_CONFIG),
+                "Qwen3.6 (FP8)" => sparkflash_model::Architecture::from_json(QWEN36_FP8),
+                "GLM" => sparkflash_model::Architecture::from_json(GLM_CONFIG),
+                "Dory" => sparkflash_model::Architecture::from_json(DORY),
+                "Inkling" => sparkflash_model::Architecture::from_json(
+                    sparkflash_model_inkling2::carried_config(),
+                ),
+                other => panic!("{other} has a carried profile but no config in this test"),
+            }
+            .unwrap_or_else(|error| panic!("{}: {error}", arm.id()));
+            // World 2 is a group the plan can lay out for every carried arm. The device open is
+            // the arm's own; this is the construction the group's lanes stand on.
+            let plan = EnginePlan::for_architecture(architecture, Target::Sm121, 2, 0)
+                .unwrap_or_else(|error| panic!("{} at TP2: {error}", arm.id()));
+            assert!(
+                plan.boot_summary().contains("TP0/2"),
+                "{}: {}",
+                arm.id(),
+                plan.boot_summary()
+            );
+            match pack.route() {
+                Route::Typed => {
+                    assert!(pack.has_pack_arm(), "{}", arm.id());
+                    assert!(pack.opens_group_lanes(), "{}", arm.id());
+                    assert!(
+                        typed_pack(&pack.descriptor.weights_id).is_some(),
+                        "{} has no typed opener",
+                        arm.id()
+                    );
+                }
+                Route::Reference => assert!(pack.is_reference(), "{}", arm.id()),
+                Route::Dynamic => assert!(!pack.has_pack_arm(), "{}", arm.id()),
+            }
+        }
+    }
+
+    /// The group's inner path on a device: each pack arm opens its tiny checkpoint and its walk
+    /// states the lane width a group with no `--concurrency` would step.
+    #[test]
+    #[ignore = "needs a CUDA device: opens each pack arm's tiny checkpoint"]
+    fn the_qwen_pack_arms_group_lane_width_boots_its_runtime() {
+        // The Qwen3.8 canonical drafter is looked up in the hub cache when the profile names
+        // none; an empty cache keeps a released drafter away from the tiny fixture, which is a
+        // different width.
+        let cache = tempfile::tempdir().expect("an empty hub cache");
+        unsafe { std::env::set_var("HF_HUB_CACHE", cache.path()) };
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        let config = <QwenArm as PackArm>::write_fixture(directory.path()).expect("the fixture");
+        let context = <QwenArm as PackArm>::window(&config).min(4_096);
+        let profile = <QwenArm as PackArm>::profile_from(|_| None).expect("the profile");
+        let backend =
+            <QwenArm as PackArm>::open_host(directory.path(), config, context, &profile, None)
+                .expect("the Qwen fixture opens");
+        let qwen = backend.lane_limit().expect("the Qwen lane width");
+        assert!(qwen > 0, "Qwen states no lane width");
+
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        let config = <QwenFp8Arm as PackArm>::write_fixture(directory.path()).expect("the fixture");
+        let context = <QwenFp8Arm as PackArm>::window(&config).min(4_096);
+        let profile = <QwenFp8Arm as PackArm>::profile_from(|_| None).expect("the profile");
+        let backend =
+            <QwenFp8Arm as PackArm>::open_host(directory.path(), config, context, &profile, None)
+                .expect("the FP8 fixture opens");
+        assert_eq!(
+            backend.lane_limit().expect("the FP8 lane width"),
+            qwen,
+            "the FP8 release is the same arm"
+        );
+
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        let config = <Qwen36Arm as PackArm>::write_fixture(directory.path()).expect("the fixture");
+        let context = <Qwen36Arm as PackArm>::window(&config).min(4_096);
+        let profile = <Qwen36Arm as PackArm>::profile_from(|_| None).expect("the profile");
+        let backend =
+            <Qwen36Arm as PackArm>::open_host(directory.path(), config, context, &profile, None)
+                .expect("the Qwen3.6 fixture opens");
+        assert!(
+            backend.lane_limit().expect("the Qwen3.6 lane width") > 0,
+            "Qwen3.6 states no lane width"
+        );
+
+        // GLM's tiny fixture is not device-servable (its 32-wide hidden size is refused by the
+        // mixer's 256-column threads); its group width is the world-2 plan above, and the
+        // runtime's Limits are what `open_lanes` reads on the released checkpoint.
     }
 
     #[test]

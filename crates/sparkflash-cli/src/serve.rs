@@ -820,7 +820,7 @@ impl ServeOptions {
                 // server launches no kernel, so the loadable-image check belongs to the boot
                 // plan check (`check_checkpoint_plan`) and not to detection: a DeepSeek
                 // checkpoint with no SPARKFLASH_CUBINS still serves on the host.
-                if pack == pack::Pack::Deepseek {
+                if pack.is_reference() {
                     // Keep `cli.model` unset so `run` takes the V4.1 reference/TP4 path.
                 } else {
                     let missing = pack::Pack::missing_parts(&directory);
@@ -880,7 +880,7 @@ impl ServeOptions {
         } else {
             1
         });
-        let packed = pack.is_some_and(pack::Pack::is_arm);
+        let packed = pack.is_some_and(pack::Pack::has_pack_arm);
         // A model no pack names resolves through the dynamic path, whose shared dense device arm
         // steps lanes; the dynamic path refuses the lane knobs for every other family it serves.
         let dynamic_model = pack.is_none() && cli.model.is_some() && !cli.synthetic;
@@ -934,7 +934,7 @@ impl ServeOptions {
                         .to_owned(),
                 );
             }
-            if pack != Some(pack::Pack::Inkling) {
+            if !pack.is_some_and(pack::Pack::is_inkling) {
                 return Err(format!(
                     "--rank serves the Inkling-2-Small device arm; {} names another model. Its four-rank group reads converted rank files with --converted and its collective with --peer",
                     cli.model.as_deref().unwrap_or("this checkpoint")
@@ -1153,14 +1153,14 @@ impl ServeOptions {
                         .to_owned(),
                 );
             }
-            if pack != Some(pack::Pack::Dory) && cli.model.is_none() {
+            if !pack.is_some_and(pack::Pack::is_dory) && cli.model.is_none() {
                 return Err(
                     "--recurrence-rank splits Dory's recurrent loops across ranks; name a Dory \
                      checkpoint with --model or --checkpoint"
                         .to_owned(),
                 );
             }
-            if pack.is_some_and(|pack| pack != pack::Pack::Dory) {
+            if pack.is_some_and(|pack| !pack.is_dory()) {
                 return Err(format!(
                     "--recurrence-rank splits Dory's recurrent loops across ranks; --model {} has \
                      no latent recurrence (its group is --tp4-rank)",
@@ -1178,7 +1178,7 @@ impl ServeOptions {
         // weights, its device session, its Engram paging or its four-rank group; silently ignoring
         // one would serve something other than what the operator asked for.
         if let Some(model) = cli.model.as_deref()
-            && pack != Some(pack::Pack::Deepseek)
+            && !pack.is_some_and(pack::Pack::is_reference)
         {
             let mut unsupported: Vec<&str> = Vec::new();
             if cli.engram_dir.is_some() {
@@ -4949,8 +4949,8 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
 #[cfg(feature = "tp4-serve")]
 fn open_glm_lanes(
     config: &Tp4RankConfig,
-    lanes: usize,
-) -> Result<Option<Box<dyn sparkflash_model::ModelBackend>>, String> {
+    lanes: Option<usize>,
+) -> Result<(Option<Box<dyn sparkflash_model::ModelBackend>>, usize), String> {
     let loaded = load_glm_tp4_rank(config)?;
     let policy = loaded.depth_policy();
     let drafts = loaded.drafts();
@@ -4963,6 +4963,13 @@ fn open_glm_lanes(
         config.context,
     )
     .map_err(|error| error.to_string())?;
+    // The operator's count when given, else the width this rank's walk states.
+    let lanes = match lanes {
+        Some(lanes) => lanes,
+        None => backend
+            .lane_limit()
+            .map_err(|error| format!("the group's lane width: {error}"))?,
+    };
     backend
         .enable_speculation(drafts, policy)
         .map_err(|error| error.to_string())?;
@@ -4976,7 +4983,7 @@ fn open_glm_lanes(
             "sparkflash serve: GLM rank 0 steps {lanes} fused lanes over {} ranks, {drafts} draft(s)",
             config.world_size
         );
-        return Ok(Some(Box::new(backend)));
+        return Ok((Some(Box::new(backend)), lanes));
     }
     let mut control = tp4_control_worker(config)?;
     match backend.mirror_group(&mut control, lanes)? {}
@@ -5196,22 +5203,29 @@ fn load_qwen_tp4_rank(
     Ok((backend, cuda, load_ms))
 }
 
-/// One Qwen3.8-Flash-Next rank of a group stepping `lanes` fused lanes ([PackArm::OPEN_LANES]):
+/// One Qwen3.8-Flash-Next rank of a group stepping `lanes` fused lanes ([PackArm::open_lanes]):
 /// rank 0 answers its backend, whose sessions are handles on the group's lanes
 /// ([Qwen4ExpDeviceBackend::enable_group_fusion]); a worker replays rank 0's lanes until the group
 /// ends ([Qwen4ExpDeviceBackend::mirror_group]). Drafting is the profile's, as it is alone.
 ///
-/// [PackArm::OPEN_LANES]: pack::PackArm::OPEN_LANES
+/// [PackArm::open_lanes]: pack::PackArm::open_lanes
 /// [Qwen4ExpDeviceBackend::enable_group_fusion]: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::enable_group_fusion
 /// [Qwen4ExpDeviceBackend::mirror_group]: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::mirror_group
 #[cfg(feature = "tp4-serve")]
 fn open_qwen_lanes(
     config: &Tp4RankConfig,
-    lanes: usize,
-) -> Result<Option<Box<dyn sparkflash_model::ModelBackend>>, String> {
+    lanes: Option<usize>,
+) -> Result<(Option<Box<dyn sparkflash_model::ModelBackend>>, usize), String> {
     // The backend's own CUDA handle holds the primary context the collective was opened in
     // (releases are refcounted), so this one may go once the rank is loaded.
     let (mut backend, _cuda, _) = load_qwen_tp4_rank(config)?;
+    // The operator's count when given, else the width this rank's walk states.
+    let lanes = match lanes {
+        Some(lanes) => lanes,
+        None => backend
+            .lane_limit()
+            .map_err(|error| format!("the group's lane width: {error}"))?,
+    };
     if config.rank == 0 {
         let hub = Tp4ControlHub::start(config.control_address(), config.world_size, config.timeout)
             .map_err(|error| format!("rank 0 control channel: {error}"))?;
@@ -5222,7 +5236,7 @@ fn open_qwen_lanes(
             "sparkflash serve: Qwen rank 0 steps {lanes} fused lanes over {} ranks",
             config.world_size
         );
-        return Ok(Some(Box::new(backend)));
+        return Ok((Some(Box::new(backend)), lanes));
     }
     let mut control = tp4_control_worker(config)?;
     match backend.mirror_group(&mut control, lanes)? {}
@@ -6500,7 +6514,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
         // The registry's default DeepSeek identity is served by the existing reference/TP4
         // path; a packed model is served by its own arm. Any other id is either a dynamic
         // checkpoint or a refusal naming what this build can resolve.
-        if pack::Pack::named(&model) != Some(pack::Pack::Deepseek) {
+        if !pack::Pack::named(&model).is_some_and(pack::Pack::is_reference) {
             // A cached fine-tune of the released DeepSeek family is still the reference
             // engine's arithmetic: its checkpoint was already resolved into `options`.
             if !dynamic::names_deepseek(&options) {
@@ -9897,23 +9911,26 @@ mod tests {
             .is_ok()
         );
         // A pack is named by its model id or its weights id, in any case.
+        let arm_id = |pack: pack::Pack| pack.arm().id();
         assert_eq!(
-            pack::Pack::named(&sparkflash_model_glm5_next::MODEL_ID.to_ascii_lowercase()),
-            Some(pack::Pack::Glm)
+            pack::Pack::named(&sparkflash_model_glm5_next::MODEL_ID.to_ascii_lowercase())
+                .map(arm_id),
+            Some("GLM")
         );
         assert_eq!(
-            pack::Pack::named(sparkflash_model_qwen4_exp::WEIGHTS_ID),
-            Some(pack::Pack::Qwen)
+            pack::Pack::named(sparkflash_model_qwen4_exp::WEIGHTS_ID).map(arm_id),
+            Some("Qwen")
         );
         // The official FP8 release is the same arm: the checkpoint's own quantisation field
         // selects the expert format, not a second pack.
         assert_eq!(
-            pack::Pack::named(sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID),
-            Some(pack::Pack::QwenFp8)
+            pack::Pack::named(sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID)
+                .map(arm_id),
+            Some("Qwen (FP8)")
         );
         assert_eq!(
-            pack::Pack::named(sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_ID),
-            Some(pack::Pack::QwenFp8)
+            pack::Pack::named(sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_ID).map(arm_id),
+            Some("Qwen (FP8)")
         );
         assert_eq!(pack::Pack::named("example/no-arm"), None);
     }
@@ -9947,7 +9964,10 @@ mod tests {
                 "device".to_owned(),
             ])
             .expect("the default model takes the V4.1 engine flag");
-            assert_eq!(pack::Pack::named(id), Some(pack::Pack::Deepseek));
+            assert_eq!(
+                pack::Pack::named(id).map(|pack| pack.arm().id()),
+                Some("DeepSeek")
+            );
             assert_eq!(options.engine, EngineChoice::Device);
         }
     }

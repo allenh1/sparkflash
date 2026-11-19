@@ -45,7 +45,7 @@ fn a_group_refuses_the_host_drivers_knobs() {
         ] {
             let mut args = vec!["--model", model];
             args.extend_from_slice(extra);
-            // Both groups step --fuse-batch lanes (PackArm::OPEN_LANES).
+            // Both groups step --fuse-batch lanes (PackArm::open_lanes).
             if extra.contains(&"--fuse-batch") {
                 let options =
                     ServeOptions::parse(tp4_args(&args)).expect("the group steps fused lanes");
@@ -147,19 +147,25 @@ fn a_checkpoint_names_its_pack_from_its_own_config() {
 
     let glm = tempfile::tempdir().expect("tempdir");
     std::fs::write(glm.path().join(CHECKPOINT_CONFIG_NAME), GLM).expect("write");
-    assert_eq!(pack::Pack::detect(glm.path()), Some(pack::Pack::Glm));
+    assert_eq!(
+        pack::Pack::detect(glm.path()).map(pack::Pack::model_id),
+        Some(sparkflash_model_glm5_next::MODEL_ID)
+    );
 
     let qwen = tempfile::tempdir().expect("tempdir");
     std::fs::write(qwen.path().join(CHECKPOINT_CONFIG_NAME), QWEN).expect("write");
-    assert_eq!(pack::Pack::detect(qwen.path()), Some(pack::Pack::Qwen));
+    assert_eq!(
+        pack::Pack::detect(qwen.path()).map(pack::Pack::model_id),
+        Some(sparkflash_model_qwen4_exp::MODEL_ID)
+    );
 
     // The V4.1 document is the default arm's model; detection names it, and the serve path
     // routes it to the existing reference/TP4 engine rather than a PackArm.
     let deepseek = tempfile::tempdir().expect("tempdir");
     std::fs::write(deepseek.path().join(CHECKPOINT_CONFIG_NAME), DEEPSEEK).expect("write");
     assert_eq!(
-        pack::Pack::detect(deepseek.path()),
-        Some(pack::Pack::Deepseek)
+        pack::Pack::detect(deepseek.path()).map(pack::Pack::model_id),
+        Some(sparkflash_model::descriptor::DEFAULT_MODEL_ID)
     );
 
     // The same detection makes --checkpoint enough to reach the pack's arm. The parts check is
