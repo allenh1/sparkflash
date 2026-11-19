@@ -225,7 +225,11 @@ rank_env() {
     # arm switches are the same kind of knob: a rank that walked a different schedule from its
     # peers would meet them at the wrong collective. SPARKFLASH_TICK_TRACE is the one diagnostic
     # here: every rank may carry it, and only rank 0 writes the file.
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|SPEC|DRAFTS|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE)' || true); do
+    #
+    # SPARKFLASH_NUMERICS_* are diagnostics too (the coverage and monitor dumps): a rank that
+    # wrote its dump while its peers did not is a suite with missing inputs, and leaving them out
+    # made a GLM coverage sweep produce no file at all (the recorders are constructed per rank).
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|SPEC|DRAFTS|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE|NUMERICS)' || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0
