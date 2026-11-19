@@ -1377,6 +1377,13 @@ four boot fixes carried, or a capture that records its commit in the first place
 The lesson is worth a mechanism: **a capture's server card has to name the build it came from**.
 Without that field, a frozen reference can only say that bits moved, never which commit moved
 them, and every bisect pays for the same information twice.
+
+The mechanism now exists. `scripts/numerics.py capture` writes `binary_sha256` (from
+`--binary` or `SPARKFLASH_BIN`), `commit` (from `--repo`, default the checkout the tool runs
+from) and a `build_note` naming why either is null into the reference's `server` card. The card is
+outside the fingerprint, so naming a build changes no bits, and a reference captured before the
+fields existed stays valid.
+
 ### Inkling on the tick engine: three widths, one verify width, and the group's images
 
 Commits `eddb478f` (the single process) and `d22208e8` (the group). Inkling had no

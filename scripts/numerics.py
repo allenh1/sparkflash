@@ -17,7 +17,7 @@
 
     numerics.py capture --url URL --out numerics/references/NAME.json [--suite FILE]
                         [--forced-from REFERENCE] [--max-tokens N] [--top-logprobs K]
-                        [--evidence logprobs|text]
+                        [--evidence logprobs|text] [--binary PATH] [--repo PATH]
     numerics.py check --url URL [--reference FILE]
     numerics.py compare --anchor REFERENCE --candidate CAPTURE [--floor COMPARE.json]
                         [--json OUT] [--markdown OUT]
@@ -37,7 +37,9 @@ capture  runs a prompt suite against a running server and writes a reference: ev
          and every generated token's id, logprob and top-k alternatives (evidence "logprobs"), or
          the greedy text where the path serves no logprobs (evidence "text"). --forced-from feeds
          another reference's tokens through the server instead (teacher forcing), which is what
-         compare reads.
+         compare reads. Its server card names the build it came from: --binary (or SPARKFLASH_BIN)
+         is hashed into binary_sha256, and --repo (default: this checkout) supplies the commit.
+         Either may be unknown; the card then records null and a one-line reason, never a guess.
 check    recaptures the server's registered reference and fails on any bit that differs. It also
          fails when the server does not report the registry entry this checkout has.
 compare  scores a teacher-forced capture against the anchor it was forced from: per-token NLL
@@ -190,6 +192,19 @@ def check_reference_shape(reference: dict, origin: str) -> None:
         raise NumericsFailure(f"{origin}: evidence {reference.get('evidence')!r} is not one of {EVIDENCE}")
     if not reference.get("prompts"):
         raise NumericsFailure(f"{origin}: the reference holds no prompts")
+    # The server card is outside the fingerprint and grew a build record after the first
+    # references were captured: an absent key is valid, a present one must be a string or null.
+    server = reference.get("server")
+    if server is not None:
+        if not isinstance(server, dict):
+            raise NumericsFailure(f"{origin}: the server card is not an object")
+        for field in ("binary_sha256", "commit", "build_note"):
+            value = server.get(field)
+            if value is not None and not isinstance(value, str):
+                raise NumericsFailure(f"{origin}: server.{field} is neither a string nor null")
+        digest = server.get("binary_sha256")
+        if isinstance(digest, str) and not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise NumericsFailure(f"{origin}: server.binary_sha256 is not 64 lowercase hex digits")
 
 
 def load_reference(path: Path) -> dict:
@@ -307,6 +322,53 @@ def checkpoint_identity(path: str | None) -> str | None:
     return "/".join(parts[repo:]) if repo is not None else parts[-1]
 
 
+def sha256_file(path: Path) -> str:
+    """The sha256 of a file, read in blocks so a large binary is not held whole."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def git_at(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run git in a tree other than this checkout's."""
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=False, check=False)
+
+
+def build_identity(binary: Path | None, repo: Path | None) -> dict:
+    """The build a capture came from: the binary's sha256 and the commit of the tree it was built from.
+
+    Both are facts the server cannot report through the API, so the operator names them. When one
+    cannot be determined the card records null and a one-line reason; a value is never guessed. The
+    reason names no host path, because the reference is committed.
+    """
+    reasons = []
+    digest = None
+    if binary is None:
+        reasons.append("no --binary or SPARKFLASH_BIN named the binary")
+    else:
+        try:
+            digest = sha256_file(binary)
+        except OSError as error:
+            reasons.append(f"the binary is not readable: {error.strerror or error}")
+    commit = None
+    if repo is None:
+        reasons.append("no --repo named the tree the server was built from")
+    else:
+        shown = git_at(repo, "rev-parse", "HEAD")
+        if shown.returncode != 0:
+            reasons.append("the tree named by --repo is not a git work tree with a HEAD")
+        else:
+            commit = shown.stdout.decode().strip()
+            if git_at(repo, "status", "--porcelain").stdout.strip():
+                reasons.append(
+                    "the tree named by --repo has uncommitted changes, so its commit does not "
+                    "name the exact build"
+                )
+    return {"binary_sha256": digest, "commit": commit, "build_note": "; ".join(reasons) or None}
+
+
 def key_text(key: dict) -> str:
     return " ".join([str(key["model"])] + [f"{field}={key[field]}" for field in KEY_FIELDS[1:]])
 
@@ -412,6 +474,9 @@ def capture(
     forced_from: dict | None,
     timeout: float,
     on_prompt: Callable[[dict], None] = lambda _record: None,
+    *,
+    binary: Path | None = None,
+    repo: Path | None = None,
 ) -> dict:
     """Capture `prompts` from the server at `url` into a reference document."""
     card = fetch_card(url, timeout)
@@ -440,6 +505,7 @@ def capture(
             "numerics": card["numerics"],
             "build": card.get("build"),
             "checkpoint": checkpoint_identity(card.get("checkpoint")),
+            **build_identity(binary, repo),
         },
         "settings": settings,
         "forced_from": forced_from,
@@ -2680,6 +2746,17 @@ def main(argv: list[str]) -> int:
     capture_parser.add_argument("--top-logprobs", type=int, default=8)
     capture_parser.add_argument("--evidence", choices=EVIDENCE, default="logprobs")
     capture_parser.add_argument("--timeout", type=float, default=1800.0)
+    capture_parser.add_argument(
+        "--binary",
+        type=Path,
+        help="the server binary; its sha256 goes in the reference's server card (or set SPARKFLASH_BIN)",
+    )
+    capture_parser.add_argument(
+        "--repo",
+        type=Path,
+        default=REPO,
+        help="the checkout the server was built from; its HEAD commit goes in the server card",
+    )
 
     check_parser = commands.add_parser("check", help="recapture the registered reference, bit for bit")
     check_parser.add_argument("--url", required=True)
@@ -2792,6 +2869,7 @@ def progress(record: dict) -> None:
 
 def command_capture(args: argparse.Namespace) -> int:
     url = args.url.rstrip("/")
+    binary = args.binary or (Path(os.environ["SPARKFLASH_BIN"]) if os.environ.get("SPARKFLASH_BIN") else None)
     forced_from = None
     if args.forced_from:
         anchor = load_reference(args.forced_from)
@@ -2807,12 +2885,30 @@ def command_capture(args: argparse.Namespace) -> int:
         card = fetch_card(url, args.timeout)
         prompts = suite_prompts(args.suite, url, card["id"], args.timeout)
         max_tokens = args.max_tokens
-    reference = capture(url, prompts, args.evidence, max_tokens, args.top_logprobs, forced_from, args.timeout, progress)
+    reference = capture(
+        url,
+        prompts,
+        args.evidence,
+        max_tokens,
+        args.top_logprobs,
+        forced_from,
+        args.timeout,
+        progress,
+        binary=binary,
+        repo=args.repo,
+    )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(render_reference(reference))
     numerics = reference["server"]["numerics"]
+    build = reference["server"]
     print(f"wrote {args.out}: {key_text(reference['key'])}, status {numerics['status']}")
     print(f"fingerprint {reference['fingerprint']}")
+    if build["binary_sha256"] and build["commit"]:
+        print(f"build: binary sha256 {build['binary_sha256']}, commit {build['commit']}")
+        if build["build_note"]:
+            print(f"warning: {build['build_note']}")
+    else:
+        print(f"build: not recorded ({build['build_note']})")
     if numerics.get("overrides"):
         print(f"warning: the server ran with {numerics['overrides']} set; this capture does not describe the shipped default")
     if forced_from is None:

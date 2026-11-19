@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -290,6 +291,106 @@ class CaptureTests(unittest.TestCase):
         with serving(fake) as url:
             with self.assertRaisesRegex(NUMERICS.NumericsFailure, "no numerics identity"):
                 capture(url)
+
+    def git_repo(self, directory: str) -> tuple[Callable[..., str], str]:
+        """A clean git tree holding `binary`; returns its git runner and its HEAD commit."""
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", "-C", directory, "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "server")
+        return git, git("rev-parse", "HEAD")
+
+    def test_a_capture_names_the_binary_and_the_commit_it_was_built_from(self):
+        prompts = [{"name": "a", "prompt_ids": [1]}]
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "sparkflash"
+            binary.write_bytes(b"the build")
+            git, commit = self.git_repo(directory)
+            with serving(FakeServer()) as url:
+                reference = NUMERICS.capture(
+                    url, prompts, "logprobs", 4, 2, None, 30.0, binary=binary, repo=Path(directory)
+                )
+            # A tree with uncommitted changes does not name an exact build; the reason says so.
+            binary.write_bytes(b"rebuilt")
+            dirty = NUMERICS.build_identity(binary, Path(directory))
+        server = reference["server"]
+        self.assertEqual(server["binary_sha256"], hashlib.sha256(b"the build").hexdigest())
+        self.assertEqual(server["commit"], commit)
+        self.assertIsNone(server["build_note"])
+        self.assertEqual(dirty["commit"], commit)
+        self.assertIn("uncommitted changes", dirty["build_note"])
+
+    def test_a_capture_without_a_build_records_null_and_a_reason(self):
+        with serving(FakeServer()) as url:
+            reference = capture(url)
+        server = reference["server"]
+        self.assertIsNone(server["binary_sha256"])
+        self.assertIsNone(server["commit"])
+        self.assertIn("no --binary", server["build_note"])
+        self.assertIn("no --repo", server["build_note"])
+
+    def test_a_build_that_cannot_be_determined_names_no_host_path(self):
+        missing = Path(tempfile.gettempdir()) / "not-a-sparkflash-binary"
+        repo = Path(tempfile.gettempdir()) / "not-a-sparkflash-checkout"
+        identity = NUMERICS.build_identity(missing, repo)
+        self.assertIsNone(identity["binary_sha256"])
+        self.assertIsNone(identity["commit"])
+        self.assertIn("not readable", identity["build_note"])
+        self.assertIn("not a git work tree", identity["build_note"])
+        self.assertNotIn(str(missing), identity["build_note"])
+        self.assertNotIn(str(repo), identity["build_note"])
+
+    def test_the_build_card_does_not_change_the_fingerprint(self):
+        prompts = [{"name": "a", "prompt_ids": [1, 2]}]
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "sparkflash"
+            binary.write_bytes(b"the build")
+            with serving(FakeServer()) as url:
+                plain = NUMERICS.capture(url, prompts, "logprobs", 6, 4, None, 30.0)
+                named = NUMERICS.capture(
+                    url, prompts, "logprobs", 6, 4, None, 30.0, binary=binary, repo=None
+                )
+        self.assertEqual(plain["server"]["binary_sha256"], None)
+        self.assertNotEqual(plain["server"], named["server"])
+        self.assertEqual(plain["fingerprint"], named["fingerprint"])
+        self.assertNotIn("binary_sha256", json.dumps(NUMERICS.reference_bits(named)))
+
+    def test_a_reference_without_the_build_keys_stays_valid_and_a_malformed_one_is_refused(self):
+        reference = NUMERICS.synthetic_reference([5], -0.25)
+        NUMERICS.check_reference_shape(reference, "old")  # no server card at all
+        reference["server"] = {"build": None, "checkpoint": "ckpt"}
+        NUMERICS.check_reference_shape(reference, "old")
+        reference["server"] = {"binary_sha256": 7}
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "binary_sha256"):
+            NUMERICS.check_reference_shape(reference, "bad")
+        reference["server"] = {"binary_sha256": "A" * 64}
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "64 lowercase hex"):
+            NUMERICS.check_reference_shape(reference, "bad")
+
+    def test_the_capture_command_hashes_the_binary_from_the_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "sparkflash"
+            binary.write_bytes(b"the build")
+            out = Path(directory) / "reference.json"
+            with serving(FakeServer()) as url, mock.patch.dict(
+                "os.environ", {"SPARKFLASH_BIN": str(binary)}
+            ), contextlib.redirect_stdout(io.StringIO()) as printed:
+                self.assertEqual(
+                    NUMERICS.main(["capture", "--url", url, "--out", str(out), "--max-tokens", "2"]), 0
+                )
+            reference = json.loads(out.read_text())
+        self.assertEqual(reference["server"]["binary_sha256"], hashlib.sha256(b"the build").hexdigest())
+        expected = subprocess.run(
+            ["git", "-C", str(NUMERICS.REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        self.assertEqual(reference["server"]["commit"], expected)
+        self.assertIn("binary sha256", printed.getvalue())
 
     def test_the_suite_is_tokenized_by_the_server(self):
         with tempfile.TemporaryDirectory() as directory:
