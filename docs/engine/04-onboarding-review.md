@@ -464,6 +464,16 @@ delta, not the decode body's share, because version 1's reference predates the m
 both. Qwen's decode move was +7.0e-04 with 99.39 % agreement, so this is a large served change
 and the page says so rather than calling it a rounding note.
 
+**The window's separation capture is not evidence, and that is its finding.** The same window
+served the build with `SPARKFLASH_DECODE_MMA` unset and with it set to `off` and got two
+bit-identical captures. The switch was inert: `DeviceRank::gemv` routed the one-to-eight-row FP8
+parts to the tile's few-row body by shape alone and nothing in the decode path read the switch.
+The arm's `TOKEN_DECODE` now states what it runs ("the FP8 parts on the tile's few-row body, the
+BF16 parts on the tiled GEMV"), the CLI's GLM profile check accepts `decode.tensor_cores = true`
+from that same constant, and the switch selects the body or the tiled GEMV. The separation
+capture must be retaken on a build after the fix before version 2 declares; until then the delta
+above is the tip's, not the body's, and is not decomposed.
+
 Two operational facts the plan's gate should carry:
 
 1. **A four-rank boot needs the same binary on every rank, verified before the swap.** The

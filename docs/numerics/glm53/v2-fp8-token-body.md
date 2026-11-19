@@ -11,7 +11,8 @@ Until then version 1's reference stands, and this page records how far the tip's
 
 Version 2 of the world-4 sm_121a configuration moves GLM's one-to-eight-row block-scaled FP8
 projections from the tiled row GEMV (`q4e_gemv_tiled_e4m3_block`) to the shared tile's few-row
-body (`glm_decode_fp8b128_rows`). It is the first declared change to GLM's arithmetic after the
+body (`glm_decode_fp8b128_rows`) under `decode.tensor_cores`'s on default, which the shipped
+`glm53_flash.toml` implies. It is the first declared change to GLM's arithmetic after the
 shipped version 1 (the E4M3 attention window, [v1-e4m3-window.md](v1-e4m3-window.md)).
 
 ## What changed
@@ -27,11 +28,14 @@ which takes f32 activations; the shipped release's bulk prefill takes `glm_prefi
 dynamic E4M3 activations, so this change does not by itself make a continued turn equal a cold q8
 prefill.
 
-The routing boundary is the arm's existing one: `MAX_ROWS` is eight, one to eight rows take the
-body, and a larger batch keeps the bulk tensor-core GEMM. Projections whose shape the body does
-not take (a BF16 weight, a K run that is not whole 128-column blocks, or a part that is not whole
-eight-column outputs) keep the tiled GEMV. The routed experts' `q4e_expert_gemv_e4m3_block` is
-outside this change and still serves the token rows.
+The routing boundary is the arm's existing one, now gated by the decode switch:
+`decode.tensor_cores` (`SPARKFLASH_DECODE_MMA`), on by default and left unset by the shipped
+`glm53_flash.toml`, routes a one-to-eight-row FP8 part to the body; `off` puts it back on the
+tiled GEMV (`gemv_small`). `MAX_ROWS` is eight and a larger batch keeps the bulk tensor-core
+GEMM whatever the switch says. Projections whose shape the body does not take (a BF16 weight, a
+K run that is not whole 128-column blocks, or a part that is not whole eight-column outputs)
+keep the tiled GEMV in both switch states. The routed experts'
+`q4e_expert_gemv_e4m3_block` is outside this change and still serves the token rows.
 
 ## What was measured before the cluster
 
@@ -45,7 +49,11 @@ outside this change and still serves the token rows.
 - **The routing boundary.** A CPU test holds the band to one through eight rows and the ninth to
   the bulk path, and rejects a BF16 weight, a part that is not whole eight-column writes, and a
   part whose block scale does not start on a 128-row boundary
-  (`device::tests::the_fp8_token_body_takes_one_to_eight_rows`).
+  (`device::tests::the_fp8_token_body_takes_one_to_eight_rows`). The switch test covers both
+  values: on routes the FP8 parts to the body, off to the tiled GEMV, and a BF16 part or a shape
+  the body does not fit stays on the tiled GEMV either way
+  (`the_decode_switch_picks_the_token_body_or_the_tiled_gemv`); the shipped profile's unset
+  field is pinned to the body's route (`the_shipped_profile_decodes_on_the_token_body`).
 
 The device arm's device-versus-host fixture moves with the declared change: with the FP8 weights'
 inputs unquantised, the three worlds' worst seams are 1.3e-5, 1.8e-5 and 1.3e-5
@@ -99,13 +107,22 @@ mean NLL with 99.39 % top-1 agreement ([../qwen38/v1-tc-decode.md](../qwen38/v1-
 two orders of magnitude less. Two causes are consistent with the per-prompt pattern and neither
 is established: the body's accumulation order (the 128-column block scale folded in ascending
 block order, two MMAs a 16-column step) against the row GEMV's, and the arm's prefill chunking
-at the profile's 4,096 rows where version 1's build ran the code default. A capture on this same
-build with `SPARKFLASH_DECODE_MMA=off`, compared against this capture, separates the body from the
-move; that capture is not yet taken.
+at the profile's 4,096 rows where version 1's build ran the code default.
+
+**The separation capture taken in that window is not evidence.** The same window served the build
+once with `SPARKFLASH_DECODE_MMA` unset and once with it set to `off`, and the two captures were
+**bit-identical**. That is the defect the window found, not the body agreeing with the row GEMV:
+on that build the switch was inert. Nothing in the decode path read it; `DeviceRank::gemv` chose
+the tile's few-row body by shape alone (`fp8_token_body_fits`), so `off` served exactly the same
+kernel. This fix gates the route on the switch. The separation capture has to be retaken on a
+build that carries it, against this capture, before version 2 declares: only then does `off`
+measure the tiled GEMV's bits and the body's own share separate from the move's.
 
 ## What is still not measured
 
-- **The body's own share of the delta**, for the reason above.
+- **The body's own share of the delta.** The switch is live now, so the separating capture -
+  the shipped default against `SPARKFLASH_DECODE_MMA=off` - must be retaken on the fixed build;
+  the window's `off` capture was bit-identical only because the switch was inert.
 - **The speed A/B.** Whether the one-row step is flat or slightly slower and whether the
   several-row step is faster are both **unmeasured**. The expected shape from the plan is flat or
   slightly slower at one row and faster at several, as on DeepSeek and Qwen; that expectation is
@@ -126,6 +143,7 @@ top-1.
 Version 1 remains the only reference the registry names until the coverage and monitor dumps
 allow version 2 to declare this capture.
 
-The body covers the FP8 precision of GLM's decode; BF16 projections still take the tiled GEMV,
-and the `WAIVERS` lines in `crates/sparkflash-ops/src/parts.rs` now say so and cite
+The body covers the FP8 precision of GLM's decode while `decode.tensor_cores` is on (the
+shipped default); `off` puts those parts on the same tiled GEMV the BF16 projections always take,
+and the `WAIVERS` lines in `crates/sparkflash-ops/src/parts.rs` say so and cite
 `glm_decode_fp8b128_rows`.
