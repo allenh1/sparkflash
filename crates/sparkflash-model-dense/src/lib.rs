@@ -82,6 +82,10 @@ use sparkflash_ops::OpPlan;
 use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
 use sparkflash_ops::dflash::{DraftUploader, Part as Run};
 use sparkflash_ops::engine_plan::{EnginePlan, PlanError};
+use sparkflash_ops::formats::{
+    Bf16, F32 as F32Format, FormatKind, Fp8E4m3, Mat, PackedBf16, PackedOrder, Scales, Tensor,
+    upload as upload_format,
+};
 use sparkflash_ops::gdn::{self, GdnGeometry, gdn_qk_row};
 use sparkflash_ops::gemv::{
     CudaHandle, E4M3_TILE, GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3Tile, TILED_GEMV_BLOCKS,
@@ -96,9 +100,10 @@ use sparkflash_ops::projection::{
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
+use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 use sparkflash_runtime::{ChunkPolicy, Fusion, Limits, TextWire};
 use sparkflash_weights::tp::TpRuntime;
-use sparkflash_weights::{DType, WeightSource};
+use sparkflash_weights::{DType, TensorSpec, WeightSource};
 
 mod walk;
 
@@ -360,7 +365,7 @@ impl Shape {
 }
 
 /// One layer's device weights.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Layer {
     shape: Shape,
     input_norm: Deviceptr,
@@ -372,7 +377,7 @@ struct Layer {
 }
 
 /// A layer's token mixer on the device.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Mixer {
     /// Grouped-query attention's projections and its q/k norms.
     Gqa {
@@ -388,7 +393,7 @@ enum Mixer {
 /// A Gated DeltaNet layer's weights: the fused q/k/v projection, the output gate's, the beta and
 /// decay logits', the conv (BF16 `[conv_width][taps]`), the decay vectors and the gated norm (BF16
 /// a value head's width).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GdnLayer {
     qkv: Proj,
     z: Proj,
@@ -402,14 +407,16 @@ struct GdnLayer {
 
 impl Layer {
     /// Every BF16 projection the layer's GEMVs read.
-    fn bf16_projections(&self) -> Vec<GpuMat> {
-        let mut projections = vec![self.o];
-        match self.mixer {
-            Mixer::Gqa { q, k, v, .. } => projections.extend([q, k, v]),
-            Mixer::Gdn(gdn) => projections.extend([gdn.qkv, gdn.z, gdn.b, gdn.a]),
+    fn bf16_projections(&self) -> Vec<Mat<Bf16>> {
+        let mut projections = vec![self.o.clone()];
+        match &self.mixer {
+            Mixer::Gqa { q, k, v, .. } => projections.extend([q.clone(), k.clone(), v.clone()]),
+            Mixer::Gdn(gdn) => {
+                projections.extend([gdn.qkv.clone(), gdn.z.clone(), gdn.b.clone(), gdn.a.clone()])
+            }
         }
-        let mlp = |mlp: Mlp| [mlp.gate, mlp.up, mlp.down];
-        match self.ffn {
+        let mlp = |mlp: &Mlp| [mlp.gate.clone(), mlp.up.clone(), mlp.down.clone()];
+        match &self.ffn {
             LayerFfn::Dense(dense) => projections.extend(mlp(dense)),
             LayerFfn::Routed {
                 router,
@@ -417,9 +424,11 @@ impl Layer {
                 shared_gate,
                 ..
             } => {
-                projections.push(router);
-                projections.extend(shared.into_iter().flat_map(mlp));
-                projections.extend(shared_gate);
+                projections.push(router.clone());
+                if let Some(shared) = shared {
+                    projections.extend(mlp(shared));
+                }
+                projections.extend(shared_gate.clone());
             }
         }
         projections
@@ -433,33 +442,66 @@ impl Layer {
 }
 
 /// One projection's weights on the device: BF16, or E4M3 codes under one BF16 inverse scale a
-/// 128 x 128 tile, as the checkpoint stores the tensor.
-#[derive(Debug, Clone, Copy)]
+/// 128 x 128 tile, as the checkpoint stores the tensor. The matrix is the typed upload
+/// ([sparkflash_ops::formats::upload]), so its stored dtype and its format's scale count were
+/// checked when it was read.
+#[derive(Debug, Clone)]
 enum Proj {
-    Bf16(GpuMat),
-    Fp8(GpuMatE4m3Tile),
+    Bf16(Mat<Bf16>),
+    Fp8(Mat<Fp8E4m3>),
 }
 
 impl Proj {
     /// Output rows.
-    const fn rows(&self) -> usize {
+    fn rows(&self) -> usize {
         match self {
-            Self::Bf16(mat) => mat.rows,
-            Self::Fp8(mat) => mat.rows,
+            Self::Bf16(mat) => mat.rows(),
+            Self::Fp8(mat) => mat.rows(),
         }
     }
 
     /// The token passes' table entries: the weight and its scale grid (none for BF16).
-    const fn table(&self) -> [u64; 2] {
+    fn table(&self) -> [u64; 2] {
         match self {
-            Self::Bf16(mat) => [mat.pointer.0, 0],
-            Self::Fp8(mat) => [mat.weight.0, mat.scales.0],
+            Self::Bf16(mat) => [mat.data().0, 0],
+            Self::Fp8(mat) => [
+                mat.data().0,
+                mat.scales().blocks().map_or(0, |blocks| blocks.0),
+            ],
+        }
+    }
+
+    /// The format the checkpoint stores this projection as.
+    fn format(&self) -> FormatKind {
+        match self {
+            Self::Bf16(mat) => mat.format(),
+            Self::Fp8(mat) => mat.format(),
+        }
+    }
+
+    /// The stored bytes one token reads from this projection.
+    fn bytes_per_token(&self) -> u128 {
+        match self {
+            Self::Bf16(mat) => mat.bytes_per_token(),
+            Self::Fp8(mat) => mat.bytes_per_token(),
+        }
+    }
+
+    /// The BF16 matrix a GEMV or a wide tile takes, when this projection is BF16.
+    fn bf16(&self) -> Option<GpuMat> {
+        match self {
+            Self::Bf16(mat) => Some(GpuMat {
+                pointer: mat.data(),
+                rows: mat.rows(),
+                columns: mat.columns(),
+            }),
+            Self::Fp8(_) => None,
         }
     }
 }
 
 /// One SwiGLU MLP's projections: a dense layer's, or a routed layer's shared expert.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Mlp {
     gate: Proj,
     up: Proj,
@@ -467,7 +509,7 @@ struct Mlp {
 }
 
 /// A layer's MLP on the device.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum LayerFfn {
     Dense(Mlp),
     Routed {
@@ -667,8 +709,8 @@ impl Formats {
 struct Shared {
     cuda: CudaHandle,
     kernels: Kernels,
-    embed: GpuMat,
-    head: GpuMat,
+    embed: Mat<Bf16>,
+    head: Mat<Bf16>,
     norm: Deviceptr,
     layers: Vec<Layer>,
     hidden: usize,
@@ -812,7 +854,7 @@ impl DenseDeviceBackend {
             &shapes,
             &mut owned,
         );
-        let (embed, head, norm, layers, weight_bytes) = match uploaded {
+        let (embed, head, norm, layers, weight_bytes, mut ledger_rows, widen) = match uploaded {
             Ok(uploaded) => uploaded,
             Err(error) => {
                 let references: Vec<&Deviceptr> = owned.iter().collect();
@@ -821,11 +863,12 @@ impl DenseDeviceBackend {
             }
         };
         // The token GEMVs read a packed copy of every BF16 projection; the wide tiles keep the
-        // BF16 rows, so the copy sits beside them.
+        // BF16 rows, so the copy sits beside them. Each packed copy is a `Mat<Bf16>` too, with
+        // the form's word layout as its scales, so the uploader checks the row geometry.
         let mut packed = PackedSet::new(Form::from_env()?, Placement::Beside);
-        let matrices: Vec<_> = std::iter::once(head)
+        let matrices: Vec<_> = std::iter::once(head.clone())
             .chain(layers.iter().flat_map(Layer::bf16_projections))
-            .map(|mat| (mat.pointer, mat.rows, mat.columns))
+            .map(|mat| (mat.data(), mat.rows(), mat.columns()))
             .collect();
         let packed_bytes = match packed.pack(&cuda, &kernels.packed, &matrices, 0) {
             Ok((_, packed_bytes)) => packed_bytes,
@@ -835,8 +878,54 @@ impl DenseDeviceBackend {
                 return Err(error);
             }
         };
+        for (pointer, rows, columns) in &matrices {
+            let Some(copy) = packed.get(*pointer) else {
+                continue;
+            };
+            let planes = copy.planes();
+            let spec = TensorSpec {
+                name: format!("packed {rows} x {columns} BF16 projection"),
+                dtype: DType::BF16,
+                shape: vec![*rows, *columns],
+            };
+            let typed = match typed_bf16(
+                &spec,
+                *rows,
+                *columns,
+                Deviceptr(planes[0]),
+                copy.row_bytes(),
+                Scales::packed_bf16(PackedBf16 {
+                    escapes: Deviceptr(planes[2]),
+                    offsets: Deviceptr(planes[1]),
+                    row_bytes: copy.row_bytes(),
+                    order: PackedOrder::Walk,
+                }),
+            ) {
+                Ok(typed) => typed,
+                Err(error) => {
+                    let references: Vec<&Deviceptr> = owned.iter().collect();
+                    cuda.free_buffers(&references);
+                    return Err(error);
+                }
+            };
+            ledger_rows.push(LedgerRow::new(
+                typed.spec().name.clone(),
+                typed.format(),
+                typed.format(),
+                typed.bytes_per_token(),
+            ));
+        }
         owned.extend(packed.allocations());
         let weight_bytes = weight_bytes + packed_bytes;
+        let ledger = match FormatLedger::boot(ledger_rows, &widen) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                let references: Vec<&Deviceptr> = owned.iter().collect();
+                cuda.free_buffers(&references);
+                return Err(error.to_string());
+            }
+        };
+        eprintln!("[dense] {ledger}");
         eprintln!("[dense] {}", packed.summary());
         let lanes = SequenceLanes::plan(
             &cuda,
@@ -1154,17 +1243,83 @@ fn linear_sizes(layers: &[Layer]) -> Vec<usize> {
         .collect()
 }
 
-type Uploaded = (GpuMat, GpuMat, Deviceptr, Vec<Layer>, usize);
+type Uploaded = (
+    Mat<Bf16>,
+    Mat<Bf16>,
+    Deviceptr,
+    Vec<Layer>,
+    usize,
+    Vec<LedgerRow>,
+    WidenLog,
+);
+
+/// The typed matrix of a stored BF16 tensor this arm reads: [upload] checks the container's
+/// stored dtype and the scale count of the format (none, or the packed word layout).
+fn typed_bf16(
+    spec: &TensorSpec,
+    rows: usize,
+    columns: usize,
+    data: Deviceptr,
+    stride: usize,
+    scales: Scales,
+) -> Result<Mat<Bf16>, String> {
+    let stored = TensorSpec {
+        name: spec.name.clone(),
+        dtype: spec.dtype,
+        shape: vec![rows, columns],
+    };
+    upload_format::<Bf16>(Tensor {
+        stored: &stored,
+        shape: &[rows, columns],
+        data,
+        stride,
+        scales,
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// The typed matrix of a stored FP8 E4M3 tensor: [upload] checks the stored dtype and that the
+/// inverse-scale plane has exactly one entry a 128 x 128 tile.
+fn typed_fp8(
+    spec: &TensorSpec,
+    rows: usize,
+    columns: usize,
+    data: Deviceptr,
+    stride: usize,
+    blocks: Deviceptr,
+    entries: usize,
+    scale_dtype: DType,
+) -> Result<Mat<Fp8E4m3>, String> {
+    let stored = TensorSpec {
+        name: spec.name.clone(),
+        dtype: spec.dtype,
+        shape: vec![rows, columns],
+    };
+    upload_format::<Fp8E4m3>(Tensor {
+        stored: &stored,
+        shape: &[rows, columns],
+        data,
+        stride,
+        scales: Scales::fp8_e4m3(blocks, entries, scale_dtype),
+    })
+    .map_err(|error| error.to_string())
+}
 
 /// One upload's tensors: each checked at its architecture shape (BF16, or a projection's
-/// block-scaled E4M3), and every allocation in `owned` as it is made, so a failure part way frees
-/// what was uploaded.
+/// block-scaled E4M3), through [upload] so its stored dtype and scale count are checked too, and
+/// every allocation in `owned` as it is made, so a failure part way frees what was uploaded.
 struct Uploads<'a> {
     uploader: DraftUploader<'a>,
     source: &'a dyn WeightSource,
     formats: Formats,
     owned: &'a mut Vec<Deviceptr>,
     bytes: usize,
+    /// Every part's stored and arithmetic format and the bytes it reads for one token, in upload
+    /// order: the boot format ledger's rows.
+    rows: Vec<LedgerRow>,
+    /// The one widening this load path takes (a BF16 router bias read at f32), recorded with its
+    /// reason so boot can accept it.
+    widen: WidenLog,
 }
 
 impl Uploads<'_> {
@@ -1174,11 +1329,26 @@ impl Uploads<'_> {
         pointer
     }
 
-    fn mat(&mut self, name: &str, rows: usize, columns: usize) -> Result<GpuMat, String> {
+    /// One ledger row for a typed matrix, with the bytes one token reads from it.
+    fn record(&mut self, part: &str, format: FormatKind, bytes: u128) {
+        self.rows.push(LedgerRow::new(part, format, format, bytes));
+    }
+
+    fn mat(&mut self, name: &str, rows: usize, columns: usize) -> Result<Mat<Bf16>, String> {
         bf16(self.source, name, &[rows, columns])?;
+        let spec = self.source.spec(name).map_err(|error| error.to_string())?;
         let mat = self.uploader.mat(name, rows, columns)?;
+        let typed = typed_bf16(
+            &spec,
+            rows,
+            columns,
+            mat.pointer,
+            columns * 2,
+            Scales::none(),
+        )?;
         self.keep(mat.pointer, rows * columns * 2);
-        Ok(mat)
+        self.record(name, typed.format(), typed.bytes_per_token());
+        Ok(typed)
     }
 
     fn vector(&mut self, name: &str, width: usize) -> Result<Deviceptr, String> {
@@ -1205,8 +1375,17 @@ impl Uploads<'_> {
         if spec.dtype != DType::F8E4M3 {
             bf16(self.source, name, &[rows, columns])?;
             let mat = self.uploader.mat_parts(name, (rows, columns), runs)?;
+            let typed = typed_bf16(
+                &spec,
+                mat.rows,
+                mat.columns,
+                mat.pointer,
+                mat.columns * 2,
+                Scales::none(),
+            )?;
             self.keep(mat.pointer, mat.rows * mat.columns * 2);
-            return Ok(Proj::Bf16(mat));
+            self.record(name, typed.format(), typed.bytes_per_token());
+            return Ok(Proj::Bf16(typed));
         }
         if !self.formats.fp8 {
             return Err(format!(
@@ -1227,7 +1406,18 @@ impl Uploads<'_> {
                 mat.columns
             ));
         }
-        Ok(Proj::Fp8(mat))
+        let typed = typed_fp8(
+            &spec,
+            mat.rows,
+            mat.columns,
+            mat.weight,
+            mat.columns,
+            mat.scales,
+            grid,
+            DType::BF16,
+        )?;
+        self.record(name, typed.format(), typed.bytes_per_token());
+        Ok(Proj::Fp8(typed))
     }
 
     /// A SwiGLU of `width` columns, of which this rank holds `count` from `first`: the gate and up
@@ -1259,18 +1449,30 @@ impl Uploads<'_> {
                 spec.shape
             ));
         }
-        let bytes = match spec.dtype {
-            DType::F32 => self.uploader.read(name, elements * 4)?,
-            DType::BF16 => self
-                .uploader
-                .read(name, elements * 2)?
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .flat_map(|word| {
-                    f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16).to_le_bytes()
-                })
-                .collect(),
+        let (stored, bytes) = match spec.dtype {
+            DType::F32 => (FormatKind::F32, self.uploader.read(name, elements * 4)?),
+            DType::BF16 => {
+                // The one widening this arm takes, and it is exact: every BF16 value is an f32.
+                widen::<Bf16, F32Format>(
+                    name,
+                    "the router bias is f32 arithmetic; the release stores bf16, and every bf16 \
+                     value is an f32",
+                    &mut self.widen,
+                )
+                .map_err(|error| error.to_string())?;
+                (
+                    FormatKind::Bf16,
+                    self.uploader
+                        .read(name, elements * 2)?
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .flat_map(|word| {
+                            f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16).to_le_bytes()
+                        })
+                        .collect(),
+                )
+            }
             other => {
                 return Err(format!(
                     "{name} is {other:?}; the shared dense device arm reads an F32 or BF16 vector"
@@ -1278,6 +1480,14 @@ impl Uploads<'_> {
             }
         };
         let pointer = self.uploader.bytes(&bytes)?;
+        // The device arithmetic reads the f32 vector; the row says what was stored and what is
+        // read, and the record above is what lets boot accept the difference.
+        self.rows.push(LedgerRow::new(
+            name,
+            stored,
+            FormatKind::F32,
+            (elements * 4) as u128,
+        ));
         Ok(self.keep(pointer, elements * 4))
     }
 
@@ -1516,11 +1726,11 @@ impl Uploads<'_> {
                     ));
                 }
                 let pointer = self.uploader.vector(name, hidden)?;
-                Some(Proj::Bf16(GpuMat {
-                    pointer: self.keep(pointer, hidden * 2),
-                    rows: 1,
-                    columns: hidden,
-                }))
+                let spec = self.source.spec(name).map_err(|error| error.to_string())?;
+                let typed = typed_bf16(&spec, 1, hidden, pointer, hidden * 2, Scales::none())?;
+                self.keep(pointer, hidden * 2);
+                self.record(name, typed.format(), typed.bytes_per_token());
+                Some(Proj::Bf16(typed))
             }
             None => None,
         };
@@ -1558,12 +1768,14 @@ fn upload(
         formats,
         owned,
         bytes: 0,
+        rows: Vec::new(),
+        widen: WidenLog::new(),
     };
     let hidden = architecture.hidden_size;
     let vocab = architecture.vocab_size;
     let embed = up.mat(&names.embed, vocab, hidden)?;
     let head = if names.head_tied() {
-        embed
+        embed.clone()
     } else {
         up.mat(&names.head, vocab, hidden)?
     };
@@ -1599,7 +1811,7 @@ fn upload(
             ffn,
         });
     }
-    Ok((embed, head, norm, layers, up.bytes))
+    Ok((embed, head, norm, layers, up.bytes, up.rows, up.widen))
 }
 
 /// Refuses a tensor that is not BF16 at `shape`.
@@ -1880,7 +2092,7 @@ impl Shared {
     /// reference's arithmetic to a tolerance.
     fn project_fp8(
         &self,
-        mat: &GpuMatE4m3Tile,
+        mat: &Mat<Fp8E4m3>,
         b: &Buffers,
         input: u64,
         output: u64,
@@ -1902,7 +2114,12 @@ impl Shared {
             gemv_e4m3_tile(
                 &tiled,
                 kernels.gemv,
-                mat,
+                &GpuMatE4m3Tile {
+                    weight: mat.data(),
+                    scales: mat.scales().blocks().unwrap_or(Deviceptr(0)),
+                    rows: mat.rows(),
+                    columns: mat.columns(),
+                },
                 Deviceptr(input),
                 Deviceptr(output),
                 batch,
@@ -1911,26 +2128,31 @@ impl Shared {
         let batched = || {
             for start in (0..rows).step_by(GEMV_MAX_BATCH) {
                 gemv(
-                    input + (start * mat.columns * 4) as u64,
-                    output + (start * mat.rows * 4) as u64,
+                    input + (start * mat.columns() * 4) as u64,
+                    output + (start * mat.rows() * 4) as u64,
                     GEMV_MAX_BATCH.min(rows - start),
                 )?;
             }
             Ok(())
         };
-        let aligned = [mat.weight.0, input, output]
-            .iter()
-            .all(|address| address.is_multiple_of(16));
-        match route_fp8(policy, mat.rows, mat.columns, rows) {
+        let aligned = [
+            mat.data().0,
+            mat.scales().blocks().map_or(0, |blocks| blocks.0),
+            input,
+            output,
+        ]
+        .iter()
+        .all(|address| address.is_multiple_of(16));
+        match route_fp8(policy, mat.rows(), mat.columns(), rows) {
             Route::RowGemv => gemv(input, output, rows),
             Route::Wide if aligned => {
                 let tile = Fp8Tile::call(
-                    mat.weight.0,
-                    mat.scales.0,
+                    mat.data().0,
+                    mat.scales().blocks().map_or(0, |blocks| blocks.0),
                     input,
                     output,
-                    mat.rows,
-                    mat.columns,
+                    mat.rows(),
+                    mat.columns(),
                     rows,
                 )
                 .map_err(|error| BackendError::new(DEVICE, error))?;
@@ -1943,7 +2165,8 @@ impl Shared {
                 DEVICE,
                 format!(
                     "the dense policy routed an FP8 {} x {} projection to {route:?}",
-                    mat.rows, mat.columns
+                    mat.rows(),
+                    mat.columns()
                 ),
             )),
         }
@@ -1953,7 +2176,7 @@ impl Shared {
     /// [route_bf16] picks under `policy` (`None` keeps the row GEMV).
     fn project_bf16(
         &self,
-        mat: &GpuMat,
+        mat: &Mat<Bf16>,
         input: u64,
         output: u64,
         rows: usize,
@@ -1961,7 +2184,7 @@ impl Shared {
     ) -> Result<(), BackendError> {
         // The packed copy where there is one and the activations are a 16-byte load: the same
         // bits from about three quarters of the bytes.
-        let packed = self.packed.get(mat.pointer);
+        let packed = self.packed.get(mat.data());
         let gemv = |input: u64, output: u64, batch: usize| match packed
             .filter(|_| input.is_multiple_of(16))
         {
@@ -1971,7 +2194,7 @@ impl Shared {
                     rows,
                     Deviceptr(input),
                     Deviceptr(output),
-                    (mat.rows, mat.columns),
+                    (mat.rows(), mat.columns()),
                     batch,
                     1,
                 )
@@ -1979,16 +2202,22 @@ impl Shared {
             ),
             None => self.call(
                 self.kernels.gemv,
-                calls::gemv_bf16(mat.pointer.0, input, output, (mat.rows, mat.columns), batch),
+                calls::gemv_bf16(
+                    mat.data().0,
+                    input,
+                    output,
+                    (mat.rows(), mat.columns()),
+                    batch,
+                ),
             ),
         };
-        match route_bf16(policy, mat.rows, mat.columns, rows) {
+        match route_bf16(policy, mat.rows(), mat.columns(), rows) {
             Route::RowGemv => gemv(input, output, rows),
             Route::BatchedGemv => {
                 for start in (0..rows).step_by(GEMV_MAX_BATCH) {
                     gemv(
-                        input + (start * mat.columns * 4) as u64,
-                        output + (start * mat.rows * 4) as u64,
+                        input + (start * mat.columns() * 4) as u64,
+                        output + (start * mat.rows() * 4) as u64,
                         GEMV_MAX_BATCH.min(rows - start),
                     )?;
                 }
@@ -1996,7 +2225,7 @@ impl Shared {
             }
             Route::Wide => {
                 let tile =
-                    WideTile::call(mat.pointer.0, input, output, mat.rows, mat.columns, rows)
+                    WideTile::call(mat.data().0, input, output, mat.rows(), mat.columns(), rows)
                         .map_err(|error| BackendError::new(DEVICE, error))?;
                 self.cuda
                     .launch_async(self.kernels.wide, tile.grid, tile.block, &tile.args)
@@ -2006,7 +2235,8 @@ impl Shared {
                 DEVICE,
                 format!(
                     "the dense policy routed a {} x {} projection to {route:?}",
-                    mat.rows, mat.columns
+                    mat.rows(),
+                    mat.columns()
                 ),
             )),
         }
@@ -2205,8 +2435,22 @@ impl GemvDevice for Tiled<'_> {
         output: Deviceptr,
         rows: usize,
     ) -> Result<(), BackendError> {
+        let spec = TensorSpec {
+            name: "the tiled GEMV's matrix".to_owned(),
+            dtype: DType::BF16,
+            shape: vec![matrix.rows, matrix.columns],
+        };
+        let typed = typed_bf16(
+            &spec,
+            matrix.rows,
+            matrix.columns,
+            matrix.pointer,
+            matrix.columns * 2,
+            Scales::none(),
+        )
+        .map_err(|error| BackendError::new(DEVICE, error))?;
         self.shared
-            .project_bf16(matrix, input.0, output.0, rows, None)
+            .project_bf16(&typed, input.0, output.0, rows, None)
     }
 
     fn tiled_scratch(&self) -> (Deviceptr, Deviceptr) {
@@ -2651,7 +2895,7 @@ fn walk(
     shared.call(
         kernels.embed,
         calls::embed_rows(
-            shared.embed.pointer.0,
+            shared.embed.data().0,
             b.x.0,
             b.tokens.0,
             (hidden, hidden),
@@ -2949,13 +3193,101 @@ impl ModelSession for DenseDeviceSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy};
+    use super::{
+        CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy, typed_bf16, typed_fp8,
+    };
+    use sparkflash_kernels::cuda_driver::Deviceptr;
     use sparkflash_model::backend::Sampling;
     use sparkflash_model::ledger::State;
     use sparkflash_model::profile::ModelProfile;
+    use sparkflash_ops::formats::{Bf16, F32 as F32Format, FormatKind, Scales};
     use sparkflash_ops::projection::WidePolicy;
     use sparkflash_ops::sampler::Sampler;
+    use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
     use sparkflash_runtime::Walk;
+    use sparkflash_weights::{DType, TensorSpec};
+
+    fn spec(name: &str, dtype: DType, shape: &[usize]) -> TensorSpec {
+        TensorSpec {
+            name: name.to_owned(),
+            dtype,
+            shape: shape.to_vec(),
+        }
+    }
+
+    /// The load path's two checks are [sparkflash_ops::formats::upload]'s: a tensor of another
+    /// stored dtype, or an FP8 tile whose inverse-scale plane is not one entry a 128 x 128 tile,
+    /// is refused before the matrix is built.
+    #[test]
+    fn the_load_path_checks_the_stored_dtype_and_the_scale_count() {
+        let bf16 = spec("layers.0.mlp.up_proj.weight", DType::BF16, &[4, 256]);
+        let typed = typed_bf16(&bf16, 4, 256, Deviceptr(0x1000), 512, Scales::none())
+            .expect("a BF16 projection");
+        assert_eq!(typed.format(), FormatKind::Bf16);
+        assert_eq!(typed.bytes_per_token(), 4 * 512);
+
+        // The same logical matrix stored as U8 codes is not a BF16 Mat.
+        let quantized = spec("layers.0.mlp.up_proj.weight", DType::U8, &[4, 128]);
+        let error = typed_bf16(&quantized, 4, 256, Deviceptr(0x1000), 128, Scales::none())
+            .expect_err("a U8 tensor is not a BF16 Mat");
+        assert!(error.contains("bf16"), "{error}");
+        assert!(error.contains("U8"), "{error}");
+
+        let fp8 = spec("layers.0.mlp.up_proj.weight", DType::F8E4M3, &[4, 256]);
+        let short = typed_fp8(
+            &fp8,
+            4,
+            256,
+            Deviceptr(0x2000),
+            256,
+            Deviceptr(0x3000),
+            1,
+            DType::BF16,
+        )
+        .expect_err("a 4 x 256 FP8 matrix has two 128 x 128 tiles");
+        assert!(short.contains("needs 2"), "{short}");
+        assert!(short.contains("has 1"), "{short}");
+        let typed = typed_fp8(
+            &fp8,
+            4,
+            256,
+            Deviceptr(0x2000),
+            256,
+            Deviceptr(0x3000),
+            2,
+            DType::BF16,
+        )
+        .expect("two inverse scales");
+        assert_eq!(typed.format(), FormatKind::Fp8E4m3);
+        assert_eq!(typed.bytes_per_token(), 4 * 256);
+    }
+
+    /// Boot refuses a part read at a format its checkpoint does not store unless the load path
+    /// recorded the widening; the router bias is the one this arm takes.
+    #[test]
+    fn boot_refuses_a_widening_the_load_path_did_not_record() {
+        let rows = vec![LedgerRow::new(
+            "layers.0.ffn.router.bias",
+            FormatKind::Bf16,
+            FormatKind::F32,
+            32,
+        )];
+        let error = FormatLedger::boot(rows.clone(), &WidenLog::new())
+            .expect_err("an unrecorded widen is refused");
+        assert!(error.to_string().contains("layers.0.ffn.router.bias"));
+        assert!(error.to_string().contains("bf16"));
+        assert!(error.to_string().contains("f32"));
+
+        let mut log = WidenLog::new();
+        widen::<Bf16, F32Format>(
+            "layers.0.ffn.router.bias",
+            "every bf16 value is an f32",
+            &mut log,
+        )
+        .expect("the recorded widening");
+        let ledger = FormatLedger::boot(rows, &log).expect("a recorded widening boots");
+        assert!(ledger.to_string().contains("widened bf16 -> f32"));
+    }
 
     /// The token the device head's kernel chooses, transcribed from `q4e_argmax_slices`: the
     /// higher value wins, a tie takes the lower index, a NaN never wins, and a row whose first
