@@ -19,8 +19,9 @@
 //! a plain residual and the head) needs no code of its own: this arm reads the shared
 //! [Architecture], resolves the checkpoint's own spelling through [sparkflash_ops::naming],
 //! uploads every tensor through [DraftUploader] and launches the shared token-image bodies through
-//! their typed [sparkflash_ops::calls]. Its prompt projections take the shared wide tile under
-//! [WidePolicy::DENSE]; decode rows keep the row GEMV.
+//! their typed [sparkflash_ops::calls]. Its projections take the shared wide tile under
+//! [WidePolicy::DENSE]; decode rows of eight or fewer keep the row GEMV, and a step that batches
+//! more takes the tile.
 //!
 //! A projection or expert stored as E4M3 codes under one BF16 inverse scale a 128 x 128 tile (the
 //! Qwen3 FP8 releases' form, [Proj::Fp8]) runs the kernels Qwen's and GLM's FP8 weights run: the
@@ -115,9 +116,11 @@ const DEVICE: &str = "dense_device";
 /// dense prompt keeps the 256-row chunks its kernels were chosen for.
 pub const CHUNK_ROWS: usize = 256;
 
-/// The dense arm's token step: the row GEMV, not a tensor-core body. The walk's capability row
-/// and the profile check that refuses `decode.tensor_cores = true` read this one value, so the
-/// ledger and the refusal cannot disagree.
+/// The dense arm's one-row token step: the row GEMV, not a tensor-core body. A step that batches
+/// more than [sparkflash_ops::gemv::GEMV_MAX_BATCH] rows takes the shared wide tile, but the
+/// single-row decode the strategy row is about does not. The walk's capability row and the profile
+/// check that refuses `decode.tensor_cores = true` read this one value, so the ledger and the
+/// refusal cannot disagree.
 pub(crate) const TOKEN_DECODE: State = State::Off("row GEMV; decode.tensor_cores=true is refused");
 
 /// One layer's attention and MLP shape. A Gated DeltaNet layer's attention fields are zero and

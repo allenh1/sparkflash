@@ -16,10 +16,12 @@
 //!
 //! The runtime drives it: [runtime] opens a [`sparkflash_runtime::Runtime`] over this walk, and
 //! the runtime owns the prompt parts, history, reuse, rewind, lane pool and ledger. This walk
-//! routes every Pass to the same free walk the old serving loop called, with the policy that
-//! loop used for that pass: token rows pass no wide policy (a row GEMV is the same sum at any
-//! batch), and a bulk or paired prompt pass takes the arm's WidePolicy. Its head is the
-//! existing host logits path; the device head is phase 4's.
+//! routes every Pass to the same free walk the old serving loop called, with the arm's
+//! [`WidePolicy::DENSE`] for every pass: a prompt chunk takes the wide tile, and a token step
+//! takes the tile once it batches more than the row GEMV's eight rows (below that the policy still
+//! picks the row GEMV, so a one-to-eight-row step is the kernel it always was). Its head turns
+//! the final residual row into the token on the device for a greedy request, and only copies a
+//! logits row when the request samples with temperature or penalties.
 //!
 //! The layout and limits are the arm's: attention layers are positional BF16 key/value caches,
 //! Gated DeltaNet layers are recurrent, the context is the served context, and a pass is
@@ -62,12 +64,14 @@ pub(crate) fn row_plan(lengths: &[usize]) -> RowPlan {
     RowPlan { rows, offsets }
 }
 
-/// The wide policy the existing loop uses for a pass shape.
-pub(crate) fn policy_for_kind(kind: PassKind, policy: Option<WidePolicy>) -> Option<WidePolicy> {
-    match kind {
-        PassKind::TokenRows | PassKind::Verify { .. } => None,
-        PassKind::Bulk { .. } | PassKind::Paired { .. } => policy,
-    }
+/// The wide policy a pass shape takes: the arm's policy for every pass.
+///
+/// [`WidePolicy::DENSE`] keeps the row GEMV at eight rows or fewer, so a one-row or four-lane
+/// decode step still runs the kernel its bits were recorded under; a step that batches nine or
+/// more rows takes the shared wide tile, as the policy says. Passing `None` here would hide the
+/// tile from exactly those steps.
+pub(crate) fn policy_for_kind(_kind: PassKind, policy: Option<WidePolicy>) -> Option<WidePolicy> {
+    policy
 }
 
 /// The dense arm, exposed to the shared runtime as a Walk.
@@ -319,14 +323,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_pass_routes_to_the_policy_the_serving_loop_uses() {
+    fn every_pass_routes_to_the_dense_policy() {
         let policy = Some(WidePolicy::DENSE);
-        assert_eq!(policy_for_kind(PassKind::TokenRows, policy), None);
-        assert_eq!(policy_for_kind(PassKind::Verify { rows: 4 }, policy), None);
-        assert_eq!(policy_for_kind(PassKind::Bulk { rows: 1 }, policy), policy);
+        for kind in [
+            PassKind::TokenRows,
+            PassKind::Verify { rows: 4 },
+            PassKind::Bulk { rows: 1 },
+            PassKind::Paired { chunks: 2 },
+        ] {
+            assert_eq!(policy_for_kind(kind, policy), policy, "{kind:?}");
+        }
+    }
+
+    /// The policy's own threshold is dense's legacy input: eight rows or fewer keep the row
+    /// GEMV, so a decode step at the served lane count does not move; nine rows take the wide
+    /// tile. That boundary is where a bit delta can first appear.
+    #[test]
+    fn the_dense_policy_keeps_eight_rows_on_the_row_gemv_and_takes_the_tile_at_nine() {
+        use sparkflash_ops::projection::{Route, route_bf16, route_fp8};
+
+        let (columns, inner) = (256, 256);
+        for rows in 1..=8 {
+            assert_eq!(
+                route_bf16(Some(WidePolicy::DENSE), columns, inner, rows),
+                Route::RowGemv,
+                "{rows} rows stay on the row GEMV"
+            );
+            assert_eq!(
+                route_fp8(Some(WidePolicy::DENSE), columns, inner, rows),
+                Route::RowGemv,
+                "{rows} FP8 rows stay on the tiled E4M3 GEMV"
+            );
+        }
         assert_eq!(
-            policy_for_kind(PassKind::Paired { chunks: 2 }, policy),
-            policy
+            route_bf16(Some(WidePolicy::DENSE), columns, inner, 9),
+            Route::Wide,
+            "nine BF16 rows take dory_mma_wide"
+        );
+        assert_eq!(
+            route_fp8(Some(WidePolicy::DENSE), columns, inner, 9),
+            Route::Wide,
+            "nine FP8 rows take q4p_dense_fp8"
+        );
+        assert_eq!(
+            route_bf16(None, columns, inner, 9),
+            Route::BatchedGemv,
+            "without the policy the same rows stay on the row GEMV"
         );
     }
 
