@@ -1926,7 +1926,9 @@ reference's tokens through two builds and measured:
 The divergence is structured, not a precision tail: the worst position of every prompt is position
 0. There the reference puts essentially all mass on `200001` (`<|message_model|>`, logprob ~0),
 while `7850cffc`'s argmax is content token `125148` at `-1.156` and `200001` sits at `-48.25`.
-Equal prompt ids, equal forced tokens, one decode step apart.
+Equal prompt ids, equal forced tokens, one decode step apart. (The side that assigns `200001`
+probability ~1 is the **reference**, the captured tip; the pre-change build is the one that finds
+`200001` at `-48.25`. The window's summary sentence is easy to read the other way round.)
 
 **What was wrong.** Commit `84f07db7` moved the head's one-to-eight-row projection to
 `q4p_dense_rows` and handed the launch the head's packed copy. That body's `Q4pRowsPacked` stage
@@ -2009,10 +2011,11 @@ sha256sum /tmp/inkling2-tp4-v2-a.json /tmp/inkling2-tp4-checkpoint.json
 
 Pass is: the bodies' device tests still pass; the greedy completion begins with a plausible
 assistant opener (not `200001` or a repeated special token); the two forced captures are
-byte-identical; the forced comparison reports a positive NLL delta against the old reference (a
-clean row where the degenerate one put probability ~1 on `200001`); and the checkpoint-form capture
-matches the packed-form capture bit for bit. Soup, a zero or negative delta, or a body/GEMV
-mismatch is a failed fix.
+byte-identical; the forced comparison against the old reference reports a large **positive** NLL
+delta of the pre-change build's order (+5.8 mean) - the forced tokens are the degenerate capture's
+own soup, and a clean build assigns them low probability where the reference gave `200001`
+probability ~1 - and the checkpoint-form capture matches the packed-form capture bit for bit.
+Soup, a delta near zero, or a body/GEMV mismatch is a failed fix.
 
 ### The version-1 tail checks: Dory is precision, Inkling was a defect
 
