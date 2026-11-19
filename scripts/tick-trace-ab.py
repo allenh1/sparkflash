@@ -40,6 +40,11 @@ Usage:
   --reps              launches of each build for each pair, default 3.
   --max-tokens        completion length a request asks for, default 16.
   --out DIR           the traces and server logs, default target/tick-trace-ab.
+  --site-script FILE  launch the four-rank group through the site's own launcher
+                      (scripts/serve-four-node.sh) instead of one serve process. The binary is
+                      named by SPARKFLASH_BIN and the trace by SPARKFLASH_TICK_TRACE, which the
+                      launcher forwards; this is the served topology the trace measures, because
+                      a single process takes the reference path and never constructs Batch.
   --bind HOST:PORT    default 127.0.0.1:8000; one launch at a time.
   --timeout SECONDS   readiness/request timeout, default 3600.
   --dry-run           print the exact commands and workload, run nothing.
@@ -226,6 +231,51 @@ def tail(path, lines=40):
         pass
 
 
+def group_launch(script, binary, trace_path, log_path, url, timeout):
+    """Launches the site's four-rank group with `binary`, its trace on rank 0."""
+    environment = dict(os.environ)
+    environment["SPARKFLASH_BIN"] = binary
+    environment["SPARKFLASH_TICK_TRACE"] = trace_path
+    command = ["bash", script, "launch"]
+    print("LAUNCH %s (SPARKFLASH_BIN=%s)" % (" ".join(command), binary))
+    print("  SPARKFLASH_TICK_TRACE=%s" % trace_path)
+    log = open(log_path, "w", encoding="utf-8")
+    process = subprocess.Popen(
+        command, stdout=log, stderr=subprocess.STDOUT, env=environment, start_new_session=True
+    )
+    if not wait_ready(url, process, timeout):
+        tail(log_path)
+        group_stop(script, log, url)
+        return None
+    return process, log
+
+
+def group_stop(script, log, url, grace=120):
+    """Stops the site's group through its own stop action, then waits for :8000 to close."""
+    subprocess.run(
+        ["bash", script, "stop"],
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        env=dict(os.environ),
+        timeout=grace,
+        check=False,
+    )
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        try:
+            model_id(url, 2)
+        except (urllib.error.URLError, OSError, ValueError, KeyError):
+            break
+        time.sleep(1)
+    log.close()
+
+
+def stop_server(args, process, log, url):
+    if args.site_script:
+        group_stop(args.site_script, log, url)
+    else:
+        stop(process, log)
+
 def server_args(args):
     out = ["--bind", args.bind]
     if args.checkpoint:
@@ -257,7 +307,14 @@ def run(args):
                 for name, binary in order:
                     trace_path = os.path.join(args.out, "%s-%s.trace" % (label, name))
                     log_path = os.path.join(args.out, "%s-%s.log" % (label, name))
-                    started = launch(binary, server_args(args), trace_path, log_path, args.timeout)
+                    if args.site_script:
+                        started = group_launch(
+                            args.site_script, binary, trace_path, log_path, url, args.timeout
+                        )
+                    else:
+                        started = launch(
+                            binary, server_args(args), trace_path, log_path, args.timeout
+                        )
                     if started is None:
                         ok = False
                         traces[name] = None
@@ -274,7 +331,7 @@ def run(args):
                                 print("  %s" % value, file=sys.stderr)
                                 ok = False
                     finally:
-                        stop(process, log)
+                        stop_server(args, process, log, url)
                     traces[name] = trace_path
                 if traces.get("old") and traces.get("new"):
                     pairs += 1
@@ -292,8 +349,15 @@ def dry_run(args):
     streams = [int(value) for value in args.streams.split(",")]
     prompts = [int(value) for value in args.prompt_tokens.split(",")]
     print("# one release binary per build; both need the tick-trace emission")
-    for binary in (args.old, args.new):
-        print("#   %s serve %s" % (binary, " ".join(args_served)))
+    if args.site_script:
+        for binary in (args.old, args.new):
+            print(
+                "#   SPARKFLASH_BIN=%s SPARKFLASH_TICK_TRACE=<trace> bash %s launch"
+                % (binary, args.site_script)
+            )
+    else:
+        for binary in (args.old, args.new):
+            print("#   %s serve %s" % (binary, " ".join(args_served)))
     for tokens in prompts:
         for count in streams:
             for rep in range(args.reps):
@@ -301,6 +365,13 @@ def dry_run(args):
                 order = ["old", "new"] if rep % 2 == 0 else ["new", "old"]
                 for name in order:
                     trace = os.path.join(args.out, "%s-%s.trace" % (label, name))
+                    binary = args.old if name == "old" else args.new
+                    if args.site_script:
+                        print(
+                            "SPARKFLASH_BIN=%s SPARKFLASH_TICK_TRACE=%s bash %s launch"
+                            % (binary, trace, args.site_script)
+                        )
+                        continue
                     print(
                         "SPARKFLASH_TICK_TRACE=%s %s serve %s"
                         % (
@@ -322,6 +393,12 @@ def main():
     parser.add_argument("--old", help="the frozen pre-move sparkflash binary")
     parser.add_argument("--new", help="the new-engine sparkflash binary")
     parser.add_argument("--checkpoint", help="the DeepSeek-V4.1 checkpoint directory")
+    parser.add_argument(
+        "--site-script",
+        help="launch the four-rank group with this site script (e.g. scripts/serve-four-node.sh) "
+        "instead of one serve process; SPARKFLASH_BIN names the build and the trace is forwarded "
+        "to rank 0",
+    )
     parser.add_argument("--model", help="pass through to serve --model")
     parser.add_argument("--synthetic", action="store_true", help="serve --synthetic (no checkpoint)")
     parser.add_argument("--streams", default="1,8,16")
@@ -341,8 +418,8 @@ def main():
         return dry_run(args)
     if not args.old or not args.new:
         parser.error("--old and --new are required (or --dry-run / --diff)")
-    if not args.checkpoint and not args.synthetic:
-        parser.error("--checkpoint is required (or --synthetic)")
+    if not args.site_script and not args.checkpoint and not args.synthetic:
+        parser.error("--checkpoint is required (or --synthetic, or --site-script)")
     return run(args)
 
 
