@@ -2048,6 +2048,12 @@ impl Uploads<'_> {
         let mut table = Vec::with_capacity(routed.experts * 6 * 8);
         let mut scales_table = Vec::with_capacity(routed.experts * 3 * 4);
         let form = self.formats.expert;
+        if form == ExpertForm::NvFp4 && shape.clamp.is_some() {
+            return Err(format!(
+                "layer {index} stores NVFP4 experts under a swiglu_limit, and the NVFP4 token body \
+                 has no clamped form"
+            ));
+        }
         for (number, expert) in experts.iter().enumerate() {
             let Mlp { gate, up, down } = self.mlp(
                 expert,
