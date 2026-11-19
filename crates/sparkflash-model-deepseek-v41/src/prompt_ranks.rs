@@ -147,29 +147,10 @@ pub struct RankPosition {
     pub greater_than_own: u32,
 }
 
-/// One alternative in a merged prompt-logprob position.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MergedAlternative {
-    /// The global vocabulary id.
-    pub token_id: u32,
-    /// The f32 log probability.
-    pub logprob: f32,
-}
-
-/// One merged scored prompt position, before tokenizer decoding.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MergedPosition {
-    /// The zero-based index in the scored-position list (prompt index minus one for the TP=4 path).
-    pub position: usize,
-    /// The prompt token this position scores.
-    pub own_token_id: u32,
-    /// Its log probability.
-    pub own_logprob: f32,
-    /// Its exact 1-based competition rank (strictly greater count plus one).
-    pub own_rank: u32,
-    /// The requested alternatives, in serial top-k order.
-    pub alternatives: Vec<MergedAlternative>,
-}
+// The merged-position contract is a protocol value both a model crate's rank opener and the
+// serving crate's rank seam name, so it lives in `sparkflash-model`. These re-exports keep the
+// `prompt_ranks::MergedPosition` path this pack's callers already use.
+pub use sparkflash_model::prompt_ranks::{MergedAlternative, MergedPosition};
 
 /// Why the contract refused to report a prompt-logprob payload.
 #[derive(Debug, Clone, PartialEq)]

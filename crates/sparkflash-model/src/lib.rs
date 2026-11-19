@@ -17,11 +17,12 @@
 //! This crate is deliberately small: it is the boundary between the protocol/runtime crates and
 //! the model-specific packs. It owns the **descriptor** (what a model is called, how much context
 //! it serves, what it can do) and the **registry** (which descriptors this build knows about).
-//! It owns no weights, no arithmetic, no HTTP types, and no CUDA.
+//! It owns no weights, no kernels, no HTTP types, and no CUDA.
 //!
 //! It also holds what several packs share at that boundary: the error their configuration parsers
-//! return ([config]) and the DFlash 2 drafter's configuration ([dflash2]), which more than one
-//! target drafts with.
+//! return ([config]), the DFlash 2 drafter's configuration ([dflash2]), which more than one
+//! target drafts with, and the host [sampler] a served arm applies to a logits row it already
+//! has. The sampler is request bookkeeping over that row, not a kernel.
 //!
 //! The first pack is DeepSeek-V4.1-Flash. The registry is compile-time and static for now; a
 //! second pack adds a descriptor here (or in a pack crate that registers at startup) without
@@ -47,6 +48,8 @@ pub mod parts;
 pub mod prof;
 pub mod profile;
 pub mod prompt;
+pub mod prompt_ranks;
+pub mod sampler;
 pub mod settings;
 pub mod spec;
 pub mod speculation;
@@ -90,6 +93,8 @@ pub use profile::{
     active as active_profile, install_active,
 };
 pub use prompt::{PromptCodec, PromptError};
+pub use prompt_ranks::{MergedAlternative, MergedPosition};
+pub use sampler::{Sampler, SamplerMark, argmax};
 pub use spec::{Pending, Queue, Speculator, kept_to_end, lookup_draft, verdict};
 pub use speculation::{DepthPolicy, StepCost};
 pub use tp_plan::{Split, TpAxis, TpPlan, TpPlanError};

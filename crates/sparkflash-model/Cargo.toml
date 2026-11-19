@@ -26,7 +26,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 sparkflash-trace = { workspace = true }
+# The host sampler's finite argmax and seeded draw are the weights crate's, not a second copy.
+sparkflash-weights = { workspace = true }
 
 [dev-dependencies]
-sparkflash-weights = { workspace = true }
 tempfile = { workspace = true }
