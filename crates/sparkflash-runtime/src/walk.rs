@@ -688,8 +688,9 @@ impl<W: Walk + ?Sized> Vision<W> for NoVision {
 /// One model arm's arithmetic, as the runtime drives it.
 ///
 /// Every item here is required except [`Walk::capabilities`], which reads the associated
-/// constant. A missing `layout`, `open`, `limits`, `walk`, `head`, capability value,
-/// sequence state, drafter or vision type stops the arm compiling.
+/// constant, and [`Walk::cpu`], which is a conformance hook. A missing `layout`, `open`,
+/// `limits`, `drafter`, `walk`, `head`, capability value, sequence state, drafter or vision
+/// type stops the arm compiling.
 pub trait Walk: 'static {
     /// One sequence's device state. It must expose checkpoint and rewind, because the runtime
     /// owns reuse and cannot restore an arm's state through a witness.
