@@ -794,29 +794,6 @@ mod tests {
     };
     use super::*;
 
-    /// The stored bytes a token pass must read at this rank, and the floor the plan states.
-    fn token_bytes(
-        architecture: &sparkflash_model::Architecture,
-        experts: usize,
-        top_k: usize,
-    ) -> Result<(u64, u64), BackendError> {
-        let tp = sparkflash_model::TpPlan::new(1, 0)
-            .map_err(|error| BackendError::new("fixture", error.detail))?;
-        let tensors =
-            sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served_and_mtp(architecture, tp)
-                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
-        let total = u64::try_from(tensors.rank_bytes()).unwrap_or(u64::MAX);
-        let expert = u64::try_from(tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts))
-            .unwrap_or(u64::MAX);
-        let floor = total.saturating_sub(expert);
-        let share = if experts == 0 {
-            0
-        } else {
-            expert.saturating_mul(top_k as u64) / experts as u64
-        };
-        Ok((floor.saturating_add(share), floor))
-    }
-
     /// The stored format names the fixture's classes use.
     fn format_rule(
         format: sparkflash_model::architecture::WeightFormat,
@@ -851,11 +828,9 @@ mod tests {
             )
             .map_err(|error| BackendError::new("fixture", error))?;
             let walk = backend.walk_arm()?;
-            let (bytes, floor) = token_bytes(
-                &config.architecture,
-                config.n_routed_experts,
-                config.num_experts_per_tok,
-            )?;
+            // The shared tensor plan does not spell Inkling's block-attention residual, so the
+            // fixture's floor is the weights it uploaded: every dense weight is read a token.
+            let bytes = backend.weight_bytes() as u64;
             let formats = vec![
                 format_rule(config.architecture.quantization.dense_format),
                 format_rule(config.architecture.quantization.expert_format),
@@ -864,7 +839,7 @@ mod tests {
                 walk,
                 "the Inkling-2 tiny synthetic checkpoint",
                 bytes,
-                floor,
+                bytes,
                 formats,
                 None,
             ))

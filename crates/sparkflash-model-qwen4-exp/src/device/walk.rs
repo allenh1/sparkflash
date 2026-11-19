@@ -880,7 +880,10 @@ mod tests {
                     "the Qwen fixture is one rank; TP 2 and TP 4 need a group",
                 ));
             }
-            let config = Qwen4ExpConfig::tiny();
+            // The Qwen3.5/3.6 spelling, not `tiny`: its family is not the canonical Qwen3.8
+            // target, so the hub cache's released DFlash 2 drafter (2,560 wide) is not loaded
+            // into a 128-wide fixture and refused. The tiny MTP stage still exercises the round.
+            let config = Qwen4ExpConfig::tiny_qwen35_moe(crate::config::DenseQuant::Fp8Block);
             let directory = tempfile::tempdir()
                 .map_err(|error| BackendError::new("fixture", error.to_string()))?;
             crate::write_synthetic_checkpoint(directory.path(), &config, 7)
@@ -901,7 +904,7 @@ mod tests {
             ];
             Ok(Fixture::new(
                 walk,
-                "the Qwen3.8 tiny synthetic checkpoint",
+                "the Qwen3.5-MoE tiny synthetic checkpoint",
                 bytes,
                 floor,
                 formats,

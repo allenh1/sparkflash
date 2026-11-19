@@ -423,7 +423,7 @@ mod tests {
                 architecture.max_position_embeddings,
             )
             .map_err(|error| BackendError::new("fixture", error))?;
-            let walk = backend.walk_arm(4)?;
+            let walk = backend.walk_arm(64)?;
             let bytes = backend.weight_bytes() as u64;
             let mut formats = Vec::new();
             for format in [
