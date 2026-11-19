@@ -171,7 +171,10 @@ the push's previous tip, or the merge base with `main`). It fails:
 - a version bump whose bits did not change (a reference moved to another path with the same
   fingerprint is a rename, which needs no bump);
 - a bump by more than one, or a version that went down;
-- a bump while any prerequisite below is false, at the base or at the head;
+- a bump while a global prerequisite below (`declaration_check`, `coverage`, `monitors`) is false
+  at the base or at the head, or while the bumping configuration's own model has no `[[anchor]]`
+  or no committed capture teacher-forced from it;
+- a bump on `text` evidence, which has no token ids to teacher-force;
 - a bump without a new report;
 - any change to an anchor, its removal, or a change to its file;
 - a fingerprint that does not match its file, or a reference file no entry names;
@@ -189,7 +192,8 @@ the push's previous tip, or the merge base with `main`). It fails:
   and the invariance gate that holds it. The check trusts that list to waive a recapture, so the
   list is judged in the same diff.
 
-`scripts/numerics.py self-test` shows each refusal on synthetic registries.
+`scripts/numerics.py self-test` shows the declaration refusals on synthetic registries; the
+unit tests under `scripts/tests/test_numerics.py` cover the per-model anchor and both dump judges.
 
 The bits themselves are checked against a running server by `scripts/numerics.py check`, during a
 window on the cluster, as the existing gates are. CI has no GPU or weights; it checks that what is
