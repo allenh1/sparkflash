@@ -263,7 +263,17 @@ impl QwenWalk {
             })?;
             tokens.push(*anchor);
             drafts.push(rest.to_vec());
-            confidence.push(vec![0.0; rest.len()]);
+            // The drafter's own confidence in these leading drafts, as the old fusion's round
+            // passed it to the batch: a policy calibrated on it must not be fed zeroes.
+            confidence.push(
+                segment
+                    .seq
+                    .spec_confidence
+                    .iter()
+                    .take(rest.len())
+                    .copied()
+                    .collect(),
+            );
         }
         let mut members: Vec<&mut DeviceSequence> = segments
             .iter_mut()
@@ -400,7 +410,9 @@ impl Drafter<QwenWalk> for QwenDrafter {
         let mut chain = seq.spec.chain(&seq.spec_confidence, seq.spec_drafts.len());
         chain.truncate(seq.spec_drafts.len());
         let drafts = std::mem::take(&mut seq.spec_drafts);
-        let _confidence = std::mem::take(&mut seq.spec_confidence);
+        // The confidence stays on the sequence: [QwenWalk::verify_pass] hands it back to the
+        // batch, which records the round's calibration. Taking it here would make every verify
+        // look like a drafter that offers no probabilities.
         if !self.joint {
             return Ok(Draft::Chain {
                 confidence: Vec::new(),
