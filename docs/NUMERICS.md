@@ -259,9 +259,9 @@ non-zero on the first refusal.
 #### The monitor dump
 
 A monitor run samples the reference forward and the candidate forward on the same probe. Each
-dump records, for every decoder layer and every routed expert, the values at a fixed set of hidden
-indices, so `monitors` can compute a relative L2 error without shipping whole activations. The
-format is versioned as `sparkflash-numerics-monitors/1`:
+dump records, for every decoder layer and every expert the probe routed to, the values at a fixed
+set of hidden indices, so `monitors` can compute a relative L2 error without shipping whole
+activations. The format is versioned as `sparkflash-numerics-monitors/1`:
 
 ```json
 {
@@ -284,8 +284,9 @@ python3 scripts/numerics.py monitors --reference numerics/monitors/glm53-tp4-ref
 
 The error is `||candidate - reference|| / ||reference||` on the sampled values. The command refuses
 two dumps that name different models, probes or sampled indices, that do not hold the same layers
-and experts, that hold a non-finite value, or whose reference sample is all zeros (the relative
-error is undefined); it refuses a bar that is not finite and positive; and it exits non-zero when
+and the same routed experts (a routing change is a coverage question, not a like-for-like monitor),
+that hold a non-finite value, or whose reference sample is all zeros (the relative error is
+undefined); it refuses a bar that is not finite and positive; and it exits non-zero when
 any layer exceeds `--layer-bar` or any expert exceeds `--expert-bar`, printing every failure and
 writing the per-layer and per-expert result when asked. The bars are supplied by the run: this
 page does not invent a bar the data has not measured.
