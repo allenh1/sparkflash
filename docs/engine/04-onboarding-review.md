@@ -1508,9 +1508,9 @@ runtime's property, which is what Inkling's group relies on.
 * `cargo test -p sparkflash-runtime -p sparkflash-model-inkling2`: 0 failed.
 * `cargo clippy -p sparkflash-runtime -p sparkflash-model-inkling2 --all-targets -- -D warnings`
   and `cargo fmt --all -- --check`: clean at this tip.
-* `cargo test --workspace`: **4,326 passed, 0 failed, 81 ignored**, 220 test binaries, exit 0,
-  at `24389eb7` with this section's docs change on top (the tip's own tests included, so this is
-  the workspace's count and not this move's).
+* `cargo test --workspace`: **4,326 passed, 0 failed, 81 ignored**, 220 test binaries, exit 0, at
+  `76ce0c72` and the same count at `24389eb7` before it. That is the workspace's count and not
+  this move's: the other arms' and the CLI fold's tests are in it.
 
 **Unverified without a cluster.**
 
