@@ -2499,7 +2499,26 @@ pub struct Qwen4ExpDeviceBackend {
     /// session runs its own forward on its own stream, the one-row-a-session path.
     /// The engine sessions are handles on, once [Qwen4ExpDeviceBackend::enable_fusion] or
     /// [Qwen4ExpDeviceBackend::enable_group_fusion] ran.
-    fused: Option<sparkflash_runtime::Fusion<sparkflash_runtime::Runtime<walk::QwenWalk>>>,
+    fused: Option<QwenServing>,
+}
+
+/// What a fused Qwen backend's sessions open on.
+enum QwenServing {
+    /// The fused engine: rank 0 of a tensor-parallel group and its workers' mirror. The group's
+    /// lane frames carry a prompt and a part, not the rows a tick decided, so the group is not on
+    /// the tick engine.
+    Fused(sparkflash_runtime::Fusion<sparkflash_runtime::Runtime<walk::QwenWalk>>),
+    /// The tick engine: DeepSeek's scheduler over the Qwen walk, for the single-process path.
+    Tick(Arc<sparkflash_runtime::TickServe<walk::QwenWalk>>),
+}
+
+impl QwenServing {
+    fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        match self {
+            Self::Fused(fusion) => fusion.open(),
+            Self::Tick(engine) => Ok(Box::new(engine.open()?)),
+        }
+    }
 }
 
 impl std::fmt::Debug for Qwen4ExpDeviceBackend {
@@ -3190,7 +3209,8 @@ impl Qwen4ExpDeviceBackend {
     /// Call it before the backend is shared with the serving driver, with the driver's concurrency
     /// as the capacity: each request takes one of the pooled sequences for its lifetime, so a
     /// smaller capacity than the driver's concurrency would leave requests waiting for a slot. A
-    /// fused session does not speculate, and a prefill runs alone.
+    /// prompt still runs alone in its lane, in the prefill plan's chunks; a decode steps up to the
+    /// batch's four members together, drafting when the arm's drafter is on.
     ///
     /// # Errors
     /// A pooled session the device refuses, or a thread that cannot be started.
@@ -3207,10 +3227,15 @@ impl Qwen4ExpDeviceBackend {
                 ),
             ));
         }
-        self.fused = Some(sparkflash_runtime::Fusion::local(
-            self.lanes(capacity)?,
-            capacity,
-        )?);
+        // The single-process path serves on the tick engine: DeepSeek's scheduler over the Qwen
+        // walk. Its config is Qwen's profile - the prefill plan's chunk as the pass width, the
+        // batch's verify width as the member cap, the drafter's own depth and the joint-round
+        // switch - and its executor is the same runtime, so a prompt chunk and a speculative step
+        // are the rows they were.
+        let walk = walk::QwenWalk::new(Arc::clone(&self.shared), self.context_limit, capacity)?;
+        self.fused = Some(QwenServing::Tick(sparkflash_runtime::TickServe::start(
+            walk, capacity,
+        )?));
         Ok(())
     }
 
@@ -3230,12 +3255,12 @@ impl Qwen4ExpDeviceBackend {
         hub: sparkflash_comm::control::Tp4ControlHub,
     ) -> Result<(), BackendError> {
         self.group_rank()?;
-        self.fused = Some(sparkflash_runtime::Fusion::group(
+        self.fused = Some(QwenServing::Fused(sparkflash_runtime::Fusion::group(
             self.lanes(capacity)?,
             hub,
             self.wire(),
             capacity,
-        )?);
+        )?));
         Ok(())
     }
 
