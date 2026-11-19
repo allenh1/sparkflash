@@ -1300,8 +1300,24 @@ mod tests {
 
     #[test]
     fn prerequisites_name_what_is_missing() {
+        // Derived from the registry rather than spelled out, so turning a prerequisite on is one
+        // reviewed edit and not two. On 2026-11-19 all four are on: anchor, declaration_check,
+        // coverage (with its swept dump) and monitors (with the first judged pair).
         let registry = Registry::embedded().unwrap();
-        assert_eq!(registry.prerequisites.missing(), vec!["monitors"]);
+        let expected: Vec<&str> = [
+            ("anchor", registry.prerequisites.anchor),
+            (
+                "declaration_check",
+                registry.prerequisites.declaration_check,
+            ),
+            ("coverage", registry.prerequisites.coverage),
+            ("monitors", registry.prerequisites.monitors),
+        ]
+        .iter()
+        .filter(|(_, on)| !on)
+        .map(|(name, _)| *name)
+        .collect();
+        assert_eq!(registry.prerequisites.missing(), expected);
         assert!(registry.prerequisites.monitors_pair.is_some());
     }
 

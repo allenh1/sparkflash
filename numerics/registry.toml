@@ -82,10 +82,12 @@ coverage_dump = "numerics/coverage/qwen38-world1.json"
 # state, and the judge compares the experts both dumps hold, counts the rest, and fails on the bars
 # only. The pair named below is the first real one: GLM-5.3 at world 4, the reference build
 # (`SPARKFLASH_DECODE_MMA=off`, the tiled row GEMV) against the shipped default (the FP8 few-row
-# body). The flag stays false until the reviewed edit that turns it on; the pair and its bars are
-# already here so that edit only flips the flag. `scripts/numerics.py ci` then judges the two
-# dumps at these bars and fails a true flag whose pair is missing, mismatched or over a bar.
-monitors = false
+# body). True from 2026-11-19: the pair below passed at its bars (maxima 3.158e-01 per layer,
+# 3.511e-01 per shared expert, 7 of 42 layers routing one row to a different expert and 14 experts
+# unshared of 343). The bars are a regression guard, not a quality claim - they sit just above the
+# measured maxima so a later change that doubles the error fails. `scripts/numerics.py ci` judges
+# the two dumps at these bars and fails a true flag whose pair is missing, mismatched or over a bar.
+monitors = true
 monitors_pair = { reference = "numerics/monitors/glm53-tp4-v1-reference.json", candidate = "numerics/monitors/glm53-tp4-v2-candidate.json", layer_bar = 0.5, expert_bar = 0.5 }
 
 # Qwen3.8-Flash-Next: the host driver at world 1, the TP driver at 2 and 4. Each world sums in its
