@@ -91,6 +91,13 @@ fn build_with(
             Err(error) => panic!("the device arm refused the fixture checkpoint: {error}"),
         };
     configure(&mut backend).expect("the backend accepts the configuration");
+    // The arm serves on the shared runtime's engine, so a driver needs a fused backend. A test
+    // that fused itself (to check the order against speculation) keeps its engine.
+    if !backend.fused() {
+        backend
+            .enable_fusion(concurrency)
+            .expect("the runtime fuses the arm's lanes");
+    }
     let descriptor = backend.descriptor().clone();
     let codec = Arc::new(ByteCodec::new(descriptor.vocab_size));
     let driver = HostDriver::start(
@@ -332,7 +339,10 @@ fn drafting_and_plain_backends() -> Option<(Glm5NextDeviceBackend, Glm5NextDevic
         )
         .ok()
     };
-    let plain = open()?;
+    let mut plain = open()?;
+    plain
+        .enable_fusion(1)
+        .expect("the plain arm fuses one lane");
     let mut fused = open()?;
     fused
         .enable_speculation(2, None)
@@ -394,6 +404,7 @@ fn one_session(speculate: bool) -> Option<Box<dyn sparkflash_model::ModelSession
     if speculate {
         backend.enable_speculation(2, None).ok()?;
     }
+    backend.enable_fusion(1).ok()?;
     backend.open_session().ok()
 }
 
@@ -423,6 +434,7 @@ fn two_backends() -> Option<(
         if speculate {
             backend.enable_speculation(2, None).ok()?;
         }
+        backend.enable_fusion(1).ok()?;
         backend.open_session().ok()
     };
     Some((open(false)?, open(true)?))

@@ -16,51 +16,41 @@
 //!
 //! The runtime drives an arm: it owns the prompt parts, the history, reuse, rewind, the lane
 //! pool, give-back and the ledger, and this walk supplies only what GLM alone knows. GLM's
-//! serving construction still opens its own [crate::serve::GlmFusion] in this pass, because the
-//! runtime has no draft path yet (see [Walk::Drafter]); this is the arm that commits onto it
-//! next, with its arithmetic already the same calls the fusion arm makes.
+//! serving construction opens [sparkflash_runtime::Fusion] over a [Runtime] of this walk
+//! ([crate::serve::Glm5NextDeviceBackend::enable_fusion]); nothing of the arm's own session,
+//! prompt-part or round glue is left.
 //!
 //! * [Walk::layout] is what the rank's caches are: every sparse (DSA) layer holds a positional
 //!   latent row and its indexer's rows a position, and every linear (KDA) layer holds a
 //!   convolution history and a recurrent memory that are one live value. The bytes come from the
 //!   rank's own plan ([DeviceRank::kv_plan]), not a compiled-in estimate.
 //! * [Walk::limits] is the rank's bulk chunk width ([DeviceRank::prefill_rows], the profile's
-//!   4096 by default) and the served context. The runtime's [sparkflash_runtime::ChunkPolicy]
-//!   quantises the first, so a GLM prompt still runs the 4096-row chunks its kernels and scratch
-//!   were sized for.
+//!   4096 by default), the served context, and the rank's verify width ([MAX_ROWS]) as the
+//!   member cap. The runtime's [sparkflash_runtime::ChunkPolicy] quantises the first, so a GLM
+//!   prompt still runs the 4096-row chunks its kernels and scratch were sized for.
 //! * [Walk::walk] runs the same calls the old serving loop ran: a bulk prompt through
-//!   [DeviceRank::begin_prefill]/[DeviceRank::prefill_chunk] (the tensor-core chunk path) and a
-//!   token row through [DeviceRank::forward_batch_greedy] (the row-GEMV decode path). It does
-//!   not draft (see below).
+//!   [DeviceRank::begin_prefill]/[DeviceRank::prefill_chunk] (the tensor-core chunk path), a
+//!   token row through [DeviceRank::forward_batch_greedy] (the row-GEMV decode path), and a
+//!   verify through [DeviceRank::verify_batch].
 //! * [Walk::head] is the arm's existing head: the host sampler over the row the greedy step left
 //!   on the device, or a verified chain's [sparkflash_model::verdict] and [DeviceRank::commit].
-//!
-//! # The drafting gap
-//!
-//! [Walk::ready] and [Walk::speculation] are defaulted on [Walk] and [Drafter] is a marker, so
-//! a drafting arm on the runtime silently loses its verified runs: the engine hands back one
-//! token a step and the reported counters stay zero even though the arm drafted. GLM therefore
-//! names [Absent] and its token path is a plain one-row-a-member step; [crate::serve::GlmFusion]
-//! still serves, so nothing is slower in this pass.
-//!
-//! The round's arithmetic is here, ready for the contract: [GlmSequence::draft_after] (the MTP
-//! layer's or the DFlash 2 block drafter's chain), [GlmSequence::settle] (the verdict, the
-//! commit and the queue of kept answers), [GlmWalk::budget] with [GlmWalk::wall] and
-//! [GlmWalk::joint_rounds] for the row share, and the defaulted [Walk::ready],
-//! [Walk::give_back] and [Walk::speculation] overrides. When the contract lands, ready,
-//! give-back and speculation belong on [Drafter] as required methods, and the arm's source is
-//! the checkpoint's MTP layer or the loaded block drafter.
+//! * [Walk::Drafter] is [GlmDrafter], the arm's one round: the MTP layer's or the DFlash 2
+//!   block drafter's chain ([GlmSequence::draft_after]), the shared verify
+//!   ([DeviceRank::verify_batch]) and the settlement ([GlmSequence::settle]). The runtime decides
+//!   which members share a pass, when a lane walks alone, and how many rows a lone member keeps;
+//!   the arm states only its depth, its verify width and its cost ([Drafter::budget],
+//!   [Drafter::wall]).
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
+use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_model::{DepthPolicy, Queue, Speculator, kept_to_end, verdict};
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{
-    Absent, ComputeDeclaration, ExpertUnionWall, HeadInput, HeadRow, Hidden, LaneMemory, LaneState,
-    Limits, NoVision, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments, StateKind,
-    StateLayout, Walk, WalkCapabilities,
+    ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden, LaneMemory,
+    LaneState, Limits, NoVision, OutputConstraint, Pass, PassKind, PassMask, Region, Runtime,
+    Segment, Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
 };
 use sparkflash_weights::tp::{BitGatherHandle, TpRuntime};
 
@@ -163,13 +153,35 @@ impl GlmSequence {
             .is_some_and(|front| front.token == token)
     }
 
+    /// The caller fed `token`: it joins the sampler history, and the answer a verify already
+    /// holds for it is returned. `None` says the token still needs a round.
+    ///
+    /// # Errors
+    /// A token other than the one the verify kept: the caches have consumed that one already.
+    fn take_held(&mut self, token: u32) -> Result<Option<StepOutput>, BackendError> {
+        self.sampler.record(token);
+        let Some(front) = self.pending.front() else {
+            return Ok(None);
+        };
+        let expected = front.token;
+        let Some(next) = self.pending.pop(token) else {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!(
+                    "the engine fed token {token} where the verify produced {expected}; a check that did not accept the drafts must be re-drafted"
+                ),
+            ));
+        };
+        Ok(Some(StepOutput {
+            logits: next.logits,
+            next_token: next.next_token,
+            draft: Vec::new(),
+        }))
+    }
+
     /// The chain a round verifies after `anchor`: the anchor and the drafts the depth allows
     /// ([DeviceRank::draft_chain]), with the drafter's confidence in each draft it proposed,
     /// which the depth was chosen from and the round's verdict calibrates.
-    ///
-    /// The future drafter contract's round calls this; nothing does while the walk does not
-    /// draft.
-    #[allow(dead_code)]
     fn draft_after(
         &mut self,
         rank: &DeviceRank,
@@ -200,9 +212,9 @@ impl GlmSequence {
     }
 
     /// A verify of `verified` answered its rows: keep what the model chose, give the rest back
-    /// before the rank's next step, and queue the kept rows for the calls that feed them. The
-    /// future drafter contract's round calls this; [Walk::head] calls it for a
-    /// [PassKind::Verify] pass.
+    /// before the rank's next step, and queue the kept rows for the calls that feed them.
+    /// [GlmDrafter]'s round settles through here, and [Walk::head] calls it for a
+    /// [PassKind::Verify] pass a caller drove directly.
     fn settle(
         &mut self,
         rank: &DeviceRank,
@@ -246,7 +258,16 @@ impl GlmSequence {
     /// bulk chunks, which is the tensor-core prompt path. Every later chunk is a
     /// [DeviceRank::prefill_chunk] of the prompt [DeviceRank::begin_prefill] started, as the old
     /// serving loop's `prompt_part` ran it.
-    fn bulk_chunk(&mut self, rank: &mut DeviceRank, rows: &[u32]) -> Result<(), BackendError> {
+    ///
+    /// `after` is the prompt's remaining rows ([Pass::prompt_end]): the old loop passed the
+    /// prompt's whole end to every chunk, and the block drafter's window commits read it, so a
+    /// chunk that used its own end instead would move the drafter's rows.
+    fn bulk_chunk(
+        &mut self,
+        rank: &mut DeviceRank,
+        rows: &[u32],
+        after: usize,
+    ) -> Result<(), BackendError> {
         let first = !self.prefill_open;
         if first {
             // A new prompt's tokens replace any chain the last one left queued, and no round of
@@ -256,7 +277,7 @@ impl GlmSequence {
             self.verified = None;
             self.prompt_logits = None;
         }
-        let end = self.sequence.position() + rows.len();
+        let end = self.sequence.position() + rows.len() + after;
         let logits = if first {
             match rank.begin_prefill(
                 &self.shared.tp,
@@ -352,32 +373,189 @@ impl LaneState for GlmSequence {
     }
 }
 
+/// The drafts one verify may hold: the anchors take one row a member, and the rest of
+/// [MAX_ROWS] is shared among the members' chains. This is the [Drafter::budget] the row share
+/// reads, and it keeps a verify to one rank step whatever depth the drafter proposes.
+fn glm_draft_budget(seqs: usize, depth: usize) -> usize {
+    (seqs * depth).min(MAX_ROWS.saturating_sub(seqs))
+}
+
+/// The walk's [Limits]: the rank's prompt chunk, the served context, and the rank's verify
+/// width as the member cap. A drafting walk's batch is a verify, not a prompt chunk.
+pub(crate) fn walk_limits(chunk: usize, context: usize) -> Limits {
+    Limits::new(chunk, context).with_members(MAX_ROWS)
+}
+
+/// One member's verify answer: the drafter's confidence in each draft and the full-vocabulary
+/// logits of every row the verify ran.
+pub struct VerifyRows {
+    confidence: Vec<f32>,
+    rows: Vec<Vec<f32>>,
+}
+
+/// The arm's draft source: the checkpoint's MTP layer, or a loaded DFlash 2 block drafter.
+///
+/// This is the round the arm's old serving fusion ran, expressed on the runtime's
+/// [Drafter] contract: [GlmSequence::draft_after] proposes the chain,
+/// [DeviceRank::verify_batch] verifies every member's anchor and drafts in one pass, and
+/// [GlmSequence::settle] keeps the leading run. The runtime decides when rows are shared
+/// ([Drafter::budget], [Drafter::wall]), which member walks alone, and how deep a chain is; the
+/// arm states only what its rank can verify in one step.
+pub struct GlmDrafter {
+    shared: Arc<Shared>,
+    /// The most drafts this rank's speculator proposes a step (zero when none is configured).
+    depth: usize,
+    wall: ExpertUnionWall,
+    /// Whether the drafter is the block drafter or the checkpoint's MTP layer.
+    kind: &'static str,
+    /// Whether the depth policy chooses from the drafts' confidences.
+    adaptive: bool,
+}
+
+impl Drafter<GlmWalk> for GlmDrafter {
+    const PRESENT: bool = true;
+    /// The verify's logits and the confidence the settle needs; the runtime never reads logits.
+    type Rows = VerifyRows;
+
+    fn wall(&self) -> &dyn StepWall {
+        &self.wall
+    }
+
+    /// The member's held answer, or its next chain. The token joins the sampler history either
+    /// way, exactly as the old round's intake did.
+    fn open_round(&self, seq: &mut GlmSequence, token: u32) -> Result<Draft, BackendError> {
+        if let Some(step) = seq.take_held(token)? {
+            return Ok(Draft::Held(step));
+        }
+        let rank = self
+            .shared
+            .rank
+            .lock()
+            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
+        let (chunk, confidence) = seq.draft_after(&rank, token)?;
+        let drafts = chunk[1..].to_vec();
+        let chain = seq
+            .spec
+            .as_ref()
+            .map_or_else(Vec::new, |spec| spec.chain(&confidence, drafts.len()));
+        Ok(Draft::Chain {
+            confidence: chain,
+            drafts,
+        })
+    }
+
+    /// One [DeviceRank::verify_batch] over every segment's anchor and drafts, as the old serving
+    /// fusion ran it. The walk stores each member's rows and confidence on
+    /// its sequence; this takes them back for [Drafter::settle].
+    fn verify(
+        &self,
+        walk: &GlmWalk,
+        segments: &mut [Segment<'_, GlmSequence>],
+        _depths: &[usize],
+    ) -> Result<Vec<Self::Rows>, BackendError> {
+        let members = segments.len();
+        let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
+        walk.walk(
+            segments,
+            Pass::verify(rows, OutputConstraint::new(&[], rows)),
+        )?;
+        let mut answers = Vec::with_capacity(members);
+        for segment in segments.iter_mut() {
+            let verified = segment.seq.verified.take().ok_or_else(|| {
+                BackendError::new("glm5_device", "a member walks a round it never verified")
+            })?;
+            answers.push(VerifyRows {
+                confidence: verified.confidence,
+                rows: verified.rows,
+            });
+        }
+        if answers.len() != members {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!("a verify of {members} member(s) answered {}", answers.len()),
+            ));
+        }
+        Ok(answers)
+    }
+
+    /// The verify's settlement: the verdict, the commit and the queue of kept answers, exactly as
+    /// the old fusion's round settled.
+    fn settle(
+        &self,
+        seq: &mut GlmSequence,
+        chunk: &[u32],
+        rows: Self::Rows,
+    ) -> Result<StepOutput, BackendError> {
+        let rank = self
+            .shared
+            .rank
+            .lock()
+            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
+        seq.settle(
+            &rank,
+            Verified {
+                chunk: chunk.to_vec(),
+                confidence: rows.confidence,
+                rows: rows.rows,
+            },
+        )
+    }
+
+    /// One rank step holds at most [MAX_ROWS] rows: the anchors take one a member, and every
+    /// member's drafts share the rest.
+    fn budget(&self, seqs: usize) -> usize {
+        glm_draft_budget(seqs, self.depth)
+    }
+
+    fn ready(&self, seq: &GlmSequence, token: u32) -> bool {
+        seq.holds(token)
+    }
+
+    /// The caches have already consumed the answers; the history is cut by the runtime, and the
+    /// next prompt goes back to the rewind point. Only the queued answers and the confidence go.
+    fn give_back(&self, seq: &mut GlmSequence, _to: usize) -> Result<(), BackendError> {
+        seq.pending.clear();
+        seq.confidence.clear();
+        seq.verified = None;
+        Ok(())
+    }
+
+    fn speculation(&self, seq: &GlmSequence) -> Speculation {
+        seq.spec
+            .as_ref()
+            .map_or_else(Speculation::default, Speculator::stats)
+    }
+
+    fn describe(&self) -> String {
+        if self.depth == 0 {
+            return "the round path with no drafts configured".to_owned();
+        }
+        let depth = if self.adaptive {
+            "adaptive depth"
+        } else {
+            "fixed depth"
+        };
+        format!("{}, up to {} drafts, {depth}", self.kind, self.depth)
+    }
+}
+
 /// The GLM-5.3-Flash arm, exposed to the shared runtime as a Walk.
 pub struct GlmWalk {
     shared: Arc<Shared>,
     context_limit: usize,
     layout: StateLayout,
     limits: Limits,
-    /// Whether drafting members verify their rounds in one walk
-    /// ([sparkflash_runtime::JOINT_ROUNDS_ENV]); off, each member's chain is verified whole
-    /// without the row share. The future drafter contract's round reads this.
-    #[allow(dead_code)]
-    joint_rounds: bool,
-    /// What a shared walk costs, for the row share. The future drafter contract's round reads
-    /// this.
-    #[allow(dead_code)]
-    wall: ExpertUnionWall,
-    /// The arm publishes no drafter through the runtime yet.
-    drafter: Absent<&'static str>,
+    /// The arm's draft source, behind the runtime's round contract.
+    drafter: GlmDrafter,
 }
 
 impl GlmWalk {
     /// The walk over `shared`'s rank and `context_limit` positions a sequence.
     ///
     /// # Errors
-    /// A poisoned rank lock, or a [sparkflash_runtime::JOINT_ROUNDS_ENV] that is not a switch.
+    /// A poisoned rank lock, or a rank whose cache plan cannot be read.
     pub(crate) fn new(shared: Arc<Shared>, context_limit: usize) -> Result<Self, BackendError> {
-        let (plan, chunk, wall) = {
+        let (plan, chunk, wall, block) = {
             let rank = shared
                 .rank
                 .lock()
@@ -394,20 +572,26 @@ impl GlmWalk {
                     top_k: config.num_experts_per_tok,
                     ..JOINT_WALL
                 },
+                rank.has_block_drafter(),
             )
         };
-        let joint_rounds = sparkflash_runtime::joint_rounds()
-            .map_err(|error| BackendError::new("glm5_device", error))?;
+        let spec = shared.spec.get();
+        let drafter = GlmDrafter {
+            shared: Arc::clone(&shared),
+            depth: spec.map_or(0, |spec| spec.drafts),
+            wall,
+            kind: if block { "DFlash 2" } else { "MTP" },
+            adaptive: spec.is_some_and(|spec| spec.policy.is_some()),
+        };
         Ok(Self {
             shared,
             context_limit,
             layout: layout_of(plan),
             // The runtime's ChunkPolicy quantises this, so a profile's 4096 stays 4096 and the
-            // rank's scratch can always hold the chunk it is handed.
-            limits: Limits::new(chunk, context_limit),
-            joint_rounds,
-            wall,
-            drafter: Absent("GLM's round is still its fusion's"),
+            // rank's scratch can always hold the chunk it is handed. A verify is one rank step,
+            // so the member cap is the rank's verify width, not the prompt chunk.
+            limits: walk_limits(chunk, context_limit),
+            drafter,
         })
     }
 }
@@ -432,16 +616,12 @@ fn layout_of(plan: sparkflash_model::KvPlan) -> StateLayout {
     StateLayout::new(regions)
 }
 
-/// The runtime over a GLM walk: the serving arm the backend opens when it fuses its lanes, and
-/// the arm a session outside the engine steps through.
-///
-/// [crate::serve::GlmFusion] still serves in this pass, because the runtime has no draft path
-/// yet ([Walk::Drafter]); the next commit opens this instead.
+/// The runtime over a GLM walk: the serving arm the backend's [sparkflash_runtime::Fusion]
+/// opens.
 ///
 /// # Errors
 /// A device allocation the first slot cannot make, a [sparkflash_runtime::REWIND_ENV] that is
 /// not a switch, or a [sparkflash_runtime::JOINT_ROUNDS_ENV] that is not one.
-#[allow(dead_code)]
 pub(crate) fn runtime(
     shared: Arc<Shared>,
     context_limit: usize,
@@ -454,12 +634,8 @@ pub(crate) fn runtime(
 
 impl Walk for GlmWalk {
     type Seq = GlmSequence;
-    /// The runtime has no draft path yet: [sparkflash_runtime::Runtime] steps one row a member
-    /// and its [sparkflash_runtime::Runtime::verify] heads only each member's anchor, so an arm
-    /// that named a drafter here would lose its rounds silently (see the module's drafting gap).
-    /// GLM's source is the checkpoint's MTP layer or the loaded DFlash 2 block drafter; the
-    /// contract that can carry it is the next pass's, shared with Qwen and Inkling.
-    type Drafter = Absent<&'static str>;
+    /// The checkpoint's MTP layer or the loaded DFlash 2 block drafter, as the runtime's round.
+    type Drafter = GlmDrafter;
     type Vision = NoVision;
 
     const CAPABILITIES: WalkCapabilities = WalkCapabilities {
@@ -494,9 +670,15 @@ impl Walk for GlmWalk {
             .rank
             .lock()
             .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        // The walk does not draft in this pass, so it opens a plain sequence: the MTP layer's
-        // and the block drafter's state are the future drafter contract's to ask for.
-        let sequence = rank.new_sequence(self.context_limit)?;
+        // A sequence is a drafting one or it is not for its whole life: the rank's drafter is
+        // chosen here, before the first prompt, exactly as the old fusion's slot did.
+        let sequence = match self.shared.spec.get() {
+            Some(_) if rank.has_block_drafter() => {
+                rank.new_block_drafting_sequence(self.context_limit)?
+            }
+            Some(_) => rank.new_drafting_sequence(self.context_limit)?,
+            None => rank.new_sequence(self.context_limit)?,
+        };
         drop(rank);
         Ok(GlmSequence::new(Arc::clone(&self.shared), sequence))
     }
@@ -528,6 +710,7 @@ impl Walk for GlmWalk {
         segments: &mut [Segment<'_, Self::Seq>],
         pass: Pass<'_>,
     ) -> Result<Hidden, BackendError> {
+        let after = pass.prompt_end.unwrap_or(0);
         let mut rank = self
             .shared
             .rank
@@ -540,7 +723,7 @@ impl Walk for GlmWalk {
                     rows += segment.rows.len();
                     let words = segment.rows;
                     let seq = &mut *segment.seq;
-                    seq.bulk_chunk(&mut rank, words)?;
+                    seq.bulk_chunk(&mut rank, words, after)?;
                 }
                 Ok(Hidden::new(rows))
             }
@@ -559,7 +742,7 @@ impl Walk for GlmWalk {
                 for (segment, rows) in segments.iter_mut().zip(verified) {
                     segment.seq.verified = Some(Verified {
                         chunk: segment.rows.to_vec(),
-                        confidence: Vec::new(),
+                        confidence: segment.seq.confidence.clone(),
                         rows,
                     });
                 }
@@ -657,10 +840,9 @@ impl GlmWalk {
     /// One token a segment: every member's row through the rank's batched greedy path, whose
     /// last kept row's logits [Walk::head] reads back.
     ///
-    /// The walk does not draft in this pass (see [Walk::Drafter]): a round is the future
-    /// drafter contract's, and the bodies it will use are [GlmSequence::draft_after],
-    /// [GlmSequence::settle] and [Self::budget]. A batch wider than [MAX_ROWS] rows still runs
-    /// as one call: [DeviceRank::forward_batch_greedy] splits it a step at a time.
+    /// The round path is [GlmDrafter]'s; this is the plain pass the runtime's own plain walk
+    /// and a conformance comparison still use. A batch wider than [MAX_ROWS] rows runs as one
+    /// call: [DeviceRank::forward_batch_greedy] splits it a step at a time.
     fn token_rows(
         &self,
         rank: &mut DeviceRank,
@@ -677,15 +859,6 @@ impl GlmWalk {
             .collect();
         rank.forward_batch_greedy(&self.shared.tp, &self.shared.gather, &mut batch)?;
         Ok(Hidden::new(rows))
-    }
-
-    /// The most drafts one walk of `seqs` members verifies in all: one row a member is its
-    /// anchor, and a step is at most [MAX_ROWS] rows. The future drafter contract's row share
-    /// reads this; nothing calls it while the walk does not draft.
-    #[allow(dead_code)]
-    fn budget(&self, seqs: usize) -> usize {
-        let depth = self.shared.spec.get().map_or(0, |spec| spec.drafts);
-        (seqs * depth).min(MAX_ROWS.saturating_sub(seqs))
     }
 }
 
@@ -753,34 +926,394 @@ mod tests {
         assert_eq!(both.bytes_at(2), 40_320 + 4_096);
     }
 
-    /// The walk declares no drafter while its token path is one plain row a member, so the
-    /// ledger and the path cannot disagree about whether GLM drafts through the runtime.
+    /// The walk declares its drafter, so the ledger's three round rows are the path's and the
+    /// seventh generated check is claimed rather than skipped.
     #[test]
-    fn the_walk_declares_no_drafter_while_it_has_no_round_path() {
-        // The assertion is a compile-time fact; putting it in a const block keeps it a gate
-        // without tripping clippy's constant-assertion lint on a runtime `assert!`.
+    fn the_walk_declares_the_round_path_and_claims_its_check() {
         const {
             assert!(
-                !<<GlmWalk as Walk>::Drafter as sparkflash_runtime::Drafter<GlmWalk>>::PRESENT,
-                "the token path does not draft; a drafter name here would be the loaded gun"
+                <<GlmWalk as Walk>::Drafter as Drafter<GlmWalk>>::PRESENT,
+                "the GLM walk drafts through the runtime's round path"
             );
         }
         let ledger = ledger_for::<GlmWalk>();
         assert!(
-            matches!(ledger.mode(Strategy::Drafting), Mode::Off(_)),
-            "the runtime ledger states GLM's drafting off: {}",
+            matches!(ledger.mode(Strategy::Drafting), Mode::Native(_)),
+            "the runtime ledger states GLM's drafting: {}",
             ledger.line()
         );
+        assert!(
+            matches!(ledger.mode(Strategy::Runs), Mode::Native(_)),
+            "an accepted run reaches the request: {}",
+            ledger.line()
+        );
+        let joint = sparkflash_runtime::joint_rounds().unwrap_or(true);
+        assert_eq!(
+            matches!(ledger.mode(Strategy::JointRounds), Mode::Native(_)),
+            joint,
+            "the joint row follows the switch: {}",
+            ledger.line()
+        );
+        assert!(
+            !ledger.line().contains("does not state it"),
+            "the runtime derives every row GLM states: {}",
+            ledger.line()
+        );
+        let checks = sparkflash_runtime::checks_for::<GlmWalk>();
+        assert!(
+            checks.contains(&sparkflash_runtime::ConformanceCheck::DraftedEqualsPlain),
+            "a drafting arm claims drafted = plain"
+        );
+        sparkflash_runtime::check_claims::<GlmWalk>(checks)
+            .expect("every generated check is supported");
+    }
+
+    /// The member cap is the rank's verify width, not the prompt chunk: a verify is one rank
+    /// step, so the engine may hand the walk no more members than that.
+    #[test]
+    fn the_member_cap_is_the_rank_verify_width() {
+        let limits = walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 1_048_576);
+        assert_eq!(limits.rows, crate::device::DEFAULT_PREFILL_ROWS);
+        assert_eq!(limits.members, MAX_ROWS);
+        assert_eq!(limits.context, 1_048_576);
+        assert_ne!(limits.members, limits.rows, "the two widths are separate");
     }
 
     /// A profile's 4096-row chunk survives the runtime's ChunkPolicy quantization.
     #[test]
     fn the_runtime_chunks_a_glm_prompt_4096_rows_at_a_time() {
-        let limits = Limits::new(crate::device::DEFAULT_PREFILL_ROWS, 1_048_576);
+        let limits = walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 1_048_576);
         assert_eq!(
             sparkflash_runtime::ChunkPolicy::for_limits(limits).rows(),
             crate::device::DEFAULT_PREFILL_ROWS
         );
+    }
+
+    /// The budget is one rank step: anchors plus drafts never exceed [MAX_ROWS].
+    #[test]
+    fn the_budget_caps_anchors_and_drafts_to_one_verify() {
+        for seqs in 1..=MAX_ROWS {
+            for depth in 0..MAX_ROWS {
+                let drafts = glm_draft_budget(seqs, depth);
+                assert!(
+                    seqs + drafts <= MAX_ROWS,
+                    "{seqs} member(s) at depth {depth} budget {drafts} rows"
+                );
+                assert_eq!(drafts, (seqs * depth).min(MAX_ROWS.saturating_sub(seqs)));
+            }
+        }
+        // Four members and a three-deep chain share four draft rows, so the verify is eight.
+        assert_eq!(glm_draft_budget(4, 3), 4);
+        assert_eq!(glm_draft_budget(1, 3), 3);
+    }
+
+    // A CPU walk shaped like GLM's: its verify width is [MAX_ROWS], its budget is
+    // [glm_draft_budget], and its chains are the ones the arm proposes. The runtime's policies
+    // can be checked with no device; the device path is compiled and stays `#[ignore]`d.
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use sparkflash_runtime::{
+        Draft, Drafter, HeadInput, HeadRow, Hidden, LaneMemory, LaneState, Pass, PassKind, Segment,
+        StepWall, WalkCapabilities,
+    };
+
+    #[derive(Debug, Default)]
+    struct ShapeSeq {
+        rows: Vec<u32>,
+        pending: VecDeque<(u32, StepOutput)>,
+        checkpoint: Option<Vec<u32>>,
+    }
+
+    impl LaneState for ShapeSeq {
+        fn position(&self) -> usize {
+            self.rows.len()
+        }
+
+        fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
+            if at != self.rows.len() {
+                return Err(BackendError::new(
+                    "shape",
+                    "a checkpoint is at the position",
+                ));
+            }
+            self.checkpoint = Some(self.rows.clone());
+            Ok(())
+        }
+
+        fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
+            if to > self.rows.len() {
+                return Err(BackendError::new("shape", "a rewind past the position"));
+            }
+            match (to, self.checkpoint.take()) {
+                (0, _) => self.rows.clear(),
+                (_, Some(rows)) if rows.len() >= to => self.rows = rows[..to].to_vec(),
+                _ => self.rows.truncate(to),
+            }
+            self.pending.clear();
+            Ok(())
+        }
+
+        fn room(&self, _positions: usize, _reset: bool) -> bool {
+            true
+        }
+    }
+
+    /// The flat wall of the arm's round: one draft row costs an anchor row.
+    static GLM_WALL: ExpertUnionWall = JOINT_WALL;
+
+    struct ShapeWalk {
+        layout: StateLayout,
+        limits: Limits,
+        walks: Mutex<Vec<Vec<usize>>>,
+        drafter: ShapeDrafter,
+    }
+
+    impl ShapeWalk {
+        fn new(depth: usize) -> Self {
+            Self {
+                layout: StateLayout::new(vec![Region::Positional {
+                    name: "shape",
+                    bytes_per_row: 4,
+                }]),
+                limits: walk_limits(64, 4_096),
+                walks: Mutex::new(Vec::new()),
+                drafter: ShapeDrafter { depth },
+            }
+        }
+    }
+
+    struct ShapeDrafter {
+        depth: usize,
+    }
+
+    impl Walk for ShapeWalk {
+        type Seq = ShapeSeq;
+        type Drafter = ShapeDrafter;
+        type Vision = NoVision;
+
+        const CAPABILITIES: WalkCapabilities = WalkCapabilities::all(StateKind::Positional);
+
+        fn layout(&self) -> &StateLayout {
+            &self.layout
+        }
+
+        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+            Ok(ShapeSeq::default())
+        }
+
+        fn limits(&self) -> Limits {
+            self.limits
+        }
+
+        fn drafter(&self) -> &Self::Drafter {
+            &self.drafter
+        }
+
+        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
+
+        fn walk(
+            &self,
+            segments: &mut [Segment<'_, Self::Seq>],
+            pass: Pass<'_>,
+        ) -> Result<Hidden, BackendError> {
+            if matches!(pass.kind, PassKind::Verify { .. }) {
+                self.walks
+                    .lock()
+                    .expect("the walk record")
+                    .push(segments.iter().map(|segment| segment.rows.len()).collect());
+            }
+            let mut rows = 0;
+            for segment in segments {
+                segment.seq.rows.extend_from_slice(segment.rows);
+                rows += segment.rows.len();
+            }
+            Ok(Hidden::new(rows))
+        }
+
+        fn head(
+            &self,
+            _hidden: &Hidden,
+            rows: &mut [HeadRow<'_, Self::Seq>],
+        ) -> Result<Vec<StepOutput>, BackendError> {
+            rows.iter_mut()
+                .map(|row| {
+                    let token = match &row.input {
+                        HeadInput::Verify { rows, row: index } => {
+                            rows.get(*index).copied().unwrap_or_default() + 1
+                        }
+                        HeadInput::Prompt(_) | HeadInput::Token(_) => row
+                            .seq
+                            .rows
+                            .last()
+                            .copied()
+                            .ok_or_else(|| BackendError::new("shape", "no row to head"))?
+                            .wrapping_add(1),
+                    };
+                    Ok(StepOutput {
+                        logits: vec![token as f32],
+                        next_token: Some(token),
+                        draft: Vec::new(),
+                    })
+                })
+                .collect()
+        }
+    }
+
+    impl Drafter<ShapeWalk> for ShapeDrafter {
+        const PRESENT: bool = true;
+        type Rows = ();
+
+        fn wall(&self) -> &dyn StepWall {
+            &GLM_WALL
+        }
+
+        fn open_round(&self, seq: &mut ShapeSeq, token: u32) -> Result<Draft, BackendError> {
+            if let Some((front, _)) = seq.pending.front()
+                && *front == token
+            {
+                let (_, step) = seq.pending.pop_front().expect("the front was read");
+                return Ok(Draft::Held(step));
+            }
+            let drafts: Vec<u32> = (1..=self.depth)
+                .map(|at| token.wrapping_add(at as u32))
+                .collect();
+            let confidence = (0..drafts.len()).map(|at| 0.9 - 0.05 * at as f64).collect();
+            Ok(Draft::Chain { confidence, drafts })
+        }
+
+        fn verify(
+            &self,
+            walk: &ShapeWalk,
+            segments: &mut [Segment<'_, ShapeSeq>],
+            _depths: &[usize],
+        ) -> Result<Vec<Self::Rows>, BackendError> {
+            let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
+            walk.walk(
+                segments,
+                Pass::verify(rows, OutputConstraint::new(&[], rows)),
+            )?;
+            Ok(vec![(); segments.len()])
+        }
+
+        fn settle(
+            &self,
+            seq: &mut ShapeSeq,
+            chunk: &[u32],
+            _rows: Self::Rows,
+        ) -> Result<StepOutput, BackendError> {
+            let picks: Vec<u32> = chunk.iter().map(|token| token.wrapping_add(1)).collect();
+            let kept = verdict(chunk, &picks);
+            let base = seq.rows.len().saturating_sub(chunk.len());
+            seq.rows.truncate(base + kept);
+            for &token in chunk.iter().take(kept).skip(1) {
+                seq.pending.push_back((
+                    token,
+                    StepOutput {
+                        logits: Vec::new(),
+                        next_token: Some(token.wrapping_add(1)),
+                        draft: Vec::new(),
+                    },
+                ));
+            }
+            Ok(StepOutput {
+                logits: Vec::new(),
+                next_token: Some(chunk[0].wrapping_add(1)),
+                draft: Vec::new(),
+            })
+        }
+
+        fn budget(&self, seqs: usize) -> usize {
+            glm_draft_budget(seqs, self.depth)
+        }
+
+        fn ready(&self, seq: &ShapeSeq, token: u32) -> bool {
+            seq.pending
+                .front()
+                .is_some_and(|(front, _)| *front == token)
+        }
+
+        fn give_back(&self, seq: &mut ShapeSeq, to: usize) -> Result<(), BackendError> {
+            seq.rows.truncate(to.min(seq.rows.len()));
+            seq.pending.clear();
+            Ok(())
+        }
+
+        fn speculation(&self, _seq: &ShapeSeq) -> Speculation {
+            Speculation::default()
+        }
+    }
+
+    fn shape_runtime(depth: usize) -> Runtime<ShapeWalk> {
+        Runtime::new(ShapeWalk::new(depth), 0).expect("the shape runtime starts")
+    }
+
+    fn prompted(
+        runtime: &Runtime<ShapeWalk>,
+        token: u32,
+    ) -> sparkflash_runtime::RuntimeSlot<ShapeWalk> {
+        let mut slot = runtime.open_slot().expect("a slot");
+        runtime
+            .prefill_slot(&mut slot, &[token])
+            .expect("the prompt");
+        slot
+    }
+
+    fn verifies(runtime: &Runtime<ShapeWalk>) -> Vec<Vec<usize>> {
+        runtime
+            .walk()
+            .walks
+            .lock()
+            .expect("the walk record")
+            .clone()
+    }
+
+    /// One member keeps the drafter's own depth in one verify pass.
+    #[test]
+    fn a_lone_member_verifies_its_own_depth_in_one_pass() {
+        let runtime = shape_runtime(3);
+        let mut members = [(prompted(&runtime, 10), 11)];
+        runtime.step_slots(&mut members).expect("the round");
+        assert_eq!(verifies(&runtime), vec![vec![4]]);
+    }
+
+    /// Four members share one verify pass, and their anchors and drafts fit one rank step.
+    #[test]
+    fn four_members_share_one_verify_pass() {
+        let runtime = shape_runtime(3);
+        let mut members: Vec<_> = (0..4)
+            .map(|at| (prompted(&runtime, at + 1), at + 11))
+            .collect();
+        runtime.step_slots(&mut members).expect("the joint round");
+        let passes = verifies(&runtime);
+        assert_eq!(passes.len(), 1, "one verify pass for four members");
+        let rows: usize = passes[0].iter().sum();
+        assert_eq!(passes[0].len(), 4);
+        assert!(
+            passes[0].iter().all(|rows| *rows >= 1),
+            "every member steps"
+        );
+        assert!(
+            rows <= MAX_ROWS,
+            "the shared verify is one rank step: {rows} rows"
+        );
+        assert!(
+            rows < 4 * 4,
+            "the budget shared the drafts: {} rows for four chains of three",
+            rows
+        );
+    }
+
+    /// With joint rounds off, each lane's round walks alone at the drafter's own depth.
+    #[test]
+    fn with_joint_off_each_lane_walks_alone() {
+        let runtime = shape_runtime(3).with_joint_rounds(false);
+        let mut members: Vec<_> = (0..2)
+            .map(|at| (prompted(&runtime, at + 1), at + 11))
+            .collect();
+        runtime.step_slots(&mut members).expect("two lone rounds");
+        assert_eq!(verifies(&runtime), vec![vec![4], vec![4]]);
     }
 
     sparkflash_runtime::conformance!(super::GlmWalk);
