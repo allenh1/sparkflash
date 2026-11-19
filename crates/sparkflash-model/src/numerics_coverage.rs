@@ -76,6 +76,29 @@ pub struct Recorder {
     path: PathBuf,
 }
 
+/// The FNV-1a 64-bit offset basis.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The FNV-1a 64-bit prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// A content-addressed input name for a forward's token ids: `input-<16 hex digits>`.
+///
+/// The digest is FNV-1a over the ids' little-endian bytes. It is deliberately small and stable:
+/// `scripts/numerics.py coverage-sweep` computes the same name from `/tokenize`'s ids, so a
+/// dump can prove an input was already run without storing the prompt text or the ids.
+#[must_use]
+pub fn input_name(tokens: &[u32]) -> String {
+    let mut digest = FNV_OFFSET;
+    for token in tokens {
+        for byte in token.to_le_bytes() {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(FNV_PRIME);
+        }
+    }
+    format!("input-{digest:016x}")
+}
+
 impl Recorder {
     /// A recorder for `experts` routed experts per decoder layer.
     #[must_use]
@@ -152,11 +175,26 @@ impl Recorder {
 
     /// Open an input named after the document's input count (`input-0`, `input-1`, ...).
     ///
-    /// A serving process handles several forwards; the count is read from the merged document, so
-    /// the names stay unique across a suite without the caller tracking them.
+    /// This is the position-addressed form, kept for callers that have only a token count. A
+    /// serving forward uses [Self::input_auto_ids] instead: its name is the content, so a sweep
+    /// can tell whether it has already run the same input.
     pub fn input_auto(&mut self, tokens: usize) {
         let name = format!("input-{}", self.dump.inputs.len());
         self.input(name, tokens);
+    }
+
+    /// Open a content-addressed input for a forward's token ids.
+    ///
+    /// The name is [input_name], a stable digest of the ids, so the dump itself says which input
+    /// it holds: a sweep can skip a prompt without re-running it, and a repeated forward does not
+    /// append a second copy of the same input. The routing hits still accumulate, as they do for
+    /// every forward.
+    pub fn input_auto_ids(&mut self, tokens: &[u32]) {
+        let name = input_name(tokens);
+        if self.dump.inputs.iter().any(|input| input.name == name) {
+            return;
+        }
+        self.input(name, tokens.len());
     }
 
     /// Record one routing decision. An out-of-range layer or expert is ignored, never a panic in
@@ -292,6 +330,33 @@ mod tests {
             "another model's inputs are not merged"
         );
         assert_eq!(mine.dump().layers[0].hits, vec![0, 0]);
+    }
+
+    #[test]
+    fn a_content_addressed_name_is_the_stable_digest_of_the_ids() {
+        // The Python sweep computes these same names from `/tokenize`'s ids; pin the FNV-1a
+        // contract on both sides of the language boundary.
+        assert_eq!(input_name(&[1, 2, 3]), "input-fd1f0f4381eb0395");
+        assert_eq!(input_name(&[4]), "input-cd3ac65e44f721b1");
+        assert_eq!(input_name(&[]), "input-cbf29ce484222325");
+    }
+
+    #[test]
+    fn a_repeated_input_adds_no_second_entry_but_still_counts_its_hits() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("coverage.json");
+        let mut recorder = Recorder::new("toy/model", vec![2], &path);
+        recorder.input_auto_ids(&[1, 2]);
+        recorder.hit(0, 0);
+        recorder.input_auto_ids(&[1, 2]);
+        recorder.hit(0, 1);
+        recorder.input_auto_ids(&[3]);
+        recorder.hit(0, 0);
+        assert_eq!(recorder.dump().inputs.len(), 2);
+        assert_eq!(recorder.dump().inputs[0].name, "input-c9c28939c99668c6");
+        assert_eq!(recorder.dump().inputs[0].tokens, 2);
+        assert_eq!(recorder.dump().inputs[1].name, input_name(&[3]));
+        assert_eq!(recorder.dump().layers[0].hits, vec![2, 1]);
     }
 
     #[test]

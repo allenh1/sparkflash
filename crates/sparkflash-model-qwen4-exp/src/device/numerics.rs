@@ -102,11 +102,12 @@ impl Switches {
     /// Open the recorders for one forward over `tokens` at `position`, or None when both
     /// switches are off (or neither recorder could be opened).
     ///
-    /// The coverage recorder opens one named input, input-n, counted from the document already
-    /// at the path, so a serving process accumulates a suite across forwards exactly as the host
-    /// reference does. The monitor recorder takes this forward as the probe; a later forward is a
-    /// different probe, which the recorder reports as AlreadyExists. That is logged once and this
-    /// forward serves on without a monitor dump.
+    /// The coverage recorder opens one content-addressed input, `input-<digest>`, named from
+    /// this forward's token ids, so a serving process accumulates a suite across forwards exactly
+    /// as the host reference does and a repeated input adds no second entry. The monitor recorder
+    /// takes this forward as the probe; a later forward is a different probe, which the recorder
+    /// reports as AlreadyExists. That is logged once and this forward serves on without a monitor
+    /// dump.
     pub(crate) fn begin(&self, tokens: &[u32], position: usize) -> Option<Forward> {
         if self.is_off() {
             return None;
@@ -122,7 +123,7 @@ impl Switches {
                 switch.experts.clone(),
             );
             if let Some(recorder) = recorder.as_mut() {
-                recorder.input_auto(tokens.len());
+                recorder.input_auto_ids(tokens);
             }
             recorder
         });
@@ -315,9 +316,17 @@ mod tests {
         );
         assert_eq!(document["model"], "toy/qwen");
         assert_eq!(document["inputs"].as_array().map(Vec::len), Some(2));
-        assert_eq!(document["inputs"][0]["name"], "input-0");
+        assert_eq!(
+            document["inputs"][0]["name"],
+            sparkflash_model::numerics_coverage::input_name(&[1, 2, 3])
+        );
+        assert_eq!(document["inputs"][0]["name"], "input-fd1f0f4381eb0395");
         assert_eq!(document["inputs"][0]["tokens"], 3);
-        assert_eq!(document["inputs"][1]["name"], "input-1");
+        assert_eq!(
+            document["inputs"][1]["name"],
+            sparkflash_model::numerics_coverage::input_name(&[4])
+        );
+        assert_eq!(document["inputs"][1]["name"], "input-cd3ac65e44f721b1");
         assert_eq!(document["inputs"][1]["tokens"], 1);
         let layers = document["layers"].as_array().expect("the layers");
         assert_eq!(layers.len(), 2);

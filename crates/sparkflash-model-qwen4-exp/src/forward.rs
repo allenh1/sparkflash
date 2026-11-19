@@ -1012,7 +1012,7 @@ impl Qwen4ExpWeights {
             self.layers.iter().map(|_| config.num_experts).collect(),
         );
         if let Some(recorder) = coverage.as_mut() {
-            recorder.input_auto(tokens.len());
+            recorder.input_auto_ids(tokens);
         }
         // A monitor dump is one probe. The probe is this forward's token chunk at its absolute
         // position; the reference and candidate runs must feed the same chunk.
