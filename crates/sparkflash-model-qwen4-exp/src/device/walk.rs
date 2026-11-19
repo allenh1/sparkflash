@@ -25,10 +25,8 @@
 //! arm's speculative decode: a sequence whose last verify already holds the token answers from
 //! it, and one that does not batches its token and drafts through the same kernels as before.
 //!
-//! The walk is kept for when the shared runtime can drive a drafting arm; Qwen serves on its own
-//! fused arm ([super::fusion::QwenFusion]) until then, so much of this module is not constructed
-//! on the serving path yet.
-#![allow(dead_code)]
+//! Qwen serves through this walk: `Qwen4ExpDeviceBackend::enable_fusion` and
+//! `enable_group_fusion` start the runtime over it, so the fragment is the serving path.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -37,14 +35,27 @@ use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculatio
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
     ChunkPolicy, ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden,
-    LaneMemory, LaneState, Limits, Opened, Pass, PassKind, PassMask, Region, Runtime, Segment,
-    Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
+    LaneMemory, LaneState, Limits, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments,
+    StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
 };
 
 use sparkflash_kernels::cuda_driver::Deviceptr;
 
 use super::batch::{BatchBuffers, MAX_BATCH};
 use super::{DENSE_ROWS, DeviceSequence, SequenceShared};
+
+/// A shared walk's cost at TP=1 on a GB10-class node, from the block drafter's own step cost
+/// ([super::DFLASH2_STEP_COST]: 59 ms a step and 8.4 ms a verified draft): about 10 new experts
+/// a row at 0.8 ms each, the rest of a step fixed, and a few milliseconds a member past the first
+/// for its own attention, recurrence and draft. The expert counts are the checkpoint's.
+pub(super) const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
+    fixed_ms: 50.4,
+    expert_ms: 0.81,
+    row_ms: 0.5,
+    seq_ms: 6.0,
+    experts: 0,
+    top_k: 0,
+};
 
 /// The Qwen arm, exposed to the shared runtime as a [Walk].
 pub(super) struct QwenWalk {
@@ -71,13 +82,14 @@ impl QwenWalk {
         capacity: usize,
     ) -> Result<Self, BackendError> {
         let layout = layout_of(&shared.config);
-        let limits = Limits::new(pass_rows(shared.prefill.chunk), context_limit);
+        let limits = walk_limits(shared.prefill.chunk, context_limit, capacity);
+        let members = limits.members;
         let joint = sparkflash_runtime::joint_rounds()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
         let wall = ExpertUnionWall {
             experts: shared.config.num_experts,
             top_k: shared.config.num_experts_per_tok,
-            ..super::fusion::JOINT_WALL
+            ..JOINT_WALL
         };
         let drafter = QwenDrafter {
             depth: shared.verify_rows.saturating_sub(1),
@@ -89,7 +101,7 @@ impl QwenWalk {
             layout,
             limits,
             batch: Mutex::new(None),
-            members: capacity.clamp(1, MAX_BATCH),
+            members,
             pending: Mutex::new(VecDeque::new()),
             drafter,
         })
@@ -131,16 +143,30 @@ impl QwenWalk {
     }
 
     /// A prompt chunk: the prefill plan's forwards, each on the arm's own prompt path.
-    fn prompt_chunk(&self, seq: &mut DeviceSequence, rows: &[u32]) -> Result<(), BackendError> {
+    ///
+    /// `prompt_end` is the pass's [Pass::prompt_end]: the rows of the prompt still to come.
+    /// The drafter's commit window reaches the prompt's true end, as the old prompt loop's did,
+    /// so a non-final pass does not stop the window at the chunk boundary.
+    ///
+    /// Only the prompt's last forward heads a row. The old loop passed `logit_rows=0` on every
+    /// chunk but the last, which skipped each earlier chunk's head-row gather (a collective in a
+    /// TP group); `usize::MAX` defers the last one's head to [Walk::head].
+    fn prompt_chunk(
+        &self,
+        seq: &mut DeviceSequence,
+        rows: &[u32],
+        prompt_end: Option<usize>,
+    ) -> Result<(), BackendError> {
         seq.consumed.extend_from_slice(rows);
+        let end = seq.position + rows.len() + prompt_end.unwrap_or(0);
+        let last_pass = prompt_end.is_none_or(|after| after == 0);
         for range in self.shared.prefill.forwards(rows.len()) {
             let start = seq.position;
-            let end_of_chunk = range.end;
+            let last = last_pass && range.end == rows.len();
             let chunk = &rows[range];
-            // The head of a prompt runs once, from [Walk::head], on the last chunk's row.
-            seq.forward_batch(chunk, usize::MAX, 0)?;
+            let logit_rows = if last { usize::MAX } else { 0 };
+            seq.forward_batch(chunk, logit_rows, 0)?;
             if seq.drafting() {
-                let end = seq.position + rows.len().saturating_sub(end_of_chunk);
                 let commits: Vec<_> = seq.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
                     draft
                         .config
@@ -320,6 +346,16 @@ fn pass_rows(chunk: usize) -> usize {
         .unwrap_or(chunk)
 }
 
+/// The limits the runtime sees: the arm's own prefill chunk for a pass, the context, and the
+/// batch's members.
+///
+/// The member count is the verify width, not the prompt chunk: a verify of `members` members is
+/// `members x (1 + depth)` rows, and the batch buffers hold exactly that many. Capping it at
+/// [MAX_BATCH] is the arm's own batch width.
+fn walk_limits(chunk: usize, context: usize, capacity: usize) -> Limits {
+    Limits::new(pass_rows(chunk), context).with_members(capacity.clamp(1, MAX_BATCH))
+}
+
 /// The arm's runtime: the fused engine and the group mirror see this one type.
 ///
 /// # Errors
@@ -334,10 +370,8 @@ pub(super) fn runtime(
 
 /// The arm's draft source: the checkpoint's MTP stage, or a loaded DFlash 2 head.
 ///
-/// Qwen still serves on its own fusion; this is the same round expressed on the runtime's
-/// contract, so a walk opened through [`Runtime`] drafts the way the fusion does. With
-/// `SPARKFLASH_JOINT_ROUNDS=off` the arm drafts nothing (the fusion's own policy), which the
-/// empty chain states.
+/// With `SPARKFLASH_JOINT_ROUNDS=off` the arm drafts nothing (the fusion's own policy): the
+/// walk opens each sequence with speculation off, and the empty chain states it as well.
 pub(super) struct QwenDrafter {
     /// The most drafts the verify batch holds, past the anchor.
     depth: usize,
@@ -356,25 +390,27 @@ impl Drafter<QwenWalk> for QwenDrafter {
     }
 
     fn open_round(&self, seq: &mut DeviceSequence, token: u32) -> Result<Draft, BackendError> {
-        match seq.open_round(token)? {
-            Opened::Held(step) => Ok(Draft::Held(step)),
-            Opened::Round(chain) => {
-                let drafts = std::mem::take(&mut seq.spec_drafts);
-                let confidence = std::mem::take(&mut seq.spec_confidence);
-                let _ = confidence;
-                if self.joint {
-                    Ok(Draft::Chain {
-                        confidence: chain,
-                        drafts,
-                    })
-                } else {
-                    Ok(Draft::Chain {
-                        confidence: Vec::new(),
-                        drafts: Vec::new(),
-                    })
-                }
-            }
+        seq.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        if let Some(step) = seq.feed(token)? {
+            return Ok(Draft::Held(step));
         }
+        let mut chain = seq.spec.chain(&seq.spec_confidence, seq.spec_drafts.len());
+        chain.truncate(seq.spec_drafts.len());
+        let drafts = std::mem::take(&mut seq.spec_drafts);
+        let _confidence = std::mem::take(&mut seq.spec_confidence);
+        if !self.joint {
+            return Ok(Draft::Chain {
+                confidence: Vec::new(),
+                drafts: Vec::new(),
+            });
+        }
+        Ok(Draft::Chain {
+            confidence: chain,
+            drafts,
+        })
     }
 
     fn verify(
@@ -412,17 +448,42 @@ impl Drafter<QwenWalk> for QwenDrafter {
         Ok(rows)
     }
 
+    /// The most rows one verify of `seqs` members may hold: every member's anchor and its
+    /// drafts, which is the batch buffers' width. `share_rows` spends it on drafts only, so a
+    /// chain's own depth still bounds what a member takes.
     fn budget(&self, seqs: usize) -> usize {
-        seqs * self.depth
+        seqs.saturating_mul(1 + self.depth)
     }
 
     fn ready(&self, seq: &DeviceSequence, token: u32) -> bool {
-        seq.holds(token)
+        seq.spec_queue
+            .first()
+            .is_some_and(|pending| pending.token == token)
     }
 
     fn give_back(&self, seq: &mut DeviceSequence, to: usize) -> Result<(), BackendError> {
         let count = seq.consumed.len().saturating_sub(to);
-        seq.give_back(count)
+        if count == 0 {
+            return Ok(());
+        }
+        let served = seq.spec_served.len();
+        if count > served {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!("{count} answers to give back, and the last verify served {served}"),
+            ));
+        }
+        let pending = seq
+            .spec_served
+            .drain(served - count..)
+            .next()
+            .expect("the served answers were just counted");
+        seq.spec_queue.clear();
+        seq.unwind(&pending)?;
+        seq.consumed.truncate(seq.consumed.len() - count);
+        let history = seq.sampler.history().len();
+        seq.sampler.truncate(history - count);
+        Ok(())
     }
 
     fn speculation(&self, seq: &DeviceSequence) -> Speculation {
@@ -461,7 +522,11 @@ impl Walk for QwenWalk {
 
     fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError> {
         let _ = memory;
-        DeviceSequence::allocate(Arc::clone(&self.shared), self.limits.context)
+        let mut seq = DeviceSequence::allocate(Arc::clone(&self.shared), self.limits.context)?;
+        // Without joint rounds the arm drafts nothing, exactly as the fusion's own policy did: a
+        // member would otherwise run the MTP's prompt pass and then throw every chain away.
+        seq.spec_enabled &= self.drafter.joint;
+        Ok(seq)
     }
 
     fn limits(&self) -> Limits {
@@ -504,7 +569,7 @@ impl Walk for QwenWalk {
                     .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?
                     .clear();
                 let (seq, tokens) = (&mut *segment.seq, segment.rows);
-                self.prompt_chunk(seq, tokens)?;
+                self.prompt_chunk(seq, tokens, pass.prompt_end)?;
                 Hidden::new(rows)
             }
             PassKind::Paired { .. } => {
@@ -799,6 +864,34 @@ mod tests {
         assert_eq!(layout.kind(), StateKind::Both);
         assert!(layout.bytes_per_row() > 0, "the KV cache is positional");
         assert!(layout.needs_checkpoint(), "the recurrence needs a point");
+    }
+
+    /// The engine's member cap is the verify width, not the prompt chunk: a four-row batch
+    /// steps at most four members, though its prompt pass holds the whole prefill chunk.
+    #[test]
+    fn the_member_cap_is_the_verify_width_not_the_prompt_chunk() {
+        let limits = walk_limits(DEFAULT_PREFILL_CHUNK, 4_096, 9);
+        assert_eq!(limits.rows, 4_096, "a prompt pass keeps the arm's chunk");
+        assert_eq!(limits.members, 4, "a batch is the arm's verify width");
+        assert_eq!(walk_limits(DEFAULT_PREFILL_CHUNK, 4_096, 0).members, 1);
+        assert_eq!(walk_limits(DEFAULT_PREFILL_CHUNK, 4_096, 2).members, 2);
+    }
+
+    /// The drafter's budget is the verify's whole width: every member's anchor and its depth.
+    /// The batch buffers hold this many rows, so a wider budget would claim memory the verify
+    /// does not have and a narrower one would refuse a chain the runtime asked for.
+    #[test]
+    fn the_verify_budget_covers_every_anchor_and_draft() {
+        for depth in [0, 1, 3] {
+            let drafter = QwenDrafter {
+                depth,
+                wall: JOINT_WALL,
+                joint: true,
+            };
+            assert_eq!(drafter.budget(0), 0);
+            assert_eq!(drafter.budget(1), 1 + depth);
+            assert_eq!(drafter.budget(4), 4 * (1 + depth));
+        }
     }
 
     /// The walk takes the passes the generated checks read: a prompt chunk and many segments.
