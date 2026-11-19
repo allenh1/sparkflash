@@ -140,6 +140,13 @@ const INKLING_GQA_GROUPS: &[usize] = &[6];
 const INKLING_SHORT_CONV: usize = 4;
 const INKLING_INTERMEDIATE: usize = 2304;
 
+/// The first row a chained block residual takes.
+///
+/// The chunk walk chains a residual only when it has more than `RESIDUAL_SPLIT_PAIRS` (8) rows
+/// (`crates/sparkflash-model-inkling2/src/device.rs`), so the catalogue's band starts one past
+/// that. Below it the walk launches the one- or two-launch form.
+const INKLING_CHAIN_FIRST_ROWS: usize = 9;
+
 /// The shape rule of one catalogue entry.
 ///
 /// This is the model-independent part of kernel selection: a kernel that only works on whole
@@ -385,6 +392,23 @@ const fn pre(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
 /// A token/decode symbol accepting exactly these precisions.
 const fn dec(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
     KernelSymbol::decode(name, precisions, ComputeClass::Elementwise, RowBand::ALL)
+}
+
+/// One instantiation of the chained block residual.
+///
+/// `inkling_block_residual_chain_q<queries>_n<next>` is one template in
+/// `kernels/inkling_conv_sm121.cu`; the six entries differ only in the compile-time query and
+/// next-call counts. Each takes f32 summaries, queries and carry (the signature is all
+/// `const float*`), so it is the elementwise residual body the arm plans and loads at BF16, as
+/// it loads the two-launch form's statistics and mix. The walk launches it only over more than
+/// eight rows, which is the bulk-prefill pass.
+const fn chain(name: &'static str) -> KernelSymbol {
+    KernelSymbol::prefill(
+        name,
+        &[Precision::Bf16],
+        ComputeClass::Elementwise,
+        RowBand::from(INKLING_CHAIN_FIRST_ROWS),
+    )
 }
 
 /// A row GEMV's band: at most eight token rows a launch.
@@ -1283,8 +1307,19 @@ pub const CATALOGUE: &[PartKernel] = &[
         Image::Inkling,
         &[
             sym("inkling_block_residual", &[Precision::Bf16, Precision::F32]),
-            // The two-launch form, the chained form's statistics and mix, the plain residual
-            // add, the row-split join and the exact f32 widening.
+            // The chained form: one template instantiated at each (query, next) pair the chunk
+            // walk launches, one symbol a pair the way the GDN scan entry names its
+            // q4p_gdn_scan_64_64 / _128_256 instantiations. The catalogue had a hole here for
+            // the whole released arm: the walk loaded these six by name and the entry named
+            // only the one- and two-launch bodies, so the typed lookup refused the boot.
+            chain("inkling_block_residual_chain_q1_n0"),
+            chain("inkling_block_residual_chain_q1_n1"),
+            chain("inkling_block_residual_chain_q1_n3"),
+            chain("inkling_block_residual_chain_q3_n0"),
+            chain("inkling_block_residual_chain_q3_n1"),
+            chain("inkling_block_residual_chain_q3_n3"),
+            // The two-launch form, the plain residual add, the row-split join and the exact f32
+            // widening.
             sym("inkling_block_residual_stats", &[Precision::Bf16]),
             sym("inkling_block_residual_mix", &[Precision::Bf16]),
             sym("inkling_residual_add", &[Precision::Bf16]),
