@@ -1165,6 +1165,27 @@ def monitor_dump(layer_values, experts, model: str = MODEL, probe: dict | None =
     }
 
 
+def monitor_layers_dump(layers: list, model: str = MODEL, probe: dict | None = None) -> dict:
+    return {
+        "schema": NUMERICS.MONITORS_SCHEMA,
+        "model": model,
+        "probe": probe or {"name": "p", "prompt_ids": [1, 2], "position": 0},
+        "sample": {"width": 4, "indices": [0, 1]},
+        "layers": layers,
+    }
+
+
+def monitor_layer(number: int, values: list, experts: list) -> dict:
+    return {
+        "layer": number,
+        "values": values,
+        "experts": [
+            {"expert": expert, "values": expert_values}
+            for expert, expert_values in experts
+        ],
+    }
+
+
 class MonitorTests(unittest.TestCase):
     def setUp(self):
         self.reference = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])])
@@ -1213,15 +1234,90 @@ class MonitorTests(unittest.TestCase):
         with self.assertRaisesRegex(NUMERICS.NumericsFailure, "sampled different"):
             NUMERICS.judge_monitors(self.reference, other_sample, 1.0, 1.0)
 
-    def test_a_missing_layer_or_expert_is_refused(self):
+    def test_a_missing_layer_is_refused_and_a_missing_expert_is_reported(self):
         missing_expert = json.loads(json.dumps(self.reference))
         missing_expert["layers"][0]["experts"].pop()
-        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "same experts"):
-            NUMERICS.judge_monitors(self.reference, missing_expert, 1.0, 1.0)
+        result = NUMERICS.judge_monitors(self.reference, missing_expert, 0.05, 0.05)
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["routing"]["layers_differing"], 1)
+        self.assertEqual(result["routing"]["experts_unshared"], 1)
+        self.assertEqual(result["routing"]["reference_only"], 1)
+        self.assertEqual(result["routing"]["candidate_only"], 0)
+        self.assertEqual(result["routing"]["per_layer"][0]["reference_only"], [1])
+        markdown = NUMERICS.render_monitors(result)
+        self.assertIn("routing: 1 of 1 layer(s)", markdown)
+        self.assertIn("layer 0: reference only [1]", markdown)
         missing_layer = json.loads(json.dumps(self.reference))
         missing_layer["layers"].append(dict(missing_layer["layers"][0], layer=1))
         with self.assertRaisesRegex(NUMERICS.NumericsFailure, "same layers"):
             NUMERICS.judge_monitors(self.reference, missing_layer, 1.0, 1.0)
+
+    def test_an_unshared_expert_on_every_layer_passes_and_is_reported(self):
+        # The router may send a row to a different expert on a slightly different hidden state.
+        # That is a measured fact about the candidate, not a refusal: the shared expert still
+        # matches and the pair is judged on the bars.
+        reference = monitor_layers_dump(
+            [
+                monitor_layer(0, [1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])]),
+                monitor_layer(1, [2.0, 1.0], [(2, [2.0, 0.0]), (3, [0.0, 1.0])]),
+            ]
+        )
+        candidate = monitor_layers_dump(
+            [
+                monitor_layer(0, [1.0, 2.0], [(0, [1.0, 0.0]), (4, [0.0, 2.0])]),
+                monitor_layer(1, [2.0, 1.0], [(2, [2.0, 0.0]), (5, [0.0, 1.0])]),
+            ]
+        )
+        result = NUMERICS.judge_monitors(reference, candidate, 1e-3, 1e-3)
+        self.assertTrue(result["pass"], result["failures"])
+        routing = result["routing"]
+        self.assertEqual(routing["layers_differing"], 2)
+        self.assertEqual(routing["experts_unshared"], 4)
+        self.assertEqual(routing["reference_only"], 2)
+        self.assertEqual(routing["candidate_only"], 2)
+        self.assertEqual(routing["experts_shared"], 2)
+        self.assertEqual(
+            [(layer["layer"], layer["shared"], layer["reference_only"], layer["candidate_only"])
+             for layer in routing["per_layer"]],
+            [(0, 1, [1], [4]), (1, 1, [3], [5])],
+        )
+        self.assertEqual(result["maxima"]["layer"], 0.0)
+        self.assertEqual(result["maxima"]["expert"], 0.0)
+        markdown = NUMERICS.render_monitors(result)
+        self.assertIn("PASS monitors", markdown)
+        self.assertIn("2 of 2 layer(s) routed a row to a different expert", markdown)
+        self.assertIn("4 expert(s) unshared", markdown)
+        self.assertIn("layer 0: reference only [1]; candidate only [4]", markdown)
+        self.assertIn("layer 1: reference only [3]; candidate only [5]", markdown)
+        self.assertEqual(json.loads(json.dumps(result))["routing"]["layers_differing"], 2)
+
+    def test_the_bars_still_fail_over_the_shared_experts(self):
+        candidate = monitor_dump([1.0, 2.0], [(0, [1.2, 0.0]), (2, [0.0, 2.0])])
+        result = NUMERICS.judge_monitors(self.reference, candidate, 1.0, 0.05)
+        self.assertFalse(result["pass"])
+        self.assertTrue(result["layers"][0]["ok"])
+        self.assertEqual(len(result["failures"]), 1)
+        self.assertIn("layer 0 expert 0", result["failures"][0])
+        self.assertNotIn("expert 1", result["failures"][0])
+        self.assertNotIn("expert 2", result["failures"][0])
+        self.assertEqual(result["routing"]["experts_unshared"], 2)
+        self.assertEqual(
+            [expert["expert"] for expert in result["layers"][0]["experts"]], [0]
+        )
+
+    def test_a_layer_bar_still_fails_beside_a_routing_divergence(self):
+        candidate = monitor_dump([1.2, 2.0], [(0, [1.0, 0.0]), (2, [0.0, 2.0])])
+        result = NUMERICS.judge_monitors(self.reference, candidate, 0.05, 1.0)
+        self.assertFalse(result["pass"])
+        self.assertFalse(result["layers"][0]["ok"])
+        self.assertTrue(any("layer 0:" in failure for failure in result["failures"]))
+        self.assertEqual(result["routing"]["layers_differing"], 1)
+
+    def test_an_undefined_relative_error_is_still_refused(self):
+        reference = monitor_dump([1.0, 2.0], [(0, [0.0, 0.0]), (1, [0.0, 2.0])])
+        candidate = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])])
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "all zeros"):
+            NUMERICS.judge_monitors(reference, candidate, 1.0, 1.0)
 
     def test_a_malformed_dump_is_refused(self):
         for mutate, needle in [
@@ -1270,7 +1366,11 @@ class MonitorTests(unittest.TestCase):
             result = json.loads(result_path.read_text())
         self.assertFalse(result["pass"])
         self.assertEqual(result["schema"], NUMERICS.MONITOR_RESULT_SCHEMA)
+        self.assertEqual(result["routing"]["layers_differing"], 0)
+        self.assertEqual(result["routing"]["experts_unshared"], 0)
+        self.assertAlmostEqual(result["maxima"]["layer"], 0.2 / math.sqrt(5.0), places=15)
         self.assertIn("FAIL monitors", out.getvalue())
+        self.assertIn("routing:", out.getvalue())
 
 
 def synthetic_text_reference(text: str = "abc") -> dict:

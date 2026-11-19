@@ -2577,7 +2577,15 @@ def relative_error(reference: list[float], candidate: list[float], origin: str) 
 
 
 def judge_monitors(reference: dict, candidate: dict, layer_bar: float, expert_bar: float) -> dict:
-    """Compare a candidate forward's sample with the reference forward's, per layer and expert."""
+    """Compare a candidate forward's sample with the reference forward's, per layer and per shared
+    expert.
+
+    A router is not arithmetic: a slightly different hidden state can change which experts a row
+    reaches, and that is a measured fact about the candidate, not a reason to refuse the pair.
+    Each layer's experts are intersected; the experts only one dump holds are counted and named,
+    and the expert bar is judged over the ones both hold. The layer bar is always judged, and the
+    exit code follows the bars alone.
+    """
     if not math.isfinite(layer_bar) or layer_bar <= 0.0:
         raise NumericsFailure(f"--layer-bar {layer_bar}: a bar must be finite and positive")
     if not math.isfinite(expert_bar) or expert_bar <= 0.0:
@@ -2601,27 +2609,49 @@ def judge_monitors(reference: dict, candidate: dict, layer_bar: float, expert_ba
             "the two dumps do not hold the same layers: "
             f"reference {sorted(reference_layers)}, candidate {sorted(candidate_layers)}"
         )
-    failures, results = [], []
+    failures, results, routing_per_layer = [], [], []
+    layers_differing = 0
+    experts_unshared = 0
+    reference_only_total = 0
+    candidate_only_total = 0
+    experts_shared = 0
+    max_layer = 0.0
+    max_expert = None
     for number in sorted(reference_layers):
         left, right = reference_layers[number], candidate_layers[number]
         layer_error = relative_error(left["values"], right["values"], f"layer {number}")
+        max_layer = max(max_layer, layer_error)
         layer_ok = layer_error <= layer_bar
         if not layer_ok:
             failures.append(f"layer {number}: {layer_error:.6e} > layer bar {layer_bar:.6e}")
         reference_experts = {expert["expert"]: expert for expert in left["experts"]}
         candidate_experts = {expert["expert"]: expert for expert in right["experts"]}
-        if reference_experts.keys() != candidate_experts.keys():
-            raise NumericsFailure(
-                f"layer {number}: the two dumps do not hold the same experts: "
-                f"reference {sorted(reference_experts)}, candidate {sorted(candidate_experts)}"
-            )
+        shared = sorted(reference_experts.keys() & candidate_experts.keys())
+        reference_only = sorted(reference_experts.keys() - candidate_experts.keys())
+        candidate_only = sorted(candidate_experts.keys() - reference_experts.keys())
+        unshared = len(reference_only) + len(candidate_only)
+        if unshared:
+            layers_differing += 1
+            experts_unshared += unshared
+            reference_only_total += len(reference_only)
+            candidate_only_total += len(candidate_only)
+        experts_shared += len(shared)
+        routing_per_layer.append(
+            {
+                "layer": number,
+                "shared": len(shared),
+                "reference_only": reference_only,
+                "candidate_only": candidate_only,
+            }
+        )
         experts, worst = [], None
-        for expert in sorted(reference_experts):
+        for expert in shared:
             error = relative_error(
                 reference_experts[expert]["values"],
                 candidate_experts[expert]["values"],
                 f"layer {number} expert {expert}",
             )
+            max_expert = error if max_expert is None else max(max_expert, error)
             ok = error <= expert_bar
             if not ok:
                 failures.append(
@@ -2635,6 +2665,9 @@ def judge_monitors(reference: dict, candidate: dict, layer_bar: float, expert_ba
                 "layer": number,
                 "rel_error": layer_error,
                 "ok": layer_ok,
+                "shared_experts": len(shared),
+                "reference_only": reference_only,
+                "candidate_only": candidate_only,
                 "worst_expert": worst,
                 "experts": experts,
             }
@@ -2645,6 +2678,15 @@ def judge_monitors(reference: dict, candidate: dict, layer_bar: float, expert_ba
         "probe": reference["probe"],
         "sample": reference["sample"],
         "bars": {"layer": layer_bar, "expert": expert_bar},
+        "routing": {
+            "layers_differing": layers_differing,
+            "experts_unshared": experts_unshared,
+            "reference_only": reference_only_total,
+            "candidate_only": candidate_only_total,
+            "experts_shared": experts_shared,
+            "per_layer": routing_per_layer,
+        },
+        "maxima": {"layer": max_layer, "expert": max_expert},
         "layers": results,
         "failures": failures,
         "pass": not failures,
@@ -2652,27 +2694,51 @@ def judge_monitors(reference: dict, candidate: dict, layer_bar: float, expert_ba
 
 
 def render_monitors(result: dict) -> str:
+    routing = result["routing"]
+    maxima = result["maxima"]
     lines = [
         f"monitors: {result['model']}, probe {result['probe']['name']!r}, "
         f"{len(result['layers'])} layer(s), sample {len(result['sample']['indices'])} of "
         f"{result['sample']['width']} values",
+        f"routing: {routing['layers_differing']} of {len(result['layers'])} layer(s) routed a row "
+        f"to a different expert; {routing['experts_unshared']} expert(s) unshared "
+        f"({routing['reference_only']} reference-only, {routing['candidate_only']} "
+        f"candidate-only), {routing['experts_shared']} shared expert(s) judged",
         "",
-        "| layer | relative error | layer bar | worst expert | worst expert error | expert bar |",
-        "| --: | --: | --: | --: | --: | --: |",
+        "| layer | relative error | layer bar | shared experts | unshared | worst expert | "
+        "worst expert error | expert bar |",
+        "| --: | --: | --: | --: | --: | --: | --: | --: |",
     ]
     for layer in result["layers"]:
         worst = layer["worst_expert"]
         worst_text = "-" if worst is None else f"{worst['expert']}"
         worst_error = "-" if worst is None else f"{worst['rel_error']:.3e}"
+        unshared = len(layer["reference_only"]) + len(layer["candidate_only"])
         lines.append(
             f"| {layer['layer']} | {layer['rel_error']:.3e} | {result['bars']['layer']:.3e} | "
-            f"{worst_text} | {worst_error} | {result['bars']['expert']:.3e} |"
+            f"{layer['shared_experts']} | {unshared} | {worst_text} | {worst_error} | "
+            f"{result['bars']['expert']:.3e} |"
         )
+    differing = [
+        layer
+        for layer in result["layers"]
+        if layer["reference_only"] or layer["candidate_only"]
+    ]
+    if differing:
+        lines.append("")
+        lines.append("routing differences (the shared experts are what the expert bar judges):")
+        for layer in differing:
+            reference_only = layer["reference_only"] or "-"
+            candidate_only = layer["candidate_only"] or "-"
+            lines.append(
+                f"  layer {layer['layer']}: reference only {reference_only}; "
+                f"candidate only {candidate_only}"
+            )
     lines.append("")
     if result["pass"]:
         lines.append(
-            f"PASS monitors: every layer is within {result['bars']['layer']:.3e} and every routed "
-            f"expert within {result['bars']['expert']:.3e} of the reference forward."
+            f"PASS monitors: every layer is within {result['bars']['layer']:.3e} and every shared "
+            f"routed expert within {result['bars']['expert']:.3e} of the reference forward."
         )
     else:
         lines.append(f"FAIL monitors: {len(result['failures'])} bar(s) exceeded")
