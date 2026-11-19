@@ -765,10 +765,14 @@ mod tests {
     /// ledger and the path cannot disagree about whether GLM drafts through the runtime.
     #[test]
     fn the_walk_declares_no_drafter_while_it_has_no_round_path() {
-        assert!(
-            !<<GlmWalk as Walk>::Drafter as sparkflash_runtime::Drafter<GlmWalk>>::PRESENT,
-            "the token path does not draft; a drafter name here would be the loaded gun"
-        );
+        // The assertion is a compile-time fact; putting it in a const block keeps it a gate
+        // without tripping clippy's constant-assertion lint on a runtime `assert!`.
+        const {
+            assert!(
+                !<<GlmWalk as Walk>::Drafter as sparkflash_runtime::Drafter<GlmWalk>>::PRESENT,
+                "the token path does not draft; a drafter name here would be the loaded gun"
+            );
+        }
         let ledger = ledger_for::<GlmWalk>();
         assert!(
             matches!(ledger.mode(Strategy::Drafting), Mode::Off(_)),

@@ -204,12 +204,21 @@ things the drafting contract must settle, and exposed a hole in the guard:
   carries a draft head may not name `Absent`.
 * **A one-row pass must not append drafts.** `Walk`'s contract says a token pass is one row a
   member; a walk that drafts inside it changes the shape the runtime reasons about.
-* **The round cannot be copied.** GLM's walk copy differed from the served one in three places:
-  lone-request depth went through `share_rows` instead of the arm's own depth; with
-  `SPARKFLASH_JOINT_ROUNDS=off` it still verified everyone in one batch where the served arm and
-  `rounds.rs:32-34` run each lane alone; and more than eight members reached
-  `forward_batch_greedy` with more than `MAX_ROWS` rows because `max_batch` reports the prompt
-  chunk. Each is a policy the `Drafter` contract must name, not inherit by accident.
+* **The round cannot be copied.** GLM's walk copy differed from the served one in three places,
+  each confirmed against the old code and each a policy the `Drafter` contract must name rather
+  than inherit by accident:
+  * a lone member truncated the drafter's own depth through `share_rows`; the served arm ran the
+    drafter's depth with no row share (`serve.rs:980`). Rule: one member verifies the drafter's
+    own depth.
+  * with `SPARKFLASH_JOINT_ROUNDS=off` the copy still issued one `verify_batch` over every
+    member; the served arm ran each lane's round alone (`serve.rs:273-304`, `rounds.rs:32-34`).
+    Rule: off means each lane alone, and on Qwen off means no drafting at all (`fusion.rs:186-189`).
+  * more than eight members: `Runtime::max_batch` reports `Limits.rows` (the 4096-row chunk)
+    where `GlmFusion::max_batch` reported `MAX_ROWS` (8). The rank does not fail — `run_batch`
+    splits rows into `MAX_ROWS`-row steps — so the change is the engine-level member cap, which
+    matters only for a drafting walk because `verify_batch` refuses more than `MAX_ROWS` rows in
+    one verify. Rule: a drafting walk's member cap is the rank's 8, or the contract splits the
+    batch into verify-sized groups and commits each before the next step.
 * **The hooks belong on `Drafter`, as required methods.** `Walk::ready` and `Walk::speculation`
   default to false and zero, so a drafting arm that forgets them silently loses multi-token runs
   or reports nothing — the same class of silent default the plan exists to remove. Putting them
