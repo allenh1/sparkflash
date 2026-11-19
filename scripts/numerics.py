@@ -1891,7 +1891,12 @@ def main(argv: list[str]) -> int:
     coverage_parser = commands.add_parser("coverage", help="judge a coverage dump against a model's expert layout")
     coverage_parser.add_argument("--dump", required=True, type=Path)
     coverage_parser.add_argument("--layout", type=Path, help="the model's expert layout; looked up by model by default")
-    coverage_parser.add_argument("--min-inputs", type=int, default=1, help="the coverage suite's input count")
+    coverage_parser.add_argument(
+        "--min-inputs",
+        required=True,
+        type=int,
+        help="the coverage suite's declared input count; a dump must name at least this many",
+    )
 
     monitors_parser = commands.add_parser("monitors", help="compare a candidate monitor dump with the reference forward")
     monitors_parser.add_argument("--reference", required=True, type=Path)

@@ -252,9 +252,9 @@ python3 scripts/numerics.py coverage --dump numerics/coverage/glm53-tp4.json --m
 The command refuses a dump whose schema or model is wrong, whose model has no committed layout,
 whose layer list omits, repeats or invents a layer, whose hit list does not have exactly one
 non-negative integer per routed expert, whose dense layer carries hits, whose routed expert has
-zero hits, or that names fewer distinct inputs than the declared coverage suite (`--min-inputs`).
-It prints the per-layer hit count and the min/max per layer, and exits non-zero on the first
-refusal.
+zero hits, or that names fewer distinct inputs than the required `--min-inputs` declaration of
+the coverage suite. It prints the per-layer hit count and the min/max per layer, and exits
+non-zero on the first refusal.
 
 #### The monitor dump
 
