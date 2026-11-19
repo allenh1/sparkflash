@@ -64,10 +64,14 @@ declaration_check = true
 coverage_slots = 0.93
 # Inputs that reach at least `coverage_slots` of the routed slots, with the per-layer hit counts to
 # prove it. `scripts/numerics.py coverage --dump ... --min-inputs N` judges one against
-# numerics/layouts/. False because no real dump is committed yet. It turns true only with a
-# reviewed edit that also names the committed dump below; `scripts/numerics.py ci` then judges that
-# dump at `coverage_slots` and fails a true flag whose dump is missing or below the bar.
-coverage = false
+# numerics/layouts/. True from 2026-11-19: the dump named below is Qwen3.8 world 1's, accumulated
+# by the measured sweep (`coverage-sweep`) to 24,494 of 24,576 slots (99.67%) over 416 inputs,
+# from 29.04% at the start of the sweep; the corpus tool kept 120 of 256 candidates. `ci` judges
+# the named dump at `coverage_slots` and fails a true flag whose dump is missing or below the bar.
+coverage = true
+# The evidence the flag names. A path under numerics/; the model's layout must be committed under
+# numerics/layouts/.
+coverage_dump = "numerics/coverage/qwen38-world1.json"
 # The committed dump the true `coverage` flag rests on, relative to the repository root. It is
 # omitted while the flag is false (a false flag makes no claim); turning the flag on requires this
 # pointer and the dump it names, in the same reviewed change. Its model must have a committed
