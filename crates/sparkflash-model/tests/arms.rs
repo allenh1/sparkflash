@@ -31,9 +31,11 @@ use sparkflash_model::{ARMS, ModelProfile, Strategy, arm_for_weights};
 /// plus the one `env::var_os` in Qwen's test helper) and are asserted exactly so a new read
 /// cannot hide behind the exception.
 const ENV_READ_EXCEPTIONS: &[(&str, usize)] = &[
-    // The generated conformance checks name the dense arm's synthetic checkpoint by this
-    // variable; it is the check's fixture, not a served setting, so it stays out of the profile.
-    ("sparkflash-model-dense", 1),
+    // The generated conformance checks name the dense arm's synthetic checkpoint by
+    // SPARKFLASH_CONFORMANCE_CHECKPOINT and the tokenizer it is written from by
+    // SPARKFLASH_TOKENIZER_DIR; both are the check's fixture, not a served setting, so they stay
+    // out of the profile.
+    ("sparkflash-model-dense", 2),
     ("sparkflash-model-glm5-next", 2),
     ("sparkflash-model-inkling2", 20),
     ("sparkflash-model-qwen4-exp", 2),

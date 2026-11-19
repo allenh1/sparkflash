@@ -395,9 +395,123 @@ mod tests {
 
     use super::*;
 
-    /// The dense fixture: the checkpoint `scripts/dense-synthetic-checkpoint.py` writes, named
-    /// by `SPARKFLASH_CONFORMANCE_CHECKPOINT`. A missing path is a named fixture error, never a
-    /// skipped check.
+    /// The workspace root, without the `..` components a path from the crate directory would
+    /// print.
+    fn dense_workspace_root() -> std::path::PathBuf {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        std::fs::canonicalize(&root).unwrap_or(root)
+    }
+
+    /// The directory the dense conformance checkpoint lives in when
+    /// `SPARKFLASH_CONFORMANCE_CHECKPOINT` is unset: the one `scripts/onboard-gate.sh dense`
+    /// writes, so a direct `cargo test` and the script share one cache.
+    fn dense_fixture_directory() -> std::path::PathBuf {
+        dense_workspace_root().join("target/conformance/dense-synthetic")
+    }
+
+    /// The tokenizer the synthetic checkpoint is written from.
+    fn dense_fixture_tokenizer() -> std::path::PathBuf {
+        std::env::var_os("SPARKFLASH_TOKENIZER_DIR").map_or_else(
+            || dense_workspace_root().join("reference"),
+            std::path::PathBuf::from,
+        )
+    }
+
+    /// The exact command that writes the dense conformance checkpoint at `out`.
+    ///
+    /// Every fixture error names it, so a host that cannot write the checkpoint is told what to
+    /// run instead of what switch it forgot.
+    fn dense_fixture_command(tokenizer: &std::path::Path, out: &std::path::Path) -> String {
+        format!(
+            "python3 {} {} {} --layers 2 --hidden 1024 --intermediate 2816 --context 512",
+            dense_workspace_root()
+                .join("scripts/dense-synthetic-checkpoint.py")
+                .display(),
+            tokenizer.display(),
+            out.display()
+        )
+    }
+
+    /// Whether `path` holds the config and weights the fixture opens.
+    fn dense_fixture_is_written(path: &std::path::Path) -> bool {
+        path.join("config.json").is_file() && path.join("model.safetensors").is_file()
+    }
+
+    /// Writes the dense conformance checkpoint with `scripts/dense-synthetic-checkpoint.py`.
+    ///
+    /// The writer stages into a sibling directory and publishes it by rename, so generated
+    /// checks that boot the fixture in parallel never open a half-written checkpoint. Writing it
+    /// needs no device; the checks that boot it do.
+    fn write_dense_fixture(path: &std::path::Path) -> Result<(), String> {
+        // The generated checks run in parallel by default, so the first check through writes the
+        // checkpoint and the rest wait here and find it: one Python run, not six.
+        static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = WRITE.lock().unwrap_or_else(|poison| poison.into_inner());
+        if dense_fixture_is_written(path) {
+            return Ok(());
+        }
+        let tokenizer = dense_fixture_tokenizer();
+        let command = dense_fixture_command(&tokenizer, path);
+        if !tokenizer.join("tokenizer.json").is_file() {
+            return Err(format!(
+                "no tokenizer at {} (set SPARKFLASH_TOKENIZER_DIR); write the checkpoint with `{command}`",
+                tokenizer.display()
+            ));
+        }
+        let staged = path.with_file_name(format!(
+            "{}-{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&staged);
+        let output = std::process::Command::new("python3")
+            .arg(dense_workspace_root().join("scripts/dense-synthetic-checkpoint.py"))
+            .arg(&tokenizer)
+            .arg(&staged)
+            .args([
+                "--layers",
+                "2",
+                "--hidden",
+                "1024",
+                "--intermediate",
+                "2816",
+                "--context",
+                "512",
+            ])
+            .output()
+            .map_err(|error| {
+                format!("python3 could not run ({error}); write the checkpoint with `{command}`")
+            })?;
+        if !output.status.success() {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(format!(
+                "`{command}` failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        match std::fs::rename(&staged, path) {
+            Ok(()) => Ok(()),
+            // Another check, or another test process, published the same fixture first.
+            Err(_) if dense_fixture_is_written(path) => {
+                let _ = std::fs::remove_dir_all(&staged);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staged);
+                Err(format!(
+                    "the checkpoint wrote to {} but could not be published at {} ({error})",
+                    staged.display(),
+                    path.display()
+                ))
+            }
+        }
+    }
+
+    /// The dense fixture: the checkpoint `scripts/dense-synthetic-checkpoint.py` writes. When
+    /// `SPARKFLASH_CONFORMANCE_CHECKPOINT` is unset the fixture writes it into the same cache
+    /// directory `scripts/onboard-gate.sh dense` uses and names the path; a named path that is
+    /// not a checkpoint is a fixture error that names the exact command which writes one. A
+    /// missing fixture is never a skipped check.
     impl WalkFixture for DenseWalk {
         fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
             if world > 1 {
@@ -406,18 +520,52 @@ mod tests {
                     "the dense fixture is one rank; TP 2 and TP 4 need a group",
                 ));
             }
-            let path = std::env::var("SPARKFLASH_CONFORMANCE_CHECKPOINT").map_err(|_| {
-                BackendError::new(
+            let path = match std::env::var_os("SPARKFLASH_CONFORMANCE_CHECKPOINT") {
+                Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
+                _ => {
+                    let path = dense_fixture_directory();
+                    if !dense_fixture_is_written(&path) {
+                        write_dense_fixture(&path)
+                            .map_err(|error| BackendError::new("fixture", error))?;
+                    }
+                    eprintln!(
+                        "dense conformance: using the synthetic checkpoint at {} (SPARKFLASH_CONFORMANCE_CHECKPOINT is unset)",
+                        path.display()
+                    );
+                    path
+                }
+            };
+            let command = dense_fixture_command(&dense_fixture_tokenizer(), &path);
+            if !dense_fixture_is_written(&path) {
+                return Err(BackendError::new(
                     "fixture",
-                    "dense needs SPARKFLASH_CONFORMANCE_CHECKPOINT; scripts/onboard-gate.sh \
-                     dense writes one with scripts/dense-synthetic-checkpoint.py",
-                )
-            })?;
-            let path = std::path::Path::new(&path);
-            let architecture = sparkflash_model::Architecture::from_checkpoint_dir(path)
-                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
-            let source = sparkflash_weights::safetensors::open_checkpoint(path)
-                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+                    format!(
+                        "the dense conformance checkpoint at {} is missing its config.json or model.safetensors; write it with `{command}`",
+                        path.display()
+                    ),
+                ));
+            }
+            let architecture =
+                sparkflash_model::Architecture::from_checkpoint_dir(&path).map_err(|error| {
+                    BackendError::new(
+                        "fixture",
+                        format!(
+                            "the dense conformance checkpoint at {} does not open: {error}; write it with `{command}`",
+                            path.display()
+                        ),
+                    )
+                })?;
+            let source = sparkflash_weights::safetensors::open_checkpoint(&path).map_err(
+                |error| {
+                    BackendError::new(
+                        "fixture",
+                        format!(
+                            "the dense conformance checkpoint at {} does not open: {error}; write it with `{command}`",
+                            path.display()
+                        ),
+                    )
+                },
+            )?;
             let descriptor = sparkflash_model::ModelDescriptor::from_architecture(
                 "dense-conformance",
                 &architecture,
@@ -463,6 +611,35 @@ mod tests {
         }
     }
 
+    /// The fixture writes its own checkpoint when `SPARKFLASH_CONFORMANCE_CHECKPOINT` is unset,
+    /// so the direct `cargo test -p sparkflash-model-dense --lib conformance:: -- --ignored`
+    /// works without an operator remembering a fixture first. That is exactly the checklist item
+    /// `docs/engine/04-onboarding.md` phase 8 removes, and it is the rule the device window
+    /// tripped on: the checks panicked instead of writing the checkpoint the script knows how
+    /// to write.
+    ///
+    /// This half is CPU-only: it writes the checkpoint and reads its architecture back without
+    /// opening a device, so it runs on a host with no GPU (and skips where python3 does not).
+    #[test]
+    fn the_dense_fixture_writes_itself_on_the_cpu() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("python3 is unavailable; skipping the dense fixture writer check");
+            return;
+        }
+        let path = dense_fixture_directory();
+        if !dense_fixture_is_written(&path) {
+            write_dense_fixture(&path).expect("the dense synthetic checkpoint writes");
+        }
+        assert!(dense_fixture_is_written(&path), "{}", path.display());
+        let architecture = sparkflash_model::Architecture::from_checkpoint_dir(&path)
+            .expect("the written checkpoint config parses");
+        assert_eq!(architecture.hidden_size, 1024);
+        assert_eq!(architecture.layers.len(), 2);
+    }
     #[test]
     fn every_pass_routes_to_the_dense_policy() {
         let policy = Some(WidePolicy::DENSE);

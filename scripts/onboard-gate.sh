@@ -23,8 +23,9 @@
 # entry, exactly as docs/engine/04-onboarding.md mechanism 6 says.
 #
 # The conformance checks boot the arm's own fixture, not a served server:
-#   dense     SPARKFLASH_CONFORMANCE_CHECKPOINT, or a synthetic checkpoint this script writes
-#             with scripts/dense-synthetic-checkpoint.py from SPARKFLASH_TOKENIZER_DIR
+#   dense     SPARKFLASH_CONFORMANCE_CHECKPOINT, or the synthetic checkpoint this script writes
+#             with scripts/dense-synthetic-checkpoint.py from SPARKFLASH_TOKENIZER_DIR. A direct
+#             cargo test writes the same checkpoint to the same path when the switch is unset.
 #   GLM       the synthetic small checkpoint the arm writes
 #   Qwen      the synthetic tiny checkpoint the arm writes
 #   Inkling   the tiny source fixture the device tests share
@@ -182,8 +183,12 @@ fi
 NUMERICS=(python3 "$ROOT/scripts/numerics.py" capture --url "$URL" --out "$REFERENCE" --evidence "$EVIDENCE")
 CONFORMANCE=(cargo test -p "$CRATE" --lib "conformance::" -- --ignored --nocapture --test-threads=1)
 
+# The direct test invocation writes this checkpoint too (WalkFixture for DenseWalk), so a
+# partial or missing directory is rewritten here rather than left to the checks. A directory
+# that already holds both files is reused, which is what keeps repeated gate runs cheap.
 FIXTURE_CMD=()
-if [ "$CRATE" = "sparkflash-model-dense" ] && [ ! -d "$FIXTURE" ]; then
+if [ "$CRATE" = "sparkflash-model-dense" ] &&
+    { [ ! -f "$FIXTURE/config.json" ] || [ ! -f "$FIXTURE/model.safetensors" ]; }; then
     TOKENIZER="${SPARKFLASH_TOKENIZER_DIR:-$ROOT/reference}"
     FIXTURE_CMD=(python3 "$ROOT/scripts/dense-synthetic-checkpoint.py" "$TOKENIZER" "$FIXTURE"
         --layers 2 --hidden 1024 --intermediate 2816 --context 512)
