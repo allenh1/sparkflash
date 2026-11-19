@@ -21,7 +21,8 @@
 //!
 //! Phase 7 converts one arm at a time. [EXEMPTIONS] is the measured list: one line per file,
 //! its site count and why the string is still there. A conversion deletes lines and the test
-//! fails until the table agrees, so the ban tightens with each arm rather than drifting.
+//! fails until the table agrees, so the ban tightens with each arm rather than drifting. The
+//! remaining lines are DeepSeek's and the two loaders each converted arm keeps in Bound.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -91,10 +92,9 @@ const EXEMPTIONS: &[Exemption] = &[
     Exemption {
         crate_name: "sparkflash-model-glm5-next",
         file: "src/device.rs",
-        // Two more than before the walk moved onto `Runtime`: the runtime owns the
-        // strategy, and the arm's device file still binds the kernels it launches.
-        sites: 14,
-        why: "not converted yet: phase 7 runs by arm",
+        sites: 2,
+        why: "the two loaders in Bound: the catalogue and the image are checked once, and every \
+              launch in the crate holds the resolved handle",
     },
     Exemption {
         crate_name: "sparkflash-model-qwen4-exp",
@@ -125,7 +125,8 @@ const EXEMPTIONS: &[Exemption] = &[
         crate_name: "sparkflash-model-dory",
         file: "src/device.rs",
         sites: 4,
-        why: "not converted yet: phase 7 runs by arm",
+        why: "the two loaders in Bound: the catalogue and the image are checked once, and every \
+              launch in the crate holds the resolved handle",
     },
 ];
 

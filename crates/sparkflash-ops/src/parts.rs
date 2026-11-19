@@ -672,6 +672,8 @@ pub const CATALOGUE: &[PartKernel] = &[
             ),
             pre("glm_prefill_heads_bf16_mma", &[Precision::Bf16]),
             pre("glm_prefill_heads_fp8b128_mma", &[Precision::Fp8E4M3]),
+            // The chunk indexer's scores over f32 queries and pooled keys.
+            pre("glm_prefill_index_scores", &[Precision::F32]),
         ],
         false,
     ),
@@ -892,6 +894,9 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "q4e_gdn_recur",
                 &[Precision::Bf16, Precision::F32, Precision::Fp8E4M3],
             ),
+            // The same recurrence split over a head's value columns, for a KDA head whose
+            // whole state does not fit one block.
+            dec("q4e_gdn_recur_columns", &[Precision::Bf16]),
         ],
         false,
     ),
@@ -1058,6 +1063,38 @@ pub const CATALOGUE: &[PartKernel] = &[
             tc_tile("glm_prefill_fp8b128_mma", &[Precision::Fp8E4M3]),
             tc_tile("glm_prefill_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
             tc_tile("glm_prefill_q8_mma", &[Precision::Fp8E4M3]),
+            // The exact router and indexer parts, and the skinny BF16 part of at most four
+            // rows a block: f32 activations, BF16 weights, the prefill pass.
+            KernelSymbol::prefill(
+                "glm_prefill_exact_bf16",
+                &[Precision::Bf16],
+                ComputeClass::Row,
+                RowBand::ALL,
+            ),
+            KernelSymbol::prefill(
+                "glm_prefill_skinny_bf16_1",
+                &[Precision::Bf16],
+                ComputeClass::Row,
+                RowBand::ALL,
+            ),
+            KernelSymbol::prefill(
+                "glm_prefill_skinny_bf16_2",
+                &[Precision::Bf16],
+                ComputeClass::Row,
+                RowBand::ALL,
+            ),
+            KernelSymbol::prefill(
+                "glm_prefill_skinny_bf16_3",
+                &[Precision::Bf16],
+                ComputeClass::Row,
+                RowBand::ALL,
+            ),
+            KernelSymbol::prefill(
+                "glm_prefill_skinny_bf16_4",
+                &[Precision::Bf16],
+                ComputeClass::Row,
+                RowBand::ALL,
+            ),
         ],
         false,
     ),
@@ -1101,6 +1138,9 @@ pub const CATALOGUE: &[PartKernel] = &[
                 &[Precision::Bf16, Precision::F32],
             ),
             row_dec("q4e_gemv_tiled_e4m3_block", &[Precision::Fp8E4M3]),
+            // SLM's L2 prefetch hint over the next kernels' weights: no arithmetic, and it
+            // reads the same spans the projections do.
+            dec("q4e_prefetch_l2", &[Precision::F32]),
         ],
         false,
     ),
@@ -1831,6 +1871,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("q4d_topk_partial", &[Precision::Bf16, Precision::Fp8E4M3]),
             sym("q4d_topk_final", &[Precision::Bf16, Precision::Fp8E4M3]),
             sym("q4d_select", &[Precision::Bf16, Precision::Fp8E4M3]),
+            // The Inkling drafter's block attention reuses DFlash's span pair.
+            sym("q4d_attn_span_chunk", &[Precision::Bf16]),
+            sym("q4d_attn_span_merge", &[Precision::Bf16]),
         ],
         false,
     ),

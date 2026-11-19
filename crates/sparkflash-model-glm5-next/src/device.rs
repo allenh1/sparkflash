@@ -95,12 +95,15 @@ use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, HostMapped, Kernel,
     RunStream, SideStream, StreamEvent,
 };
-use sparkflash_kernels::images;
+use sparkflash_kernels::images::{self, Image};
 use sparkflash_kernels::lane_memory::{self, BackError, LanePlans, Layout, SequenceLanes};
 use sparkflash_model::{BackendError, Part, StepCost};
 use sparkflash_ops::OpPlan;
 use sparkflash_ops::calls::{self, Call, RmsNorm};
 use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
+use sparkflash_ops::formats::{
+    Bf16, F32 as F32Format, FormatKind, Fp8E4m3, Mat, Scales, Tensor, upload as upload_format,
+};
 use sparkflash_ops::gdn::{self, CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE};
 use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
@@ -109,11 +112,13 @@ use sparkflash_ops::gemv::{
 use sparkflash_ops::indexer::{IndexerPass, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS};
 use sparkflash_ops::moe::{MoePlanCall, combine_grid};
 use sparkflash_ops::packed::{self, Form, PackedSet, Placement};
+use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{host_sum, reduce_scatter, reduce_two_shot, takes_two_shots};
+use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 
 fn cubin_available() -> bool {
     !images::qwen4_exp_cubin().is_empty() && !images::glm_decode_cubin().is_empty()
@@ -476,99 +481,172 @@ fn append(into: &mut Vec<u8>, bytes: Vec<u8>) {
 /// one row and 102 against 81 at eight; the 288 x 4,096 router lost at every batch.
 const PACK_MIN_WEIGHTS: usize = 1 << 24;
 
+/// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
+/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
+/// than a name it looked up.
+#[derive(Clone, Copy)]
+struct Bound {
+    /// The loaded driver function.
+    kernel: Kernel,
+}
+
+impl Bound {
+    /// Whether the image exports the symbol and the catalogue carries it at this precision.
+    fn carried(image: Image, symbol: &'static str, precision: Precision) -> Result<(), String> {
+        if !image.exported_symbols().contains(&symbol) {
+            return Err(format!("{} does not export {symbol}", image.name()));
+        }
+        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
+            entry.image == image
+                && entry
+                    .symbols
+                    .iter()
+                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
+        });
+        if !carried {
+            return Err(format!(
+                "the catalogue carries no {symbol} in {} accepting {}",
+                image.name(),
+                precision.name()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve a symbol in an image at a precision and load it.
+    ///
+    /// # Errors
+    /// A symbol the image does not export, one the catalogue does not carry at this precision,
+    /// or the driver's load refusal.
+    fn new(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+    ) -> Result<Self, String> {
+        Self::carried(image, symbol, precision)?;
+        let (_, kernel) = cuda.load_named(cubin, symbol)?;
+        Ok(Self { kernel })
+    }
+
+    /// Self::new for a body loaded with a dynamic shared-memory reservation.
+    ///
+    /// # Errors
+    /// As Self::new, or the driver's attribute call.
+    fn shared(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+        shared_bytes: u32,
+    ) -> Result<Self, String> {
+        Self::carried(image, symbol, precision)?;
+        let (_, kernel) = cuda.load_named_shared(cubin, symbol, shared_bytes)?;
+        Ok(Self { kernel })
+    }
+}
+
+impl From<Bound> for Kernel {
+    fn from(bound: Bound) -> Self {
+        bound.kernel
+    }
+}
+
 /// The kernels a rank launches, by name from the pack's cubin.
 #[derive(Clone, Copy)]
 struct Kernels {
-    embed: Kernel,
-    argmax: Kernel,
+    embed: Bound,
+    argmax: Bound,
     /// [Self::argmax] that also reports the pick's softmax probability: an MTP draft's confidence.
-    argmax_prob: Kernel,
-    gemv_bf16: Kernel,
+    argmax_prob: Bound,
+    gemv_bf16: Bound,
     /// [Self::gemv_bf16] over a packed copy ([sparkflash_ops::packed]): the same sums.
-    gemv_packed: Kernel,
-    gemv_fp8: Kernel,
+    gemv_packed: Bound,
+    gemv_fp8: Bound,
     /// The E4M3 copy of the LM head drafts score with ([DeviceRank::draft_head]): its quantizer
     /// and its GEMV.
-    quantize_e4m3: Kernel,
-    gemv_e4m3: Kernel,
-    expert_fp8: Kernel,
-    mhc_in: Kernel,
-    mhc_post: Kernel,
-    sum_slots: Kernel,
-    rmsnorm: Kernel,
-    rmsnorm_rows: Kernel,
-    conv: Kernel,
-    kda_decay: Kernel,
-    recur: Kernel,
+    quantize_e4m3: Bound,
+    gemv_e4m3: Bound,
+    expert_fp8: Bound,
+    mhc_in: Bound,
+    mhc_post: Bound,
+    sum_slots: Bound,
+    rmsnorm: Bound,
+    rmsnorm_rows: Bound,
+    conv: Bound,
+    kda_decay: Bound,
+    recur: Bound,
     /// A bulk chunk's convolution and recurrence (Qwen's prefill image,
     /// kernels/qwen4_prefill_sm121.cu): the convolution a thread an output, then the history
     /// advanced, the token kernel's products in its order; the rows' normed q and k and beta,
     /// the scan with the state in registers, and the gated norm. The token kernels ([Self::conv],
     /// [Self::recur]) stay the decode and verify path, whose bits a replay is defined by.
-    conv_rows: Kernel,
-    conv_history: Kernel,
-    kda_prep: Kernel,
-    kda_scan: Kernel,
-    kda_gate: Kernel,
-    copy_flat: Kernel,
-    layer_norm: Kernel,
-    pool: Kernel,
-    index_scores: Kernel,
-    pick: Kernel,
+    conv_rows: Bound,
+    conv_history: Bound,
+    kda_prep: Bound,
+    kda_scan: Bound,
+    kda_gate: Bound,
+    copy_flat: Bound,
+    layer_norm: Bound,
+    pool: Bound,
+    index_scores: Bound,
+    pick: Bound,
     /// The absorbed MLA ([DeviceRank::dsa_attend]): the latent cache writer, the query's
     /// projection into the latent space, then the attention's logits, softmax, weighted latent
     /// and value projection.
-    mla_cache: Kernel,
-    mla_cache_fp8: Kernel,
-    mla_absorb: Kernel,
-    mla_scores: Kernel,
-    mla_softmax: Kernel,
-    mla_mix: Kernel,
-    mla_project: Kernel,
-    swiglu: Kernel,
-    router: Kernel,
-    combine: Kernel,
-    fold: Kernel,
-    prefetch_l2: Kernel,
+    mla_cache: Bound,
+    mla_cache_fp8: Bound,
+    mla_absorb: Bound,
+    mla_scores: Bound,
+    mla_softmax: Bound,
+    mla_mix: Bound,
+    mla_project: Bound,
+    swiglu: Bound,
+    router: Bound,
+    combine: Bound,
+    fold: Bound,
+    prefetch_l2: Bound,
     /// The bulk prefill image (kernels/glm_prefill_sm121.cu): dense block-scaled FP8 and BF16
     /// GEMMs (the BF16 one over the 128 x 256 tile, [WIDE_SHARED]), and the skinny projections.
     /// The padded routed-expert plan and its gather/SwiGLU/scatter are in the MoE image
     /// (kernels/glm_moe_sm121.cu).
-    prefill_dense_bf16: Kernel,
-    prefill_dense_fp8: Kernel,
+    prefill_dense_bf16: Bound,
+    prefill_dense_fp8: Bound,
     /// The same two GEMMs over the bf16 head of each activation alone, and the routed one.
-    prefill_dense_bf16_bf16a: Kernel,
-    prefill_dense_fp8_bf16a: Kernel,
+    prefill_dense_bf16_bf16a: Bound,
+    prefill_dense_fp8_bf16a: Bound,
     /// The FP8 tile's few-row form (kernels/glm_decode_sm121.cu), the decode path's body: one
     /// to eight rows, a row the prompt tile's bits over GLM's f32 128 x 128 block scales.
-    prefill_dense_fp8_rows: Kernel,
+    prefill_dense_fp8_rows: Bound,
     /// The bulk routed-expert image (kernels/glm_moe_sm121.cu): the padded plan, the
     /// gather/SwiGLU/scatter, and the gate/up and down MMAs over f32 and E4M3 activations.
-    prefill_moe_mma_bf16a: Kernel,
-    prefill_moe_plan: Kernel,
-    prefill_moe_mma: Kernel,
-    prefill_moe_swiglu: Kernel,
+    prefill_moe_mma_bf16a: Bound,
+    prefill_moe_plan: Bound,
+    prefill_moe_mma: Bound,
+    prefill_moe_swiglu: Bound,
     /// The checkpoint's dynamic activation scheme ([PrefillActivation::Fp8]): rows quantised per
     /// 128 columns, the SwiGLU into the down projection's codes, and the E4M3 x E4M3 dense and
     /// routed GEMMs over them.
-    prefill_quantise: Kernel,
-    prefill_moe_swiglu_q8: Kernel,
-    prefill_dense_q8: Kernel,
-    prefill_moe_q8: Kernel,
+    prefill_quantise: Bound,
+    prefill_moe_swiglu_q8: Bound,
+    prefill_dense_q8: Bound,
+    prefill_moe_q8: Bound,
     /// A BF16 part of at most 8 (i + 1) rows ([DeviceRank::bulk_gemm]'s mixers and gates).
-    prefill_skinny: [Kernel; 4],
+    prefill_skinny: [Bound; 4],
     /// The tiled GEMV's floats for a BF16 part it splits one round a block (the exact prefill's
     /// router and indexer parts, [DeviceRank::gemv_chunked]).
-    prefill_exact: Kernel,
+    prefill_exact: Bound,
     /// The chunk's MLA ([DeviceRank::bulk_attend]) from the bulk attention image
     /// (kernels/glm_attention_sm121.cu): the tensor-core sparse attention over the E4M3 latent
     /// (and over its bf16 heads alone), and the per-head GEMM of the absorbed query and the
     /// value projection.
-    prefill_mla_attend: Kernel,
-    prefill_index_scores: Kernel,
-    prefill_mla_attend_bf16a: Kernel,
-    prefill_heads_bf16: Kernel,
-    prefill_heads_fp8: Kernel,
+    prefill_mla_attend: Bound,
+    prefill_index_scores: Bound,
+    prefill_mla_attend_bf16a: Bound,
+    prefill_heads_bf16: Bound,
+    prefill_heads_fp8: Bound,
 }
 
 // SAFETY: a kernel is an immutable function handle loaded from the cubin. Every launch goes
@@ -578,35 +656,61 @@ unsafe impl Send for Kernels {}
 
 impl Kernels {
     fn load(cuda: &Cuda, head_dim: usize) -> Result<Self, String> {
-        let named = |name| {
-            cuda.load_named(embedded_cubin(), name)
-                .map(|(_, kernel)| kernel)
+        let token = |symbol: &'static str, precision: Precision| {
+            Bound::new(cuda, Image::Qwen4Exp, embedded_cubin(), symbol, precision)
         };
-        let decode = |name| {
-            cuda.load_named(embedded_glm_decode_cubin(), name)
-                .map(|(_, kernel)| kernel)
+        let decode = |symbol: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::GlmDecode,
+                embedded_glm_decode_cubin(),
+                symbol,
+                precision,
+            )
         };
         if embedded_glm_prefill_cubin().is_empty() {
             return Err("this build embeds no GLM bulk prefill cubin".to_owned());
         }
-        let prefill = |name| {
-            cuda.load_named(embedded_glm_prefill_cubin(), name)
-                .map(|(_, kernel)| kernel)
+        let prefill = |symbol: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::GlmPrefill,
+                embedded_glm_prefill_cubin(),
+                symbol,
+                precision,
+            )
         };
-        let prefill_q8 = |name| {
-            cuda.load_named_shared(embedded_glm_prefill_cubin(), name, Q8_SHARED)
-                .map(|(_, kernel)| kernel)
+        let prefill_q8 = |symbol: &'static str, precision: Precision| {
+            Bound::shared(
+                cuda,
+                Image::GlmPrefill,
+                embedded_glm_prefill_cubin(),
+                symbol,
+                precision,
+                Q8_SHARED,
+            )
         };
-        let prefill_wide = |name| {
-            cuda.load_named_shared(embedded_glm_prefill_cubin(), name, WIDE_SHARED)
-                .map(|(_, kernel)| kernel)
+        let prefill_wide = |symbol: &'static str, precision: Precision| {
+            Bound::shared(
+                cuda,
+                Image::GlmPrefill,
+                embedded_glm_prefill_cubin(),
+                symbol,
+                precision,
+                WIDE_SHARED,
+            )
         };
         if embedded_glm_moe_cubin().is_empty() {
             return Err("this build embeds no GLM routed-expert cubin".to_owned());
         }
-        let glm_moe = |name| {
-            cuda.load_named(embedded_glm_moe_cubin(), name)
-                .map(|(_, kernel)| kernel)
+        let glm_moe = |symbol: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::GlmMoe,
+                embedded_glm_moe_cubin(),
+                symbol,
+                precision,
+            )
         };
         // The routed-expert plan is the shared image (kernels/moe_plan_sm121.cu), not GLM's
         // own: Qwen's token path, this arm's bulk prefill and DeepSeek's bulk prefill run one
@@ -614,111 +718,140 @@ impl Kernels {
         if images::moe_plan_cubin().is_empty() {
             return Err("this build embeds no routed-expert plan cubin".to_owned());
         }
-        let plan = |name| {
-            cuda.load_named(images::moe_plan_cubin(), name)
-                .map(|(_, kernel)| kernel)
+        let plan = |symbol: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::MoePlan,
+                images::moe_plan_cubin(),
+                symbol,
+                precision,
+            )
         };
-        let glm_moe_q8 = |name| {
-            cuda.load_named_shared(embedded_glm_moe_cubin(), name, Q8_SHARED)
-                .map(|(_, kernel)| kernel)
+        let glm_moe_q8 = |symbol: &'static str, precision: Precision| {
+            Bound::shared(
+                cuda,
+                Image::GlmMoe,
+                embedded_glm_moe_cubin(),
+                symbol,
+                precision,
+                Q8_SHARED,
+            )
         };
         if embedded_glm_attention_cubin().is_empty() {
             return Err("this build embeds no GLM MLA attention cubin".to_owned());
         }
-        let attention = |name| {
-            cuda.load_named(embedded_glm_attention_cubin(), name)
-                .map(|(_, kernel)| kernel)
+        let attention = |symbol: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::GlmAttention,
+                embedded_glm_attention_cubin(),
+                symbol,
+                precision,
+            )
         };
         if embedded_scan_cubin().is_empty() {
             return Err("this build embeds no scan cubin for the bulk KDA scan".to_owned());
         }
-        let scan = |name| {
-            cuda.load_named(embedded_scan_cubin(), name)
-                .map(|(_, kernel)| kernel)
+        let scan = |symbol: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Scan,
+                embedded_scan_cubin(),
+                symbol,
+                precision,
+            )
         };
         if embedded_moe_cubin().is_empty() {
             return Err("this build embeds no Qwen4 MoE cubin for the routed combine".to_owned());
         }
-        let moe = |name| {
-            cuda.load_named(embedded_moe_cubin(), name)
-                .map(|(_, kernel)| kernel)
+        let moe = |symbol: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Moe,
+                embedded_moe_cubin(),
+                symbol,
+                precision,
+            )
         };
         if embedded_glm_decode_cubin().is_empty() {
             return Err("this build embeds no GLM decode/token cubin".to_owned());
         }
         // The recurrence stages a block's slice of a head's state in shared memory.
-        let (_, recur) = cuda.load_named_shared(
+        let recur = Bound::shared(
+            cuda,
+            Image::Qwen4Exp,
             embedded_cubin(),
             "q4e_gdn_recur_columns",
+            Precision::Bf16,
             (head_dim * head_dim / recur_parts(head_dim) * 4) as u32,
         )?;
         Ok(Self {
-            embed: named("q4e_embed")?,
-            argmax: named("q4e_argmax_slices")?,
-            argmax_prob: named("q4e_argmax_prob_slices")?,
-            gemv_bf16: decode("q4e_gemv_tiled_bf16_parts")?,
-            gemv_packed: decode("q4e_gemv_tiled_packed_parts")?,
-            gemv_fp8: decode("q4e_gemv_tiled_e4m3_block")?,
-            quantize_e4m3: named("q4e_quantize_e4m3_rows")?,
-            gemv_e4m3: named("q4e_gemv_tiled_e4m3")?,
-            expert_fp8: decode("q4e_expert_gemv_e4m3_block")?,
-            mhc_in: decode("q4e_mhc_in")?,
-            mhc_post: decode("q4e_mhc_post")?,
-            sum_slots: named("q4e_sum_slots")?,
-            rmsnorm: named("q4e_rmsnorm")?,
-            rmsnorm_rows: named("q4e_rmsnorm_rows")?,
-            conv: named("q4e_gdn_conv")?,
-            kda_decay: named("q4e_kda_decay")?,
+            embed: token("q4e_embed", Precision::Bf16)?,
+            argmax: token("q4e_argmax_slices", Precision::Bf16)?,
+            argmax_prob: token("q4e_argmax_prob_slices", Precision::Bf16)?,
+            gemv_bf16: decode("q4e_gemv_tiled_bf16_parts", Precision::Bf16)?,
+            gemv_packed: decode("q4e_gemv_tiled_packed_parts", Precision::Bf16)?,
+            gemv_fp8: decode("q4e_gemv_tiled_e4m3_block", Precision::Fp8E4M3)?,
+            quantize_e4m3: token("q4e_quantize_e4m3_rows", Precision::Bf16)?,
+            gemv_e4m3: token("q4e_gemv_tiled_e4m3", Precision::Fp8E4M3)?,
+            expert_fp8: decode("q4e_expert_gemv_e4m3_block", Precision::Fp8E4M3)?,
+            mhc_in: decode("q4e_mhc_in", Precision::Bf16)?,
+            mhc_post: decode("q4e_mhc_post", Precision::Bf16)?,
+            sum_slots: token("q4e_sum_slots", Precision::Bf16)?,
+            rmsnorm: token("q4e_rmsnorm", Precision::Bf16)?,
+            rmsnorm_rows: token("q4e_rmsnorm_rows", Precision::Bf16)?,
+            conv: token("q4e_gdn_conv", Precision::Bf16)?,
+            kda_decay: token("q4e_kda_decay", Precision::Bf16)?,
             recur,
-            conv_rows: scan("q4p_gdn_conv")?,
-            conv_history: scan("q4p_gdn_conv_state")?,
-            kda_prep: scan("q4p_kda_prep")?,
-            kda_scan: scan("q4p_kda_scan")?,
-            kda_gate: scan("q4p_gdn_gate")?,
-            copy_flat: named("q4e_copy_flat")?,
-            layer_norm: decode("q4e_layer_norm")?,
-            pool: decode("q4e_glm_pool")?,
-            index_scores: decode("q4e_glm_index_scores")?,
-            pick: decode("q4e_glm_pick")?,
-            mla_cache: decode("q4e_glm_mla_cache")?,
-            mla_cache_fp8: decode("q4e_glm_mla_cache_fp8")?,
-            mla_absorb: decode("q4e_glm_mla_absorb")?,
-            mla_scores: decode("q4e_glm_mla_scores")?,
-            mla_softmax: decode("q4e_glm_mla_softmax")?,
-            mla_mix: decode("q4e_glm_mla_mix")?,
-            mla_project: decode("q4e_glm_mla_project")?,
-            swiglu: decode("q4e_swiglu_limited")?,
-            router: decode("q4e_noaux_router")?,
-            combine: moe("q4e_moe_combine")?,
-            prefetch_l2: decode("q4e_prefetch_l2")?,
-            fold: named("q4e_fold_streams")?,
-            prefill_dense_bf16: prefill_wide("glm_prefill_bf16_wide")?,
-            prefill_dense_fp8: prefill("glm_prefill_fp8b128_mma")?,
-            prefill_dense_bf16_bf16a: prefill_wide("glm_prefill_bf16_wide_bf16a")?,
-            prefill_dense_fp8_bf16a: prefill("glm_prefill_fp8b128_mma_bf16a")?,
-            prefill_dense_fp8_rows: decode("glm_decode_fp8b128_rows")?,
-            prefill_moe_mma_bf16a: glm_moe("glm_moe_fp8b128_mma_bf16a")?,
-            prefill_moe_plan: plan("moe_plan")?,
-            prefill_moe_mma: glm_moe("glm_moe_fp8b128_mma")?,
-            prefill_moe_swiglu: glm_moe("glm_moe_swiglu")?,
+            conv_rows: scan("q4p_gdn_conv", Precision::Bf16)?,
+            conv_history: scan("q4p_gdn_conv_state", Precision::Bf16)?,
+            kda_prep: scan("q4p_kda_prep", Precision::Bf16)?,
+            kda_scan: scan("q4p_kda_scan", Precision::Bf16)?,
+            kda_gate: scan("q4p_gdn_gate", Precision::Bf16)?,
+            copy_flat: token("q4e_copy_flat", Precision::F32)?,
+            layer_norm: decode("q4e_layer_norm", Precision::Bf16)?,
+            pool: decode("q4e_glm_pool", Precision::Bf16)?,
+            index_scores: decode("q4e_glm_index_scores", Precision::Bf16)?,
+            pick: decode("q4e_glm_pick", Precision::Bf16)?,
+            mla_cache: decode("q4e_glm_mla_cache", Precision::Bf16)?,
+            mla_cache_fp8: decode("q4e_glm_mla_cache_fp8", Precision::Fp8E4M3)?,
+            mla_absorb: decode("q4e_glm_mla_absorb", Precision::Bf16)?,
+            mla_scores: decode("q4e_glm_mla_scores", Precision::Bf16)?,
+            mla_softmax: decode("q4e_glm_mla_softmax", Precision::Bf16)?,
+            mla_mix: decode("q4e_glm_mla_mix", Precision::Bf16)?,
+            mla_project: decode("q4e_glm_mla_project", Precision::Bf16)?,
+            swiglu: decode("q4e_swiglu_limited", Precision::Bf16)?,
+            router: decode("q4e_noaux_router", Precision::Bf16)?,
+            combine: moe("q4e_moe_combine", Precision::Bf16)?,
+            prefetch_l2: decode("q4e_prefetch_l2", Precision::F32)?,
+            fold: token("q4e_fold_streams", Precision::F32)?,
+            prefill_dense_bf16: prefill_wide("glm_prefill_bf16_wide", Precision::Bf16)?,
+            prefill_dense_fp8: prefill("glm_prefill_fp8b128_mma", Precision::Fp8E4M3)?,
+            prefill_dense_bf16_bf16a: prefill_wide("glm_prefill_bf16_wide_bf16a", Precision::Bf16)?,
+            prefill_dense_fp8_bf16a: prefill("glm_prefill_fp8b128_mma_bf16a", Precision::Fp8E4M3)?,
+            prefill_dense_fp8_rows: decode("glm_decode_fp8b128_rows", Precision::Fp8E4M3)?,
+            prefill_moe_mma_bf16a: glm_moe("glm_moe_fp8b128_mma_bf16a", Precision::Fp8E4M3)?,
+            prefill_moe_plan: plan("moe_plan", Precision::Bf16)?,
+            prefill_moe_mma: glm_moe("glm_moe_fp8b128_mma", Precision::Fp8E4M3)?,
+            prefill_moe_swiglu: glm_moe("glm_moe_swiglu", Precision::Bf16)?,
             // The dynamic activation quantiser stays in the prefill image: the dense q8 GEMM
             // reads it too (kernels/glm_prefill_sm121.cu).
-            prefill_quantise: prefill("glm_quantise_rows")?,
-            prefill_moe_swiglu_q8: glm_moe("glm_moe_swiglu_q8")?,
-            prefill_dense_q8: prefill_q8("glm_prefill_q8_mma")?,
-            prefill_moe_q8: glm_moe_q8("glm_moe_q8_mma")?,
+            prefill_quantise: prefill("glm_quantise_rows", Precision::F32)?,
+            prefill_moe_swiglu_q8: glm_moe("glm_moe_swiglu_q8", Precision::Bf16)?,
+            prefill_dense_q8: prefill_q8("glm_prefill_q8_mma", Precision::Fp8E4M3)?,
+            prefill_moe_q8: glm_moe_q8("glm_moe_q8_mma", Precision::Fp8E4M3)?,
             prefill_skinny: [
-                prefill("glm_prefill_skinny_bf16_1")?,
-                prefill("glm_prefill_skinny_bf16_2")?,
-                prefill("glm_prefill_skinny_bf16_3")?,
-                prefill("glm_prefill_skinny_bf16_4")?,
+                prefill("glm_prefill_skinny_bf16_1", Precision::Bf16)?,
+                prefill("glm_prefill_skinny_bf16_2", Precision::Bf16)?,
+                prefill("glm_prefill_skinny_bf16_3", Precision::Bf16)?,
+                prefill("glm_prefill_skinny_bf16_4", Precision::Bf16)?,
             ],
-            prefill_exact: prefill("glm_prefill_exact_bf16")?,
-            prefill_mla_attend: attention("glm_prefill_mla_attend")?,
-            prefill_index_scores: attention("glm_prefill_index_scores")?,
-            prefill_mla_attend_bf16a: attention("glm_prefill_mla_attend_bf16a")?,
-            prefill_heads_bf16: attention("glm_prefill_heads_bf16_mma")?,
-            prefill_heads_fp8: attention("glm_prefill_heads_fp8b128_mma")?,
+            prefill_exact: prefill("glm_prefill_exact_bf16", Precision::Bf16)?,
+            prefill_mla_attend: attention("glm_prefill_mla_attend", Precision::Bf16)?,
+            prefill_index_scores: attention("glm_prefill_index_scores", Precision::F32)?,
+            prefill_mla_attend_bf16a: attention("glm_prefill_mla_attend_bf16a", Precision::Bf16)?,
+            prefill_heads_bf16: attention("glm_prefill_heads_bf16_mma", Precision::Bf16)?,
+            prefill_heads_fp8: attention("glm_prefill_heads_fp8b128_mma", Precision::Fp8E4M3)?,
         })
     }
 }
@@ -760,7 +893,7 @@ fn absorb_kv_b(
     }
     let widened = dequantise_kv_b(cuda, linear)?;
     let mut laid = Vec::with_capacity(widened.len() * 4);
-    let mut key_t = Vec::with_capacity(if linear.scales.is_none() {
+    let mut key_t = Vec::with_capacity(if !linear.weight.is_fp8() {
         rows / per_head * nope * columns * 2
     } else {
         0
@@ -775,7 +908,7 @@ fn absorb_kv_b(
                 laid.extend_from_slice(&row[column].to_le_bytes());
             }
         }
-        if linear.scales.is_none() {
+        if !linear.weight.is_fp8() {
             for column in 0..columns {
                 for row in keys.chunks_exact(columns) {
                     key_t.extend_from_slice(&((row[column].to_bits() >> 16) as u16).to_le_bytes());
@@ -794,13 +927,13 @@ fn absorb_kv_b(
 /// kv_b's rows, `[rows][columns]` row-major, as the f32 the absorbed MLA multiplies.
 fn dequantise_kv_b(cuda: &Cuda, linear: &DeviceLinear) -> Result<Vec<f32>, BackendError> {
     let (rows, columns) = (linear.rows, linear.columns);
-    let Some(scales) = linear.scales else {
+    let Some(scales) = linear.weight.scales() else {
         // BF16, widened exactly: its bits are an f32's top half.
         let elements = rows
             .checked_mul(columns)
             .ok_or_else(|| refusal("kv_b's shape overflows a usize"))?;
         let mut bytes = vec![0u8; elements * 2];
-        cuda.copy_dtoh(&mut bytes, &linear.weight)
+        cuda.copy_dtoh(&mut bytes, &linear.weight.data())
             .map_err(cuda_error)?;
         return Ok(bytes
             .as_chunks::<2>()
@@ -818,7 +951,7 @@ fn dequantise_kv_b(cuda: &Cuda, linear: &DeviceLinear) -> Result<Vec<f32>, Backe
         .checked_mul(columns)
         .ok_or_else(|| refusal("kv_b's shape overflows a usize"))?;
     let mut weight = vec![0u8; codes];
-    cuda.copy_dtoh(&mut weight, &linear.weight)
+    cuda.copy_dtoh(&mut weight, &linear.weight.data())
         .map_err(cuda_error)?;
     let grid = ScaleGrid::Tile(FP8_BLOCK);
     let scale_count = grid.len(rows, columns);
@@ -1017,12 +1150,46 @@ impl Drop for Allocations {
     }
 }
 
+/// One uploaded linear's values: the typed matrix its kernel reads, BF16 or E4M3 with the
+/// inverse-scale plane the format requires.
+#[derive(Debug, Clone)]
+enum LinearWeight {
+    Bf16(Mat<Bf16>),
+    Fp8(Mat<Fp8E4m3>),
+}
+
+impl LinearWeight {
+    /// The values' device address.
+    fn data(&self) -> Deviceptr {
+        match self {
+            Self::Bf16(mat) => mat.data(),
+            Self::Fp8(mat) => mat.data(),
+        }
+    }
+
+    /// The inverse-scale plane, absent for BF16.
+    fn scales(&self) -> Option<Deviceptr> {
+        match self {
+            Self::Bf16(_) => None,
+            Self::Fp8(mat) => mat.scales().blocks(),
+        }
+    }
+
+    /// Whether the weights are E4M3 codes over a block-scale plane.
+    fn is_fp8(&self) -> bool {
+        matches!(self, Self::Fp8(_))
+    }
+
+    /// One value's stored bytes: one for E4M3, two for BF16.
+    fn element(&self) -> usize {
+        if self.is_fp8() { 1 } else { 2 }
+    }
+}
+
 /// One uploaded linear, `rows x columns`: BF16, or E4M3 with its f32 tile scales.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DeviceLinear {
-    weight: Deviceptr,
-    /// `[ceil(rows / 128)][columns / 128]` for an E4M3 weight; `None` for a BF16 one.
-    scales: Option<Deviceptr>,
+    weight: LinearWeight,
     rows: usize,
     columns: usize,
     /// Where parts two to four of a fused projection's rows start, every one at `rows` for a
@@ -1031,6 +1198,52 @@ struct DeviceLinear {
 }
 
 impl DeviceLinear {
+    /// A sub-view of an uploaded projection: a part of its rows, typed from the same format.
+    fn view(
+        data: Deviceptr,
+        rows: usize,
+        columns: usize,
+        fp8: bool,
+        scales: Option<Deviceptr>,
+    ) -> Self {
+        let spec = TensorSpec {
+            name: "view".to_owned(),
+            dtype: if fp8 { DType::F8E4M3 } else { DType::BF16 },
+            shape: vec![rows, columns],
+        };
+        let weight = if fp8 {
+            let entries = rows.div_ceil(FP8_BLOCK) * columns.div_ceil(FP8_BLOCK);
+            let scales = scales.expect("an FP8 view carries its scale plane");
+            LinearWeight::Fp8(
+                upload_format::<Fp8E4m3>(Tensor {
+                    stored: &spec,
+                    shape: &[rows, columns],
+                    data,
+                    stride: columns,
+                    scales: Scales::fp8_e4m3(scales, entries, DType::F32),
+                })
+                .expect("an FP8 view of an uploaded projection"),
+            )
+        } else {
+            LinearWeight::Bf16(
+                upload_format::<Bf16>(Tensor {
+                    stored: &spec,
+                    shape: &[rows, columns],
+                    data,
+                    stride: columns * 2,
+                    scales: Scales::none(),
+                })
+                .expect("a BF16 view of an uploaded projection"),
+            )
+        };
+        Self {
+            weight,
+            rows,
+            columns,
+            parts: [rows; 3],
+        }
+    }
+
     /// This linear with its outputs in parts that start at `starts`.
     fn parted(self, starts: [usize; 3]) -> Self {
         Self {
@@ -1048,8 +1261,8 @@ impl DeviceLinear {
     /// The weight's bytes, one a value for E4M3 and two for BF16, as a [DeviceRank::prefetch]
     /// span.
     fn span(&self) -> (Deviceptr, usize) {
-        let size = if self.scales.is_some() { 1 } else { 2 };
-        (self.weight, self.rows * self.columns * size)
+        let size = if self.weight.is_fp8() { 1 } else { 2 };
+        (self.weight.data(), self.rows * self.columns * size)
     }
 }
 
@@ -1065,7 +1278,7 @@ fn fp8_token_body_rows(rows: usize) -> bool {
 /// whole eight-column output writes whose scales start on a 128-row block. A shape it does not
 /// take keeps the tiled GEMV.
 fn fp8_token_body_fits(linear: &DeviceLinear, rows: usize) -> bool {
-    if linear.scales.is_none()
+    if !linear.weight.is_fp8()
         || !fp8_token_body_rows(rows)
         || !linear.columns.is_multiple_of(FP8_BLOCK)
     {
@@ -1099,7 +1312,8 @@ fn launch_fp8_token_body(
 ) -> Result<(), BackendError> {
     let columns = linear.columns;
     let scales = linear
-        .scales
+        .weight
+        .scales()
         .ok_or_else(|| refusal("the FP8 token body takes a block-scaled weight"))?;
     let starts = [
         0,
@@ -1114,7 +1328,7 @@ fn launch_fp8_token_body(
             continue;
         }
         let part_rows = end - first;
-        let weight = linear.weight.offset(first * columns);
+        let weight = linear.weight.data().offset(first * columns);
         let part_scales =
             scales.offset((first / FP8_BLOCK) * (columns / FP8_BLOCK) * std::mem::size_of::<f32>());
         let out = output.offset(rows * first * 4);
@@ -1212,6 +1426,9 @@ struct DeviceMoe {
     intermediate: usize,
 }
 
+// A sparse layer carries the indexer and the absorbed operands; boxing it would only move
+// the allocation.
+#[allow(clippy::large_enum_variant)]
 enum DeviceBranch {
     Linear(DeviceKda),
     Sparse(DeviceDsa),
@@ -1300,6 +1517,10 @@ pub(crate) struct Uploader<'a, S: WeightSource + ?Sized> {
     plan: Glm5NextTensorPlan,
     layout: TpLayout,
     sink: &'a mut dyn Sink,
+    /// Every uploaded part's format ledger row, in upload order.
+    ledger: Vec<LedgerRow>,
+    /// The exact widenings this walk recorded, for the boot ledger.
+    widen: WidenLog,
 }
 
 /// The elements of a shape.
@@ -1320,7 +1541,21 @@ impl<'a, S: WeightSource + ?Sized> Uploader<'a, S> {
             plan: Glm5NextTensorPlan::served_and_mtp(config),
             layout,
             sink,
+            ledger: Vec::new(),
+            widen: WidenLog::new(),
         }
+    }
+
+    /// One part's ledger row: it was read at the format it is stored as.
+    fn record(&mut self, name: &str, stored: FormatKind, arithmetic: FormatKind, bytes: u128) {
+        self.ledger
+            .push(LedgerRow::new(name, stored, arithmetic, bytes));
+    }
+
+    /// The boot ledger: every uploaded part, and the exact widenings the walk took.
+    fn format_ledger(&self) -> Result<FormatLedger, BackendError> {
+        FormatLedger::boot(self.ledger.clone(), &self.widen)
+            .map_err(|error| refusal(error.to_string()))
     }
 
     /// Every weight of the rank: the embedding, the final norm, the LM head, each layer, then the
@@ -1430,7 +1665,9 @@ impl<'a, S: WeightSource + ?Sized> Uploader<'a, S> {
             len += dtype.storage_bytes(elements(&rank_shape));
             append(&mut bytes, stored);
         }
-        self.sink.weight(&names.join("+"), len, bytes)
+        let key = names.join("+");
+        self.record(&key, FormatKind::Bf16, FormatKind::Bf16, len as u128);
+        self.sink.weight(&key, len, bytes)
     }
 
     /// An f32 vector: stored F32, or BF16 widened exactly.
@@ -1452,6 +1689,18 @@ impl<'a, S: WeightSource + ?Sized> Uploader<'a, S> {
                 )));
             }
         };
+        if dtype == DType::BF16 {
+            // A released checkpoint stores these vectors BF16 and the kernel reads f32.
+            widen::<Bf16, F32Format>(
+                name,
+                "the kernel's argument is f32 and the checkpoint stores the vector BF16; the                  widening is exact",
+                &mut self.widen,
+            )
+            .map_err(|error| refusal(error.to_string()))?;
+            self.record(name, FormatKind::Bf16, FormatKind::F32, len as u128);
+        } else {
+            self.record(name, FormatKind::F32, FormatKind::F32, len as u128);
+        }
         self.sink.weight(name, len, bytes)
     }
 
@@ -1544,9 +1793,50 @@ impl<'a, S: WeightSource + ?Sized> Uploader<'a, S> {
         } else {
             None
         };
+        let spec = TensorSpec {
+            name: key.clone(),
+            dtype: format,
+            shape: vec![rows, columns],
+        };
+        // The typed upload checks the container's dtype and the scale plane's entry count; the
+        // ledger row takes the matrix's own bytes a token.
+        let typed = if fp8 {
+            let entries = rows.div_ceil(FP8_BLOCK) * columns.div_ceil(FP8_BLOCK);
+            let scales = scales.ok_or_else(|| refusal("an FP8 projection without its scales"))?;
+            let mat = upload_format::<Fp8E4m3>(Tensor {
+                stored: &spec,
+                shape: &[rows, columns],
+                data: weight,
+                stride: columns,
+                scales: Scales::fp8_e4m3(scales, entries, DType::F32),
+            })
+            .map_err(|error| refusal(error.to_string()))?;
+            self.record(
+                &key,
+                FormatKind::Fp8E4m3,
+                FormatKind::Fp8E4m3,
+                mat.bytes_per_token(),
+            );
+            LinearWeight::Fp8(mat)
+        } else {
+            let mat = upload_format::<Bf16>(Tensor {
+                stored: &spec,
+                shape: &[rows, columns],
+                data: weight,
+                stride: columns * 2,
+                scales: Scales::none(),
+            })
+            .map_err(|error| refusal(error.to_string()))?;
+            self.record(
+                &key,
+                FormatKind::Bf16,
+                FormatKind::Bf16,
+                mat.bytes_per_token(),
+            );
+            LinearWeight::Bf16(mat)
+        };
         Ok(DeviceLinear {
-            weight,
-            scales,
+            weight: typed,
             rows,
             columns,
             parts: [rows; 3],
@@ -1703,12 +1993,12 @@ impl<'a, S: WeightSource + ?Sized> Uploader<'a, S> {
         for expert in 0..experts {
             let mlp = self.mlp(&format!("{prefix}.experts.{expert}"), intermediate)?;
             for (table, linear) in [(&mut gate_up, mlp.gate_up), (&mut down, mlp.down)] {
-                let Some(scales) = linear.scales else {
+                let Some(scales) = linear.weight.scales() else {
                     return Err(refusal(format!(
                         "{prefix}.experts.{expert} is BF16; the routed expert GEMV reads FP8"
                     )));
                 };
-                table.extend(linear.weight.0.to_le_bytes());
+                table.extend(linear.weight.data().0.to_le_bytes());
                 table.extend(scales.0.to_le_bytes());
             }
         }
@@ -2408,7 +2698,10 @@ impl DeviceRank {
     ) -> Result<Self, BackendError> {
         Self::build(cuda, config, layout, cache, |stream, memory| {
             let mut sink = Direct { stream, memory };
-            Uploader::new(source, config, layout, &mut sink).weights()
+            let mut uploader = Uploader::new(source, config, layout, &mut sink);
+            let weights = uploader.weights()?;
+            eprintln!("[glm] rank {}: {}", layout.rank, uploader.format_ledger()?);
+            Ok(weights)
         })
     }
 
@@ -2451,7 +2744,9 @@ impl DeviceRank {
                 stream,
                 memory,
             };
-            let weights = Uploader::new(&specs, config, layout, &mut sink).weights()?;
+            let mut uploader = Uploader::new(&specs, config, layout, &mut sink);
+            let weights = uploader.weights()?;
+            eprintln!("[glm] rank {}: {}", layout.rank, uploader.format_ledger()?);
             sink.slots.finish().map_err(refusal)?;
             Ok(weights)
         })
@@ -2485,7 +2780,7 @@ impl DeviceRank {
         // The absorbed MLA operands: each sparse layer's kv_b, dequantised once. The latent
         // cache's representation is the caller's ([LatentCache]).
         let (nope, value) = (config.qk_nope_head_dim, config.v_head_dim);
-        let quantise = |dsa: &DeviceDsa| cache.quantises(config, dsa.kv_b.scales.is_some());
+        let quantise = |dsa: &DeviceDsa| cache.quantises(config, dsa.kv_b.weight.is_fp8());
         for layer in &mut layers {
             if let DeviceBranch::Sparse(dsa) = &mut layer.branch {
                 dsa.quantise = quantise(dsa);
@@ -2573,7 +2868,7 @@ impl DeviceRank {
             packed: PackedSet::new(Form::from_env().map_err(refusal)?, Placement::Beside).tiled(),
             memory,
         };
-        if rank.mtp.is_some() && rank.lm_head.scales.is_none() {
+        if rank.mtp.is_some() && !rank.lm_head.weight.is_fp8() {
             rank.draft_head()?;
         }
         rank.pack_linears()?;
@@ -2590,8 +2885,8 @@ impl DeviceRank {
     fn pack_linears(&mut self) -> Result<(), BackendError> {
         let mut matrices = Vec::new();
         let mut add = |linear: &DeviceLinear| {
-            if linear.scales.is_none() && linear.rows * linear.columns > PACK_MIN_WEIGHTS {
-                matrices.push((linear.weight, linear.rows, linear.columns));
+            if !linear.weight.is_fp8() && linear.rows * linear.columns > PACK_MIN_WEIGHTS {
+                matrices.push((linear.weight.data(), linear.rows, linear.columns));
             }
         };
         for layer in &self.layers {
@@ -2642,7 +2937,7 @@ impl DeviceRank {
         if let Some(head) = self.draft_head {
             return Ok(head);
         }
-        if self.lm_head.scales.is_some() {
+        if self.lm_head.weight.is_fp8() {
             return Err(refusal("drafts score with an E4M3 copy of a BF16 LM head"));
         }
         // The quantization runs on the default stream, which this rank's uploads are not ordered
@@ -2651,14 +2946,14 @@ impl DeviceRank {
             .synchronize_stream(&self.stream)
             .map_err(cuda_error)?;
         let matrix = GpuMat {
-            pointer: self.lm_head.weight,
+            pointer: self.lm_head.weight.data(),
             rows: self.lm_head.rows,
             columns: self.lm_head.columns,
         };
         let memory = &mut self.memory;
         let head = GpuMatE4m3::quantize(
             &self.cuda,
-            self.kernels.quantize_e4m3,
+            self.kernels.quantize_e4m3.kernel,
             &matrix,
             &mut memory.bytes,
         )
@@ -3473,7 +3768,7 @@ impl DeviceRank {
         }
         if fp8_token_body_fits(linear, rows)
             && input.0.is_multiple_of(8)
-            && linear.weight.0.is_multiple_of(8)
+            && linear.weight.data().0.is_multiple_of(8)
         {
             return self.fp8_token_body(linear, input, output, rows);
         }
@@ -3494,7 +3789,7 @@ impl DeviceRank {
         launch_fp8_token_body(
             &self.cuda,
             &self.stream,
-            self.kernels.prefill_dense_fp8_rows,
+            self.kernels.prefill_dense_fp8_rows.kernel,
             linear,
             input,
             output,
@@ -3519,7 +3814,7 @@ impl DeviceRank {
             ));
         }
         let columns = linear.columns;
-        let element = if linear.scales.is_some() { 1 } else { 2 };
+        let element = linear.weight.element();
         let starts = [
             0,
             linear.parts[0],
@@ -3534,8 +3829,8 @@ impl DeviceRank {
                 continue;
             }
             let part_rows = end - first;
-            let weight = linear.weight.offset(first * columns * element);
-            let scales = linear.scales.map(|scales| {
+            let weight = linear.weight.data().offset(first * columns * element);
+            let scales = linear.weight.scales().map(|scales| {
                 scales.offset(
                     (first / FP8_BLOCK) * (columns / FP8_BLOCK) * std::mem::size_of::<f32>(),
                 )
@@ -3548,9 +3843,9 @@ impl DeviceRank {
                 match WidePolicy::GLM.bulk(part_rows, columns, rows) {
                     Route::Wide => {
                         let bf16 = if self.prefill_activation == PrefillActivation::Bf16 {
-                            self.kernels.prefill_dense_bf16_bf16a
+                            self.kernels.prefill_dense_bf16_bf16a.kernel
                         } else {
-                            self.kernels.prefill_dense_bf16
+                            self.kernels.prefill_dense_bf16.kernel
                         };
                         let tile =
                             WideTile::call(weight.0, input.0, out.0, part_rows, columns, rows)
@@ -3558,7 +3853,7 @@ impl DeviceRank {
                         self.launch(bf16, tile.grid, tile.block.0, &tile.args)?;
                     }
                     Route::Skinny => self.launch(
-                        self.kernels.prefill_skinny[part_rows.div_ceil(8) - 1],
+                        self.kernels.prefill_skinny[part_rows.div_ceil(8) - 1].kernel,
                         (rows.div_ceil(16) as u32, 1, 1),
                         BLOCK,
                         &[
@@ -3571,13 +3866,7 @@ impl DeviceRank {
                         ],
                     )?,
                     _ => {
-                        let row = DeviceLinear {
-                            weight,
-                            scales: None,
-                            rows: part_rows,
-                            columns,
-                            parts: [part_rows; 3],
-                        };
+                        let row = DeviceLinear::view(weight, part_rows, columns, false, None);
                         self.gemv_grouped(&row, input, out, rows)?;
                     }
                 }
@@ -3587,21 +3876,15 @@ impl DeviceRank {
             // scaled part needs the K run to be whole blocks, not just whole 32-column stages.
             let tiled = fp8_tile_fits(part_rows, columns) && first.is_multiple_of(FP8_BLOCK);
             if !tiled {
-                let row = DeviceLinear {
-                    weight,
-                    scales: Some(scales),
-                    rows: part_rows,
-                    columns,
-                    parts: [part_rows; 3],
-                };
+                let row = DeviceLinear::view(weight, part_rows, columns, true, Some(scales));
                 self.gemv_grouped(&row, input, out, rows)?;
                 continue;
             }
             let grid = Fp8Tile::grid(part_rows, rows);
             let fp8 = if self.prefill_activation == PrefillActivation::Bf16 {
-                self.kernels.prefill_dense_fp8_bf16a
+                self.kernels.prefill_dense_fp8_bf16a.kernel
             } else {
-                self.kernels.prefill_dense_fp8
+                self.kernels.prefill_dense_fp8.kernel
             };
             if self.prefill_activation == PrefillActivation::Fp8
                 && columns.is_multiple_of(FP8_BLOCK)
@@ -3613,7 +3896,7 @@ impl DeviceRank {
                 }
                 let s = &self.scratch;
                 self.launch(
-                    self.kernels.prefill_dense_q8,
+                    self.kernels.prefill_dense_q8.kernel,
                     grid,
                     BLOCK,
                     &[
@@ -3661,7 +3944,7 @@ impl DeviceRank {
         // One warp a 128-column block.
         let warps = rows * columns / FP8_BLOCK;
         self.launch(
-            self.kernels.prefill_quantise,
+            self.kernels.prefill_quantise.kernel,
             ((warps * 32).div_ceil(BLOCK as usize) as u32, 1, 1),
             BLOCK,
             &[
@@ -3706,7 +3989,7 @@ impl DeviceRank {
             return self.gemv_small(linear, input, output, rows);
         }
         let columns = linear.columns;
-        let element = if linear.scales.is_some() { 1 } else { 2 };
+        let element = linear.weight.element();
         let starts = [
             0,
             linear.parts[0],
@@ -3720,27 +4003,27 @@ impl DeviceRank {
                 continue;
             }
             let part_rows = end - first;
-            let row = DeviceLinear {
-                weight: linear.weight.offset(first * columns * element),
-                scales: linear.scales.map(|scales| {
+            let row = DeviceLinear::view(
+                linear.weight.data().offset(first * columns * element),
+                part_rows,
+                columns,
+                linear.weight.is_fp8(),
+                linear.weight.scales().map(|scales| {
                     scales.offset(
                         (first / FP8_BLOCK) * (columns / FP8_BLOCK) * std::mem::size_of::<f32>(),
                     )
                 }),
-                rows: part_rows,
-                columns,
-                parts: [part_rows; 3],
-            };
+            );
             let out = output.offset(rows * first * 4);
             let rounds = columns / TILED_GEMV_ROUND;
-            if row.scales.is_none()
+            if !row.weight.is_fp8()
                 && columns.is_multiple_of(TILED_GEMV_ROUND)
                 && input.0.is_multiple_of(16)
-                && row.weight.0.is_multiple_of(16)
+                && row.weight.data().0.is_multiple_of(16)
                 && tiled_gemv_splits(part_rows.div_ceil(TILE_ROWS), columns) == rounds
             {
                 self.launch(
-                    self.kernels.prefill_exact,
+                    self.kernels.prefill_exact.kernel,
                     (
                         part_rows.div_ceil(EXACT_OUTS) as u32,
                         rows.div_ceil(EXACT_ROWS) as u32,
@@ -3748,7 +4031,7 @@ impl DeviceRank {
                     ),
                     EXACT_THREADS,
                     &[
-                        row.weight.0,
+                        row.weight.data().0,
                         input.0,
                         out.0,
                         part_rows as u64,
@@ -3810,23 +4093,23 @@ impl DeviceRank {
         // A packed copy of these rows, when there is one: the same launch over the packed planes.
         let packed = self
             .packed
-            .get(linear.weight)
+            .get(linear.weight.data())
             .filter(|packed| packed.admits(linear.rows, linear.columns, input).is_ok());
-        let (kernel, splits, mut args) = match (linear.scales, packed) {
+        let (kernel, splits, mut args) = match (linear.weight.scales(), packed) {
             (None, Some(packed)) => (
-                self.kernels.gemv_packed,
+                self.kernels.gemv_packed.kernel,
                 tiled_gemv_splits(tiles, linear.columns),
                 packed.planes().to_vec(),
             ),
             (None, None) => (
-                self.kernels.gemv_bf16,
+                self.kernels.gemv_bf16.kernel,
                 tiled_gemv_splits(tiles, linear.columns),
-                vec![linear.weight.0],
+                vec![linear.weight.data().0],
             ),
             (Some(scales), _) => (
-                self.kernels.gemv_fp8,
+                self.kernels.gemv_fp8.kernel,
                 tiled_gemv_e4m3_splits(tiles, linear.columns),
-                vec![linear.weight.0, scales.0],
+                vec![linear.weight.data().0, scales.0],
             ),
         };
         args.extend([
@@ -3838,11 +4121,11 @@ impl DeviceRank {
             scratch.partials.0,
             scratch.counters.0,
         ]);
-        if linear.scales.is_some() {
+        if linear.weight.is_fp8() {
             args.push(u64::from(self.config.dynamic_activations));
         }
         args.extend(linear.parts.map(|start| start as u64));
-        if let (None, Some(packed)) = (linear.scales, packed) {
+        if let (None, Some(packed)) = (linear.weight.scales(), packed) {
             args.push(packed.row_bytes() as u64);
         }
         let groups = rows.div_ceil(MAX_ROWS) as u32;
@@ -3866,7 +4149,7 @@ impl DeviceRank {
     ) -> Result<(), BackendError> {
         let topk = self.config.num_experts_per_tok;
         self.launch(
-            self.kernels.expert_fp8,
+            self.kernels.expert_fp8.kernel,
             (outputs.div_ceil(TILE_ROWS) as u32, 1, (rows * topk) as u32),
             BLOCK,
             &[
@@ -3914,7 +4197,7 @@ impl DeviceRank {
                 .side_launch_on(
                     &self.stream,
                     &prefetch.side,
-                    self.kernels.prefetch_l2,
+                    self.kernels.prefetch_l2.kernel,
                     (1, 1, 1),
                     (32, 1, 1),
                     &args,
@@ -3955,7 +4238,7 @@ impl DeviceRank {
             self.gemv(&hyper.projection, streams, raw, rows)?;
         }
         self.launch(
-            self.kernels.mhc_in,
+            self.kernels.mhc_in.kernel,
             (2, count as u32, 1),
             BLOCK,
             &[
@@ -4039,7 +4322,7 @@ impl DeviceRank {
         let (hc, hidden) = (self.geometry.hc_mult, self.geometry.dim);
         let tiles = linear.rows.div_ceil(TILE_ROWS);
         (self.prefetch.is_some()
-            && linear.scales.is_none()
+            && !linear.weight.is_fp8()
             && linear.parts == [linear.rows; 3]
             && linear.columns == hc * hidden
             && BLOCK as usize == TILED_GEMV_ROUND
@@ -4086,7 +4369,7 @@ impl DeviceRank {
     /// two-shot reduce's sum, in rank order from 0.0 as `q4e_mhc_post` folds the one-shot's.
     fn sum_slots(&self, mine: Deviceptr, count: usize) -> Result<(), BackendError> {
         self.launch(
-            self.kernels.sum_slots,
+            self.kernels.sum_slots.kernel,
             (blocks(count / 4), 1, 1),
             BLOCK,
             &[
@@ -4147,7 +4430,7 @@ impl DeviceRank {
         let s = &self.scratch;
         let hidden = self.geometry.dim;
         self.launch(
-            self.kernels.mhc_post,
+            self.kernels.mhc_post.kernel,
             (blocks(hidden), rows as u32, 1),
             BLOCK,
             &[
@@ -4159,7 +4442,7 @@ impl DeviceRank {
                 s.slots.0,
                 self.layout.rank as u64,
                 world as u64,
-                next.map_or(0, |linear| linear.weight.0),
+                next.map_or(0, |linear| linear.weight.data().0),
                 if next.is_some() { s.mix_parts.0 } else { 0 },
                 next.map_or(0, |linear| linear.rows as u64),
             ],
@@ -4247,11 +4530,16 @@ impl DeviceRank {
             if self.bulk(run) {
                 let width = (mixes, config.linear_conv_kernel_dim);
                 let call = gdn::conv_rows(raw.0, conv.0, kda.conv.0, mixed.0, width, run.len);
-                self.launch(self.kernels.conv_rows, call.grid, call.block.0, &call.args)?;
+                self.launch(
+                    self.kernels.conv_rows.kernel,
+                    call.grid,
+                    call.block.0,
+                    &call.args,
+                )?;
                 // A chunk never verifies, so it keeps no windows.
                 let call = gdn::conv_history(raw.0, conv.0, width, run.len, (0, 0, 0));
                 self.launch(
-                    self.kernels.conv_history,
+                    self.kernels.conv_history.kernel,
                     call.grid,
                     call.block.0,
                     &call.args,
@@ -4269,7 +4557,7 @@ impl DeviceRank {
                 (0, 0)
             };
             self.launch(
-                self.kernels.conv,
+                self.kernels.conv.kernel,
                 (blocks(mixes), 1, 1),
                 BLOCK,
                 &[
@@ -4289,7 +4577,7 @@ impl DeviceRank {
         self.gemv(&kda.f_b, f_a, s.forget, rows)?;
         self.gemv(&kda.g_b, g_a, s.gate, rows)?;
         self.launch(
-            self.kernels.kda_decay,
+            self.kernels.kda_decay.kernel,
             (blocks(rows * width), 1, 1),
             BLOCK,
             &[
@@ -4395,7 +4683,7 @@ impl DeviceRank {
         // One value head a key head.
         let groups = 1;
         self.launch(
-            self.kernels.kda_prep,
+            self.kernels.kda_prep.kernel,
             (heads as u32, len as u32, 1),
             GDN_KEY as u32,
             &[
@@ -4426,7 +4714,7 @@ impl DeviceRank {
             ));
         }
         self.launch(
-            self.kernels.kda_scan,
+            self.kernels.kda_scan.kernel,
             launch.grid,
             launch.block.0,
             &[
@@ -4456,7 +4744,12 @@ impl DeviceRank {
             true,
             len,
         );
-        self.launch(self.kernels.kda_gate, call.grid, call.block.0, &call.args)
+        self.launch(
+            self.kernels.kda_gate.kernel,
+            call.grid,
+            call.block.0,
+            &call.args,
+        )
     }
 
     /// KDA's recurrence over `len` rows of one sequence: `inputs` are the convolved rows, the
@@ -4474,7 +4767,7 @@ impl DeviceRank {
         let config = &self.config;
         let head = config.linear_head_dim;
         self.launch(
-            self.kernels.recur,
+            self.kernels.recur.kernel,
             (kda.heads as u32, recur_parts(head) as u32, 1),
             RECUR_THREADS,
             &[
@@ -4499,7 +4792,7 @@ impl DeviceRank {
                 // The sigmoid output gate.
                 1,
                 len as u64,
-                u64::from(self.kernels.recur.shared_bytes()),
+                u64::from(self.kernels.recur.kernel.shared_bytes()),
                 decay.0,
                 self.scratch.recur_counters.0,
             ],
@@ -4541,7 +4834,7 @@ impl DeviceRank {
             (latent, dsa.kv_a_norm, kv_lora),
         ] {
             self.call(
-                self.kernels.rmsnorm,
+                self.kernels.rmsnorm.kernel,
                 RmsNorm::new(part.0, norm.0, part.0, width, eps).call(rows),
             )?;
         }
@@ -4559,7 +4852,7 @@ impl DeviceRank {
             let source = latent.offset(floats(run.first * kv_lora)).0;
             if dsa.quantise {
                 self.launch(
-                    self.kernels.mla_cache_fp8,
+                    self.kernels.mla_cache_fp8.kernel,
                     (run.len as u32, 1, 1),
                     BLOCK,
                     &[
@@ -4573,7 +4866,7 @@ impl DeviceRank {
                 )?;
             } else {
                 self.launch(
-                    self.kernels.mla_cache,
+                    self.kernels.mla_cache.kernel,
                     (run.len as u32, 1, 1),
                     BLOCK,
                     &[
@@ -4631,7 +4924,7 @@ impl DeviceRank {
             };
             let (first, len) = (run.first as u64, run.len as u32);
             self.launch(
-                self.kernels.mla_absorb,
+                self.kernels.mla_absorb.kernel,
                 (heads as u32, len, latent.div_ceil(BLOCK as usize) as u32),
                 BLOCK,
                 &[
@@ -4648,7 +4941,7 @@ impl DeviceRank {
             let selection = [s.selected.0, s.count.0];
             let quantise = u64::from(dsa.quantise);
             self.launch(
-                self.kernels.mla_scores,
+                self.kernels.mla_scores.kernel,
                 (
                     (MAX_SELECTED_TOKENS / MLA_SCORE_SLOTS) as u32,
                     len,
@@ -4672,13 +4965,13 @@ impl DeviceRank {
                 .concat(),
             )?;
             self.launch(
-                self.kernels.mla_softmax,
+                self.kernels.mla_softmax.kernel,
                 (heads as u32, len, 1),
                 BLOCK,
                 &[s.mla_logits.0, s.count.0, s.mla_total.0, first],
             )?;
             self.launch(
-                self.kernels.mla_mix,
+                self.kernels.mla_mix.kernel,
                 (
                     latent.div_ceil(32) as u32,
                     heads.div_ceil(MLA_MIX_HEADS) as u32,
@@ -4702,7 +4995,7 @@ impl DeviceRank {
                 .concat(),
             )?;
             self.launch(
-                self.kernels.mla_project,
+                self.kernels.mla_project.kernel,
                 (
                     heads as u32,
                     (value as u32).div_ceil(MLA_PROJECT_THREADS),
@@ -4751,7 +5044,7 @@ impl DeviceRank {
         let row_tiles = rows.div_ceil(128) as u32;
         match dsa.kv_key_t {
             Some(key_t) => self.launch(
-                self.kernels.prefill_heads_bf16,
+                self.kernels.prefill_heads_bf16.kernel,
                 ((latent / 128) as u32, row_tiles, heads as u32),
                 BLOCK,
                 &[
@@ -4769,7 +5062,7 @@ impl DeviceRank {
                 ],
             )?,
             None => self.launch(
-                self.kernels.mla_absorb,
+                self.kernels.mla_absorb.kernel,
                 (
                     heads as u32,
                     rows as u32,
@@ -4788,9 +5081,9 @@ impl DeviceRank {
             )?,
         }
         let attend = if self.prefill_activation == PrefillActivation::Bf16 {
-            self.kernels.prefill_mla_attend_bf16a
+            self.kernels.prefill_mla_attend_bf16a.kernel
         } else {
-            self.kernels.prefill_mla_attend
+            self.kernels.prefill_mla_attend.kernel
         };
         for run in runs {
             let SequenceLayer::Sparse {
@@ -4820,8 +5113,8 @@ impl DeviceRank {
         }
         // kv_b's value rows of head h: rows h (nope + value) + nope .. + value of the matrix.
         let per_head = nope + value;
-        let element = if dsa.kv_b.scales.is_some() { 1 } else { 2 };
-        let weight = dsa.kv_b.weight.offset(nope * latent * element);
+        let element = dsa.kv_b.weight.element();
+        let weight = dsa.kv_b.weight.data().offset(nope * latent * element);
         let geometry = [
             value as u64,
             latent as u64,
@@ -4833,7 +5126,7 @@ impl DeviceRank {
             (per_head * latent * element) as u64,
         ];
         let grid = ((value / 128) as u32, row_tiles, heads as u32);
-        match dsa.kv_b.scales {
+        match dsa.kv_b.weight.scales() {
             Some(scales) => {
                 let blocks = latent / FP8_BLOCK;
                 let mut args = vec![
@@ -4844,12 +5137,12 @@ impl DeviceRank {
                 ];
                 args.extend(geometry);
                 args.push(((per_head / FP8_BLOCK) * blocks) as u64);
-                self.launch(self.kernels.prefill_heads_fp8, grid, BLOCK, &args)
+                self.launch(self.kernels.prefill_heads_fp8.kernel, grid, BLOCK, &args)
             }
             None => {
                 let mut args = vec![weight.0, s.q_abs.0, s.attn_out.0];
                 args.extend(geometry);
-                self.launch(self.kernels.prefill_heads_bf16, grid, BLOCK, &args)
+                self.launch(self.kernels.prefill_heads_bf16.kernel, grid, BLOCK, &args)
             }
         }
     }
@@ -4890,7 +5183,7 @@ impl DeviceRank {
             };
             let cached = floats(run.position * dim);
             self.launch(
-                self.kernels.layer_norm,
+                self.kernels.layer_norm.kernel,
                 (run.len as u32, 1, 1),
                 BLOCK,
                 &[
@@ -4903,7 +5196,7 @@ impl DeviceRank {
                 ],
             )?;
             self.launch(
-                self.kernels.copy_flat,
+                self.kernels.copy_flat.kernel,
                 (blocks(run.len * dim), 1, 1),
                 BLOCK,
                 &[
@@ -4914,7 +5207,7 @@ impl DeviceRank {
             )?;
             let (grid, block) = IndexerPass::new(run.position, run.len, pool).per_row();
             self.launch(
-                self.kernels.pool,
+                self.kernels.pool.kernel,
                 grid,
                 block.0,
                 &[
@@ -4973,7 +5266,7 @@ impl DeviceRank {
                 // A prefill run's rows share their pooled keys: glm_prefill_index_scores keeps a
                 // tile of them while it walks the rows, and computes the decode kernel's floats.
                 self.launch(
-                    self.kernels.prefill_index_scores,
+                    self.kernels.prefill_index_scores.kernel,
                     grid,
                     block.0,
                     &[
@@ -4992,7 +5285,7 @@ impl DeviceRank {
             } else {
                 let (grid, block) = pass.scores();
                 self.launch(
-                    self.kernels.index_scores,
+                    self.kernels.index_scores.kernel,
                     grid,
                     block.0,
                     &[
@@ -5012,7 +5305,7 @@ impl DeviceRank {
             }
             let (grid, block) = pass.per_row();
             self.launch(
-                self.kernels.pick,
+                self.kernels.pick.kernel,
                 grid,
                 block.0,
                 &[
@@ -5036,7 +5329,7 @@ impl DeviceRank {
         let width = mlp.gate_up.rows / 2;
         self.gemv(&mlp.gate_up, s.collapsed, s.gate_up, rows)?;
         self.launch(
-            self.kernels.swiglu,
+            self.kernels.swiglu.kernel,
             (blocks(width), rows as u32, 1),
             BLOCK,
             &[
@@ -5070,7 +5363,7 @@ impl DeviceRank {
             self.exact_prefill,
         )?;
         self.launch(
-            self.kernels.router,
+            self.kernels.router.kernel,
             (rows as u32, 1, 1),
             // One warp a row picks.
             32,
@@ -5101,7 +5394,7 @@ impl DeviceRank {
         )?;
         self.prof_mark("moe_up");
         self.launch(
-            self.kernels.swiglu,
+            self.kernels.swiglu.kernel,
             (blocks(width), (rows * topk) as u32, 1),
             BLOCK,
             &[
@@ -5154,7 +5447,12 @@ impl DeviceRank {
         )
         .zeroing(s.expert_out.0, hidden);
         let (grid, block) = MoePlanCall::launch();
-        self.launch(self.kernels.prefill_moe_plan, grid, block.0, &plan.args())?;
+        self.launch(
+            self.kernels.prefill_moe_plan.kernel,
+            grid,
+            block.0,
+            &plan.args(),
+        )?;
         if self.prefill_activation == PrefillActivation::Fp8
             && width.is_multiple_of(FP8_BLOCK)
             && hidden.is_multiple_of(FP8_BLOCK)
@@ -5163,9 +5461,9 @@ impl DeviceRank {
             return self.combine_experts(rows);
         }
         let mma = if self.prefill_activation == PrefillActivation::Bf16 {
-            self.kernels.prefill_moe_mma_bf16a
+            self.kernels.prefill_moe_mma_bf16a.kernel
         } else {
-            self.kernels.prefill_moe_mma
+            self.kernels.prefill_moe_mma.kernel
         };
         self.launch(
             mma,
@@ -5184,7 +5482,7 @@ impl DeviceRank {
             ],
         )?;
         self.launch(
-            self.kernels.prefill_moe_swiglu,
+            self.kernels.prefill_moe_swiglu.kernel,
             (blocks(moe_rows * width), 1, 1),
             BLOCK,
             &[
@@ -5229,7 +5527,7 @@ impl DeviceRank {
         q8_inner(width)?;
         self.quantise(s.collapsed, rows, hidden)?;
         self.launch(
-            self.kernels.prefill_moe_q8,
+            self.kernels.prefill_moe_q8.kernel,
             ((2 * width).div_ceil(128) as u32, 1, items as u32),
             BLOCK,
             &[
@@ -5249,7 +5547,7 @@ impl DeviceRank {
         // One warp a 128-column block of an item row.
         let warps = moe_rows * width / FP8_BLOCK;
         self.launch(
-            self.kernels.prefill_moe_swiglu_q8,
+            self.kernels.prefill_moe_swiglu_q8.kernel,
             ((warps * 32).div_ceil(BLOCK as usize) as u32, 1, 1),
             BLOCK,
             &[
@@ -5262,7 +5560,7 @@ impl DeviceRank {
             ],
         )?;
         self.launch(
-            self.kernels.prefill_moe_q8,
+            self.kernels.prefill_moe_q8.kernel,
             (hidden.div_ceil(128) as u32, 1, items as u32),
             BLOCK,
             &[
@@ -5287,7 +5585,7 @@ impl DeviceRank {
         let config = &self.config;
         let (grid, block) = combine_grid(config.hidden_size, rows);
         self.launch(
-            self.kernels.combine,
+            self.kernels.combine.kernel,
             grid,
             block.0,
             &[
@@ -5697,7 +5995,7 @@ impl DeviceRank {
                 )?;
                 let window = Self::window_floats(config, width);
                 self.launch(
-                    self.kernels.copy_flat,
+                    self.kernels.copy_flat.kernel,
                     (blocks(window), 1, 1),
                     BLOCK,
                     &[
@@ -5940,7 +6238,7 @@ impl DeviceRank {
         }
         self.prof_mark("tail");
         self.launch(
-            self.kernels.fold,
+            self.kernels.fold.kernel,
             (blocks(count * hidden), 1, 1),
             BLOCK,
             &[
@@ -5954,7 +6252,7 @@ impl DeviceRank {
         )?;
         let normed = row(s.head_normed, hidden);
         self.call(
-            self.kernels.rmsnorm,
+            self.kernels.rmsnorm.kernel,
             RmsNorm::new(
                 row(s.head, hidden).0,
                 self.norm.0,
@@ -6023,7 +6321,7 @@ impl DeviceRank {
             s.logits
         };
         match self.draft_head.filter(|_| draft) {
-            Some(head) => gemv_e4m3(self, self.kernels.gemv_e4m3, &head, input, own, rows)?,
+            Some(head) => gemv_e4m3(self, self.kernels.gemv_e4m3.kernel, &head, input, own, rows)?,
             None => self.gemv(&self.lm_head, input, own, rows)?,
         }
         if !device_leg {
@@ -6129,7 +6427,7 @@ impl DeviceRank {
         probs: Deviceptr,
     ) -> Result<(), BackendError> {
         self.launch(
-            self.kernels.argmax_prob,
+            self.kernels.argmax_prob.kernel,
             (rows as u32, 1, 1),
             ARGMAX_BLOCK,
             &[
@@ -6146,7 +6444,7 @@ impl DeviceRank {
     /// The argmax of each of `rows` rows of the gathered logits into `tokens`, a u32 a row.
     fn argmax_rows(&self, rows: usize, tokens: Deviceptr) -> Result<(), BackendError> {
         self.launch(
-            self.kernels.argmax,
+            self.kernels.argmax.kernel,
             (rows as u32, 1, 1),
             ARGMAX_BLOCK,
             &[
@@ -6179,7 +6477,7 @@ impl DeviceRank {
         slab.write_at(0, bytemuck::cast_slice(tokens))
             .map_err(cuda_error)?;
         self.call(
-            self.kernels.embed,
+            self.kernels.embed.kernel,
             calls::embed_rows(
                 self.embed.0,
                 out.0,
@@ -6200,7 +6498,7 @@ impl DeviceRank {
         let hidden = self.config.hidden_size;
         let tokens = s.drafted.device().offset(iteration * MAX_ROWS * 4);
         self.call(
-            self.kernels.embed,
+            self.kernels.embed.kernel,
             calls::embed_rows(
                 self.embed.0,
                 s.mtp_embed.0,
@@ -6229,7 +6527,7 @@ impl DeviceRank {
             self.config.rms_norm_eps as f32,
         );
         self.call(
-            self.kernels.rmsnorm_rows,
+            self.kernels.rmsnorm_rows.kernel,
             norm.rows_call(rows, src_stride, dst_stride),
         )
     }
@@ -6325,7 +6623,7 @@ impl DeviceRank {
             if let Some(drafter) = run.drafter {
                 let kept = run.len.min(MAX_ROWS);
                 self.launch(
-                    self.kernels.copy_flat,
+                    self.kernels.copy_flat.kernel,
                     (blocks(kept * hidden), 1, 1),
                     BLOCK,
                     &[
@@ -6699,7 +6997,7 @@ impl DeviceRank {
             draft.merge(self, scratch, lists(gathered, row), world, slot)?;
             draft.select(self, scratch, *next)?;
             self.launch(
-                self.kernels.copy_flat,
+                self.kernels.copy_flat.kernel,
                 (blocks(2 * block_size), 1, 1),
                 BLOCK,
                 &[
@@ -6756,13 +7054,7 @@ impl GemvDevice for DeviceRank {
         output: Deviceptr,
         rows: usize,
     ) -> Result<(), BackendError> {
-        let linear = DeviceLinear {
-            weight: matrix.pointer,
-            scales: None,
-            rows: matrix.rows,
-            columns: matrix.columns,
-            parts: [matrix.rows; 3],
-        };
+        let linear = DeviceLinear::view(matrix.pointer, matrix.rows, matrix.columns, false, None);
         DeviceRank::gemv(self, &linear, input, output, rows)
     }
 
@@ -6927,12 +7219,24 @@ mod tests {
         };
         let cuda = CudaHandle::new(cuda);
         let run = cuda.run_stream().expect("a run stream");
-        let (_tile_module, tile) = cuda
-            .load_named(images::glm_prefill_cubin(), "glm_prefill_fp8b128_mma")
-            .expect("glm_prefill_fp8b128_mma");
-        let (_body_module, body) = cuda
-            .load_named(images::glm_decode_cubin(), "glm_decode_fp8b128_rows")
-            .expect("glm_decode_fp8b128_rows");
+        let tile = Bound::new(
+            &cuda,
+            Image::GlmPrefill,
+            images::glm_prefill_cubin(),
+            "glm_prefill_fp8b128_mma",
+            Precision::Fp8E4M3,
+        )
+        .expect("glm_prefill_fp8b128_mma")
+        .kernel;
+        let body = Bound::new(
+            &cuda,
+            Image::GlmDecode,
+            images::glm_decode_cubin(),
+            "glm_decode_fp8b128_rows",
+            Precision::Fp8E4M3,
+        )
+        .expect("glm_decode_fp8b128_rows")
+        .kernel;
 
         const COLS: usize = 256;
         const INNER: usize = 512;
@@ -6962,13 +7266,11 @@ mod tests {
         let body_out = test_io::upload::<f32>(&cuda, &vec![0.0; TOKENS * COLS]);
         // Two whole-tile parts, as the MLA's fused projections are: the body's part offsets,
         // weight slice and block-scale slice all have to line up with the tile's full matrix.
-        let linear = DeviceLinear {
-            weight,
-            scales: Some(scale),
-            rows: COLS,
-            columns: INNER,
-            parts: [COLS / 2, COLS, COLS],
-        };
+        let linear = DeviceLinear::view(weight, COLS, INNER, true, Some(scale)).parted([
+            COLS / 2,
+            COLS,
+            COLS,
+        ]);
 
         for count in 1..=TOKENS {
             cuda.launch(
@@ -7029,13 +7331,7 @@ mod tests {
         let fits = |weight: u8, rows: usize, parts: [usize; 3]| {
             let scales = (weight != 0).then_some(Deviceptr(0));
             fp8_token_body_fits(
-                &DeviceLinear {
-                    weight: Deviceptr(0),
-                    scales,
-                    rows,
-                    columns: 512,
-                    parts,
-                },
+                &DeviceLinear::view(Deviceptr(0), rows, 512, weight != 0, scales).parted(parts),
                 8,
             )
         };
