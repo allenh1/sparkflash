@@ -1,11 +1,12 @@
 # GLM-5.3-Flash, numerics version 2: decode on the FP8 E4M3 token body
 
-**Registry state: version 1 is still the captured entry.** The body is wired and the change is
-declared here, but `numerics/registry.toml` keeps version 1 and its captured reference until a
-cluster capture of version 2 exists: a capture cannot be withdrawn, and a bump that names the old
-reference is a declared non-change (`scripts/numerics.py ci`). Landing version 2 means bumping the
-entry and committing the new reference in the same diff, after `scripts/numerics.py capture` on the
-served world-4 configuration.
+**Registry state: version 1 is still the captured entry; version 2's capture exists as evidence.**
+The capture was taken on the served world-4 configuration on 2026-11-19 and is committed under
+`numerics/captures/glm53/`. It is not the entry's `reference`: naming new bits at version 1 is an
+undeclared change, and the registry may not bump while `anchor`, `coverage` and `monitors` are
+false (`scripts/numerics.py ci`). Version 2 lands as one diff - the reference, the bump and this
+report - once those prerequisites are in place. Until then version 1's reference stands, and this
+page records how far the tip's bits move from it.
 
 Version 2 of the world-4 sm_121a configuration moves GLM's one-to-eight-row block-scaled FP8
 projections from the tiled row GEMV (`q4e_gemv_tiled_e4m3_block`) to the shared tile's few-row
@@ -17,25 +18,25 @@ shipped version 1 (the E4M3 attention window, [v1-e4m3-window.md](v1-e4m3-window
 A decode step, a speculative verify and any FP8 projection of at most eight rows now launch the
 body on the same E4M3 codes, the same f32 128 x 128 block scales and the same f32 activations the
 GEMV read. Nothing is converted: the body takes the GEMV's operands and writes its part-by-part
-output layout, one launch for each part of a fused projection. The body runs the prompt
-tile's chain - the E4M3 codes widened to bf16, the activation split into a bf16 head and
-remainder, two MMAs a 16-column step with K ascending, and the 128-column block scale folded in
-ascending block order - so its row is the prompt tile's row bit for bit. That tile is
-`glm_prefill_fp8b128_mma`, which takes f32 activations; the shipped release's bulk prefill
-takes `glm_prefill_q8_mma` for its dynamic E4M3 activations, so this change does not by itself
-make a continued turn equal a cold q8 prefill.
+output layout, one launch for each part of a fused projection. The body runs the prompt tile's
+chain - the E4M3 codes widened to bf16, the activation split into a bf16 head and remainder, two
+MMAs a 16-column step with K ascending, and the 128-column block scale folded in ascending block
+order - so its row is the prompt tile's row bit for bit. That tile is `glm_prefill_fp8b128_mma`,
+which takes f32 activations; the shipped release's bulk prefill takes `glm_prefill_q8_mma` for its
+dynamic E4M3 activations, so this change does not by itself make a continued turn equal a cold q8
+prefill.
 
 The routing boundary is the arm's existing one: `MAX_ROWS` is eight, one to eight rows take the
 body, and a larger batch keeps the bulk tensor-core GEMM. Projections whose shape the body does
-not take (a BF16 weight, a K run that is not whole 128-column blocks, or a part that is not
-whole eight-column outputs) keep the tiled GEMV. The routed experts' `q4e_expert_gemv_e4m3_block`
-is outside this change and still serves the token rows.
+not take (a BF16 weight, a K run that is not whole 128-column blocks, or a part that is not whole
+eight-column outputs) keep the tiled GEMV. The routed experts' `q4e_expert_gemv_e4m3_block` is
+outside this change and still serves the token rows.
 
-## What was measured
+## What was measured before the cluster
 
 - **The body is the tile's row.** On the sm_121a device, for every token count from 1 to 8, a
-  two-part fused projection launched through the arm's own body path is bit-equal, row by row,
-  to `glm_prefill_fp8b128_mma` over the same weights, scales and activations
+  two-part fused projection launched through the arm's own body path is bit-equal, row by row, to
+  `glm_prefill_fp8b128_mma` over the same weights, scales and activations
   (`device::tests::a_decode_step_on_the_token_body_is_the_prefill_tiles_row`, ignored unless a
   CUDA device is present). The kernel-level harness
   (`crates/sparkflash-kernels/tests/token_bodies_device.rs`) also holds the body to the tile at
@@ -45,67 +46,85 @@ is outside this change and still serves the token rows.
   part whose block scale does not start on a 128-row boundary
   (`device::tests::the_fp8_token_body_takes_one_to_eight_rows`).
 
-The device run, on the sm_121a host:
-
-```text
-$ cargo test -p sparkflash-model-glm5-next --lib a_decode_step_on_the_token_body_is_the_prefill_tiles_row -- --ignored --nocapture
-running 1 test
-device 0: NVIDIA RTX Spark N1X (6144-core Blackwell RTX GPU) of 1 (total 118815 MiB, MemAvailable 106777 MiB)
-test device::tests::a_decode_step_on_the_token_body_is_the_prefill_tiles_row ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 74 filtered out; finished in 0.44s
-```
-
-The device arm's device-versus-host fixture moves with the declared change: with the FP8
-weights' inputs unquantised, the three worlds' worst seams are 1.3e-5, 1.8e-5 and 1.3e-5
+The device arm's device-versus-host fixture moves with the declared change: with the FP8 weights'
+inputs unquantised, the three worlds' worst seams are 1.3e-5, 1.8e-5 and 1.3e-5
 (`TOKEN_BODY_REL_L2_BAR` is 2e-5); with the release's activation scheme the host quantises each
 input per 128 columns and the body takes the f32 row, so the median seam is 4.8e-2
 (`TOKEN_BODY_QUANTISED_MEDIAN_BAR` is 6e-2) and the test now asserts rank agreement rather than
 host parity. These are fixture distances, not the served model's.
 
-Both checks compare bits. Neither is a speed measurement, and neither runs a checkpoint.
+## Measured on the cluster, 2026-11-19
 
-## What could not be measured
+Served at world 4 on the four DGX Sparks from the branch built at `f1f86bf4` (release,
+`5a092d5a`), GLM-5.3-Flash over 1,048,576 tokens, the shipped `glm53_flash.toml` profile. The
+four ranks agreed on the plan agreement word before the gather (`5b3e9a9f0b067407`, context
+`1048576`, configuration `bc832624869ede08`), all four carried the same binary before the swap,
+and `/readyz` answered in 21 s.
 
-- **The served delta.** No cluster window and no checkpoint were available, so the change was not
-  captured against the frozen GLM anchor (`numerics/references/glm53-anchor.json`). The mean NLL
-  delta, top-1 agreement, KL lower bound and greedy-text flips of version 2 against version 1 are
-  therefore **unmeasured**. The registry's `reference` and `fingerprint` still name the version-1
-  capture until the cluster recaptures; the next capture must be compared against the anchor with
-  `scripts/numerics.py compare`.
+Two free captures are bit-identical, so the served configuration is deterministic at this tip:
+
+```text
+451be41bb5fbe34db4646d2167647fad282be34b2f144523fe4549d101be30fa  e4m3-token-body-v2.json
+451be41bb5fbe34db4646d2167647fad282be34b2f144523fe4549d101be30fa  the same capture, second run
+41dc724dd71ca2b8e5df1dd2fc32c48a12987042bf5c88657763ea9458d44011  e4m3-token-body-v2-forced.json
+```
+
+The forced capture is teacher-forced on version 1's tokens, top-8 logprobs, and compared against
+the version 1 reference (`827ec5f682d512cc`):
+
+| metric | value |
+| :-- | --: |
+| tokens scored | 997 |
+| version 1 NLL / token | 0.1504 |
+| mean NLL delta | +1.373e-01 |
+| mean absolute NLL delta | 1.559e-01 |
+| p99 absolute NLL delta | 4.780e+00 |
+| max absolute NLL delta | 1.446e+01 |
+| top-1 agreement | 93.3801 % |
+| mean KL lower bound | 1.075e-01 |
+
+Per prompt the delta is not uniform: retrieval is on the floor (+4.2e-03 mean NLL, top-1 100 %),
+logic +6.8e-03 (98.4 %), tool-json +6.4e-02 (96.9 %), summary +1.0e-01 (95.3 %), arithmetic
++1.2e-01 (94.5 %), code +1.6e-01 (89.8 %), translation +2.0e-01 (97.7 %) and raw continuation
++4.1e-01 (75.8 %).
+
+The served gate's lanes check also passed on the same boot: 41.4 tok/s for a prompt alone, 54.7
+and 54.8 tok/s with four at once, and every together answer equal to its alone answer.
+
+**What this number is.** It is the tip against version 1, not this body's share. Version 1's
+reference predates the arm's move onto `Runtime<Walk>` (phase 1) and this decode body (phase 5),
+so the delta is the sum of those changes. For scale: Qwen's tensor-core decode moved +7.0e-04
+mean NLL with 99.39 % top-1 agreement ([../qwen38/v1-tc-decode.md](../qwen38/v1-tc-decode.md)),
+two orders of magnitude less. Two causes are consistent with the per-prompt pattern and neither
+is established: the body's accumulation order (the 128-column block scale folded in ascending
+block order, two MMAs a 16-column step) against the row GEMV's, and the arm's prefill chunking
+at the profile's 4,096 rows where version 1's build ran the code default. A capture on this same
+build with `SPARKFLASH_DECODE_MMA=off`, compared against this capture, separates the body from the
+move; that capture is not yet taken.
+
+## What is still not measured
+
+- **The body's own share of the delta**, for the reason above.
 - **The speed A/B.** Whether the one-row step is flat or slightly slower and whether the
   several-row step is faster are both **unmeasured**. The expected shape from the plan is flat or
   slightly slower at one row and faster at several, as on DeepSeek and Qwen; that expectation is
-  not evidence.
-
-To measure the served configuration, on the cluster with GLM served at world 4:
-
-```bash
-# The version-2 reference, then the bit check against it.
-python3 scripts/numerics.py capture --url http://127.0.0.1:8001 --out numerics/references/glm53-tp4-sm121a.json
-python3 scripts/numerics.py check --url http://127.0.0.1:8001 --reference numerics/references/glm53-tp4-sm121a.json
-
-# The served delta against the frozen anchor.
-python3 scripts/numerics.py capture --url http://127.0.0.1:8001 --forced-from numerics/references/glm53-anchor.json --top-logprobs 20 --out numerics/captures/glm53/v2-fp8-token-body.json
-python3 scripts/numerics.py compare --anchor numerics/references/glm53-anchor.json --candidate numerics/captures/glm53/v2-fp8-token-body.json --markdown docs/numerics/glm53/v2-fp8-token-body.md
-```
-
-`scripts/numerics.py check` is the command that decides whether the server's bits are the
-declared version's.
-
-The declaration check itself (`python3 scripts/numerics.py ci`) reports two findings until that
-capture exists: version 2 names version 1's fingerprint, so it is a declared non-change, and the
-`anchor`, `coverage` and `monitors` prerequisites are still false. Both are expected here - the
-first clears with the recapture, the second with the prerequisite work - and neither can pass
-without the cluster.
+  not evidence. The lanes check above is a functional gate, not a speed comparison.
+- **Greedy-text flips.** `numerics.py` at this tip reports top-1 agreement, not a flipped-token
+  count; 93.38 % agreement over 997 positions is about 66 changed argmaxes, which is derived and
+  not the tool's own count.
 
 ## Reading
 
-The important property this version establishes is the one the device test measures: a GLM decode
-step on the body is the prompt tile's row, not a second arithmetic image. What it does not
-establish, until the cluster capture, is how far the served logits move and whether the step got
-faster. Version 1 remains the only measured GLM reference.
+The device tests establish that a GLM decode step on the body is the prompt tile's row, not a
+second arithmetic image. The cluster capture establishes something the device tests could not: on
+the released checkpoint the tip's bits are deterministic, they are measurably different from
+version 1's, and the difference is large enough that it is a served change and not a rounding
+note. Retrieval is essentially unchanged; the raw continuation is the worst prompt at 75.8 %
+top-1.
 
-The body covers the FP8 precision of GLM's decode; BF16 projections still take the tiled
-GEMV, and the `WAIVERS` lines in `crates/sparkflash-ops/src/parts.rs` now say so and cite
+Version 1 remains the only reference the registry names until the prerequisites allow version 2 to
+declare this capture.
+
+The body covers the FP8 precision of GLM's decode; BF16 projections still take the tiled GEMV,
+and the `WAIVERS` lines in `crates/sparkflash-ops/src/parts.rs` now say so and cite
 `glm_decode_fp8b128_rows`.

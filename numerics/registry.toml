@@ -124,7 +124,7 @@ reference = "references/glm53-tp4-sm121a.json"
 fingerprint = "827ec5f682d512ccc73f10e6145a1ada548fbc027710d09330b34da61c3bafd6"
 report = "docs/numerics/glm53/v2-fp8-token-body.md"
 captured = "2026-11-03"
-note = "Version 1's reference, captured before decode moved to the tile's few-row body. The 1..=8-row FP8 token body is wired (glm_decode_fp8b128_rows) and its served delta is unmeasured; version 2 and its new reference land together with the cluster capture, because a capture cannot be withdrawn and a bump without a changed reference is a declared non-change (docs/numerics/glm53/v2-fp8-token-body.md)."
+note = "Version 1's reference, captured before decode moved to the tile's few-row body. The 1..=8-row FP8 token body is wired (glm_decode_fp8b128_rows) and its served delta is now measured at world 4: numerics/captures/glm53/e4m3-token-body-v2.json and its forced capture, +1.373e-01 mean NLL with 93.38% top-1 agreement against this reference, deterministic over two runs (docs/numerics/glm53/v2-fp8-token-body.md). The bump to version 2 still waits on the anchor, coverage and monitors prerequisites; until then this entry keeps version 1 and its reference."
 
 # Inkling-2-Small and Dory1.0-4B are registered before their first capture: both entries name the
 # configuration, version and evidence, and leave `reference` and `fingerprint` out. That is the

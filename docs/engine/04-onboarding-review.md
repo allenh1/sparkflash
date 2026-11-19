@@ -418,6 +418,46 @@ The ban is a test, not a convention: `crates/sparkflash-ops/tests/kernel_lookup.
 `sparkflash-model-*` crate and the DeepSeek forward for `load_named`, `load_named_shared` and
 `load_function`, and holds each file to a recorded count with a reason. A converted arm must
 tighten its line; an unconverted one records "not converted yet: phase 7 runs by arm".
+### The GLM capture, and what a four-rank boot needs
+
+The arm does boot at world 4 on the branch. Three windows on the cluster (head `sg1-oneill`, four
+DGX Sparks, GLM-5.3-Flash over 1,048,576 tokens) established it, and the third measured it:
+
+* Window one failed in 8 s with `the bootstrap gather's plan digest differs by rank (rank 0 sent
+  0xb067407, rank(s) [1, 2, 3] differ)`. The cause was the window, not the code: the binary had
+  been installed on the head node only, and the console's swap began copying it to the three peers
+  while the ranks were already starting. Rank 0 ran the branch (whose `Glm5NextConfig` Debug
+  string gained fields in the phase-1 merge) and the workers ran the old build, so the agreement
+  word differed. The arm never loaded weights; the window cost 4 m 07 s and restored.
+* Window two printed the agreement word from all four ranks and booted: every rank reported
+  `5b3e9a9f0b067407`, context `1048576`, configuration `bc832624869ede08`, 35808 bytes. The trace
+  that made the component nameable is now part of the boot output (`serve.rs`, one line a rank).
+* Window three installed the binary on **all four** ranks, verified the four hashes, waited for no
+  sync job, and only then swapped: `/readyz` in 21 s, two bit-identical captures, a forced
+  capture, a compare, and the served gate's lanes check PASS (41.4 tok/s alone, 54.7/54.8 with
+  four at once). Restored on `435179d6` with four ranks in 4 m 30 s.
+
+The measured delta is in [the GLM report](../numerics/glm53/v2-fp8-token-body.md): +1.373e-01
+mean NLL per token against version 1, 93.38 % top-1 agreement over 997 positions, and a per-prompt
+spread that runs from retrieval at +4.2e-03 to raw continuation at +4.1e-01. It is the tip's
+delta, not the decode body's share, because version 1's reference predates the move and the body
+both. Qwen's decode move was +7.0e-04 with 99.39 % agreement, so this is a large served change
+and the page says so rather than calling it a rounding note.
+
+Two operational facts the plan's gate should carry:
+
+1. **A four-rank boot needs the same binary on every rank, verified before the swap.** The
+   console deploys a changed binary to the peers as part of the launch, so an operator who installs
+   on rank 0 alone races that copy. The check is four `sha256sum`s and one wait;
+   `scripts/onboard-gate.sh` and the served gate should make it, because the failure mode reads
+   like an arithmetic disagreement and is not one.
+2. **A failed swap rolls the selection back and leaves the cluster stopped.** The restore is
+   `/api/actions/launch` (the selected model is already the production one), not a second swap;
+   a swap to the selected model is refused with `already the selected model`.
+
+Both windows' reports and artifacts are under `/home/allenh1/cluster-tests/2026111*` on the head
+node. The cluster was over its window for 4 m 07 s, 5 m 23 s and 4 m 30 s respectively, and was
+verified serving the production model card, build and four ranks after each.
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
