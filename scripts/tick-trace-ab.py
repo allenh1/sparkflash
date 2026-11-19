@@ -39,6 +39,9 @@ Usage:
   --prompt-tokens     comma list, default 2048,16384.
   --reps              launches of each build for each pair, default 3.
   --max-tokens        completion length a request asks for, default 16.
+  --stagger SECONDS   start request N N*stagger after the first. 0 fires them together, which
+                      makes a tick's admission set a race between launches; spacing them is how
+                      the comparison sees the scheduler rather than arrival timing.
   --out DIR           the traces and server logs, default target/tick-trace-ab.
   --site-script FILE  launch the four-rank group through the site's own launcher
                       (scripts/serve-four-node.sh) instead of one serve process. The binary is
@@ -175,12 +178,20 @@ def wait_ready(url, process, timeout):
     return False
 
 
-def workload(url, streams, text, max_tokens, timeout):
-    """All streams start together; the answer's prompt_tokens checks the size."""
-    barrier = threading.Barrier(streams)
+def workload(url, streams, text, max_tokens, timeout, stagger=0.0):
+    """All streams start together unless staggered; prompt_tokens checks the size.
 
-    def one(_):
-        barrier.wait()
+    With `stagger` seconds, request N starts N*stagger after request 0. A tick's admission set
+    depends on when the requests arrive, so a barrier makes the admission lines a race; spacing
+    them is what lets the A/B compare the scheduler rather than the network.
+    """
+    barrier = threading.Barrier(streams) if not stagger else None
+
+    def one(index):
+        if barrier is not None:
+            barrier.wait()
+        elif stagger:
+            time.sleep(index * stagger)
         try:
             return ask(url, text, max_tokens, timeout)
         except Exception as error:  # a failed stream is reported, not silently compared
@@ -349,7 +360,9 @@ def run(args):
                         continue
                     process, log = started
                     try:
-                        seen = workload(url, count, text, args.max_tokens, args.timeout)
+                        seen = workload(
+                            url, count, text, args.max_tokens, args.timeout, args.stagger
+                        )
                         print(
                             "WORKLOAD %s %s prompt_tokens=%s"
                             % (label, name, sorted({value for value in seen if isinstance(value, int)}))
@@ -433,6 +446,13 @@ def main():
     parser.add_argument("--prompt-tokens", default="2048,16384")
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument(
+        "--stagger",
+        type=float,
+        default=0.0,
+        help="seconds between the starts of consecutive requests; 0 fires them together, which "
+        "makes a tick's admission set a race between launches",
+    )
     parser.add_argument("--out", default="target/tick-trace-ab")
     parser.add_argument("--bind", default="127.0.0.1:8000")
     parser.add_argument("--timeout", type=float, default=3600)
