@@ -38,7 +38,7 @@
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::{
-    glm_decode_cubin, glm_prefill_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
+    dory_cubin, glm_decode_cubin, glm_prefill_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
 };
 use sparkflash_kernels::m4_quant::{bf16_bits, fp8_e4m3_encode};
 use sparkflash_kernels::test_io::{self, download, upload};
@@ -504,6 +504,110 @@ fn the_packed_token_body_is_the_bf16_tiles_rows() {
                 .map(f32::from_bits)
                 .collect();
             assert_rows_are_the_tiles(&label, &tile, &rows, count, tile_cols, cols);
+        }
+    }
+}
+
+/// The wide tile's dynamic shared memory (`GLM_WIDE_SHARED`, `sparkflash_ops::projection`):
+/// three cp.async stages of a 128-row activation tile and a 256-column weight tile.
+const WIDE_SHARED: u32 = 98_304;
+
+/// One matrix of a `q4p_dense_rows` launch over `count` rows: the launch the arm's decode path
+/// makes, the matrix a part, the sum itself (no epilogue, no split).
+fn dense_rows_call(
+    input: Deviceptr,
+    weight: Deviceptr,
+    output: Deviceptr,
+    cols: usize,
+    inner: usize,
+    count: usize,
+) -> ((u32, u32, u32), [u64; 61]) {
+    let mut args = [0u64; 61];
+    args[0] = input.0;
+    args[1] = inner as u64;
+    args[2] = count as u64;
+    args[3] = output.0;
+    args[4] = 0;
+    args[5] = u64::from(1.0f32.to_bits());
+    args[6] = 1;
+    args[7..12].copy_from_slice(&[weight.0, output.0, output.0, cols as u64, 1]);
+    args[27] = cols.div_ceil(32) as u64;
+    args[28] = 0;
+    (
+        (cols.div_ceil(32) as u32, count.div_ceil(16) as u32, 1),
+        args,
+    )
+}
+
+/// The BF16 few-row body is the wide tile's row, which is the prompt tile Dory and Inkling run
+/// their dense projections on: `dory_mma_wide` is `shared_prefill_wide_body` and
+/// `glm_prefill_bf16_wide` is the same body, so a decode row on `q4p_dense_rows` is a cold
+/// prompt's row at every row count.
+#[test]
+#[ignore = "needs a CUDA device and the shared model images"]
+fn the_bf16_rows_body_is_the_wide_tiles_row() {
+    let Some(cuda) = open() else { return };
+    let (_rows_module, rows_kernel) = cuda
+        .load_named(qwen4_prefill_cubin(), "q4p_dense_rows")
+        .expect("q4p_dense_rows");
+    let (_glm_module, glm_wide) = cuda
+        .load_named_shared(glm_prefill_cubin(), "glm_prefill_bf16_wide", WIDE_SHARED)
+        .expect("glm_prefill_bf16_wide");
+    let (_dory_module, dory_wide) = cuda
+        .load_named_shared(dory_cubin(), "dory_mma_wide", WIDE_SHARED)
+        .expect("dory_mma_wide");
+
+    const COLS: usize = 256;
+    const INNER: usize = 512;
+    let mut stream = Lcg(0xb16b00b5);
+    let weights: Vec<u16> = (0..COLS * INNER)
+        .map(|_| bf16_bits(stream.next() * 0.05))
+        .collect();
+    let w = upload::<u8>(
+        &cuda,
+        &weights
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let a = upload::<u8>(&cuda, &f32_bytes(&activations(TOKENS[3], INNER, 31)));
+    let tile_out = upload::<u8>(&cuda, &vec![0u8; TOKENS[3] * COLS * 4]);
+    let rows_out = upload::<u8>(&cuda, &vec![0u8; TOKENS[3] * COLS * 4]);
+    for (label, tile_kernel) in [
+        ("glm_prefill_bf16_wide", glm_wide),
+        ("dory_mma_wide", dory_wide),
+    ] {
+        for count in TOKENS {
+            cuda.memset_d8_async(tile_out, 0xff, TOKENS[3] * COLS * 4)
+                .expect("poison the tile's output");
+            cuda.memset_d8_async(rows_out, 0xff, TOKENS[3] * COLS * 4)
+                .expect("poison the rows body's output");
+            cuda.launch(
+                tile_kernel,
+                (COLS.div_ceil(256) as u32, count.div_ceil(128) as u32, 1),
+                (256, 1, 1),
+                &[
+                    w.0,
+                    a.0,
+                    tile_out.0,
+                    COLS as u64,
+                    INNER as u64,
+                    count as u64,
+                ],
+            )
+            .expect("the wide tile");
+            let (grid, args) = dense_rows_call(a, w, rows_out, COLS, INNER, count);
+            cuda.launch(rows_kernel, grid, (128, 1, 1), &args)
+                .expect("the BF16 rows body");
+            let tile: Vec<f32> = download::<u32>(&cuda, &tile_out, count * COLS)
+                .into_iter()
+                .map(f32::from_bits)
+                .collect();
+            let rows: Vec<f32> = download::<u32>(&cuda, &rows_out, count * COLS)
+                .into_iter()
+                .map(f32::from_bits)
+                .collect();
+            assert_rows_are_the_tiles(label, &tile, &rows, count, COLS, COLS);
         }
     }
 }

@@ -1480,13 +1480,14 @@ extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_runs_mx8_head(
 // An item of 16 rows or fewer skips the second m16 tile. Grid (intermediate / 32, max items) for
 // gate_up and (hidden / 64, max items) for down, 128 threads; both K dimensions are multiples of
 // 128.
-template <bool GATE_UP>
+template <bool GATE_UP, class Epi = Q4pSiluSwiglu>
 __device__ __forceinline__ void q4p_moe_rows_body(
     const unsigned long long* __restrict__ table, const float* __restrict__ scales,
     const int* __restrict__ sorted, const int4* __restrict__ items,
     const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ a_src,
     unsigned long long a_plane, const float* __restrict__ route_weights, void* __restrict__ out,
-    unsigned long long out_plane, int topk, int hidden, int intermediate, int weight_stride) {
+    unsigned long long out_plane, int topk, int hidden, int intermediate, int weight_stride,
+    const Epi epi = Epi()) {
     __shared__ uint32_t lut[256];
     __shared__ int s_slot[Q4P_MOE_ROWS];
     if ((int)blockIdx.y >= *item_count) {
@@ -1519,8 +1520,12 @@ __device__ __forceinline__ void q4p_moe_rows_body(
     for (int j = 0; j < 2; ++j) {
         const unsigned long long row = GATE_UP ? (unsigned long long)(n0 + g) : (unsigned long long)(n0 + 8 * j + g);
         const int packed = GATE_UP ? (j == 0 ? 0 : 2) : 4;
-        w_row[j] = (const unsigned char*)table[expert * 6 + packed] + row * packed_row + 16 * t;
-        s_row[j] = (const unsigned char*)table[expert * 6 + packed + 1] + row * scale_row;
+        // Inkling's w13 interleaves the gate and up rows, so a column is `Epi::kGateUpRows`
+        // stored rows on; Qwen's separate matrices are one.
+        w_row[j] = (const unsigned char*)table[expert * 6 + packed] +
+                   row * (Epi::kGateUpRows * packed_row) + 16 * t;
+        s_row[j] = (const unsigned char*)table[expert * 6 + packed + 1] +
+                   row * (Epi::kGateUpRows * scale_row);
     }
     // The item rows this lane's A fragments read: g, g + 8, 16 + g, 24 + g.
     const __nv_bfloat16* a_row[4];
@@ -1625,8 +1630,9 @@ __device__ __forceinline__ void q4p_moe_rows_body(
                     continue;
                 }
                 const int slot = s_slot[r];
-                const float a0 = q4p_swiglu(acc[mt][0][2 * h], acc[mt][1][2 * h], g2, u2);
-                const float a1 = q4p_swiglu(acc[mt][0][2 * h + 1], acc[mt][1][2 * h + 1], g2, u2);
+                const float a0 = epi.activate(acc[mt][0][2 * h], acc[mt][1][2 * h], g2, u2);
+                const float a1 =
+                    epi.activate(acc[mt][0][2 * h + 1], acc[mt][1][2 * h + 1], g2, u2);
                 __nv_bfloat162 head;
                 __nv_bfloat162 rest;
                 q4p_split2(a0, a1, head, rest);
@@ -1682,6 +1688,21 @@ extern "C" __global__ __launch_bounds__(128) void q4p_moe_rows_down(
     OPT_PDL_ENTRY();
     q4p_moe_rows_body<false>(table, scales, sorted, items, item_count, activated, activated_plane,
                              route_weights, partials, 0, topk, hidden, intermediate, weight_stride);
+}
+
+// q4p_moe_gate_up_capped for a few rows: Inkling-2-Small's interleaved w13 and softcapped
+// SwiGLU through q4p_moe_rows_body, so a decode row is q4p_moe_gate_up_capped's row.
+extern "C" __global__ __launch_bounds__(128) void q4p_moe_rows_gate_up_capped(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ x,
+    unsigned long long x_plane, __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, int topk, int hidden, int intermediate, float gate_cap,
+    float up_cap) {
+    OPT_PDL_ENTRY();
+    q4p_moe_rows_body<true>(table, scales, sorted, items, item_count, x, x_plane, nullptr,
+                            activated, activated_plane, topk, hidden, intermediate, 0,
+                            Q4pSoftcapSwiglu{gate_cap, up_cap});
 }
 
 // ---------------------------------------------------------------------------------------------

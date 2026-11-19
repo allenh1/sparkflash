@@ -313,6 +313,7 @@ impl Image {
                 "q4p_moe_gate_up_fp8",
                 "q4p_moe_rows_down",
                 "q4p_moe_rows_gate_up",
+                "q4p_moe_rows_gate_up_capped",
                 "q4p_moe_swiglu_fp8",
                 "q4p_split_bf16",
             ],
