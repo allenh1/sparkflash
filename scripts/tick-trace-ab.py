@@ -231,8 +231,28 @@ def tail(path, lines=40):
         pass
 
 
+def wait_ready_url(url, timeout):
+    """Waits for /v1/models to answer, without owning the server's process."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            model_id(url, 5)
+            return True
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
+            last = error
+            time.sleep(1)
+    print("tick-trace-ab: not ready in %ss: %s" % (timeout, last), file=sys.stderr)
+    return False
+
+
 def group_launch(script, binary, trace_path, log_path, url, timeout):
-    """Launches the site's four-rank group with `binary`, its trace on rank 0."""
+    """Launches the site's four-rank group with `binary`, its trace on rank 0.
+
+    The site launcher starts the workers detached, checks that rank 0 survived two seconds and
+    exits; the ranks outlive it. So the launcher's exit is not the server's, and readiness is
+    read from the endpoint rather than from the launcher's process.
+    """
     environment = dict(os.environ)
     environment["SPARKFLASH_BIN"] = binary
     environment["SPARKFLASH_TICK_TRACE"] = trace_path
@@ -243,7 +263,15 @@ def group_launch(script, binary, trace_path, log_path, url, timeout):
     process = subprocess.Popen(
         command, stdout=log, stderr=subprocess.STDOUT, env=environment, start_new_session=True
     )
-    if not wait_ready(url, process, timeout):
+    try:
+        code = process.wait(timeout=90)
+    except subprocess.TimeoutExpired:
+        code = None
+    if code not in (0, None):
+        tail(log_path)
+        group_stop(script, log, url)
+        return None
+    if not wait_ready_url(url, timeout):
         tail(log_path)
         group_stop(script, log, url)
         return None
