@@ -62,7 +62,7 @@ pub use ledger::{Ledger, Mode, Strategy};
 pub use pool::{LaneMemory, LanePool};
 pub use resume::{Restore, Rewind, checkpoint_after, rewind_plan};
 pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
-pub use runtime::{Runtime, RuntimeSlot, ledger_for};
+pub use runtime::{Runtime, RuntimeSession, RuntimeSlot, ledger_for};
 pub use share::{BandWall, ExpertUnionWall, StepWall, share_rows};
 pub use walk::{
     Absent, ComputeDeclaration, Draft, Drafter, HeadInput, HeadRow, Hidden, NoVision,
