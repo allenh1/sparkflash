@@ -33,12 +33,12 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use sparkflash_model::backend::{BackendError, ModelSession, Sampling, StepOutput};
+use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
-    ChunkPolicy, ComputeDeclaration, Drafter, HeadInput, HeadRow, Hidden, LaneMemory, LaneState,
-    Limits, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments, StateKind, StateLayout,
-    Walk, WalkCapabilities,
+    ChunkPolicy, ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden,
+    LaneMemory, LaneState, Limits, Opened, Pass, PassKind, PassMask, Region, Runtime, Segment,
+    Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
 };
 
 use sparkflash_kernels::cuda_driver::Deviceptr;
@@ -58,6 +58,8 @@ pub(super) struct QwenWalk {
     members: usize,
     /// The steps a token or verify pass already resolved, in segment order, for the head.
     pending: Mutex<VecDeque<StepOutput>>,
+    /// The arm's draft source, behind the runtime's round contract.
+    drafter: QwenDrafter,
 }
 
 impl QwenWalk {
@@ -70,6 +72,18 @@ impl QwenWalk {
     ) -> Result<Self, BackendError> {
         let layout = layout_of(&shared.config);
         let limits = Limits::new(pass_rows(shared.prefill.chunk), context_limit);
+        let joint = sparkflash_runtime::joint_rounds()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let wall = ExpertUnionWall {
+            experts: shared.config.num_experts,
+            top_k: shared.config.num_experts_per_tok,
+            ..super::fusion::JOINT_WALL
+        };
+        let drafter = QwenDrafter {
+            depth: shared.verify_rows.saturating_sub(1),
+            wall,
+            joint,
+        };
         Ok(Self {
             shared,
             layout,
@@ -77,6 +91,7 @@ impl QwenWalk {
             batch: Mutex::new(None),
             members: capacity.clamp(1, MAX_BATCH),
             pending: Mutex::new(VecDeque::new()),
+            drafter,
         })
     }
 
@@ -319,12 +334,100 @@ pub(super) fn runtime(
 
 /// The arm's draft source: the checkpoint's MTP stage, or a loaded DFlash 2 head.
 ///
-/// The runtime's drafting methods are a later phase; the walk itself already drafts after each
-/// prompt and each step, so the ledger states the source rather than `Absent`.
-pub(super) struct QwenDrafter;
+/// Qwen still serves on its own fusion; this is the same round expressed on the runtime's
+/// contract, so a walk opened through [`Runtime`] drafts the way the fusion does. With
+/// `SPARKFLASH_JOINT_ROUNDS=off` the arm drafts nothing (the fusion's own policy), which the
+/// empty chain states.
+pub(super) struct QwenDrafter {
+    /// The most drafts the verify batch holds, past the anchor.
+    depth: usize,
+    wall: ExpertUnionWall,
+    /// Whether the arm drafts at all with the joint switch as set.
+    joint: bool,
+}
 
 impl Drafter<QwenWalk> for QwenDrafter {
     const PRESENT: bool = true;
+    /// The batch already folded each member's rows into its step.
+    type Rows = StepOutput;
+
+    fn wall(&self) -> &dyn StepWall {
+        &self.wall
+    }
+
+    fn open_round(&self, seq: &mut DeviceSequence, token: u32) -> Result<Draft, BackendError> {
+        match seq.open_round(token)? {
+            Opened::Held(step) => Ok(Draft::Held(step)),
+            Opened::Round(chain) => {
+                let drafts = std::mem::take(&mut seq.spec_drafts);
+                let confidence = std::mem::take(&mut seq.spec_confidence);
+                let _ = confidence;
+                if self.joint {
+                    Ok(Draft::Chain {
+                        confidence: chain,
+                        drafts,
+                    })
+                } else {
+                    Ok(Draft::Chain {
+                        confidence: Vec::new(),
+                        drafts: Vec::new(),
+                    })
+                }
+            }
+        }
+    }
+
+    fn verify(
+        &self,
+        walk: &QwenWalk,
+        segments: &mut [Segment<'_, DeviceSequence>],
+        _depths: &[usize],
+    ) -> Result<Vec<Self::Rows>, BackendError> {
+        let members = segments.len();
+        walk.verify_pass(segments)?;
+        let mut pending = walk
+            .pending
+            .lock()
+            .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?;
+        let steps: Vec<StepOutput> = pending.drain(..).collect();
+        if steps.len() != members {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!(
+                    "a verify of {members} member(s) answered {} step(s)",
+                    steps.len()
+                ),
+            ));
+        }
+        Ok(steps)
+    }
+
+    fn settle(
+        &self,
+        _seq: &mut DeviceSequence,
+        _chunk: &[u32],
+        rows: Self::Rows,
+    ) -> Result<StepOutput, BackendError> {
+        // DeviceSequence::resolve_verify already settled the round inside the batch.
+        Ok(rows)
+    }
+
+    fn budget(&self, seqs: usize) -> usize {
+        seqs * self.depth
+    }
+
+    fn ready(&self, seq: &DeviceSequence, token: u32) -> bool {
+        seq.holds(token)
+    }
+
+    fn give_back(&self, seq: &mut DeviceSequence, to: usize) -> Result<(), BackendError> {
+        let count = seq.consumed.len().saturating_sub(to);
+        seq.give_back(count)
+    }
+
+    fn speculation(&self, seq: &DeviceSequence) -> Speculation {
+        seq.spec.stats()
+    }
 
     fn describe(&self) -> String {
         "DFlash 2 or MTP".to_owned()
@@ -363,6 +466,10 @@ impl Walk for QwenWalk {
 
     fn limits(&self) -> Limits {
         self.limits
+    }
+
+    fn drafter(&self) -> &Self::Drafter {
+        &self.drafter
     }
 
     /// A token pass holds at most the batch's four members, though a prompt pass holds a whole
@@ -481,6 +588,12 @@ impl Walk for QwenWalk {
                         row.seq.draft_chain(token, position)?;
                     }
                     next
+                }
+                HeadInput::Verify { rows, row: index } => {
+                    row.seq
+                        .sampler
+                        .record(rows.get(*index).copied().unwrap_or_default());
+                    row.seq.next(&logits)
                 }
             };
             steps.push(StepOutput {

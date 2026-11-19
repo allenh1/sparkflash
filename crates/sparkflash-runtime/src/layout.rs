@@ -184,20 +184,40 @@ impl StateLayout {
     }
 }
 
-/// Most rows one pass may hold, and the context a sequence may reach.
+/// Most rows one pass may hold, most members one batch may hold, and the context a sequence may
+/// reach.
+///
+/// Rows and members are separate numbers because they are separate widths: a prompt chunk may be
+/// four thousand rows while a token batch holds four members, and a verify pass of `members`
+/// members is `members x (1 + depth)` rows. A drafting walk states the member count of its
+/// verify batch here, so the engine caps members at its verify width and not at its prompt chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// The most rows one [crate::Walk::walk] may be given.
     pub rows: usize,
+    /// The most members one batch may hold.
+    pub members: usize,
     /// The most positions a sequence may hold.
     pub context: usize,
 }
 
 impl Limits {
-    /// Limits of `rows` rows a pass and `context` positions a sequence.
+    /// Limits of `rows` rows a pass and `context` positions a sequence, with as many members a
+    /// batch as rows a pass.
     #[must_use]
     pub const fn new(rows: usize, context: usize) -> Self {
-        Self { rows, context }
+        Self {
+            rows,
+            members: rows,
+            context,
+        }
+    }
+
+    /// The same limits with `members` members a batch.
+    #[must_use]
+    pub const fn with_members(mut self, members: usize) -> Self {
+        self.members = members;
+        self
     }
 }
 

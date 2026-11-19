@@ -34,6 +34,7 @@ use sparkflash_model::ledger::State;
 
 use crate::layout::{LaneState, Limits, StateKind, StateLayout};
 use crate::pool::LaneMemory;
+use crate::share::StepWall;
 
 /// What a walk is for.
 ///
@@ -115,6 +116,13 @@ pub struct Pass<'a> {
     pub kind: PassKind,
     /// The output constraint of a [`PassKind::Verify`] pass, and `None` otherwise.
     pub constraint: Option<OutputConstraint<'a>>,
+    /// The rows of the prompt still to come after a [`PassKind::Bulk`] chunk; `0` is the
+    /// prompt's last chunk and `None` is a pass that is not a prompt chunk.
+    ///
+    /// A drafter that commits a window of its prompt work needs the end: the old serving loops
+    /// limited the commits to the prompt's end (`window_commits`), and one that ran to the
+    /// chunk's own end would do the last chunk's work twice.
+    pub prompt_end: Option<usize>,
     /// The hook between the last layer and the head ([tick-ahead][`WalkHook`]).
     pub hook: Option<&'a mut dyn WalkHook>,
 }
@@ -126,6 +134,7 @@ impl<'a> Pass<'a> {
         Self {
             kind: PassKind::TokenRows,
             constraint: None,
+            prompt_end: None,
             hook: None,
         }
     }
@@ -136,6 +145,7 @@ impl<'a> Pass<'a> {
         Self {
             kind: PassKind::Bulk { rows },
             constraint: None,
+            prompt_end: None,
             hook: None,
         }
     }
@@ -146,6 +156,7 @@ impl<'a> Pass<'a> {
         Self {
             kind: PassKind::Paired { chunks },
             constraint: None,
+            prompt_end: None,
             hook: None,
         }
     }
@@ -156,6 +167,7 @@ impl<'a> Pass<'a> {
         Self {
             kind: PassKind::Verify { rows },
             constraint: Some(constraint),
+            prompt_end: None,
             hook: None,
         }
     }
@@ -165,6 +177,23 @@ impl<'a> Pass<'a> {
     pub fn with_hook(mut self, hook: &'a mut dyn WalkHook) -> Self {
         self.hook = Some(hook);
         self
+    }
+
+    /// The same bulk pass with `after` rows of the prompt still to come.
+    #[must_use]
+    pub const fn with_prompt_end(mut self, after: usize) -> Self {
+        self.prompt_end = Some(after);
+        self
+    }
+
+    /// Whether this is a prompt's last chunk; `None` when the pass is not a prompt chunk or the
+    /// caller did not say where the prompt ends.
+    #[must_use]
+    pub const fn last_chunk(&self) -> Option<bool> {
+        match self.prompt_end {
+            Some(after) => Some(after == 0),
+            None => None,
+        }
     }
 
     /// The number of rows the pass says it holds, when the kind names one.
@@ -233,6 +262,16 @@ pub enum HeadInput<'a> {
     Prompt(&'a [u32]),
     /// The row consumes `token`.
     Token(u32),
+    /// The row is one verify row of the member's `rows` (the anchor, then the drafts): `row`
+    /// is its index. The head answers this row's token; the runtime compares it with the draft
+    /// after it and stops the member's run at the first mismatch, so a later row's head is not
+    /// asked for.
+    Verify {
+        /// The member's rows in order, anchor first.
+        rows: &'a [u32],
+        /// The index of this row in `rows`.
+        row: usize,
+    },
 }
 
 /// One residual row to turn into a token, and the sequence whose sampler takes it.
@@ -264,6 +303,16 @@ impl<'a, S> HeadRow<'a, S> {
             seq,
             row,
             input: HeadInput::Token(token),
+        }
+    }
+
+    /// A verify row `index` of the member's `rows`.
+    #[must_use]
+    pub fn verify(seq: &'a mut S, row: usize, rows: &'a [u32], index: usize) -> Self {
+        Self {
+            seq,
+            row,
+            input: HeadInput::Verify { rows, row: index },
         }
     }
 }
@@ -418,15 +467,112 @@ impl WalkCapabilities {
     }
 }
 
-/// A draft source.
+/// What a member's round opens to.
+///
+/// A round starts on the token its caller fed. A member whose last verify already holds that
+/// token's answer opens [`Draft::Held`] and costs no row; every other member drafts its chain
+/// and opens [`Draft::Chain`].
+#[derive(Debug, Clone)]
+pub enum Draft {
+    /// The member's last verify already holds the fed token's step: this is its answer, and it
+    /// takes no row of the walk.
+    Held(StepOutput),
+    /// The member's next chain. `drafts[j]` is the token proposed after `drafts[0..=j]`, and
+    /// `confidence[j]` is the chance the first `j + 1` drafts are all accepted, falling with
+    /// depth; the runtime shares its verify rows by it. An empty chain verifies the anchor alone.
+    Chain {
+        /// The chance each leading run of `drafts` is accepted.
+        confidence: Vec<f64>,
+        /// The tokens proposed after the anchor, likeliest first.
+        drafts: Vec<u32>,
+    },
+}
+
+/// A draft source: the round path every drafting arm already had in its own fusion.
 ///
 /// Leaving [`Walk::Drafter`] out is a compile error; an arm with no released draft head names
-/// [`Absent`] with its reason, which the ledger prints. The marker's [`Drafter::PRESENT`] is a
-/// const so a ledger is available without a device; a future drafting phase adds the methods
-/// that actually draft here.
+/// [`Absent`] with its reason, which the ledger prints. Every method is required. A defaulted
+/// `ready` or `speculation` silently loses a multi-token run or reports nothing, which is the
+/// class of silent default the shared runtime exists to remove; a defaulted `give_back` would
+/// leave a rejected draft's rows in the caches.
+///
+/// The three policies a moved arm used to decide in its fusion are stated here, once:
+///
+/// * A lone member verifies the drafter's own depth with no row share ([crate::Runtime::step]
+///   does not call `share_rows` for one member), so a single request keeps exactly the chain it
+///   drafted.
+/// * [`crate::JOINT_ROUNDS_ENV`] `=off` runs each lane's round alone, one after another; an
+///   arm for which off means no drafting at all returns an empty [`Draft::Chain`].
+/// * A drafting walk's engine member cap is the arm's verify width (`Limits::members`), not its
+///   prompt chunk: a verify refuses more rows than the rank's verify batch.
 pub trait Drafter<W: Walk + ?Sized> {
     /// Whether the arm has a drafter at all.
     const PRESENT: bool;
+
+    /// The rows a verify answer belongs to the arm: whatever its settle needs, never the
+    /// runtime's host logits. A row the runtime never interprets can be `()`.
+    type Rows;
+
+    /// What a shared walk costs, for the row share ([crate::share_rows]).
+    fn wall(&self) -> &dyn StepWall;
+
+    /// Opens `seq`'s round on `token`: the step its last verify already holds, or its next
+    /// chain. The drafts stay with the sequence until [`Drafter::verify`] walks them.
+    ///
+    /// # Errors
+    /// A backend failure, an exhausted context, or a chain the drafter cannot propose.
+    fn open_round(&self, seq: &mut W::Seq, token: u32) -> Result<Draft, BackendError>;
+
+    /// One verify pass over the members' rows: each segment is one member's anchor followed by
+    /// the drafts the row share gave it, and `depths[j]` is how many of those rows are drafts.
+    /// The runtime calls this once for a joint round and once a member when the lanes run alone.
+    ///
+    /// # Errors
+    /// A backend failure; every member of the pass fails with it.
+    fn verify(
+        &self,
+        walk: &W,
+        segments: &mut [Segment<'_, W::Seq>],
+        depths: &[usize],
+    ) -> Result<Vec<Self::Rows>, BackendError>;
+
+    /// Folds a verify answer back into `seq`'s step: the token the model chose at the anchor,
+    /// the rows it keeps, and (in the arm) the queued answers of the drafts it accepted. `chunk`
+    /// is the member's anchor followed by the drafts it was walked over.
+    ///
+    /// # Errors
+    /// A backend failure while the rejected rows are given back.
+    fn settle(
+        &self,
+        seq: &mut W::Seq,
+        chunk: &[u32],
+        rows: Self::Rows,
+    ) -> Result<StepOutput, BackendError>;
+
+    /// The most drafts one walk of `seqs` members verifies in all, for [crate::share_rows].
+    /// An arm whose verify refuses more than a fixed row count caps here.
+    fn budget(&self, seqs: usize) -> usize;
+
+    /// Whether `seq` already holds the answer to a step fed `token`. The engine keeps feeding
+    /// a member the token its last step chose while this says yes, so an accepted run reaches the
+    /// request in one reply.
+    fn ready(&self, seq: &W::Seq, token: u32) -> bool;
+
+    /// Puts `seq`'s state at `to`, the position the caller keeps, after the last answers went
+    /// unused. An arm whose caches cannot go back may leave them where they are; its next prompt
+    /// then goes back to the rewind point.
+    ///
+    /// # Errors
+    /// An arm that cannot put its state at `to`.
+    fn give_back(&self, seq: &mut W::Seq, to: usize) -> Result<(), BackendError>;
+
+    /// The speculative counters of `seq`'s request, as the arm kept them.
+    fn speculation(&self, seq: &W::Seq) -> Speculation;
+
+    /// The least chance a draft must have to be given a row.
+    fn floor(&self) -> f64 {
+        0.0
+    }
 
     /// One line for the ledger.
     #[must_use]
@@ -454,12 +600,77 @@ pub trait Vision<W: Walk + ?Sized> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Absent<Reason = &'static str>(pub Reason);
 
+/// The wall of a walk that drafts nothing: no row share can be charged for it.
+struct NoWall;
+
+impl StepWall for NoWall {
+    fn ms(&self, _seqs: usize, _rows: usize) -> f64 {
+        0.0
+    }
+}
+
+static NO_WALL: NoWall = NoWall;
+
 impl<W, Reason> Drafter<W> for Absent<Reason>
 where
     W: Walk + ?Sized,
     Reason: std::fmt::Display,
 {
     const PRESENT: bool = false;
+    type Rows = ();
+
+    fn wall(&self) -> &dyn StepWall {
+        &NO_WALL
+    }
+
+    /// An absent drafter has no round: [`crate::Runtime::step`] branches on
+    /// [`Drafter::PRESENT`] before calling any of these.
+    fn open_round(&self, _seq: &mut W::Seq, _token: u32) -> Result<Draft, BackendError> {
+        Err(BackendError::new(
+            "drafter",
+            format!("{} drafts no round", self.0),
+        ))
+    }
+
+    fn verify(
+        &self,
+        _walk: &W,
+        _segments: &mut [Segment<'_, W::Seq>],
+        _depths: &[usize],
+    ) -> Result<Vec<Self::Rows>, BackendError> {
+        Err(BackendError::new(
+            "drafter",
+            format!("{} verifies no rows", self.0),
+        ))
+    }
+
+    fn settle(
+        &self,
+        _seq: &mut W::Seq,
+        _chunk: &[u32],
+        _rows: Self::Rows,
+    ) -> Result<StepOutput, BackendError> {
+        Err(BackendError::new(
+            "drafter",
+            format!("{} has no round to settle", self.0),
+        ))
+    }
+
+    fn budget(&self, _seqs: usize) -> usize {
+        0
+    }
+
+    fn ready(&self, _seq: &W::Seq, _token: u32) -> bool {
+        false
+    }
+
+    fn give_back(&self, seq: &mut W::Seq, to: usize) -> Result<(), BackendError> {
+        seq.rewind(to)
+    }
+
+    fn speculation(&self, _seq: &W::Seq) -> Speculation {
+        Speculation::default()
+    }
 
     fn describe(&self) -> String {
         format!("absent ({})", self.0)
@@ -477,8 +688,9 @@ impl<W: Walk + ?Sized> Vision<W> for NoVision {
 /// One model arm's arithmetic, as the runtime drives it.
 ///
 /// Every item here is required except [`Walk::capabilities`], which reads the associated
-/// constant. A missing `layout`, `open`, `limits`, `walk`, `head`, capability value,
-/// sequence state, drafter or vision type stops the arm compiling.
+/// constant, and [`Walk::cpu`], which is a conformance hook. A missing `layout`, `open`,
+/// `limits`, `drafter`, `walk`, `head`, capability value, sequence state, drafter or vision
+/// type stops the arm compiling.
 pub trait Walk: 'static {
     /// One sequence's device state. It must expose checkpoint and rewind, because the runtime
     /// owns reuse and cannot restore an arm's state through a witness.
@@ -504,8 +716,26 @@ pub trait Walk: 'static {
     /// A device allocation, an unreadable checkpoint or an exhausted lane.
     fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError>;
 
-    /// The most rows one pass may hold, and the context.
+    /// The most rows one pass may hold, the members one batch may hold, and the context.
+    ///
+    /// A prompt chunk and a token batch are different widths, and a verify pass is
+    /// `members x (1 + depth)` rows: the two numbers are separate so a drafting walk's member
+    /// cap is its verify width and not its prompt chunk ([Drafter]'s third policy).
     fn limits(&self) -> Limits;
+
+    /// The arm's draft source. A drafting arm returns its configured drafter; an arm that names
+    /// [`Absent`] returns the absent value it declares.
+    fn drafter(&self) -> &Self::Drafter;
+
+    /// A walk of this type the generated checks can drive with no device, or `None` when they
+    /// need the arm's fixture. The toy walk in the runtime's tests supplies one so
+    /// [`crate::ConformanceCheck::DraftedEqualsPlain`] runs at least on a CPU.
+    fn cpu() -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 
     /// Applies a request's sampler to one of the arm's sequences before its prompt runs.
     ///
@@ -545,48 +775,13 @@ pub trait Walk: 'static {
         Self::CAPABILITIES
     }
 
-    /// Whether `seq` already holds its answer for a step fed `token`: a verify's row the arm
-    /// kept ([`sparkflash_model::verdict`]). The engine keeps feeding a member the token its last
-    /// step chose while this says yes, so a drafting arm's whole round reaches the request in one
-    /// reply. The default holds none.
-    fn ready(&self, seq: &Self::Seq, token: u32) -> bool {
-        let _ = (seq, token);
-        false
-    }
-
-    /// Puts `seq`'s state at `to`, the position the caller keeps, after the last `count`
-    /// answers went unused.
-    ///
-    /// The default truncates the state ([`LaneState::rewind`]). An arm whose caches cannot go
-    /// back (they consumed the rows the caller did not use) may leave them where they are and
-    /// name none while the state is ahead of the history; the next prompt then goes back to the
-    /// rewind point, and the state's position is what tells the runtime the history lags it.
-    ///
-    /// # Errors
-    /// An arm that cannot put its state at `to`.
-    fn give_back(&self, seq: &mut Self::Seq, to: usize) -> Result<(), BackendError> {
-        seq.rewind(to)
-    }
-
-    /// The speculative counters of `seq`'s request, as the arm's drafter kept them.
-    ///
-    /// The runtime owns the slot and cannot see inside a walk, so an arm that drafts reports its
-    /// own counters here; a walk that drafts nothing keeps the zero default, which the serving
-    /// layer reads as "no speculation". The counters are a request's, not a lifetime's: the arm
-    /// resets them when the request's sampler is set ([Walk::set_sampling]).
-    fn speculation(&self, seq: &Self::Seq) -> Speculation {
-        let _ = seq;
-        Speculation::default()
-    }
-
-    /// The most segments one walk may hold, when that is narrower than [Self::limits]' rows.
+    /// The most segments one walk may hold, when that is narrower than [`Limits::members`].
     ///
     /// The fused engine caps a batch here rather than handing a walk more members than its row
-    /// buffers take. The default is the pass limit, which is the whole truth for an arm whose
-    /// prompt chunk and token batch are the same width; an arm with a wide prompt chunk and a
-    /// narrow token batch (Qwen's 4,096 and 4) states its own.
+    /// buffers take. The default is [`Limits::members`], which is the whole truth for an arm
+    /// whose prompt chunk and token batch are the same width.
     #[must_use]
     fn max_segments(&self) -> usize {
-        self.limits().rows
+        self.limits().members
     }
 }
