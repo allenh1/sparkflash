@@ -746,38 +746,49 @@ impl Qwen4ExpConfig {
     #[must_use]
     pub fn serving_fixture() -> Self {
         let mut config = Self::tiny();
-        config.hidden_size = 2560;
+        config.hidden_size = 2048;
         config.vocab_size = 256;
+        config.num_hidden_layers = 1;
         config.head_dim = 128;
         config.linear_key_head_dim = 128;
         config.linear_value_head_dim = 128;
-        config.num_experts = 512;
-        config.num_experts_per_tok = 10;
+        config.linear_num_key_heads = 2;
+        config.linear_num_value_heads = 4;
+        config.ple_layer_ids = Vec::new();
+        config.mtp_num_hidden_layers = 0;
+        config.expert_quant = ExpertQuant::Fp8Block;
+        config.dense_quant = DenseQuant::Fp8Block;
+        config.layer_types = vec![LayerKind::Linear];
+        config.num_experts = 256;
+        config.num_experts_per_tok = 8;
         config.moe_intermediate_size = 128;
         config.shared_expert_intermediate_size = 128;
-        config.ple_embed_dim = 128;
-        config.indexer_head_dim = 128;
         let architecture = &mut config.architecture;
-        architecture.hidden_size = 2560;
+        architecture.hidden_size = 2048;
         architecture.vocab_size = 256;
+        architecture.family = "qwen3_5_moe".to_owned();
+        architecture.mtp = None;
+        architecture.layers.truncate(1);
         for layer in &mut architecture.layers {
             layer.attention.head_dim = 128;
+            layer.sides.clear();
             if let sparkflash_model::architecture::AttentionKind::Gdn(gdn) =
                 &mut layer.attention.kind
             {
                 gdn.key_dim = 128;
                 gdn.value_dim = 128;
             }
-            if let Some(indexer) = &mut layer.attention.indexer {
-                indexer.head_dim = 128;
-            }
             if let sparkflash_model::architecture::Ffn::Moe(moe) = &mut layer.ffn {
-                moe.routed_experts = 512;
-                moe.active_experts = 10;
+                moe.routed_experts = 256;
+                moe.active_experts = 8;
                 moe.intermediate = 128;
                 moe.shared_intermediate = 128;
             }
         }
+        // The rendered document is the one the arm opens from disk, so the in-memory
+        // architecture must be its parse, as the tiny fixtures do.
+        config.architecture = crate::architecture::architecture_from_json(&config.to_json())
+            .expect("the serving fixture's document parses");
         config
     }
 

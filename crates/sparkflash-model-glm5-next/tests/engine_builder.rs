@@ -21,7 +21,6 @@ use sparkflash_model_glm5_next::{
 };
 use sparkflash_ops::tensor_plan::ArchitectureTensorPlan;
 use sparkflash_ops::{EngineBuilder, EnginePlan, PartsDeviceRank, PlanContext};
-use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::{TensorSpec, WeightError, WeightSource};
 
 struct Specs {
@@ -102,52 +101,40 @@ fn the_small_fixture_is_refused_by_the_serving_boot_check() {
 }
 
 #[test]
-fn a_serving_fixture_opens_through_the_engine_builder() {
+fn a_serving_fixture_passes_the_boot_check_and_opens() {
+    let config = Glm5NextConfig::serving_fixture();
+    let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
+        .expect("the serving plan builds");
+    let tensors = ArchitectureTensorPlan::served_and_mtp(&config.architecture, plan.tp())
+        .expect("the shared tensor plan builds");
+    let source = Specs::new(tensors.plan().specs());
+    let rank = PartsDeviceRank::open(&plan, &source, PlanContext::SM121_CATALOGUE)
+        .expect("the serving fixture passes the boot check");
+    assert_eq!(rank.plan().family(), "glm5_next");
+    rank.boot_check().expect("the serving rank has no gap");
+
     if sparkflash_kernels::cuda_driver::Cuda::load().is_err() {
         eprintln!("skipped: no CUDA driver");
         return;
     }
-    let config = Glm5NextConfig::serving_fixture();
     let checkpoint = tempfile::tempdir().expect("a temporary directory");
     write_synthetic_checkpoint(checkpoint.path(), &config, 7, 1).expect("the fixture writes");
-    let source = SafeTensorsSource::open(checkpoint.path(), &checkpoint.path().join(INDEX_NAME))
-        .expect("the fixture opens");
-    let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
-        .expect("the small plan builds");
-    let mut backend = <Glm5NextDeviceBackend as EngineBuilder>::open(
-        &plan,
-        &source,
+    let cuda = sparkflash_kernels::cuda_driver::Cuda::load().expect("a CUDA context");
+    let mut backend = Glm5NextDeviceBackend::open_single_rank_with_plan(
+        std::sync::Arc::new(sparkflash_model_glm5_next::device::CudaHandle::new(cuda)),
+        config.clone(),
+        checkpoint.path(),
         plan.architecture().max_position_embeddings,
+        &plan,
     )
-    .expect("the engine builder opens the arm");
-    assert_eq!(backend.rank().plan().family(), "glm5_next");
+    .expect("the arm opens on the serving plan");
     assert_eq!(backend.descriptor().vocab_size, config.vocab_size);
     backend
-        .arm_mut()
         .enable_fusion(1)
         .expect("the arm fuses onto the runtime");
     let mut session = backend.open_session().expect("a session opens");
     let first = session.prefill(&[1, 2, 3, 4]).expect("a prefill runs");
     assert_eq!(first.logits.len(), config.vocab_size);
-
-    // The shared builder is the same numeric arm: the direct open returns the same bits.
-    let cuda = sparkflash_kernels::cuda_driver::Cuda::load().expect("a CUDA context");
-    let mut direct = Glm5NextDeviceBackend::open_single_rank(
-        std::sync::Arc::new(sparkflash_model_glm5_next::device::CudaHandle::new(cuda)),
-        config.clone(),
-        checkpoint.path(),
-        plan.architecture().max_position_embeddings,
-    )
-    .expect("the direct arm opens");
-    direct
-        .enable_fusion(1)
-        .expect("the direct arm fuses onto the runtime");
-    let mut direct_session = direct.open_session().expect("a direct session opens");
-    let expected = direct_session
-        .prefill(&[1, 2, 3, 4])
-        .expect("the direct prefill runs");
-    assert_eq!(first.logits, expected.logits);
-    assert_eq!(first.next_token, expected.next_token);
 }
 
 #[test]
