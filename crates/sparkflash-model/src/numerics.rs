@@ -331,11 +331,16 @@ pub enum Evidence {
     Text,
 }
 
-/// The four prerequisites docs/NUMERICS.md §5 names before any arithmetic change may land.
+/// The prerequisites docs/NUMERICS.md §5 names before an arithmetic change may land.
+///
+/// `anchor` is per model: a configuration is judged against its own model's frozen anchor and a
+/// committed capture teacher-forced from it, not against this aggregate. The other three gate
+/// every bump. This flag reports whether every `logprobs` model is anchored; a false value does
+/// not block a model that has its own anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prerequisites {
-    /// The frozen anchors and the teacher-forced comparison.
+    /// The frozen anchors and teacher-forced comparisons, reported per model (see the type docs).
     pub anchor: bool,
     /// The CI declaration check.
     pub declaration_check: bool,
