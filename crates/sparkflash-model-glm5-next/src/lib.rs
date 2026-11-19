@@ -236,7 +236,7 @@ pub use codec::GlmCodec;
 pub use config::{ConfigError, Glm5NextConfig, IndexerKind, LayerKind, MlpKind, VisionConfig};
 pub use device::{DFLASH2_STEP_COST, DeviceRank, DeviceSequence, MAX_ROWS, MTP_STEP_COST};
 pub use forward::{Glm5NextWeights, ReferenceState};
-pub use rank::{GlmDrafting, LoadedRank, OpenCollective, glm_drafting};
+pub use rank::{GlmDrafting, LoadedRank, glm_drafting};
 pub use serve::Glm5NextDeviceBackend;
 pub use tensor::{Glm5NextTensorPlan, Role, Split};
 pub use walk::{GlmDrafter, GlmSequence, GlmWalk};

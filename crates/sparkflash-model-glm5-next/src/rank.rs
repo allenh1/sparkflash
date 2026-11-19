@@ -51,13 +51,6 @@ pub const MODEL_LABEL: &str = "GLM";
 /// The configuration file a checkpoint directory carries.
 const CHECKPOINT_CONFIG_NAME: &str = "config.json";
 
-/// Opens the collective of this rank's group: what the process that drives the group supplies.
-///
-/// `open(model, hidden, run)` answers the rank's reduce and gather seams over `hidden` columns,
-/// with `run` naming the run every rank must agree on before the communicator opens.
-pub type OpenCollective<'a> =
-    dyn Fn(&Cuda, &str, usize, &str) -> Result<(TpRuntime, BitGatherHandle), String> + 'a;
-
 /// One GLM-5.3-Flash rank of a group as it comes off the disk: its weights, drafter and
 /// collective, and the drafting the profile asks of it.
 pub struct LoadedRank {

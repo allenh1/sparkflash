@@ -1377,14 +1377,16 @@ four boot fixes carried, or a capture that records its commit in the first place
 The lesson is worth a mechanism: **a capture's server card has to name the build it came from**.
 Without that field, a frozen reference can only say that bits moved, never which commit moved
 them, and every bisect pays for the same information twice.
+
 ### Phase 6, step 6, first slice: the rank openers leave `serve.rs`
 
-Commits `a593e069` (the fold) and `f869952f` (the ratchet). Phase 2 named this slice and could
+Commits `a593e069` (the fold), `f869952f` (the ratchet) and the cleanup that follows them (the
+unused opener alias and the arm-name tie). Phase 2 named this slice and could
 not take it: "the rank openers (about 900 lines) leave `serve.rs`", and "the rank openers did
 not leave `serve.rs` in this commit; that is phase 6". This is phase 6's step 6, first slice.
 Measured instead of estimated, as the phase asks.
 
-**The inventory.** Read at `f869952f`, after the slice. Every file the CLI serves from, what it
+**The inventory.** Read after the slice and its cleanup. Every file the CLI serves from, what it
 owns, and whether the runtime could own it:
 
 | file | lines | owns | could the runtime own it |
@@ -1410,7 +1412,7 @@ slices of step 6 fold. What the runtime already owns is the strategies: `sparkfl
 
 **What moved.** Opening a rank is arm construction, so the arms hold it:
 
-* `sparkflash-model-glm5-next/src/rank.rs` (new, 463 lines): `load_rank` (the checkpoint's
+* `sparkflash-model-glm5-next/src/rank.rs` (new, 456 lines): `load_rank` (the checkpoint's
   `config.json`, the CUDA handle, the plan-agreement line, the collective call, the latent
   cache, the converted rank file or the checkpoint's tensors, the block drafter, the drafting
   rule), `open_rank` (the window allocation and the load line), `open_lanes` (the fused lanes,
@@ -1433,17 +1435,17 @@ environment, not a rank's (a model crate reads no environment here, which the ar
 **Before and after**, measured with the ratchet's own rule (every `.rs` under
 `crates/sparkflash-cli/src`, line counts):
 
-| | before (`a53057f3`) | after (`f869952f`) |
+| | before (`a53057f3`) | after (the slice) |
 | :-- | --: | --: |
 | `crates/sparkflash-cli/src` (the ratchet's measure) | 36,987 | **36,566** |
 | `serve.rs` | 11,771 | **11,449** |
 | `serve/pack.rs` | 2,325 | **2,226** |
-| `sparkflash-model-glm5-next/src/rank.rs` | — | 463 |
+| `sparkflash-model-glm5-next/src/rank.rs` | — | 456 |
 | `sparkflash-model-qwen4-exp/src/rank.rs` | — | 168 |
 | `sparkflash-serve/src/tp4.rs` | — | 73 |
 | `sparkflash-weights/src/rank_file.rs` | 1,046 | 1,073 |
 
-So 421 lines left the CLI and 731 arrived in the crates that own them; the difference is the
+So 421 lines left the CLI and 724 arrived in the crates that own them; the difference is the
 documentation and the new seam's doc comments, which a shared type and a public opener carry and
 a private one did not have to.
 
@@ -1461,6 +1463,11 @@ only, the same window allocation (`new_block_drafting_sequence` / `new_drafting_
 `new_sequence`) in the same order, and the same load milliseconds in the first metrics report.
 Nothing in this slice touches a kernel, an arithmetic choice or a scheduling decision; the
 `glm_drafting` rule, the depth policy and the collective's wire are the same code moved.
+
+The seven `sparkflash serve:` boot lines the moved code prints are byte-identical to the seven
+that stood in `serve.rs`'s loader block (`git show a53057f3:crates/sparkflash-cli/src/serve.rs |
+sed -n '4600,5250p' | grep 'sparkflash serve:'` against the two `rank.rs` files: same lines, same
+order, no reflow). What a window adds is the ranks printing them, and the numbers inside them.
 
 **The window gate.** No boot is possible on this host (no GPU, no checkpoint), so the fold is
 owed one window. Build the frozen tip and this one (`git worktree add /tmp/pre-fold a53057f3`),

@@ -729,6 +729,7 @@ measurements, the inventory and the window gate are in
 [04-onboarding-review.md](04-onboarding-review.md#phase-6-step-6-first-slice-the-rank-openers-leave-serverrs).
 DeepSeek's 14,545-line serving path (`device_chain.rs`, `tp4_host.rs`, `tp4_chain.rs`,
 `tp4_device_runner.rs`, `serve/device.rs`) is untouched and is the rest of step 6.
+
 #### Phase 6: what the tick trace emits now
 
 `Batch` emits the scheduler's live trace when `SPARKFLASH_TICK_TRACE=PATH` names a file. Rank 0

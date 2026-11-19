@@ -201,7 +201,7 @@ impl PackArm for QwenArm {
     type Backend = sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
 
     const MODEL_ID: &'static str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID;
-    const NAME: &'static str = "Qwen3.8-Flash-Next";
+    const NAME: &'static str = sparkflash_model_qwen4_exp::rank::ARM_NAME;
     const FIXTURE: &'static str = "qwen4";
     const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::QWEN38_MAX_OUTPUT_TOKENS;
     const DEFAULT_CONTEXT: usize = sparkflash_model::descriptor::QWEN38_CONTEXT_TOKENS;
@@ -507,7 +507,7 @@ impl PackArm for GlmArm {
     type Backend = sparkflash_model_glm5_next::Glm5NextDeviceBackend;
 
     const MODEL_ID: &'static str = sparkflash_model::descriptor::GLM53_FLASH_ID;
-    const NAME: &'static str = "GLM-5.3-Flash";
+    const NAME: &'static str = sparkflash_model_glm5_next::rank::ARM_NAME;
     const FIXTURE: &'static str = "glm53";
     const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::GLM53_MAX_OUTPUT_TOKENS;
     const DEFAULT_CONTEXT: usize = sparkflash_model::descriptor::GLM53_CONTEXT_TOKENS;
