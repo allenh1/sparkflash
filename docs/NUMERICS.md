@@ -371,15 +371,72 @@ for another model or expert layout is replaced by the new run, not merged.
 
 | Model | Coverage emission site | Monitor emission site |
 | :-- | :-- | :-- |
-| Qwen3.8-Flash-Next | `crates/sparkflash-model-qwen4-exp/src/forward.rs`, `moe_forward` (the host reference forward; **wired**, test `the_reference_forward_can_record_routing_for_a_coverage_dump`), and the device arm's `crates/sparkflash-model-qwen4-exp/src/device/blocks.rs`, `Blocks::routed_experts` | the same host reference `moe_forward` (**wired**, test `the_reference_forward_can_record_a_monitor_dump`), and the device arm's `Blocks::routed_experts` `expert_accumulator` |
-| GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/src/forward.rs`, `Moe::apply`, and the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `Glm5NextDevice::moe` / `bulk_moe` | `crates/sparkflash-model-glm5-next/src/device.rs`, `combine_experts`; the host reference's `Moe::apply` |
-| DeepSeek-V4.1-Flash | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn` (the selected ids are already copied to the host at `moe_device.rs:643`) | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn`'s routed combine |
+| Qwen3.8-Flash-Next | `crates/sparkflash-model-qwen4-exp/src/forward.rs`, `moe_forward` (the host reference forward; **wired**, test `the_reference_forward_can_record_routing_for_a_coverage_dump`), and the world-1 device arm's `crates/sparkflash-model-qwen4-exp/src/device/blocks.rs`, `DeviceSequence::mlp_branch` after the router launch (**wired**, `DeviceSequence::record_routing`) | the same host reference `moe_forward` (**wired**, test `the_reference_forward_can_record_a_monitor_dump`), and the world-1 device arm's `DeviceSequence::record_probe` after `moe_combine` (**wired**, sampling `branch` and each slot of `expert_accumulator`); the TP arm is named |
+| GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/src/forward.rs`, `Moe::apply`, and the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `Glm5NextDevice::moe` / `bulk_moe` — **named** | `crates/sparkflash-model-glm5-next/src/device.rs`, `combine_experts`; the host reference's `Moe::apply` — **named** |
+| DeepSeek-V4.1-Flash | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn` (the selected ids are already copied to the host at `moe_device.rs:643`) — **named** | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn`'s routed combine — **named** |
 
 The Qwen host reference is wired for **both** dumps and is covered by the two CPU tests named
 above; the cross-language test `the_dump_round_trips_through_the_python_monitor_command` writes a
-monitor document and judges it with `scripts/numerics.py monitors`. The device sites are named,
-not wired: they need a device context and a cluster window, and the first real dumps are still
-ahead.
+monitor document and judges it with `scripts/numerics.py monitors`. The Qwen3.8 world-1 device
+arm — the path the cluster window exercised — is wired for both as well:
+
+- `DeviceSequence::forward_batch` opens the recorders once a forward
+  (`crates/sparkflash-model-qwen4-exp/src/device/numerics.rs`, `Switches::begin`), so coverage
+  opens one named input a forward and the monitor recorder takes that forward as the probe.
+- `DeviceSequence::record_routing` copies the router's `[batch][top-k]` ids back after
+  `mlp_branch`'s router launch and counts them.
+- `DeviceSequence::record_probe` samples the first row's `moe_combine` branch and each routed
+  expert's `expert_accumulator` slot, divided by its routing weight — the expert kernels write
+  `weight * body` there. The MTP layer is a draft pass and is not recorded.
+
+Both switches read **once** when a session is made: `SPARKFLASH_NUMERICS_COVERAGE` and
+`SPARKFLASH_NUMERICS_MONITORS` name output paths, `SPARKFLASH_NUMERICS_MODEL` overrides the dump's
+model id, and `SPARKFLASH_NUMERICS_SAMPLE` sets the monitor sample's evenly spaced hidden-index
+count (default 8). With them unset a forward pays one `Option` check and a layer one more: no
+environment read, no formatting, no allocation. A recorder that cannot open or write logs once and
+serving continues; a request never fails for a diagnostic. The rules — the document shapes, the
+input naming and accumulation, and the one-probe rule — are unit-tested with a synthetic table in
+`crates/sparkflash-model-qwen4-exp/src/device/numerics.rs`, so they need no GPU.
+
+The other arms are **named, not wired**. GLM's `combine_experts(rows)` does not receive the layer
+index and the routed ids and weights are device-resident, so a recorder there cannot name the
+layer it counts. DeepSeek's `ffn` does have its ids on the host, but the forward crate calls the
+backend one layer at a time with no per-forward boundary, so a recorder there would open one input
+per layer and a layer list the judge refuses. The Qwen TP arm's `mlp_branch` leaves only this
+rank's share of the expert sum in `branch`, so monitor dumps are the world-1 arm's; a sharded arm
+logs once and records none. The device-batch path (`DeviceSequence::forward_rows`) is not wired.
+Wiring those is a device window's work, and the first real dumps are still ahead.
+
+The exact window command for the Qwen3.8 world-1 dumps (both switches on in one process, the
+first forward is the probe, then the two judges):
+
+```bash
+W=/home/allenh1/cluster-tests/$(date +%Y%m%dT%H%M)-numerics
+mkdir -p "$W"
+SPARKFLASH_MODEL=qwen3.8-flash-next-nvfp4 \
+SPARKFLASH_CHECKPOINT="$QWEN_CHECKPOINT" \
+SPARKFLASH_TOKENIZER="$QWEN_TOKENIZER" \
+SPARKFLASH_CONTEXT=65536 \
+SPARKFLASH_HTTP_BIND=127.0.0.1:8002 \
+SPARKFLASH_NUMERICS_COVERAGE="$W/qwen38-coverage.json" \
+SPARKFLASH_NUMERICS_MONITORS="$W/qwen38-monitors.json" \
+SPARKFLASH_NUMERICS_MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4 \
+SPARKFLASH_NUMERICS_SAMPLE=8 \
+  scripts/serve-single-node.sh launch
+# After /readyz: three passes of the reference suite's eight prompts, one token each. Every
+# request's prefill is at least one forward, and each forward opens one named input.
+for pass in 1 2 3; do
+  python3 scripts/numerics.py capture --url http://127.0.0.1:8002 \
+    --suite numerics/prompts/reference.json --out "$W/drive-$pass.json" --max-tokens 1
+done
+scripts/serve-single-node.sh stop
+
+python3 scripts/numerics.py coverage --dump "$W/qwen38-coverage.json" --min-inputs 8
+# The monitors judge needs a reference build's dump against this candidate; the pair block above
+# runs both builds. This window's file is the candidate, and the bars are the run's to declare.
+python3 scripts/numerics.py monitors --reference "$W/qwen38-monitors-reference.json" \
+  --candidate "$W/qwen38-monitors.json" --layer-bar <declared> --expert-bar <declared>
+```
 
 ### Across architectures and versions
 
@@ -503,8 +560,8 @@ have captured `logprobs` references but no `[[anchor]]`, so they are not covered
 The flag reports that aggregate; it is not a gate on a model that has its own anchor. A true flag
 with an uncovered model fails `ci`. The two new dumps are implemented, but no real coverage or
 monitor dump is committed, so `coverage` and `monitors` are also false; they are not flipped on
-synthetic data. The first real dumps need the cluster commands below, and the device emission
-sites are named in §5.
+synthetic data. The first real dumps need the cluster command in §5, which now writes both from
+the Qwen3.8 world-1 device arm; the other arms' device sites are still named in §5.
 
 ## How this reconciles the earlier decisions
 
