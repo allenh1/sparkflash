@@ -6565,12 +6565,37 @@ impl InklingDeviceSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivationPlanes, AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, DRAFT_MIN_DEPTH_ENV,
-        DRAFT_POLICY_ENV, DSPARK_STEP_COST, DepthPolicy, Drafter, LONG_PREFILL_CHUNK,
-        LONG_PREFILL_FROM, Mxfp8Walk, PrefillWalk, REWIND_ENV, depth_policy_from_env,
-        mma_attention_shared, overlap_request, residual_chain_request, rewind_request,
+        ActivationPlanes, AttentionWalk, Bound, ChunkWidths, DEFAULT_PREFILL_CHUNK,
+        DRAFT_MIN_DEPTH_ENV, DRAFT_POLICY_ENV, DSPARK_STEP_COST, DepthPolicy, Drafter,
+        LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, Mxfp8Walk, PrefillWalk, RESIDUAL_CHAIN_PAIRS,
+        REWIND_ENV, depth_policy_from_env, mma_attention_shared, overlap_request,
+        residual_chain_request, rewind_request,
     };
     use crate::config::Inkling2Config;
+    use sparkflash_kernels::images::Image;
+    use sparkflash_ops::plan::Precision;
+
+    /// The arm's catalogue rule, on the family that was missing: every symbol
+    /// [RESIDUAL_CHAIN_PAIRS] loads is one the catalogue carries at the precision the load site
+    /// names. Dense states the rule in `every_kernel_the_arm_loads_is_in_the_catalogue`; this is
+    /// Inkling's instance of it, and [Bound::carried] is the same typed lookup the boot runs.
+    ///
+    /// It prevents a released arm from reaching a device with a kernel the catalogue does not
+    /// carry. The six chained block residuals were launched and exported but not catalogued, so
+    /// the boot refused each of them with "the catalogue carries no
+    /// inkling_block_residual_chain_... accepting bf16" and the conformance gate panicked with
+    /// NEEDS-FIXTURE instead of serving. All six are checked, not one representative, because
+    /// the walk picks an entry by its (query, next) pair.
+    #[test]
+    fn every_chained_residual_the_arm_launches_is_in_the_catalogue() {
+        for &(queries, next, symbol) in &RESIDUAL_CHAIN_PAIRS {
+            Bound::carried(Image::Inkling, symbol, Precision::Bf16).unwrap_or_else(|error| {
+                panic!(
+                    "{symbol} (q{queries}_n{next}) at bf16: {error}; the arm launches it from RESIDUAL_CHAIN_PAIRS, so the catalogue's BlockAttentionResidual Inkling entry must carry it"
+                )
+            });
+        }
+    }
 
     #[test]
     fn the_mxfp8_walk_is_the_mma_under_the_tensor_walk_alone() {
