@@ -596,8 +596,8 @@ impl<F: Format> Mat<F> {
 ///
 /// The checks are the two a bare device pointer cannot make:
 ///
-/// 1. the container's dtype and shape are this format's stored form, its packing, or the
-///    logical shape with the container's unit dimensions dropped
+/// 1. the container's dtype and shape are this format's stored form, its packing, or a
+///    contiguous collapse of the container's leading dimensions into the logical rows
 ///    ([sparkflash_weights::TensorSpec::is_stored_as]);
 /// 2. the scale plane has exactly the entry count the layout needs
 ///    ([ScaleLayout::entries]).
@@ -1130,5 +1130,53 @@ mod tests {
         assert_eq!(mat.spec().dtype, StoredDType::BF16);
         assert_eq!(mat.spec().shape, vec![32, 4]);
         assert_eq!(mat.bytes_per_token(), 256);
+    }
+
+    #[test]
+    fn the_inkling_fixture_stacked_experts_upload_as_bf16() {
+        // The tiny fixture's routed expert block is `[experts, out, in]` = `[2, 32, 32]`; the
+        // boot flattens it to the `[64, 32]` matrix the arithmetic sees and still passes the
+        // container's 3-D spec (`device::type_slots`).
+        let stored = spec(
+            "model.llm.layers.0.mlp.experts.w13_weight",
+            StoredDType::BF16,
+            &[2, 32, 32],
+        );
+        let mat: Mat<Bf16> = upload(Tensor {
+            stored: &stored,
+            shape: &[64, 32],
+            data: Deviceptr(0x2000),
+            stride: 64,
+            scales: Scales::none(),
+        })
+        .expect("the fixture's stacked expert block uploads as bf16");
+        assert_eq!((mat.rows(), mat.columns(), mat.stride()), (64, 32, 64));
+        assert_eq!(mat.spec().dtype, StoredDType::BF16);
+        assert_eq!(mat.spec().shape, vec![64, 32]);
+    }
+
+    #[test]
+    fn the_released_nvfp4_stacked_experts_upload_as_nvfp4() {
+        // The released NVFP4 checkpoint stores `w13_weight` as `[384, 4608, 2304]` U8; the
+        // arithmetic sees `[1769472, 4608]`, two E2M1 codes a byte along the last axis.
+        let rows = 1_769_472;
+        let columns = 4_608;
+        let stored = spec(
+            "model.llm.layers.0.mlp.experts.w13_weight",
+            StoredDType::U8,
+            &[384, 4_608, 2_304],
+        );
+        let entries = ScaleLayout::NvFp4 { group: 16 }.entries(rows, columns);
+        let mat: Mat<NvFp4> = upload(Tensor {
+            stored: &stored,
+            shape: &[rows, columns],
+            data: Deviceptr(0x3000),
+            stride: 2_304,
+            scales: Scales::nvfp4(Deviceptr(0x4000), entries, 1.0),
+        })
+        .expect("the released stacked expert block uploads as NVFP4");
+        assert_eq!((mat.rows(), mat.columns()), (rows, columns));
+        assert_eq!(mat.spec().dtype, StoredDType::F4E2M1);
+        assert_eq!(mat.spec().shape, vec![rows, columns]);
     }
 }
