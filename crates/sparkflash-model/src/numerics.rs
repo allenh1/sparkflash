@@ -1111,6 +1111,7 @@ mod tests {
 
     const QWEN: &str = "nvidia/Qwen3.8-Flash-Next-NVFP4";
     const GLM: &str = "zai-org/GLM-5.3-Flash";
+    const INKLING: &str = "thinkingmachines/Inkling-2-Small";
     const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const COVERAGE_ROW: &str = concat!(
         "[[coverage]]\n",
@@ -1416,15 +1417,24 @@ mod tests {
     #[test]
     fn the_per_model_rows_answer_for_their_model() {
         let registry = Registry::embedded().unwrap();
-        // Qwen3.8 has the coverage row; GLM-5.3 has the monitors row. Neither has both, which is
-        // why both aggregate flags are false and every unapproved bump is refused today.
+        // Qwen3.8 and GLM-5.3 have coverage rows (Qwen's world-1 sweep, GLM's world-4 sweep);
+        // only GLM has a monitors row, because its pair is the first judged one. Inkling-2 and
+        // Dory1.0 have neither, which is why both aggregate flags are false and an unapproved
+        // bump on them is refused today.
         assert!(registry.coverage_for(QWEN).is_some());
+        assert!(registry.coverage_for(GLM).is_some());
         assert!(registry.monitors_for(QWEN).is_none());
         assert!(registry.monitors_for(GLM).is_some());
-        assert!(registry.coverage_for(GLM).is_none());
         assert_eq!(registry.coverage_for(QWEN).unwrap().min_inputs, 8);
         assert_eq!(registry.missing_for(QWEN), ["monitors"]);
-        assert_eq!(registry.missing_for(GLM), ["coverage"]);
+        assert!(
+            registry.missing_for(GLM).is_empty(),
+            "GLM has both rows now"
+        );
+        assert_eq!(
+            registry.missing_for(INKLING),
+            ["coverage", "monitors"].as_slice()
+        );
         assert_eq!(
             registry.missing_for("acme/unknown"),
             ["anchor", "coverage", "monitors"]

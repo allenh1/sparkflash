@@ -81,6 +81,11 @@ model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 dump = "numerics/coverage/qwen38-world1.json"
 min_inputs = 8
 
+[[coverage]]
+model = "zai-org/GLM-5.3-Flash"
+dump = "numerics/coverage/glm53-world4.json"
+min_inputs = 8
+
 # The per-model monitor evidence: one row a model, the committed reference/candidate pair and the
 # relative-error bars it is judged at. The pair below is GLM-5.3 at world 4: the reference build
 # (SPARKFLASH_DECODE_MMA=off, the tiled row GEMV) against the shipped default (the FP8 few-row

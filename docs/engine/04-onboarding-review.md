@@ -2046,7 +2046,18 @@ columns, rows and alignment, never on the copy's layout). Plane A's walk offsets
 from another chunk's bytes - only lane 0, chunk 0 coincides - and the logits were garbage. The fix
 routes on the copy's layout and refuses the body for a walk-layout copy, so the head returns to
 `q4e_gemv_packed`; a same-class guard makes the few-row band's down grid tile the output rows.
-The GPU proof and version 1's re-declaration from a clean build are the next window's.
+**Proven on the GPU (2026-11-19).** The fix's build (`5a1aead8…`, four ranks one hash) serves a
+clean model: a greedy 32-token completion answers the question it was asked ("The capital of France
+is Paris.", finish `stop`), where the degenerate reference's text was token soup. The forced
+capture against the old reference gives mean NLL **+5.823**, top-1 29.49% - the size and shape of
+the defect, now on the correct side. Two repeats are byte-identical. The head's body-versus-GEMV
+check on the released checkpoint (the head takes the body over BF16 rows when
+`SPARKFLASH_DENSE_WEIGHTS=checkpoint`, the GEMV otherwise) is **not bit-identical**, and the
+earlier expectation that it would be is corrected here: 986 of 1024 logprobs differ by a last-bit
+tail (median 2.0e-5, p90 9.4e-5, max 0.125) with the argmax identical at all 1024 positions -
+the accumulation-order tail a body always has against a row GEMV, one order of magnitude smaller
+than the layout defect's 47-nat swings. Version 1's re-declaration from a clean build is still
+owed: the current reference pins the soup.
 
 **A blocker the GLM coverage sweep found.** The GLM recorder was wired (the `combine_experts`
 site) but the sweep wrote no dump at all: `scripts/serve-four-node.sh` starts every rank with an
