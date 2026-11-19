@@ -350,6 +350,17 @@ impl Glm5NextDeviceBackend {
         crate::walk::runtime(Arc::clone(&self.shared), self.context_limit)
     }
 
+    /// The most lanes this rank's batch takes: the member width its runtime's Limits states.
+    ///
+    /// A group whose operator gave no `--concurrency` opens this many lanes, so the count comes
+    /// from the arm rather than a CLI constant.
+    ///
+    /// # Errors
+    /// The runtime refuses this rank's walk.
+    pub fn lane_limit(&self) -> Result<usize, BackendError> {
+        Ok(self.lanes()?.limits().members)
+    }
+
     /// Whether this backend steps its sessions together.
     #[must_use]
     pub fn fused(&self) -> bool {

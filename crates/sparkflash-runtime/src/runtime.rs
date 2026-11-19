@@ -848,6 +848,8 @@ fn runtime_ledger<W: Walk>(
     ledger
 }
 
+impl<W> crate::fused::sealed::Sealed for Runtime<W> where W: Walk {}
+
 impl<W> FusedArm for Runtime<W>
 where
     W: Walk + Send + Sync,
@@ -2414,6 +2416,57 @@ mod tests {
             vec![(PassKind::TokenRows, vec![1, 1, 1])],
             "the three members share one token pass"
         );
+    }
+
+    #[test]
+    fn a_group_of_a_runtimes_lanes_takes_its_width_from_limits() {
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
+
+        use crate::FusedEngine;
+        use crate::group::{GroupLanes, TextWire, mirror_lanes};
+
+        // A world of two, as the group's control hub sees it; the lanes themselves are one
+        // runtime's, which is the only group width the compiler allows. Rank 1 mirrors rank 0's
+        // decisions on its own runtime, so the broadcast path is the real one.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("the bound address");
+        let _worker = std::thread::spawn(move || {
+            let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
+                .expect("a control connection");
+            control.handshake().expect("the handshake");
+            let runtime = Runtime::new(ToyWalk::new(4, 64), 0).expect("the worker's runtime");
+            let _ = mirror_lanes(
+                &mut control,
+                &runtime,
+                &TextWire::new("toy", "the toy", 64),
+                4,
+            );
+        });
+        let hub = Tp4ControlHub::start_with_listener(listener, 2, Duration::from_secs(5))
+            .expect("the control hub");
+        let runtime = Runtime::new(ToyWalk::new(4, 64), 0).expect("the toy runtime");
+        let lanes = runtime.limits().members;
+        assert_eq!(lanes, 4, "the arm's Limits name the lane width");
+        let group = GroupLanes::new(
+            runtime,
+            Arc::new(Mutex::new(hub)),
+            TextWire::new("toy", "the toy", 64),
+        );
+        let engine = FusedEngine::start(Arc::new(group), lanes).expect("the group's engine");
+        let mut session = engine.open().expect("a lane");
+        let first = session.prefill(&[1, 2, 3]).expect("the prompt");
+        assert_eq!(first.next_token, Some(4));
+        assert_eq!(
+            session.decode(4).expect("the step").next_token,
+            Some(5),
+            "a lane of the group steps its runtime's walk"
+        );
+        session.park();
+        drop(session);
+        drop(engine);
     }
 
     crate::conformance!(ToyWalk);
