@@ -24,8 +24,8 @@
 //! logits row when the request samples with temperature or penalties.
 //!
 //! The layout and limits are the arm's: attention layers are positional BF16 key/value caches,
-//! Gated DeltaNet layers are recurrent, the context is the served context, and a pass is
-//! CHUNK_ROWS rows.
+//! Gated DeltaNet layers are recurrent, the context is the served context, and a pass is the
+//! chunk [super::chunk_rows] takes from [sparkflash_runtime::ChunkPolicy] (256 rows by default).
 
 use std::sync::{Arc, Mutex};
 
@@ -92,7 +92,7 @@ impl DenseWalk {
         let scratch = Scratch::new(Arc::clone(&shared), rows)
             .map_err(|error| BackendError::new(DEVICE, error))?;
         let layout = layout_of(&shared);
-        let limits = Limits::new(CHUNK_ROWS, shared.context);
+        let limits = Limits::new(shared.chunk, shared.context);
         Ok(Self {
             shared,
             layout,
@@ -524,8 +524,8 @@ mod tests {
         }
     }
 
-    /// The runtime over a walk with dense's limits: CHUNK_ROWS a pass, a served context.
-    fn dense_shaped_runtime() -> Runtime<RecordingWalk> {
+    /// The runtime over a walk with dense's limits: `chunk` rows a pass, a served context.
+    fn dense_shaped_runtime(chunk: usize) -> Runtime<RecordingWalk> {
         Runtime::new(
             RecordingWalk {
                 layout: StateLayout::new(vec![
@@ -538,7 +538,7 @@ mod tests {
                         bytes: 16,
                     },
                 ]),
-                limits: Limits::new(CHUNK_ROWS, 32_768),
+                limits: Limits::new(chunk, 32_768),
                 passes: Mutex::new(Vec::new()),
             },
             0,
@@ -546,13 +546,7 @@ mod tests {
         .expect("the runtime starts")
     }
 
-    fn prompt_passes(len: usize) -> Vec<Recorded> {
-        let runtime = dense_shaped_runtime();
-        assert_eq!(
-            runtime.chunk_policy().rows(),
-            CHUNK_ROWS,
-            "dense's chunk size comes from its limits through ChunkPolicy"
-        );
+    fn prompt_passes_in(runtime: &Runtime<RecordingWalk>, len: usize) -> Vec<Recorded> {
         let mut slot = runtime.open_slot().expect("a slot");
         runtime
             .prefill(&mut slot, &vec![7u32; len])
@@ -563,6 +557,16 @@ mod tests {
             .lock()
             .expect("the pass record")
             .clone()
+    }
+
+    fn prompt_passes(len: usize) -> Vec<Recorded> {
+        let runtime = dense_shaped_runtime(CHUNK_ROWS);
+        assert_eq!(
+            runtime.chunk_policy().rows(),
+            CHUNK_ROWS,
+            "dense's chunk size comes from its limits through ChunkPolicy"
+        );
+        prompt_passes_in(&runtime, len)
     }
 
     /// The runtime's prompt loop is dense's old one: 256-row chunks and the remainder, in order.
@@ -582,6 +586,42 @@ mod tests {
             vec![
                 (PassKind::Bulk { rows: 256 }, vec![256]),
                 (PassKind::Bulk { rows: 1 }, vec![1]),
+            ]
+        );
+    }
+
+    /// The runtime's prompt chunk is the walk's Limits, and the Limits come from the arm's
+    /// ChunkPolicy: the default profile still gets 256, and a profile switch that the policy
+    /// documents gets the smaller pass.
+    #[test]
+    fn the_chunk_policy_keeps_256_unless_the_profile_switches_it() {
+        use sparkflash_model::profile::ModelProfile;
+
+        let default = crate::chunk_rows(&ModelProfile::default(), 32_768).expect("the default");
+        assert_eq!(default, CHUNK_ROWS);
+        let runtime = dense_shaped_runtime(default);
+        assert_eq!(runtime.chunk_policy().rows(), CHUNK_ROWS);
+        assert_eq!(
+            prompt_passes_in(&runtime, 600),
+            vec![
+                (PassKind::Bulk { rows: 256 }, vec![256]),
+                (PassKind::Bulk { rows: 256 }, vec![256]),
+                (PassKind::Bulk { rows: 88 }, vec![88]),
+            ]
+        );
+
+        let mut profile = ModelProfile::default();
+        profile.prefill.chunk = Some(64);
+        let switched = crate::chunk_rows(&profile, 32_768).expect("the switch");
+        assert_eq!(switched, 64);
+        let runtime = dense_shaped_runtime(switched);
+        assert_eq!(runtime.chunk_policy().rows(), 64);
+        assert_eq!(
+            prompt_passes_in(&runtime, 150),
+            vec![
+                (PassKind::Bulk { rows: 64 }, vec![64]),
+                (PassKind::Bulk { rows: 64 }, vec![64]),
+                (PassKind::Bulk { rows: 22 }, vec![22]),
             ]
         );
     }

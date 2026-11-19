@@ -96,7 +96,7 @@ use sparkflash_ops::projection::{
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
-use sparkflash_runtime::{Fusion, TextWire};
+use sparkflash_runtime::{ChunkPolicy, Fusion, Limits, TextWire};
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, WeightSource};
 
@@ -111,9 +111,10 @@ pub type DenseLanes = sparkflash_runtime::Runtime<DenseWalk>;
 /// The host-facing name of a device refusal.
 const DEVICE: &str = "dense_device";
 
-/// The prompt rows one pass of the layer walk takes: two of the wide tile's 128-row blocks. The
-/// runtime's [sparkflash_runtime::ChunkPolicy] reads this as the walk's [sparkflash_runtime::Limits], so a
-/// dense prompt keeps the 256-row chunks its kernels were chosen for.
+/// The prompt rows one pass of the layer walk takes by default: two of the wide tile's 128-row
+/// blocks. This is the arm's legacy input to [sparkflash_runtime::ChunkPolicy], so a profile that
+/// names no `prefill.chunk` keeps the 256-row chunks its kernels were chosen for. A profile may
+/// name a documented smaller size; [chunk_rows] quantises it and the walk's limits carry it.
 pub const CHUNK_ROWS: usize = 256;
 
 /// The dense arm's one-row token step: the row GEMV, not a tensor-core body. A step that batches
@@ -675,6 +676,8 @@ struct Shared {
     eps: f32,
     zero_centred: bool,
     policy: Option<WidePolicy>,
+    /// The prompt rows one pass takes, from [chunk_rows].
+    chunk: usize,
     context: usize,
     /// The sequences' key/value caches' lanes, for sequences of `context` positions.
     lanes: Arc<SequenceLanes<LaneParts>>,
@@ -778,6 +781,7 @@ impl DenseDeviceBackend {
         }
         let profile = sparkflash_model::profile::active();
         let policy = profile_policy(profile)?;
+        let chunk = chunk_rows(profile, context)?;
         let rewind = sparkflash_runtime::rewind()?;
         let names = sparkflash_ops::naming::resolve(architecture, source)?;
         let shard = match &tp {
@@ -882,6 +886,7 @@ impl DenseDeviceBackend {
                 eps: architecture.norm_epsilon as f32,
                 zero_centred: architecture.zero_centered_norms(),
                 policy,
+                chunk,
                 context,
                 lanes,
                 linear_sizes,
@@ -1027,10 +1032,41 @@ impl ModelBackend for DenseDeviceBackend {
     }
 }
 
+/// The prompt rows one pass takes, from [sparkflash_runtime::ChunkPolicy].
+///
+/// The default input is [CHUNK_ROWS], dense's legacy chunk, so a profile that names nothing gets
+/// the 256 rows its kernels were chosen for. A profile may name a documented
+/// [sparkflash_runtime::ChunkPolicy] size at or below [CHUNK_ROWS]; memory and the context are
+/// the policy's business, and the answer is always a documented size. A larger size is refused
+/// because the arm's scratch is allocated for [CHUNK_ROWS] rows.
+fn chunk_rows(
+    profile: &sparkflash_model::profile::ModelProfile,
+    context: usize,
+) -> Result<usize, String> {
+    let asked = profile.prefill.chunk.unwrap_or(CHUNK_ROWS);
+    if !ChunkPolicy::sizes().contains(&asked) {
+        return Err(format!(
+            "the shared dense device arm takes a documented prompt chunk (one of {:?}), not \
+             prefill.chunk = {asked}; change the profile, or serve the checkpoint on the host \
+             reference (SPARKFLASH_DENSE_DEVICE=0)",
+            ChunkPolicy::sizes()
+        ));
+    }
+    let rows = ChunkPolicy::for_limits(Limits::new(asked, context)).rows();
+    if rows > CHUNK_ROWS {
+        return Err(format!(
+            "the shared dense device arm's scratch holds {CHUNK_ROWS} prompt rows, not \
+             prefill.chunk = {asked}; change the profile, or serve the checkpoint on the host \
+             reference (SPARKFLASH_DENSE_DEVICE=0)"
+        ));
+    }
+    Ok(rows)
+}
+
 /// The wide-tile policy a typed profile asks of the arm, or the field it cannot honour.
 ///
-/// The arm's chunk and its prompt-and-decode split are fixed by its kernels; a field it does not
-/// honour is refused by name rather than accepted and dropped. It honours
+/// The arm's prompt-and-decode split is fixed by its kernels; a field it does not honour is
+/// refused by name rather than accepted and dropped. The chunk is [chunk_rows]'s. It honours
 /// `prefill.tensor_cores = false`, which keeps every projection on the row GEMV; its lanes
 /// (`runtime.concurrency`) and lane memory (`runtime.lane_memory_mb`) are the serving engine's.
 fn profile_policy(
@@ -1043,13 +1079,6 @@ fn profile_policy(
              the host reference (SPARKFLASH_DENSE_DEVICE=0)"
         ))
     };
-    if let Some(chunk) = profile.prefill.chunk
-        && chunk != CHUNK_ROWS
-    {
-        return refuse(&format!(
-            "fixes its prompt chunk at {CHUNK_ROWS} rows, not prefill.chunk = {chunk}"
-        ));
-    }
     if profile.prefill.enabled == Some(false) {
         return refuse("always runs its prompt as a prefill, but prefill.enabled = false");
     }
@@ -2831,8 +2860,8 @@ impl DenseDeviceSession {
             .unwrap_or_default()
     }
 
-    /// Runs `tokens` from the session's position, [CHUNK_ROWS] rows a walk, and returns the last
-    /// row's logits. The sampler does not see them.
+    /// Runs `tokens` from the session's position, the walk's chunk rows a pass (256 by default),
+    /// and returns the last row's logits. The sampler does not see them.
     ///
     /// # Errors
     /// A token outside the vocabulary, a sequence past the served context, or a device failure.
@@ -2840,7 +2869,7 @@ impl DenseDeviceSession {
         let shared = Arc::clone(&self.sequence.shared);
         let b = &self.scratch.buffers;
         let mut last = 0;
-        for chunk in tokens.chunks(CHUNK_ROWS) {
+        for chunk in tokens.chunks(shared.chunk) {
             walk(
                 &shared,
                 b,
@@ -2881,7 +2910,7 @@ impl ModelSession for DenseDeviceSession {
             trace,
         } = self;
         let mut last = 0;
-        for chunk in tokens.chunks(CHUNK_ROWS) {
+        for chunk in tokens.chunks(shared.chunk) {
             walk(
                 &shared,
                 &scratch.buffers,
@@ -2920,7 +2949,7 @@ impl ModelSession for DenseDeviceSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_ROWS, DenseWalk, TOKEN_DECODE, profile_policy};
+    use super::{CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy};
     use sparkflash_model::backend::Sampling;
     use sparkflash_model::ledger::State;
     use sparkflash_model::profile::ModelProfile;
@@ -3061,7 +3090,6 @@ mod tests {
             edit(&mut profile);
             profile_policy(&profile).expect_err("the field is refused")
         };
-        assert!(refused(|profile| profile.prefill.chunk = Some(CHUNK_ROWS * 2)).contains("chunk"));
         assert!(refused(|profile| profile.prefill.enabled = Some(false)).contains("prefill"));
         assert!(refused(|profile| profile.prefill.exact = Some(true)).contains("exact"));
         assert!(refused(|profile| profile.decode.tensor_cores = Some(true)).contains("decode"));
@@ -3081,5 +3109,27 @@ mod tests {
             profile_policy(&chunk).is_ok(),
             "the arm's own chunk is honoured"
         );
+    }
+
+    /// The default is dense's legacy 256 through ChunkPolicy; a documented smaller switch moves
+    /// it, and an undocumented or larger one is refused rather than silently rounded.
+    #[test]
+    fn the_chunk_comes_from_the_policy_and_defaults_to_256() {
+        assert_eq!(chunk_rows(&ModelProfile::default(), 32_768), Ok(CHUNK_ROWS));
+        for size in [1usize, 2, 4, 8, 64, CHUNK_ROWS] {
+            let mut profile = ModelProfile::default();
+            profile.prefill.chunk = Some(size);
+            assert_eq!(
+                chunk_rows(&profile, 32_768),
+                Ok(size),
+                "a documented {size}-row chunk is honoured"
+            );
+        }
+        for size in [0usize, 3, 128, 300, 512, 1_024, 4_096] {
+            let mut profile = ModelProfile::default();
+            profile.prefill.chunk = Some(size);
+            let error = chunk_rows(&profile, 32_768).expect_err("the size is refused");
+            assert!(error.contains("prefill.chunk"), "{error}");
+        }
     }
 }
