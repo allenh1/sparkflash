@@ -2983,7 +2983,7 @@ mod tests {
             vec![0.5, -1.0, 2.0, 0.0],
             vec![3.0, 3.0, 1.0, -2.0],
             vec![-3.0, -2.0, -1.0, -4.0],
-            vec![7.0],
+            vec![7.0, -1.0, 0.0, 2.0],
             vec![1.0, 1.0, 1.0, 1.0],
         ]
     }
@@ -2999,6 +2999,122 @@ mod tests {
                 "the device kernel's argmax on {row:?}"
             );
         }
+    }
+
+    /// The bit delta the policy change can make, on a device: a nine-row BF16 projection through
+    /// `dory_mma_wide` (the policy's route at nine rows) against the row GEMV the same rows took
+    /// before (one row a launch). The test reports the largest absolute and ULP difference rather
+    /// than pinning the tile's arithmetic; it is the first dense number a device gate can compare
+    /// with the host reference.
+    #[test]
+    fn the_dense_tile_and_the_row_gemv_move_a_nine_row_projection_in_the_last_bits() {
+        let Ok(cuda) = sparkflash_kernels::cuda_driver::Cuda::load() else {
+            eprintln!("skipping the dense tile bit delta: no CUDA device");
+            return;
+        };
+        if sparkflash_kernels::images::dory_cubin().is_empty()
+            || sparkflash_kernels::images::qwen4_exp_cubin().is_empty()
+        {
+            eprintln!("skipping the dense tile bit delta: this build has no Dory/Qwen cubin");
+            return;
+        }
+        let (columns, inner, rows) = (256usize, 256usize, 9usize);
+        // A deterministic BF16 weight and f32 activation, in the shape the wide tile covers.
+        let mut state = 0x5eed_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let weight: Vec<u8> = (0..columns * inner)
+            .flat_map(|_| ((next().to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let input: Vec<u8> = (0..rows * inner)
+            .flat_map(|_| next().to_le_bytes())
+            .collect();
+        let (_, gemv) = cuda
+            .load_named(
+                sparkflash_kernels::images::qwen4_exp_cubin(),
+                "q4e_gemv_bf16",
+            )
+            .expect("the Qwen4-Exp image carries q4e_gemv_bf16");
+        let (_, wide) = cuda
+            .load_named_shared(
+                sparkflash_kernels::images::dory_cubin(),
+                "dory_mma_wide",
+                sparkflash_ops::projection::WIDE_SHARED,
+            )
+            .expect("the Dory image carries dory_mma_wide");
+        let mut total = 0;
+        let w = cuda.alloc(weight.len(), &mut total).expect("the weights");
+        let x = cuda.alloc(input.len(), &mut total).expect("the input");
+        let row_out = cuda
+            .alloc(rows * columns * 4, &mut total)
+            .expect("the GEMV output");
+        let tile_out = cuda
+            .alloc(rows * columns * 4, &mut total)
+            .expect("the tile output");
+        cuda.copy_htod(&w, &weight).expect("the weights upload");
+        cuda.copy_htod(&x, &input).expect("the input upload");
+        for row in 0..rows {
+            cuda.launch(
+                gemv,
+                (columns.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+                &[
+                    w.0,
+                    x.0 + (row * inner * 4) as u64,
+                    row_out.0 + (row * columns * 4) as u64,
+                    columns as u64,
+                    inner as u64,
+                    1,
+                ],
+            )
+            .expect("the row GEMV launches");
+        }
+        cuda.launch(
+            wide,
+            (
+                columns.div_ceil(sparkflash_ops::projection::WIDE_COLUMNS) as u32,
+                rows.div_ceil(sparkflash_ops::projection::WIDE_ROWS) as u32,
+                1,
+            ),
+            (sparkflash_ops::projection::WIDE_THREADS, 1, 1),
+            &[
+                w.0,
+                x.0,
+                tile_out.0,
+                columns as u64,
+                inner as u64,
+                rows as u64,
+            ],
+        )
+        .expect("the wide tile launches");
+        let mut left = vec![0u8; rows * columns * 4];
+        let mut right = vec![0u8; rows * columns * 4];
+        cuda.copy_dtoh(&mut left, &row_out)
+            .expect("the GEMV output");
+        cuda.copy_dtoh(&mut right, &tile_out)
+            .expect("the tile output");
+        cuda.free_buffers(&[&w, &x, &row_out, &tile_out]);
+        let left = super::floats(&left);
+        let right = super::floats(&right);
+        assert!(left.iter().chain(&right).all(|value| value.is_finite()));
+        let mut worst = 0.0f32;
+        let mut worst_ulp = 0u32;
+        let mut differing = 0usize;
+        for (a, b) in left.iter().zip(&right) {
+            worst = worst.max((a - b).abs());
+            worst_ulp = worst_ulp.max(a.to_bits().abs_diff(b.to_bits()));
+            differing += usize::from(a.to_bits() != b.to_bits());
+        }
+        eprintln!(
+            "dense tile vs row GEMV at {rows}x{columns}x{inner}: {differing} of {} values \
+             differ, largest |delta| {worst:e}, largest ULP {worst_ulp}",
+            rows * columns
+        );
+        assert!(worst.is_finite());
     }
 
     /// The same comparison against the real kernel, where this build and host have a CUDA device

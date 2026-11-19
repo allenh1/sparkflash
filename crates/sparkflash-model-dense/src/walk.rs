@@ -665,10 +665,12 @@ mod tests {
     #[test]
     fn no_draft_head_ships_so_the_walk_names_absent() {
         use sparkflash_runtime::{Drafter, Mode, Strategy, ledger_for};
-        assert!(
-            !<<DenseWalk as Walk>::Drafter as Drafter<DenseWalk>>::PRESENT,
-            "a draft head landed: give the walk a Drafter, not Absent"
-        );
+        const {
+            assert!(
+                !<<DenseWalk as Walk>::Drafter as Drafter<DenseWalk>>::PRESENT,
+                "a draft head landed: give the walk a Drafter, not Absent"
+            );
+        }
         assert_eq!(
             ledger_for::<DenseWalk>().mode(Strategy::Drafting),
             Mode::off("no drafter configured")
