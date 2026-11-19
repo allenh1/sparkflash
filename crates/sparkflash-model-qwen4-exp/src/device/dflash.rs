@@ -45,13 +45,17 @@ pub(super) fn load_dflash_from_env(
     let Some(directory) = crate::dflash::drafter_directory(target) else {
         return Ok(None);
     };
-    let loaded = cuda
-        .load_named(super::embedded_cubin(), "q4e_quantize_e4m3_rows")
-        .and_then(|(_, quantize)| GpuMatE4m3::quantize(cuda, quantize, head, &mut 0))
-        .and_then(|head| {
-            GpuDflash2::load(cuda, &directory, target, &head, (0, 1))
-                .inspect_err(|_| head.free(cuda))
-        });
+    let loaded = super::Bound::new(
+        cuda,
+        sparkflash_kernels::images::Image::Qwen4Exp,
+        super::embedded_cubin(),
+        "q4e_quantize_e4m3_rows",
+        sparkflash_ops::plan::Precision::Bf16,
+    )
+    .and_then(|quantize| GpuMatE4m3::quantize(cuda, quantize.kernel, head, &mut 0))
+    .and_then(|head| {
+        GpuDflash2::load(cuda, &directory, target, &head, (0, 1)).inspect_err(|_| head.free(cuda))
+    });
     loaded.map(Some).map_err(|error| {
         BackendError::new(
             "qwen4_dflash2",

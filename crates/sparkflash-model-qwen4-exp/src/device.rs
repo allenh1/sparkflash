@@ -62,6 +62,7 @@ use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{
     Cuda, Deviceptr, HostMapped, Kernel, RunStream, StreamEvent,
 };
+use sparkflash_kernels::images::Image;
 use sparkflash_kernels::lane_memory::{BackError, LanePlans, Layout, SequenceLane, SequenceLanes};
 
 // The shared context handle: one definition in `sparkflash_ops`, so both arms carry the same
@@ -103,6 +104,7 @@ pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
 use sparkflash_ops::packed::{Form, PackedSet, Placement};
+use sparkflash_ops::plan::Precision;
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -512,66 +514,167 @@ pub(crate) struct GpuWeights {
     mtp: Option<GpuMtp>,
 }
 
+/// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
+/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
+/// than a name it looked up.
+#[derive(Clone, Copy)]
+struct Bound {
+    /// The loaded driver function.
+    kernel: Kernel,
+    /// The arithmetic the catalogue entry accepts this body at.
+    precision: Precision,
+    /// The dynamic shared-memory reservation the handle was loaded with, 0 for none.
+    shared: u32,
+}
+
+impl Bound {
+    /// Whether `image` exports `symbol` and the catalogue carries it at `precision`.
+    fn carried(image: Image, symbol: &'static str, precision: Precision) -> Result<(), String> {
+        if !image.exported_symbols().contains(&symbol) {
+            return Err(format!("{} does not export {symbol}", image.name()));
+        }
+        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
+            entry.image == image
+                && entry
+                    .symbols
+                    .iter()
+                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
+        });
+        if !carried {
+            return Err(format!(
+                "the catalogue carries no {symbol} in {} accepting {}",
+                image.name(),
+                precision.name()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve `symbol` in `image` at `precision` and load it.
+    ///
+    /// # Errors
+    /// A symbol the image does not export, one the catalogue does not carry at this precision,
+    /// or the driver's load refusal.
+    fn new(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+    ) -> Result<Self, String> {
+        Self::carried(image, symbol, precision)?;
+        let (_, kernel) = cuda.load_named(cubin, symbol)?;
+        Ok(Self {
+            kernel,
+            precision,
+            shared: 0,
+        })
+    }
+
+    /// [Self::new] for a body loaded with a dynamic shared-memory reservation.
+    ///
+    /// # Errors
+    /// As [Self::new], or the driver's attribute call.
+    fn shared(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+        shared: u32,
+    ) -> Result<Self, String> {
+        Self::carried(image, symbol, precision)?;
+        let (_, kernel) = cuda.load_named_shared(cubin, symbol, shared)?;
+        Ok(Self {
+            kernel,
+            precision,
+            shared,
+        })
+    }
+
+    /// The dynamic shared-memory reservation the handle carries.
+    const fn shared_bytes(&self) -> u32 {
+        self.shared
+    }
+}
+
+impl From<Bound> for Kernel {
+    fn from(bound: Bound) -> Self {
+        bound.kernel
+    }
+}
+
+impl std::fmt::Debug for Bound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Bound")
+            .field("kernel", &self.kernel)
+            .field("precision", &self.precision)
+            .field("shared", &self.shared)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 struct Kernels {
-    embed: Kernel,
-    gemv_bf16: Kernel,
-    gemv_tiled_bf16: Kernel,
+    embed: Bound,
+    gemv_bf16: Bound,
+    gemv_tiled_bf16: Bound,
     /// The FP8 release's block-scaled dense projections at decode ([Dense::Fp8]).
-    gemv_tiled_e4m3_tile: Kernel,
-    gemv4_bf16: Kernel,
-    gemm_bf16: Kernel,
-    gemm_reduce: Kernel,
-    shared_gate_up: Kernel,
-    rmsnorm: Kernel,
-    zero: Kernel,
-    add: Kernel,
-    hyper_down: Kernel,
-    hyper_up: Kernel,
-    hyper_down_tiled: Kernel,
-    hyper_up_tiled: Kernel,
-    hyper_mix: Kernel,
-    hyper_inject: Kernel,
-    inject: Kernel,
+    gemv_tiled_e4m3_tile: Bound,
+    gemv4_bf16: Bound,
+    gemm_bf16: Bound,
+    gemm_reduce: Bound,
+    shared_gate_up: Bound,
+    rmsnorm: Bound,
+    zero: Bound,
+    add: Bound,
+    hyper_down: Bound,
+    hyper_up: Bound,
+    hyper_down_tiled: Bound,
+    hyper_up_tiled: Bound,
+    hyper_mix: Bound,
+    hyper_inject: Bound,
+    inject: Bound,
     /// The row sums' in-place sum of this rank's chunk ([sparkflash_ops::tp::RowSums]).
-    sum_slots: Kernel,
-    swiglu: Kernel,
-    router: Kernel,
+    sum_slots: Bound,
+    swiglu: Bound,
+    router: Bound,
     /// The shared routed-expert plan (kernels/moe_plan_sm121.cu): the run order its expert
     /// kernels read and the run bounds that tell each block where its run starts.
-    moe_plan: Kernel,
-    expert_gate_up: Kernel,
-    expert_down: Kernel,
-    expert_gate_up_fp8: Kernel,
-    expert_down_fp8: Kernel,
-    fold_streams: Kernel,
-    widen_streams: Kernel,
-    moe_combine: Kernel,
-    gdn_conv: Kernel,
-    gdn_recur: Kernel,
-    rope: Kernel,
-    qsa_pool: Kernel,
-    qsa_scores: Kernel,
-    qsa_pick: Kernel,
-    attn: Kernel,
+    moe_plan: Bound,
+    expert_gate_up: Bound,
+    expert_down: Bound,
+    expert_gate_up_fp8: Bound,
+    expert_down_fp8: Bound,
+    fold_streams: Bound,
+    widen_streams: Bound,
+    moe_combine: Bound,
+    gdn_conv: Bound,
+    gdn_recur: Bound,
+    rope: Bound,
+    qsa_pool: Bound,
+    qsa_scores: Bound,
+    qsa_pick: Bound,
+    attn: Bound,
     /// q4e_attn for several query heads of a KV head at once, bit-identical per head: the
     /// [GQA_GROUP_KERNELS] the device grants their shared memory, by their head counts. Which one
     /// a configuration launches is ops' rule
     /// ([sparkflash_ops::attention::GqaBody::choose]), the one its boot plan names.
-    attn_group: [Option<(usize, Kernel)>; GQA_GROUP_KERNELS.len()],
+    attn_group: [Option<(usize, Bound)>; GQA_GROUP_KERNELS.len()],
     /// Every causal position, split over the context, and the splits' fold: the attention of a
     /// configuration with no sparse indexer ([Qwen4ExpConfig::full_attention]).
-    attn_full: Kernel,
-    attn_full_combine: Kernel,
-    ple_gate: Kernel,
-    ple_conv: Kernel,
-    deinterleave: Kernel,
-    rmsnorm_rows: Kernel,
-    copy_flat: Kernel,
+    attn_full: Bound,
+    attn_full_combine: Bound,
+    ple_gate: Bound,
+    ple_conv: Bound,
+    deinterleave: Bound,
+    rmsnorm_rows: Bound,
+    copy_flat: Bound,
     /// Narrow a f32 projection row into the BF16 KV cache, flat or one row at a time.
-    cache_bf16: Kernel,
-    cache_rows_bf16: Kernel,
+    cache_bf16: Bound,
+    cache_rows_bf16: Bound,
     /// The tensor-core forms a prefill chunk takes (kernels/qwen4_prefill_sm121.cu).
     prefill: PrefillKernels,
 }
@@ -602,66 +705,82 @@ impl Kernels {
                     .to_owned(),
             );
         }
-        fn named(cuda: &Cuda, name: &'static str) -> Result<Kernel, String> {
-            let (_, kernel) = cuda.load_named(embedded_cubin(), name)?;
-            Ok(kernel)
-        }
+        let token = |name: &'static str, precision: Precision| {
+            Bound::new(cuda, Image::Qwen4Exp, embedded_cubin(), name, precision)
+        };
         // The attention, indexer and KV-cache family lives in its own image
         // (kernels/qwen4_attn_sm121.cu).
-        fn attn(cuda: &Cuda, name: &'static str) -> Result<Kernel, String> {
-            let (_, kernel) = cuda.load_named(embedded_attn_cubin(), name)?;
-            Ok(kernel)
-        }
+        let attn = |name: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Attn,
+                embedded_attn_cubin(),
+                name,
+                precision,
+            )
+        };
         // The routed-expert family lives in its own image (kernels/qwen4_moe_sm121.cu). Its
         // activation staging is dynamic shared memory, so every expert launch reserves the
         // function's size explicitly.
-        fn moe(cuda: &Cuda, name: &'static str) -> Result<Kernel, String> {
-            let (_, kernel) = cuda.load_named(embedded_moe_cubin(), name)?;
-            Ok(kernel)
-        }
-        fn moe_staged(cuda: &Cuda, name: &'static str, shared: u32) -> Result<Kernel, String> {
+        let moe = |name: &'static str, precision: Precision| {
+            Bound::new(cuda, Image::Qwen4Moe, embedded_moe_cubin(), name, precision)
+        };
+        let moe_staged = |name: &'static str, precision: Precision, shared: u32| {
             if shared == 0 {
-                return moe(cuda, name);
+                return moe(name, precision);
             }
-            let (_, kernel) = cuda.load_named_shared(embedded_moe_cubin(), name, shared)?;
-            Ok(kernel)
-        }
-        /// A handle that reserves `shared` bytes of dynamic shared memory per launch, falling back
-        /// to the plain one (and a warning) when the device refuses the reservation.
-        fn staged(cuda: &Cuda, name: &'static str, shared: u32) -> Result<Kernel, String> {
+            Bound::shared(
+                cuda,
+                Image::Qwen4Moe,
+                embedded_moe_cubin(),
+                name,
+                precision,
+                shared,
+            )
+        };
+        // A handle that reserves `shared` bytes of dynamic shared memory per launch, falling back
+        // to the plain one (and a warning) when the device refuses the reservation.
+        let staged = |name: &'static str, precision: Precision, shared: u32| {
             if shared == 0 {
-                return named(cuda, name);
+                return token(name, precision);
             }
-            match cuda.load_named_shared(embedded_cubin(), name, shared) {
-                Ok((_, kernel)) => Ok(kernel),
+            match Bound::shared(
+                cuda,
+                Image::Qwen4Exp,
+                embedded_cubin(),
+                name,
+                precision,
+                shared,
+            ) {
+                Ok(bound) => Ok(bound),
                 Err(error) => {
                     eprintln!("{name}: {shared} bytes of shared memory refused ({error}); global");
-                    named(cuda, name)
+                    token(name, precision)
                 }
             }
-        }
+        };
         Ok(Self {
-            embed: named(cuda, "q4e_embed")?,
-            gemv_bf16: named(cuda, "q4e_gemv_bf16")?,
-            gemv_tiled_bf16: named(cuda, "q4e_gemv_tiled_bf16")?,
-            gemv_tiled_e4m3_tile: named(cuda, "q4e_gemv_tiled_e4m3_tile")?,
-            gemv4_bf16: named(cuda, "q4e_gemv4_bf16")?,
-            gemm_bf16: named(cuda, "q4e_gemm_bf16")?,
-            gemm_reduce: named(cuda, "q4e_gemm_reduce")?,
-            shared_gate_up: named(cuda, "q4e_shared_gate_up")?,
-            rmsnorm: named(cuda, "q4e_rmsnorm")?,
-            zero: named(cuda, "q4e_zero")?,
-            add: named(cuda, "q4e_add")?,
-            hyper_down: named(cuda, "q4e_hyper_down")?,
-            hyper_up: named(cuda, "q4e_hyper_up")?,
-            hyper_down_tiled: named(cuda, "q4e_hyper_down_tiled")?,
-            hyper_up_tiled: named(cuda, "q4e_hyper_up_tiled")?,
-            hyper_mix: named(cuda, "q4e_hyper_mix")?,
-            hyper_inject: named(cuda, "q4e_hyper_inject")?,
-            inject: named(cuda, "q4e_inject")?,
-            sum_slots: named(cuda, "q4e_sum_slots")?,
-            swiglu: named(cuda, "q4e_swiglu")?,
-            router: moe(cuda, "q4e_router")?,
+            embed: token("q4e_embed", Precision::Bf16)?,
+            gemv_bf16: token("q4e_gemv_bf16", Precision::Bf16)?,
+            gemv_tiled_bf16: token("q4e_gemv_tiled_bf16", Precision::Bf16)?,
+            gemv_tiled_e4m3_tile: token("q4e_gemv_tiled_e4m3_tile", Precision::Fp8E4M3)?,
+            gemv4_bf16: token("q4e_gemv4_bf16", Precision::Bf16)?,
+            gemm_bf16: token("q4e_gemm_bf16", Precision::Bf16)?,
+            gemm_reduce: token("q4e_gemm_reduce", Precision::Bf16)?,
+            shared_gate_up: token("q4e_shared_gate_up", Precision::Bf16)?,
+            rmsnorm: token("q4e_rmsnorm", Precision::Bf16)?,
+            zero: token("q4e_zero", Precision::Bf16)?,
+            add: token("q4e_add", Precision::Bf16)?,
+            hyper_down: token("q4e_hyper_down", Precision::Bf16)?,
+            hyper_up: token("q4e_hyper_up", Precision::Bf16)?,
+            hyper_down_tiled: token("q4e_hyper_down_tiled", Precision::Bf16)?,
+            hyper_up_tiled: token("q4e_hyper_up_tiled", Precision::Bf16)?,
+            hyper_mix: token("q4e_hyper_mix", Precision::Bf16)?,
+            hyper_inject: token("q4e_hyper_inject", Precision::F32)?,
+            inject: token("q4e_inject", Precision::F32)?,
+            sum_slots: token("q4e_sum_slots", Precision::Bf16)?,
+            swiglu: token("q4e_swiglu", Precision::Bf16)?,
+            router: moe("q4e_router", Precision::Bf16)?,
             moe_plan: {
                 if sparkflash_kernels::images::moe_plan_cubin().is_empty() {
                     return Err(
@@ -670,45 +789,62 @@ impl Kernels {
                             .to_owned(),
                     );
                 }
-                let (_, kernel) =
-                    cuda.load_named(sparkflash_kernels::images::moe_plan_cubin(), "moe_plan")?;
-                kernel
+                Bound::new(
+                    cuda,
+                    Image::MoePlan,
+                    sparkflash_kernels::images::moe_plan_cubin(),
+                    "moe_plan",
+                    Precision::Bf16,
+                )?
             },
-            expert_gate_up: moe_staged(cuda, "q4e_expert_gate_up", expert_stage_bytes)?,
-            expert_down: moe_staged(cuda, "q4e_expert_down", expert_stage_bytes)?,
-            expert_gate_up_fp8: moe_staged(cuda, "q4e_expert_gate_up_fp8", expert_stage_bytes)?,
-            expert_down_fp8: moe_staged(cuda, "q4e_expert_down_fp8", expert_stage_bytes)?,
-            fold_streams: named(cuda, "q4e_fold_streams")?,
-            widen_streams: named(cuda, "q4e_widen_streams")?,
-            moe_combine: moe(cuda, "q4e_moe_combine")?,
-            gdn_conv: named(cuda, "q4e_gdn_conv")?,
-            gdn_recur: staged(cuda, "q4e_gdn_recur", gdn_stage_bytes)?,
-            rope: named(cuda, "q4e_rope")?,
-            qsa_pool: attn(cuda, "q4e_qsa_pool")?,
-            qsa_scores: attn(cuda, "q4e_qsa_scores")?,
-            qsa_pick: attn(cuda, "q4e_qsa_pick")?,
-            attn: attn(cuda, "q4e_attn")?,
+            expert_gate_up: moe_staged("q4e_expert_gate_up", Precision::NvFp4, expert_stage_bytes)?,
+            expert_down: moe_staged("q4e_expert_down", Precision::NvFp4, expert_stage_bytes)?,
+            expert_gate_up_fp8: moe_staged(
+                "q4e_expert_gate_up_fp8",
+                Precision::Fp8E4M3,
+                expert_stage_bytes,
+            )?,
+            expert_down_fp8: moe_staged(
+                "q4e_expert_down_fp8",
+                Precision::Fp8E4M3,
+                expert_stage_bytes,
+            )?,
+            fold_streams: token("q4e_fold_streams", Precision::F32)?,
+            widen_streams: token("q4e_widen_streams", Precision::F32)?,
+            moe_combine: moe("q4e_moe_combine", Precision::Bf16)?,
+            gdn_conv: token("q4e_gdn_conv", Precision::Bf16)?,
+            gdn_recur: staged("q4e_gdn_recur", Precision::Bf16, gdn_stage_bytes)?,
+            rope: token("q4e_rope", Precision::Bf16)?,
+            qsa_pool: attn("q4e_qsa_pool", Precision::Bf16)?,
+            qsa_scores: attn("q4e_qsa_scores", Precision::Bf16)?,
+            qsa_pick: attn("q4e_qsa_pick", Precision::Bf16)?,
+            attn: attn("q4e_attn", Precision::Bf16)?,
             // Their buffers live only in the dynamic reservation, so a refusal means q4e_attn.
             attn_group: GQA_GROUP_KERNELS.map(|(heads, name)| {
                 let bytes = gqa_group_shared_bytes(heads);
-                cuda.load_named_shared(embedded_attn_cubin(), name, bytes)
-                    .map_err(|error| {
-                        eprintln!(
-                            "{name}: {bytes} bytes of shared memory refused ({error}); q4e_attn"
-                        );
-                    })
-                    .ok()
-                    .map(|(_, kernel)| (heads, kernel))
+                Bound::shared(
+                    cuda,
+                    Image::Qwen4Attn,
+                    embedded_attn_cubin(),
+                    name,
+                    Precision::Bf16,
+                    bytes,
+                )
+                .map_err(|error| {
+                    eprintln!("{name}: {bytes} bytes of shared memory refused ({error}); q4e_attn");
+                })
+                .ok()
+                .map(|bound| (heads, bound))
             }),
-            attn_full: attn(cuda, "q4e_attn_full")?,
-            attn_full_combine: attn(cuda, "q4e_attn_full_combine")?,
-            ple_gate: named(cuda, "q4e_ple_gate")?,
-            ple_conv: named(cuda, "q4e_ple_conv")?,
-            deinterleave: named(cuda, "q4e_deinterleave")?,
-            rmsnorm_rows: named(cuda, "q4e_rmsnorm_rows")?,
-            copy_flat: named(cuda, "q4e_copy_flat")?,
-            cache_bf16: attn(cuda, "q4e_cache_bf16")?,
-            cache_rows_bf16: attn(cuda, "q4e_cache_rows_bf16")?,
+            attn_full: attn("q4e_attn_full", Precision::Bf16)?,
+            attn_full_combine: attn("q4e_attn_full_combine", Precision::Bf16)?,
+            ple_gate: token("q4e_ple_gate", Precision::Bf16)?,
+            ple_conv: token("q4e_ple_conv", Precision::Bf16)?,
+            deinterleave: token("q4e_deinterleave", Precision::Bf16)?,
+            rmsnorm_rows: token("q4e_rmsnorm_rows", Precision::Bf16)?,
+            copy_flat: token("q4e_copy_flat", Precision::F32)?,
+            cache_bf16: attn("q4e_cache_bf16", Precision::Bf16)?,
+            cache_rows_bf16: attn("q4e_cache_rows_bf16", Precision::Bf16)?,
             prefill: PrefillKernels::load(cuda)?,
         })
     }
@@ -2955,7 +3091,7 @@ impl Qwen4ExpDeviceBackend {
         self.shared
             .cuda
             .launch(
-                self.shared.kernels.rmsnorm,
+                self.shared.kernels.rmsnorm.kernel,
                 norm.grid,
                 norm.block,
                 &norm.args,
@@ -3667,18 +3803,23 @@ fn pack_dense(cuda: &Cuda, weights: &GpuWeights) -> Result<PackedSet, BackendErr
 
 impl DeviceSequence {
     /// Launch a typed call of the shared token kernels ([sparkflash_ops::calls]).
-    fn call<const N: usize>(&self, kernel: Kernel, call: Call<N>) -> Result<(), BackendError> {
+    fn call<const N: usize>(
+        &self,
+        kernel: impl Into<Kernel>,
+        call: Call<N>,
+    ) -> Result<(), BackendError> {
         self.launch(kernel, call.grid, call.block, &call.args)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn launch(
         &self,
-        kernel: Kernel,
+        kernel: impl Into<Kernel>,
         grid: (u32, u32, u32),
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), BackendError> {
+        let kernel = kernel.into();
         self.backend
             .cuda
             .launch_on(self.clock(), kernel, grid, block, args)
@@ -4103,7 +4244,7 @@ impl DeviceSequence {
             let count = GEMV_MAX_BATCH.min(batch - base);
             gemv_e4m3_tile(
                 self,
-                self.backend.kernels.gemv_tiled_e4m3_tile,
+                self.backend.kernels.gemv_tiled_e4m3_tile.kernel,
                 matrix,
                 input.offset(base * matrix.columns * 4),
                 output.offset(base * matrix.rows * 4),
@@ -5330,7 +5471,7 @@ impl DeviceSequence {
             let blocks = elements.div_ceil(256).max(1) as u32;
             cuda.launch_on(
                 &stream,
-                shared.kernels.zero,
+                shared.kernels.zero.kernel,
                 (blocks, 1, 1),
                 (256, 1, 1),
                 &[pointer.0, elements as u64],
@@ -6444,7 +6585,7 @@ pub fn device_self_test() -> Result<(), BackendError> {
     .zero_centred(true)
     .groups(width, true)
     .call(1);
-    cuda.launch(kernels.rmsnorm, norm.grid, norm.block, &norm.args)
+    cuda.launch(kernels.rmsnorm.kernel, norm.grid, norm.block, &norm.args)
         .map_err(|error| BackendError::new("qwen4_device", error))?;
     let mut bytes = vec![0u8; width * 4];
     cuda.copy_dtoh(&mut bytes, &device_output)

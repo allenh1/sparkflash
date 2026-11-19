@@ -47,15 +47,17 @@
 //!   [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0), through the
 //!   shared kernels/opt_mma_*_sm121.cuh headers. See the root NOTICE file.
 
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
+use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use sparkflash_kernels::images::Image;
 use sparkflash_model::BackendError;
+use sparkflash_ops::plan::Precision;
 use sparkflash_ops::{OpPlan, gdn};
 // The routed experts' plan, grouped tile and item count are the shared rule.
 use sparkflash_ops::moe::{MAX_EXPERTS as MOE_MAX_EXPERTS, MoePlanCall, grouped};
 use sparkflash_ops::projection::{Fp8Tile, SPLIT_STAGE, SplitTile, fp8_tile_fits, split_k_slices};
 
 use super::{
-    DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMat,
+    Bound, DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMat,
     GpuMatE4m3Tile, split_tickets,
 };
 use crate::config::Qwen4ExpConfig;
@@ -302,36 +304,36 @@ impl PrefillPlan {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PrefillKernels {
-    dense_mma: Kernel,
+    dense_mma: Bound,
     /// The FP8 release's block-scaled dense projections on the shared 128 x 128 tile.
-    dense_fp8: Kernel,
-    dense_rows: Kernel,
+    dense_fp8: Bound,
+    dense_rows: Bound,
     /// The hyper connection's up projection and stream mix for a few rows, in one launch.
-    hyper_up_rows: Kernel,
-    pub(super) gemm_rows: Kernel,
-    epilogue: Kernel,
-    split_bf16: Kernel,
-    moe_plan: Kernel,
-    moe_gate_up: Kernel,
-    moe_down: Kernel,
-    moe_rows_gate_up: Kernel,
-    moe_rows_down: Kernel,
+    hyper_up_rows: Bound,
+    pub(super) gemm_rows: Bound,
+    epilogue: Bound,
+    split_bf16: Bound,
+    moe_plan: Bound,
+    moe_gate_up: Bound,
+    moe_down: Bound,
+    moe_rows_gate_up: Bound,
+    moe_rows_down: Bound,
     /// The block-scaled FP8 grouped prefill MMA (D95), on the shared 128 x 128 tile.
-    moe_gate_up_fp8: Kernel,
-    moe_swiglu_fp8: Kernel,
-    moe_down_fp8: Kernel,
-    gdn_conv: Kernel,
-    gdn_conv_state: Kernel,
-    gdn_prep: Kernel,
-    gdn_scan: Kernel,
-    gdn_scan_64_64: Kernel,
-    gdn_scan_128_256: Kernel,
-    gdn_gate: Kernel,
+    moe_gate_up_fp8: Bound,
+    moe_swiglu_fp8: Bound,
+    moe_down_fp8: Bound,
+    gdn_conv: Bound,
+    gdn_conv_state: Bound,
+    gdn_prep: Bound,
+    gdn_scan: Bound,
+    gdn_scan_64_64: Bound,
+    gdn_scan_128_256: Bound,
+    gdn_gate: Bound,
 }
 
 impl PrefillKernels {
     /// The GDN scan body a plan names ([sparkflash_ops::scan::ScanPlan]).
-    fn gdn_scan_named(&self, symbol: &str) -> Result<Kernel, String> {
+    fn gdn_scan_named(&self, symbol: &str) -> Result<Bound, String> {
         match symbol {
             "q4p_gdn_scan" => Ok(self.gdn_scan),
             "q4p_gdn_scan_64_64" => Ok(self.gdn_scan_64_64),
@@ -355,46 +357,61 @@ impl PrefillKernels {
                     .to_owned(),
             );
         }
-        let named = |name: &'static str| -> Result<Kernel, String> {
-            let (_, kernel) = cuda.load_named(embedded_prefill_cubin(), name)?;
-            Ok(kernel)
+        let named = |name: &'static str, precision: Precision| -> Result<Bound, String> {
+            Bound::new(
+                cuda,
+                Image::Qwen4Prefill,
+                embedded_prefill_cubin(),
+                name,
+                precision,
+            )
         };
         // The Gated DeltaNet and Kimi Delta Attention kernels live in the scan image, not here.
-        let scan = |name: &'static str| -> Result<Kernel, String> {
-            let (_, kernel) = cuda.load_named(embedded_scan_cubin(), name)?;
-            Ok(kernel)
+        let scan = |name: &'static str, precision: Precision| -> Result<Bound, String> {
+            Bound::new(
+                cuda,
+                Image::Qwen4Scan,
+                embedded_scan_cubin(),
+                name,
+                precision,
+            )
         };
         Ok(Self {
-            dense_mma: named("q4p_dense_mma")?,
-            dense_fp8: named("q4p_dense_fp8")?,
-            dense_rows: named("q4p_dense_rows")?,
-            hyper_up_rows: named("q4p_hyper_up_rows")?,
-            gemm_rows: named("q4p_gemm_rows")?,
-            epilogue: named("q4p_epilogue")?,
-            split_bf16: named("q4p_split_bf16")?,
+            dense_mma: named("q4p_dense_mma", Precision::Bf16)?,
+            dense_fp8: named("q4p_dense_fp8", Precision::Fp8E4M3)?,
+            dense_rows: named("q4p_dense_rows", Precision::Bf16)?,
+            hyper_up_rows: named("q4p_hyper_up_rows", Precision::Bf16)?,
+            gemm_rows: named("q4p_gemm_rows", Precision::Bf16)?,
+            epilogue: named("q4p_epilogue", Precision::Bf16)?,
+            split_bf16: named("q4p_split_bf16", Precision::Bf16)?,
             // The routed-expert plan is the shared image (kernels/moe_plan_sm121.cu), as the
             // token path's is: one counting pass, one item layout, four callers.
             moe_plan: {
                 if sparkflash_kernels::images::moe_plan_cubin().is_empty() {
                     return Err("this build has no routed-expert plan cubin".to_owned());
                 }
-                cuda.load_named(sparkflash_kernels::images::moe_plan_cubin(), "moe_plan")?
-                    .1
+                Bound::new(
+                    cuda,
+                    Image::MoePlan,
+                    sparkflash_kernels::images::moe_plan_cubin(),
+                    "moe_plan",
+                    Precision::Bf16,
+                )?
             },
-            moe_gate_up: named("q4p_moe_gate_up")?,
-            moe_down: named("q4p_moe_down")?,
-            moe_rows_gate_up: named("q4p_moe_rows_gate_up")?,
-            moe_rows_down: named("q4p_moe_rows_down")?,
-            moe_gate_up_fp8: named("q4p_moe_gate_up_fp8")?,
-            moe_swiglu_fp8: named("q4p_moe_swiglu_fp8")?,
-            moe_down_fp8: named("q4p_moe_down_fp8")?,
-            gdn_conv: scan("q4p_gdn_conv")?,
-            gdn_conv_state: scan("q4p_gdn_conv_state")?,
-            gdn_prep: scan("q4p_gdn_prep")?,
-            gdn_scan: scan("q4p_gdn_scan")?,
-            gdn_scan_64_64: scan("q4p_gdn_scan_64_64")?,
-            gdn_scan_128_256: scan("q4p_gdn_scan_128_256")?,
-            gdn_gate: scan("q4p_gdn_gate")?,
+            moe_gate_up: named("q4p_moe_gate_up", Precision::NvFp4)?,
+            moe_down: named("q4p_moe_down", Precision::NvFp4)?,
+            moe_rows_gate_up: named("q4p_moe_rows_gate_up", Precision::NvFp4)?,
+            moe_rows_down: named("q4p_moe_rows_down", Precision::NvFp4)?,
+            moe_gate_up_fp8: named("q4p_moe_gate_up_fp8", Precision::Fp8E4M3)?,
+            moe_swiglu_fp8: named("q4p_moe_swiglu_fp8", Precision::Fp8E4M3)?,
+            moe_down_fp8: named("q4p_moe_down_fp8", Precision::Fp8E4M3)?,
+            gdn_conv: scan("q4p_gdn_conv", Precision::Bf16)?,
+            gdn_conv_state: scan("q4p_gdn_conv_state", Precision::Bf16)?,
+            gdn_prep: scan("q4p_gdn_prep", Precision::Bf16)?,
+            gdn_scan: scan("q4p_gdn_scan", Precision::Bf16)?,
+            gdn_scan_64_64: scan("q4p_gdn_scan_64_64", Precision::Bf16)?,
+            gdn_scan_128_256: scan("q4p_gdn_scan_128_256", Precision::Bf16)?,
+            gdn_gate: scan("q4p_gdn_gate", Precision::Bf16)?,
         })
     }
 }

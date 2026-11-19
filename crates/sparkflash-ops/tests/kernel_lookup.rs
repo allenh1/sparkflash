@@ -99,20 +99,9 @@ const EXEMPTIONS: &[Exemption] = &[
     Exemption {
         crate_name: "sparkflash-model-qwen4-exp",
         file: "src/device.rs",
-        sites: 7,
-        why: "not converted yet: phase 7 runs by arm",
-    },
-    Exemption {
-        crate_name: "sparkflash-model-qwen4-exp",
-        file: "src/device/prefill.rs",
-        sites: 3,
-        why: "not converted yet: phase 7 runs by arm",
-    },
-    Exemption {
-        crate_name: "sparkflash-model-qwen4-exp",
-        file: "src/device/dflash.rs",
-        sites: 1,
-        why: "not converted yet: phase 7 runs by arm",
+        sites: 2,
+        why: "the two loaders in Bound: the catalogue and the image are checked once, and every \
+              launch in the crate holds the resolved handle",
     },
     Exemption {
         crate_name: "sparkflash-model-inkling2",

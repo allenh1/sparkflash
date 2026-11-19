@@ -97,7 +97,7 @@ impl BatchBuffers {
         zero_split_tickets(
             cuda,
             &stream,
-            shared.kernels.zero,
+            shared.kernels.zero.kernel,
             combined[PARTIALS_SLOT],
             rows,
         )
