@@ -543,6 +543,8 @@ impl<A: FusedArm, W: GroupWire> GroupLanes<A, W> {
     }
 }
 
+impl<A: FusedArm, W: GroupWire> crate::fused::sealed::Sealed for GroupLanes<A, W> {}
+
 impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
     type Slot = GroupLane<A::Slot>;
 
@@ -876,6 +878,8 @@ mod tests {
         refuses: bool,
         fails: bool,
     }
+
+    impl crate::fused::sealed::Sealed for ToyLanes {}
 
     impl FusedArm for ToyLanes {
         fn ledger(&self) -> Ledger {

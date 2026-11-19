@@ -178,11 +178,26 @@ pub enum Part {
     More,
 }
 
+/// The seal on [`FusedArm`]: only this crate's strategies may name it.
+///
+/// The trait is public so an engine can hold a `FusedArm` and so the runtime's own types can
+/// implement it; the supertrait is not reachable from outside `sparkflash-runtime`, so no model
+/// crate can add a second strategy. The runtime owns every strategy; an arm is a [`crate::Walk`].
+pub(crate) mod sealed {
+    /// Implemented by the runtime's strategies and, in tests, by its toys.
+    pub trait Sealed {}
+}
+
 /// What a model exposes for its sessions to be fused.
 ///
 /// A slot is one request's state: its caches, its sampler and the history it has forwarded. The
 /// engine owns the slots of its pool and steps the waiting ones in a single call.
-pub trait FusedArm: Send + Sync + 'static {
+///
+/// **Sealed.** The runtime owns every strategy; an arm is a [`crate::Walk`]. Only
+/// [`crate::Runtime`] and [`crate::GroupLanes`] implement this trait, and the compiler enforces
+/// it: a crate outside `sparkflash-runtime` cannot name [`sealed::Sealed`], so it cannot write a
+/// second strategy. A new model supplies its walk, not a serving loop.
+pub trait FusedArm: sealed::Sealed + Send + Sync + 'static {
     /// One request's state.
     type Slot: Send + 'static;
 
@@ -1236,6 +1251,8 @@ mod tests {
         rows: AtomicUsize,
     }
 
+    impl sealed::Sealed for Toy {}
+
     impl FusedArm for Toy {
         fn ledger(&self) -> Ledger {
             stated("toy")
@@ -1390,6 +1407,8 @@ mod tests {
         cached: usize,
     }
 
+    impl sealed::Sealed for Keeper {}
+
     impl FusedArm for Keeper {
         fn ledger(&self) -> Ledger {
             stated("keeper")
@@ -1487,6 +1506,8 @@ mod tests {
     struct Extender {
         renewed: AtomicUsize,
     }
+
+    impl sealed::Sealed for Extender {}
 
     impl FusedArm for Extender {
         fn ledger(&self) -> Ledger {
@@ -1590,6 +1611,8 @@ mod tests {
         point: Option<usize>,
         cached: usize,
     }
+
+    impl sealed::Sealed for Rewinder {}
 
     impl FusedArm for Rewinder {
         fn ledger(&self) -> Ledger {
@@ -1708,6 +1731,8 @@ mod tests {
             self.held.lock().unwrap()[slot.index] = slot.ids.len();
         }
     }
+
+    impl sealed::Sealed for Budget {}
 
     impl FusedArm for Budget {
         fn ledger(&self) -> Ledger {
@@ -1853,6 +1878,8 @@ mod tests {
     }
 
     const HELD: usize = 3;
+
+    impl sealed::Sealed for Rounds {}
 
     impl FusedArm for Rounds {
         fn ledger(&self) -> Ledger {
@@ -2039,6 +2066,8 @@ mod tests {
         }
     }
 
+    impl sealed::Sealed for Parted {}
+
     impl FusedArm for Parted {
         fn ledger(&self) -> Ledger {
             stated("parted")
@@ -2206,6 +2235,8 @@ mod tests {
     }
 
     struct Unstated;
+
+    impl sealed::Sealed for Unstated {}
 
     impl FusedArm for Unstated {
         type Slot = ();

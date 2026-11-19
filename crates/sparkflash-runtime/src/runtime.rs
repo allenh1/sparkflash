@@ -848,6 +848,8 @@ fn runtime_ledger<W: Walk>(
     ledger
 }
 
+impl<W> crate::fused::sealed::Sealed for Runtime<W> where W: Walk {}
+
 impl<W> FusedArm for Runtime<W>
 where
     W: Walk + Send + Sync,
