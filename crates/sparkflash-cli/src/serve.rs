@@ -4778,13 +4778,20 @@ fn load_glm_tp4_rank(config: &Tp4RankConfig) -> Result<GlmLoadedRank, String> {
         rank: config.rank,
         world_size: config.world_size,
     };
-    let (tp, gather) = open_pack_collective(
-        config,
-        &cuda,
-        "GLM",
-        glm_config.hidden_size,
-        &format!("glm-serve;{glm_config:?};{}", config.context),
-    )?;
+    let run = format!("glm-serve;{glm_config:?};{}", config.context);
+    // The agreement word, printed before the gather: a rank whose plan differs names the
+    // component here (its context, its configuration, or the digest itself) rather than only
+    // refusing in the bootstrap.
+    eprintln!(
+        "sparkflash serve: rank {} plan agreement {:016x}: context {}, configuration {:016x}, \
+         {} bytes",
+        config.rank,
+        sparkflash_engine::synthetic::fnv1a(run.as_bytes()),
+        config.context,
+        sparkflash_engine::synthetic::fnv1a(format!("{glm_config:?}").as_bytes()),
+        run.len()
+    );
+    let (tp, gather) = open_pack_collective(config, &cuda, "GLM", glm_config.hidden_size, &run)?;
     // The latent cache the 1M window needs: E4M3 by default (vLLM's `fp8_ds_mla` trade), or
     // f32 for the expansion's exact arithmetic at a smaller window.
     //
