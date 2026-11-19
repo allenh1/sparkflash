@@ -1384,6 +1384,13 @@ from) and a `build_note` naming why either is null into the reference's `server`
 outside the fingerprint, so naming a build changes no bits, and a reference captured before the
 fields existed stays valid.
 
+The owner's decision of 2026-11-18 — moving decode to the tensor cores is an approved arithmetic
+change, and the output shift it causes is expected — now has a gate path: a `[[config]]` entry
+may carry `approved = { decision, date, report }`, which carries one bump while the three global
+prerequisites stay false (`docs/NUMERICS.md` §5). It does not excuse the per-model anchor, so
+Inkling-2's re-declaration still waits on its own `[[anchor]]` and a teacher-forced capture; a
+model that already has one, such as GLM-5.3, no longer waits on `coverage` and `monitors`.
+
 ### Inkling on the tick engine: three widths, one verify width, and the group's images
 
 Commits `eddb478f` (the single process) and `d22208e8` (the group). Inkling had no

@@ -105,6 +105,10 @@ PREREQUISITES = ("anchor", "declaration_check", "coverage", "monitors")
 # requirement (docs/NUMERICS.md section 5), looked up for the bumping configuration's own model.
 GATING_PREREQUISITES = ("declaration_check", "coverage", "monitors")
 KEY_FIELDS = ("model", "world", "profile", "plan", "arch")
+# An owner's recorded approval of one declared change (docs/NUMERICS.md §5): a one-line decision,
+# the day it was taken, and the report that justifies the change. It sits beside the version it
+# lets land and is part of the record, like a version.
+APPROVAL_FIELDS = ("decision", "date", "report")
 EVIDENCE = ("logprobs", "text")
 # A text reference holds no token ids and no logprobs, so it cannot be teacher-forced. A
 # configuration with text evidence is exempt from the per-model anchor requirement; it also
@@ -558,6 +562,43 @@ def parse_registry(text: str, origin: str) -> dict:
     return registry
 
 
+def approval_problem(entry: dict) -> str | None:
+    """Why an entry's `approved` block is not a usable record, or None when it is well formed.
+
+    The block names the owner's decision that lets one bump land past the three global
+    prerequisites (docs/NUMERICS.md §5). Its report's existence and freshness are judged at the
+    bump, because a carried record's report belongs to an earlier change.
+    """
+    approved = entry.get("approved")
+    if approved is None:
+        return None
+    if not isinstance(approved, dict):
+        return "approved is not a table"
+    unknown = sorted(set(approved) - set(APPROVAL_FIELDS))
+    if unknown:
+        return f"approved has unknown key(s) {unknown}"
+    missing = [field for field in APPROVAL_FIELDS if not isinstance(approved.get(field), str)]
+    if missing:
+        return f"approved {missing} are not all strings"
+    if not approved["decision"].strip():
+        return "approved.decision is empty"
+    if "\n" in approved["decision"].strip():
+        return "approved.decision is not one line"
+    if not approved["date"].strip():
+        return "approved.date is empty"
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", approved["date"]):
+        return f"approved.date {approved['date']!r} is not a YYYY-MM-DD date"
+    try:
+        datetime.date.fromisoformat(approved["date"])
+    except ValueError:
+        return f"approved.date {approved['date']!r} is not a calendar date"
+    if not approved["report"].strip():
+        return "approved.report is empty"
+    if not approved["report"].startswith("docs/numerics/"):
+        return f"approved.report {approved['report']!r} is not under docs/numerics/"
+    return None
+
+
 def entry_key(entry: dict) -> tuple:
     return tuple(entry[field] for field in KEY_FIELDS)
 
@@ -705,6 +746,10 @@ def entry_snippet(reference: dict, reference_path: str, registered: dict | None 
     ]
     if registered and registered.get("report"):
         lines.append(f"report = {json.dumps(registered['report'])}")
+    approved = (registered or {}).get("approved")
+    if isinstance(approved, dict) and all(isinstance(approved.get(field), str) for field in APPROVAL_FIELDS):
+        inline = ", ".join(f"{field} = {json.dumps(approved[field])}" for field in APPROVAL_FIELDS)
+        lines.append(f"approved = {{ {inline} }}")
     lines.append(f"captured = {json.dumps(reference['captured'])}")
     if registered and registered.get("note"):
         lines.append(f"note = {json.dumps(registered['note'])}")
@@ -858,6 +903,25 @@ def declaration_findings(
             findings.append(f"{name}: version {old['version']} -> {entry['version']}; one declared change is one version")
         if entry["evidence"] != old["evidence"] and not bumped:
             findings.append(f"{name}: evidence {old['evidence']} -> {entry['evidence']} without a version bump")
+        # An approval is part of the record, like a version: it is well formed, its report exists,
+        # and it is neither removed nor added without the bump it records.
+        approval = entry.get("approved")
+        old_approval = old.get("approved")
+        problem = approval_problem(entry)
+        if problem:
+            findings.append(f"{name}: {problem}")
+        if old_approval is not None and approval is None:
+            findings.append(
+                f"{name}: removed the approval recorded at version {entry['version']}; an approval "
+                "is part of the record, like a version"
+            )
+        if approval is not None and old_approval is None and not bumped:
+            findings.append(
+                f"{name}: approved at version {entry['version']} without a version bump; an "
+                "approval records the bump it lets land"
+            )
+        if approval is not None and problem is None and read_head(approval["report"]) is None:
+            findings.append(f"{name}: approved.report {approval['report']} does not exist")
         # The fingerprint is the bits: a reference moved to another path with the same bits is a
         # rename, which needs no bump and is no declared change. A first capture fills an
         # uncaptured entry and is not an arithmetic change; removing one is refused.
@@ -893,11 +957,23 @@ def declaration_findings(
             if prerequisite in base_missing or prerequisite in head_missing
         ]
         if gating_missing:
-            findings.append(
-                f"{name}: version {entry['version']} declares an arithmetic change, but "
-                f"prerequisites {gating_missing} are not in place "
-                "(docs/NUMERICS.md §5); until they are, the gate is bit-exact"
-            )
+            # The approval path (docs/NUMERICS.md §5): an entry may carry the owner's recorded
+            # decision instead, and its report is what this change adds. It replaces only these
+            # three global prerequisites; the declared change, the entry's own report and the
+            # per-model anchor rules below still apply.
+            if approval is None or problem is not None or read_head(approval["report"]) is None:
+                findings.append(
+                    f"{name}: version {entry['version']} declares an arithmetic change, but "
+                    f"prerequisites {gating_missing} are not in place "
+                    "(docs/NUMERICS.md §5); until they are, the gate is bit-exact, or record the "
+                    "owner's approval as decision, date and report beside the entry"
+                )
+            elif changed.get(approval["report"]) not in ("A", "M"):
+                findings.append(
+                    f"{name}: version {entry['version']} would land under the approval recorded at "
+                    f"version {old['version']}, but its report {approval['report']} is not new or "
+                    "changed in this change; an approval names the report that justifies its bump"
+                )
         # The anchor is per model (docs/NUMERICS.md §4): this entry is judged against its own
         # model's frozen anchor and the teacher-forced capture made from it. A text reference has
         # no token ids to force, so it can neither be anchored nor bump; that is DeepSeek's
@@ -2540,7 +2616,13 @@ def synthetic_registry(entries: list[dict], prerequisites: bool) -> dict:
     }
 
 
-def synthetic_entry(version: int, reference: dict, path: str = "references/q.json", report: str | None = None) -> dict:
+def synthetic_entry(
+    version: int,
+    reference: dict,
+    path: str = "references/q.json",
+    report: str | None = None,
+    approved: dict | None = None,
+) -> dict:
     entry = {
         "model": "m",
         "world": 4,
@@ -2555,6 +2637,8 @@ def synthetic_entry(version: int, reference: dict, path: str = "references/q.jso
     }
     if report:
         entry["report"] = report
+    if approved:
+        entry["approved"] = approved
     return entry
 
 
@@ -2673,6 +2757,151 @@ def self_test() -> int:
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {'refused' if findings else 'passed'}")
         for finding in findings:
             print(f"       {finding}")
+
+    # The approval path (docs/NUMERICS.md section 5): the same bump a missing global prerequisite
+    # refuses passes when the head entry records the owner's approval of this change, and stays
+    # refused when the approval is not a usable record. The per-model anchor stays present.
+    approval_report = "docs/numerics/m/approval.md"
+    approval = {
+        "decision": "The owner's recorded decision for this change",
+        "date": "2026-11-18",
+        "report": approval_report,
+    }
+    approved = dict(synthetic_entry(2, flipped, report=report), approved=approval)
+
+    def approval_case(
+        name: str,
+        base_entry: dict,
+        head_entry: dict,
+        head_reference: dict,
+        changed: dict,
+        extra: dict,
+        refused: bool,
+        anchored: bool = True,
+        base_reference: dict | None = None,
+    ) -> None:
+        nonlocal failed
+        base = synthetic_registry([base_entry], anchored)
+        head = synthetic_registry([head_entry], anchored)
+        for prerequisite in GATING_PREREQUISITES:
+            base["prerequisites"][prerequisite] = False
+            head["prerequisites"][prerequisite] = False
+        findings = declaration_findings(
+            base,
+            head,
+            files(base_reference or old, {report: b"old", approval_report: b"old"}),
+            files(head_reference, extra),
+            changed,
+        )
+        ok = bool(findings) == refused
+        failed += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} {name}: {'refused' if findings else 'passed'}")
+        for finding in findings:
+            print(f"       {finding}")
+
+
+    # A bump that a missing global prerequisite refuses, carried by the approval instead.
+    approval_case(
+        "a declared change under the owner's approval, prerequisites missing",
+        synthetic_entry(1, old),
+        approved,
+        flipped,
+        {path: "M", report: "A", approval_report: "A"},
+        {report: b"x", approval_report: b"approved"},
+        False,
+    )
+    approval_case(
+        "the same change with no approval is refused",
+        synthetic_entry(1, old),
+        synthetic_entry(2, flipped, report=report),
+        flipped,
+        {path: "M", report: "A"},
+        {report: b"x"},
+        True,
+    )
+    approval_case(
+        "an approval with an empty decision",
+        synthetic_entry(1, old),
+        dict(approved, approved=dict(approval, decision="   ")),
+        flipped,
+        {path: "M", report: "A", approval_report: "A"},
+        {report: b"x", approval_report: b"approved"},
+        True,
+    )
+    approval_case(
+        "an approval with an empty date",
+        synthetic_entry(1, old),
+        dict(approved, approved=dict(approval, date="")),
+        flipped,
+        {path: "M", report: "A", approval_report: "A"},
+        {report: b"x", approval_report: b"approved"},
+        True,
+    )
+    approval_case(
+        "an approval whose report does not exist",
+        synthetic_entry(1, old),
+        approved,
+        flipped,
+        {path: "M", report: "A", approval_report: "A"},
+        {report: b"x"},
+        True,
+    )
+    approval_case(
+        "an approval whose report is not new in this change",
+        synthetic_entry(1, old),
+        approved,
+        flipped,
+        {path: "M", report: "A"},
+        {report: b"x", approval_report: b"old"},
+        True,
+    )
+    approval_case(
+        "an approved bump that changes nothing",
+        synthetic_entry(1, old),
+        dict(synthetic_entry(2, old, report=report), approved=approval),
+        old,
+        {path: "M", report: "A", approval_report: "A"},
+        {report: b"x", approval_report: b"approved"},
+        True,
+    )
+    approval_case(
+        "an approved bump without its version report",
+        synthetic_entry(1, old),
+        dict(synthetic_entry(2, flipped), approved=approval),
+        flipped,
+        {path: "M", approval_report: "A"},
+        {approval_report: b"approved"},
+        True,
+    )
+    approval_case(
+        "an approval on a model with no anchor",
+        synthetic_entry(1, old),
+        approved,
+        flipped,
+        {path: "M", report: "A", approval_report: "A"},
+        {report: b"x", approval_report: b"approved"},
+        True,
+        anchored=False,
+    )
+    approval_case(
+        "a removed approval",
+        dict(synthetic_entry(2, flipped, report=report), approved=approval),
+        synthetic_entry(2, flipped, report=report),
+        flipped,
+        {},
+        {report: b"x", approval_report: b"approved"},
+        True,
+        base_reference=flipped,
+    )
+    approval_case(
+        "an approval added without a version bump",
+        synthetic_entry(1, old),
+        dict(synthetic_entry(1, old), approved=approval),
+        old,
+        {approval_report: "A"},
+        {approval_report: b"approved"},
+        True,
+    )
 
     # Model "m"'s arm profile and the serving side's neutral list, against its one registered
     # configuration.

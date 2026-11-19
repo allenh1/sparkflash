@@ -50,7 +50,8 @@ Defaults:
 - A change that reduces precision is **opt-in only**, as a named numerics profile, with its
   measured deltas published.
 - The default arithmetic changes only by an explicit maintainer decision recorded in
-  [DECISIONS.md](DECISIONS.md), never automatically because a bar passed.
+  [DECISIONS.md](DECISIONS.md), never automatically because a bar passed. One bump may record that
+  decision as its `approved` block in the registry (§5).
 - An unknown `--numerics` value is refused. The one profile today is `reference`.
 - DeepSeek production does not change arithmetic until it has been measured under this policy.
 
@@ -129,6 +130,17 @@ not yet captured: the binary reports it `unregistered`, and `check` refuses with
 captured yet" rather than comparing. A first capture fills both in; from then on a changed capture
 is a declared change.
 
+An entry may also carry the owner's approval of one declared change, as a nested table:
+
+```toml
+approved = { decision = "tensor-core decode is an approved arithmetic change", date = "2026-11-18", report = "docs/numerics/qwen38/v2-approval.md" }
+```
+
+The approval replaces only the three global prerequisites (§5). The declared change, the entry's own
+`report` and the per-model anchor rule still apply. It is part of the record, like a version: the
+declaration check refuses its removal, and refuses an empty `decision` or `date`, a `report` that
+does not exist, and an approved bump that changes nothing.
+
 `[[retired]]` keeps a removed configuration's last version, so removing and re-adding one cannot
 reset it. A reference's `server` card is what the capturing binary reported, and it is outside the
 fingerprint: the registry can name a capture's fingerprint only after the capture exists, so a
@@ -180,8 +192,14 @@ the push's previous tip, or the merge base with `main`). It fails:
   fingerprint is a rename, which needs no bump);
 - a bump by more than one, or a version that went down;
 - a bump while a global prerequisite below (`declaration_check`, `coverage`, `monitors`) is false
-  at the base or at the head, or while the bumping configuration's own model has no `[[anchor]]`
-  or no committed capture teacher-forced from it;
+  at the base or at the head and the entry carries no usable `approved` record, or while the
+  bumping configuration's own model has no `[[anchor]]` or no committed capture teacher-forced
+  from it (an approval does not replace the per-model rule);
+- an `approved` record that is not a table, whose `decision` or `date` is empty, whose `date` is
+  not `YYYY-MM-DD`, or whose `report` is not under `docs/numerics/`;
+- an approved bump whose report does not exist, is not new or changed in this change, or that
+  declares no change;
+- an approval removed from an entry that carried one, or added without the bump it records;
 - a bump on `text` evidence, which has no token ids to teacher-force;
 - a bump without a new report;
 - any change to an anchor, its removal, or a change to its file;
@@ -213,16 +231,27 @@ kernel or a default set in Rust, is the bit gate's to catch.
 
 No version may be bumped, which is to say no arithmetic change may land, until the three global
 prerequisites are true in the registry's `[prerequisites]` **and** the bumping configuration's own
-model has a frozen anchor and a teacher-forced comparison:
+model has a frozen anchor and a teacher-forced comparison — **or** the entry carries an `approved`
+record, the owner's decision that one declared change is expected, which replaces the three global
+flags but nothing else:
 
 | Prerequisite | State |
 | :-- | :-- |
-| `anchor`: the frozen anchor and the teacher-forced comparison | per model. Qwen3.8 and GLM-5.3 have a `[[anchor]]` and a committed capture teacher-forced from it; Inkling-2 and Dory1.0 do not, so their configurations cannot bump until they are anchored; DeepSeek is exempt (its device path serves no logprobs, so a text reference has no token ids and cannot teacher-force), and a text-evidence change is refused rather than excused. The aggregate flag is **false** because not every `logprobs` model is anchored; `scripts/numerics.py ci` prints the covered, exempt and uncovered models, and refuses a true flag whose coverage is incomplete. The flag reports coverage; it does not gate a model that has its own anchor. |
+| `anchor`: the frozen anchor and the teacher-forced comparison | per model. Qwen3.8, GLM-5.3 and Dory1.0 have a `[[anchor]]` and a committed capture teacher-forced from it; Inkling-2 does not, so its configuration cannot bump until it is anchored; DeepSeek is exempt (its device path serves no logprobs, so a text reference has no token ids and cannot teacher-force), and a text-evidence change is refused rather than excused. The aggregate flag is **false** because not every `logprobs` model is anchored; `scripts/numerics.py ci` prints the covered, exempt and uncovered models, and refuses a true flag whose coverage is incomplete. The flag reports coverage; it does not gate a model that has its own anchor. |
 | `declaration_check`: the CI check above | **done** |
 | `coverage`: inputs that reach every routed expert of every layer, with hit counts | **implemented**, no dump committed: `coverage` judges one, `coverage-gaps` reports what a partial one misses, and `coverage-sweep` measures a corpus and selects the next suite; the flag stays false until a real dump is in the repository |
 | `monitors`: per-layer and per-expert relative error against the reference | **implemented**, no dump committed: the `monitors` command below compares two, and the flag stays false until a real pair is in the repository |
 
-Until then the gate is exactly the bit gate. The per-model anchor gate is enforced by
+An `approved` record accepts that one bump when its `decision` is a non-empty one line, its
+`date` is the day the decision was taken, and its `report` exists and is new or changed in the same
+diff. The declared change (a changed fingerprint), the entry's own `report` and the per-model anchor
+and teacher-forced comparison still apply, so a model with no anchor cannot bump under an approval.
+The record stays with the entry afterwards and its removal is refused. This is how a deliberate
+arithmetic change whose output shift the owner has accepted lands while `coverage` and `monitors`
+are still false. A defect is still a defect: the approval says a shift is expected, not that any
+output is acceptable.
+
+Otherwise the gate is exactly the bit gate. The per-model anchor gate is enforced by
 `scripts/numerics.py ci`: a bump whose model has no `[[anchor]]`, whose anchor has no committed
 teacher-forced capture, or whose evidence is `text` is refused with the model named, while a
 model that has its own anchor is not blocked by another model's missing one.

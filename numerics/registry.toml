@@ -23,6 +23,16 @@
 # bump, or whose version bumped without a change. The binary embeds this file and reports the
 # entry it serves at boot and on /v1/models.
 #
+# A bump usually waits for the [prerequisites] below. The owner may instead record an approval
+# beside the entry, which replaces only those three global prerequisites for that one bump:
+#
+#     approved = { decision = "<one line>", date = "YYYY-MM-DD", report = "docs/numerics/..." }
+#
+# The report must exist and be new or changed in the bump's own diff, and the decision must be
+# non-empty. The declared change, the entry's own report and the model's anchor still apply, so a
+# model with no anchor cannot bump under an approval. An approval is part of the record, like a
+# version: ci refuses its removal, an empty decision or date, and a bump that changes nothing.
+#
 # [[anchor]] entries are the frozen quality references a declared change is measured against
 # (docs/NUMERICS.md §4). They are never edited or removed. There is one per model: a bump is
 # looked up against the bumping configuration's own anchor, not a global flag.

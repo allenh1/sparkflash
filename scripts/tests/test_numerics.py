@@ -673,6 +673,169 @@ class DeclarationTests(unittest.TestCase):
                 self.assertEqual(NUMERICS.run_ci(base), 0, out.getvalue())
 
 
+class ApprovalTests(unittest.TestCase):
+    """The approved path: an owner's recorded decision carries one bump past the global gates."""
+
+    def setUp(self):
+        self.old = NUMERICS.synthetic_reference([5, 6], -0.25)
+        self.flipped = NUMERICS.synthetic_reference([5, 6], next_ulp(-0.25))
+        self.path = "numerics/references/q.json"
+        self.report = "docs/numerics/m/2.md"
+        self.approval_report = "docs/numerics/m/approval.md"
+        self.approval = {
+            "decision": "The owner's recorded decision for this change",
+            "date": "2026-11-18",
+            "report": self.approval_report,
+        }
+        self.changed = {self.path: "M", self.report: "A", self.approval_report: "A"}
+        self.extra = {self.report: b"x", self.approval_report: b"approved\n"}
+
+    def approved_entry(self, **overrides) -> dict:
+        version = overrides.pop("version", 2)
+        reference = overrides.pop("reference", self.flipped)
+        report = overrides.pop("report", self.report)
+        approval = overrides.pop("approval", self.approval)
+        assert not overrides, overrides
+        entry = NUMERICS.synthetic_entry(version, reference, report=report)
+        entry["approved"] = dict(approval)
+        return entry
+
+    def judge(
+        self,
+        head_entry: dict,
+        changed: dict,
+        extra: dict | None = None,
+        base_entry: dict | None = None,
+        anchored: bool = True,
+        head_reference: dict | None = None,
+        base_reference: dict | None = None,
+    ) -> list:
+        base = NUMERICS.synthetic_registry(
+            [base_entry or NUMERICS.synthetic_entry(1, self.old)], anchored
+        )
+        head = NUMERICS.synthetic_registry([head_entry], anchored)
+        for prerequisite in NUMERICS.GATING_PREREQUISITES:
+            base["prerequisites"][prerequisite] = False
+            head["prerequisites"][prerequisite] = False
+        anchor = NUMERICS.render_reference(NUMERICS.synthetic_reference([9], -0.5)).encode()
+        base_files = {
+            self.path: NUMERICS.render_reference(base_reference or self.old).encode(),
+            NUMERICS.ANCHOR_PATH: anchor,
+            self.report: b"old",
+            self.approval_report: b"old",
+        }
+        head_files = {
+            self.path: NUMERICS.render_reference(head_reference or self.flipped).encode(),
+            NUMERICS.ANCHOR_PATH: anchor,
+            self.report: b"x",
+            **(extra or {}),
+        }
+        return NUMERICS.declaration_findings(base, head, base_files.get, head_files.get, changed)
+
+    def test_an_approval_carries_a_bump_past_the_global_prerequisites(self):
+        self.assertEqual(self.judge(self.approved_entry(), self.changed, self.extra), [])
+
+    def test_without_the_approval_the_same_bump_is_refused_by_the_gate(self):
+        entry = NUMERICS.synthetic_entry(2, self.flipped, report=self.report)
+        findings = self.judge(entry, {self.path: "M", self.report: "A"})
+        self.assertTrue(any("prerequisites" in finding for finding in findings), findings)
+
+    def test_an_approval_with_an_empty_decision_or_date_is_refused(self):
+        for field in ("decision", "date"):
+            approval = dict(self.approval, **{field: "  "})
+            findings = self.judge(self.approved_entry(approval=approval), self.changed, self.extra)
+            self.assertTrue(
+                any(f"approved.{field} is empty" in finding for finding in findings), findings
+            )
+
+    def test_an_approval_with_a_date_that_is_not_yyyy_mm_dd_is_refused(self):
+        approval = dict(self.approval, date="18-11-2026")
+        findings = self.judge(self.approved_entry(approval=approval), self.changed, self.extra)
+        self.assertTrue(any("YYYY-MM-DD" in finding for finding in findings), findings)
+
+    def test_an_approval_that_is_not_a_table_is_refused(self):
+        entry = dict(self.approved_entry(), approved="yes")
+        findings = self.judge(entry, self.changed, self.extra)
+        self.assertTrue(any("approved is not a table" in finding for finding in findings), findings)
+
+    def test_an_approval_whose_report_does_not_exist_is_refused(self):
+        findings = self.judge(self.approved_entry(), self.changed, {self.report: b"x"})
+        self.assertTrue(
+            any("approved.report" in finding and "does not exist" in finding for finding in findings),
+            findings,
+        )
+
+    def test_an_approval_whose_report_is_not_new_or_changed_is_refused(self):
+        findings = self.judge(
+            self.approved_entry(),
+            {self.path: "M", self.report: "A"},
+            {self.report: b"x", self.approval_report: b"old"},
+        )
+        self.assertTrue(any("not new or changed" in finding for finding in findings), findings)
+
+    def test_an_approval_on_a_bump_that_changes_nothing_is_refused(self):
+        entry = self.approved_entry(reference=self.old)
+        findings = self.judge(entry, self.changed, self.extra, head_reference=self.old)
+        self.assertTrue(any("declared non-change" in finding for finding in findings), findings)
+
+    def test_an_approved_bump_still_names_its_version_report(self):
+        entry = self.approved_entry(report=None)
+        findings = self.judge(entry, {self.path: "M", self.approval_report: "A"}, {self.approval_report: b"x"})
+        self.assertTrue(any("names no report" in finding for finding in findings), findings)
+
+    def test_an_approval_on_a_model_with_no_anchor_is_refused(self):
+        findings = self.judge(self.approved_entry(), self.changed, self.extra, anchored=False)
+        self.assertTrue(any("has no [[anchor]]" in finding for finding in findings), findings)
+
+    def test_removing_an_approval_is_refused(self):
+        base_entry = self.approved_entry()
+        head_entry = NUMERICS.synthetic_entry(2, self.flipped, report=self.report)
+        findings = self.judge(
+            head_entry,
+            {},
+            {self.approval_report: b"approved\n"},
+            base_entry=base_entry,
+            base_reference=self.flipped,
+        )
+        self.assertTrue(any("removed the approval" in finding for finding in findings), findings)
+
+    def test_an_approval_added_without_a_version_bump_is_refused(self):
+        entry = dict(NUMERICS.synthetic_entry(1, self.old), approved=dict(self.approval))
+        findings = self.judge(
+            entry,
+            {self.approval_report: "A"},
+            {self.approval_report: b"approved\n"},
+            head_reference=self.old,
+        )
+        self.assertTrue(any("without a version bump" in finding for finding in findings), findings)
+
+    def test_a_recapture_snippet_keeps_the_approval(self):
+        reference = dict(self.flipped, captured="2026-11-19")
+        snippet = NUMERICS.entry_snippet(reference, "references/q.json", self.approved_entry())
+        self.assertIn('approved = { decision = "', snippet)
+        self.assertIn(self.approval_report, snippet)
+
+    def test_the_registry_parses_a_nested_approval_table(self):
+        text = TOY_REGISTRY + """
+[[config]]
+model = "m"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 2
+evidence = "logprobs"
+reference = "references/q.json"
+fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+report = "docs/numerics/m/2.md"
+captured = "2026-11-03"
+approved = { decision = "The owner's recorded decision", date = "2026-11-18", report = "docs/numerics/m/approval.md" }
+"""
+        registry = NUMERICS.parse_registry(text, "toy")
+        self.assertEqual(registry["config"][0]["approved"]["date"], "2026-11-18")
+        self.assertIsNone(NUMERICS.approval_problem(registry["config"][0]))
+
+
 def synthetic_layout(model: str = MODEL, spans: list | None = None) -> dict:
     return {
         "schema": NUMERICS.LAYOUT_SCHEMA,
