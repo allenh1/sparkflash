@@ -764,6 +764,14 @@ struct Kernels {
     gemv4: Entry,
     /// The same two walks over packed matrices ([packed]), and the form's packer and unpacker.
     packed: sparkflash_ops::packed::Kernels,
+    /// The wide tile's few-row BF16 body (q4p_dense_rows): a decode head's row is the prompt
+    /// tile's, and the catalogued body for the precision the head stores.
+    dense_rows: Entry,
+    /// The grouped experts' few-row bodies, the tile's chain over one to eight item rows:
+    /// Inkling's interleaved w13 and softcapped SwiGLU (q4p_moe_rows_gate_up_capped) and the
+    /// same passes over its MXFP8 layers (q4p_moe_rows_gate_up_capped_mx8 / _down_mx8).
+    moe_rows_gate_up: Entry,
+    moe_rows_down: Entry,
     block_residual: Entry,
     /// The residual's two-launch form: every stack row's statistics in a block of its own,
     /// then the softmax and the mix.
@@ -927,6 +935,9 @@ impl Kernels {
         Ok(Self {
             wide: Entry { kernel: wide },
             split_bf16: load(experts, "q4p_split_bf16")?,
+            dense_rows: load(experts, "q4p_dense_rows")?,
+            moe_rows_gate_up: load(experts, "q4p_moe_rows_gate_up_capped")?,
+            moe_rows_down: load(experts, "q4p_moe_rows_down")?,
             moe_gate_up: load(
                 experts,
                 planes.pick("q4p_moe_gate_up_capped", "q4p_moe_gate_up_capped_head"),
@@ -1267,6 +1278,63 @@ impl Shared {
             (gemv_grid(rows), 1, 1),
             (TOKEN_BLOCK, 1, 1),
             &[weight.0, input.0, out.0, rows as u64, columns as u64, 1],
+        )
+    }
+
+    /// One dense BF16 projection of `batch` rows through `q4p_dense_rows`, the wide tile's
+    /// few-row body: the row is `glm_prefill_bf16_wide`'s, the tile Inkling's prompt walk runs.
+    /// The body takes the matrix's packed copy where it has one. Only the shapes the body covers
+    /// take it (whole eight-column writes and a whole 32-column K run); everything else keeps
+    /// the row GEMV.
+    fn dense_rows(
+        &self,
+        weight: Deviceptr,
+        input: Deviceptr,
+        out: Deviceptr,
+        width: usize,
+        inner: usize,
+        batch: usize,
+    ) -> Result<(), String> {
+        if batch == 0 || batch > BATCH_ROWS {
+            return Err(format!(
+                "the few-row body carries 1 to {BATCH_ROWS} rows, not {batch}"
+            ));
+        }
+        if !width.is_multiple_of(8) || !inner.is_multiple_of(32) {
+            return Err(format!(
+                "the few-row body takes whole eight-column writes and a 32-column K run, and \
+                 this projection is {width} x {inner}"
+            ));
+        }
+        let packed = self
+            .dense
+            .get(weight)
+            .filter(|copy| copy.admits(batch, inner, input).is_ok());
+        let [packed_rows, packed_offsets, packed_entries] =
+            packed.map_or([0u64; 3], |copy| copy.planes());
+        let packed_row_bytes = packed.map_or(0usize, |copy| copy.row_bytes());
+        let mut args = [0u64; 61];
+        args[0] = input.0;
+        args[1] = inner as u64;
+        args[2] = batch as u64;
+        args[3] = out.0;
+        args[4] = 0;
+        args[5] = u64::from(1.0f32.to_bits());
+        args[6] = 1;
+        args[7..12].copy_from_slice(&[weight.0, out.0, out.0, width as u64, 1]);
+        args[27] = width.div_ceil(32) as u64;
+        args[28] = 0;
+        args[45..49].copy_from_slice(&[
+            packed_rows,
+            packed_offsets,
+            packed_entries,
+            packed_row_bytes as u64,
+        ]);
+        self.launch(
+            self.kernels.dense_rows,
+            (width.div_ceil(32) as u32, batch.div_ceil(16) as u32, 1),
+            (128, 1, 1),
+            &args,
         )
     }
 
@@ -3282,10 +3350,12 @@ fn expert_scales(
     cuda: &Cuda,
     plan: &InklingDevicePlan,
     weights: &Weights,
-    mxfp8: Mxfp8Walk,
+    _mxfp8: Mxfp8Walk,
 ) -> Result<ExpertTables, String> {
-    let mma_mx8 =
-        |layer: &LayerSchedule| mxfp8 == Mxfp8Walk::Mma && layer.experts == ExpertBody::MxFp8;
+    // Every MXFP8 layer's table is built, whatever prompt walk is configured: the decode band
+    // takes the few-row MXFP8 body at one to eight rows, and it reads the same table the tensor
+    // walk does.
+    let mma_mx8 = |layer: &LayerSchedule| layer.experts == ExpertBody::MxFp8;
     let (_, owned) = plan.expert_range();
     for layer in plan.layers().iter().filter(|layer| mma_mx8(layer)) {
         admit_mxfp8_scales(cuda, layer, weights)?;
@@ -5742,13 +5812,27 @@ impl InklingDeviceSession {
                 (Op::Gemv, Target::Project(Projection::Head)) => {
                     self.rms(&shared, "final_norm", self.state.scratch.final_row, hidden)?;
                     let weight = self.weight(step.weights[0]);
-                    run(shared.gemv(
+                    // The head's one row takes the wide tile's few-row body (q4p_dense_rows),
+                    // so a decode row is the prompt tile's row; a shape it does not cover keeps
+                    // the row GEMV.
+                    let rows = plan.rank_vocab();
+                    match shared.dense_rows(
                         weight,
                         self.state.scratch.final_row,
                         self.state.scratch.logits,
-                        plan.rank_vocab(),
+                        rows,
                         hidden,
-                    ))?;
+                        1,
+                    ) {
+                        Ok(()) => {}
+                        Err(_) => run(shared.gemv(
+                            weight,
+                            self.state.scratch.final_row,
+                            self.state.scratch.logits,
+                            rows,
+                            hidden,
+                        ))?,
+                    }
                 }
                 (Op::Collective(Collective::LogitSlice), _) => {
                     exchange_gather(
