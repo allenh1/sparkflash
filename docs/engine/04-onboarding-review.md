@@ -1377,6 +1377,257 @@ four boot fixes carried, or a capture that records its commit in the first place
 The lesson is worth a mechanism: **a capture's server card has to name the build it came from**.
 Without that field, a frozen reference can only say that bits moved, never which commit moved
 them, and every bisect pays for the same information twice.
+### Inkling on the tick engine: three widths, one verify width, and the group's images
+
+Commits `eddb478f` (the single process) and `d22208e8` (the group). Inkling had no
+`enable_fusion`: its device arm opened a session a sequence (`InklingDeviceBackend::open_session`,
+a `RuntimeSession` over a `Runtime`) and its group in
+`crates/sparkflash-model-inkling2/src/group.rs` (`Fusion::group` over
+`GroupLanes<Runtime<InklingWalk>, InklingWire>`). Both now serve on the tick engine. The walk, the
+drafter, the kernels and the layout are untouched: the engine chooses *when* a chunk or a step
+runs, and the runtime executes the same rows with the same shape.
+
+**Single process.** A session opens on a `TickServe` over `InklingWalk`.
+`InklingDeviceBackend::enable_fusion(capacity)` opens one engine for `capacity` lanes; a backend
+that does not call it starts a one-lane engine for each session, which is the sequence memory a
+`RuntimeSession` held before the move, so the batch runner (`sparkflash inkling-tp4`) and the
+device tests keep their shape. No in-tree caller passes `enable_fusion` a concurrency, because
+the CLI serves Inkling at TP=1 through its f32 host reference; the device arm's single process is
+the batch runner and the tests, and each of them opens a session at a time.
+
+**The chunk, exactly.** The arm's three widths are `DEFAULT_PREFILL_CHUNK` 4,096,
+`LONG_PREFILL_CHUNK` 8,192 and `MAX_PREFILL_CHUNK` 65,535. Its widest width
+(`Shared::prefill_chunk`) is what the sliding rings and the exchange slots are sized for, and a
+*pass* has always been the runtime's `ChunkPolicy` over that width: every one of the three is an
+entry of `CHUNK_SIZES`, and a context or a switch that lowers the width is quantised to the
+largest documented size at or below it. `InklingWalk::limits` used to state the widest width and
+the runtime quantised it; it now states the quantised number, and `TickConfig::for_walk` reads
+that as `rows_max`, `chunk_rows`, `exact_tick_rows`, `busy_chunk`, `chunk_min` and
+`bulk_cap`. Nothing else moved, so the pass is the number it was:
+
+| configuration | widest width (`Shared::prefill_chunk`) | a prompt pass, before and after |
+| :-- | :-- | :-- |
+| the switch unset, context >= 8,192 (the released default: 262,144 or 1,048,576) | 8,192 | **8,192** |
+| the switch unset, context 4,096..8,191 | the context | the documented size at or below it: **4,096** (5,000 is 4,096) |
+| the switch unset, context < 4,096 | the context | the documented size at or below it (1,000 is **256**) |
+| `SPARKFLASH_INKLING_PREFILL_CHUNK=4096` | 4,096 | **4,096** |
+| `SPARKFLASH_INKLING_PREFILL_CHUNK=65535` (the whole-context pass) | 65,535 | **65,535** |
+
+Inside a pass the arm's own width rule still cuts the rows: `walk_bulk` splits every
+`Pass::Bulk` at the positions remaining (`ChunkWidths::next`: 4,096 rows until fewer than
+16,384 remain, 8,192 above), so a 20,000-row prompt at the default is the engine's parts
+8,192 + 8,192 + 3,616 and the walk's passes 8,192 + 4,096 + 4,096 + 3,616 - the same total split
+the arm's prompt loop made before, because the rule depends only on the positions remaining. That
+is what `the_runtime_chunks_do_not_move_the_arms_prompt_boundaries` holds, now with the policy's
+pass as the part size.
+
+| | Before (`RuntimeSession` / `Fusion::group`) | After (`TickServe` / `TickGroup`) |
+| :-- | :-- | :-- |
+| prompt part | `ChunkPolicy` rows = **8,192** by default | `exact_tick_rows` = `busy_chunk` = `chunk_min` = `bulk_cap` = `chunk_rows` = **8,192** |
+| a 20,000-row prompt | parts 8,192 + 8,192 + 3,616 | the same |
+| prompt rows at the whole-context switch | 65,535 + the tail | 65,535 + the tail |
+| verify width | `Limits::members` = `BATCH_ROWS` = **8** | `TickConfig::members` = **8** |
+| a member's verify rows | 1 + the depth `SPARKFLASH_INKLING_DRAFT_DEPTH` picks, **7** by default | `k = drafter.budget(1)` = min(7, 8 - 1) = **7** |
+| a joint round's rows | `share_rows` over `budget(members)` = `(members x depth).min(8 - members)` | the same `budget` and floor, through the engine's `Shared` plan |
+| joint rounds | the runtime's `JOINT_ROUNDS` | `for_runtime` reads the same switch into `shared_rounds` |
+| drafter | `InklingDrafter`: the DSpark stage or prompt lookup, and `Draft::Held` when the switch is off | unchanged |
+| the draft floor | `Drafter::floor()` = 0.0 | `share_floor` = 0.0 |
+| decoder-layer skip | none; only DeepSeek has those layers | `decoder_skip = false` |
+| row exchange | a fused group's | `exchange = false` at TP=1, `true` in a group (`with_group`) |
+| a group's lanes | `GroupOptions::lanes` = `--concurrency` when `--fuse-batch` is given, else 1 | the same |
+
+Neither path that could move the boundary does: `bulk_rows` returns the chunk and then its tail
+with `bulk_cap = chunk`, and the exact tick is `exact_tick_rows = chunk`, so a group's bulk
+chunks and a single process's exact ones name the same rows. A CPU test pins it on a 20,000-row
+prompt (8,192, 8,192, 3,616) and on a 100,000-row one at the 65,535 switch (65,535, 34,465), on
+both the exact path and a group's bulk path.
+
+**What the group carries.** The tick group's wire with Inkling's widths: `LaneRequest` with the
+start `start_prompt_slot` chose and the prompt's image spans, `LaneRows` for every prompt chunk
+rank 0's tick decided, `LaneStepMode` with the member order and `Plain`/`Round { joint }`,
+`LaneGiveBack`, `LaneRelease` and `Error`. Rank 0 keeps every decision - `pick_lane`,
+`prefill_order`, `hold_prefill`, the chunk boundary, `decode_plan` and the tick-ahead plan - and
+a worker checks only that the lane is in its pool, that the request's start is the one its own
+`start_prompt_slot` reaches, that the rows fit the prompt left and that the step's members are the
+frame's. A worker runs `Runtime::run_part_rows` with the frame's row count and
+`step_mode_slots` with the frame's shape, so lane `n` is the same sequence on every rank and the
+collectives inside a verify line up.
+
+**Vision: the one configuration that stays on `Fusion`, and why.** The tick group's request frame
+does carry a prompt's image spans (`image_frames`), and
+`runtime.start_prompt_slot` encodes them through `InklingVision`: rank 0 runs the tower, every
+rank receives the rows through one group sum (`exchange_sum`). That sum is a collective. The tick
+group orders rank 0's `start_prompt_slot` *before* the request frame, because the frame carries
+the start it chose, so rank 0 would enter the sum before any worker had received the request and
+the group would deadlock on its first image. The fused group orders the frame first
+(`GroupLanes::begin_prompt` broadcasts, then runs rank 0's start), which is exactly why it serves
+images today. So:
+
+* a group whose rank 0 loaded the tower (the default when the checkpoint has one and
+  `SPARKFLASH_INKLING_VISION` is not `off`) keeps **`Fusion::group`**, unchanged;
+* a **text-only** group (`SPARKFLASH_INKLING_VISION=off`, or a checkpoint that describes no
+  tower) is the tick group, and `InklingWire::serves_images = false` refuses an image request
+  *before* any frame - a refusal, not a deadlock, and not a group that dies after the request
+  went out.
+
+`SPARKFLASH_INKLING_VISION` must be the same on every rank, like the rank files; a rank that
+chose the other engine refuses rank 0's frames by name rather than running a different row. The
+alternative - carrying the encode on the tick group - is a wire change (the request frame would
+have to precede rank 0's start and a start frame follow it), and it is not written here: no
+cluster was available to check it, and the fused group keeps the image path exactly as it was, so
+no image-bearing request runs on an unverified wire. The single process does carry images: at
+TP=1 `exchange_sum` returns without a collective (`world == 1`), so `TickSession::prefill_images`
+encodes on the engine thread and nothing waits.
+
+**CPU evidence.** `InklingWalk`'s generated checks now say `tick_engine() == true`, so
+`whole = chunked = token`, `alone = four`, `continued = cold`, `rewound = cold`,
+`drafted = plain`, `no unrecorded widening` and the TP leg drive the engine on the device host.
+The CPU tests added here are `the_generated_checks_drive_the_tick_engine`,
+`the_tick_config_is_the_inkling_profile` (8,192 pass rows, 8 members, `k` = 7, the arm's 0.0
+floor, a drafter present and `shared_rounds` following the runtime's own switch, no decoder skip,
+no exchange at TP=1), `the_tick_engine_hands_inkling_chunks_past_one_width` (20,000 rows as
+8,192 + 8,192 + 3,616 on the exact and the bulk path; 100,000 at the 65,535 switch),
+`the_tick_engine_keeps_inklings_joint_round` (three lanes, one `Verify` pass of three segments
+and at most 8 rows, the trace's `plan=shared`), `a_speculative_round_keeps_its_accepted_rows_only`
+(one lane, `Round { joint: false }` over the anchor and two drafts, the rejected token never
+reaching the history, `plan=spec`), and `a_text_only_group_refuses_an_image_before_any_frame`.
+The group's frames did not change, so `crates/sparkflash-runtime/tests/tick_engine_group.rs` is
+reused **unchanged**: its frame order and its start agreement test
+(`rank 0 starts the prompt at 4, this rank starts it at 3: the ranks are out of step`) are the
+runtime's property, which is what Inkling's group relies on.
+
+**Measured on this host (CPU; it has no GPU).**
+
+* `cargo test -p sparkflash-model-inkling2`: **125 passed, 0 failed, 7 ignored** across its
+  binaries (73 library tests including the six new CPU ones, then 4 + 4 + 8 + 16 + 2 + 8 + 10 in
+  the integration binaries; the 7 ignored are the generated checks, which boot the tiny
+  checkpoint on a device).
+* `cargo test -p sparkflash-runtime`: **91 passed, 0 failed, 8 ignored** (77 library tests, then
+  `sealed` 2, `tick_engine_drafter` 5, `tick_engine_group` 2, `tick_engine_trace` 2,
+  `tick_trace` 1, plus 2 doc-tests; the 8 ignored are the 7 conformance stubs and 1 doc-test).
+* `cargo test -p sparkflash-runtime -p sparkflash-model-inkling2`: 0 failed.
+* `cargo clippy -p sparkflash-runtime -p sparkflash-model-inkling2 --all-targets -- -D warnings`
+  and `cargo fmt --all -- --check`: clean at this tip.
+* `cargo test --workspace`: **4,326 passed, 0 failed, 81 ignored**, 220 test binaries, exit 0,
+  at `24389eb7` with this section's docs change on top (the tip's own tests included, so this is
+  the workspace's count and not this move's).
+
+**Unverified without a cluster.**
+
+* Inkling's device walk through the engine: the generated checks on the tiny checkpoint, then the
+  served gate.
+* The tiny checkpoint's own DSpark round through the engine: the CPU tests drive a shape walk, not
+  `InklingDeviceSession`, so the round's bits are the arm's existing claim, not a measurement.
+* The live trace on Inkling: `WallClock` readings, the per-tick flush and the rank-0 rule.
+* TP>1: no Inkling rank pair or group ran here. The claim that a text-only TP=4 group on the tick
+  group gives the same token ids as the pre-move `Fusion::group` build is the first thing the
+  window must measure, and so is the image-capable group's unchanged path.
+* Speed: no tokens/s, no step time, no time to first token. Nothing here says the tick engine is
+  as fast as the fused one, and the regression clause's A/B has not run.
+
+**This move is a schedule change: measure it against the same build's pre-move path.** Inkling's
+registered reference is stale - version 1 names `387647bc`, the branch serves `397907e6`, the
+first difference is at the first position, and the cause is not isolated (the section above). So
+no comparison in this window may use `387647bc` as the criterion: a difference against it says
+nothing about this move. The criterion is a **pre-move build of the same tree**:
+
+```sh
+# the frozen pre-move path: the commit this move's first commit follows
+git worktree add /tmp/inkling-pre eddb478f^
+(cd /tmp/inkling-pre && cargo build --release -p sparkflash-cli --features tp4-serve)
+cargo build --release -p sparkflash-cli --features tp4-serve   # the moved build, this tip
+```
+
+Pass criteria, in order:
+
+1. **The single process, on the device.** The arm's device tests boot the tiny checkpoint through
+   the engine and compare it with the host reference:
+   ```sh
+   cargo test -p sparkflash-model-inkling2 --test device -- --include-ignored --test-threads=1
+   ```
+   Pass: the same best token per step and the logits within the arm's `RELATIVE_TOLERANCE` of the
+   host reference, and `reusable_prefix()` = the prompt plus the tokens fed, as before.
+2. **The generated checks through the engine, then a served gate.**
+   ```sh
+   cargo test -p sparkflash-model-inkling2 --lib -- --include-ignored --test-threads=1
+   cargo test -p sparkflash-model-inkling2 --lib conformance:: -- --ignored --nocapture
+   scripts/onboard-gate.sh Inkling --url http://127.0.0.1:8000 --port 8000 --world 1 --apply
+   scripts/onboard-gate.sh Inkling --url http://127.0.0.1:8000 --port 8000 --world 4 --apply
+   ```
+   Pass: six PASS and one SKIP - `TP 1 = TP 2 = TP 4`, whose SKIP names the world its fixture
+   cannot boot (the Inkling fixture is one rank) - with no `NEEDS-FIXTURE` line.
+3. **Tokens against the pre-move build at the deployed world.** Build both, run the same fixed
+   prompts through each: greedy and sampled, **TP=1** (`sparkflash inkling-tp4` at world 1, or the
+   device test's session path) and **TP=4** (the text-only group, with
+   `SPARKFLASH_INKLING_VISION=off` on every rank), at **2K and 16K** prompt tokens, **one and
+   four** concurrent requests (the group's `--fuse-batch --concurrency 4`), several reps each,
+   alternating the launch order:
+   ```sh
+   SPARKFLASH_INKLING_VISION=off CONTEXT=32768 LANES=4 \
+     ./scripts/inkling-serve-group.sh launch     # each build in turn, alternating
+   ```
+   Pass: identical greedy token ids, and per request the same reported `cached_tokens`. A
+   difference is a regression, not a scheduling variance, because the move changes when a row
+   runs and not which row. Sampled runs need the same seed and temperature, which the group's
+   sampler frame carries whole.
+4. **The image path is unchanged.** With the tower loaded (no `SPARKFLASH_INKLING_VISION`), one
+   image prompt at TP=4 on both builds: both must take `Fusion::group` and answer the same token
+   ids. Pass: identical, and the boot line says "the fused group, images on". A text-only group
+   must refuse the same request before any frame ("this group serves text only").
+5. **The trace's chunk boundaries.** Only the tick engine writes a tick trace, so this is the new
+   build's evidence, not a diff:
+   ```sh
+   SPARKFLASH_INKLING_VISION=off SPARKFLASH_TICK_TRACE=/tmp/inkling-tp4.trace \
+     ./scripts/inkling-serve-group.sh launch   # rank 0's trace only; a worker writes nothing
+   ```
+   Pass: every `prefill` line's rows are 8,192 (4,096 with a smaller `CONTEXT`, 65,535 with the
+   switch) except a prompt's tail, each `LaneRows` frame carries exactly the chunk the trace
+   recorded, a `LaneRows` frame never carries a step, and no decode step holds more than 8
+   members. Above 8 lanes a decode batch is plain rows in groups of 8 (the named deviation
+   below), which the trace shows as `plan=plain`.
+6. **Verify shapes.** From the trace and the arm's counters: one `Round { joint: true }` for two
+   to eight lanes whose whole verify is at most `BATCH_ROWS` = 8 rows (members x (1 + depth),
+   drafted by the arm's own budget), `Round { joint: false }` for one lane, and no verify while
+   the drafter is off. With `JOINT_ROUNDS=off` the engine plans `Plain` (the named deviation
+   below), so that run is a separate A/B and not the default.
+7. **Speed, and this is what the window must measure first.** TP=1 at one request and at four
+   lanes, and TP=4 at one and four lanes: tokens/s, mean step time and time to first token, the
+   pre-move build against this one, alternated launches, several reps. Under the regression
+   clause, a slower Inkling returns to `RuntimeSession` (TP=1) and `Fusion::group` (TP>1): that
+   is a revert of `eddb478f` and `d22208e8`, and this section then records the number, the
+   workload and why.
+
+**Named deviations, so none is implied.**
+
+* **The tick order is the engine's.** Which lanes step together and when is the scheduler's; the
+  rows and the shapes are the arm's. A greedy token does not depend on when its chunk ran.
+* **`JOINT_ROUNDS=off` plans `Plain` on a drafting arm** (the earlier GLM deviation, unchanged
+  by this move): one plain token row a member in groups no wider than 8, where the fused runtime
+  ran one round a member. Inkling's held chain is not opened on that setting - the runtime's
+  plain branch runs no `open_round`, so no draft is proposed and thrown away - and the rows are
+  plain token rows, so the tokens are still the `drafted = plain` property's.
+* **More than eight decoding lanes are plain rows in groups of eight.** `BATCH_ROWS` is 8, so a
+  fusion group of 9 or more lanes `--fuse-batch --concurrency 9+` steps plain token rows in
+  groups of at most 8, where the fused runtime ran one joint round whose budget was 0 (every
+  member's anchor and no draft). The rows per member are one either way; the pass shape is not
+  the same, so that configuration is a separate A/B and the window's default group is 1 or 4
+  lanes.
+* **The vision configuration is the fused group** (above): that is the deviation the move makes
+  instead of a wire change, and it is named in the ledger row.
+* **The engine's pacing values are DeepSeek's**: `share = DecodeShare::new(0.5, 200_000.0)`,
+  `model = (23.0, 4.0, 23.0, 4.0, 2.3)` and `prefix_reuse_min_rows`, from
+  `TickConfig::for_walk`. They decide when a decoding lane takes a row during a long prompt, not
+  what a row computes; the round's own cost stays the arm's `ExpertUnionWall` through
+  `Drafter::wall`.
+* **The resume start is `resume`'s checkpoint**, never an arbitrary shared prefix (the earlier
+  deviation, unchanged): the engine picks the lane by its shared prefix and records the start
+  `start_prompt_slot` chose, and the group's frame carries that start and is checked.
+* **Adoption, lane growth, paired prompt chunks and preemption are still absent** (the earlier
+  deviation): `Pass::Paired` is unused, and a preempted prompt is served to its end.
+* **`enable_fusion` has no in-tree caller yet.** The CLI's TP=1 Inkling path is the f32 host
+  reference, so the shared multi-lane engine is the opener a device-arm HTTP serve would call;
+  the batch runner and the tests take the per-session one-lane engine, which is the path their
+  bits are captured on.
 
 ### Phase 6, step 6, first slice: the rank openers leave `serve.rs`
 
@@ -1504,7 +1755,6 @@ implement, `Tp4RankApi`, names `sparkflash_model_deepseek_v41::prompt_ranks::Mer
 lines, today in the Qwen crate and used by the GLM adapter) and `MergedPosition` move to
 `sparkflash-model`, the trait moves to `sparkflash-serve::tp4`, and then the two adapters follow
 the openers into their arms. That is the remaining ~490 lines of the plan's "about 900".
-
 
 ## Order and ownership
 
