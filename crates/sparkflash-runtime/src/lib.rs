@@ -64,6 +64,7 @@ pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
 pub use runtime::{Runtime, RuntimeSlot, ledger_for};
 pub use share::{BandWall, ExpertUnionWall, StepWall, share_rows};
 pub use walk::{
-    Absent, ComputeDeclaration, Drafter, HeadInput, HeadRow, Hidden, NoVision, OutputConstraint,
-    Pass, PassKind, PassMask, Segment, Segments, Vision, Walk, WalkCapabilities, WalkHook,
+    Absent, ComputeDeclaration, Draft, Drafter, HeadInput, HeadRow, Hidden, NoVision,
+    OutputConstraint, Pass, PassKind, PassMask, Segment, Segments, Vision, Walk, WalkCapabilities,
+    WalkHook,
 };

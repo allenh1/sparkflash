@@ -76,6 +76,8 @@ pub struct DenseWalk {
     layout: StateLayout,
     limits: Limits,
     scratch: Mutex<Scratch>,
+    /// The arm publishes no draft head.
+    drafter: Absent<&'static str>,
 }
 
 impl DenseWalk {
@@ -94,6 +96,7 @@ impl DenseWalk {
             layout,
             limits,
             scratch: Mutex::new(scratch),
+            drafter: Absent("dense has no draft head"),
         })
     }
 
@@ -229,6 +232,10 @@ impl Walk for DenseWalk {
         self.limits
     }
 
+    fn drafter(&self) -> &Self::Drafter {
+        &self.drafter
+    }
+
     fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
         seq.sampling = sampling;
         seq.sampler.reset();
@@ -242,6 +249,7 @@ impl Walk for DenseWalk {
         let Pass {
             kind,
             constraint: _,
+            prompt_end: _,
             hook,
         } = pass;
         let lengths: Vec<usize> = segments.iter().map(|segment| segment.rows.len()).collect();
@@ -300,6 +308,10 @@ impl Walk for DenseWalk {
                         row.seq.sampler.record_prompt(tokens);
                     }
                     HeadInput::Token(token) => row.seq.sampler.record(*token),
+                    HeadInput::Verify { rows, row: index } => row
+                        .seq
+                        .sampler
+                        .record(rows.get(*index).copied().unwrap_or_default()),
                 }
                 let chosen = row.seq.sampler.choose(&logits, &row.seq.sampling);
                 Ok(StepOutput {
@@ -398,6 +410,12 @@ mod tests {
 
         fn limits(&self) -> Limits {
             self.limits
+        }
+
+        fn drafter(&self) -> &Self::Drafter {
+            /// The recording walk publishes no draft head.
+            static ABSENT: Absent<&'static str> = Absent("the recording walk drafts nothing");
+            &ABSENT
         }
 
         fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}

@@ -55,7 +55,7 @@ pub(super) struct QwenFusion {
 /// ([super::DFLASH2_STEP_COST]: 59 ms a step and 8.4 ms a verified draft): about 10 new experts a
 /// row at 0.8 ms each, the rest of a step fixed, and a few milliseconds a member past the first
 /// for its own attention, recurrence and draft. The expert counts are the checkpoint's.
-const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
+pub(super) const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
     fixed_ms: 50.4,
     expert_ms: 0.81,
     row_ms: 0.5,

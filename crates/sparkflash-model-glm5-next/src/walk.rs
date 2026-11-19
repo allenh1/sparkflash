@@ -53,7 +53,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
+use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_model::{DepthPolicy, Queue, Speculator, kept_to_end, verdict};
 use sparkflash_ops::sampler::Sampler;
@@ -367,6 +367,8 @@ pub struct GlmWalk {
     /// this.
     #[allow(dead_code)]
     wall: ExpertUnionWall,
+    /// The arm publishes no drafter through the runtime yet.
+    drafter: Absent<&'static str>,
 }
 
 impl GlmWalk {
@@ -405,6 +407,7 @@ impl GlmWalk {
             limits: Limits::new(chunk, context_limit),
             joint_rounds,
             wall,
+            drafter: Absent("GLM's round is still its fusion's"),
         })
     }
 }
@@ -502,6 +505,10 @@ impl Walk for GlmWalk {
         self.limits
     }
 
+    fn drafter(&self) -> &Self::Drafter {
+        &self.drafter
+    }
+
     fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
         // The penalties, temperature, top-k and top-p run on the host over the row this step
         // already copies back, so a non-greedy request is served rather than approximated.
@@ -595,6 +602,11 @@ impl Walk for GlmWalk {
                     seq.sampler.record(*token);
                     Some(*token)
                 }
+                HeadInput::Verify { rows, row: index } => {
+                    let token = rows.get(*index).copied().unwrap_or_default();
+                    seq.sampler.record(token);
+                    Some(token)
+                }
             };
             // A verify already consumed this token and produced the answer: hand back the row it
             // sampled, exactly as the one-token step it stands in for would have.
@@ -638,26 +650,6 @@ impl Walk for GlmWalk {
             });
         }
         Ok(steps)
-    }
-
-    fn ready(&self, seq: &Self::Seq, token: u32) -> bool {
-        seq.holds(token)
-    }
-
-    /// The caches consumed the unused rows and cannot give them back, so the history is cut and
-    /// the queued answers dropped: the sequence is ahead of its history and names none, and its
-    /// next prompt goes back to its rewind point. This is the arm's old give-back, unchanged.
-    fn give_back(&self, seq: &mut Self::Seq, _to: usize) -> Result<(), BackendError> {
-        seq.pending.clear();
-        seq.confidence.clear();
-        seq.verified = None;
-        Ok(())
-    }
-
-    fn speculation(&self, seq: &Self::Seq) -> Speculation {
-        seq.spec
-            .as_ref()
-            .map_or_else(Speculation::default, Speculator::stats)
     }
 }
 
