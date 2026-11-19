@@ -263,7 +263,9 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
             ),
             (
                 Strategy::TensorCoreDecode,
-                State::Off("row GEMV; decode.tensor_cores=true is refused"),
+                State::Native(
+                    "the FP8 parts on the tile's few-row body, the BF16 parts on the tiled GEMV",
+                ),
             ),
             (Strategy::Drafting, State::Native("MTP or DFlash 2")),
             (

@@ -89,15 +89,23 @@ pub const DEFAULT_DEVICE_CONTEXT: usize = sparkflash_model::descriptor::GLM53_CO
 /// The output ceiling the serving arm advertises for one request.
 pub const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::GLM53_MAX_OUTPUT_TOKENS;
 
-/// What the arm states of its token (one-to-eight row) step: the row GEMV.
+/// What the arm states of its token (one-to-eight row) step: the tile's few-row body.
 ///
-/// The release decodes on the row GEMV, not on the tensor-core tile, so a profile that asks for
-/// `decode.tensor_cores = true` is refused. The refusal and the boot ledger's tensor-core
-/// decode row are the same constant ([crate::walk::GlmWalk]'s
-/// [sparkflash_runtime::WalkCapabilities] and the CLI's GLM profile check), so a GLM that ever
-/// decodes on the tile stops refusing the switch by the same edit.
-pub const TOKEN_DECODE: sparkflash_model::ledger::State =
-    sparkflash_model::ledger::State::Off("row GEMV; decode.tensor_cores=true is refused");
+/// A decode step's block-scaled FP8 projections run the shared tile's few-row body
+/// (`glm_decode_fp8b128_rows`) over the same E4M3 codes, f32 128 x 128 block scales and f32
+/// activations the tiled GEMV read; the BF16 projections of the same step run the tiled GEMV,
+/// whose bits a verified row is defined by. The switch (`decode.tensor_cores`,
+/// `SPARKFLASH_DECODE_MMA`) chooses the FP8 parts: on - the code default, and the value the
+/// shipped `glm53_flash.toml` implies by leaving the field unset - is the body; off puts them
+/// back on the tiled GEMV. Every FP8 part the body fits runs it under `true`, so no shape makes
+/// the switch a refusal.
+///
+/// The declaration, the boot ledger's tensor-core decode row ([crate::walk::GlmWalk]'s
+/// [sparkflash_runtime::WalkCapabilities]) and the CLI's GLM profile check are this one
+/// constant, so an arm that stops running the body stops accepting the switch by the same edit.
+pub const TOKEN_DECODE: sparkflash_model::ledger::State = sparkflash_model::ledger::State::Native(
+    "the FP8 parts on the tile's few-row body, the BF16 parts on the tiled GEMV",
+);
 
 pub mod architecture;
 pub mod checkpoint;

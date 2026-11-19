@@ -648,7 +648,7 @@ impl Walk for GlmWalk {
         state: StateKind::Both,
         // The arm's own four rows, word for word the declaration in
         // `sparkflash_model::ARM_LEDGERS`; a test below holds them equal. The token row is the
-        // same constant the profile check that refuses `decode.tensor_cores = true` reads.
+        // same constant the CLI's GLM profile check reads.
         compute: ComputeDeclaration {
             prompt: State::Native("bulk GEMMs on the FP8 E4M3 MMAs; BF16 as head and remainder"),
             token: crate::TOKEN_DECODE,
@@ -982,24 +982,30 @@ mod tests {
         }
     }
 
-    /// The profile refusal and the ledger's token row are one constant, as dense's are: the
-    /// switch cannot be refused for a reason the ledger does not state.
+    /// The CLI's profile check and the ledger's token row are one constant: the row states the
+    /// tile's few-row body, so `decode.tensor_cores = true` is accepted and the boot line says
+    /// what the arm runs instead of naming a gap it does not have.
     #[test]
-    fn the_token_row_and_the_profile_refusal_are_one_source() {
-        let State::Off(why) = crate::TOKEN_DECODE else {
-            panic!("GLM declares a tensor-core token body; delete the refusal with the row");
+    fn the_token_row_and_the_profile_check_are_one_source() {
+        let State::Native(detail) = crate::TOKEN_DECODE else {
+            panic!("GLM decodes on the tile's few-row body; the CLI reads this row");
         };
-        assert!(why.contains("row GEMV"));
+        assert!(detail.contains("few-row body"), "{detail}");
+        assert!(detail.contains("tiled GEMV"), "{detail}");
         assert_eq!(
             <GlmWalk as Walk>::CAPABILITIES.compute.token,
             crate::TOKEN_DECODE
         );
         let mut ledger = ledger_for::<GlmWalk>();
         ledger.set(Strategy::Lanes, Mode::native("one segment a walk"));
+        let line = ledger.line();
         assert!(
-            !ledger.line().contains("does not state it"),
-            "the runtime derives every row GLM states: {}",
-            ledger.line()
+            line.contains(&format!("tensor-core decode native ({detail})")),
+            "the boot line states the body: {line}"
+        );
+        assert!(
+            !line.contains("does not state it"),
+            "the runtime derives every row GLM states: {line}"
         );
     }
 

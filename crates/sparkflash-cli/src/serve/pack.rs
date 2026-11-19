@@ -526,18 +526,18 @@ impl PackArm for GlmArm {
     }
 
     fn check_profile(profile: &ModelProfile) -> Result<(), String> {
-        // The ledger's tensor-core decode row, the serving walk's capability and this refusal
-        // are one constant ([sparkflash_model_glm5_next::TOKEN_DECODE]), so the switch cannot be
-        // refused for a reason the boot ledger does not state.
+        // The ledger's tensor-core decode row, the serving walk's capability and this check are
+        // one constant ([sparkflash_model_glm5_next::TOKEN_DECODE]): GLM's row states the tile's
+        // few-row body, so `decode.tensor_cores = true` is accepted and runs it. A row that ever
+        // goes off refuses the switch with the row's own reason.
         let sparkflash_model::ledger::State::Off(why) = sparkflash_model_glm5_next::TOKEN_DECODE
         else {
             return Ok(());
         };
         if profile.decode.tensor_cores == Some(true) {
             return Err(format!(
-                "the GLM arm ({}) cannot honour decode.tensor_cores = true: {why}. Set \
-                 SPARKFLASH_DECODE_MMA=off, or unset it, to run the row GEMV GLM serves; its \
-                 tensor-core decode is a later phase",
+                "the GLM arm ({}) cannot honour decode.tensor_cores = true: {why}. Unset \
+                 SPARKFLASH_DECODE_MMA, or set it to off, to run the row GEMV the arm serves",
                 Self::MODEL_ID
             ));
         }
@@ -1678,17 +1678,17 @@ mod tests {
     }
 
     #[test]
-    fn glm_refuses_tensor_core_decode_where_its_profile_is_read() {
-        let error = GlmArm::profile_from(|name| match name {
+    fn glm_accepts_tensor_core_decode_where_its_profile_is_read() {
+        // The token row is the tile's few-row body, so the switch names what the arm runs.
+        let profile = GlmArm::profile_from(|name| match name {
             "SPARKFLASH_DECODE_MMA" => Some("on".to_owned()),
             _ => None,
         })
-        .expect_err("GLM reads decode.tensor_cores and cannot honour it");
-        assert!(error.contains("GLM"), "{error}");
-        assert!(error.contains("SPARKFLASH_DECODE_MMA"), "{error}");
-        assert!(error.contains("row GEMV"), "{error}");
-        // The carried profile's decode.tensor_cores = false is accepted.
-        GlmArm::profile_from(|_| None).expect("the carried GLM profile boots");
+        .expect("GLM runs the tile's few-row body");
+        assert_eq!(profile.decode.tensor_cores, Some(true));
+        // The carried profile leaves the field unset, which is the on default.
+        let carried = GlmArm::profile_from(|_| None).expect("the carried GLM profile boots");
+        assert_eq!(carried.decode.tensor_cores, None);
     }
 
     #[test]
