@@ -542,9 +542,32 @@ by that one tick.
 By the plan's rule - "a pair that differs only in an admission tick is reported, not excused" -
 the A/B **fails**. What the rule cannot say is whether the deferral is policy or arrival timing:
 concurrent admissions depend on when rank 0's stream receives the requests, and one rep cannot
-separate the two. Repeating the pair (the script's `--reps`) is the experiment that would: a
-timing difference appears in some reps and not others, a policy difference in all of them. That
-repetition is owed, and the 8-stream 16K pair is the one to repeat first.
+separate the two. So the pair was repeated three times, and the same-build traces were compared
+with each other - the comparison the first run had not made.
+
+| same-build pair | verdict |
+| :-- | :-- |
+| old r0 / r1 | different at decision 21 (r0 places, r1 holds) |
+| old r0 / r2 | different at decision 21 |
+| old r1 / r2 | different at decision 42 (`hold 1` vs `hold 0`) |
+| new r0 / r1 | different at decision 42 |
+| new r0 / r2 | different at decision 42 |
+| new r1 / r2 | identical |
+
+Every cross-build difference in the three reps falls at decision 21 or 42, which are exactly the
+decisions where two launches of the *same* binary also differ. At decision 21 the old r0 launch
+places and all other five traces hold (its clock at tick 9 was 1144 against 1373-1660); at
+decision 42 the split is by launcher and rep, not by build. The cross-build pairs reproduce the
+first run's shape at r0 and then disagree at r1, which is what arrival timing looks like.
+
+**Conclusion, stated at the strength the evidence supports:** the served tick's decisions are the
+same across the move except at the admission decisions, where one build differs from itself as
+much as it differs from the other. The A/B's strict criterion (all three pairs identical) is
+not met, and it should not be read as a policy divergence. What would settle it is a workload
+whose admissions are deterministic - requests admitted one per tick, or a barrier the server
+observes - so the admission lines stop being a race. Until then, phase 6 step 4's claim is "the
+decisions agree outside the admission race, measured on 4 pairs and 3 repetitions", not "the
+decisions are identical".
 
 Two build facts this run exposed, both now checked before any window stops the cluster: the
 binary embeds `numerics/registry.toml`, so a stale build can ship a registry that disagrees with
