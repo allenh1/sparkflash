@@ -102,7 +102,7 @@ use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
-use sparkflash_runtime::{ChunkPolicy, Fusion, Limits, TextWire};
+use sparkflash_runtime::{ChunkPolicy, Fusion, Limits, TextWire, TickServe};
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, TensorSpec, WeightSource};
 
@@ -954,13 +954,31 @@ impl Drop for Shared {
     }
 }
 
+/// What a fused dense backend's sessions open on.
+enum DenseServing {
+    /// The fused engine, for the tensor-parallel group's rank 0 (and its workers' mirror).
+    Fused(Fusion<DenseLanes>),
+    /// The tick engine, for the single-process serving path: DeepSeek's scheduler over the
+    /// dense walk.
+    Tick(Arc<TickServe<DenseWalk>>),
+}
+
+impl DenseServing {
+    fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        match self {
+            Self::Fused(fusion) => fusion.open(),
+            Self::Tick(engine) => Ok(Box::new(engine.open()?)),
+        }
+    }
+}
+
 /// A dense grouped-query checkpoint on the device.
 pub struct DenseDeviceBackend {
     descriptor: ModelDescriptor,
     shared: Arc<Shared>,
-    /// The fused engine its sessions open on once [Self::enable_fusion] (or, on rank 0 of a
-    /// group, [Self::enable_group_fusion]) has run.
-    fused: Option<Fusion<DenseLanes>>,
+    /// The engine its sessions open on once [Self::enable_fusion] (or, on rank 0 of a group,
+    /// [Self::enable_group_fusion]) has run.
+    fused: Option<DenseServing>,
 }
 
 impl DenseDeviceBackend {
@@ -1240,8 +1258,11 @@ impl DenseDeviceBackend {
                  enable_group_fusion and mirror them on the others with mirror_group",
             ));
         }
-        let arm = walk::runtime(Arc::clone(&self.shared), capacity)?;
-        self.fused = Some(Fusion::local(arm, capacity)?);
+        // The single-process path serves on the tick engine: DeepSeek's scheduler, the dense
+        // walk's arithmetic. The group path below still serves through the fused engine until
+        // its lane frames can carry a chunk's rows.
+        let walk = walk::walk(Arc::clone(&self.shared), capacity)?;
+        self.fused = Some(DenseServing::Tick(TickServe::start(walk, capacity)?));
         Ok(())
     }
 
@@ -1262,7 +1283,12 @@ impl DenseDeviceBackend {
     ) -> Result<(), BackendError> {
         self.group_rank()?;
         let arm = walk::runtime(Arc::clone(&self.shared), capacity)?;
-        self.fused = Some(Fusion::group(arm, hub, self.wire(), capacity)?);
+        self.fused = Some(DenseServing::Fused(Fusion::group(
+            arm,
+            hub,
+            self.wire(),
+            capacity,
+        )?));
         Ok(())
     }
 

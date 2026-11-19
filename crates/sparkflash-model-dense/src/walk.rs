@@ -122,7 +122,15 @@ pub(crate) fn runtime(
     shared: Arc<Shared>,
     capacity: usize,
 ) -> Result<Runtime<DenseWalk>, BackendError> {
-    Runtime::new(DenseWalk::new(shared, capacity)?, 0)
+    Runtime::new(walk(shared, capacity)?, 0)
+}
+
+/// The dense walk for `shared`'s weights and `capacity` lanes, for the tick engine's thread.
+///
+/// # Errors
+/// A device allocation the walk's scratch cannot make.
+pub(crate) fn walk(shared: Arc<Shared>, capacity: usize) -> Result<DenseWalk, BackendError> {
+    DenseWalk::new(shared, capacity)
 }
 
 /// The arm's state, as the runtime needs to see it: one positional region a GQA layer, one
@@ -448,6 +456,11 @@ mod tests {
                 None,
             ))
         }
+
+        /// The dense arm serves on the tick engine, so its generated checks drive that engine.
+        fn tick_engine() -> bool {
+            true
+        }
     }
 
     #[test]
@@ -715,6 +728,56 @@ mod tests {
                 (PassKind::Bulk { rows: 64 }, vec![64]),
                 (PassKind::Bulk { rows: 22 }, vec![22]),
             ]
+        );
+    }
+
+    /// The dense arm's serving path is the tick engine: its chunks are still the 256 rows its
+    /// kernels were chosen for, decided by [crate::tick] over dense's own limits.
+    #[test]
+    fn the_tick_engine_hands_dense_256_row_chunks() {
+        use sparkflash_model::backend::Sampling;
+        use sparkflash_runtime::{TickEngine, TickEvent};
+
+        let recording = RecordingWalk {
+            layout: StateLayout::new(vec![
+                Region::Positional {
+                    name: "kv",
+                    bytes_per_row: 4,
+                },
+                Region::Recurrent {
+                    name: "gated-deltanet",
+                    bytes: 16,
+                },
+            ]),
+            limits: Limits::new(CHUNK_ROWS, 32_768),
+            passes: Mutex::new(Vec::new()),
+        };
+        let mut engine = TickEngine::new(recording, 1).expect("the tick engine starts");
+        assert_eq!(
+            engine.config().chunk_rows,
+            CHUNK_ROWS,
+            "the engine's chunk is the arm's ChunkPolicy chunk"
+        );
+        let id = engine
+            .admit(&vec![7u32; 600], &[], Sampling::default())
+            .expect("the prompt");
+        loop {
+            let events = engine.tick().expect("the tick");
+            if events
+                .iter()
+                .any(|event| matches!(event, TickEvent::Prompt { id: got, .. } if *got == id))
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            *engine.walk().passes.lock().expect("the pass record"),
+            vec![
+                (PassKind::Bulk { rows: 256 }, vec![256]),
+                (PassKind::Bulk { rows: 256 }, vec![256]),
+                (PassKind::Bulk { rows: 88 }, vec![88]),
+            ],
+            "a 600-row prompt runs the chunks dense's old runtime ran"
         );
     }
 
