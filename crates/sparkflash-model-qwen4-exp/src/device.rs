@@ -2847,6 +2847,17 @@ impl Qwen4ExpDeviceBackend {
         walk::runtime(Arc::clone(&self.shared), self.context_limit, capacity)
     }
 
+    /// The most lanes this arm's batch takes: the member width its runtime's Limits states.
+    ///
+    /// A group whose operator gave no `--concurrency` opens this many lanes, so the count comes
+    /// from the arm rather than a CLI constant.
+    ///
+    /// # Errors
+    /// The runtime refuses this rank's walk.
+    pub fn lane_limit(&self) -> Result<usize, BackendError> {
+        Ok(self.lanes(batch::MAX_BATCH)?.limits().members)
+    }
+
     /// What the group's frames carry and rank 0 refuses: the arm serves text.
     fn wire(&self) -> sparkflash_runtime::TextWire {
         sparkflash_runtime::TextWire::new("qwen", "Qwen", self.context_limit)
