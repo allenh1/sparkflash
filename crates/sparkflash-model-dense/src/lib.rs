@@ -70,7 +70,7 @@ use std::sync::Arc;
 use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::{
-    dory_cubin, moe_plan_cubin, qwen4_attn_cubin, qwen4_exp_cubin, qwen4_moe_cubin,
+    Image, dory_cubin, moe_plan_cubin, qwen4_attn_cubin, qwen4_exp_cubin, qwen4_moe_cubin,
     qwen4_prefill_cubin, qwen4_scan_cubin,
 };
 use sparkflash_kernels::lane_memory::{Layout, SequenceLane, SequenceLanes};
@@ -94,6 +94,7 @@ use sparkflash_ops::gemv::{
 use sparkflash_ops::moe::{Launch, MoePlanCall, combine_grid, router_score, token};
 use sparkflash_ops::naming::{AttentionNames, ExpertNames, FfnNames, GdnNames, TensorNames};
 use sparkflash_ops::packed::{self, Form, PackedSet, Placement};
+use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
@@ -470,34 +471,6 @@ impl Proj {
             ],
         }
     }
-
-    /// The format the checkpoint stores this projection as.
-    fn format(&self) -> FormatKind {
-        match self {
-            Self::Bf16(mat) => mat.format(),
-            Self::Fp8(mat) => mat.format(),
-        }
-    }
-
-    /// The stored bytes one token reads from this projection.
-    fn bytes_per_token(&self) -> u128 {
-        match self {
-            Self::Bf16(mat) => mat.bytes_per_token(),
-            Self::Fp8(mat) => mat.bytes_per_token(),
-        }
-    }
-
-    /// The BF16 matrix a GEMV or a wide tile takes, when this projection is BF16.
-    fn bf16(&self) -> Option<GpuMat> {
-        match self {
-            Self::Bf16(mat) => Some(GpuMat {
-                pointer: mat.data(),
-                rows: mat.rows(),
-                columns: mat.columns(),
-            }),
-            Self::Fp8(_) => None,
-        }
-    }
 }
 
 /// One SwiGLU MLP's projections: a dense layer's, or a routed layer's shared expert.
@@ -526,38 +499,135 @@ enum LayerFfn {
     },
 }
 
+/// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
+/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
+/// than a name it looked up.
+#[derive(Clone, Copy)]
+struct Bound {
+    /// The loaded driver function.
+    kernel: Kernel,
+    /// The arithmetic the catalogue entry accepts this body at.
+    precision: Precision,
+}
+
+impl Bound {
+    /// Whether `image` exports `symbol` and the catalogue carries it at `precision`.
+    fn carried(image: Image, symbol: &'static str, precision: Precision) -> Result<(), String> {
+        if !image.exported_symbols().contains(&symbol) {
+            return Err(format!("{} does not export {symbol}", image.name()));
+        }
+        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
+            entry.image == image
+                && entry
+                    .symbols
+                    .iter()
+                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
+        });
+        if !carried {
+            return Err(format!(
+                "the catalogue carries no {symbol} in {} accepting {}",
+                image.name(),
+                precision.name()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve `symbol` in `image` at `precision` and load it.
+    ///
+    /// # Errors
+    /// A symbol the image does not export, one the catalogue does not carry at this precision,
+    /// or the driver's load refusal.
+    fn new(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+    ) -> Result<Self, String> {
+        Self::carried(image, symbol, precision)?;
+        let (_, kernel) = cuda.load_named(cubin, symbol)?;
+        Ok(Self { kernel, precision })
+    }
+
+    /// [Self::new] for a body loaded with a dynamic shared-memory reservation.
+    ///
+    /// # Errors
+    /// As [Self::new], or the driver's attribute call.
+    fn shared(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+        shared_bytes: u32,
+    ) -> Result<Self, String> {
+        Self::carried(image, symbol, precision)?;
+        let (_, kernel) = cuda.load_named_shared(cubin, symbol, shared_bytes)?;
+        Ok(Self { kernel, precision })
+    }
+}
+
+impl From<Bound> for Kernel {
+    fn from(bound: Bound) -> Self {
+        bound.kernel
+    }
+}
+
 /// The routed layers' kernels, loaded when a layer routes.
 #[derive(Clone, Copy)]
 struct MoeKernels {
-    route: Kernel,
-    plan: Kernel,
-    gate_up: Kernel,
+    route: Bound,
+    plan: Bound,
+    gate_up: Bound,
     /// The gate/up pass under a `swiglu_limit`.
-    gate_up_clamped: Kernel,
-    down: Kernel,
-    combine: Kernel,
+    gate_up_clamped: Bound,
+    down: Bound,
+    combine: Bound,
 }
 
-/// The kernels this arm launches, loaded once.
+/// The packed BF16 form's four bodies ([sparkflash_ops::packed]), resolved through the catalogue
+/// like the projections.
+#[derive(Clone, Copy)]
+struct PackedKernels {
+    pack: Bound,
+    unpack: Bound,
+    gemv: Bound,
+    gemv4: Bound,
+}
+
+impl PackedKernels {
+    /// The plain handles [packed::PackedSet] takes.
+    fn raw(&self) -> packed::Kernels {
+        packed::Kernels {
+            pack: self.pack.kernel,
+            unpack: self.unpack.kernel,
+            gemv: self.gemv.kernel,
+            gemv4: self.gemv4.kernel,
+        }
+    }
+}
+
+/// The kernels this arm launches, loaded once and bound to the catalogue entry each runs.
 #[derive(Clone, Copy)]
 struct Kernels {
-    add: Kernel,
+    add: Bound,
     /// A group's row sum ([RowSums]) on the device legs.
-    sum_slots: Kernel,
-    deinterleave: Kernel,
-    embed: Kernel,
-    gemv: Kernel,
-    packed: packed::Kernels,
-    rmsnorm: Kernel,
-    rope: Kernel,
-    swiglu: Kernel,
-    swiglu_clamped: Kernel,
-    attention: Kernel,
-    combine: Kernel,
-    cache: Kernel,
-    wide: Kernel,
+    sum_slots: Bound,
+    deinterleave: Bound,
+    embed: Bound,
+    gemv: Bound,
+    packed: PackedKernels,
+    rmsnorm: Bound,
+    rope: Bound,
+    swiglu: Bound,
+    swiglu_clamped: Bound,
+    attention: Bound,
+    combine: Bound,
+    cache: Bound,
+    wide: Bound,
     /// The vocabulary-wide argmax the greedy head chooses with (`q4e_argmax_slices`).
-    argmax: Kernel,
+    argmax: Bound,
     moe: Option<MoeKernels>,
     fp8: Option<Fp8Kernels>,
     gdn: Option<GdnKernels>,
@@ -567,14 +637,14 @@ struct Kernels {
 /// ([sparkflash_ops::gdn]) with the scan the [ScanPlan] resolves, and the zero a reset state takes.
 #[derive(Clone, Copy)]
 struct GdnKernels {
-    conv: Kernel,
-    history: Kernel,
-    prep: Kernel,
-    scan: Kernel,
+    conv: Bound,
+    history: Bound,
+    prep: Bound,
+    scan: Bound,
     /// The plan's scan grid and block.
     scan_launch: ((u32, u32, u32), (u32, u32, u32)),
-    gate: Kernel,
-    zero: Kernel,
+    gate: Bound,
+    zero: Bound,
 }
 
 /// Threads in the block `q4e_argmax_slices` reduces a vocabulary with: the 32 warps its block
@@ -585,8 +655,8 @@ const ARGMAX_BLOCK: u32 = 1024;
 /// tiled E4M3 GEMV for decode rows and the FP8 tensor-core tile for prompt chunks.
 #[derive(Clone, Copy)]
 struct Fp8Kernels {
-    gemv: Kernel,
-    tile: Kernel,
+    gemv: Bound,
+    tile: Bound,
 }
 
 // SAFETY: a Kernel is an opaque driver function word, and the handle only names it. The context
@@ -605,41 +675,82 @@ impl Kernels {
         formats: Formats,
         scan: Option<&ScanPlan>,
     ) -> Result<Self, String> {
-        let named = |image: &'static [u8], name: &'static str| {
-            cuda.load_named(image, name).map(|(_, kernel)| kernel)
+        let token = |symbol: &'static str, precision: Precision| {
+            Bound::new(cuda, Image::Qwen4Exp, qwen4_exp_cubin(), symbol, precision)
         };
-        let staged = |name: &'static str, bytes: u32| {
-            cuda.load_named_shared(qwen4_moe_cubin(), name, bytes)
-                .map(|(_, kernel)| kernel)
+        let attention = |symbol: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Attn,
+                qwen4_attn_cubin(),
+                symbol,
+                precision,
+            )
         };
-        let (gate_up, gate_up_clamped, down) = if formats.fp8_experts {
+        let (gate_up, gate_up_clamped, down, expert_precision) = if formats.fp8_experts {
             (
                 "q4e_expert_gate_up_fp8",
                 "q4e_expert_gate_up_fp8_clamped",
                 "q4e_expert_down_fp8",
+                Precision::Fp8E4M3,
             )
         } else {
             (
                 "q4e_expert_gate_up_bf16",
                 "q4e_expert_gate_up_bf16_clamped",
                 "q4e_expert_down_bf16",
+                Precision::Bf16,
+            )
+        };
+        let staged = |symbol: &'static str, precision: Precision, bytes: u32| {
+            Bound::shared(
+                cuda,
+                Image::Qwen4Moe,
+                qwen4_moe_cubin(),
+                symbol,
+                precision,
+                bytes,
             )
         };
         let moe = match stage {
             Some(bytes) => Some(MoeKernels {
-                route: named(qwen4_moe_cubin(), "q4e_route")?,
-                plan: named(moe_plan_cubin(), "moe_plan")?,
-                gate_up: staged(gate_up, bytes)?,
-                gate_up_clamped: staged(gate_up_clamped, bytes)?,
-                down: staged(down, bytes)?,
-                combine: named(qwen4_moe_cubin(), "q4e_moe_combine")?,
+                route: Bound::new(
+                    cuda,
+                    Image::Qwen4Moe,
+                    qwen4_moe_cubin(),
+                    "q4e_route",
+                    Precision::Bf16,
+                )?,
+                plan: Bound::new(
+                    cuda,
+                    Image::MoePlan,
+                    moe_plan_cubin(),
+                    "moe_plan",
+                    Precision::Bf16,
+                )?,
+                gate_up: staged(gate_up, expert_precision, bytes)?,
+                gate_up_clamped: staged(gate_up_clamped, expert_precision, bytes)?,
+                down: staged(down, expert_precision, bytes)?,
+                combine: Bound::new(
+                    cuda,
+                    Image::Qwen4Moe,
+                    qwen4_moe_cubin(),
+                    "q4e_moe_combine",
+                    Precision::Bf16,
+                )?,
             }),
             None => None,
         };
         let fp8 = if formats.fp8 {
             Some(Fp8Kernels {
-                gemv: named(qwen4_exp_cubin(), "q4e_gemv_tiled_e4m3_tile")?,
-                tile: named(qwen4_prefill_cubin(), "q4p_dense_fp8")?,
+                gemv: token("q4e_gemv_tiled_e4m3_tile", Precision::Fp8E4M3)?,
+                tile: Bound::new(
+                    cuda,
+                    Image::Qwen4Prefill,
+                    qwen4_prefill_cubin(),
+                    "q4p_dense_fp8",
+                    Precision::Fp8E4M3,
+                )?,
             })
         } else {
             None
@@ -647,39 +758,71 @@ impl Kernels {
         let gdn = match scan {
             Some(plan) => {
                 let launch = plan.launch();
+                let scan = |symbol: &'static str| {
+                    Bound::new(
+                        cuda,
+                        Image::Qwen4Scan,
+                        qwen4_scan_cubin(),
+                        symbol,
+                        Precision::Bf16,
+                    )
+                };
                 Some(GdnKernels {
-                    conv: named(qwen4_scan_cubin(), "q4p_gdn_conv")?,
-                    history: named(qwen4_scan_cubin(), "q4p_gdn_conv_state")?,
-                    prep: named(qwen4_scan_cubin(), "q4p_gdn_prep")?,
-                    scan: named(qwen4_scan_cubin(), launch.kernel.symbol)?,
+                    conv: scan("q4p_gdn_conv")?,
+                    history: scan("q4p_gdn_conv_state")?,
+                    prep: scan("q4p_gdn_prep")?,
+                    scan: scan(launch.kernel.symbol)?,
                     scan_launch: (launch.grid, launch.block),
-                    gate: named(qwen4_scan_cubin(), "q4p_gdn_gate")?,
-                    zero: named(qwen4_exp_cubin(), "q4e_zero")?,
+                    gate: scan("q4p_gdn_gate")?,
+                    zero: token("q4e_zero", Precision::Bf16)?,
                 })
             }
             None => None,
+        };
+        debug_assert!(
+            fp8.as_ref()
+                .is_none_or(|kernels| kernels.gemv.precision == Precision::Fp8E4M3),
+            "the FP8 GEMV resolves at FP8 E4M3"
+        );
+        debug_assert!(
+            moe.as_ref().is_none_or(|kernels| {
+                kernels.gate_up.precision == expert_precision
+                    && kernels.down.precision == expert_precision
+            }),
+            "the expert bodies resolve at the checkpoint's expert format"
+        );
+        let packed = PackedKernels {
+            pack: token("q4e_pack_bf16", Precision::Bf16)?,
+            unpack: token("q4e_unpack_bf16", Precision::Bf16)?,
+            gemv: token("q4e_gemv_packed", Precision::Bf16)?,
+            gemv4: token("q4e_gemv4_packed", Precision::Bf16)?,
         };
         Ok(Self {
             moe,
             fp8,
             gdn,
-            add: named(qwen4_exp_cubin(), "q4e_add")?,
-            sum_slots: named(qwen4_exp_cubin(), "q4e_sum_slots")?,
-            deinterleave: named(qwen4_exp_cubin(), "q4e_deinterleave")?,
-            embed: named(qwen4_exp_cubin(), "q4e_embed")?,
-            gemv: named(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
-            packed: packed::Kernels::load(cuda)?,
-            rmsnorm: named(qwen4_exp_cubin(), "q4e_rmsnorm")?,
-            rope: named(qwen4_exp_cubin(), "q4e_rope")?,
-            swiglu: named(qwen4_exp_cubin(), "q4e_swiglu")?,
-            swiglu_clamped: named(qwen4_exp_cubin(), "q4e_swiglu_clamped")?,
-            attention: named(qwen4_attn_cubin(), "q4e_attn_full")?,
-            combine: named(qwen4_attn_cubin(), "q4e_attn_full_combine")?,
-            cache: named(qwen4_attn_cubin(), "q4e_cache_bf16")?,
-            argmax: named(qwen4_exp_cubin(), "q4e_argmax_slices")?,
-            wide: cuda
-                .load_named_shared(dory_cubin(), "dory_mma_wide", WIDE_SHARED)
-                .map(|(_, kernel)| kernel)?,
+            add: token("q4e_add", Precision::Bf16)?,
+            sum_slots: token("q4e_sum_slots", Precision::Bf16)?,
+            deinterleave: token("q4e_deinterleave", Precision::Bf16)?,
+            embed: token("q4e_embed", Precision::Bf16)?,
+            gemv: token("q4e_gemv_bf16", Precision::Bf16)?,
+            packed,
+            rmsnorm: token("q4e_rmsnorm", Precision::Bf16)?,
+            rope: token("q4e_rope", Precision::Bf16)?,
+            swiglu: token("q4e_swiglu", Precision::Bf16)?,
+            swiglu_clamped: token("q4e_swiglu_clamped", Precision::Bf16)?,
+            attention: attention("q4e_attn_full", Precision::Bf16)?,
+            combine: attention("q4e_attn_full_combine", Precision::Bf16)?,
+            cache: attention("q4e_cache_bf16", Precision::Bf16)?,
+            argmax: token("q4e_argmax_slices", Precision::Bf16)?,
+            wide: Bound::shared(
+                cuda,
+                Image::Dory,
+                dory_cubin(),
+                "dory_mma_wide",
+                Precision::Bf16,
+                WIDE_SHARED,
+            )?,
         })
     }
 }
@@ -870,7 +1013,7 @@ impl DenseDeviceBackend {
             .chain(layers.iter().flat_map(Layer::bf16_projections))
             .map(|mat| (mat.data(), mat.rows(), mat.columns()))
             .collect();
-        let packed_bytes = match packed.pack(&cuda, &kernels.packed, &matrices, 0) {
+        let packed_bytes = match packed.pack(&cuda, &kernels.packed.raw(), &matrices, 0) {
             Ok((_, packed_bytes)) => packed_bytes,
             Err(error) => {
                 let references: Vec<&Deviceptr> = owned.iter().collect();
@@ -1838,7 +1981,12 @@ impl Shared {
         }
     }
 
-    fn call<const N: usize>(&self, kernel: Kernel, call: Call<N>) -> Result<(), BackendError> {
+    fn call<const N: usize>(
+        &self,
+        kernel: impl Into<Kernel>,
+        call: Call<N>,
+    ) -> Result<(), BackendError> {
+        let kernel = kernel.into();
         self.cuda
             .launch_async(kernel, call.grid, call.block, &call.args)
             .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
@@ -2050,9 +2198,9 @@ impl Shared {
                 count,
             );
             self.cuda
-                .launch_async(kernels.scan, grid, block, &args)
+                .launch_async(kernels.scan.kernel, grid, block, &args)
                 .map_err(|error| {
-                    BackendError::new(DEVICE, format!("{}: {error}", kernels.scan.name()))
+                    BackendError::new(DEVICE, format!("{}: {error}", kernels.scan.kernel.name()))
                 })?;
             first += count;
         }
@@ -2113,7 +2261,7 @@ impl Shared {
         let gemv = |input: u64, output: u64, batch: usize| {
             gemv_e4m3_tile(
                 &tiled,
-                kernels.gemv,
+                kernels.gemv.kernel,
                 &GpuMatE4m3Tile {
                     weight: mat.data(),
                     scales: mat.scales().blocks().unwrap_or(Deviceptr(0)),
@@ -2157,7 +2305,7 @@ impl Shared {
                 )
                 .map_err(|error| BackendError::new(DEVICE, error))?;
                 self.cuda
-                    .launch_async(kernels.tile, tile.grid, tile.block, &tile.args)
+                    .launch_async(kernels.tile.kernel, tile.grid, tile.block, &tile.args)
                     .map_err(|error| BackendError::new(DEVICE, format!("q4p_dense_fp8: {error}")))
             }
             Route::Wide | Route::BatchedGemv => batched(),
@@ -2228,7 +2376,7 @@ impl Shared {
                     WideTile::call(mat.data().0, input, output, mat.rows(), mat.columns(), rows)
                         .map_err(|error| BackendError::new(DEVICE, error))?;
                 self.cuda
-                    .launch_async(self.kernels.wide, tile.grid, tile.block, &tile.args)
+                    .launch_async(self.kernels.wide.kernel, tile.grid, tile.block, &tile.args)
                     .map_err(|error| BackendError::new(DEVICE, format!("dory_mma_wide: {error}")))
             }
             route @ (Route::Skinny | Route::Refuse) => Err(BackendError::new(
@@ -2251,10 +2399,11 @@ impl Shared {
 
     fn launch(
         &self,
-        kernel: Kernel,
+        kernel: impl Into<Kernel>,
         (grid, block): Launch,
         args: &[u64],
     ) -> Result<(), BackendError> {
+        let kernel = kernel.into();
         self.cuda
             .launch_async(kernel, grid, block, args)
             .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
@@ -3007,7 +3156,7 @@ fn head_choices(
     shared
         .cuda
         .launch_async(
-            shared.kernels.argmax,
+            shared.kernels.argmax.kernel,
             (rows, 1, 1),
             (ARGMAX_BLOCK, 1, 1),
             &[
@@ -3194,13 +3343,16 @@ impl ModelSession for DenseDeviceSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy, typed_bf16, typed_fp8,
+        Bound, CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy, typed_bf16,
+        typed_fp8,
     };
     use sparkflash_kernels::cuda_driver::Deviceptr;
+    use sparkflash_kernels::images::Image;
     use sparkflash_model::backend::Sampling;
     use sparkflash_model::ledger::State;
     use sparkflash_model::profile::ModelProfile;
     use sparkflash_ops::formats::{Bf16, F32 as F32Format, FormatKind, Scales};
+    use sparkflash_ops::plan::Precision;
     use sparkflash_ops::projection::WidePolicy;
     use sparkflash_ops::sampler::Sampler;
     use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -3213,6 +3365,20 @@ mod tests {
             dtype,
             shape: shape.to_vec(),
         }
+    }
+
+    /// A bound handle names a symbol the image exports and the catalogue carries at the
+    /// handle's precision; a launch site never looks a kernel up by string.
+    #[test]
+    fn a_bound_handle_names_a_catalogued_symbol_and_precision() {
+        Bound::carried(Image::Qwen4Exp, "q4e_gemv_bf16", Precision::Bf16)
+            .expect("the catalogue carries q4e_gemv_bf16 at bf16");
+        let error = Bound::carried(Image::Qwen4Exp, "q4e_gemv_bf16", Precision::Fp8E4M3)
+            .expect_err("q4e_gemv_bf16 is a bf16 body, not an FP8 one");
+        assert!(error.contains("accepting e4m3"), "{error}");
+        let error = Bound::carried(Image::Qwen4Exp, "q4e_not_a_kernel", Precision::Bf16)
+            .expect_err("the image does not export it");
+        assert!(error.contains("does not export"), "{error}");
     }
 
     /// The load path's two checks are [sparkflash_ops::formats::upload]'s: a tensor of another
@@ -3365,19 +3531,25 @@ mod tests {
         let input: Vec<u8> = (0..rows * inner)
             .flat_map(|_| next().to_le_bytes())
             .collect();
-        let (_, gemv) = cuda
-            .load_named(
-                sparkflash_kernels::images::qwen4_exp_cubin(),
-                "q4e_gemv_bf16",
-            )
-            .expect("the Qwen4-Exp image carries q4e_gemv_bf16");
-        let (_, wide) = cuda
-            .load_named_shared(
-                sparkflash_kernels::images::dory_cubin(),
-                "dory_mma_wide",
-                sparkflash_ops::projection::WIDE_SHARED,
-            )
-            .expect("the Dory image carries dory_mma_wide");
+        let gemv = Bound::new(
+            &cuda,
+            Image::Qwen4Exp,
+            sparkflash_kernels::images::qwen4_exp_cubin(),
+            "q4e_gemv_bf16",
+            Precision::Bf16,
+        )
+        .expect("the Qwen4-Exp image carries q4e_gemv_bf16")
+        .kernel;
+        let wide = Bound::shared(
+            &cuda,
+            Image::Dory,
+            sparkflash_kernels::images::dory_cubin(),
+            "dory_mma_wide",
+            Precision::Bf16,
+            sparkflash_ops::projection::WIDE_SHARED,
+        )
+        .expect("the Dory image carries dory_mma_wide")
+        .kernel;
         let mut total = 0;
         let w = cuda.alloc(weight.len(), &mut total).expect("the weights");
         let x = cuda.alloc(input.len(), &mut total).expect("the input");
@@ -3463,9 +3635,15 @@ mod tests {
             eprintln!("skipping the device head choice: this build has no Qwen4-Exp cubin");
             return;
         }
-        let (_, argmax) = cuda
-            .load_named(image, "q4e_argmax_slices")
-            .expect("the Qwen4-Exp image carries q4e_argmax_slices");
+        let argmax = Bound::new(
+            &cuda,
+            Image::Qwen4Exp,
+            image,
+            "q4e_argmax_slices",
+            Precision::Bf16,
+        )
+        .expect("the Qwen4-Exp image carries q4e_argmax_slices")
+        .kernel;
         let rows = toy_rows();
         let vocab = rows[0].len();
         assert!(rows.iter().all(|row| row.len() == vocab));

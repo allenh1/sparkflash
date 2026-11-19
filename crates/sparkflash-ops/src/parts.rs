@@ -835,6 +835,8 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "q4e_attn_full_combine",
                 &[Precision::Bf16, Precision::Fp8E4M3],
             ),
+            // The BF16 cache a boundary row appends to its lane.
+            sym("q4e_cache_bf16", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -1068,6 +1070,12 @@ pub const CATALOGUE: &[PartKernel] = &[
             row_dec("q4e_gemv_tiled_e4m3", &[Precision::Fp8E4M3]),
             // The Qwen3.5/3.6 FP8 release's block-scaled dense projections (BF16 tile scales).
             row_dec("q4e_gemv_tiled_e4m3_tile", &[Precision::Fp8E4M3]),
+            // The packed BF16 form's row walk and its load-time pack/unpack pair
+            // (sparkflash_ops::packed): the dense arm reads the same bits from fewer bytes.
+            row_dec("q4e_gemv_packed", &[Precision::Bf16]),
+            row_dec("q4e_gemv4_packed", &[Precision::Bf16]),
+            sym("q4e_pack_bf16", &[Precision::Bf16]),
+            sym("q4e_unpack_bf16", &[Precision::Bf16]),
         ],
         false,
     ),
@@ -1106,7 +1114,15 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::Activation,
         Image::TOKEN,
-        &[sym("q4e_swiglu", &[Precision::Bf16, Precision::F32])],
+        &[
+            sym("q4e_swiglu", &[Precision::Bf16, Precision::F32]),
+            sym("q4e_swiglu_clamped", &[Precision::Bf16, Precision::F32]),
+            // The residual add, the chunk's layout fan-out and the state zero the dense arm
+            // launches beside its projections.
+            sym("q4e_add", &[Precision::Bf16, Precision::F32]),
+            sym("q4e_deinterleave", &[Precision::Bf16, Precision::F32]),
+            sym("q4e_zero", &[Precision::Bf16, Precision::F32]),
+        ],
         false,
     ),
     sm121(
@@ -1443,6 +1459,20 @@ pub const CATALOGUE: &[PartKernel] = &[
             // resolves the grouped `q4p_moe_*_fp8` symbols below.
             row("q4e_expert_gate_up_fp8", &[Precision::Fp8E4M3]),
             row("q4e_expert_down_fp8", &[Precision::Fp8E4M3]),
+        ],
+        false,
+    ),
+    // The BF16 token expert bodies the shared dense arm's routed layers read. They are dense
+    // GEMMs an expert run, listed apart from the grouped entries so a BF16 document does not
+    // claim a tensor-core grouped body it has none of.
+    sm121(
+        Part::DenseGemm,
+        Image::ROUTED_EXPERTS,
+        &[
+            row_dec("q4e_expert_gate_up_bf16", &[Precision::Bf16]),
+            row_dec("q4e_expert_gate_up_bf16_clamped", &[Precision::Bf16]),
+            row_dec("q4e_expert_down_bf16", &[Precision::Bf16]),
+            row_dec("q4e_expert_gate_up_fp8_clamped", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
