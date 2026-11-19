@@ -157,6 +157,12 @@ impl QwenWalk {
         rows: &[u32],
         prompt_end: Option<usize>,
     ) -> Result<(), BackendError> {
+        // A proposal from the previous round anchors on the old end, which this prompt may
+        // replace; the fusion's begin_prompt cleared the same three lists. The final chunk's
+        // head drafts afresh.
+        seq.spec_drafts.clear();
+        seq.spec_confidence.clear();
+        seq.spec_served.clear();
         seq.consumed.extend_from_slice(rows);
         let end = seq.position + rows.len() + prompt_end.unwrap_or(0);
         let last_pass = prompt_end.is_none_or(|after| after == 0);
