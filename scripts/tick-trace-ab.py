@@ -91,8 +91,14 @@ def parse_trace(path):
     return rows
 
 
-def first_difference(old_path, new_path):
-    """(tick, old line, new line, why) or None when the decision sequences agree."""
+def first_difference(old_path, new_path, ignore_tick=False):
+    """(tick, old line, new line, why) or None when the decision sequences agree.
+
+    With `ignore_tick`, the same decisions at different tick numbers compare equal: that is
+    the verdict "the decisions agree, the tick boundaries do not", which is what a real-time
+    scheduler's admission jitter looks like and what a strict comparison cannot separate from a
+    changed decision.
+    """
     old = parse_trace(old_path)
     new = parse_trace(new_path)
     if not old and not new:
@@ -113,7 +119,7 @@ def first_difference(old_path, new_path):
                 "%s:%d" % (new_line, new_number),
                 "decision %d differs" % index,
             )
-        if old_tick != new_tick:
+        if old_tick != new_tick and not ignore_tick:
             # The same decisions at different tick numbers are a different schedule.
             return (
                 "%d/%d" % (old_tick, new_tick),
@@ -124,15 +130,44 @@ def first_difference(old_path, new_path):
     return None
 
 
-def report_diff(label, old_path, new_path):
-    difference = first_difference(old_path, new_path)
+def report_diff(label, old_path, new_path, ignore_tick=False):
+    difference = first_difference(old_path, new_path, ignore_tick)
     if difference is None:
-        print("RESULT %s: identical (%d decisions)" % (label, len(parse_trace(old_path))))
+        suffix = ", tick boundaries ignored" if ignore_tick else ""
+        print(
+            "RESULT %s: identical (%d decisions%s)"
+            % (label, len(parse_trace(old_path)), suffix),
+        )
         return True
     tick, old_line, new_line, why = difference
     print("RESULT %s: DIFFERENT at tick %s (%s)" % (label, tick, why))
     print("  old %s" % old_line)
     print("  new %s" % new_line)
+    return False
+
+
+def report_unordered(label, old_path, new_path):
+    """Compares the two traces as multisets of decisions.
+
+    A real-time scheduler can place an admission one tick later and still run every other
+    decision unchanged; the two traces then hold the same decisions in a different order. This
+    verdict says exactly that, and it is weaker than the ordered one by design.
+    """
+    old = parse_trace(old_path)
+    new = parse_trace(new_path)
+    old_decisions = [decision for _, decision, _, _ in old]
+    new_decisions = [decision for _, decision, _, _ in new]
+    if sorted(old_decisions) == sorted(new_decisions):
+        print(
+            "RESULT %s: identical as a multiset (%d decisions)"
+            % (label, len(old_decisions)),
+        )
+        return True
+    missing = sorted(set(old_decisions) - set(new_decisions))
+    extra = sorted(set(new_decisions) - set(old_decisions))
+    print("RESULT %s: DIFFERENT decisions" % label)
+    print("  only in old: %s" % (missing[:4] or "-"))
+    print("  only in new: %s" % (extra[:4] or "-"))
     return False
 
 
@@ -458,10 +493,32 @@ def main():
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--diff", nargs=2, metavar=("OLD", "NEW"))
+    parser.add_argument(
+        "--unordered",
+        action="store_true",
+        help="with --diff: compare the traces as multisets of decisions, so an admission "
+        "that landed one tick later still matches",
+    )
+    parser.add_argument(
+        "--ignore-tick",
+        action="store_true",
+        help="with --diff: compare the decisions only, not the tick each ran at (a schedule "
+        "whose admissions land a tick apart is then reported as identical decisions)",
+    )
     args = parser.parse_args()
 
     if args.diff:
-        return 0 if report_diff("diff", args.diff[0], args.diff[1]) else 1
+        if args.unordered:
+            return (
+                0
+                if report_unordered("diff", args.diff[0], args.diff[1])
+                else 1
+            )
+        return (
+            0
+            if report_diff("diff", args.diff[0], args.diff[1], args.ignore_tick)
+            else 1
+        )
     if args.dry_run:
         return dry_run(args)
     if not args.old or not args.new:
