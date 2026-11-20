@@ -95,15 +95,45 @@ rows, which no longer exists on this branch.
 
 - **The change against the row-GEMV arithmetic.** The body is the tile's row (the device test
   above), but how far the served logits move from the GEMV's was never captured.
-- **The speed A/B.** Whether the one-row step is flat or slower and whether the several-row step
-  is faster are both **unmeasured**. The plan expects flat-to-slightly-slower at one row and
-  faster at several; that is not evidence.
+- **The speed A/B.** Measured on 2026-11-19: the few-row body is **33% slower** than the row
+  GEMV, not flat. See *The speed rule* below.
 - **The sliding window's effect on a continued turn.** The body is a per-row arithmetic and does
   not change the cache or the window, but a continued turn's tokens after a >8-row reply were not
   compared with a cold prompt.
 - **The recurrence ring's speed.** Its bits are measured (the world-2 capture equals this
   reference and the loopback tests hold it to a single process), but tokens a second at world 2
   against world 1 were not compared.
+
+## The speed rule: the body is 33% slower, and version 2 is owed
+
+The written speed rule (`docs/NUMERICS.md`) was applied on the two builds the change separates:
+the current one with the few-row body (`18a76075`, binary `102d216d`) against the pre-change
+build with the row GEMV (`84f07db7`, binary `4de25a5e`), one process on the head at world 1,
+context 8,192, fresh boot each, `bench_serving.py --levels 1 --tokens 256 --rounds 3`:
+
+| boot | route | tok/s | per stream |
+| :-- | :-- | --: | --: |
+| body 1 | few-row body | 17.77 | 17.95 |
+| gemv 1 | row GEMV | 26.19 | 26.65 |
+| gemv 2 | row GEMV | 26.15 | 26.60 |
+| body 2 | few-row body | 17.55 | 17.73 |
+
+The ratios are 0.679 and 0.671, against a rule that needs 1.02; the single-request guard (0.97) is
+missed by the same distance. The body reads the BF16 rows (the GEMV build logs 289 projections
+packed beside them, 23.1% fewer bytes a pass; the body build logs no packing), so the deficit is the
+extra bytes a pass. One-process Dory accepts **one lane** - `--concurrency` and `--fuse-batch`
+are the packed-model knobs and the group path needs at least two ranks - so the 16-lane part of the
+rule degenerates to the single-request number here; that is recorded, not worked around.
+
+**Dory therefore returns to the row GEMV as numerics version 2.** The reference is captured and
+stored as `numerics/captures/dory10/v2-gemv.json` (`4f3af7e0…`, eight prompts, 1,024 tokens,
+built from `84f07db7`), two free captures bit-identical, and its floor's forced comparison
+against version 1 (1,024 tokens) is a precision tail: mean NLL delta -3.062e-05, mean absolute
+4.962e-04, max 1.006e-02, top-1 100.0000%, mean KL 2.586e-06. The reference's own mean NLL is
+0.1616 a token. Known answers: "the capital of France" answers "Paris"; the arithmetic and READY
+probes spent their 128-token budget inside `reasoning_content` and returned empty `content`, which
+is recorded as observed rather than retried. The registry declaration (version 2, retiring version
+1 with this reason) is the next change; the code still serves the body until it lands.
 
 ## Reading
 

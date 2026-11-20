@@ -2167,6 +2167,20 @@ monitor pair stays as the body's evidence. The declaration check learned the rev
 that names the base's bits again is a change when the version between them is retired with its own
 arithmetic, and the self-test pins both sides of that rule.
 
+Dory is the largest loss and the cleanest verdict: the few-row body is 17.77 and 17.55 tok/s
+against the row GEMV's 26.19 and 26.15 (ratios 0.679 and 0.671) at world 1, one process. The body
+reads the BF16 rows while the GEMV build packs them beside the rows (23.1% fewer bytes a pass), and
+a 33% deficit at one lane is past any bar. One-process Dory accepts one lane only
+(`--concurrency`/`--fuse-batch` are packed-model knobs; the recurrence group needs two ranks), so
+the 16-lane half of the rule degenerates to the single-request number and that is recorded rather
+than worked around. Qwen's tensor-core decode is 35.82/35.96 against the token kernels'
+36.81/36.77 at its default one lane (ratios 0.973 and 0.978): the single-request guard passes but
+the aggregate is 2.45% worse, and the rule asks for a 2% win. Both arms therefore return to the
+older route; their version 2 references are captured and stored as evidence
+(`numerics/captures/dory10/v2-gemv.json`, `numerics/captures/qwen38/v2-token-kernels.json`), with
+bit-identical pairs, precision-tail floors (top-1 100% and 99.39%) and templated known answers,
+and the registry declarations follow in the next change.
+
 Two mechanism defects the windows exposed are fixed with it: the declaration gate now parses the
 registry with the binary's own parser (the `validate_registry` example) so a schema mismatch
 cannot pass Python and abort a release at boot; and both launchers' stop/status patterns now match

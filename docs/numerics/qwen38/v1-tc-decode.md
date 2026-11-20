@@ -127,3 +127,31 @@ python3 scripts/numerics.py compare --anchor numerics/references/qwen38-anchor.j
 
 Captured 2026-11-03 from the official checkpoint
 (`nvidia/Qwen3.8-Flash-Next-NVFP4`, snapshot `fc694b54`).
+
+## The speed rule: the tensor-core decode is not kept
+
+The written speed rule (`docs/NUMERICS.md`) applies to every arm, so Qwen's tensor-core decode
+was re-measured on the current build (`18a76075`, binary `102d216d`), the declared world-1
+configuration, context 65,536, default lanes (one), fresh boots alternating
+`SPARKFLASH_DECODE_MMA`:
+
+| boot | route | tok/s | per stream |
+| :-- | :-- | --: | --: |
+| on 1 | tensor-core decode | 35.82 | 37.25 |
+| off 1 | token kernels | 36.81 | 38.28 |
+| off 2 | token kernels | 36.77 | 38.25 |
+| on 2 | tensor-core decode | 35.96 | 37.41 |
+
+The ratios are 0.9731 and 0.9780. The single-request guard (no more than 3% worse) passes in both
+pairs, but the served-concurrency aggregate (here the same number, because the arm's default lane
+count is one) is not **+2% better** in either; it is about 2.45% worse on the means. The gap has
+narrowed from the 2026-11-04 measurement's ~8%, but the rule asks for a win, not a smaller loss.
+
+**Qwen therefore returns to its token kernels for decode as numerics version 2.** The reference is
+captured and stored as `numerics/captures/qwen38/v2-token-kernels.json` (`9e122aa7…`, eight
+prompts, 988 tokens, built from `18a76075` with `SPARKFLASH_DECODE_MMA=off`), two free captures
+bit-identical, and its floor's forced comparison against version 1 (982 tokens) is a precision
+tail: mean NLL delta +8.361e-04, mean absolute 4.991e-03, max 1.109e-01, top-1 99.3890%, mean KL
+2.180e-04. The reference's own mean NLL is 0.2228 a token. Known answers, through the template,
+are 4 / Paris / READY on all three. The registry declaration (version 2, retiring version 1 with
+this reason) is the next change; the code still serves the tensor-core decode until it lands.
