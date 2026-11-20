@@ -128,7 +128,7 @@ python3 scripts/numerics.py compare --anchor numerics/references/qwen38-anchor.j
 Captured 2026-11-03 from the official checkpoint
 (`nvidia/Qwen3.8-Flash-Next-NVFP4`, snapshot `fc694b54`).
 
-## The speed rule: the tensor-core decode is not kept
+## The speed rule, and the version it briefly chose
 
 The written speed rule (`docs/NUMERICS.md`) applies to every arm, so Qwen's tensor-core decode
 was re-measured on the current build (`18a76075`, binary `102d216d`), the declared world-1
@@ -147,13 +147,14 @@ pairs, but the served-concurrency aggregate (here the same number, because the a
 count is one) is not **+2% better** in either; it is about 2.45% worse on the means. The gap has
 narrowed from the 2026-11-04 measurement's ~8%, but the rule asks for a win, not a smaller loss.
 
-**Qwen therefore returns to its token kernels for decode as numerics version 2.** The reference is
-captured and stored as `numerics/captures/qwen38/v2-token-kernels.json` (`9e122aa7…`, eight
-prompts, 988 tokens, built from `18a76075` with `SPARKFLASH_DECODE_MMA=off`), two free captures
-bit-identical, and its floor's forced comparison against version 1 (982 tokens) is a precision
-tail: mean NLL delta +8.361e-04, mean absolute 4.991e-03, max 1.109e-01, top-1 99.3890%, mean KL
-2.180e-04. The reference's own mean NLL is 0.2228 a token. Known answers, through the template,
-are 4 / Paris / READY on all three. **Version 2 landed** (`docs/numerics/qwen38/v2-token-kernels.md`):
-the world-1 decode is the token kernels and `decode.tensor_cores = true` is refused. The
-world-2 and world-4 configurations are retired with their tensor-core captures, since the arm
-serves world 1.
+Qwen briefly served the token kernels as numerics version 2 on this measurement: the reference
+was captured as `numerics/captures/qwen38/v2-token-kernels.json` (`9e122aa7…`, eight prompts,
+988 tokens from `18a76075` with `SPARKFLASH_DECODE_MMA=off`), and its floor's forced comparison
+against version 1 (982 tokens) was a precision tail: mean NLL delta +8.361e-04, mean absolute
+4.991e-03, max 1.109e-01, top-1 99.3890%, mean KL 2.180e-04. Then the resumed = fresh test
+refused it: with the decode on the token kernels a continued turn is no longer the bits of a cold
+prefill (all 64 logits of the 73-token prompt differ). The speed rule compares only routes that
+both meet §1's invariances, so **version 3 returns world 1 to this version's arithmetic**
+(`docs/numerics/qwen38/v3-tensor-core-decode.md`), on this card and anchor again; version 2 is
+retired with its capture. The world-2 and world-4 configurations are back at version 1 on their
+existing captures.

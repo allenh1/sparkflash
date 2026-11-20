@@ -16,14 +16,16 @@ limitations under the License.
 
 # Qwen3.8-Flash-Next, world 1, numerics version 2: the token kernels
 
-**Registry state: version 2, captured on 2026-11-19 on `18a76075` (binary `102d216d`) with
-`SPARKFLASH_DECODE_MMA=off`.** It replaces the world-1 version 1 reference, retired with "the
-tensor-core decode is 2.45% behind the token kernels at one lane; version 2 returns to the token
-kernels". The world-2 and world-4 configurations are retired with their tensor-core captures in
-history, because the arm serves world 1 and the profile change is measured there.
+**Registry state: retired.** Version 2 captured on 2026-11-19 on `18a76075` (binary
+`102d216d`) with `SPARKFLASH_DECODE_MMA=off`, and served until the resumed = fresh test
+refused it. It is retired with its own reference and the reason "breaks resumed = fresh"; version
+3 returns world 1 to version 1's tensor-core decode
+(`v3-tensor-core-decode.md`). The world-2 and world-4 configurations, retired here with their
+tensor-core captures, are restored at version 1 on those same captures.
 
-The speed rule (docs/NUMERICS.md, *The speed rule*) judged the decode route on the arm's default
-one lane. The tensor-core decode is not kept.
+The speed rule (docs/NUMERICS.md, *The speed rule*) measured the token kernels ahead at the arm's
+default one lane, but the rule compares only routes that both meet §1's invariances. This one does
+not: the token kernels match the tile to a tolerance, not to its bits.
 
 ## What was measured
 
@@ -62,10 +64,16 @@ mean NLL is **0.2228 a token** over 988 tokens.
 The templated known answers all pass: `4`, `Paris`, `READY` (temperature 0, 128 tokens,
 `finish_reason: stop`).
 
+## Why it was retired
+
+The test `device_parity::a_continued_conversation_is_the_bits_of_a_cold_prefill`, with its plan
+built from the shipped profile, fails at this version's default: on the 73-token prompt all 64
+logits differ from a cold prefill of the same transcript (the first 0.2048311 against 0.2048319).
+Version 2 was 2.45% faster at one lane and not the same model on resume. Version 3 restores version
+1's bits (`v3-tensor-core-decode.md`).
+
 ## Reading
 
-Qwen's world-1 decode is back on the token kernels its prefill path uses, 2.45% faster at one lane,
-with the tensor-core route measured and held for the next attempt. The world-2 and world-4
-entries are retired with their captures; a re-added world starts at a version above 1 and takes the
-same rule. Open: the
-coverage/monitor rows the registry still names as missing (Qwen has coverage, not monitors).
+Qwen's world-1 decode was returned to the token kernels its prefill path uses, 2.45% faster at one
+lane, and then returned to the tile because the speed was bought with the resumed = fresh
+invariance. Open: Qwen has coverage, not monitors.

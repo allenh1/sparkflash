@@ -167,13 +167,8 @@ pub(super) trait PackArm {
     ///
     /// # Errors
     /// A field this arm cannot serve.
-    fn check_profile(profile: &ModelProfile) -> Result<(), String> {
-        sparkflash_model::profile::refuse_tensor_core_decode(
-            "Qwen",
-            Self::MODEL_ID,
-            "docs/numerics/qwen38/v2-token-kernels.md",
-            profile,
-        )
+    fn check_profile(_profile: &ModelProfile) -> Result<(), String> {
+        Ok(())
     }
 
     /// Parse the carried profile and apply the process environment as overrides.

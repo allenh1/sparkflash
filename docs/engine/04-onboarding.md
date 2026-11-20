@@ -688,11 +688,13 @@ slower and the several-row step to be faster, as on DeepSeek and Qwen; the writt
   `docs/numerics/glm53/v3-gemv.md`.
 - Dory's few-row body: 0.679/0.671 at one lane -
   `docs/numerics/dory10/v2-gemv.md`.
-- Qwen's tensor-core decode: 0.9731/0.9780 at its default one lane -
-  `docs/numerics/qwen38/v2-token-kernels.md`.
+- Qwen's tensor-core decode: 0.9731/0.9780 at its default one lane, so version 2 served the
+  token kernels - until the resumed = fresh test refused them; version 3 keeps the tensor-core
+  decode (`docs/numerics/qwen38/v3-tensor-core-decode.md`).
 
-Every arm therefore serves its row GEMV (or token kernels for Qwen's decode) and the optional
-tensor-core route is a typed, measured, held-back path. **For a later attempt**, start from
+Every arm therefore serves its row GEMV, except Qwen's decode, whose tensor-core route is kept
+for §1's invariance; the optional tensor-core route is otherwise a typed, measured, held-back
+path. **For a later attempt**, start from
 DeepSeek's `opt_gemv_mma`, which is the one tensor-core decode in service - not from the prompt
 tiles, whose few-row bodies lost on every released arm. Not scheduled.
 

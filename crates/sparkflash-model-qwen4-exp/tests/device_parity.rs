@@ -777,19 +777,25 @@ fn a_continued_conversation_is_the_bits_of_a_cold_prefill() {
     pin_hub_cache();
     let temp = tempfile::tempdir().expect("a temporary directory");
     write_synthetic_checkpoint(temp.path(), &config, 13).expect("the fixture writes");
+    // The shipped profile's plan, with the chunk pinned to [CHUNK] so the prompts cross a chunk
+    // boundary. The decode is the profile's: this is the test that fails when it leaves the tensor
+    // cores.
+    let plan = PrefillPlan::from_lookup(|name| {
+        (name == "SPARKFLASH_QWEN4_PREFILL_CHUNK").then(|| CHUNK.to_string())
+    })
+    .expect("the shipped profile plans");
     for prompt_len in [73, CHUNK + 100] {
-        let backend = match Qwen4ExpDeviceBackend::open_with_prefill(
-            temp.path(),
-            prompt_len + 64,
-            PrefillPlan::new(CHUNK, true),
-        ) {
-            Ok(backend) => backend,
-            Err(error) if error.code() == "qwen4_device" && error.message().contains("CUDA:") => {
-                eprintln!("skipping the continued conversation: {error}");
-                return;
-            }
-            Err(error) => panic!("the device arm refused the fixture checkpoint: {error}"),
-        };
+        let backend =
+            match Qwen4ExpDeviceBackend::open_with_prefill(temp.path(), prompt_len + 64, plan) {
+                Ok(backend) => backend,
+                Err(error)
+                    if error.code() == "qwen4_device" && error.message().contains("CUDA:") =>
+                {
+                    eprintln!("skipping the continued conversation: {error}");
+                    return;
+                }
+                Err(error) => panic!("the device arm refused the fixture checkpoint: {error}"),
+            };
         let prompt: Vec<u32> = (0..prompt_len)
             .map(|index| 3 + (index * 5 % 11) as u32)
             .collect();

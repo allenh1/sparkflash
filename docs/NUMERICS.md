@@ -216,6 +216,9 @@ tests the wrong thing. One rule judges every arm, written here before any run:
 > than 3% worse, both pairs agreeing. Otherwise the arm keeps its row GEMV for that route,
 > recorded with the numbers.
 
+The rule compares only routes that both meet §1's invariances; a route whose speed comes from
+changing the bits a resumed request sees is judged by §1, not by this rule.
+
 Served concurrency is the arm's default lane count (Inkling 4, GLM 4, Dory 16, Qwen its
 default), with drafting as served. The measurement itself:
 

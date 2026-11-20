@@ -19,10 +19,11 @@ tensor_cores = true
 exact = false
 
 [decode]
-# The speed rule measured the tensor-core decode about 2.45% behind the token kernels at the arm's
-# default one lane (35.82/35.96 against 36.81/36.77 tok/s), so version 2 serves the token kernels
-# and `decode.tensor_cores = true` is refused (docs/numerics/qwen38/v2-token-kernels.md).
-tensor_cores = false
+# Version 2 served the token kernels for the 2.45% speed win the rule measured at one lane, but
+# they compute a row a tolerance away from the tensor cores, not to its bits: a resumed turn
+# stopped matching a cold prefill. Version 3 serves the tensor-core decode again
+# (docs/numerics/qwen38/v3-tensor-core-decode.md).
+tensor_cores = true
 
 [attention]
 latent_cache = "auto"

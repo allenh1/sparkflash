@@ -104,21 +104,51 @@ expert_bar = 0.5
 # arithmetic its prefill already used (D68), so a continued chat turn is the bits of a cold one;
 # v1-tc-decode.md measures that against the anchor, which keeps the token-kernel decode
 # (SPARKFLASH_DECODE_MMA=off), and v1-tp-floor.md the reassociation floor docs/NUMERICS.md §4
-# names.
+# names. Version 2 served the token kernels for a measured 2.45% at one lane but broke resumed =
+# fresh; version 3 is version 1's arithmetic again, and v3-tensor-core-decode.md records why the
+# speed rule does not keep version 2.
 [[config]]
 model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 world = 1
 profile = "reference"
 plan = "tp"
 arch = "sm_121a"
-version = 2
+version = 3
 evidence = "logprobs"
-reference = "references/qwen38-tp1-sm121a-v2.json"
-fingerprint = "9e122aa7c12b1c13bc5d338a5f16c65b9af463dbdc544e888bbfffdf49835381"
-captured = "2026-11-19"
-report = "docs/numerics/qwen38/v2-token-kernels.md"
-approved = { decision = "The tensor-core decode is 2.45% behind the token kernels at one lane; Qwen returns to the token kernels as version 2", date = "2026-11-19", report = "docs/numerics/qwen38/v2-token-kernels.md" }
-note = "Version 2 returns the decode step to the token kernels (SPARKFLASH_DECODE_MMA=off) on the same build 18a76075 (binary 102d216d). The speed rule measured the tensor-core decode 35.82/35.96 tok/s against the token kernels' 36.81/36.77 at the arm's default one lane (ratios 0.9731/0.9780): the single-request guard passes but the served-concurrency aggregate is not +2% better, so the route is held back. The floor's forced comparison against version 1 over 982 positions is a precision tail: mean delta +8.361e-04, mean absolute 4.991e-03, max 1.109e-01, top-1 99.3890%; the templated known answers are 4, Paris and READY. The reference's own mean NLL is 0.2228 a token. The world-2 and world-4 configurations are retired with their tensor-core captures, since the arm serves world 1."
+reference = "references/qwen38-tp1-sm121a.json"
+fingerprint = "37578a09102537e51b3ff5ba0d5bef2becbf1c7578459e5fbe9c5e53c872901b"
+captured = "2026-11-03"
+report = "docs/numerics/qwen38/v3-tensor-core-decode.md"
+approved = { decision = "The token-kernel decode breaks resumed = fresh; version 3 returns world 1 to version 1's tensor-core decode", date = "2026-11-20", report = "docs/numerics/qwen38/v3-tensor-core-decode.md" }
+note = "Version 3 is version 1's arithmetic again: the reference is version 1's own card (37578a09), and the tensor-core decode is the default. Version 2's 2.45% win at one lane does not hold it: the token kernels match the tile to a tolerance, not to its bits, so a resumed turn stopped matching a cold prefill (device_parity::a_continued_conversation_is_the_bits_of_a_cold_prefill, with the shipped profile's plan at version 2's default, fails 64 of 64 logits on the 73-token prompt). Version 2 is retired with its own reference and fingerprint; docs/numerics/qwen38/v3-tensor-core-decode.md records the run."
+
+[[config]]
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+world = 2
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "logprobs"
+reference = "references/qwen38-tp2-sm121a.json"
+fingerprint = "d1d546aed4e8f285494cddcdcd1b9b788a60af3494ee260ba68deda5f936b425"
+report = "docs/numerics/qwen38/v1-tc-decode.md"
+captured = "2026-11-03"
+note = "The TP driver on two nodes over NCCL, context 65,536."
+
+[[config]]
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "logprobs"
+reference = "references/qwen38-tp4-sm121a.json"
+fingerprint = "007e70467d0d4b0667191ffc5e896b34cd1769c333bf42916b0eef2327bbca5b"
+report = "docs/numerics/qwen38/v1-tc-decode.md"
+captured = "2026-11-03"
+note = "The TP driver on four nodes over NCCL, context 65,536."
 
 # DeepSeek-V4.1-Flash's TP=4 device path serves greedy text only, so its evidence is text and it
 # has no anchor. Its greedy text depends on the server's history: a request resumed from the
@@ -203,28 +233,6 @@ note = "Version 2 returns Dory's one-to-eight-row projections to the row GEMV, o
 
 [[retired]]
 model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
-world = 2
-profile = "reference"
-plan = "tp"
-arch = "sm_121a"
-version = 1
-reference = "references/qwen38-tp2-sm121a.json"
-fingerprint = "d1d546aed4e8f285494cddcdcd1b9b788a60af3494ee260ba68deda5f936b425"
-reason = "the arm serves world 1; the decode profile change is measured there, and this world's tensor-core capture stays in history"
-
-[[retired]]
-model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
-world = 4
-profile = "reference"
-plan = "tp"
-arch = "sm_121a"
-version = 1
-reference = "references/qwen38-tp4-sm121a.json"
-fingerprint = "007e70467d0d4b0667191ffc5e896b34cd1769c333bf42916b0eef2327bbca5b"
-reason = "the arm serves world 1; the decode profile change is measured there, and this world's tensor-core capture stays in history"
-
-[[retired]]
-model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 world = 1
 profile = "reference"
 plan = "tp"
@@ -233,6 +241,17 @@ version = 1
 reference = "references/qwen38-tp1-sm121a.json"
 fingerprint = "37578a09102537e51b3ff5ba0d5bef2becbf1c7578459e5fbe9c5e53c872901b"
 reason = "the tensor-core decode is 2.45% behind the token kernels at one lane; version 2 returns to the token kernels"
+
+[[retired]]
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+world = 1
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 2
+reference = "references/qwen38-tp1-sm121a-v2.json"
+fingerprint = "9e122aa7c12b1c13bc5d338a5f16c65b9af463dbdc544e888bbfffdf49835381"
+reason = "breaks resumed = fresh: the token kernels do not compute a row to the tensor cores' bits"
 
 [[retired]]
 model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"

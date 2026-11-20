@@ -531,7 +531,7 @@ impl Walk for QwenWalk {
         // equal so the walk and the table cannot drift.
         compute: ComputeDeclaration {
             prompt: State::Native("prompt chunks on the wide tile and the grouped expert MMAs"),
-            token: State::Off("row GEMV; decode.tensor_cores=true is refused"),
+            token: State::Native("few-row twins of the tile at every row count"),
             stored: State::Native("NVFP4 weights with BF16 activation pairs"),
             rewind: State::Native("a prompt that goes back to the last prompt's end"),
         },
