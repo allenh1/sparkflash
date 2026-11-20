@@ -146,6 +146,17 @@ A CPU test pins the three-way routing:
 `token_bodies_device::the_bf16_rows_body_is_the_wide_tiles_row` - the body-equals-tile test - is
 unchanged and keeps passing; it cannot see a wrong *input*, which is exactly what this was.
 
+### The lasting fix: the layout is a type
+
+The routing refusal above was a patch. The layout now lives in the packed matrix's type:
+`sparkflash_ops::packed::Packed<Walk>` / `Packed<Tiled>`, with `PackedSet<Walk>` and
+`PackedSet<Tiled>` and a `PackedSet::body_copy` that only a tiled set fills. The row GEMV takes
+`Packed<Walk>` only, and the few-row body takes `Packed<Tiled>` only, so the head's
+walk-layout copy cannot reach `q4p_dense_rows` even if every shape check passes. Inkling's set
+stays `PackedSet<Walk>`, so the head's route is the row GEMV by type. The full route table for
+every arm, the wrong-layout tests, and what is still admitted by shape alone are in
+[the route record](../v1-few-row-routes.md).
+
 ### The consequence for v1
 
 **`numerics/references/inkling2-tp4-sm121a.json` (`387647bc…`) pins the defect, not clean
