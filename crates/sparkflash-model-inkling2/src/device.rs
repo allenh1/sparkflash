@@ -741,10 +741,6 @@ fn gemv_grid(rows: usize) -> u32 {
 /// packed in the walk layout is therefore the row GEMV's alone, and the body must keep off it:
 /// packing in place overwrites the BF16 rows, so a body handed that pointer reads the packed
 /// bytes as if they were BF16 words.
-///
-/// The head is the exception: it carries a second, tiled packed copy beside the walk one
-/// (`device/packed.rs`), so its few-row body reads [DenseRowsInput::Packed] while the wider
-/// chunk walk keeps its row GEMV over the walk copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DenseRowsInput {
     /// The BF16 rows the matrix pointer names: no packed copy stands for this matrix.
@@ -766,9 +762,6 @@ fn dense_rows_input(packed: Option<Layout>) -> DenseRowsInput {
     }
 }
 
-/// The packed copy a projection offers the few-row body: the head's tiled copy when the matrix is
-/// the head, else the dense set's copy (which is another projection's only packed form, and the
-/// head's walk-layout one for the row GEMV).
 /// One f32 argument as the driver's one-word cell.
 fn bits(value: f32) -> u64 {
     u64::from(value.to_bits())
@@ -1468,10 +1461,6 @@ struct Shared {
     weights: Weights,
     /// The dense projections packed in place ([packed]), by their slots' pointers.
     dense: PackedSet,
-    /// The head's tiled packed copy ([packed]), beside the walk-layout one in [Self::dense]: the
-    /// few-row body (`q4p_dense_rows`) decodes only the tiled layout, and the head is the one
-    /// projection whose few-row decode takes the body. Empty under [DenseForm::Checkpoint].
-    head: PackedSet<Tiled>,
     clip: Vec<ClipScales>,
     clip_arena: Deviceptr,
     experts: Vec<Option<ExpertScale>>,
@@ -1630,13 +1619,12 @@ impl Shared {
     /// One dense BF16 projection of `batch` rows through `q4p_dense_rows`, the wide tile's
     /// few-row body: the row is `glm_prefill_bf16_wide`'s, the tile Inkling's prompt walk runs.
     /// The body reads the matrix's packed copy only when the arm packed it in the body's tiled
-    /// layout ([DenseRowsInput::Packed]); the other projections pack in place in the row walk's
-    /// layout, so a packed projection is the row GEMV's and the body must keep off it. The set's
-    /// layout types that hand-off: [sparkflash_ops::packed::PackedSet::body_copy] is the only
-    /// source of the body's `Option<Packed<Tiled>>`, and a `PackedSet<Walk>` yields none. The
-    /// head carries a tiled copy of its own beside its walk copy (`device/packed.rs`), and that
-    /// is the copy the body reads. Only the shapes the body covers take it (whole eight-column
-    /// writes and a whole 32-column K run); everything else keeps the row GEMV.
+    /// layout ([DenseRowsInput::Packed]); Inkling packs in place in the row walk's layout, so a
+    /// packed projection is the row GEMV's and the body must keep off it. The set's layout types
+    /// that hand-off: [sparkflash_ops::packed::PackedSet::body_copy] is the only source of the
+    /// body's `Option<Packed<Tiled>>`, and a `PackedSet<Walk>` yields none. Only the shapes
+    /// the body covers take it (whole eight-column writes and a whole 32-column K run);
+    /// everything else keeps the row GEMV.
     fn dense_rows(
         &self,
         weight: Deviceptr,
@@ -1660,19 +1648,12 @@ impl Shared {
         // The rows this launch reads, and the copy it reads them from. A walk-layout packed copy
         // is refused rather than passed with a null packed pointer: in place it is the matrix's
         // only copy, so the null form would read the packed bytes as BF16. `body_copy` is the
-        // typed hand-off: the head's tiled set yields its copy, and the dense set (a walk one)
-        // yields none. The head's tiled copy is preferred over the walk copy the dense set holds
-        // for the wider chunk walk.
-        let tiled = self.head.body_copy(weight);
+        // typed hand-off: a tiled set's copy is the body's, and a walk set has none to offer.
         let held = self.dense.get(weight);
-        let packed: Option<Packed<Tiled>> = match dense_rows_input(
-            tiled
-                .map(|copy| copy.layout())
-                .or_else(|| held.map(|copy| copy.layout())),
-        ) {
+        let packed: Option<Packed<Tiled>> = match dense_rows_input(held.map(|copy| copy.layout())) {
             DenseRowsInput::Bf16 => None,
             DenseRowsInput::Packed => {
-                let copy = tiled.unwrap_or_else(|| {
+                let copy = self.dense.body_copy(weight).unwrap_or_else(|| {
                     unreachable!("only a tiled-layout set yields the body's copy")
                 });
                 copy.admits(batch, inner, input)?;
@@ -3031,7 +3012,6 @@ impl Drop for Shared {
     fn drop(&mut self) {
         let mut pointers: Vec<Deviceptr> = self.weights.allocations.clone();
         pointers.extend(self.dense.allocations());
-        pointers.extend(self.head.allocations());
         pointers.push(self.weights.zeros);
         pointers.push(self.clip_arena);
         pointers.push(self.expert_arena);
@@ -3288,9 +3268,8 @@ impl InklingDeviceBackend {
         let ledger = FormatLedger::boot(weights.ledger.clone(), &weights.widen)
             .map_err(|error| error.to_string())?;
         eprintln!("[inkling] rank {}: {ledger}", tp.rank());
-        let (dense, head) = pack_dense(&cuda, &kernels, &[&plan, &prefill], &weights, dense_form)?;
+        let dense = pack_dense(&cuda, &kernels, &[&plan, &prefill], &weights, dense_form)?;
         eprintln!("[inkling] rank {}: {}", tp.rank(), dense.summary());
-        eprintln!("[inkling] rank {}: {}", tp.rank(), head.summary());
         let (clip, clip_arena) = widen_clips(&cuda, &kernels, &plan, &weights)?;
         let ExpertTables {
             scales: experts,
@@ -3356,7 +3335,6 @@ impl InklingDeviceBackend {
                 kernels,
                 weights,
                 dense,
-                head,
                 clip,
                 clip_arena,
                 experts,
@@ -6384,10 +6362,9 @@ impl InklingDeviceSession {
                     self.rms(&shared, "final_norm", self.state.scratch.final_row, hidden)?;
                     let weight = self.weight(step.weights[0]);
                     // The head's one row takes the wide tile's few-row body (q4p_dense_rows)
-                    // where the body has the rows to read: the head carries a tiled packed copy
-                    // (device/packed.rs) that selects the body by layout, and a checkpoint-form
-                    // (BF16) head has no packed copy and takes the body over its rows. A shape
-                    // the body does not cover falls back to the row GEMV.
+                    // where the body has the rows to read; the head's packed copy is the row
+                    // walk's, whose only few-row reader is the row GEMV, so a packed head keeps
+                    // the GEMV and a checkpoint-form (BF16) one takes the body.
                     let rows = plan.rank_vocab();
                     match shared.dense_rows(
                         weight,
@@ -6723,23 +6700,6 @@ mod tests {
         assert_eq!(
             dense_rows_input(Some(Layout::Walk)),
             DenseRowsInput::RowGemv
-        );
-        // The head holds both copies (device/packed.rs packs the tiled one before the walk one
-        // replaces the BF16 rows): the body's selection must take the tiled copy, not the walk
-        // copy the row GEMV reads.
-        assert_eq!(
-            dense_rows_input(Some(Layout::Tiled).or(Some(Layout::Walk))),
-            DenseRowsInput::Packed
-        );
-        // Every other projection has only the dense set's walk copy, so it keeps the row GEMV.
-        assert_eq!(
-            dense_rows_input(None.or(Some(Layout::Walk))),
-            DenseRowsInput::RowGemv
-        );
-        // A checkpoint-form head holds neither copy and takes the body over its BF16 rows.
-        assert_eq!(
-            dense_rows_input(None.or(None::<Layout>)),
-            DenseRowsInput::Bf16
         );
     }
 
