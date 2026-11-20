@@ -2187,6 +2187,196 @@ cannot pass Python and abort a release at boot; and both launchers' stop/status 
 a renamed binary (`[s]parkflash[^ ]* serve` and `[s]erve --model`), which had silently left four
 ranks serving twice.
 
+## The 2026-11-20 pass: one prompt half for every scheduler, and where onboarding cost sits
+
+No cluster was used. Device runs are on one GB10 host (one rank), CPU runs on a development
+machine. What that leaves unverified is listed at the end of each part.
+
+### What the tip verifies on one GB10
+
+At `3f7e62fa`, before any change of this pass:
+
+* The generated checks pass on the toy walk, dense, Qwen, GLM and Inkling: whole prompt = chunked
+  = token by token, alone = four at once, continued turn = cold, rewound turn = cold, no
+  unrecorded widening; drafted = plain passes on Qwen, GLM and Inkling and is skipped where the
+  arm declares no drafter. TP 1 = 2 = 4 is skipped on every arm: one rank.
+* `numerics.py check` passes for Qwen world 1 version 3 (`37578a09…872901b`) against the released
+  NVFP4 checkpoint and for Dory world 1 version 2 (`4f3af7e0…3955abc`).
+* Dory has no `conformance!` invocation, so its resumed = fresh check is the served one:
+  `served-gate.py turns --strict` at TP 1. Every continued turn equals its cold run, and every
+  one reports `cached 0`: the single-process Dory session reuses nothing
+  (`DoryDeviceSession::reusable_prefix` is `None`). The strict verdict is therefore FAIL for want
+  of reuse, with no wrong token. That is a missing pattern, not a numerics defect, and it is the
+  first row of "Dory" below.
+* One observation, not diagnosed: the tip's Qwen serve at a 262,144 context reached about 102 GB
+  resident on a 116 GB host.
+
+### The share clock had drifted between the four ticks
+
+The tick existed in four hand-kept copies: `tick::replay::Replay::tick` (the CPU model),
+`TickEngine::tick`, DeepSeek's `Batch::tick`, and `tp4_forward/live_trace.rs` (a CPU mirror of
+`Batch`). The text-equality gates hold their *decisions* together for one workload; they do not
+hold the copies' control flow together. One rule had drifted: `Batch` restarts the decoders'
+share clock only on a long chunk (more than `SHARE_MIN_ROWS` rows left when it ran), and the
+replay, the engine and the mirror restarted it on any prefill. A short prompt between two long
+chunks therefore held the next long chunk back in three of the four and not in the fourth.
+`Batch` is the reference, so the other three were corrected and the two committed traces
+regenerated; the difference is the long prompt's first chunk running one tick earlier.
+
+### What landed
+
+The decisions and the control flow that were `Batch`'s alone are now in `runtime/src/tick.rs`,
+and each scheduler calls them:
+
+| Piece | What it decides | Callers |
+|---|---|---|
+| `long_chunk` | which prefill restarts the share clock | all four |
+| `tick_chunks` | the chunks one bulk tick runs: a chunk a rows state, the decoder's rows split off | replay, engine, mirror; `Batch::prefill_bulk` keeps its own loop (below) |
+| `together` over `TogetherHost` | which prompts end together in one tick | all four |
+| `ShareClock` | the clock's three values, `hold`, `hold_since`, `settle` | all four |
+| `tick_prefill` over `TickHost` | the prompt half of a tick: adopt, hold, together or alone, the long chunk | all four |
+
+The engine gained what the decisions need: `Limits::chunks` (the prompts one pass may hold),
+`Runtime::run_parts_paired` (several prompts' rests in one `Paired` pass, each headed from its
+own last row), and `TickConfig::ways`. They are inert for the four served arms: none declares a
+paired pass it can run (Qwen and Inkling refuse it, GLM runs it as bulk), so `ways` is 1, and a
+group's wire carries no paired frame, so a group is 1 as well. CPU tests pin both the three-way
+behaviour and the refusal of a config wider than the pass.
+
+`Batch::tick` now runs `tick_prefill` through a host wrapper (`Ticking`): the order, the copy
+from another lane, the whole-chunk test, the shared rows, the lane memory and the two prefills
+stay `Batch`'s; the rule that chooses among them is the runtime's. Three things about it are
+deliberate:
+
+* `Batch::prefill_bulk`'s slot loop was not moved onto `tick_chunks`. Its sizes interleave with
+  the Engram reads it submits for the next tick, and a restructure there needs the device gate.
+  It is the one remaining copy of the chunk rule.
+* `place` and `decode` are still each scheduler's own. `place` differs in what commits a start
+  (the runtime's `start_prompt_slot` on the engine, `decoder_resume` and the lane's memory on
+  `Batch`); only its candidate scoring is common, and that is already `pick_lane`.
+* `live_trace.rs` stays for now. With the prompt half shared it mirrors only `place`, the two
+  prefills and `decode`, which is what `tick::replay` also models; it can be deleted once those
+  are shared, and the phase 6 text that names it as the gate then names the replay instead.
+
+One defect was found by the audit and fixed: the dense arm's `head` recorded a sampled token
+twice (once before the argmax test, once again on the sampling path), so a request with
+penalties counted every generated token twice and the sampler's history ran one token a step
+ahead of the position a rewind truncates it to. Greedy requests without penalties take the
+argmax path and were unaffected, which is why the generated checks did not see it. The second
+record is removed and `a_sampled_step_records_its_token_once` (a device test) fails on the old
+code and passes on the new. No released model serves on the dense arm.
+
+Verified, CPU: `cargo test -p sparkflash-runtime` (the replay trace, the engine trace, the
+drafter, group and sealing tests, and the new unit tests of each piece), clippy clean. Verified,
+one GB10: `sparkflash-deepseek-forward`'s library tests (299 pass, the mirror gate among them),
+the generated checks on all five crates again after the engine moved onto `tick_prefill`, and the
+dense arm's whole test module with its device tests.
+
+Not verified, and owed to the cluster: `Batch` on a device. The prompt half is a restructure
+with the same calls in the same order, but DeepSeek's outputs are gated by the tick-trace A/B
+and the served gate, and neither has run. The TP checks of every arm are skipped on one rank.
+
+### Where the run path stands
+
+| Model | Scheduler | On `Walk` |
+|---|---|---|
+| DeepSeek V4.1 | `Batch` (its own; shares the decisions and the prompt half) | no |
+| Qwen (three selectors), GLM | `TickEngine` through `TickServe`, alone and in a group | yes |
+| Inkling | `TickEngine` in a group; the older `FusedEngine` when the group serves images; an f32 host path with no walk when it runs alone | group only |
+| dense (any catalogue-only model) | `TickEngine` alone; `Fusion::group` (the older engine) in a TP group | yes |
+| Dory | its own two `ModelSession`s (device, recurrence ring): own lanes, chunking, history, rewind and ledger | no |
+
+So the runtime itself still carries two schedulers (`engine.rs` 2,242 lines, `fused.rs` 2,290),
+and two models are outside it.
+
+### What a new family costs today
+
+Measured at this tip, by reading (line ranges are in the two sweeps' notes, not repeated here):
+
+* **The walk.** 391 non-test lines for dense, 829 for Qwen, 864 for GLM, 998 for Inkling. The
+  `impl Walk` block itself is 173 to 203 lines in each; the rest is the sequence, the drafter and
+  the arm's row plumbing.
+* **Test scaffolding.** More than 60% of each walk file is its test module (658 to 808 lines),
+  and most of that is the same CPU shape walk, the same tick-engine profile tests and the same
+  fixture helpers, copied with the type name changed (Qwen's and Inkling's shape walks differ in
+  61 of about 322 lines).
+* **Serving glue.** `enable_fusion`, `enable_group_fusion`, `mirror_group`, `lane_limit`, `wire`,
+  `group_rank` and a serving enum in each arm: three to eight lines of body each under ten to
+  twenty of comment, near-identical between GLM, Qwen and dense.
+* **Outside the crate.** About 25 edits in about 15 files on the cheapest route: the descriptor
+  and `MODELS` row, the `Arm` impl and `ARMS` entry, the `ARM_LEDGERS` row, the workspace and
+  both CI files (a test enforces those), then the sites `ARMS` does not derive: `TYPED_PACKS` and
+  a roughly 20-item `PackArm` impl or a family arm in `dynamic.rs`, the codec and `Dialect`
+  match, a response engine, the converter's branch and its `released` list, the web console's
+  `deployment_for` row, the launch script's environment pattern, and `onboard-gate.sh`'s crate
+  case. `PackArm::PROFILE_TOML` and `DEFAULT_CONTEXT`, the converter's `released` list and
+  default world, and the console's world size all repeat a field `Arm` already has.
+* **Two traps.** The CLI line gate has no headroom: the CLI is 35,972 lines and the gate is
+  `< 35,973`, so any CLI edit must delete as many lines as it adds. And the group default context
+  in `dynamic.rs` is Inkling's constant applied to every `--rank` group.
+
+Against the plan's test for done (a family supplies its `Architecture` mapping, the arithmetic of
+its own parts, and its weight names, tokenizer and template), the gap is these four, in this
+order of size: the dispatch outside the crate, the hand-written walk, the copied scaffolding, the
+glue.
+
+### Is the unified run path being reached the cheapest way
+
+Three findings, each with the change it implies.
+
+1. **Phase 6 does not lower onboarding cost; mechanisms 2 and 5 do, and neither is finished.**
+   Moving DeepSeek onto the runtime's engine removes a program and gives the other arms batched
+   prompts, tick-ahead and adoption. A new family writes exactly as much after it as before. The
+   two mechanisms that decide what a family writes are the generic walk with part plug-ins
+   (mechanism 2, phase 4: `PlanWalk` and `PartExec` do not exist; the dense arm's walk is the
+   generic loop with two closed enums, `Mixer` and `LayerFfn`, as its only extension points) and
+   the serving dispatch derived from one registration (mechanism 5 explicitly leaves it
+   underived). Recommended order from here: the derived dispatch, then the part plug-in, with
+   phase 6 continuing underneath as bit-neutral steps.
+2. **Phase 6 is cheaper as shared halves under host traits than as a second engine grown to
+   parity and a cutover.** The plan's route builds `TickEngine` feature by feature until it can
+   replace `Batch`, then moves DeepSeek across in one step with an A/B. This pass took the other
+   route for the prompt half: one function, and each scheduler a host of it. It removes the drift
+   by construction, needs no cutover, leaves `Batch`'s device work where it is, and each step is
+   pinned on the CPU by traces that must not change. The same shape applies to the bulk chunk
+   loop (with the read submissions as host calls) and to `decode`'s plan. Whether DeepSeek then
+   becomes a `Walk` is a separate and later question; decision 4's condition (no speed loss) is
+   easier to meet when its device work has not moved.
+3. **The arm contract still makes every arm write what the runtime could own.** Each of these is
+   in all four walks:
+   * the head's record-then-choose over `HeadInput` (and it is where the dense defect was);
+   * a stash between `walk` and `head`, because `Hidden` carries only a row count (dense keeps
+     device scratch, GLM three fields, Qwen a queue under a lock, Inkling three fields);
+   * `LaneState`'s bounds checks, with the same error strings;
+   * the lane memory the runtime hands `open`, discarded by all four (`let _ = memory;`);
+   * the draft budget formula and the expert-union wall's construction.
+   Moving the first two into the contract changes every arm's `head` and so needs each arm's
+   generated checks; one GB10 runs all five suites in about three minutes once built, so this is
+   work for a device host, not for the cluster.
+
+### What to do next, in order
+
+1. **One serve entry for any `Walk` arm.** A `WalkArm` item in the runtime (build the walk, name
+   the wire, say whether this is a group's rank) with generic `serve`, `serve_group`, `mirror` and
+   `lane_limit`, and the three text arms' glue deleted onto it. Then `Arm` gains the crate name,
+   the dialect and the lane count, and `TYPED_PACKS`, the codec match, the converter's lists and
+   the console's deployment rows read `ARMS`. This is the step that turns "25 edits in 15 files"
+   into one declaration, and it lowers the CLI line gate as it goes. The group halves need a
+   group to verify.
+2. **The scaffolding.** One parametrised CPU shape walk in the runtime replaces the three copies
+   (in progress at the time of writing; see the commit that follows this section), then
+   `conformance!` emits the tick-profile and compute-row tests from the arm's stated chunk list
+   and member cap.
+3. **The contract** (finding 3), one item at a time, each gated by the generated checks.
+4. **Retire `FusedEngine`.** Two users remain: dense in a TP group (its lane frames cannot carry
+   a chunk's rows yet) and Inkling's group with images. Both need a group.
+5. **Dory onto `Walk`.** It is the only served model with no reuse at TP 1 and the only one whose
+   ledger is written by hand.
+6. **The part plug-in** (mechanism 2). Open the dense walk's two enums into `PartExec` and move
+   the dense arm onto it; a family with one new part then writes that part.
+7. **Phase 6, continued as shared halves**: the bulk chunk loop, then `decode`'s plan, each with
+   the tick-trace A/B on the cluster.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:

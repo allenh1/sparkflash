@@ -769,10 +769,13 @@ decisions compare as decisions. The file is rewritten at each tick's end, so a r
 up has the decisions it has already made.
 
 The gate is `crates/sparkflash-deepseek-forward/src/tp4_forward/live_trace.rs`: a CPU mirror of
-`Batch::tick`'s order (place, hold, the first prefill in prompt order, decode) drives the same
-shared functions and records through the same `TickTrace`; for the fixed 30-tick workload of
+`Batch::tick`'s order (place, hold, the prompt half, decode) drives the same shared functions and
+records through the same `TickTrace`; for the fixed 30-tick workload of
 `sparkflash-runtime/tests/tick_trace.rs` its rendered trace must equal `tick::replay`'s text. It
-needs no device. The device-only decisions `Batch` makes (`resume_boundary`, lane memory and
+needs no device. Since 2026-11-20 the prompt half is not mirrored at all: `Batch`, the engine,
+the replay and the mirror all run `sparkflash_runtime::tick::tick_prefill`, each as a host of it
+([04-onboarding-review.md](04-onboarding-review.md#the-2026-11-20-pass-one-prompt-half-for-every-scheduler-and-where-onboarding-cost-sits)),
+so the mirror now models only `place`, the two prefills and `decode`. The device-only decisions `Batch` makes (`resume_boundary`, lane memory and
 growth, adoption, paired chunks, preemption, the actual step, the drafter's depth) are not in
 that mirror; a device run's trace is the only check of those, and it still owes the cluster.
 
