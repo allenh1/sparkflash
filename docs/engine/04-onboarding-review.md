@@ -2136,16 +2136,42 @@ the GEMV head (`b62e2fcb`, binary `23666b8d`):
 - **The tiled copy is exact.** With `SPARKFLASH_DENSE_WEIGHTS=checkpoint` the same build
   forced-captures the tiled default's own tokens with 0.000e+00 at every position: the body over
   the tiled packed copy and the body over the BF16 rows are the same bits.
-- **It is slower.** Two alternated fresh-boot pairs, three 256-token greedy requests each after
-  two warm-ups: tiled 30.54 vs GEMV 34.50 tok/s (pair 1), GEMV 34.48 vs tiled 32.57 (pair 2).
-  The tiled head is 6.6-8.5% below the GEMV and loses both pairs; the written bar was +2% with
-  both pairs won.
+- **It is slower, at one request and at four lanes.** Under the written speed rule (served
+  concurrency four lanes, drafting as served), two alternated fresh-boot pairs: pair 1, tiled
+  31.55 single / 59.56 four-lane against GEMV 33.61 / 62.95; pair 2, GEMV 33.38 / 63.06 against
+  tiled 32.07 / 62.69. The ratios are 0.9387 and 0.9461 in pair 1 and 0.9608 and 0.9941 in pair
+  2, against a four-lane bar of 1.02 and a single guard of 0.97 in both pairs.
 
 The plan's regression clause keeps the GEMV, so the tiled head's packing and its +355 MB arena
 were reverted (`4ee6eb45`). The typed packed layout (`Packed<L>`, `PackedSet<Tiled>`,
 `body_copy`) and the route audit (`docs/numerics/v1-few-row-routes.md`) stay: they are what
 makes the next tiled attempt a type-checked change, and the audit's Inkling head row still
 describes the served path (walk copy → GEMV).
+
+## The speed rule's first results
+
+The rule was written before the runs (`e9ac17da`): a tensor-core route is kept when, on
+alternated fresh-boot pairs, the served concurrency's aggregate tok/s is at least +2% better and
+single-request tok/s no more than 3% worse, both pairs agreeing; otherwise the arm keeps its row
+GEMV, recorded with the numbers. Inkling's tiled head failed both pairs at four lanes (0.9461 and
+0.9941) and at one request (0.9387 and 0.9608), so it stays out; its four-lane and single numbers
+are in `docs/numerics/inkling2/v2-clean-head.md`.
+
+GLM-5.3's version 2, the FP8 tile body, fails the same rule decisively: on one build
+(`18a76075`, binary `102d216d`) the ON route is 42.06 single / 56.22 four-lane against OFF
+46.20 / 61.50, and 41.78 / 47.93 against 46.35 / 61.42 tok/s. The clean ratios are ~0.91 on both
+axes (~0.78 four-lane on the loaded boot), against a +2% four-lane bar and a -3% single guard.
+GLM returns to the tiled row GEMV as version 3, whose reference is version 1's own card and
+whose report is `docs/numerics/glm53/v3-gemv.md`; version 2 is retired with that reason and the
+monitor pair stays as the body's evidence. The declaration check learned the revert shape: a bump
+that names the base's bits again is a change when the version between them is retired with its own
+arithmetic, and the self-test pins both sides of that rule.
+
+Two mechanism defects the windows exposed are fixed with it: the declaration gate now parses the
+registry with the binary's own parser (the `validate_registry` example) so a schema mismatch
+cannot pass Python and abort a release at boot; and both launchers' stop/status patterns now match
+a renamed binary (`[s]parkflash[^ ]* serve` and `[s]erve --model`), which had silently left four
+ranks serving twice.
 
 ## Order and ownership
 

@@ -117,11 +117,14 @@ comparison above shows that change is a precision tail. What is still open:
   correct: its forced comparison against this reference over 970 positions is a precision tail
   (top-1 100.0000%, mean absolute NLL delta 5.742e-06, max 2.655e-03, 0 of the worst 20 at
   position 0, the worst 20 over 4 prompts), and the checkpoint-form capture is bit-identical to
-  the default one, which proves the tiled copy exact. It is slower, though: two alternated
-  fresh-boot pairs give 30.54 vs 34.50 and 32.57 vs 34.48 tokens/s, -6.6% to -8.5% for the tiled
-  head, losing both pairs against a written +2% bar. The plan's regression clause keeps the GEMV
-  head, so the tiled copy and its +355 MB arena were reverted (`4ee6eb45`); the typed packed
-  layout and its routing contract stay.
+  the default one, which proves the tiled copy exact. It is slower, though. Under the written
+  speed rule (served concurrency 4 lanes, drafting as served), two alternated fresh-boot pairs
+  give: pair 1, tiled 31.55 single / 59.56 four-lane against GEMV 33.61 / 62.95 (0.9387 and
+  0.9461); pair 2, GEMV 33.38 / 63.06 against tiled 32.07 / 62.69 (0.9608 and 0.9941) - the rule
+  needs four-lane at least 1.02 and single at least 0.97 in both pairs, and neither pair reaches
+  the four-lane bar. The earlier single-stream pairs (30.54 vs 34.50 and 32.57 vs 34.48) agree.
+  The plan's regression clause keeps the GEMV head, so the tiled copy and its +355 MB arena were
+  reverted (`4ee6eb45`); the typed packed layout and its routing contract stay.
 - **Coverage and monitors.** The model has neither row yet; this bump carries the owner's
   approval for that reason.
 - **The speed A/B.** Unmeasured here; the plan expects flat-to-slightly-slower at one row.
