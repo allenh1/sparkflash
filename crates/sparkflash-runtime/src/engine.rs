@@ -65,10 +65,10 @@ use crate::group::{GroupWire, TickGroup, watched_hub};
 use crate::ledger::{Ledger, Mode, Strategy};
 use crate::runtime::{Runtime, RuntimeSlot, StepMode};
 use crate::tick::{
-    Clock, Decision, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, SHARE_MIN_ROWS,
-    StepModel, TickRows, TickTrace, TraceSink, WallClock, bulk_budget, bulk_from, bulk_rows,
-    common_prefix, decode_plan, hold_prefill, pick_lane, prefill_order, reusable_shared, tick_rows,
-    whole_chunk_fits,
+    Clock, Decision, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, QUEUE,
+    SHARE_MIN_ROWS, StepModel, TickRows, TickTrace, TraceSink, WallClock, bulk_budget, bulk_from,
+    bulk_rows, common_prefix, decode_plan, hold_prefill, pick_lane, prefill_order, reusable_shared,
+    tick_rows, whole_chunk_fits,
 };
 use crate::walk::{Drafter, Hidden, PassMask, Vision, Walk, WalkHook};
 
@@ -665,6 +665,18 @@ impl<W: Walk> TickEngine<W> {
                     "the prompt needs {} positions and the sequence holds {}",
                     tokens.len(),
                     self.runtime.limits().context
+                ),
+            ));
+        }
+        // DeepSeek's queue: the lanes plus crate::tick::QUEUE sequences may wait. A prompt past
+        // that is refused here, before it becomes a frame the group has to abandon.
+        let queued = self.requests.iter().filter(|request| !request.done).count();
+        if queued >= self.slots.len() + QUEUE {
+            return Err(BackendError::new(
+                "queue",
+                format!(
+                    "the queue is full: {} lane(s) and {QUEUE} waiting",
+                    self.slots.len()
                 ),
             ));
         }

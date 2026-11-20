@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, StepOutput};
-use sparkflash_runtime::tick::Clock;
+use sparkflash_runtime::tick::{Clock, QUEUE};
 use sparkflash_runtime::{
     Absent, ComputeDeclaration, HeadRow, Hidden, LaneMemory, LaneState, Limits, NoVision, Pass,
     Segment, StateKind, StateLayout, TickConfig, TickEngine, TickEvent, Walk, WalkCapabilities,
@@ -334,6 +334,23 @@ fn the_serving_engine_answers_two_sessions_and_keeps_a_lane_s_prefix() {
     );
     drop(alone);
     drop(other);
+}
+
+/// DeepSeek's queue is the lanes plus [QUEUE] waiting sequences; the next prompt is refused
+/// before it is queued, not failed inside a tick.
+#[test]
+fn the_admission_queue_is_sixty_four_past_the_lanes() {
+    let walk = ReplayWalk::new(64, 65_536);
+    let mut engine = TickEngine::new(walk, 3).expect("the engine starts");
+    for index in 0..3 + QUEUE {
+        engine
+            .admit(&[index as u32 + 1], &[], Sampling::default())
+            .expect("a queued prompt");
+    }
+    let error = engine
+        .admit(&[1], &[], Sampling::default())
+        .expect_err("the queue is full");
+    assert!(error.message().contains("queue is full"), "{error}");
 }
 
 #[test]
