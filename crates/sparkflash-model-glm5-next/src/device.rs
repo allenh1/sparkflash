@@ -112,7 +112,7 @@ use sparkflash_ops::gemv::{
 };
 use sparkflash_ops::indexer::{IndexerPass, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS};
 use sparkflash_ops::moe::{MoePlanCall, combine_grid};
-use sparkflash_ops::packed::{self, Form, PackedSet, Placement};
+use sparkflash_ops::packed::{self, Form, PackedSet, Placement, Tiled};
 use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
@@ -2668,7 +2668,7 @@ pub struct DeviceRank {
     rewind: bool,
     /// Packed copies of the BF16 projections the tiled GEMV reads ([Self::pack_linears]), beside
     /// the BF16 rows the bulk prefill and the drafts' E4M3 head still read.
-    packed: PackedSet,
+    packed: PackedSet<Tiled>,
     memory: Allocations,
 }
 
@@ -4174,7 +4174,7 @@ impl DeviceRank {
             (None, Some(packed)) => (
                 self.kernels.gemv_packed.kernel,
                 tiled_gemv_splits(tiles, linear.columns),
-                packed.planes().to_vec(),
+                packed.tiled_planes()[..3].to_vec(),
             ),
             (None, None) => (
                 self.kernels.gemv_bf16.kernel,
@@ -4201,7 +4201,7 @@ impl DeviceRank {
         }
         args.extend(linear.parts.map(|start| start as u64));
         if let (None, Some(packed)) = (linear.weight.scales(), packed) {
-            args.push(packed.row_bytes() as u64);
+            args.push(packed.tiled_planes()[3]);
         }
         let groups = rows.div_ceil(MAX_ROWS) as u32;
         self.launch(kernel, (tiles as u32, splits as u32, groups), BLOCK, &args)

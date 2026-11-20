@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_ops::calls::Call;
-use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement, packable};
+use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement, Walk, packable};
 use sparkflash_weights::DType;
 
 use super::{Entry, Kernels, Shared, Weights};
@@ -113,7 +113,7 @@ impl Shared {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn gemv_packed(
         &self,
-        matrix: Packed,
+        matrix: Packed<Walk>,
         input: Deviceptr,
         out: Deviceptr,
         rows: usize,
@@ -135,7 +135,7 @@ impl Shared {
     /// bits. `parts` holds (matrix, output, rows).
     pub(super) fn gemv4_packed(
         &self,
-        parts: &[(Packed, Deviceptr, usize)],
+        parts: &[(Packed<Walk>, Deviceptr, usize)],
         input: Deviceptr,
         columns: usize,
         batch: usize,

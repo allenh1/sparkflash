@@ -801,16 +801,12 @@ impl DeviceSequence {
             if let Some(copy) = self
                 .backend
                 .packed
-                .get(matrix.data())
+                .body_copy(matrix.data())
                 .filter(|copy| copy.admits(matrix.rows(), matrix.columns(), input).is_ok())
             {
-                let [rows, offsets, entries] = copy.planes();
-                packed[slot * 4..slot * 4 + 4].copy_from_slice(&[
-                    rows,
-                    offsets,
-                    entries,
-                    copy.row_bytes() as u64,
-                ]);
+                let [rows, offsets, entries, row_bytes] = copy.tiled_planes();
+                packed[slot * 4..slot * 4 + 4]
+                    .copy_from_slice(&[rows, offsets, entries, row_bytes]);
             }
             let target = if segments > 1 {
                 self.gemm_partials.offset(partials * 4)

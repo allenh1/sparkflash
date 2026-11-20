@@ -89,7 +89,7 @@ use chunk::{BandOut, Rows, band_exchange, band_mix, exchange_gather, exchange_su
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 use packed::pack_dense;
-use sparkflash_ops::packed::{Form as DenseForm, Layout, PackedSet};
+use sparkflash_ops::packed::{Form as DenseForm, Layout, Packed, PackedSet, Tiled};
 use sparkflash_ops::plan::Precision;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 pub use tower::InklingVisionTower;
@@ -1620,9 +1620,11 @@ impl Shared {
     /// few-row body: the row is `glm_prefill_bf16_wide`'s, the tile Inkling's prompt walk runs.
     /// The body reads the matrix's packed copy only when the arm packed it in the body's tiled
     /// layout ([DenseRowsInput::Packed]); Inkling packs in place in the row walk's layout, so a
-    /// packed projection is the row GEMV's and the body must keep off it. Only the shapes the
-    /// body covers take it (whole eight-column writes and a whole 32-column K run); everything
-    /// else keeps the row GEMV.
+    /// packed projection is the row GEMV's and the body must keep off it. The set's layout types
+    /// that hand-off: [sparkflash_ops::packed::PackedSet::body_copy] is the only source of the
+    /// body's `Option<Packed<Tiled>>`, and a `PackedSet<Walk>` yields none. Only the shapes
+    /// the body covers take it (whole eight-column writes and a whole 32-column K run);
+    /// everything else keeps the row GEMV.
     fn dense_rows(
         &self,
         weight: Deviceptr,
@@ -1645,13 +1647,14 @@ impl Shared {
         }
         // The rows this launch reads, and the copy it reads them from. A walk-layout packed copy
         // is refused rather than passed with a null packed pointer: in place it is the matrix's
-        // only copy, so the null form would read the packed bytes as BF16.
+        // only copy, so the null form would read the packed bytes as BF16. `body_copy` is the
+        // typed hand-off: a tiled set's copy is the body's, and a walk set has none to offer.
         let held = self.dense.get(weight);
-        let packed = match dense_rows_input(held.map(|copy| copy.layout())) {
+        let packed: Option<Packed<Tiled>> = match dense_rows_input(held.map(|copy| copy.layout())) {
             DenseRowsInput::Bf16 => None,
             DenseRowsInput::Packed => {
-                let copy = held.unwrap_or_else(|| {
-                    unreachable!("only a packed copy selects DenseRowsInput::Packed")
+                let copy = self.dense.body_copy(weight).unwrap_or_else(|| {
+                    unreachable!("only a tiled-layout set yields the body's copy")
                 });
                 copy.admits(batch, inner, input)?;
                 Some(copy)

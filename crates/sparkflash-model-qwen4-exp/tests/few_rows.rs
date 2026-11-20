@@ -51,7 +51,7 @@ use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::m4_quant::{bf16_bits, bf16_bits_to_f32};
 use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin, embedded_prefill_cubin};
-use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement};
+use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement, Tiled};
 
 /// The worst |error| relative to the largest |reference| the forms may reach. The split carries
 /// about 2^-17 of each activation; dropping the remainder (one BF16 activation) lands near 6e-4.
@@ -174,7 +174,7 @@ fn launch_rows_packed(
     cuda: &Cuda,
     kernel: Kernel,
     matrices: &[(Deviceptr, Deviceptr, Deviceptr, usize, usize)],
-    packed: &[Option<Packed>; 4],
+    packed: &[Option<Packed<Tiled>>; 4],
     riders: &[Rider],
     a: Deviceptr,
     inner: usize,

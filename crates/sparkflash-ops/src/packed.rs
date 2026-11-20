@@ -30,6 +30,7 @@
 //! BF16 rows, at the price of the packed bytes on top).
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::qwen4_exp_cubin;
@@ -102,6 +103,31 @@ pub enum Layout {
     Walk,
     /// A step's chunks in order, 32 lanes' a round, as the tiled readers take them.
     Tiled,
+}
+
+/// A layout as a type, so that a matrix's reader is checked where it is written rather than at a
+/// launch. [Layout] is the same choice at run time; this is the one [Packed] carries.
+pub trait MatrixLayout: Copy + 'static {
+    /// The [Layout] the marker names.
+    const LAYOUT: Layout;
+}
+
+/// The row walk's layout ([Layout::Walk]): [Packed]'s default, and the only one `gemv` and
+/// `gemv4` take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Walk;
+
+/// The tiled readers' layout ([Layout::Tiled]): the few-row tensor-core body's and the tiled
+/// GEMV's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tiled;
+
+impl MatrixLayout for Walk {
+    const LAYOUT: Layout = Layout::Walk;
+}
+
+impl MatrixLayout for Tiled {
+    const LAYOUT: Layout = Layout::Tiled;
 }
 
 /// The form's four kernels, all in the Qwen4Exp image beside `q4e_gemv_bf16`.
@@ -185,34 +211,25 @@ fn grid(rows: usize) -> u32 {
         .min(4_096)
 }
 
-/// One packed matrix: its rows, and its escapes.
+/// One packed matrix: its rows, and its escapes, in the layout `L` names. A reader of the other
+/// layout takes a `Packed` of the other marker, so handing a walk-layout copy to a tiled body is
+/// a type error, not a shape check.
 #[derive(Debug, Clone, Copy)]
-pub struct Packed {
+pub struct Packed<L: MatrixLayout = Walk> {
     pointer: Deviceptr,
     offsets: Deviceptr,
     entries: Deviceptr,
     rows: usize,
     columns: usize,
     row_bytes: usize,
-    layout: Layout,
+    layout: PhantomData<L>,
 }
 
-impl Packed {
+impl<L: MatrixLayout> Packed<L> {
     /// The order of the matrix's plane bytes, which its reader must take.
     #[must_use]
     pub fn layout(&self) -> Layout {
-        self.layout
-    }
-
-    /// Refuses a reader of the other layout's kind.
-    fn read_as(&self, layout: Layout) -> Result<(), String> {
-        if self.layout == layout {
-            return Ok(());
-        }
-        Err(format!(
-            "a {:?}-layout reader over a packed {} x {} matrix in the {:?} layout",
-            layout, self.rows, self.columns, self.layout
-        ))
+        L::LAYOUT
     }
 
     /// The pointers a packed walk takes for this matrix, in its argument order: the packed rows,
@@ -258,20 +275,51 @@ impl Packed {
     }
 }
 
+impl Packed<Tiled> {
+    /// The four arguments a tiled reader takes, in its argument order: the packed rows, the row
+    /// offsets into the escapes, the escapes, and the row stride. Only a matrix packed in the
+    /// tiled layout has them, so a tiled body cannot be handed the row walk's copy.
+    ///
+    /// A walk-layout copy has no such arguments:
+    ///
+    /// ```compile_fail,E0599
+    /// use sparkflash_ops::packed::{Packed, Walk};
+    /// let walk: Packed<Walk> = unsafe { std::mem::zeroed() };
+    /// let _ = walk.tiled_planes();
+    /// ```
+    #[must_use]
+    pub fn tiled_planes(&self) -> [u64; 4] {
+        [
+            self.pointer.0,
+            self.offsets.0,
+            self.entries.0,
+            self.row_bytes as u64,
+        ]
+    }
+}
+
 /// `q4e_gemv_packed`: `q4e_gemv_bf16`'s walk and bits over a packed matrix, for `groups` groups
 /// of `batch` rows along the grid's y.
+///
+/// Only the walk layout's matrix is the row walk's; a tiled copy is a type error:
+///
+/// ```compile_fail,E0308
+/// use sparkflash_kernels::cuda_driver::Deviceptr;
+/// use sparkflash_ops::packed::{self, Packed, Tiled};
+/// let tiled: Packed<Tiled> = unsafe { std::mem::zeroed() };
+/// let _ = packed::gemv(tiled, Deviceptr(0), Deviceptr(0), (4, 256), 1, 1);
+/// ```
 ///
 /// # Errors
 /// A launch the matrix does not admit.
 pub fn gemv(
-    packed: Packed,
+    packed: Packed<Walk>,
     input: Deviceptr,
     output: Deviceptr,
     (rows, columns): (usize, usize),
     batch: usize,
     groups: u32,
 ) -> Result<Call<9>, String> {
-    packed.read_as(Layout::Walk)?;
     packed.admits(rows, columns, input)?;
     Ok(Call {
         grid: (grid(rows), groups, 1),
@@ -296,7 +344,7 @@ pub fn gemv(
 /// # Errors
 /// No parts or more than [FUSED], or a launch a matrix does not admit.
 pub fn gemv4(
-    parts: &[(Packed, Deviceptr, usize)],
+    parts: &[(Packed<Walk>, Deviceptr, usize)],
     input: Deviceptr,
     columns: usize,
     batch: usize,
@@ -310,7 +358,6 @@ pub fn gemv4(
     // (w0..w3, o0..o3, e0..e3, x, y0..y3, r0..r3, columns, batch, row_bytes)
     let mut args = [0u64; 5 * FUSED + 4];
     for (slot, (packed, output, rows)) in parts.iter().enumerate() {
-        packed.read_as(Layout::Walk)?;
         packed.admits(*rows, columns, input)?;
         args[slot] = packed.pointer.0;
         args[FUSED + slot] = packed.offsets.0;
@@ -332,8 +379,8 @@ pub fn gemv4(
 
 /// `q4e_unpack_bf16` of a packed matrix's first `rows` rows into `output`, or, with `output`
 /// null, compared with `source`, every differing word counted at `differ`.
-fn unpack(
-    packed: &Packed,
+fn unpack<L: MatrixLayout>(
+    packed: &Packed<L>,
     output: Deviceptr,
     (source, differ): (Deviceptr, Deviceptr),
     rows: usize,
@@ -351,19 +398,18 @@ fn unpack(
             rows as u64,
             packed.columns as u64,
             packed.row_bytes as u64,
-            u64::from(packed.layout == Layout::Tiled),
+            u64::from(packed.layout() == Layout::Tiled),
         ],
     }
 }
 
-/// A set of packed matrices, by the device pointer of the BF16 rows each stands for.
-pub struct PackedSet {
-    packed: HashMap<u64, Packed>,
+/// A set of packed matrices, by the device pointer of the BF16 rows each stands for, all in the
+/// layout `L` names: a set is packed in one layout, so its matrices' readers are typed with it.
+pub struct PackedSet<L: MatrixLayout = Walk> {
+    packed: HashMap<u64, Packed<L>>,
     /// The form [FORM_ENV] chose, which every later [Self::pack] keeps to.
     form: Form,
     placement: Placement,
-    /// The layout every matrix of the set is packed in.
-    layout: Layout,
     /// Each [Self::pack] call's offsets, escapes and (beside the rows) packed rows.
     arenas: Vec<Deviceptr>,
     /// In place only: a BF16 matrix's worth, for the walks that read BF16 rows, and what the
@@ -372,39 +418,67 @@ pub struct PackedSet {
     /// The BF16 bytes the packed matrices stand for, and their packed bytes.
     bf16_bytes: usize,
     packed_bytes: usize,
+    layout: PhantomData<L>,
 }
 
-impl PackedSet {
-    /// An empty set.
+impl PackedSet<Walk> {
+    /// An empty set in the row walk's layout.
     #[must_use]
     pub fn new(form: Form, placement: Placement) -> Self {
         Self {
             packed: HashMap::new(),
             form,
             placement,
-            layout: Layout::Walk,
             arenas: Vec::new(),
             scratch: None,
             bf16_bytes: 0,
             packed_bytes: 0,
+            layout: PhantomData,
         }
     }
 
     /// The set in the tiled layout, for an arm whose packed reader is tiled. Set before the first
     /// [Self::pack].
     #[must_use]
-    pub fn tiled(mut self) -> Self {
-        debug_assert!(
+    pub fn tiled(self) -> PackedSet<Tiled> {
+        assert!(
             self.packed.is_empty(),
             "a set changes layout before it packs"
         );
-        self.layout = Layout::Tiled;
-        self
+        PackedSet {
+            packed: HashMap::new(),
+            form: self.form,
+            placement: self.placement,
+            arenas: self.arenas,
+            scratch: self.scratch,
+            bf16_bytes: self.bf16_bytes,
+            packed_bytes: self.packed_bytes,
+            layout: PhantomData,
+        }
     }
+}
 
+impl PackedSet<Tiled> {
+    /// The packed copy a few-row body in the tiled layout reads for `weight`, if the set has one.
+    #[must_use]
+    pub fn body_copy(&self, weight: Deviceptr) -> Option<Packed<Tiled>> {
+        self.get(weight)
+    }
+}
+
+impl PackedSet<Walk> {
+    /// The few-row body's copy: none, because the body decodes only the tiled layout and this set
+    /// is packed in the row walk's. A matrix the set does hold is the row GEMV's.
+    #[must_use]
+    pub fn body_copy(&self, _weight: Deviceptr) -> Option<Packed<Tiled>> {
+        None
+    }
+}
+
+impl<L: MatrixLayout> PackedSet<L> {
     /// The packed matrix whose BF16 rows start at `weight`, if it is one.
     #[must_use]
-    pub fn get(&self, weight: Deviceptr) -> Option<Packed> {
+    pub fn get(&self, weight: Deviceptr) -> Option<Packed<L>> {
         self.packed.get(&weight.0).copied()
     }
 
@@ -488,7 +562,6 @@ impl PackedSet {
         let packed = pack_matrices(
             cuda,
             kernels,
-            self.layout,
             &mut candidates,
             (counts, differ),
             scratch,
@@ -587,27 +660,30 @@ struct Candidate {
     offsets: Vec<u32>,
 }
 
+/// The packed matrices one [PackedSet::pack] adds, by the address of the BF16 rows each stands
+/// for.
+type PackedMatrices<L> = HashMap<u64, Packed<L>>;
+
 /// [PackedSet::pack]'s passes: count every matrix's escapes, lay out one arena (a matrix's
 /// offsets, then its escapes, then beside the rows its packed rows, each a 16-byte run), then pack
 /// each matrix and check it against the BF16 rows it stands for. In place, `scratch` is set and a
 /// matrix packs a group of rows at a time through it, each group checked before its BF16 rows are
 /// overwritten. Returns the packed matrices, the BF16 bytes they stand for and their packed bytes;
 /// `arena` is set as soon as it is allocated, so the caller frees it on an error.
-fn pack_matrices(
+fn pack_matrices<L: MatrixLayout>(
     cuda: &Cuda,
     kernels: &Kernels,
-    layout: Layout,
     matrices: &mut [Candidate],
     (counts, differ): (Deviceptr, Deviceptr),
     scratch: Option<(Deviceptr, usize)>,
     arena: &mut Option<Deviceptr>,
-) -> Result<(HashMap<u64, Packed>, usize, usize), String> {
+) -> Result<(PackedMatrices<L>, usize, usize), String> {
     let launch = |kernel: Kernel, grid: (u32, u32, u32), args: &[u64]| -> Result<(), String> {
         cuda.launch(kernel, grid, (BLOCK, 1, 1), args)
             .map_err(|error| format!("{}: {error}", kernel.name()))
     };
     // q4e_pack_bf16: counts with `packed` null, else the packed rows and escapes.
-    let pack = |source: Deviceptr, packed: &Packed, counts: Deviceptr, rows: usize| {
+    let pack = |source: Deviceptr, packed: &Packed<L>, counts: Deviceptr, rows: usize| {
         let args = [
             source.0,
             packed.pointer.0,
@@ -617,21 +693,21 @@ fn pack_matrices(
             rows as u64,
             packed.columns as u64,
             packed.row_bytes as u64,
-            u64::from(packed.layout == Layout::Tiled),
+            u64::from(packed.layout() == Layout::Tiled),
         ];
         launch(kernels.pack, (grid(rows), 1, 1), &args)
     };
     let check = |call: Call<10>| launch(kernels.unpack, call.grid, &call.args);
     let mut arena_bytes = 0usize;
     for matrix in matrices.iter_mut() {
-        let counting = Packed {
+        let counting = Packed::<L> {
             pointer: Deviceptr(0),
             offsets: Deviceptr(0),
             entries: Deviceptr(0),
             rows: matrix.rows,
             columns: matrix.columns,
             row_bytes: row_bytes(matrix.columns),
-            layout,
+            layout: PhantomData,
         };
         pack(matrix.pointer, &counting, counts, matrix.rows)?;
         let mut bytes = vec![0u8; matrix.rows * 4];
@@ -672,14 +748,14 @@ fn pack_matrices(
         let entries = base.offset(at);
         at += (escapes * 4).max(4).next_multiple_of(ALIGN);
         let row_bytes = row_bytes(matrix.columns);
-        let mut done = Packed {
+        let mut done = Packed::<L> {
             pointer: matrix.pointer,
             offsets,
             entries,
             rows: matrix.rows,
             columns: matrix.columns,
             row_bytes,
-            layout,
+            layout: PhantomData,
         };
         match scratch {
             None => {
@@ -777,6 +853,51 @@ mod tests {
         assert!(refused.contains(FORM_ENV), "{refused}");
     }
 
+    /// A set's layout is its type's: a tiled set is the only one that offers the few-row body
+    /// a copy, and a walk set's matrix -- a perfectly good row GEMV operand -- is
+    /// [PackedSet::body_copy]'s none. The hand-off to the tiled body is therefore the set's
+    /// layout, not the matrix's shape.
+    #[test]
+    fn the_body_copy_is_the_tiled_sets_only() {
+        let tiled_copy = Packed::<Tiled> {
+            pointer: Deviceptr(0x1000),
+            offsets: Deviceptr(0x1010),
+            entries: Deviceptr(0x1020),
+            rows: 64,
+            columns: 512,
+            row_bytes: row_bytes(512),
+            layout: PhantomData,
+        };
+        let walk_copy = Packed::<Walk> {
+            pointer: Deviceptr(0x1000),
+            offsets: Deviceptr(0x1010),
+            entries: Deviceptr(0x1020),
+            rows: 64,
+            columns: 512,
+            row_bytes: row_bytes(512),
+            layout: PhantomData,
+        };
+
+        let mut tiled = PackedSet::new(Form::Packed, Placement::Beside).tiled();
+        tiled.packed.insert(0x1000, tiled_copy);
+        let mut walk = PackedSet::new(Form::Packed, Placement::Beside);
+        walk.packed.insert(0x1000, walk_copy);
+        // The tiled set's matrix is the body's, with the four tiled arguments the body reads.
+        let body = tiled.body_copy(Deviceptr(0x1000)).expect("the tiled copy");
+        assert_eq!(body.layout(), Layout::Tiled);
+        assert_eq!(
+            body.tiled_planes(),
+            [0x1000, 0x1010, 0x1020, row_bytes(512) as u64]
+        );
+        // The walk set holds the same shape at the same address, and offers the body nothing:
+        // its matrix is a Packed<Walk>, which the tiled body's arguments do not take.
+        assert!(walk.body_copy(Deviceptr(0x1000)).is_none());
+        assert_eq!(
+            walk.get(Deviceptr(0x1000)).map(|copy| copy.layout()),
+            Some(Layout::Walk)
+        );
+    }
+
     #[test]
     fn the_fused_call_lays_out_every_slot() {
         let matrix = |base: u64| Packed {
@@ -786,7 +907,7 @@ mod tests {
             rows: 64,
             columns: 512,
             row_bytes: row_bytes(512),
-            layout: Layout::Walk,
+            layout: PhantomData,
         };
         let call = gemv4(
             &[
@@ -819,12 +940,24 @@ mod tests {
             )
             .is_err()
         );
-        // A tiled matrix is refused by the row walks.
-        let tiled = Packed {
-            layout: Layout::Tiled,
-            ..matrix(0x1000)
+        // A tiled matrix is not the row walk's at all: `gemv` and `gemv4` take a
+        // `Packed<Walk>` and this is a `Packed<Tiled>`, so the wrong hand-off is a compile
+        // error (the `compile_fail` examples on `gemv`). A tiled copy carries the tiled
+        // reader's four arguments instead.
+        let tiled: Packed<Tiled> = Packed {
+            pointer: Deviceptr(0x1000),
+            offsets: Deviceptr(0x1010),
+            entries: Deviceptr(0x1020),
+            rows: 64,
+            columns: 512,
+            row_bytes: row_bytes(512),
+            layout: PhantomData,
         };
-        assert!(gemv(tiled, Deviceptr(0x8000), Deviceptr(0), (64, 512), 1, 1).is_err());
-        assert!(gemv4(&[(tiled, Deviceptr(0x9000), 64)], Deviceptr(0x8000), 512, 1).is_err());
+        assert_eq!(tiled.layout(), Layout::Tiled);
+        assert_eq!(
+            tiled.tiled_planes(),
+            [0x1000, 0x1010, 0x1020, row_bytes(512) as u64]
+        );
+        assert_eq!(matrix(0x1000).layout(), Layout::Walk);
     }
 }

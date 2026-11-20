@@ -109,7 +109,7 @@ use sparkflash_ops::calls::{self, Call, RmsNorm};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
-use sparkflash_ops::packed::{Form, PackedSet, Placement};
+use sparkflash_ops::packed::{Form, PackedSet, Placement, Tiled};
 use sparkflash_ops::plan::Precision;
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
@@ -3961,7 +3961,7 @@ struct SequenceShared {
     weights: GpuWeights,
     /// Packed copies of the layers' BF16 projections beside their rows ([pack_dense]), which the
     /// few-row tensor-core tile reads for the same bits from three quarters of the bytes.
-    packed: PackedSet,
+    packed: PackedSet<Tiled>,
     /// The DFlash 2 drafter `SPARKFLASH_QWEN4_DFLASH2` names, which replaces the MTP head as the
     /// speculative drafter when it is loaded.
     dflash: Option<GpuDflash2>,
@@ -4063,7 +4063,7 @@ const PACK_MIN_WEIGHTS: usize = 1 << 20;
 fn pack_dense(
     cuda: &Cuda,
     weights: &GpuWeights,
-) -> Result<(PackedSet, Vec<LedgerRow>), BackendError> {
+) -> Result<(PackedSet<Tiled>, Vec<LedgerRow>), BackendError> {
     let refusal = |error: String| BackendError::new("qwen4_device", error);
     let mut set = PackedSet::new(Form::from_env().map_err(refusal)?, Placement::Beside).tiled();
     fn bf16(matrix: &Dense) -> Option<&Mat<Bf16>> {
