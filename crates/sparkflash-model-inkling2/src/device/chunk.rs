@@ -41,9 +41,7 @@ use sparkflash_model::backend::BackendError;
 use sparkflash_ops::moe::{MoePlanCall, grouped};
 use sparkflash_ops::projection::{Route, WidePolicy, route_bf16};
 
-use crate::device_plan::{
-    BandOp, Collective, ConvSlot, ExpertBody, ExpertCodes, LayerSchedule, Step, TauRule,
-};
+use crate::device_plan::{BandOp, Collective, ConvSlot, ExpertBody, LayerSchedule, Step, TauRule};
 
 use super::*;
 
@@ -361,67 +359,6 @@ pub(super) fn band_exchange(
     )
 }
 
-/// The geometry each code-plane kind's few-row body walks.
-impl ExpertCodes {
-    /// The columns the down pass's CTAs tile: 64 a CTA in the rows body, 128 in the MXFP8 tile
-    /// body.
-    fn down_columns(self) -> usize {
-        match self {
-            Self::NvFp4 => grouped::ROWS_DOWN_COLUMNS,
-            Self::MxFp8 => grouped::DOWN_COLUMNS,
-        }
-    }
-
-    /// The K stage the body walks: whole 128-column blocks in the NVFP4 rows body, the tile's
-    /// 64-column stages in the MXFP8 body.
-    fn k_stage(self) -> usize {
-        match self {
-            Self::NvFp4 => 128,
-            Self::MxFp8 => 64,
-        }
-    }
-
-    /// Whether the body is the MXFP8 tile pair rather than the NVFP4 rows pair.
-    fn is_mx(self) -> bool {
-        matches!(self, Self::MxFp8)
-    }
-}
-
-/// Whether the decode band's few-row routed-expert body takes a layer at `rows` rows.
-///
-/// The operand is the layer's code planes ([ExpertCodes]), not a shape: only a stored-code table
-/// produces one, so a BF16 band cannot reach this rule. The body is the prompt tile's chain over
-/// one to eight rows: the arm's `BATCH_ROWS`, both activation planes (`PLANES=both`), the
-/// grouped table, the shapes the bodies cover (whole 32-column K runs and whole eight-column
-/// writes; the NVFP4 bodies walk 128-column K blocks; the down pass's 64- or 128-column CTAs tile
-/// the output rows) and a band whose down projection does not gather. Everything else keeps the
-/// arm's row walk.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn expert_rows_body_fits(
-    codes: ExpertCodes,
-    rows: usize,
-    planes: ActivationPlanes,
-    gathers: bool,
-    table: bool,
-    hidden: usize,
-    intermediate: usize,
-    down: (usize, usize),
-) -> bool {
-    let (down_rows, down_columns) = down;
-    (1..=super::BATCH_ROWS).contains(&rows)
-        && !gathers
-        && planes == ActivationPlanes::Both
-        && table
-        && hidden.is_multiple_of(32)
-        && intermediate.is_multiple_of(32)
-        // The down pass's grid covers the output columns in whole CTAs. A remainder would leave
-        // columns the mix reads unwritten, so a shape the grids do not tile keeps the row walk.
-        && down_rows.is_multiple_of(codes.down_columns())
-        && down_columns.is_multiple_of(32)
-        && hidden.is_multiple_of(codes.k_stage())
-        && intermediate.is_multiple_of(codes.k_stage())
-}
-
 /// The most rows the chunk walk steers on the device ([run_steered_band]): a verify's anchor and
 /// its drafts, fused lanes, or a shared walk of four lanes' verifies at the deepest drafter
 /// depth (four times sixteen rows). A wider chunk groups its pairs by expert on the host
@@ -474,139 +411,6 @@ pub(super) fn run_steered_band(
     let scale_2 = shared.experts[layer].as_ref();
     let planned = rows >= PLANNED_BAND_ROWS;
     let max_items = owned.min(slots);
-    let out = BandOut::of(shared, scratch, rows);
-    let down_shape = shared.plan.expert_down();
-    // A decode step, a verify or a few lanes: one to eight rows take the grouped experts'
-    // few-row bodies, the prompt tile's chain over the same plan. A wider band, a shape the
-    // bodies do not cover or a row-split gather keeps the row walk below. The operand is the
-    // layer's code planes: a BF16 band has none, so it keeps the row walk whatever its shape.
-    if let Some(codes) = schedule.experts.codes()
-        && expert_rows_body_fits(
-            codes,
-            rows,
-            shared.planes,
-            out.gathers,
-            shared.mma[layer].is_some(),
-            hidden,
-            intermediate,
-            (down_shape.rows, down_shape.columns),
-        )
-    {
-        let meta = shared.mma[layer]
-            .ok_or_else(|| device_error(format!("layer {layer}: no grouped-MMA table")))?;
-        // The kind the route was admitted on is the kind the launches are written for: one value,
-        // not a second read of the schedule's body field.
-        let mx8 = codes.is_mx();
-        let items = grouped::items(slots, owned);
-        let grid_items = u32::try_from(items).map_err(device_error)?;
-        shared
-            .launch(
-                shared.kernels.band_shares,
-                (
-                    u32::try_from(slots.div_ceil(SHARES_BLOCK as usize)).unwrap_or(u32::MAX),
-                    1,
-                    1,
-                ),
-                (SHARES_BLOCK, 1, 1),
-                &[
-                    scratch.indices.0,
-                    scratch.shares.0,
-                    scratch.scales.0,
-                    slots as u64,
-                    first as u64,
-                    owned as u64,
-                    scratch.local.0,
-                ],
-            )
-            .map_err(device_error)?;
-        let plan = MoePlanCall::items(
-            scratch.local.0,
-            scratch.plan.0,
-            (scratch.items.0, scratch.item_count.0),
-            (slots, owned, top_k),
-            0,
-            max_items,
-        );
-        let (grid, block) = MoePlanCall::launch();
-        shared
-            .launch(shared.kernels.moe_plan, grid, block, &plan.args())
-            .map_err(device_error)?;
-        // The expert input's two bf16 planes, as the tile's split stage reads them.
-        let elements = rows * hidden;
-        shared
-            .launch(
-                shared.kernels.split_bf16,
-                (
-                    (elements / 2)
-                        .div_ceil(grouped::THREADS as usize)
-                        .clamp(1, 4096) as u32,
-                    1,
-                    1,
-                ),
-                (grouped::THREADS, 1, 1),
-                &[input.0, scratch.band.0, elements as u64],
-            )
-            .map_err(device_error)?;
-        // The NVFP4 rows take the few-row body (q4p_moe_rows_gate_up_capped); the catalogue
-        // has no MXFP8 few-row form, so those rows take the tile body itself, which computes
-        // the same row (the item holds at most eight and the rest of its 128 are zero).
-        let (gate_up, gate_up_columns, gate_up_threads) = if mx8 {
-            (shared.kernels.moe_gate_up_mx8, 64usize, grouped::THREADS)
-        } else {
-            (shared.kernels.moe_rows_gate_up, 32usize, 128u32)
-        };
-        shared
-            .launch(
-                gate_up,
-                ((intermediate / gate_up_columns) as u32, grid_items, 1),
-                (gate_up_threads, 1, 1),
-                &[
-                    meta.table.0,
-                    meta.scales.0,
-                    scratch.plan.0,
-                    scratch.items.0,
-                    scratch.item_count.0,
-                    scratch.band.0,
-                    elements as u64,
-                    scratch.activation.0,
-                    (slots * intermediate) as u64,
-                    top_k as u64,
-                    hidden as u64,
-                    intermediate as u64,
-                    bits(config.mlp_gate_softcap as f32),
-                    bits(config.mlp_up_softcap as f32),
-                ],
-            )
-            .map_err(device_error)?;
-        let (down, down_columns, down_threads) = if mx8 {
-            (shared.kernels.moe_down_mx8, 128usize, grouped::THREADS)
-        } else {
-            (shared.kernels.moe_rows_down, 64usize, 128u32)
-        };
-        shared
-            .launch(
-                down,
-                ((down_shape.rows / down_columns) as u32, grid_items, 1),
-                (down_threads, 1, 1),
-                &[
-                    meta.table.0,
-                    meta.scales.0,
-                    scratch.plan.0,
-                    scratch.items.0,
-                    scratch.item_count.0,
-                    scratch.activation.0,
-                    (slots * intermediate) as u64,
-                    shared.route_ones.0,
-                    out.down.0,
-                    top_k as u64,
-                    hidden as u64,
-                    intermediate as u64,
-                    0,
-                ],
-            )
-            .map_err(device_error)?;
-        return band_mix(shared, scratch, rows);
-    }
     if planned {
         // The shares, and this rank's local id a slot (-1 for another rank's), then the plan: one
         // item an expert this rank holds, its slots in ascending order; another rank's slots are
@@ -2175,46 +1979,28 @@ pub(super) fn walk_rows(
             }
             (Op::Gemv, Target::Project(Projection::Head)) => {
                 let matrix = weight(step.weights[0]);
-                // The head's one-to-eight rows take the wide tile's few-row body
-                // (q4p_dense_rows) where the body has the rows to read; a wider walk, a shape
-                // the body does not cover and the head's packed copy (the row walk's layout,
-                // which the body does not read) keep the row GEMV.
-                let body = if answers <= BATCH_ROWS {
-                    shared
-                        .dense_rows(
-                            matrix,
-                            scratch.final_row,
-                            scratch.logits,
-                            rank_vocab,
-                            hidden,
-                            answers,
-                        )
-                        .map_err(|_| ())
-                } else {
-                    Err(())
-                };
-                if body.is_err() {
-                    match &sequences {
-                        Rows::Chunk(_) => run(shared.gemv(
-                            matrix,
-                            scratch.final_row,
-                            scratch.logits,
-                            rank_vocab,
-                            hidden,
-                        ))?,
-                        // The lanes' or a verify's rows through the batched GEMV, whose row is
-                        // the one-row launch's bits.
-                        Rows::Lanes(_) | Rows::Verify(..) | Rows::Segments(_) => project(
-                            shared,
-                            PrefillWalk::Chunk,
-                            matrix,
-                            scratch.final_row,
-                            scratch.logits,
-                            rank_vocab,
-                            hidden,
-                            answers,
-                        )?,
-                    }
+                // The head takes the row GEMV: the packed copy is the row walk's, and
+                // version 2 returned the head to the body that layout reads.
+                match &sequences {
+                    Rows::Chunk(_) => run(shared.gemv(
+                        matrix,
+                        scratch.final_row,
+                        scratch.logits,
+                        rank_vocab,
+                        hidden,
+                    ))?,
+                    // The lanes' or a verify's rows through the batched GEMV, whose row is the
+                    // one-row launch's bits.
+                    Rows::Lanes(_) | Rows::Verify(..) | Rows::Segments(_) => project(
+                        shared,
+                        PrefillWalk::Chunk,
+                        matrix,
+                        scratch.final_row,
+                        scratch.logits,
+                        rank_vocab,
+                        hidden,
+                        answers,
+                    )?,
                 }
             }
             (Op::Collective(Collective::LogitSlice), _) => {
@@ -3277,179 +3063,6 @@ fn run_band_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The routing band: one to eight rows take the few-row expert body, and the ninth, a
-    /// BF16 layer, a head-only activation, a gathered band, a missing table or a shape the body
-    /// does not cover keeps the row walk.
-    #[test]
-    fn the_decode_band_takes_the_expert_rows_body_from_one_to_eight_rows() {
-        // The body's operand is the layer's code planes. A BF16 band holds values, not codes, so
-        // it has none to hand the rule and the route cannot reach the body by shape.
-        let fits =
-            |rows, experts: ExpertBody, planes, gathers, table, hidden, intermediate, down| {
-                let Some(codes) = experts.codes() else {
-                    return false;
-                };
-                expert_rows_body_fits(
-                    codes,
-                    rows,
-                    planes,
-                    gathers,
-                    table,
-                    hidden,
-                    intermediate,
-                    down,
-                )
-            };
-        assert!(
-            ExpertBody::Bf16.codes().is_none(),
-            "a BF16 band has no codes"
-        );
-        assert_eq!(ExpertBody::NvFp4.codes(), Some(ExpertCodes::NvFp4));
-        assert_eq!(ExpertBody::MxFp8.codes(), Some(ExpertCodes::MxFp8));
-        for rows in 1..=super::super::BATCH_ROWS {
-            assert!(
-                fits(
-                    rows,
-                    ExpertBody::NvFp4,
-                    ActivationPlanes::Both,
-                    false,
-                    true,
-                    4096,
-                    2048,
-                    (4096, 2048)
-                ),
-                "{rows} rows take the NVFP4 body"
-            );
-            assert!(
-                fits(
-                    rows,
-                    ExpertBody::MxFp8,
-                    ActivationPlanes::Both,
-                    false,
-                    true,
-                    4096,
-                    2048,
-                    (4096, 2048)
-                ),
-                "{rows} rows take the MXFP8 body"
-            );
-        }
-        assert!(!fits(
-            9,
-            ExpertBody::NvFp4,
-            ActivationPlanes::Both,
-            false,
-            true,
-            4096,
-            2048,
-            (4096, 2048)
-        ));
-        assert!(!fits(
-            1,
-            ExpertBody::Bf16,
-            ActivationPlanes::Both,
-            false,
-            true,
-            4096,
-            2048,
-            (4096, 2048)
-        ));
-        assert!(!fits(
-            1,
-            ExpertBody::NvFp4,
-            ActivationPlanes::Head,
-            false,
-            true,
-            4096,
-            2048,
-            (4096, 2048)
-        ));
-        assert!(!fits(
-            1,
-            ExpertBody::NvFp4,
-            ActivationPlanes::Both,
-            true,
-            true,
-            4096,
-            2048,
-            (4096, 2048)
-        ));
-        assert!(!fits(
-            1,
-            ExpertBody::NvFp4,
-            ActivationPlanes::Both,
-            false,
-            false,
-            4096,
-            2048,
-            (4096, 2048)
-        ));
-        // The NVFP4 bodies walk whole 128-column K runs; the MXFP8 body whole 32-column ones.
-        assert!(!fits(
-            1,
-            ExpertBody::NvFp4,
-            ActivationPlanes::Both,
-            false,
-            true,
-            4128,
-            2048,
-            (4096, 2048)
-        ));
-        // The MXFP8 body walks the tile's 64-column K stages.
-        assert!(fits(
-            1,
-            ExpertBody::MxFp8,
-            ActivationPlanes::Both,
-            false,
-            true,
-            4160,
-            2048,
-            (4096, 2048)
-        ));
-        assert!(!fits(
-            1,
-            ExpertBody::MxFp8,
-            ActivationPlanes::Both,
-            false,
-            true,
-            4096,
-            2048,
-            (4096, 2000)
-        ));
-        // The down pass's CTAs cover the output rows 64 (the rows body) or 128 (the MXFP8 tile)
-        // at a time. A remainder would leave columns the mix reads unwritten.
-        assert!(!fits(
-            1,
-            ExpertBody::NvFp4,
-            ActivationPlanes::Both,
-            false,
-            true,
-            4096,
-            2048,
-            (4128, 2048)
-        ));
-        assert!(!fits(
-            1,
-            ExpertBody::MxFp8,
-            ActivationPlanes::Both,
-            false,
-            true,
-            4096,
-            2048,
-            (4160, 2048)
-        ));
-        assert!(fits(
-            1,
-            ExpertBody::MxFp8,
-            ActivationPlanes::Both,
-            false,
-            true,
-            4096,
-            2048,
-            (4224, 2048)
-        ));
-    }
 
     #[test]
     fn the_attention_halves_split_on_a_block_edge_where_both_sums_take_two_shots() {

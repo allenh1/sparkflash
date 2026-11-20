@@ -871,13 +871,18 @@ struct Kernels {
     gemv4: Bound,
     /// The same two walks over packed matrices ([packed]), and the form's packer and unpacker.
     packed: sparkflash_ops::packed::Kernels,
-    /// The wide tile's few-row BF16 body (q4p_dense_rows): a decode head's row is the prompt
-    /// tile's, and the catalogued body for the precision the head stores.
+    /// The wide tile's few-row BF16 body (q4p_dense_rows): the prompt tile's body for the
+    /// precision the head stores. Version 2 serves the head on the row GEMV, so this stays
+    /// catalogued and tested rather than launched.
+    #[allow(dead_code)]
     dense_rows: Bound,
     /// The grouped experts' few-row bodies, the tile's chain over one to eight item rows:
     /// Inkling's interleaved w13 and softcapped SwiGLU (q4p_moe_rows_gate_up_capped) and the
-    /// same passes over its MXFP8 layers (q4p_moe_rows_gate_up_capped_mx8 / _down_mx8).
+    /// same passes over its MXFP8 layers (q4p_moe_rows_gate_up_capped_mx8 / _down_mx8). The
+    /// served band is the row walk; these stay catalogued.
+    #[allow(dead_code)]
     moe_rows_gate_up: Bound,
+    #[allow(dead_code)]
     moe_rows_down: Bound,
     block_residual: Bound,
     /// The residual's two-launch form: every stack row's statistics in a block of its own,
@@ -1618,6 +1623,8 @@ impl Shared {
 
     /// One dense BF16 projection of `batch` rows through `q4p_dense_rows`, the wide tile's
     /// few-row body: the row is `glm_prefill_bf16_wide`'s, the tile Inkling's prompt walk runs.
+    /// Version 2 serves the head on the row GEMV; the body stays for a later route and is
+    /// tested directly.
     /// The body reads the matrix's packed copy only when the arm packed it in the body's tiled
     /// layout ([DenseRowsInput::Packed]); Inkling packs in place in the row walk's layout, so a
     /// packed projection is the row GEMV's and the body must keep off it. The set's layout types
@@ -1625,6 +1632,7 @@ impl Shared {
     /// body's `Option<Packed<Tiled>>`, and a `PackedSet<Walk>` yields none. Only the shapes
     /// the body covers take it (whole eight-column writes and a whole 32-column K run);
     /// everything else keeps the row GEMV.
+    #[allow(dead_code)]
     fn dense_rows(
         &self,
         weight: Deviceptr,
@@ -6361,28 +6369,16 @@ impl InklingDeviceSession {
                 (Op::Gemv, Target::Project(Projection::Head)) => {
                     self.rms(&shared, "final_norm", self.state.scratch.final_row, hidden)?;
                     let weight = self.weight(step.weights[0]);
-                    // The head's one row takes the wide tile's few-row body (q4p_dense_rows)
-                    // where the body has the rows to read; the head's packed copy is the row
-                    // walk's, whose only few-row reader is the row GEMV, so a packed head keeps
-                    // the GEMV and a checkpoint-form (BF16) one takes the body.
+                    // The head's row takes the row GEMV: the packed copy is the row walk's,
+                    // and version 2 returned the head to the body the packed layout reads.
                     let rows = plan.rank_vocab();
-                    match shared.dense_rows(
+                    run(shared.gemv(
                         weight,
                         self.state.scratch.final_row,
                         self.state.scratch.logits,
                         rows,
                         hidden,
-                        1,
-                    ) {
-                        Ok(()) => {}
-                        Err(_) => run(shared.gemv(
-                            weight,
-                            self.state.scratch.final_row,
-                            self.state.scratch.logits,
-                            rows,
-                            hidden,
-                        ))?,
-                    }
+                    ))?;
                 }
                 (Op::Collective(Collective::LogitSlice), _) => {
                     exchange_gather(
