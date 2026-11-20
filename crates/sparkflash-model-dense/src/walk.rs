@@ -367,17 +367,9 @@ impl Walk for DenseWalk {
         rows.iter_mut()
             .zip(logits)
             .map(|(row, logits)| {
-                match &row.input {
-                    HeadInput::Prompt(tokens) => {
-                        row.seq.sampler.reset();
-                        row.seq.sampler.record_prompt(tokens);
-                    }
-                    HeadInput::Token(token) => row.seq.sampler.record(*token),
-                    HeadInput::Verify { rows, row: index } => row
-                        .seq
-                        .sampler
-                        .record(rows.get(*index).copied().unwrap_or_default()),
-                }
+                // The row's token is already recorded above, once: a second record here would
+                // count every sampled token twice in the penalties and leave the history a token
+                // a step ahead of the position a rewind truncates it to.
                 let chosen = row.seq.sampler.choose(&logits, &row.seq.sampling);
                 Ok(StepOutput {
                     logits,
@@ -959,6 +951,40 @@ mod tests {
     }
 
     /// A prompt that fits the chunk is one whole pass, as the old loop ran it.
+    /// A sampled step records the token it consumed once, so the sampler's history is the
+    /// sequence's tokens: the penalties count each token once, and a rewind truncates both to
+    /// the same position.
+    #[test]
+    #[ignore = "boots the arm's fixture; run scripts/onboard-gate.sh dense"]
+    fn a_sampled_step_records_its_token_once() {
+        let fixture = <DenseWalk as WalkFixture>::fixture(1).expect("the dense fixture");
+        let runtime = Runtime::new(fixture.walk, 0).expect("the runtime starts");
+        let mut slot = runtime.open_slot().expect("a slot");
+        let sampling = Sampling {
+            temperature: 0.8,
+            frequency_penalty: 0.5,
+            seed: 7,
+            ..Sampling::default()
+        };
+        runtime.walk().set_sampling(slot.seq_mut(), sampling);
+        let first = runtime
+            .prefill_slot(&mut slot, &[1, 2, 3, 4])
+            .expect("the prompt")
+            .next_token
+            .expect("the prompt's token");
+        assert_eq!(slot.seq().sampler.history().len(), 4);
+        let mut members = [(slot, first)];
+        let steps = runtime.step_slots(&mut members).expect("the sampled step");
+        let (mut slot, _) = members.into_iter().next().expect("the member");
+        assert_eq!(slot.seq().sampler.history(), &[1, 2, 3, 4, first]);
+        let second = steps[0].next_token.expect("the step's token");
+        let mut members = [(slot, second)];
+        runtime.step_slots(&mut members).expect("the second step");
+        (slot, _) = members.into_iter().next().expect("the member");
+        assert_eq!(slot.seq().sampler.history(), &[1, 2, 3, 4, first, second]);
+        assert_eq!(slot.seq().sampler.history().len(), slot.seq().position());
+    }
+
     #[test]
     fn a_dense_prompt_that_fits_runs_whole() {
         for len in [1usize, 255, CHUNK_ROWS] {
