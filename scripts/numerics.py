@@ -1431,7 +1431,19 @@ def declaration_findings(
         if entry["version"] < old["version"]:
             findings.append(f"{name}: version {old['version']} -> {entry['version']}; versions never go down")
             continue
-        if bumped and entry["version"] != old["version"] + 1:
+        # A revert is a change: the head names the base's own arithmetic again, and the version
+        # between them is retired with the arithmetic it had. Comparing against a base that
+        # predates the undone version would otherwise read the revert as "bumped but unchanged".
+        undone = retired.get(key)
+        revert = (
+            isinstance(undone, dict)
+            and undone.get("version") == entry["version"] - 1
+            and old["version"] < undone["version"]
+            and entry.get("reference") == old.get("reference")
+            and entry["fingerprint"] == old["fingerprint"]
+            and undone.get("fingerprint") != entry["fingerprint"]
+        )
+        if bumped and entry["version"] != old["version"] + 1 and not revert:
             findings.append(f"{name}: version {old['version']} -> {entry['version']}; one declared change is one version")
         if entry["evidence"] != old["evidence"] and not bumped:
             findings.append(f"{name}: evidence {old['evidence']} -> {entry['evidence']} without a version bump")
@@ -1478,7 +1490,7 @@ def declaration_findings(
                         f"{entry['version']}; bump the version and follow docs/NUMERICS.md §2"
                     )
             continue
-        if not bits_changed:
+        if not bits_changed and not revert:
             findings.append(
                 f"{name}: declared non-change: version {entry['version']} names the same bits as "
                 f"version {old['version']}; a version is bumped only by a change"
@@ -3926,6 +3938,47 @@ def self_test() -> int:
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {'refused' if findings else 'passed'}")
         for finding in findings:
             print(f"       {finding}")
+    # A revert is a change: the head names the base's arithmetic again and the version between
+    # them is retired with its own bits. Without that record the bump reads as a non-change (and
+    # as a jump of two versions), which is why GLM's version 3 could not pass the gate.
+    middle_path = "references/q-v2.json"
+    middle = synthetic_reference([5, 6], -0.20)
+    approval = {
+        "decision": "the body is slower in both pairs; back to the row GEMV",
+        "date": "2026-11-19",
+        "report": report,
+    }
+
+    def revert_case(name: str, with_retired: bool, refused: bool) -> None:
+        nonlocal failed
+        head_entry = dict(synthetic_entry(3, old, report=report), approved=approval)
+        base = synthetic_registry([synthetic_entry(1, old)], True)
+        head = synthetic_registry([head_entry], True)
+        if with_retired:
+            head["retired"].append(
+                {
+                    "model": "m",
+                    "world": 4,
+                    "profile": "reference",
+                    "plan": "tp",
+                    "arch": "sm_121a",
+                    "version": 2,
+                    "reason": "slower",
+                    "reference": middle_path,
+                    "fingerprint": middle["fingerprint"],
+                }
+            )
+        extra = {report: b"x", f"{NUMERICS}/{middle_path}": render_reference(middle).encode()}
+        findings = declaration_findings(base, head, files(old), files(old, extra), {report: "A"})
+        ok = bool(findings) == refused
+        failed += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} {name}: {'refused' if findings else 'passed'}")
+        for finding in findings:
+            print(f"       {finding}")
+
+    revert_case("a version 3 that returns to version 1's bits, with version 2 retired", True, False)
+    revert_case("the same revert without the retired version", False, True)
+
     print("numerics self-test: " + ("FAIL" if failed else "PASS"))
     return 1 if failed else 0
 

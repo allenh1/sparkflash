@@ -272,7 +272,10 @@ the push's previous tip, or the merge base with `main`). It fails:
   old one (more prompts, or a generation that ran out of budget continued past it; a capture of
   the same length keeps every bit, its finish reason included);
 - a version bump whose bits did not change (a reference moved to another path with the same
-  fingerprint is a rename, which needs no bump);
+  fingerprint is a rename, which needs no bump), unless it is a recorded **revert**: the head names
+  the base's own reference and fingerprint again, and the version between them is in
+  `[[retired]]` with the arithmetic it had. A revert is a change, and it may jump the versions it
+  undoes; without the retired record the bump reads as a jump and a non-change;
 - a bump by more than one, or a version that went down;
 - a bump while a global prerequisite below (`declaration_check`, `coverage`, `monitors`) is false
   at the base or at the head and the entry carries no usable `approved` record, or while the
@@ -823,7 +826,9 @@ python3 scripts/numerics.py capture --url http://127.0.0.1:8002 \
   --suite "$W/one.json" --out "$W/reference-drive.json" --max-tokens 1
 scripts/serve-four-node.sh stop
 
-# Candidate build: the same binary with the shipped default, the tile's few-row body. Same nodes,
+# Candidate build: the same binary with the tile's few-row body, which version 2 shipped and
+# version 3 retired. On a version 3 build the serving check refuses SPARKFLASH_DECODE_MMA=on, so
+# regenerate this pair on a build before the flip (18a76075) or one that states the body. Same nodes,
 # checkpoint, tokenizer, context and probe.
 SPARK_NODES="$GLM_NODES" SPARK_LOCAL_RANKS=0 \
 SPARKFLASH_MODEL=zai-org/GLM-5.3-Flash \
