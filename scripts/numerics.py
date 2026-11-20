@@ -101,6 +101,22 @@ REFERENCE_SCHEMA = "sparkflash-numerics-reference/1"
 BUILD_SOURCE = "build_source"
 BUILD_SOURCES = ("card", "repo")
 UNKNOWN_BUILD = "unknown"
+# The correctness floor (docs/NUMERICS.md section 5). A first reference or a re-declaration must
+# show that the arithmetic it pins is right, not merely repeatable: two identical captures of
+# token soup are still soup. The floor records evidence taken outside the tool - a forced
+# comparison against the pre-change build or the arm's host reference, a known-answer decode, and
+# the reference's own NLL on natural text - in the card, and the declaration check re-checks it
+# for every reference or [[anchor]] this change adds. A card without the key predates the rule and
+# is grandfathered, exactly like the build record; the capture command writes it when asked to
+# write a reference or an anchor.
+FLOOR_FIELDS = ("against", "forced", "known_answers", "nll_per_token", "explanation")
+FORCED_FIELDS = ("positions", "mean_nll_delta", "mean_abs_delta", "max_abs_delta", "top1_agreement")
+FLOOR_BAR = {
+    "top1_agreement": 0.90,
+    "mean_abs_delta": 1.0,
+    "max_abs_delta": 20.0,
+    "nll_per_token": 2.0,
+}
 SUITE_SCHEMA = "sparkflash-numerics-prompts/1"
 COMPARE_SCHEMA = "sparkflash-numerics-compare/1"
 COVERAGE_SCHEMA = "sparkflash-numerics-coverage/1"
@@ -236,6 +252,11 @@ def check_reference_shape(reference: dict, origin: str) -> None:
             raise NumericsFailure(
                 f"{origin}: server.{BUILD_SOURCE} {source!r} is not one of {list(BUILD_SOURCES)}"
             )
+    # The correctness floor is outside the fingerprint, like the server card: a reference that
+    # predates the rule has no key, and one that carries it must be well formed.
+    floor = reference.get("floor")
+    if floor is not None:
+        check_floor_shape(floor, origin)
 
 
 def build_record_commit(reference: dict) -> str | None:
@@ -269,6 +290,134 @@ def build_record_problem(reference: dict) -> str | None:
             "commit (or 'unknown'), so this reference cannot say which binary produced its bits "
             "(docs/NUMERICS.md §5)"
         )
+    return None
+
+
+def floor_bar(registry: dict, model: str) -> dict:
+    """The correctness floor's thresholds for one model: the defaults or its [[precision]] row."""
+    bar = dict(FLOOR_BAR)
+    for row in registry.get("precision") or []:
+        if row.get("model") != model:
+            continue
+        for field in bar:
+            if field in row:
+                bar[field] = float(row[field])
+    return bar
+
+
+def is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def check_floor_shape(floor: object, origin: str) -> None:
+    """The floor block's shape, exact enough that a typo cannot silently drop evidence."""
+    if not isinstance(floor, dict):
+        raise NumericsFailure(f"{origin}: floor is not an object")
+    unknown = sorted(set(floor) - set(FLOOR_FIELDS))
+    if unknown:
+        raise NumericsFailure(f"{origin}: floor has unknown key(s) {unknown}")
+    against = floor.get("against")
+    if not isinstance(against, str) or not against.strip():
+        raise NumericsFailure(
+            f"{origin}: floor.against names no pre-change build or host reference; the floor must "
+            "say what the capture was measured against"
+        )
+    forced = floor.get("forced")
+    if not isinstance(forced, dict):
+        raise NumericsFailure(f"{origin}: floor.forced is not an object")
+    missing = [field for field in FORCED_FIELDS if field not in forced]
+    if missing:
+        raise NumericsFailure(f"{origin}: floor.forced is missing {missing}")
+    for field in FORCED_FIELDS:
+        if not is_number(forced[field]):
+            raise NumericsFailure(f"{origin}: floor.forced.{field} is not a number")
+    if forced["positions"] <= 0:
+        raise NumericsFailure(f"{origin}: floor.forced.positions is not positive")
+    known = floor.get("known_answers")
+    if not isinstance(known, list) or not known:
+        raise NumericsFailure(
+            f"{origin}: floor.known_answers is empty; the greedily decoded known answers are part "
+            "of the floor"
+        )
+    for index, answer in enumerate(known):
+        if not isinstance(answer, dict):
+            raise NumericsFailure(f"{origin}: floor.known_answers[{index}] is not an object")
+        unknown = sorted(set(answer) - {"prompt", "expected", "got", "pass"})
+        if unknown:
+            raise NumericsFailure(f"{origin}: floor.known_answers[{index}] has unknown key(s) {unknown}")
+        for field in ("prompt", "expected", "got"):
+            if not isinstance(answer.get(field), str):
+                raise NumericsFailure(f"{origin}: floor.known_answers[{index}].{field} is not a string")
+        if not answer["prompt"].strip():
+            raise NumericsFailure(f"{origin}: floor.known_answers[{index}].prompt is empty")
+        if not isinstance(answer.get("pass"), bool):
+            raise NumericsFailure(f"{origin}: floor.known_answers[{index}].pass is not a boolean")
+    if not any(answer["expected"].strip() for answer in known):
+        raise NumericsFailure(
+            f"{origin}: floor.known_answers names no expected answer; one known answer must say "
+            "what the model should decode"
+        )
+    nll = floor.get("nll_per_token")
+    if not is_number(nll) or nll <= 0:
+        raise NumericsFailure(f"{origin}: floor.nll_per_token is not a positive number")
+    explanation = floor.get("explanation")
+    if explanation is not None and not isinstance(explanation, str):
+        raise NumericsFailure(f"{origin}: floor.explanation is neither a string nor null")
+
+
+def validate_floor(floor: object, origin: str, bar: dict) -> dict:
+    """The floor's shape, then its bars; a threshold miss needs an explanation to pass.
+
+    The bars are in docs/NUMERICS.md section 5 and default to FLOOR_BAR; a model may tighten or
+    loosen its own through a [[precision]] row. A distance far past the arm's precision tail
+    (Inkling's 47-nat swings and 29% top-1) is a defect until explained, so the explanation is
+    recorded beside the numbers rather than the numbers being dropped.
+    """
+    check_floor_shape(floor, origin)
+    forced = floor["forced"]
+    problems = []
+    if forced["top1_agreement"] < bar["top1_agreement"]:
+        problems.append(
+            f"top-1 agreement {forced['top1_agreement']:.4%} is below {bar['top1_agreement']:.2%}"
+        )
+    if abs(forced["mean_abs_delta"]) > bar["mean_abs_delta"]:
+        problems.append(
+            f"mean absolute NLL delta {forced['mean_abs_delta']:.3e} is above {bar['mean_abs_delta']:.3e}"
+        )
+    if abs(forced["max_abs_delta"]) > bar["max_abs_delta"]:
+        problems.append(
+            f"max absolute NLL delta {forced['max_abs_delta']:.3e} is above {bar['max_abs_delta']:.3e}"
+        )
+    if floor["nll_per_token"] > bar["nll_per_token"]:
+        problems.append(
+            f"NLL per token {floor['nll_per_token']:.4f} is above {bar['nll_per_token']:.4f}"
+        )
+    failed = [answer for answer in floor["known_answers"] if not answer["pass"]]
+    for answer in failed:
+        problems.append(
+            f"known answer {answer['prompt']!r} expected {answer['expected']!r} but decoded "
+            f"{answer['got'][:60]!r}"
+        )
+    if problems and not (floor.get("explanation") or "").strip():
+        raise NumericsFailure(
+            f"{origin}: the correctness floor fails: " + "; ".join(problems)
+            + " (docs/NUMERICS.md §5; an explained distance may be pinned, an unexplained one may not)"
+        )
+    return floor
+
+
+def floor_problem(reference: dict, model: str, registry: dict) -> str | None:
+    """Why a reference or anchor this change adds lacks a usable correctness floor, or None."""
+    floor = reference.get("floor")
+    if floor is None:
+        return (
+            "no correctness floor: a first reference or a re-declaration must record a forced "
+            "comparison, its known-answer decode and its own NLL per token (docs/NUMERICS.md §5)"
+        )
+    try:
+        validate_floor(floor, "floor", floor_bar(registry, model))
+    except NumericsFailure as error:
+        return str(error)
     return None
 
 
@@ -803,7 +952,22 @@ def parse_registry(text: str, origin: str, require_bar: bool = False) -> dict:
         for row in rows:
             check(row, origin)
         one_row_a_model(rows, table, origin)
-    for table in ("config", "anchor", "retired", "coverage", "monitors"):
+    # A [[precision]] row tightens or loosens one model's correctness-floor bars. Its fields are
+    # the floor's numeric bars; the shape is exact so a typo cannot silently leave a bar unset.
+    rows = registry.get("precision", [])
+    if not isinstance(rows, list):
+        raise NumericsFailure(f"{origin}: [[precision]] is not an array of tables")
+    for row in rows:
+        if not isinstance(row.get("model"), str) or not row["model"].strip():
+            raise NumericsFailure(f"{origin}: a [[precision]] row names no model")
+        unknown = sorted(set(row) - {"model", *FLOOR_BAR})
+        if unknown:
+            raise NumericsFailure(f"{origin}: precision {row['model']} has unknown key(s) {unknown}")
+        for field in FLOOR_BAR:
+            if field in row and (not is_number(row[field]) or row[field] <= 0):
+                raise NumericsFailure(f"{origin}: precision {row['model']}.{field} is not positive")
+    one_row_a_model(rows, "precision", origin)
+    for table in ("config", "anchor", "retired", "coverage", "monitors", "precision"):
         registry.setdefault(table, [])
     return registry
 
@@ -1133,6 +1297,24 @@ def declaration_findings(
                 findings.append(f"{path}: the file's own fingerprint field is stale ({reference.get('fingerprint')})")
             if reference.get("evidence") != entry["evidence"]:
                 findings.append(f"{path}: evidence {reference.get('evidence')!r}, but the registry says {entry['evidence']!r}")
+    # A retired configuration keeps its last reference in history, and a replaced anchor names the
+    # card it supersedes: both keep an older capture named so it is not reported as orphaned.
+    for entry in head.get("retired", []):
+        reference = entry.get("reference")
+        if isinstance(reference, str):
+            named.add(f"{NUMERICS}/{reference}")
+            retired_card = loaded(read_head, f"{NUMERICS}/{reference}")
+            if retired_card is None:
+                findings.append(f"retired {entry['model']} version {entry['version']}: {reference} does not exist")
+            elif entry.get("fingerprint") and fingerprint(retired_card) != entry["fingerprint"]:
+                findings.append(
+                    f"retired {entry['model']} version {entry['version']}: {reference} fingerprint "
+                    f"{fingerprint(retired_card)}, but the registry says {entry['fingerprint']}"
+                )
+    for anchor in head["anchor"]:
+        replaces = anchor.get("replaces")
+        if isinstance(replaces, dict) and isinstance(replaces.get("reference"), str):
+            named.add(f"{NUMERICS}/{replaces['reference']}")
     for path, status in sorted(changed.items()):
         if path.startswith(REFERENCES) and status != "D" and path not in named:
             findings.append(f"{path}: no registry entry names this reference; evidence for a report goes under {CAPTURES}")
@@ -1151,6 +1333,15 @@ def declaration_findings(
                 problem = build_record_problem(added) if isinstance(added, dict) else None
                 if problem:
                     findings.append(f"{path}: {problem}")
+                # The floor is judged the same way: a card with the build record's version note
+                # is new and must carry it; an older card, including one only moved, is
+                # grandfathered by the absent key.
+                server = (added or {}).get("server") if isinstance(added, dict) else None
+                if isinstance(added, dict) and isinstance(server, dict) and BUILD_SOURCE in server:
+                    model = (added.get("key") or {}).get("model", "")
+                    issue = floor_problem(added, model, head)
+                    if issue:
+                        findings.append(f"{path}: {issue}")
 
     base_registry = base or {"config": [], "anchor": [], "retired": [], "prerequisites": {}}
     base_missing = missing_prerequisites(base) if base else list(PREREQUISITES)
@@ -1179,12 +1370,50 @@ def declaration_findings(
         problem = build_record_problem(anchored) if isinstance(anchored, dict) else None
         if problem:
             findings.append(f"anchor {anchor['model']}: {problem}")
+        server = (anchored or {}).get("server") if isinstance(anchored, dict) else None
+        if isinstance(anchored, dict) and isinstance(server, dict) and BUILD_SOURCE in server:
+            issue = floor_problem(anchored, anchor["model"], head)
+            if issue:
+                findings.append(f"anchor {anchor['model']}: {issue}")
     for anchor in base_registry["anchor"]:
         mine = head_anchors.get(anchor["model"])
         if mine is None:
             findings.append(f"anchor {anchor['model']}: removed; an anchor is frozen")
         elif mine != anchor:
-            findings.append(f"anchor {anchor['model']}: edited; an anchor is frozen")
+            # An anchor is frozen, with one recorded exception: a replacement that names the card
+            # it replaces and why, for an anchor that pinned a defect rather than arithmetic. The
+            # old card stays in history, unchanged; the new card carries its own build and floor.
+            replaces = mine.get("replaces")
+            replaced = (
+                isinstance(replaces, dict)
+                and set(replaces) == {"reference", "fingerprint", "reason"}
+                and replaces.get("reference") == anchor.get("reference")
+                and replaces.get("fingerprint") == anchor.get("fingerprint")
+                and isinstance(replaces.get("reason"), str)
+                and bool(replaces["reason"].strip())
+            )
+            if not replaced:
+                findings.append(f"anchor {anchor['model']}: edited; an anchor is frozen")
+            else:
+                new_path = f"{NUMERICS}/{mine['reference']}"
+                data = read_head(new_path)
+                if data is None:
+                    findings.append(f"anchor {anchor['model']}: {new_path} does not exist")
+                else:
+                    try:
+                        card = json.loads(data)
+                    except json.JSONDecodeError as error:
+                        card = None
+                        findings.append(f"{new_path}: not a reference: {error}")
+                    if isinstance(card, dict):
+                        problem = build_record_problem(card)
+                        if problem:
+                            findings.append(f"anchor {anchor['model']}: {problem}")
+                        server = (card.get("server") or {}) if isinstance(card.get("server"), dict) else {}
+                        if BUILD_SOURCE in server:
+                            issue = floor_problem(card, anchor["model"], head)
+                            if issue:
+                                findings.append(f"anchor {anchor['model']}: {issue}")
         path = f"{NUMERICS}/{anchor['reference']}"
         if path in changed:
             findings.append(f"{path}: the anchor's reference changed; an anchor is frozen")
@@ -3401,6 +3630,71 @@ def self_test() -> int:
         for finding in findings:
             print(f"       {finding}")
 
+    # The correctness floor (docs/NUMERICS.md section 5): a reference this change adds must carry
+    # the evidence that its arithmetic is right. Inkling's first reference passed on determinism
+    # alone and pinned token soup, so a pin now needs a forced comparison, a known-answer decode
+    # and the reference's own NLL.
+    def floor_card(floor: dict | None) -> dict:
+        card = synthetic_reference([5, 6], -0.25)
+        card["server"] = {
+            "binary_sha256": "0" * 63 + "1",
+            "commit": "1" * 40,
+            "build_note": None,
+            "build_source": "card",
+        }
+        if floor is not None:
+            card["floor"] = floor
+        return card
+
+    good_floor = {
+        "against": "the pre-change build",
+        "forced": {
+            "positions": 970,
+            "mean_nll_delta": -5.0023e-05,
+            "mean_abs_delta": 1.6914e-04,
+            "max_abs_delta": 7.3075e-02,
+            "top1_agreement": 1.0,
+        },
+        "known_answers": [
+            {"prompt": "The capital of France is", "expected": " Paris", "got": " Paris.", "pass": True},
+        ],
+        "nll_per_token": 0.180639,
+        "explanation": None,
+    }
+
+    def floor_case(name: str, floor: dict | None, refused: bool) -> None:
+        nonlocal failed
+        new_path = "references/q2.json"
+        card = floor_card(floor)
+        base = synthetic_registry([], True)
+        head = synthetic_registry([synthetic_entry(1, card, path=new_path)], True)
+        extra = {f"{NUMERICS}/{new_path}": render_reference(card).encode()}
+        findings = declaration_findings(
+            base, head, files(old, extra), files(card, extra), {f"{NUMERICS}/{new_path}": "A"}
+        )
+        ok = bool(findings) == refused
+        failed += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} {name}: {'refused' if findings else 'passed'}")
+        for finding in findings:
+            print(f"       {finding}")
+
+    floor_case("a new reference with a correctness floor", good_floor, False)
+    floor_case("a new reference with no correctness floor", None, True)
+    floor_case(
+        "a new reference whose forced distance is a defect",
+        {**good_floor, "forced": {**good_floor["forced"], "top1_agreement": 0.2949}},
+        True,
+    )
+    floor_case(
+        "the same defect distance, explained and pinned",
+        {
+            **good_floor,
+            "forced": {**good_floor["forced"], "top1_agreement": 0.2949},
+            "explanation": "the head layout defect explains the distance; the card pins the fix",
+        },
+        False,
+    )
+
     # The approval path (docs/NUMERICS.md section 5): the same bump a missing global prerequisite
     # refuses passes when the head entry records the owner's approval of this change, and stays
     # refused when the approval is not a usable record. The per-model anchor stays present.
@@ -3629,6 +3923,21 @@ def main(argv: list[str]) -> int:
         default=REPO,
         help="fallback tree when the served card names no commit; its HEAD commit goes in the server card",
     )
+    capture_parser.add_argument(
+        "--reference",
+        action="store_true",
+        help="this capture is a reference: it needs --floor and names its build",
+    )
+    capture_parser.add_argument(
+        "--anchor",
+        action="store_true",
+        help="this capture is an anchor: it needs --floor and names its build",
+    )
+    capture_parser.add_argument(
+        "--floor",
+        type=Path,
+        help="the correctness floor (forced comparison, known answers, own NLL) a reference or anchor needs",
+    )
 
     check_parser = commands.add_parser("check", help="recapture the registered reference, bit for bit")
     check_parser.add_argument("--url", required=True)
@@ -3741,6 +4050,18 @@ def progress(record: dict) -> None:
 
 def command_capture(args: argparse.Namespace) -> int:
     url = args.url.rstrip("/")
+    writing = args.reference or args.anchor
+    if writing and args.floor is None:
+        what = "an anchor" if args.anchor else "a reference"
+        raise NumericsFailure(
+            f"{what} needs its correctness floor: pass --floor FILE with the forced comparison, "
+            "the known-answer decode and the reference's own NLL per token (docs/NUMERICS.md §5)"
+        )
+    if writing and args.forced_from is not None:
+        raise NumericsFailure(
+            "a reference or anchor is a free-running capture; --forced-from makes a comparison, "
+            "not a reference"
+        )
     binary = args.binary or (Path(os.environ["SPARKFLASH_BIN"]) if os.environ.get("SPARKFLASH_BIN") else None)
     forced_from = None
     if args.forced_from:
@@ -3769,6 +4090,18 @@ def command_capture(args: argparse.Namespace) -> int:
         binary=binary,
         repo=args.repo,
     )
+    if writing:
+        try:
+            floor = json.loads(args.floor.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise NumericsFailure(f"{args.floor}: {error}") from error
+        registry = parse_registry((REPO / REGISTRY).read_text(), REGISTRY)
+        reference["floor"] = validate_floor(
+            floor, str(args.floor), floor_bar(registry, reference["key"]["model"])
+        )
+        problem = build_record_problem(reference)
+        if problem:
+            raise NumericsFailure(f"a reference or anchor must name its build: {problem}")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(render_reference(reference))
     numerics = reference["server"]["numerics"]

@@ -169,6 +169,38 @@ always judged; an old reference is accepted without it. `text` evidence is weake
 `logprobs`: an arithmetic change that flips no greedy token is invisible to it. DeepSeek's TP=4
 device path is the only `text` configuration.
 
+### The correctness floor
+
+A first reference or a re-declaration must show that the arithmetic it pins is right, not merely
+repeatable: two identical captures of token soup are still soup. Inkling's version 1 was pinned on
+"two captures identical and the lanes gate passed" and froze degenerate output, so a pin now carries
+a floor taken outside the tool: `capture --reference` and `capture --anchor` refuse to write
+without one.
+
+The card's `floor` object sits outside the fingerprint, like the server card, and holds:
+
+- `against`: what the capture was measured against - the pre-change build, or the arm's host
+  reference where one exists.
+- `forced`: the teacher-forced comparison's `positions`, `mean_nll_delta`,
+  `mean_abs_delta`, `max_abs_delta` and `top1_agreement`.
+- `known_answers`: the fixed prompt set's greedy decodes, each with its prompt, expected text,
+  the text the model produced, and whether it passed; at least one names an expected answer.
+- `nll_per_token`: the reference's own mean NLL on its natural-text prompts.
+- `explanation`: null, or the reason a bar below is deliberately exceeded.
+
+Unless a model's `[[precision]]` row tightens or loosens them, the bars are: top-1 agreement at
+least `0.90`, mean absolute NLL delta at most `1.0` nat, max absolute NLL delta at most `20`
+nats, and the reference's own NLL at most `2.0` nats/token. A distance far beyond the arm's
+precision tail - Inkling's 47-nat swings and 29.49% top-1 were a layout defect, not precision - is
+refused unless the card records an explanation beside the numbers, and a failed known answer is
+judged the same way. The declaration check applies the rule to every reference and `[[anchor]]`
+this change adds; a card without `build_source` predates both rules and is grandfathered.
+
+An anchor is frozen, but a replacement may be recorded with
+`replaces = { reference, fingerprint, reason }` naming the card and fingerprint it supersedes -
+for an anchor that pinned a defect rather than the arithmetic. The old card stays in history,
+unchanged, and the new card carries its own build and floor.
+
 ### The served identity
 
 The binary embeds the registry. At boot every serve path prints one line:
@@ -221,10 +253,13 @@ the push's previous tip, or the merge base with `main`). It fails:
 - an approval removed from an entry that carried one, or added without the bump it records;
 - a bump on `text` evidence, which has no token ids to teacher-force;
 - a bump without a new report;
-- any change to an anchor, its removal, or a change to its file;
+- any change to an anchor, its removal, or a change to its file, unless the head anchor's
+  `replaces` record names the base anchor's reference and fingerprint and a reason;
 - a reference this change adds whose server card records a build (`server.build_source`) but
   names no commit or says `unknown`, or a `[[anchor]]` this change adds whose reference does the
   same. A reference without `build_source` predates the build record and is grandfathered;
+- a reference or `[[anchor]]` this change adds that carries `build_source` but no correctness
+  floor, or whose floor misses a bar without an explanation (see *The correctness floor* above);
 - a fingerprint that does not match its file, or a reference file no entry names;
 - a removed configuration without a `[[retired]]` entry;
 - an edited or deleted file under `numerics/captures/`, which holds the evidence behind reports;
@@ -842,6 +877,12 @@ valid within one numerics version; across versions the teacher-forced comparison
 python3 scripts/numerics.py capture --url http://127.0.0.1:8000 \
   --binary target/release/sparkflash --repo . \
   --out numerics/references/qwen38-tp4-sm121a.json
+
+# A reference or an anchor needs its correctness floor: the forced comparison, the known-answer
+# decode and the reference's own NLL, recorded in a JSON file (see *The correctness floor*).
+python3 scripts/numerics.py capture --url http://127.0.0.1:8000 \
+  --reference --floor /tmp/v2-floor.json --binary target/release/sparkflash --repo . \
+  --out numerics/references/qwen38-tp4-sm121a-v2.json
 
 # The DeepSeek device path serves only greedy text.
 python3 scripts/numerics.py capture --url http://127.0.0.1:8000 --evidence text --out numerics/references/deepseek-v41-tp4-sm121a.json

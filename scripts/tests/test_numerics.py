@@ -54,6 +54,25 @@ def with_server(reference: dict, **server) -> dict:
     return named
 
 
+def with_floor(reference: dict) -> dict:
+    """A copy of a reference carrying a correctness floor that passes every bar."""
+    floored = json.loads(json.dumps(reference))
+    floored["floor"] = {
+        "against": "the pre-change build",
+        "forced": {
+            "positions": 2,
+            "mean_nll_delta": 1.0e-04,
+            "mean_abs_delta": 1.0e-04,
+            "max_abs_delta": 1.0e-02,
+            "top1_agreement": 1.0,
+        },
+        "known_answers": [{"prompt": "p", "expected": "x", "got": "x", "pass": True}],
+        "nll_per_token": 0.2,
+        "explanation": None,
+    }
+    return floored
+
+
 def next_ulp(value: float) -> float:
     return struct.unpack("<f", struct.pack("<I", struct.unpack("<I", struct.pack("<f", value))[0] + 1))[0]
 
@@ -677,8 +696,31 @@ class DeclarationTests(unittest.TestCase):
     def test_a_new_dirty_build_is_accepted_and_named_dirty(self):
         base = NUMERICS.synthetic_registry([], False)
         head = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], False)
-        dirty = with_server(self.old, build_source="card", commit=f"{CARD_COMMIT}-dirty")
+        dirty = with_floor(with_server(self.old, build_source="card", commit=f"{CARD_COMMIT}-dirty"))
         read = {self.path: NUMERICS.render_reference(dirty).encode()}.get
+        findings = NUMERICS.declaration_findings(base, head, read, read, {self.path: "A"})
+        self.assertEqual(findings, [])
+
+    def test_a_new_reference_without_a_floor_is_refused(self):
+        # Determinism is not correctness: a build-stamped capture must also carry the evidence
+        # that its arithmetic is right (docs/NUMERICS.md §5).
+        base = NUMERICS.synthetic_registry([], False)
+        head = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], False)
+        stamped = with_server(self.old, build_source="card", commit=CARD_COMMIT)
+        read = {self.path: NUMERICS.render_reference(stamped).encode()}.get
+        findings = NUMERICS.declaration_findings(base, head, read, read, {self.path: "A"})
+        self.assertTrue(any("no correctness floor" in finding for finding in findings), findings)
+
+    def test_a_new_reference_whose_floor_misses_a_bar_is_refused_unless_explained(self):
+        base = NUMERICS.synthetic_registry([], False)
+        head = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], False)
+        floored = with_floor(with_server(self.old, build_source="card", commit=CARD_COMMIT))
+        floored["floor"]["forced"]["top1_agreement"] = 0.2949
+        read = {self.path: NUMERICS.render_reference(floored).encode()}.get
+        findings = NUMERICS.declaration_findings(base, head, read, read, {self.path: "A"})
+        self.assertTrue(any("top-1 agreement" in finding for finding in findings), findings)
+        floored["floor"]["explanation"] = "the layout defect explains the distance"
+        read = {self.path: NUMERICS.render_reference(floored).encode()}.get
         findings = NUMERICS.declaration_findings(base, head, read, read, {self.path: "A"})
         self.assertEqual(findings, [])
 
