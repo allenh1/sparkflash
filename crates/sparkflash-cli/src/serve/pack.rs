@@ -1677,17 +1677,24 @@ mod tests {
     }
 
     #[test]
-    fn glm_accepts_tensor_core_decode_where_its_profile_is_read() {
-        // The token row is the tile's few-row body, so the switch names what the arm runs.
-        let profile = GlmArm::profile_from(|name| match name {
+    fn glm_refuses_tensor_core_decode_where_its_profile_is_read() {
+        // Version 3's token row is the tiled row GEMV, so the switch that would run the FP8 body
+        // is refused with that row's reason.
+        let error = GlmArm::profile_from(|name| match name {
             "SPARKFLASH_DECODE_MMA" => Some("on".to_owned()),
             _ => None,
         })
-        .expect("GLM runs the tile's few-row body");
-        assert_eq!(profile.decode.tensor_cores, Some(true));
-        // The carried profile leaves the field unset, which is the on default.
+        .expect_err("version 3 does not run the tile's few-row body");
+        assert!(error.contains("row GEMV"), "{error}");
+        // The carried profile leaves the field unset, and the code default is the GEMV; =off is
+        // the same route and is accepted.
         let carried = GlmArm::profile_from(|_| None).expect("the carried GLM profile boots");
         assert_eq!(carried.decode.tensor_cores, None);
+        GlmArm::profile_from(|name| match name {
+            "SPARKFLASH_DECODE_MMA" => Some("off".to_owned()),
+            _ => None,
+        })
+        .expect("off is the served route");
     }
 
     #[test]
