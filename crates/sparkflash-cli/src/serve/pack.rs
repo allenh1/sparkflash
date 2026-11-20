@@ -167,7 +167,17 @@ pub(super) trait PackArm {
     ///
     /// # Errors
     /// A field this arm cannot serve.
-    fn check_profile(_profile: &ModelProfile) -> Result<(), String> {
+    fn check_profile(profile: &ModelProfile) -> Result<(), String> {
+        // Version 2's speed rule: the tensor-core decode was 2.45% behind the token kernels at
+        // the arm's default one lane, so the switch that would run it is refused.
+        if profile.decode.tensor_cores == Some(true) {
+            return Err(format!(
+                "the Qwen arm ({}) serves its decode on the token kernels since the speed rule \
+                 (docs/numerics/qwen38/v2-token-kernels.md); the tensor-core decode measured \
+                 2.45% slower at one lane. Unset SPARKFLASH_DECODE_MMA, or set it to off",
+                Self::MODEL_ID
+            ));
+        }
         Ok(())
     }
 

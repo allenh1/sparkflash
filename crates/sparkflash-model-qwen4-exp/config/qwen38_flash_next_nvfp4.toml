@@ -19,7 +19,10 @@ tensor_cores = true
 exact = false
 
 [decode]
-tensor_cores = true
+# The speed rule measured the tensor-core decode about 2.45% behind the token kernels at the arm's
+# default one lane (35.82/35.96 against 36.81/36.77 tok/s), so version 2 serves the token kernels
+# and `decode.tensor_cores = true` is refused (docs/numerics/qwen38/v2-token-kernels.md).
+tensor_cores = false
 
 [attention]
 latent_cache = "auto"

@@ -153,5 +153,7 @@ prompts, 988 tokens, built from `18a76075` with `SPARKFLASH_DECODE_MMA=off`), tw
 bit-identical, and its floor's forced comparison against version 1 (982 tokens) is a precision
 tail: mean NLL delta +8.361e-04, mean absolute 4.991e-03, max 1.109e-01, top-1 99.3890%, mean KL
 2.180e-04. The reference's own mean NLL is 0.2228 a token. Known answers, through the template,
-are 4 / Paris / READY on all three. The registry declaration (version 2, retiring version 1 with
-this reason) is the next change; the code still serves the tensor-core decode until it lands.
+are 4 / Paris / READY on all three. **Version 2 landed** (`docs/numerics/qwen38/v2-token-kernels.md`):
+the world-1 decode is the token kernels and `decode.tensor_cores = true` is refused. The
+world-2 and world-4 configurations are retired with their tensor-core captures, since the arm
+serves world 1.

@@ -217,7 +217,7 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
             ),
             (
                 Strategy::TensorCoreDecode,
-                State::Native("few-row twins of the tile at every row count"),
+                State::Off("row GEMV; decode.tensor_cores=true is refused"),
             ),
             (Strategy::Drafting, State::Native("DFlash 2 or MTP")),
             (

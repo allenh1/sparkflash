@@ -277,7 +277,10 @@ impl PrefillPlan {
         } else {
             TOKEN_PREFILL_CHUNK
         };
-        Ok(Self::new(chunk, tensor_cores).with_decode(profile.decode.tensor_cores.unwrap_or(true)))
+        Ok(
+            Self::new(chunk, tensor_cores)
+                .with_decode(profile.decode.tensor_cores.unwrap_or(false)),
+        )
     }
 
     /// [Self::from_env] over `lookup` instead of the installed profile, for a test that pins one
