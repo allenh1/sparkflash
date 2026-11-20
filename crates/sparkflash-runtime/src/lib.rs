@@ -44,6 +44,7 @@ pub mod resume;
 pub mod rounds;
 pub mod runtime;
 pub mod share;
+pub mod testing;
 pub mod tick;
 pub mod walk;
 

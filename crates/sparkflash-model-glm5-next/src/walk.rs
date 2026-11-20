@@ -865,6 +865,7 @@ impl GlmWalk {
 #[cfg(test)]
 mod tests {
     use sparkflash_model::ledger::Strategy;
+    use sparkflash_runtime::testing::ShapeWalk;
     use sparkflash_runtime::{Fixture, Mode, Walk, WalkFixture, ledger_for};
 
     use super::*;
@@ -1102,259 +1103,30 @@ mod tests {
         assert_eq!(glm_draft_budget(1, 3), 3);
     }
 
-    // A CPU walk shaped like GLM's: its verify width is [MAX_ROWS], its budget is
-    // [glm_draft_budget], and its chains are the ones the arm proposes. The runtime's policies
-    // can be checked with no device; the device path is compiled and stays `#[ignore]`d.
+    // The runtime's CPU walk shaped like GLM's: its verify width is [MAX_ROWS], its budget is
+    // [glm_draft_budget], its wall is the arm's and its chains are as deep as the arm proposes.
+    // The runtime's policies can be checked with no device; the device path is compiled and
+    // stays `#[ignore]`d.
 
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-
-    use sparkflash_runtime::{
-        Draft, Drafter, HeadInput, HeadRow, Hidden, LaneMemory, LaneState, Pass, PassKind, Segment,
-        StepWall, WalkCapabilities,
-    };
-
-    #[derive(Debug, Default)]
-    struct ShapeSeq {
-        rows: Vec<u32>,
-        pending: VecDeque<(u32, StepOutput)>,
-        checkpoint: Option<Vec<u32>>,
-    }
-
-    impl LaneState for ShapeSeq {
-        fn position(&self) -> usize {
-            self.rows.len()
-        }
-
-        fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
-            if at != self.rows.len() {
-                return Err(BackendError::new(
-                    "shape",
-                    "a checkpoint is at the position",
-                ));
-            }
-            self.checkpoint = Some(self.rows.clone());
-            Ok(())
-        }
-
-        fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-            if to > self.rows.len() {
-                return Err(BackendError::new("shape", "a rewind past the position"));
-            }
-            match (to, self.checkpoint.take()) {
-                (0, _) => self.rows.clear(),
-                (_, Some(rows)) if rows.len() >= to => self.rows = rows[..to].to_vec(),
-                _ => self.rows.truncate(to),
-            }
-            self.pending.clear();
-            Ok(())
-        }
-
-        fn room(&self, _positions: usize, _reset: bool) -> bool {
-            true
-        }
-    }
-
-    /// The flat wall of the arm's round: one draft row costs an anchor row.
-    static GLM_WALL: ExpertUnionWall = JOINT_WALL;
-
-    struct ShapeWalk {
-        layout: StateLayout,
-        limits: Limits,
-        walks: Mutex<Vec<Vec<usize>>>,
-        /// Every prompt chunk the walk was handed, in order.
-        chunks: Mutex<Vec<usize>>,
-        drafter: ShapeDrafter,
-    }
-
-    impl ShapeWalk {
-        fn new(depth: usize) -> Self {
-            Self::with_limits(depth, walk_limits(64, 4_096))
-        }
-
-        fn with_limits(depth: usize, limits: Limits) -> Self {
-            Self {
-                layout: StateLayout::new(vec![Region::Positional {
-                    name: "shape",
-                    bytes_per_row: 4,
-                }]),
-                limits,
-                walks: Mutex::new(Vec::new()),
-                chunks: Mutex::new(Vec::new()),
-                drafter: ShapeDrafter { depth },
-            }
-        }
-    }
-
-    struct ShapeDrafter {
-        depth: usize,
-    }
-
-    impl Walk for ShapeWalk {
-        type Seq = ShapeSeq;
-        type Drafter = ShapeDrafter;
-        type Vision = NoVision;
-
-        const CAPABILITIES: WalkCapabilities = WalkCapabilities::all(StateKind::Positional);
-
-        fn layout(&self) -> &StateLayout {
-            &self.layout
-        }
-
-        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
-            Ok(ShapeSeq::default())
-        }
-
-        fn limits(&self) -> Limits {
-            self.limits
-        }
-
-        fn drafter(&self) -> &Self::Drafter {
-            &self.drafter
-        }
-
-        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
-
-        fn walk(
-            &self,
-            segments: &mut [Segment<'_, Self::Seq>],
-            pass: Pass<'_>,
-        ) -> Result<Hidden, BackendError> {
-            if matches!(pass.kind, PassKind::Verify { .. }) {
-                self.walks
-                    .lock()
-                    .expect("the walk record")
-                    .push(segments.iter().map(|segment| segment.rows.len()).collect());
-            }
-            if matches!(pass.kind, PassKind::Bulk { .. }) {
-                self.chunks
-                    .lock()
-                    .expect("the chunk record")
-                    .extend(segments.iter().map(|segment| segment.rows.len()));
-            }
-            let mut rows = 0;
-            for segment in segments {
-                segment.seq.rows.extend_from_slice(segment.rows);
-                rows += segment.rows.len();
-            }
-            Ok(Hidden::new(rows))
-        }
-
-        fn head(
-            &self,
-            _hidden: &Hidden,
-            rows: &mut [HeadRow<'_, Self::Seq>],
-        ) -> Result<Vec<StepOutput>, BackendError> {
-            rows.iter_mut()
-                .map(|row| {
-                    let token = match &row.input {
-                        HeadInput::Verify { rows, row: index } => {
-                            rows.get(*index).copied().unwrap_or_default() + 1
-                        }
-                        HeadInput::Prompt(_) | HeadInput::Token(_) => row
-                            .seq
-                            .rows
-                            .last()
-                            .copied()
-                            .ok_or_else(|| BackendError::new("shape", "no row to head"))?
-                            .wrapping_add(1),
-                    };
-                    Ok(StepOutput {
-                        logits: vec![token as f32],
-                        next_token: Some(token),
-                        draft: Vec::new(),
-                    })
-                })
-                .collect()
-        }
-    }
-
-    impl Drafter<ShapeWalk> for ShapeDrafter {
-        const PRESENT: bool = true;
-        type Rows = ();
-
-        fn wall(&self) -> &dyn StepWall {
-            &GLM_WALL
-        }
-
-        fn open_round(&self, seq: &mut ShapeSeq, token: u32) -> Result<Draft, BackendError> {
-            if let Some((front, _)) = seq.pending.front()
-                && *front == token
-            {
-                let (_, step) = seq.pending.pop_front().expect("the front was read");
-                return Ok(Draft::Held(step));
-            }
-            let drafts: Vec<u32> = (1..=self.depth)
-                .map(|at| token.wrapping_add(at as u32))
-                .collect();
-            let confidence = (0..drafts.len()).map(|at| 0.9 - 0.05 * at as f64).collect();
-            Ok(Draft::Chain { confidence, drafts })
-        }
-
-        fn verify(
-            &self,
-            walk: &ShapeWalk,
-            segments: &mut [Segment<'_, ShapeSeq>],
-            _depths: &[usize],
-        ) -> Result<Vec<Self::Rows>, BackendError> {
-            let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
-            walk.walk(
-                segments,
-                Pass::verify(rows, OutputConstraint::new(&[], rows)),
-            )?;
-            Ok(vec![(); segments.len()])
-        }
-
-        fn settle(
-            &self,
-            seq: &mut ShapeSeq,
-            chunk: &[u32],
-            _rows: Self::Rows,
-        ) -> Result<StepOutput, BackendError> {
-            let picks: Vec<u32> = chunk.iter().map(|token| token.wrapping_add(1)).collect();
-            let kept = verdict(chunk, &picks);
-            let base = seq.rows.len().saturating_sub(chunk.len());
-            seq.rows.truncate(base + kept);
-            for &token in chunk.iter().take(kept).skip(1) {
-                seq.pending.push_back((
-                    token,
-                    StepOutput {
-                        logits: Vec::new(),
-                        next_token: Some(token.wrapping_add(1)),
-                        draft: Vec::new(),
-                    },
-                ));
-            }
-            Ok(StepOutput {
-                logits: Vec::new(),
-                next_token: Some(chunk[0].wrapping_add(1)),
-                draft: Vec::new(),
-            })
-        }
-
-        fn budget(&self, seqs: usize) -> usize {
-            glm_draft_budget(seqs, self.depth)
-        }
-
-        fn ready(&self, seq: &ShapeSeq, token: u32) -> bool {
-            seq.pending
-                .front()
-                .is_some_and(|(front, _)| *front == token)
-        }
-
-        fn give_back(&self, seq: &mut ShapeSeq, to: usize) -> Result<(), BackendError> {
-            seq.rows.truncate(to.min(seq.rows.len()));
-            seq.pending.clear();
-            Ok(())
-        }
-
-        fn speculation(&self, _seq: &ShapeSeq) -> Speculation {
-            Speculation::default()
-        }
+    /// A shape walk at `limits` whose drafter proposes `depth` drafts a member, every one the
+    /// model's own pick, under the arm's budget and the arm's joint wall.
+    fn shape_walk(depth: usize, limits: Limits) -> ShapeWalk {
+        ShapeWalk::new(
+            StateLayout::new(vec![Region::Positional {
+                name: "shape",
+                bytes_per_row: 4,
+            }]),
+            limits,
+            depth,
+        )
+        .with_right_picks()
+        .with_budget(glm_draft_budget)
+        .with_wall(Box::new(JOINT_WALL))
     }
 
     fn shape_runtime(depth: usize) -> Runtime<ShapeWalk> {
-        Runtime::new(ShapeWalk::new(depth), 0).expect("the shape runtime starts")
+        Runtime::new(shape_walk(depth, walk_limits(64, 4_096)), 0)
+            .expect("the shape runtime starts")
     }
 
     fn prompted(
@@ -1369,12 +1141,7 @@ mod tests {
     }
 
     fn verifies(runtime: &Runtime<ShapeWalk>) -> Vec<Vec<usize>> {
-        runtime
-            .walk()
-            .walks
-            .lock()
-            .expect("the walk record")
-            .clone()
+        runtime.walk().verifies()
     }
 
     /// One member keeps the drafter's own depth in one verify pass.
@@ -1435,7 +1202,7 @@ mod tests {
     /// exchange, and the drafter's own depth.
     #[test]
     fn the_tick_config_is_the_glm_profile() {
-        let walk = ShapeWalk::with_limits(
+        let walk = shape_walk(
             3,
             walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 1_048_576),
         );
@@ -1456,7 +1223,7 @@ mod tests {
         use sparkflash_model::backend::Sampling;
         use sparkflash_runtime::{TickEngine, TickEvent};
 
-        let walk = ShapeWalk::with_limits(
+        let walk = shape_walk(
             0,
             walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 1_048_576),
         );
@@ -1482,7 +1249,7 @@ mod tests {
             }
         }
         assert_eq!(
-            *engine.walk().chunks.lock().expect("the chunk record"),
+            engine.walk().chunks(),
             vec![
                 crate::device::DEFAULT_PREFILL_ROWS,
                 5_000 - crate::device::DEFAULT_PREFILL_ROWS
@@ -1498,8 +1265,7 @@ mod tests {
         use sparkflash_model::backend::Sampling;
         use sparkflash_runtime::{TickEngine, TickEvent};
 
-        let walk =
-            ShapeWalk::with_limits(3, walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 65_536));
+        let walk = shape_walk(3, walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 65_536));
         let mut engine = TickEngine::new(walk, 3)
             .expect("the tick engine starts")
             .with_trace();
@@ -1540,7 +1306,7 @@ mod tests {
             trace.contains("plan=shared"),
             "three lanes share one verify: {trace}"
         );
-        let passes = engine.walk().walks.lock().expect("the walk record").clone();
+        let passes = engine.walk().verifies();
         assert_eq!(passes.len(), 1, "one shared verify, not one a lane");
         assert_eq!(passes[0].len(), 3);
         assert!(

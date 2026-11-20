@@ -831,9 +831,8 @@ fn fresh_hashers(
 mod tests {
     use super::*;
     use sparkflash_model::ledger::{Strategy as LedgerStrategy, ledger_for_arm};
-    use sparkflash_runtime::{
-        ChunkPolicy, Fixture, OutputConstraint, RequestId, TickEngine, TickEvent, WalkFixture,
-    };
+    use sparkflash_runtime::testing::{self, ShapeWalk, pick, wrong};
+    use sparkflash_runtime::{ChunkPolicy, Fixture, TickEngine, TickEvent, WalkFixture};
 
     use crate::config::Qwen4ExpConfig;
     use crate::device::prefill::{DEFAULT_PREFILL_CHUNK, PrefillPlan};
@@ -1019,327 +1018,17 @@ mod tests {
             .expect("every generated check is supported");
     }
 
-    /// The model's own pick after `token`: the plain path's next token.
-    fn pick(token: u32) -> u32 {
-        token.wrapping_add(1)
-    }
-
-    /// A token the drafter gets wrong, so a round's second draft is always rejected.
-    fn wrong(token: u32) -> u32 {
-        token.wrapping_add(7)
-    }
-
-    /// A CPU walk at the Qwen arm's widths: the prefill plan's chunk as the pass width, the
-    /// batch's verify width, and a drafter whose chain is the model's own pick followed by a
-    /// deliberately wrong token, so every speculative round keeps one draft and stops at the
-    /// next. It is the shape the engine is driven at, not the arm's arithmetic.
-    struct ShapeWalk {
-        layout: StateLayout,
-        limits: Limits,
-        drafter: ShapeDrafter,
-        /// Every prompt chunk the walk was handed, in order.
-        chunks: Mutex<Vec<usize>>,
-        /// Every verify pass, one entry a member's rows.
-        verifies: Mutex<Vec<Vec<usize>>>,
-    }
-
-    impl ShapeWalk {
-        /// A walk whose prompt pass is as wide as `chunk`'s plan gives the runtime, with room
-        /// for `capacity` members in one batch and `depth` drafts a member, as
-        /// [QwenWalk::new] states its limits.
-        fn new(chunk: usize, capacity: usize, depth: usize) -> Self {
-            Self {
-                layout: layout_of(&Qwen4ExpConfig::tiny()),
-                limits: walk_limits(chunk, 65_536, capacity),
-                drafter: ShapeDrafter { depth },
-                chunks: Mutex::new(Vec::new()),
-                verifies: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn chunks(&self) -> Vec<usize> {
-            self.chunks.lock().expect("the chunk record").clone()
-        }
-
-        fn verifies(&self) -> Vec<Vec<usize>> {
-            self.verifies.lock().expect("the verify record").clone()
-        }
-    }
-
-    /// A sequence is the tokens it forwarded and still holds, plus the answers a round queued.
-    #[derive(Debug, Default)]
-    struct ShapeSeq {
-        rows: Vec<u32>,
-        pending: VecDeque<(u32, StepOutput)>,
-        point: Option<Vec<u32>>,
-    }
-
-    impl LaneState for ShapeSeq {
-        fn position(&self) -> usize {
-            self.rows.len()
-        }
-
-        fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
-            if at != self.rows.len() {
-                return Err(BackendError::new(
-                    "qwen4_shape",
-                    "a checkpoint is at the position",
-                ));
-            }
-            self.point = Some(self.rows.clone());
-            Ok(())
-        }
-
-        fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-            if to > self.rows.len() {
-                return Err(BackendError::new(
-                    "qwen4_shape",
-                    "a rewind past the position",
-                ));
-            }
-            match (to, self.point.take()) {
-                (0, _) => self.rows.clear(),
-                (_, Some(rows)) if rows.len() >= to => self.rows = rows[..to].to_vec(),
-                _ => self.rows.truncate(to),
-            }
-            self.pending.clear();
-            Ok(())
-        }
-
-        fn room(&self, _positions: usize, _reset: bool) -> bool {
-            true
-        }
-    }
-
-    /// The wall of a shared round: flat, so the row share gives the members their budget evenly.
-    struct ShapeWall;
-
-    impl StepWall for ShapeWall {
-        fn ms(&self, _seqs: usize, _rows: usize) -> f64 {
-            1.0
-        }
-    }
-
-    static SHAPE_WALL: ShapeWall = ShapeWall;
-
-    struct ShapeDrafter {
-        /// The drafts a chain holds past the anchor.
-        depth: usize,
-    }
-
-    impl Walk for ShapeWalk {
-        type Seq = ShapeSeq;
-        type Drafter = ShapeDrafter;
-        type Vision = sparkflash_runtime::NoVision;
-
-        const CAPABILITIES: WalkCapabilities =
-            WalkCapabilities::all(sparkflash_runtime::StateKind::Both);
-
-        fn layout(&self) -> &StateLayout {
-            &self.layout
-        }
-
-        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
-            Ok(ShapeSeq::default())
-        }
-
-        fn limits(&self) -> Limits {
-            self.limits
-        }
-
-        fn drafter(&self) -> &Self::Drafter {
-            &self.drafter
-        }
-
-        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
-
-        fn walk(
-            &self,
-            segments: &mut [Segment<'_, Self::Seq>],
-            mut pass: Pass<'_>,
-        ) -> Result<Hidden, BackendError> {
-            match pass.kind {
-                PassKind::TokenRows => {}
-                PassKind::Bulk { .. } => {
-                    if segments.len() != 1 {
-                        return Err(BackendError::new(
-                            "qwen4_shape",
-                            "a bulk prompt pass holds one segment",
-                        ));
-                    }
-                    let rows = segments[0].rows.len();
-                    self.chunks.lock().expect("the chunk record").push(rows);
-                }
-                PassKind::Verify { .. } => self
-                    .verifies
-                    .lock()
-                    .expect("the verify record")
-                    .push(segments.iter().map(|segment| segment.rows.len()).collect()),
-                PassKind::Paired { .. } => {
-                    return Err(BackendError::new(
-                        "qwen4_shape",
-                        "the Qwen arm does not pair several prompts in one pass",
-                    ));
-                }
-            }
-            let mut rows = 0;
-            for segment in segments {
-                segment.seq.rows.extend_from_slice(segment.rows);
-                rows += segment.rows.len();
-            }
-            let hidden = Hidden::new(rows);
-            if let Some(hook) = pass.hook.take() {
-                hook.after_layers(&hidden)?;
-            }
-            Ok(hidden)
-        }
-
-        fn head(
-            &self,
-            _hidden: &Hidden,
-            rows: &mut [HeadRow<'_, Self::Seq>],
-        ) -> Result<Vec<StepOutput>, BackendError> {
-            Ok(rows
-                .iter_mut()
-                .map(|row| {
-                    let token = match &row.input {
-                        HeadInput::Verify { rows, row: index } => {
-                            pick(rows.get(*index).copied().unwrap_or_default())
-                        }
-                        HeadInput::Prompt(_) | HeadInput::Token(_) => {
-                            row.seq.rows.last().copied().map_or(0, pick)
-                        }
-                    };
-                    StepOutput {
-                        logits: Vec::new(),
-                        next_token: Some(token),
-                        draft: Vec::new(),
-                    }
-                })
-                .collect())
-        }
-    }
-
-    impl Drafter<ShapeWalk> for ShapeDrafter {
-        const PRESENT: bool = true;
-        type Rows = ();
-
-        fn wall(&self) -> &dyn StepWall {
-            &SHAPE_WALL
-        }
-
-        fn open_round(&self, seq: &mut ShapeSeq, token: u32) -> Result<Draft, BackendError> {
-            if let Some((front, _)) = seq.pending.front()
-                && *front == token
-            {
-                let (_, step) = seq.pending.pop_front().expect("the front was read");
-                return Ok(Draft::Held(step));
-            }
-            let drafts: Vec<u32> = match self.depth {
-                0 => Vec::new(),
-                1 => vec![pick(token)],
-                _ => vec![pick(token), wrong(token)],
-            };
-            let confidence = (0..drafts.len()).map(|at| 0.9 - 0.1 * at as f64).collect();
-            Ok(Draft::Chain { confidence, drafts })
-        }
-
-        fn verify(
-            &self,
-            walk: &ShapeWalk,
-            segments: &mut [Segment<'_, ShapeSeq>],
-            _depths: &[usize],
-        ) -> Result<Vec<Self::Rows>, BackendError> {
-            let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
-            walk.walk(
-                segments,
-                Pass::verify(rows, OutputConstraint::new(&[], rows)),
-            )?;
-            Ok(vec![(); segments.len()])
-        }
-
-        fn settle(
-            &self,
-            seq: &mut ShapeSeq,
-            chunk: &[u32],
-            _rows: Self::Rows,
-        ) -> Result<StepOutput, BackendError> {
-            let picks: Vec<u32> = chunk.iter().map(|token| pick(*token)).collect();
-            let kept = sparkflash_model::verdict(chunk, &picks);
-            let base = seq.rows.len().saturating_sub(chunk.len());
-            seq.rows.truncate(base + kept);
-            for (index, &token) in chunk.iter().enumerate().take(kept).skip(1) {
-                seq.pending.push_back((
-                    token,
-                    StepOutput {
-                        logits: Vec::new(),
-                        next_token: picks.get(index).copied(),
-                        draft: Vec::new(),
-                    },
-                ));
-            }
-            Ok(StepOutput {
-                logits: Vec::new(),
-                next_token: picks.first().copied(),
-                draft: Vec::new(),
-            })
-        }
-
-        /// The arm's own rule: every member's anchor and its drafts, which is the batch buffers'
-        /// width. `share_rows` spends it on drafts only.
-        fn budget(&self, seqs: usize) -> usize {
-            seqs.saturating_mul(1 + self.depth)
-        }
-
-        fn ready(&self, seq: &ShapeSeq, token: u32) -> bool {
-            seq.pending
-                .front()
-                .is_some_and(|(front, _)| *front == token)
-        }
-
-        fn give_back(&self, seq: &mut ShapeSeq, to: usize) -> Result<(), BackendError> {
-            seq.rows.truncate(to.min(seq.rows.len()));
-            seq.pending.clear();
-            Ok(())
-        }
-
-        fn speculation(&self, _seq: &ShapeSeq) -> Speculation {
-            Speculation::default()
-        }
-    }
-
-    /// Admits a prompt and ticks until its first step.
-    fn shape_prompt(engine: &mut TickEngine<ShapeWalk>, tokens: &[u32]) -> (RequestId, StepOutput) {
-        let id = engine
-            .admit(tokens, &[], Sampling::default())
-            .expect("the prompt is admitted");
-        loop {
-            for event in engine.tick().expect("the tick") {
-                if let TickEvent::Prompt { id: got, step } = event
-                    && got == id
-                {
-                    return (id, step);
-                }
-            }
-        }
-    }
-
-    /// Feeds one token and ticks until its answer.
-    fn shape_decode(
-        engine: &mut TickEngine<ShapeWalk>,
-        id: RequestId,
-        token: u32,
-    ) -> Vec<StepOutput> {
-        engine.feed(id, token).expect("the row is fed");
-        loop {
-            for event in engine.tick().expect("the tick") {
-                if let TickEvent::Decode { id: got, steps } = event
-                    && got == id
-                {
-                    return steps;
-                }
-            }
-        }
+    /// The runtime's CPU walk at the Qwen arm's widths: the prefill plan's chunk as the pass
+    /// width and the batch's verify width, as [QwenWalk::new] states its limits, with room for
+    /// `capacity` members in one batch and `depth` drafts a member. The budget is the shape
+    /// walk's default, every member's anchor and its drafts, which is the batch buffers' width.
+    fn shape_walk(chunk: usize, capacity: usize, depth: usize) -> ShapeWalk {
+        ShapeWalk::new(
+            layout_of(&Qwen4ExpConfig::tiny()),
+            walk_limits(chunk, 65_536, capacity),
+            depth,
+        )
+        .with_code("qwen4_shape")
     }
 
     /// The generated checks drive the path Qwen serves TP=1 on, as dense's and GLM's do.
@@ -1355,7 +1044,7 @@ mod tests {
     fn the_tick_config_is_the_qwen_profile() {
         use sparkflash_runtime::TickConfig;
 
-        let walk = ShapeWalk::new(
+        let walk = shape_walk(
             DEFAULT_PREFILL_CHUNK,
             super::super::batch::MAX_BATCH,
             super::super::MTP_VERIFY_ROWS - 1,
@@ -1382,14 +1071,14 @@ mod tests {
         assert!(!config.exchange, "TP=1 has no row exchange");
 
         // The engine's shared-round switch is the runtime's, not a second rule.
-        let joint = Runtime::new(ShapeWalk::new(DEFAULT_PREFILL_CHUNK, 4, 2), 0)
+        let joint = Runtime::new(shape_walk(DEFAULT_PREFILL_CHUNK, 4, 2), 0)
             .expect("the runtime")
             .with_joint_rounds(true);
         assert!(
             TickConfig::for_runtime(&joint, 4).shared_rounds,
             "joint rounds on: the shared verify"
         );
-        let alone = Runtime::new(ShapeWalk::new(DEFAULT_PREFILL_CHUNK, 4, 2), 0)
+        let alone = Runtime::new(shape_walk(DEFAULT_PREFILL_CHUNK, 4, 2), 0)
             .expect("the runtime")
             .with_joint_rounds(false);
         assert!(
@@ -1410,9 +1099,9 @@ mod tests {
         assert_eq!(plan.forwards(4_096), vec![0..4_096], "one forward a chunk");
         assert_eq!(plan.forwards(904), vec![0..904], "the tail is one forward");
         let mut engine =
-            TickEngine::new(ShapeWalk::new(plan.chunk, 4, 0), 1).expect("the tick engine starts");
+            TickEngine::new(shape_walk(plan.chunk, 4, 0), 1).expect("the tick engine starts");
         assert_eq!(engine.config().chunk_rows, plan.chunk);
-        let _ = shape_prompt(&mut engine, &vec![7u32; 5_000]);
+        let _ = testing::prompt(&mut engine, &vec![7u32; 5_000]);
         assert_eq!(
             engine.walk().chunks(),
             vec![4_096, 904],
@@ -1420,7 +1109,7 @@ mod tests {
         );
 
         // A group's row exchange marks the bulk path; the rows are the same split.
-        let walk = ShapeWalk::new(plan.chunk, 4, 0);
+        let walk = shape_walk(plan.chunk, 4, 0);
         let mut group = TickConfig::for_walk(&walk, 1);
         group.exchange = true;
         let mut engine = TickEngine::new(walk, 1)
@@ -1428,7 +1117,7 @@ mod tests {
             .with_config(group)
             .expect("the group config");
         assert!(engine.config().exchange);
-        let _ = shape_prompt(&mut engine, &vec![7u32; 5_000]);
+        let _ = testing::prompt(&mut engine, &vec![7u32; 5_000]);
         assert_eq!(
             engine.walk().chunks(),
             vec![4_096, 904],
@@ -1449,9 +1138,9 @@ mod tests {
             "a pass is two of the plan's forwards"
         );
         let mut engine =
-            TickEngine::new(ShapeWalk::new(plan.chunk, 4, 0), 1).expect("the tick engine starts");
+            TickEngine::new(shape_walk(plan.chunk, 4, 0), 1).expect("the tick engine starts");
         assert_eq!(engine.config().chunk_rows, 256);
-        let _ = shape_prompt(&mut engine, &vec![7u32; 600]);
+        let _ = testing::prompt(&mut engine, &vec![7u32; 600]);
         assert_eq!(
             engine.walk().chunks(),
             vec![256, 256, 88],
@@ -1464,7 +1153,7 @@ mod tests {
     #[test]
     fn the_tick_engine_keeps_qwens_joint_round() {
         let mut engine = TickEngine::new(
-            ShapeWalk::new(DEFAULT_PREFILL_CHUNK, super::super::batch::MAX_BATCH, 2),
+            shape_walk(DEFAULT_PREFILL_CHUNK, super::super::batch::MAX_BATCH, 2),
             3,
         )
         .expect("the tick engine starts")
@@ -1473,7 +1162,7 @@ mod tests {
         let mut firsts = Vec::new();
         for at in 0..3u32 {
             let prompt: Vec<u32> = (0..7).map(|index| 1 + at * 13 + index).collect();
-            let (id, step) = shape_prompt(&mut engine, &prompt);
+            let (id, step) = testing::prompt(&mut engine, &prompt);
             assert_eq!(engine.kept(id).and_then(|kept| kept.history), Some(7));
             ids.push(id);
             firsts.push(step.next_token.expect("a token"));
@@ -1508,14 +1197,14 @@ mod tests {
     #[test]
     fn a_speculative_round_keeps_its_accepted_rows_only() {
         let mut engine = TickEngine::new(
-            ShapeWalk::new(DEFAULT_PREFILL_CHUNK, super::super::batch::MAX_BATCH, 2),
+            shape_walk(DEFAULT_PREFILL_CHUNK, super::super::batch::MAX_BATCH, 2),
             1,
         )
         .expect("the tick engine starts")
         .with_trace();
-        let (id, first) = shape_prompt(&mut engine, &[10, 11, 12, 13]);
+        let (id, first) = testing::prompt(&mut engine, &[10, 11, 12, 13]);
         let anchor = first.next_token.expect("a token");
-        let steps = shape_decode(&mut engine, id, anchor);
+        let steps = testing::decode(&mut engine, id, anchor);
         assert_eq!(steps.len(), 2, "the anchor and the accepted draft");
         assert_eq!(steps[0].next_token, Some(pick(anchor)));
         assert_eq!(steps[1].next_token, Some(pick(pick(anchor))));

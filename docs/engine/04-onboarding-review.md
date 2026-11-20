@@ -2296,10 +2296,12 @@ Measured at this tip, by reading (line ranges are in the two sweeps' notes, not 
 * **The walk.** 391 non-test lines for dense, 829 for Qwen, 864 for GLM, 998 for Inkling. The
   `impl Walk` block itself is 173 to 203 lines in each; the rest is the sequence, the drafter and
   the arm's row plumbing.
-* **Test scaffolding.** More than 60% of each walk file is its test module (658 to 808 lines),
-  and most of that is the same CPU shape walk, the same tick-engine profile tests and the same
-  fixture helpers, copied with the type name changed (Qwen's and Inkling's shape walks differ in
-  61 of about 322 lines).
+* **Test scaffolding.** More than 60% of each walk file was its test module (658 to 808 lines),
+  and most of that was the same CPU shape walk, the same tick-engine profile tests and the same
+  fixture helpers, copied with the type name changed (Qwen's and Inkling's shape walks differed
+  in 61 of about 322 lines). The shape walk is now one type,
+  `sparkflash_runtime::testing::ShapeWalk`, and the three test modules are 409 to 508 lines; the
+  profile tests and the fixture helpers are still copied.
 * **Serving glue.** `enable_fusion`, `enable_group_fusion`, `mirror_group`, `lane_limit`, `wire`,
   `group_rank` and a serving enum in each arm: three to eight lines of body each under ten to
   twenty of comment, near-identical between GLM, Qwen and dense.
@@ -2363,10 +2365,13 @@ Three findings, each with the change it implies.
    the console's deployment rows read `ARMS`. This is the step that turns "25 edits in 15 files"
    into one declaration, and it lowers the CLI line gate as it goes. The group halves need a
    group to verify.
-2. **The scaffolding.** One parametrised CPU shape walk in the runtime replaces the three copies
-   (in progress at the time of writing; see the commit that follows this section), then
-   `conformance!` emits the tick-profile and compute-row tests from the arm's stated chunk list
-   and member cap.
+2. **The scaffolding.** One parametrised CPU shape walk in the runtime replaces the three copies:
+   done, as `sparkflash_runtime::testing` (`ShapeWalk` with the arm's layout, limits, budget rule
+   and step wall; `prompt` and `decode` drive a tick engine to a request's answer). An arm states
+   a constructor of ten to twenty lines where it carried about 320. GLM's copy took the stricter
+   behaviour of the other two (one segment a bulk pass, a paired pass refused, the pass hook
+   called); its 91 tests pass unchanged. Next, `conformance!` emits the tick-profile and
+   compute-row tests from the arm's stated chunk list and member cap.
 3. **The contract** (finding 3), one item at a time, each gated by the generated checks.
 4. **Retire `FusedEngine`.** Two users remain: dense in a TP group (its lane frames cannot carry
    a chunk's rows yet) and Inkling's group with images. Both need a group.
