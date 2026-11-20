@@ -2065,6 +2065,53 @@ explicit environment allow-list, and `SPARKFLASH_NUMERICS_*` was not on it, so r
 was never told where to write. The allow-list now carries `NUMERICS` (`885f5edf`), and the sweep
 is owed a rerun on a binary built after the recorder landed.
 
+## The 2026-11-19 verification window: version 2, and what production was actually serving
+
+**Production never served the defect.** The deployed site tree's Inkling binary is
+`/home/allenh1/inkling-src/target/release/sparkflash`, sha256
+`bbe584d5045ef0abfc63b466f930504a4ffd73acd9bb7e92a650a9cc0cb8c600`, identical to
+`/home/allenh1/inkling-bin/sparkflash.p18`, mtime 2026-11-17 10:02:52 - one minute after the
+`b0a82f5` commit at 10:01:22, and a day before `7850cffc` (2026-11-18 23:46) and two days before
+the few-row decode (`84f07db7` / `6dd347c9`, 2026-11-19). The binary was built in a tree
+without a git HEAD, so its own card says `unknown`; the attribution is the build timestamp and
+the staged tree. No Inkling process was running at the check, so the check is of the file the
+site's launcher names, not of a live card.
+
+**The first verification window failed for a build-environment reason worth recording.** The
+release build of the fixed tip was made with `cargo` on `PATH` but without `SPARKFLASH_NVCC`
+(or `/usr/local/cuda/bin` on `PATH`), and `sparkflash-kernels`' build script silently embeds an
+empty cubin when it cannot find `nvcc`: the binary boots and only fails when an arm asks for its
+image ("this build carries no Inkling cubin, whose image holds the exchange's stage and collect
+kernels"). The build was repeated with `SPARKFLASH_NVCC=/usr/local/cuda/bin/nvcc`;
+`target/release/build/sparkflash-kernels-*/out/inkling_sm121.cubin` is 2,057,056 bytes and the
+binary grew from 188,987,080 to 217,428,688 bytes. Any Inkling build must set it.
+
+**Version 2, and the tail the plan asked for.** The fixed tip `b62e2fcb` (binary `23666b8d`)
+served at world 4 on the four DGX Sparks: `/readyz` in 26 s and the card named its commit. Two
+free captures are byte-identical (`8270fdc4…`), the anchor captures are identical
+(`02578670…`), and the teacher-forced capture of the anchor's own 128 positions scores exactly
+zero. The forced comparison against `7850cffc`, the pre-change row-GEMV build (binary
+`32b7bd03`), is a **precision tail, not a defect**: 970 positions, top-1 agreement 100.0000%,
+mean NLL delta -5.002e-05, mean absolute delta 1.691e-04, max absolute delta 7.307e-02 (the worst
+is `translation` position 68, 0.9156 against 0.8425, same top-1), 0 of the worst 20 positions at
+position 0, and the worst 20 spread over 7 of the 8 prompts (`code` 6, `translation` 5,
+`raw-continuation` 4, `tool-json` 2, one each in `summary`, `arithmetic` and `logic`). With the
+head back on its GEMV, the remaining change against `7850cffc` is exactly the expert few-row
+band and the MXFP8 tile, so this measurement closes "the expert rows are unproven on the released
+checkpoint" end to end.
+
+The known-answer checks decode `The capital of France is` to `" Paris. It is a beautiful city…"`
+and `Hello, who are you?` to a coherent English opener. `2+2=` decodes `"5\n\nA\n\nAnonymous…"`
+- and the pre-change build decodes the identical text with 970/970 forced tokens equal, so it is
+the small model's answer, not a regression. The floor records it as a failed known answer with
+that explanation rather than dropping it. The reference's own mean NLL is 0.1806 a token.
+
+The reference is `numerics/references/inkling2-tp4-sm121a-v2.json` (`acd86d46…`), the anchor is
+replaced by `inkling2-anchor-v2.json` (`a6f415ff…`, with the old card named in `replaces`), and
+version 1 is retired with "pinned degenerate output from the head layout defect (`6dd347c9`)".
+The declaration check passes with the owner's approval, because the model's coverage and monitor
+rows are still missing.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:

@@ -155,6 +155,14 @@ a clean release build with the same forced-capture discipline (two captures bit-
 served gate's lanes check, a server card that names the build), reviewed and registered as the
 arm's new version. **No deployment may be proposed on the current v2-less state.**
 
+**Re-declared as version 2 on 2026-11-19** (`docs/numerics/inkling2/v2-clean-head.md`): the
+capture is from `b62e2fcb` (binary `23666b8d`), two free captures bit-identical, and the floor's
+forced comparison against `7850cffc` is a precision tail (970 positions, top-1 100%, mean
+absolute delta 1.69e-04 nat, max 7.31e-02 nat). The anchor was replaced by a capture the
+teacher-forced comparison scores exactly zero against. This file and its reference stay as
+captured; the registry's `[[retired]]` entry names version 1 with the head layout defect's
+commit.
+
 ### What the next GPU window runs
 
 ```sh

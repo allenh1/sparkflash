@@ -198,13 +198,14 @@ world = 4
 profile = "reference"
 plan = "tp"
 arch = "sm_121a"
-version = 1
+version = 2
 evidence = "logprobs"
-reference = "references/inkling2-tp4-sm121a.json"
-fingerprint = "387647bcc3268572b2c4023978692fad7b150bcf63a0cfc12c7d5dfaaab23f16"
+reference = "references/inkling2-tp4-sm121a-v2.json"
+fingerprint = "acd86d46e35be58a11556252278219e3f3171de278f9af74588ae61c9c277652"
 captured = "2026-11-19"
-report = "docs/numerics/inkling2/v1-few-row-decode.md"
-note = "The four-rank group's first reference, captured on the branch at 5a092d5a with the arm launched by scripts/inkling-serve-group.sh: two runs bit-identical and the served gate's lanes check PASS. It pins the arithmetic the decode change lands (head and one-to-eight-row experts on the prompt tiles' bodies: q4p_dense_rows; q4p_moe_rows_gate_up_capped/_down, and the MXFP8 tile), so version 1 is the change itself and not a bump. Its speed and its distance from the row-GEMV decode are unmeasured (docs/numerics/inkling2/v1-few-row-decode.md)."
+report = "docs/numerics/inkling2/v2-clean-head.md"
+approved = { decision = "The head layout defect fix (6dd347c9, 158f5723) restores Inkling's clean arithmetic; version 1 pinned token soup", date = "2026-11-19", report = "docs/numerics/inkling2/v2-clean-head.md" }
+note = "Version 2 is the fixed build b62e2fcb (binary 23666b8d), captured after 6dd347c9 and 158f5723 put the head back on the row GEMV: two free captures are bit-identical and the card names its commit. The correctness floor (docs/NUMERICS.md section 5) records the forced comparison against 7850cffc, the pre-change row-GEMV build: 970 positions, top-1 agreement 100.00%, mean |delta NLL| 1.691e-04, max 7.307e-02 nat, 0 of the worst 20 positions at position 0 and the worst 20 spread over 7 of the 8 prompts, so the remaining expert few-row and MXFP8 change is a precision tail, not a defect. Known answers: 'The capital of France is' decodes ' Paris...' and 'Hello, who are you?' decodes a coherent English opener; '2+2=' decodes '5', identically on the pre-change build, recorded in the floor as the model's own answer rather than a regression. The reference's own mean NLL is 0.1806 a token. The anchor is replaced because the version-1 anchor pinned the soup. The head remains the row GEMV (tensor-core head restoration is docs/numerics/inkling2/v2-clean-head.md's open item); the model's coverage and monitors rows are still missing, so this bump carries the owner's approval."
 
 # Dory1.0-4B's world-4 registration could not be served from the released checkpoint: it carries
 # two recurrent loops, and `DoryStage::of_rank` refuses a world that does not divide them, so the
@@ -225,6 +226,17 @@ fingerprint = "99715d0072eab1e1cef89dbfe990faa2de2b053320c61b25726855aa460e22e3"
 captured = "2026-11-19"
 report = "docs/numerics/dory10/v1-few-row-decode.md"
 note = "The released checkpoint's first reference, single process at world 1: two captures bit-identical and `check` passing on two boots. It pins the arithmetic the decode change lands (projections on the wide tile's few-row body, q4p_dense_rows), so version 1 is the change itself and not a bump. The world-2 recurrence ring was captured on 2026-11-19 and is bit-identical to this reference (8/8 prompts, 1024/1024 logprobs, top-1 100%; numerics/captures/dory10/world2-ring.json), so the ring needs no entry of its own. Its speed, its distance from the row-GEMV decode and the ring's speed against a single process are unmeasured (docs/numerics/dory10/v1-few-row-decode.md). The world-2 ring capture was taken on the binary ef3d022e, whose own card names no commit; its commit a6ef32e4 is inferred from the staged source tree, whose Cargo.toml, crates/sparkflash-model-glm5-next/src/lib.rs and crates/sparkflash-cli/src/serve.rs match it byte for byte."
+
+[[retired]]
+model = "thinkingmachines/Inkling-2-Small"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+reference = "references/inkling2-tp4-sm121a.json"
+fingerprint = "387647bcc3268572b2c4023978692fad7b150bcf63a0cfc12c7d5dfaaab23f16"
+reason = "pinned degenerate output from the head layout defect (6dd347c9)"
 
 [[retired]]
 model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
@@ -286,16 +298,15 @@ profile = "reference"
 plan = "tp"
 arch = "sm_121a"
 evidence = "logprobs"
-reference = "references/inkling2-anchor.json"
-fingerprint = "c5ffbac96581dbe54e86995e641870fba386d98b57cd561cfbeced2777cf370e"
+reference = "references/inkling2-anchor-v2.json"
+fingerprint = "a6f415ff97ee8f58ef939e2fc3099e1db671562cf94e4fd4ab5755c4e62ba541"
 captured = "2026-11-19"
+replaces = { reference = "references/inkling2-anchor.json", fingerprint = "c5ffbac96581dbe54e86995e641870fba386d98b57cd561cfbeced2777cf370e", reason = "pinned degenerate output from the head layout defect (6dd347c9)" }
 note = """
 World 4 is Inkling's only served world, so the anchor is its arithmetic as served: the same
-configuration as the reference above, captured separately with top-20 logprobs and 16 tokens a
-prompt, with the launcher the capture used (LANES=4, tensor prefill, context 1,048,576). The
-teacher-forced capture beside it (numerics/captures/inkling2/v1-anchor-forced.json) scores
-exactly zero against this anchor over 128 scored positions. Both the anchor and the teacher-forced
-capture beside it were taken on the binary ef3d022e, whose own card names no commit; their commit
-a6ef32e4 is inferred from the staged source tree, whose Cargo.toml,
-crates/sparkflash-model-glm5-next/src/lib.rs and crates/sparkflash-cli/src/serve.rs match it byte
-for byte."""
+configuration as the reference above, captured separately on the fixed build b62e2fcb (binary
+23666b8d) with top-20 logprobs and 16 tokens a prompt, with the launcher the capture used
+(LANES=4, tensor prefill, context 1,048,576). Two anchor captures are bit-identical, and the
+teacher-forced capture beside it (numerics/captures/inkling2/v2-anchor-forced.json) scores
+exactly zero against this anchor over 128 scored positions. It replaces the version-1 anchor,
+which was a prefix of the defective build's token soup; that card stays in history, unchanged."""
