@@ -112,10 +112,16 @@ owner's tensor-core decode on this arm for correctness until the head has a tile
 its own. The decode's *experts* still run the tile's few-row bodies, and the end-to-end forced
 comparison above shows that change is a precision tail. What is still open:
 
-- **The tensor-core head.** Packing Inkling in the shared tiled layout (or building a tiled copy
-  for the head) so the head takes the body by type, then the same tail check and an
-  alternated-launch speed A/B against p18. If the tiled head is not faster, the GEMV stays, per
-  the plan's regression clause.
+- **The tensor-core head: measured, and the GEMV stays.** A tiled packed copy for the head (so
+  `q4p_dense_rows` reads it) was built and served on `985dcbf6` (binary `8f1cdc99`). It is
+  correct: its forced comparison against this reference over 970 positions is a precision tail
+  (top-1 100.0000%, mean absolute NLL delta 5.742e-06, max 2.655e-03, 0 of the worst 20 at
+  position 0, the worst 20 over 4 prompts), and the checkpoint-form capture is bit-identical to
+  the default one, which proves the tiled copy exact. It is slower, though: two alternated
+  fresh-boot pairs give 30.54 vs 34.50 and 32.57 vs 34.48 tokens/s, -6.6% to -8.5% for the tiled
+  head, losing both pairs against a written +2% bar. The plan's regression clause keeps the GEMV
+  head, so the tiled copy and its +355 MB arena were reverted (`4ee6eb45`); the typed packed
+  layout and its routing contract stay.
 - **Coverage and monitors.** The model has neither row yet; this bump carries the owner's
   approval for that reason.
 - **The speed A/B.** Unmeasured here; the plan expects flat-to-slightly-slower at one row.

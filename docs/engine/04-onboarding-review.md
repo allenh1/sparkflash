@@ -2112,6 +2112,41 @@ version 1 is retired with "pinned degenerate output from the head layout defect 
 The declaration check passes with the owner's approval, because the model's coverage and monitor
 rows are still missing.
 
+## The tiled-head window: correct, slower, and kept out
+
+The owner's decision (tensor-core decode on every arm) was only partly met for Inkling after the
+layout fix, because the head fell back to the row GEMV. A tiled packed copy for the head (the
+head's matrix packed in the wide tile's tiled layout, read by `q4p_dense_rows`) was built on the
+layout-type branch, and the first build of it exposed a registry schema defect: the v2
+declaration's `[[retired]]` entry carried `reference`/`fingerprint` and its `[[anchor]]` a
+`replaces` block, but the Rust `RetiredEntry`/`AnchorEntry` deny unknown fields and declared
+neither. `serve` parses the embedded registry at boot, so that release aborted before binding
+(`unknown field 'reference'`); the workspace test that parses the embedded text catches it. The
+schema now accepts both, validated like a config's reference (`985dcbf6`), and the model's 187
+tests pass again.
+
+The corrected build (`985dcbf6`, binary `8f1cdc99`) served at world 4 and was measured against
+the GEMV head (`b62e2fcb`, binary `23666b8d`):
+
+- **Correctness: a precision tail.** Forced on the v2 reference's 970 tokens: top-1 agreement
+  100.0000%, mean absolute NLL delta 5.742e-06, p99 2.411e-05, max 2.655e-03, 0 of the worst 20
+  positions at position 0, and the worst 20 spread over 4 prompts (`raw-continuation` 15, `code`
+  3, `tool-json` 1, `arithmetic` 1). The GEMV control reproduced the v2 reference exactly
+  (0.000e+00 at every position), so the delta is the tiled head's.
+- **The tiled copy is exact.** With `SPARKFLASH_DENSE_WEIGHTS=checkpoint` the same build
+  forced-captures the tiled default's own tokens with 0.000e+00 at every position: the body over
+  the tiled packed copy and the body over the BF16 rows are the same bits.
+- **It is slower.** Two alternated fresh-boot pairs, three 256-token greedy requests each after
+  two warm-ups: tiled 30.54 vs GEMV 34.50 tok/s (pair 1), GEMV 34.48 vs tiled 32.57 (pair 2).
+  The tiled head is 6.6-8.5% below the GEMV and loses both pairs; the written bar was +2% with
+  both pairs won.
+
+The plan's regression clause keeps the GEMV, so the tiled head's packing and its +355 MB arena
+were reverted (`4ee6eb45`). The typed packed layout (`Packed<L>`, `PackedSet<Tiled>`,
+`body_copy`) and the route audit (`docs/numerics/v1-few-row-routes.md`) stay: they are what
+makes the next tiled attempt a type-checked change, and the audit's Inkling head row still
+describes the served path (walk copy → GEMV).
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
