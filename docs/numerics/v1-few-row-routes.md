@@ -60,7 +60,7 @@ Every route that offers a packed BF16 copy to a few-row or token body, on every 
 | Qwen4-exp | Few-row tile, 1-16 rows: `device/prefill.rs:786` (`dense_rows_launch`), copy at `:804` | `q4p_dense_rows` | Tiled. `self.backend.packed` is `PackedSet<Tiled>`; the copy is `body_copy(...)` -> `Packed<Tiled>` and its arguments come from `tiled_planes()` (`:807`). | GPU: `sparkflash-model-qwen4-exp tests/few_rows.rs::a_packed_copy_gives_the_bf16_rows_bits` (skipped here); CPU: `packed::tests::the_body_copy_is_the_tiled_sets_only` |
 | Qwen4-exp | Tiled BF16 decode GEMV: `device.rs:4665` | `q4e_gemv_tiled_bf16` | No packed copy: the set is beside the BF16 rows, and this launch reads `matrix.data()`. Shape decides it, and shape is all it needs. | Existing coverage |
 | Qwen4-exp | Hyper down/up tiled: `device.rs:5020` | `q4e_hyper_down_tiled`, `q4e_hyper_up_tiled` | No packed copy (BF16/FP8 rows), shape decides. | Existing coverage |
-| Dory-10 | Few-row body, 1-8 rows: `device.rs:2544` -> `dense_rows` `:2462` | `q4p_dense_rows` | No packed copy is handed: the launch leaves the packed argument slots zero, so the body reads the matrix's BF16 rows. Dory packs `Placement::Beside`, so those rows are intact. Shape alone decides; see "What remains shape-only". | Existing device path; `dense_rows_fits` CPU-reachable shape rule |
+| Dory-10 | Few-row body, 1-8 rows: `device.rs:2579` (`Bf16Rows::of`), `dense_rows` `:2495` | `q4p_dense_rows` | The matrix's own BF16 rows, as a type: the body takes `Bf16Rows`, which only `Bf16Rows::of` makes, and that asks `PackedSet::keeps_bf16_rows`. Only a set that packs `Placement::Beside` the rows answers yes; an in-place set offers no operand, and a `Packed` copy is not a `Bf16Rows` at all, so the body can no longer be chosen by shape. Shape still decides the band and the alignment. | CPU: `sparkflash-model-dory device::tests::the_few_row_body_takes_only_rows_a_beside_set_kept`; `sparkflash-ops packed::tests::only_the_beside_set_keeps_the_bf16_rows`; `device::tests::the_decode_band_takes_the_wide_tiles_few_row_body_from_one_to_eight` |
 | Dory-10 | Token row GEMV / fused four: `device.rs:2548`, `:2656` | `q4e_gemv_packed`, `q4e_gemv4_packed` | Walk. `packed_for` returns the `DeviceMat.packed` built by a `PackedSet<Walk>`, and `packed::gemv`/`gemv4` take only `Packed<Walk>`. | CPU: `sparkflash-ops packed::tests::the_fused_call_lays_out_every_slot`; doctests |
 | Dense | Token projection: `lib.rs:2630` (`project_bf16`), packed call `:2646` | `q4e_gemv_packed` | Walk. `self.packed` is `PackedSet<Walk>`; the call is `packed::gemv`, which takes only `Packed<Walk>`. The arm declares no tensor-core token body. | CPU: ops packed tests; doctests |
 
@@ -74,12 +74,12 @@ shape-only decisions are:
   device/prefill.rs:805). It filters columns, row count and 16-byte activation alignment. Shape
   is a launch fact; the layout is already a type, so `admits` choosing a packed launch can no
   longer choose the wrong layout. It decides only packed-vs-BF16.
-- **Dory's few-row route** (device.rs:2450 `dense_rows_fits`, used at `:2544`): the body is
-  chosen by shape alone, with no packed copy handed, so it reads the BF16 rows. This is safe
-  only because Dory packs `Placement::Beside`; an in-place Dory, or one that starts handing
-  `DeviceMat.packed` to the body, must route through `PackedSet::body_copy` (and so prove the
-  tiled layout). Recorded as the one route whose admission is still shape-only and cannot be
-  typed until it has a tiled set.
+- **Dory's few-row route** (device.rs:2478 `dense_rows_fits`, used at `:2579`, `:2641`): the
+  body's operand is now `Bf16Rows`, made only by `Bf16Rows::of`, which asks
+  `PackedSet::keeps_bf16_rows`. The shape rule then decides a band and an alignment over rows the
+  set proved it left in place; an in-place Dory, or one handing `DeviceMat.packed` to the body,
+  has no operand to pass and keeps the row GEMV. What remains shape-only is the eight-row band
+  and the 8/32-column alignment, which are launch facts.
 - **Inkling's body-vs-GEMV switch** (device.rs:1653-1670) still reads the runtime `Layout`
   (`dense_rows_input`, device.rs:757) to choose between the body, the BF16 rows and the row
   GEMV. That is a routing record, not an admission of a copy: the copy the body takes is typed
@@ -104,3 +104,8 @@ The wrong-layout hand-offs are refused at compile time, and the refusal is pinne
 - `cargo test -p sparkflash-model-inkling2 --lib` keeps
   `device::tests::the_few_row_head_body_takes_only_the_tiled_packed_copy`, which pins the
   three-way routing record.
+- `cargo test -p sparkflash-model-dory --lib` runs
+  `device::tests::the_few_row_body_takes_only_rows_a_beside_set_kept`: a matrix under a
+  `Placement::Beside` set has a `Bf16Rows` operand and takes the body, and the same matrix under
+  a `Placement::InPlace` set has none, so the route cannot reach the body by shape.
+  `packed::tests::only_the_beside_set_keeps_the_bf16_rows` pins the set's answer in ops.

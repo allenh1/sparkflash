@@ -1730,6 +1730,7 @@ impl StageCore {
         gemv_group(
             cuda,
             &shared.kernels,
+            &shared.packed,
             &[
                 (&weights.attention.q, scratch.q),
                 (&weights.attention.k, scratch.k),
@@ -1847,6 +1848,7 @@ impl StageCore {
         gemv_batch(
             cuda,
             &shared.kernels,
+            &shared.packed,
             &weights.attention.o,
             scratch.attention,
             scratch.branch,
@@ -1870,6 +1872,7 @@ impl StageCore {
         gemv_group(
             cuda,
             &shared.kernels,
+            &shared.packed,
             &[
                 (&weights.mlp.gate, scratch.mlp_gate),
                 (&weights.mlp.up, scratch.mlp_up),
@@ -1895,6 +1898,7 @@ impl StageCore {
         gemv_batch(
             cuda,
             &shared.kernels,
+            &shared.packed,
             &weights.mlp.down,
             scratch.mlp_hidden,
             scratch.branch,
@@ -1948,6 +1952,7 @@ impl StageCore {
         gemv_group(
             cuda,
             &shared.kernels,
+            &shared.packed,
             &[
                 (&weights.attention.q, self.scratch.q),
                 (&weights.attention.k, self.scratch.k),
@@ -2006,6 +2011,7 @@ impl StageCore {
         gemv_batch(
             cuda,
             &shared.kernels,
+            &shared.packed,
             &weights.attention.o,
             self.scratch.attention,
             self.scratch.branch,
@@ -2029,6 +2035,7 @@ impl StageCore {
         gemv_group(
             cuda,
             &shared.kernels,
+            &shared.packed,
             &[
                 (&weights.mlp.gate, self.scratch.mlp_gate),
                 (&weights.mlp.up, self.scratch.mlp_up),
@@ -2054,6 +2061,7 @@ impl StageCore {
         gemv_batch(
             cuda,
             &shared.kernels,
+            &shared.packed,
             &weights.mlp.down,
             self.scratch.mlp_hidden,
             self.scratch.branch,
@@ -2403,6 +2411,7 @@ fn walk(
             gemv_batch(
                 cuda,
                 &shared.kernels,
+                &shared.packed,
                 lm_head,
                 scratch.hidden.offset(head.start * hidden * 4),
                 scratch.logits,
@@ -2444,10 +2453,35 @@ fn packed_for(matrix: &DeviceMat, input: Deviceptr) -> Option<Packed> {
         .filter(|_| (input.0 as usize).is_multiple_of(16))
 }
 
-/// Whether the few-row body takes a projection at `batch` rows: whole eight-column writes, a
-/// whole 32-column K run and a 16-byte-aligned activation, which every projection the arm
-/// serves has.
-fn dense_rows_fits(matrix: &DeviceMat, input: Deviceptr, batch: usize) -> bool {
+/// The few-row body's operand: one matrix's own BF16 rows, which the packed set left in place.
+///
+/// [dense_rows] reads the matrix's address as BF16 rows, so it is safe only while the set packs
+/// beside them. The field is private and [Bf16Rows::of] asks the set, so no in-place set and no
+/// packed copy can be handed to the body: a route that has only a matrix, or a `Packed` of it,
+/// has no operand to pass and falls back to the GEMV.
+#[derive(Debug, Clone, Copy)]
+struct Bf16Rows<'a> {
+    matrix: &'a DeviceMat,
+}
+
+impl<'a> Bf16Rows<'a> {
+    /// The matrix's own BF16 rows, if the packed set left them: [PackedSet::keeps_bf16_rows] is
+    /// the placement's answer, and this is the only way to make the body's operand.
+    fn of(matrix: &'a DeviceMat, packed: &PackedSet) -> Option<Self> {
+        packed.keeps_bf16_rows().then_some(Self { matrix })
+    }
+
+    /// The matrix the rows belong to.
+    fn matrix(&self) -> &'a DeviceMat {
+        self.matrix
+    }
+}
+
+/// Whether the few-row body takes a projection of BF16 rows at `batch` rows: whole eight-column
+/// writes, a whole 32-column K run and a 16-byte-aligned activation, which every projection the
+/// arm serves has. The operand is the typed rows, so the shape is checked on rows the set kept.
+fn dense_rows_fits(rows: Bf16Rows<'_>, input: Deviceptr, batch: usize) -> bool {
+    let matrix = rows.matrix();
     (1..=TOKEN_ROWS).contains(&batch)
         && matrix.rows.is_multiple_of(8)
         && matrix.columns.is_multiple_of(32)
@@ -2462,20 +2496,21 @@ fn dense_rows_fits(matrix: &DeviceMat, input: Deviceptr, batch: usize) -> bool {
 fn dense_rows(
     cuda: &Cuda,
     kernels: &Kernels,
-    projections: &[(&DeviceMat, Deviceptr)],
+    projections: &[(Bf16Rows<'_>, Deviceptr)],
     input: Deviceptr,
     batch: usize,
 ) -> Result<(), BackendError> {
     let mut args = [0u64; 61];
     args[0] = input.0;
-    args[1] = projections[0].0.columns as u64;
+    args[1] = projections[0].0.matrix().columns as u64;
     args[2] = batch as u64;
     args[3] = projections[0].1.0;
     args[4] = 0;
     args[5] = u64::from(1.0f32.to_bits());
     args[6] = projections.len() as u64;
     let mut columns = 0usize;
-    for (slot, (matrix, output)) in projections.iter().enumerate() {
+    for (slot, (rows, output)) in projections.iter().enumerate() {
+        let matrix = rows.matrix();
         args[7 + slot * 5..7 + slot * 5 + 5].copy_from_slice(&[
             matrix.pointer().0,
             output.0,
@@ -2501,6 +2536,7 @@ fn dense_rows(
 fn gemv_batch(
     cuda: &Cuda,
     kernels: &Kernels,
+    packed: &PackedSet,
     matrix: &DeviceMat,
     input: Deviceptr,
     output: Deviceptr,
@@ -2540,9 +2576,12 @@ fn gemv_batch(
         Route::RowGemv => {}
     }
     // A decode step, a verify or a few lanes: the wide tile's few-row body, so the row is the
-    // prompt tile's. A shape it does not take keeps the packed or BF16 row GEMV.
-    if dense_rows_fits(matrix, input, batch) {
-        return dense_rows(cuda, kernels, &[(matrix, output)], input, batch);
+    // prompt tile's. A shape it does not take, or a matrix whose BF16 rows the packed set did not
+    // leave in place, keeps the packed or BF16 row GEMV.
+    if let Some(rows) = Bf16Rows::of(matrix, packed)
+        && dense_rows_fits(rows, input, batch)
+    {
+        return dense_rows(cuda, kernels, &[(rows, output)], input, batch);
     }
     if let Some(rows) = packed_for(matrix, input) {
         let call = packed::gemv(rows, input, output, (matrix.rows, matrix.columns), batch, 1)
@@ -2571,6 +2610,7 @@ fn gemv_batch(
 fn gemv_group(
     cuda: &Cuda,
     kernels: &Kernels,
+    packed: &PackedSet,
     projections: &[(&DeviceMat, Deviceptr)],
     input: Deviceptr,
     batch: usize,
@@ -2586,7 +2626,7 @@ fn gemv_group(
         })
     {
         for (matrix, output) in projections {
-            gemv_batch(cuda, kernels, matrix, input, *output, batch)?;
+            gemv_batch(cuda, kernels, packed, matrix, input, *output, batch)?;
         }
         return Ok(());
     }
@@ -2594,17 +2634,22 @@ fn gemv_group(
         return Ok(());
     };
     // Up to four few-row projections of one input as one q4p_dense_rows launch: each output's
-    // row is dory_mma_wide's, and the launch is the tile's chain cut for the rows.
-    if projections
+    // row is dory_mma_wide's, and the launch is the tile's chain cut for the rows. Every
+    // projection's operand must be rows the packed set kept, so the body is never handed a copy
+    // or an in-place slot.
+    let rows: Option<Vec<Bf16Rows<'_>>> = projections
         .iter()
-        .all(|(matrix, _)| dense_rows_fits(matrix, input, batch))
+        .map(|(matrix, _)| Bf16Rows::of(matrix, packed))
+        .collect();
+    if let Some(rows) = rows
+        && rows.iter().all(|rows| dense_rows_fits(*rows, input, batch))
     {
         // One launch a matrix: the body's chain is per matrix and row, so a matrix's output is
         // the bytes its lone launch gives it, packed copy or not (the grouped launch is what
         // the arm's old fused GEMV was; the rows body's launch does not need to fuse to keep
         // the bits).
-        for (matrix, output) in projections {
-            dense_rows(cuda, kernels, &[(matrix, *output)], input, batch)?;
+        for (rows, (_, output)) in rows.iter().zip(projections) {
+            dense_rows(cuda, kernels, &[(*rows, *output)], input, batch)?;
         }
         return Ok(());
     }
@@ -2665,7 +2710,7 @@ fn gemv_group(
     }
     if !packed_parts.is_empty() {
         for (matrix, output) in projections {
-            gemv_batch(cuda, kernels, matrix, input, *output, batch)?;
+            gemv_batch(cuda, kernels, packed, matrix, input, *output, batch)?;
         }
         return Ok(());
     }
@@ -2760,8 +2805,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ATTENTION_LANES, DeviceMat, DeviceShared, DoryDeviceBackend, DoryStage, Form, Kernels,
-        LANE_BATCH, LANE_IDLE, PREFILL_BATCH, PREFILL_Q, PackedSet, Placement, SPLIT_MAX,
+        ATTENTION_LANES, Bf16Rows, DeviceMat, DeviceShared, DoryDeviceBackend, DoryStage, Form,
+        Kernels, LANE_BATCH, LANE_IDLE, PREFILL_BATCH, PREFILL_Q, PackedSet, Placement, SPLIT_MAX,
         StageCore, TOKEN_ROWS, attention_fits, decode_split, dense_rows_fits, lane_word, launch,
         profile_refusal, prompt_chunks,
     };
@@ -2773,22 +2818,40 @@ mod tests {
     /// activation keep the packed or BF16 row GEMV.
     #[test]
     fn the_decode_band_takes_the_wide_tiles_few_row_body_from_one_to_eight() {
-        let mat = |rows, columns| DeviceMat::from_parts(Deviceptr(0), rows, columns, None);
-        for rows in 1..=TOKEN_ROWS {
+        let beside = PackedSet::new(Form::Packed, Placement::Beside);
+        let fits = |rows: usize, columns: usize, input: Deviceptr, batch: usize| {
+            let matrix = DeviceMat::from_parts(Deviceptr(0), rows, columns, None);
+            let rows = Bf16Rows::of(&matrix, &beside).expect("a set beside the rows keeps them");
+            dense_rows_fits(rows, input, batch)
+        };
+        for batch in 1..=TOKEN_ROWS {
             assert!(
-                dense_rows_fits(&mat(4096, 4096), Deviceptr(0), rows),
-                "{rows} rows take the body"
+                fits(4096, 4096, Deviceptr(0), batch),
+                "{batch} rows take the body"
             );
         }
-        assert!(!dense_rows_fits(
-            &mat(4096, 4096),
-            Deviceptr(0),
-            TOKEN_ROWS + 1
-        ));
-        assert!(!dense_rows_fits(&mat(4092, 4096), Deviceptr(0), 1));
-        assert!(!dense_rows_fits(&mat(4096, 4112), Deviceptr(0), 1));
-        assert!(!dense_rows_fits(&mat(4096, 4096), Deviceptr(4), 1));
-        assert!(dense_rows_fits(&mat(4096, 4096), Deviceptr(16), 1));
+        assert!(!fits(4096, 4096, Deviceptr(0), TOKEN_ROWS + 1));
+        assert!(!fits(4092, 4096, Deviceptr(0), 1));
+        assert!(!fits(4096, 4112, Deviceptr(0), 1));
+        assert!(!fits(4096, 4096, Deviceptr(4), 1));
+        assert!(fits(4096, 4096, Deviceptr(16), 1));
+    }
+
+    /// The few-row body's operand is the matrix's own BF16 rows, and only a set that packs beside
+    /// them leaves them: an in-place set offers no operand, so a projection cannot reach the body
+    /// by shape alone, and a packed copy is not a [Bf16Rows] at all. An arm that packed in place
+    /// would keep the row GEMV rather than read the packed bytes as BF16.
+    #[test]
+    fn the_few_row_body_takes_only_rows_a_beside_set_kept() {
+        let matrix = DeviceMat::from_parts(Deviceptr(0), 4096, 4096, None);
+        let beside = PackedSet::new(Form::Packed, Placement::Beside);
+        let in_place = PackedSet::new(Form::Packed, Placement::InPlace);
+        let rows = Bf16Rows::of(&matrix, &beside).expect("a set beside the rows keeps them");
+        assert_eq!(rows.matrix().pointer(), matrix.pointer());
+        assert!(dense_rows_fits(rows, Deviceptr(0), 1));
+        // The same matrix under an in-place set has no operand: the rows at the matrix's address
+        // are the packed form's, so the route has nothing to hand the body.
+        assert!(Bf16Rows::of(&matrix, &in_place).is_none());
     }
 
     #[test]
@@ -3184,6 +3247,9 @@ mod tests {
         let input_buffer = alloc(input.len() * 4);
         cuda.copy_htod(&input_buffer, &f32_bytes(&input))
             .expect("the input");
+        // The few-row body's operand: this test's set packs beside the rows, so every matrix's
+        // own BF16 rows are the body's operand (the packed copies are the GEMV's).
+        let rows_set = PackedSet::new(Form::Checkpoint, Placement::Beside);
         // q, k, v and g's shape (a matrix whose rows end inside a 256-column tile among them),
         // and gate and up's.
         for shape in [&[384usize, 96, 96, 288][..], &[544, 544]] {
@@ -3211,11 +3277,26 @@ mod tests {
             for batch in [9, 128, 200, most_rows] {
                 let projections: Vec<(&DeviceMat, Deviceptr)> =
                     matrices.iter().zip(grouped.iter().copied()).collect();
-                super::gemv_group(&cuda, &kernels, &projections, input_buffer, batch)
-                    .expect("the grouped launch");
+                super::gemv_group(
+                    &cuda,
+                    &kernels,
+                    &rows_set,
+                    &projections,
+                    input_buffer,
+                    batch,
+                )
+                .expect("the grouped launch");
                 for (matrix, output) in matrices.iter().zip(&alone) {
-                    super::gemv_batch(&cuda, &kernels, matrix, input_buffer, *output, batch)
-                        .expect("a matrix's own launch");
+                    super::gemv_batch(
+                        &cuda,
+                        &kernels,
+                        &rows_set,
+                        matrix,
+                        input_buffer,
+                        *output,
+                        batch,
+                    )
+                    .expect("a matrix's own launch");
                 }
                 for ((matrix, one), two) in matrices.iter().zip(&grouped).zip(&alone) {
                     let mut first = vec![0u8; batch * matrix.rows * 4];
@@ -3261,19 +3342,19 @@ mod tests {
             for batch in 1..=TOKEN_ROWS {
                 let bf16: Vec<(&DeviceMat, Deviceptr)> =
                     matrices.iter().zip(grouped.iter().copied()).collect();
-                super::gemv_group(&cuda, &kernels, &bf16, input_buffer, batch)
+                super::gemv_group(&cuda, &kernels, &rows_set, &bf16, input_buffer, batch)
                     .expect("the BF16 group");
                 let rows: Vec<(&DeviceMat, Deviceptr)> =
                     packed.iter().zip(alone.iter().copied()).collect();
-                super::gemv_group(&cuda, &kernels, &rows, input_buffer, batch)
+                super::gemv_group(&cuda, &kernels, &rows_set, &rows, input_buffer, batch)
                     .expect("the packed group");
                 same(batch, "grouped");
                 for ((bf16, rows), (one, two)) in
                     matrices.iter().zip(&packed).zip(grouped.iter().zip(&alone))
                 {
-                    super::gemv_batch(&cuda, &kernels, bf16, input_buffer, *one, batch)
+                    super::gemv_batch(&cuda, &kernels, &rows_set, bf16, input_buffer, *one, batch)
                         .expect("the BF16 GEMV");
-                    super::gemv_batch(&cuda, &kernels, rows, input_buffer, *two, batch)
+                    super::gemv_batch(&cuda, &kernels, &rows_set, rows, input_buffer, *two, batch)
                         .expect("the packed GEMV");
                 }
                 same(batch, "alone");

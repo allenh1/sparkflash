@@ -482,6 +482,16 @@ impl<L: MatrixLayout> PackedSet<L> {
         self.packed.get(&weight.0).copied()
     }
 
+    /// Whether the matrices' own BF16 rows are still where a body that reads them looks: only a
+    /// set that packs [Placement::Beside] the rows leaves them intact. An in-place set overwrote
+    /// the rows it packed with the packed form, and a route that reads the matrix's address as
+    /// BF16 rows would then read packed bytes as BF16. This is the set's placement, not a
+    /// matrix's shape, because one set packs every matrix the same way.
+    #[must_use]
+    pub fn keeps_bf16_rows(&self) -> bool {
+        self.placement == Placement::Beside
+    }
+
     /// The allocations to free.
     pub fn allocations(&self) -> impl Iterator<Item = Deviceptr> + '_ {
         self.arenas
@@ -896,6 +906,17 @@ mod tests {
             walk.get(Deviceptr(0x1000)).map(|copy| copy.layout()),
             Some(Layout::Walk)
         );
+    }
+
+    /// The few-row body reads a matrix's own BF16 rows, and only a set that packs beside them
+    /// leaves those rows there: an in-place set says no for every matrix, because the set's
+    /// placement, not a matrix's shape, decides where the packed rows went.
+    #[test]
+    fn only_the_beside_set_keeps_the_bf16_rows() {
+        assert!(PackedSet::new(Form::Packed, Placement::Beside).keeps_bf16_rows());
+        assert!(PackedSet::new(Form::Checkpoint, Placement::Beside).keeps_bf16_rows());
+        assert!(!PackedSet::new(Form::Packed, Placement::InPlace).keeps_bf16_rows());
+        assert!(!PackedSet::new(Form::Checkpoint, Placement::InPlace).keeps_bf16_rows());
     }
 
     #[test]
