@@ -356,7 +356,7 @@ case "$MODE" in
         sleep 2
         failed=0
         for rank in 0 1 2 3; do
-            if ! remote "$rank" "pgrep -f '[s]parkflash serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
+            if ! remote "$rank" "pgrep -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
                 printf 'serve-four-node: rank %s exited immediately\n' "$rank" >&2
                 remote "$rank" "tail -n 25 '$LOG_ROOT/$RUN_ID/rank$rank.log'" >&2 || true
                 failed=1
@@ -364,7 +364,7 @@ case "$MODE" in
         done
         if [ "$failed" != 0 ]; then
             for rank in 0 1 2 3; do
-                remote "$rank" "pkill -TERM -f '[s]parkflash serve --checkpoint .*-rank $rank ' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+                remote "$rank" "pkill -TERM -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
             done
             die "one or more ranks failed to start"
         fi
@@ -377,14 +377,14 @@ case "$MODE" in
             # exits 0. The pattern is the exact rank flag (`--tp4-rank R` or `--rank R`), so no
             # other serve process is matched.
             # The bracket keeps the pattern from matching the shell that carries it.
-            remote "$rank" "pkill -TERM -f '[s]parkflash serve --checkpoint .*-rank $rank ' >/dev/null 2>&1 || true" || true
+            remote "$rank" "pkill -TERM -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null 2>&1 || true" || true
             printf 'serve-four-node: rank %s SIGTERM sent\n' "$rank"
         done
         printf 'serve-four-node: in-flight requests drain for up to %s ms\n' "$DRAIN_TIMEOUT_MS"
         ;;
     status)
         for rank in 0 1 2 3; do
-            if remote "$rank" "pgrep -f '[s]parkflash serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
+            if remote "$rank" "pgrep -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
                 printf 'serve-four-node: rank %s running on %s\n' "$rank" "${NODES[$rank]}"
             else
                 printf 'serve-four-node: rank %s not running on %s\n' "$rank" "${NODES[$rank]}"

@@ -58,9 +58,9 @@ fi
 case "${1:-launch}" in
 stop)
   for rank in 1 2 3; do
-    $SSH "$(rank_host $rank)" "pkill -f 'sparkflash serve --model inkling2'" >/dev/null 2>&1 || true
+    $SSH "$(rank_host $rank)" "pkill -f '[s]erve --model inkling2'" >/dev/null 2>&1 || true
   done
-  pkill -f 'sparkflash serve --model inkling2' >/dev/null 2>&1 || true
+  pkill -f '[s]erve --model inkling2' >/dev/null 2>&1 || true
   echo "serve-group: stopped"
   ;;
 launch)
