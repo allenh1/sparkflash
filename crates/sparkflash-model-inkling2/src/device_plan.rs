@@ -343,6 +343,34 @@ pub enum ExpertBody {
     Bf16,
 }
 
+/// The code planes a routed band's tables hold, when the layer stores codes: the operand the
+/// few-row expert bodies read.
+///
+/// NVFP4 packs E2M1 codes with an E4M3 scale a 16 columns and a per-expert scale, MXFP8 one E4M3
+/// byte a value with a ue8m0 scale a 32 columns; a BF16 band holds values, not codes, so it has
+/// no operand of this kind and [ExpertBody::codes] returns none for it. The few-row body's
+/// admission takes this, and the same value picks the body's kernels, so the kind the route was
+/// admitted on and the kind it launches cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertCodes {
+    /// NVFP4's packed E2M1 codes.
+    NvFp4,
+    /// MXFP8's E4M3 codes.
+    MxFp8,
+}
+
+impl ExpertBody {
+    /// The layer's code planes, or none for a BF16 band.
+    #[must_use]
+    pub const fn codes(self) -> Option<ExpertCodes> {
+        match self {
+            Self::NvFp4 => Some(ExpertCodes::NvFp4),
+            Self::MxFp8 => Some(ExpertCodes::MxFp8),
+            Self::Bf16 => None,
+        }
+    }
+}
+
 /// The destination or role a launch has, beyond its [Op].
 ///
 /// An [Op] says *what kind of arithmetic* a launch is; the target says *which of the layer's

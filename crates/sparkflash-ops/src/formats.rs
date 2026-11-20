@@ -67,6 +67,10 @@ mod sealed {
     /// Keeps [Format] closed: a new format is a marker in this module, not an implementation a
     /// model crate can add and a body can then silently accept.
     pub trait Sealed {}
+    /// Keeps [super::CodeFormat] closed for the same reason: a format that has no code plane
+    /// cannot be given one from outside, and a model crate cannot add a quantised-looking
+    /// [super::Format] that the few-row bodies would then accept.
+    pub trait Code {}
 }
 
 /// A stored weight format.
@@ -246,6 +250,21 @@ impl Format for F32 {
     const SCALES: ScaleLayout = ScaleLayout::None;
     const PRECISION: Precision = Precision::F32;
 }
+
+/// A format stored as codes behind a block-scale plane: the formats the quantised few-row and
+/// token bodies read. [Bf16] and [F32] store values, not codes, so a BF16 matrix (or a packed
+/// BF16 copy) is not one, and [CodePlanes] cannot be made from it.
+///
+/// The trait is sealed beside [Format]: the three quantised markers above are its only
+/// implementations.
+pub trait CodeFormat: Format + sealed::Code {}
+
+impl sealed::Code for Fp8E4m3 {}
+impl sealed::Code for MxFp8 {}
+impl sealed::Code for NvFp4 {}
+impl CodeFormat for Fp8E4m3 {}
+impl CodeFormat for MxFp8 {}
+impl CodeFormat for NvFp4 {}
 
 /// The shape of a format's scale plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -592,6 +611,62 @@ impl<F: Format> Mat<F> {
     }
 }
 
+/// A quantised matrix's code planes, as a few-row or token body reads them: the codes
+/// ([Mat::data]) and the block-scale plane the format's layout requires. Only a [CodeFormat]
+/// matrix makes one, so a BF16 matrix, another format's codes, or a packed BF16 copy cannot be
+/// handed to a body written for this kind.
+///
+/// This is the operand kind, not a layout: unlike [crate::packed::Packed] there is no second
+/// ordering to confuse, and the format's own upload checked the plane's layout and count.
+#[derive(Debug, Clone, Copy)]
+pub struct CodePlanes<'a, F: CodeFormat> {
+    matrix: &'a Mat<F>,
+    blocks: Deviceptr,
+}
+
+impl<'a, F: CodeFormat> CodePlanes<'a, F> {
+    /// The planes of `matrix`, if its upload supplied the block plane the layout needs ([upload]
+    /// refuses a quantised matrix without one). A format that stores values has no such plane,
+    /// and a packed copy is not a matrix:
+    ///
+    /// ```compile_fail,E0277
+    /// use sparkflash_ops::formats::{Bf16, CodePlanes, Mat};
+    /// let bf16: Mat<Bf16> = todo!("the uploaded BF16 matrix");
+    /// let _: Option<CodePlanes<'_, Bf16>> = CodePlanes::of(&bf16);
+    /// ```
+    ///
+    /// ```compile_fail,E0308
+    /// use sparkflash_ops::formats::{CodePlanes, Fp8E4m3};
+    /// use sparkflash_ops::packed::{Packed, Walk};
+    /// let copy: Packed<Walk> = unsafe { std::mem::zeroed() };
+    /// let _ = CodePlanes::<Fp8E4m3>::of(&copy);
+    /// ```
+    #[must_use]
+    pub fn of(matrix: &'a Mat<F>) -> Option<Self> {
+        matrix
+            .scales()
+            .blocks()
+            .map(|blocks| Self { matrix, blocks })
+    }
+
+    /// The code plane.
+    #[must_use]
+    pub const fn codes(&self) -> Deviceptr {
+        self.matrix.data()
+    }
+
+    /// The block-scale plane.
+    #[must_use]
+    pub const fn blocks(&self) -> Deviceptr {
+        self.blocks
+    }
+
+    /// The matrix the planes belong to.
+    #[must_use]
+    pub const fn matrix(&self) -> &'a Mat<F> {
+        self.matrix
+    }
+}
 /// Upload one stored tensor as a typed matrix.
 ///
 /// The checks are the two a bare device pointer cannot make:
@@ -1130,6 +1205,25 @@ mod tests {
         assert_eq!(mat.spec().dtype, StoredDType::BF16);
         assert_eq!(mat.spec().shape, vec![32, 4]);
         assert_eq!(mat.bytes_per_token(), 256);
+    }
+
+    /// The code-plane operand carries the format's plane pair: a quantised upload has one, and a
+    /// BF16 matrix has none to present (the type says so at the call; this pins the values).
+    #[test]
+    fn only_a_code_format_offers_its_planes() {
+        let stored = spec("w", StoredDType::F8E4M3, &[128, 128]);
+        let fp8: Mat<Fp8E4m3> = upload(Tensor {
+            stored: &stored,
+            shape: &[128, 128],
+            data: Deviceptr(0x1000),
+            stride: 128,
+            scales: Scales::fp8_e4m3(Deviceptr(0x9000), 1, StoredDType::F32),
+        })
+        .expect("a 128 x 128 E4M3 matrix");
+        let planes = CodePlanes::of(&fp8).expect("an FP8 matrix carries its scale plane");
+        assert_eq!(planes.codes(), Deviceptr(0x1000));
+        assert_eq!(planes.blocks(), Deviceptr(0x9000));
+        assert_eq!(planes.matrix().format(), FormatKind::Fp8E4m3);
     }
 
     #[test]

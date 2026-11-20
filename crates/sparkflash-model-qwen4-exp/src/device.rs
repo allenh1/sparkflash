@@ -465,6 +465,48 @@ enum GpuExperts {
     Fp8 { table: Deviceptr },
 }
 
+/// An NVFP4 routed-expert table: the six pointers an expert a body indexes by its sorted expert
+/// id, and the layer's per-tensor scale vector. Only an NVFP4 [GpuExperts] makes one.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NvFp4Experts {
+    /// The six-pointer table the kernels index by expert.
+    pub table: Deviceptr,
+    /// The layer's [experts] per-tensor scales.
+    pub scales: Deviceptr,
+}
+
+/// A block-scaled E4M3 routed-expert table (the checkpoint's MTP layer): the same six-pointer
+/// layout, its scale rows the BF16 [rows / 128][columns / 128] blocks the converter interleaved
+/// with the table. Only an FP8 [GpuExperts] makes one.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Fp8Experts {
+    /// The six-pointer table the kernels index by expert.
+    pub table: Deviceptr,
+}
+
+/// A routed-expert table's operands, typed by the code format its weights are stored in. The
+/// token bodies and the grouped MMA read one kind each, and the kind carries its table, so a
+/// launch written for one kind cannot be handed another kind's pointers (or a packed BF16 copy,
+/// which is not a table at all).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ExpertOperand {
+    /// NVFP4 codes with per-16 E4M3 scales.
+    NvFp4(NvFp4Experts),
+    /// E4M3 codes with BF16 128 x 128 block scales.
+    Fp8(Fp8Experts),
+}
+
+impl GpuExperts {
+    /// This table's operand kind, chosen once where the layer's format was fixed.
+    #[must_use]
+    pub(super) fn operand(&self) -> ExpertOperand {
+        match *self {
+            Self::Nvfp4 { table, scales } => ExpertOperand::NvFp4(NvFp4Experts { table, scales }),
+            Self::Fp8 { table } => ExpertOperand::Fp8(Fp8Experts { table }),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum GpuBranch {
     Linear {
@@ -7292,6 +7334,32 @@ mod tests {
         .expect_err("a 4 x 256 FP8 matrix has two 128 x 128 tiles");
         assert!(short.contains("needs 2"), "{short}");
         assert!(short.contains("has 1"), "{short}");
+    }
+
+    /// A routed-expert table carries its code format: the operand a launch takes is the kind the
+    /// layer was uploaded as, and the two kinds are different types, so the NVFP4 table's two
+    /// planes cannot be read by the FP8 body (or the other way round), and a packed BF16 copy is
+    /// not a table at all.
+    #[test]
+    fn the_expert_operand_carries_its_code_format() {
+        let nvfp4 = GpuExperts::Nvfp4 {
+            table: Deviceptr(0x1000),
+            scales: Deviceptr(0x2000),
+        };
+        let fp8 = GpuExperts::Fp8 {
+            table: Deviceptr(0x3000),
+        };
+        match nvfp4.operand() {
+            ExpertOperand::NvFp4(experts) => {
+                assert_eq!(experts.table, Deviceptr(0x1000));
+                assert_eq!(experts.scales, Deviceptr(0x2000));
+            }
+            ExpertOperand::Fp8(_) => panic!("an NVFP4 table is not FP8 code planes"),
+        }
+        match fp8.operand() {
+            ExpertOperand::Fp8(experts) => assert_eq!(experts.table, Deviceptr(0x3000)),
+            ExpertOperand::NvFp4(_) => panic!("an FP8 table has no per-tensor scale plane"),
+        }
     }
 
     #[test]

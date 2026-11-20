@@ -37,7 +37,7 @@ use sparkflash_ops::moe::{MoePlanCall, combine_grid, token};
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
-    Dense, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch, GpuExperts, GpuMoe,
+    Dense, DeviceSequence, ExpertOperand, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch, GpuMoe,
     MAX_SELECTED_TOKENS,
 };
 
@@ -743,19 +743,20 @@ impl DeviceSequence {
         // One hit a chosen expert, into the input this forward opened (docs/NUMERICS.md §5);
         // with SPARKFLASH_NUMERICS_COVERAGE unset this is one `Option` check.
         self.record_routing(layer, batch)?;
-        let tensor_cores = match moe.experts {
-            GpuExperts::Nvfp4 { table, scales } if chunk => {
-                self.routed_experts_mma(table, scales, mixed, batch)?
-            }
-            // The FP8 release's grouped prefill MMA (D95): the same shared 128 x 128 tile
-            // GLM's FP8 experts run, with Qwen's BF16 tile scales.
-            GpuExperts::Fp8 { table } if chunk => {
-                self.routed_experts_mma_fp8(table, mixed, batch)?
-            }
-            _ => false,
-        };
+        // The table's code format is the operand: chosen once here, it picks the grouped MMA
+        // and, below, the token body's kernel and argument list.
+        let operand = moe.experts.operand();
+        let tensor_cores = chunk
+            && match operand {
+                ExpertOperand::NvFp4(experts) => self.routed_experts_mma(experts, mixed, batch)?,
+                // The FP8 release's grouped prefill MMA (D95): the same shared 128 x 128 tile
+                // GLM's FP8 experts run, with Qwen's BF16 tile scales.
+                ExpertOperand::Fp8(experts) => {
+                    self.routed_experts_mma_fp8(experts, mixed, batch)?
+                }
+            };
         if !tensor_cores {
-            self.routed_experts(&moe.experts, mixed, batch)?;
+            self.routed_experts(operand, mixed, batch)?;
         }
         self.probe_finite(
             layer,
@@ -805,7 +806,7 @@ impl DeviceSequence {
     /// expert kernels read come from the same counting pass GLM's and DeepSeek's experts use.
     fn routed_experts(
         &self,
-        experts: &GpuExperts,
+        experts: ExpertOperand,
         mixed: Deviceptr,
         batch: usize,
     ) -> Result<(), BackendError> {
@@ -836,8 +837,9 @@ impl DeviceSequence {
         self.launch(kernels.moe_plan, grid, block, &plan.args())?;
         let (gate_up_grid, block) = token::gate_up_grid(intermediate, topk, count);
         let (down_grid, _) = token::down_grid(hidden, topk, count);
-        match *experts {
-            GpuExperts::Nvfp4 { table, scales } => {
+        match experts {
+            ExpertOperand::NvFp4(experts) => {
+                let (table, scales) = (experts.table, experts.scales);
                 self.launch(
                     kernels.expert_gate_up,
                     gate_up_grid,
@@ -875,7 +877,8 @@ impl DeviceSequence {
                     ],
                 )?;
             }
-            GpuExperts::Fp8 { table } => {
+            ExpertOperand::Fp8(experts) => {
+                let table = experts.table;
                 self.launch(
                     kernels.expert_gate_up_fp8,
                     gate_up_grid,

@@ -103,7 +103,8 @@ use sparkflash_ops::OpPlan;
 use sparkflash_ops::calls::{self, Call, RmsNorm};
 use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 use sparkflash_ops::formats::{
-    Bf16, F32 as F32Format, FormatKind, Fp8E4m3, Mat, Scales, Tensor, upload as upload_format,
+    Bf16, CodePlanes, F32 as F32Format, FormatKind, Fp8E4m3, Mat, Scales, Tensor,
+    upload as upload_format,
 };
 use sparkflash_ops::gdn::{self, CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE};
 use sparkflash_ops::gemv::{
@@ -1183,6 +1184,15 @@ impl LinearWeight {
         matches!(self, Self::Fp8(_))
     }
 
+    /// The block-scaled FP8 matrix, when the weight is one: the typed codes and the f32 128 x 128
+    /// scale plane the tile's few-row body reads. A BF16 part has none.
+    fn fp8(&self) -> Option<&Mat<Fp8E4m3>> {
+        match self {
+            Self::Bf16(_) => None,
+            Self::Fp8(matrix) => Some(matrix),
+        }
+    }
+
     /// One value's stored bytes: one for E4M3, two for BF16.
     fn element(&self) -> usize {
         if self.is_fp8() { 1 } else { 2 }
@@ -1261,6 +1271,13 @@ impl DeviceLinear {
         output.offset(rows * start * 4)
     }
 
+    /// The code planes the tile's few-row FP8 body reads, when the weight is a block-scaled FP8
+    /// matrix: the E4M3 codes and their f32 128 x 128 scale plane, typed by the upload. A BF16
+    /// part has none, so no route can choose the FP8 body over it.
+    fn fp8_planes(&self) -> Option<CodePlanes<'_, Fp8E4m3>> {
+        CodePlanes::of(self.weight.fp8()?)
+    }
+
     /// The weight's bytes, one a value for E4M3 and two for BF16, as a [DeviceRank::prefetch]
     /// span.
     fn span(&self) -> (Deviceptr, usize) {
@@ -1283,14 +1300,21 @@ fn fp8_token_body_rows(rows: usize) -> bool {
     (1..=MAX_ROWS).contains(&rows)
 }
 
-/// Whether the FP8 tile body takes this projection at `rows` rows: the row rule, an E4M3
-/// weight with f32 128 x 128 block scales, a K run of whole 128-column blocks, and parts of
-/// whole eight-column output writes whose scales start on a 128-row block. A shape it does not
-/// take keeps the tiled GEMV.
-fn fp8_token_body_fits(linear: &DeviceLinear, rows: usize) -> bool {
-    if !linear.weight.is_fp8()
-        || !fp8_token_body_rows(rows)
+/// Whether the FP8 tile body takes this projection at `rows` rows: the row rule, a K run of
+/// whole 128-column blocks, and parts of whole eight-column output writes whose scales start on a
+/// 128-row block.
+///
+/// The weight is the operand, not a shape: only [CodePlanes]<[Fp8E4m3]> reaches this rule, which
+/// only an E4M3 weight with its block-scale plane produces ([DeviceLinear::fp8_planes]). A shape
+/// it does not take, and a BF16 part, keep the tiled GEMV.
+fn fp8_token_body_fits(
+    planes: CodePlanes<'_, Fp8E4m3>,
+    linear: &DeviceLinear,
+    rows: usize,
+) -> bool {
+    if !fp8_token_body_rows(rows)
         || !linear.columns.is_multiple_of(FP8_BLOCK)
+        || planes.matrix().columns() != linear.columns
     {
         return false;
     }
@@ -1309,37 +1333,40 @@ fn fp8_token_body_fits(linear: &DeviceLinear, rows: usize) -> bool {
 
 /// The body a projection takes inside a walk: the bulk GEMM past the arm's step, the tile's
 /// few-row FP8 body, or the tiled GEMV.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TokenRoute {
+#[derive(Debug, Clone, Copy)]
+enum TokenRoute<'a> {
     /// Past [MAX_ROWS] rows: the bulk tensor-core GEMM.
     Bulk,
-    /// The shared tile's few-row body over each part of an FP8 projection.
-    TokenBody,
+    /// The shared tile's few-row body over each part of an FP8 projection, with the code planes
+    /// the admission proved: the E4M3 codes and their 128 x 128 scale plane.
+    TokenBody(CodePlanes<'a, Fp8E4m3>),
     /// The tiled GEMV, whose bits a verified row is defined by.
     TiledGemv,
 }
 
 /// Which body `linear` takes for `rows` rows under the decode switch.
 ///
-/// The tile's few-row body takes an FP8 part only when `decode_tensor_cores` is on and the
-/// part fits ([fp8_token_body_fits]), the operands are eight-byte aligned and the batch is one
-/// to [MAX_ROWS] rows. A BF16 part and a shape the body does not fit keep the tiled GEMV in
-/// both switch states; a batch past [MAX_ROWS] takes the bulk GEMM whatever the switch says.
+/// The tile's few-row body takes an FP8 part only when `decode_tensor_cores` is on, the weight
+/// is the code planes an FP8 matrix produces ([DeviceLinear::fp8_planes]), the part fits
+/// ([fp8_token_body_fits]), the operands are eight-byte aligned and the batch is one to
+/// [MAX_ROWS] rows. A BF16 part and a shape the body does not fit keep the tiled GEMV in both
+/// switch states; a batch past [MAX_ROWS] takes the bulk GEMM whatever the switch says.
 fn token_route(
     linear: &DeviceLinear,
     input: Deviceptr,
     rows: usize,
     decode_tensor_cores: bool,
-) -> TokenRoute {
+) -> TokenRoute<'_> {
     if rows > MAX_ROWS {
         return TokenRoute::Bulk;
     }
     if decode_tensor_cores
-        && fp8_token_body_fits(linear, rows)
+        && let Some(planes) = linear.fp8_planes()
+        && planes.codes().0.is_multiple_of(8)
         && input.0.is_multiple_of(8)
-        && linear.weight.data().0.is_multiple_of(8)
+        && fp8_token_body_fits(planes, linear, rows)
     {
-        return TokenRoute::TokenBody;
+        return TokenRoute::TokenBody(planes);
     }
     TokenRoute::TiledGemv
 }
@@ -1348,20 +1375,19 @@ fn token_route(
 /// weight rows, its 128-column scale block and its outputs for all `rows` rows. The body's
 /// arguments are the prompt tile's (`w, ws, a, out, cols, inner, tokens`) and its activations
 /// are the f32 rows the GEMV read, so nothing is converted between the two.
+#[allow(clippy::too_many_arguments)]
 fn launch_fp8_token_body(
     cuda: &Cuda,
     stream: &RunStream,
     kernel: Kernel,
+    planes: CodePlanes<'_, Fp8E4m3>,
     linear: &DeviceLinear,
     input: Deviceptr,
     output: Deviceptr,
     rows: usize,
 ) -> Result<(), BackendError> {
     let columns = linear.columns;
-    let scales = linear
-        .weight
-        .scales()
-        .ok_or_else(|| refusal("the FP8 token body takes a block-scaled weight"))?;
+    let scales = planes.blocks();
     let starts = [
         0,
         linear.parts[0],
@@ -1375,7 +1401,7 @@ fn launch_fp8_token_body(
             continue;
         }
         let part_rows = end - first;
-        let weight = linear.weight.data().offset(first * columns);
+        let weight = planes.codes().offset(first * columns);
         let part_scales =
             scales.offset((first / FP8_BLOCK) * (columns / FP8_BLOCK) * std::mem::size_of::<f32>());
         let out = output.offset(rows * first * 4);
@@ -3845,7 +3871,9 @@ impl DeviceRank {
     ) -> Result<(), BackendError> {
         match token_route(linear, input, rows, self.decode_tensor_cores) {
             TokenRoute::Bulk => self.bulk_gemm(linear, input, output, rows),
-            TokenRoute::TokenBody => self.fp8_token_body(linear, input, output, rows),
+            TokenRoute::TokenBody(planes) => {
+                self.fp8_token_body(planes, linear, input, output, rows)
+            }
             TokenRoute::TiledGemv => self.gemv_small(linear, input, output, rows),
         }
     }
@@ -3856,6 +3884,7 @@ impl DeviceRank {
     /// activations are the f32 rows the GEMV read, so nothing is converted between the two.
     fn fp8_token_body(
         &self,
+        planes: CodePlanes<'_, Fp8E4m3>,
         linear: &DeviceLinear,
         input: Deviceptr,
         output: Deviceptr,
@@ -3865,6 +3894,7 @@ impl DeviceRank {
             &self.cuda,
             &self.stream,
             self.kernels.prefill_dense_fp8_rows.kernel,
+            planes,
             linear,
             input,
             output,
@@ -7535,7 +7565,8 @@ mod tests {
                 ],
             )
             .expect("the prompt tile");
-            launch_fp8_token_body(&cuda, &run, body, &linear, input, body_out, count)
+            let planes = linear.fp8_planes().expect("an FP8 projection's planes");
+            launch_fp8_token_body(&cuda, &run, body, planes, &linear, input, body_out, count)
                 .expect("the token body");
             let expected: Vec<u32> = test_io::download::<u32>(&cuda, &tile_out, count * COLS);
             let got: Vec<u32> = test_io::download::<u32>(&cuda, &body_out, count * COLS);
@@ -7575,16 +7606,19 @@ mod tests {
             assert!(!fp8_token_body_rows(rows), "{rows} rows do not");
         }
 
+        // The operand is the weight's code planes: a BF16 weight has none, so the rule is never
+        // reached with it (the type says so; this pins the refusal at the accessor).
         let fits = |weight: u8, rows: usize, parts: [usize; 3]| {
             let scales = (weight != 0).then_some(Deviceptr(0));
-            fp8_token_body_fits(
-                &DeviceLinear::view(Deviceptr(0), rows, 512, weight != 0, scales).parted(parts),
-                8,
-            )
+            let linear =
+                DeviceLinear::view(Deviceptr(0), rows, 512, weight != 0, scales).parted(parts);
+            linear
+                .fp8_planes()
+                .is_some_and(|planes| fp8_token_body_fits(planes, &linear, 8))
         };
         assert!(fits(1, 8, [8, 8, 8]), "one eight-row part");
         assert!(fits(1, 256, [128, 256, 256]), "whole-tile parts");
-        assert!(!fits(0, 8, [8, 8, 8]), "a BF16 weight stays on the GEMV");
+        assert!(!fits(0, 8, [8, 8, 8]), "a BF16 weight has no FP8 operand");
         assert!(
             !fits(1, 196, [128, 196, 196]),
             "a part that is not whole eight-column writes"
@@ -7610,34 +7644,43 @@ mod tests {
         let narrow = || DeviceLinear::view(Deviceptr(0), 256, 500, true, Some(Deviceptr(0)));
         let input = Deviceptr(8);
         for rows in 1..=MAX_ROWS {
-            assert_eq!(
-                token_route(&fp8(), input, rows, true),
-                TokenRoute::TokenBody,
+            assert!(
+                matches!(
+                    token_route(&fp8(), input, rows, true),
+                    TokenRoute::TokenBody(_)
+                ),
                 "{rows} FP8 rows with the switch on"
             );
-            assert_eq!(
-                token_route(&fp8(), input, rows, false),
-                TokenRoute::TiledGemv,
+            assert!(
+                matches!(
+                    token_route(&fp8(), input, rows, false),
+                    TokenRoute::TiledGemv
+                ),
                 "{rows} FP8 rows with the switch off"
             );
             for switch in [true, false] {
-                assert_eq!(
-                    token_route(&bf16(), input, rows, switch),
-                    TokenRoute::TiledGemv,
+                // The body's operand is the FP8 code planes: a BF16 part produces none, so the
+                // route keeps the tiled GEMV whatever the switch says.
+                assert!(
+                    matches!(
+                        token_route(&bf16(), input, rows, switch),
+                        TokenRoute::TiledGemv
+                    ),
                     "{rows} BF16 rows, switch {switch}"
                 );
-                assert_eq!(
-                    token_route(&narrow(), input, rows, switch),
-                    TokenRoute::TiledGemv,
+                assert!(
+                    matches!(
+                        token_route(&narrow(), input, rows, switch),
+                        TokenRoute::TiledGemv
+                    ),
                     "{rows} narrow rows, switch {switch}"
                 );
             }
         }
         for rows in [MAX_ROWS + 1, 512] {
             for switch in [true, false] {
-                assert_eq!(
-                    token_route(&fp8(), input, rows, switch),
-                    TokenRoute::Bulk,
+                assert!(
+                    matches!(token_route(&fp8(), input, rows, switch), TokenRoute::Bulk),
                     "{rows} rows, switch {switch}"
                 );
             }
@@ -7660,9 +7703,11 @@ mod tests {
         );
         let fp8 = DeviceLinear::view(Deviceptr(0), 256, 512, true, Some(Deviceptr(0)));
         for rows in 1..=MAX_ROWS {
-            assert_eq!(
-                token_route(&fp8, Deviceptr(8), rows, decode_tensor_cores(&profile)),
-                TokenRoute::TokenBody,
+            assert!(
+                matches!(
+                    token_route(&fp8, Deviceptr(8), rows, decode_tensor_cores(&profile)),
+                    TokenRoute::TokenBody(_)
+                ),
                 "{rows} rows of the shipped profile"
             );
         }
@@ -7672,9 +7717,11 @@ mod tests {
             .expect("off is a switch value");
         assert_eq!(profile.decode.tensor_cores, Some(false));
         for rows in 1..=MAX_ROWS {
-            assert_eq!(
-                token_route(&fp8, Deviceptr(8), rows, decode_tensor_cores(&profile)),
-                TokenRoute::TiledGemv,
+            assert!(
+                matches!(
+                    token_route(&fp8, Deviceptr(8), rows, decode_tensor_cores(&profile)),
+                    TokenRoute::TiledGemv
+                ),
                 "{rows} rows with SPARKFLASH_DECODE_MMA=off"
             );
         }

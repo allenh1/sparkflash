@@ -59,8 +59,8 @@ use sparkflash_ops::projection::{Fp8Tile, SPLIT_STAGE, SplitTile, fp8_tile_fits,
 use sparkflash_ops::formats::{Bf16, Fp8E4m3, Mat};
 
 use super::{
-    Bound, DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMatE4m3Tile,
-    split_tickets,
+    Bound, DeviceSequence, Fp8Experts, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS,
+    GpuMatE4m3Tile, NvFp4Experts, split_tickets,
 };
 use crate::config::Qwen4ExpConfig;
 
@@ -975,11 +975,11 @@ impl DeviceSequence {
     /// stage pairs.
     pub(super) fn routed_experts_mma(
         &self,
-        table: Deviceptr,
-        scales: Deviceptr,
+        experts: NvFp4Experts,
         mixed: Deviceptr,
         batch: usize,
     ) -> Result<bool, BackendError> {
+        let (table, scales) = (experts.table, experts.scales);
         let config = &self.backend.config;
         let hidden = config.hidden_size;
         let intermediate = config.moe_intermediate_size;
@@ -1087,10 +1087,13 @@ impl DeviceSequence {
     /// write, so the combine is unchanged.
     pub(super) fn routed_experts_mma_fp8(
         &self,
-        table: Deviceptr,
+        experts: Fp8Experts,
         mixed: Deviceptr,
         batch: usize,
     ) -> Result<bool, BackendError> {
+        // The block-scaled E4M3 table, whose kind this type is: the grouped FP8 tile cannot be
+        // handed the NVFP4 table, whose scales are per tensor rather than a 128 x 128 grid.
+        let table = experts.table;
         let config = &self.backend.config;
         let hidden = config.hidden_size;
         let intermediate = config.moe_intermediate_size;
