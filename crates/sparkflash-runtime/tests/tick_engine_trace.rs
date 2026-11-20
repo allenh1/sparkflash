@@ -35,9 +35,8 @@ use std::sync::{Arc, Mutex};
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, StepOutput};
 use sparkflash_runtime::tick::{Clock, QUEUE};
 use sparkflash_runtime::{
-    Absent, ComputeDeclaration, HeadRow, Hidden, LaneMemory, LaneState, Limits, NoVision, Pass,
-    PassKind, Segment, StateKind, StateLayout, TickConfig, TickEngine, TickEvent, Walk,
-    WalkCapabilities,
+    Absent, ComputeDeclaration, HeadRow, Hidden, LaneState, Limits, NoVision, Pass, PassKind,
+    Segment, StateKind, StateLayout, TickConfig, TickEngine, TickEvent, Walk, WalkCapabilities,
 };
 
 /// A clock the test advances before each tick, so the engine's cost model reads the same scripted
@@ -111,6 +110,7 @@ impl ReplayWalk {
 
 impl Walk for ReplayWalk {
     type Seq = Seq;
+    type Hidden = Hidden;
     type Drafter = Absent<&'static str>;
     type Vision = NoVision;
 
@@ -130,7 +130,7 @@ impl Walk for ReplayWalk {
         &self.layout
     }
 
-    fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+    fn open(&self) -> Result<Self::Seq, BackendError> {
         Ok(Seq::default())
     }
 
@@ -177,7 +177,7 @@ impl Walk for ReplayWalk {
 
     fn head(
         &self,
-        hidden: &Hidden,
+        hidden: &mut Hidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
         let _ = hidden;

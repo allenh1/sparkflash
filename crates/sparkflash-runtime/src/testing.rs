@@ -31,9 +31,8 @@ use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput}
 use sparkflash_model::verdict;
 
 use crate::engine::{RequestId, TickEngine, TickEvent};
-use crate::layout::{LaneState, Limits, StateKind, StateLayout};
-use crate::pool::LaneMemory;
-use crate::share::StepWall;
+use crate::layout::{LaneState, Limits, StateKind, StateLayout, check_checkpoint, check_rewind};
+use crate::share::{DraftBudget, StepWall};
 use crate::walk::{
     Draft, Drafter, HeadInput, HeadRow, Hidden, NoVision, OutputConstraint, Pass, PassKind,
     Segment, Walk, WalkCapabilities,
@@ -72,11 +71,6 @@ impl StepWall for FlatWall {
     }
 }
 
-/// The default verify budget: every member's anchor and its drafts.
-fn anchors_and_drafts(seqs: usize, depth: usize) -> usize {
-    seqs.saturating_mul(1 + depth)
-}
-
 /// A CPU walk at an arm's widths.
 ///
 /// The arm gives its state layout and its limits; the walk records every prompt chunk and
@@ -104,7 +98,7 @@ impl ShapeWalk {
     /// at most `depth` drafts a member.
     ///
     /// The defaults are a flat wall of one modelled millisecond, the chain [`pick`] then
-    /// [`wrong`], a verify budget of `seqs * (1 + depth)` and the error code `shape`.
+    /// [`wrong`], the verify budget [`DraftBudget::AnchorsAndDrafts`] and the error code `shape`.
     #[must_use]
     pub fn new(layout: StateLayout, limits: Limits, depth: usize) -> Self {
         Self {
@@ -114,7 +108,7 @@ impl ShapeWalk {
             drafter: ShapeDrafter {
                 depth,
                 chain: Chain::PickThenWrong,
-                budget: anchors_and_drafts,
+                budget: DraftBudget::AnchorsAndDrafts,
                 wall: Box::new(FlatWall),
             },
             chunks: Mutex::new(Vec::new()),
@@ -129,10 +123,9 @@ impl ShapeWalk {
         self
     }
 
-    /// The same walk with the arm's own [`Drafter::budget`]: `rule(seqs, depth)` is the most
-    /// drafts one verify of `seqs` members holds.
+    /// The same walk with the arm's own [`Drafter::budget`] rule.
     #[must_use]
-    pub fn with_budget(mut self, rule: fn(usize, usize) -> usize) -> Self {
+    pub fn with_budget(mut self, rule: DraftBudget) -> Self {
         self.drafter.budget = rule;
         self
     }
@@ -188,20 +181,13 @@ impl LaneState for ShapeSeq {
     }
 
     fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
-        if at != self.rows.len() {
-            return Err(BackendError::new(
-                self.code,
-                "a checkpoint is at the position",
-            ));
-        }
+        check_checkpoint(self.code, at, self.rows.len())?;
         self.point = Some(self.rows.clone());
         Ok(())
     }
 
     fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-        if to > self.rows.len() {
-            return Err(BackendError::new(self.code, "a rewind past the position"));
-        }
+        check_rewind(self.code, to, self.rows.len())?;
         match (to, self.point.take()) {
             (0, _) => self.rows.clear(),
             (_, Some(rows)) if rows.len() >= to => self.rows = rows[..to].to_vec(),
@@ -222,12 +208,13 @@ pub struct ShapeDrafter {
     depth: usize,
     chain: Chain,
     /// The arm's rule for the most drafts a verify of `seqs` members holds at `depth`.
-    budget: fn(usize, usize) -> usize,
+    budget: DraftBudget,
     wall: Box<dyn StepWall + Send + Sync>,
 }
 
 impl Walk for ShapeWalk {
     type Seq = ShapeSeq;
+    type Hidden = Hidden;
     type Drafter = ShapeDrafter;
     type Vision = NoVision;
 
@@ -237,7 +224,7 @@ impl Walk for ShapeWalk {
         &self.layout
     }
 
-    fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+    fn open(&self) -> Result<Self::Seq, BackendError> {
         Ok(ShapeSeq {
             code: self.code,
             rows: Vec::new(),
@@ -299,7 +286,7 @@ impl Walk for ShapeWalk {
 
     fn head(
         &self,
-        _hidden: &Hidden,
+        _hidden: &mut Hidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
         Ok(rows
@@ -399,7 +386,7 @@ impl Drafter<ShapeWalk> for ShapeDrafter {
     }
 
     fn budget(&self, seqs: usize) -> usize {
-        (self.budget)(seqs, self.depth)
+        self.budget.rows(seqs, self.depth)
     }
 
     fn ready(&self, seq: &ShapeSeq, token: u32) -> bool {
@@ -511,9 +498,6 @@ mod tests {
     /// right keeps every draft, and the budget rule sees the members and the depth.
     #[test]
     fn the_builders_state_an_arms_own_round() {
-        fn two_a_member(seqs: usize, _depth: usize) -> usize {
-            2 * seqs
-        }
         struct Steep;
         impl StepWall for Steep {
             fn ms(&self, _seqs: usize, rows: usize) -> f64 {
@@ -524,9 +508,14 @@ mod tests {
         let shaped = walk(64, 3)
             .with_code("arm")
             .with_right_picks()
-            .with_budget(two_a_member)
+            .with_budget(DraftBudget::OnePass(5))
             .with_wall(Box::new(Steep));
-        assert_eq!(shaped.drafter().budget(3), 6);
+        assert_eq!(shaped.drafter().budget(1), 3, "the member's depth");
+        assert_eq!(
+            shaped.drafter().budget(3),
+            2,
+            "what three anchors leave of five rows"
+        );
         assert!((shaped.drafter().wall().ms(1, 5) - 5.0).abs() < f64::EPSILON);
         assert_eq!(walk(64, 3).drafter().budget(3), 12, "anchors and drafts");
 

@@ -31,15 +31,15 @@
 //! chooses when a chunk or a step runs; the rows and the shape are the runtime's, which is what
 //! keeps the arm's chunk boundaries and its verify width.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
-    ChunkPolicy, ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden,
-    LaneMemory, LaneState, Limits, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments,
-    StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
+    ChunkPolicy, ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, HeadInput,
+    HeadRow, Hidden, LaneState, Limits, Pass, PassKind, PassMask, Region, Residual, Runtime,
+    Segment, Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities, check_checkpoint,
+    check_rewind,
 };
 
 use sparkflash_kernels::cuda_driver::Deviceptr;
@@ -60,6 +60,26 @@ pub(super) const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
     top_k: 0,
 };
 
+/// What a Qwen pass hands its head.
+///
+/// A token or verify pass resolves each member's step inside its batch (the sampler's record,
+/// the choice and the draft verdict are the batch's), so the head has only to hand the steps
+/// over. A prompt chunk leaves no step: its last row waits on the sequence as the deferred head
+/// and the head folds it into logits.
+pub(super) struct QwenHidden {
+    /// The pass's residual rows: one a member for a token or verify pass, the chunk's rows for
+    /// a prompt.
+    rows: usize,
+    /// The steps the batch resolved, in segment order; empty after a prompt chunk.
+    steps: Vec<StepOutput>,
+}
+
+impl Residual for QwenHidden {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
 /// The Qwen arm, exposed to the shared runtime as a [Walk].
 pub(super) struct QwenWalk {
     shared: Arc<SequenceShared>,
@@ -70,8 +90,6 @@ pub(super) struct QwenWalk {
     batch: Mutex<Option<BatchBuffers>>,
     /// The most members one token pass may hold: the driver's concurrency.
     members: usize,
-    /// The steps a token or verify pass already resolved, in segment order, for the head.
-    pending: Mutex<VecDeque<StepOutput>>,
     /// The arm's draft source, behind the runtime's round contract.
     drafter: QwenDrafter,
 }
@@ -89,11 +107,8 @@ impl QwenWalk {
         let members = limits.members;
         let joint = sparkflash_runtime::joint_rounds()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
-        let wall = ExpertUnionWall {
-            experts: shared.config.num_experts,
-            top_k: shared.config.num_experts_per_tok,
-            ..JOINT_WALL
-        };
+        let wall =
+            JOINT_WALL.with_experts(shared.config.num_experts, shared.config.num_experts_per_tok);
         let drafter = QwenDrafter {
             depth: shared.verify_rows.saturating_sub(1),
             wall,
@@ -105,7 +120,6 @@ impl QwenWalk {
             limits,
             batch: Mutex::new(None),
             members,
-            pending: Mutex::new(VecDeque::new()),
             drafter,
         })
     }
@@ -198,7 +212,7 @@ impl QwenWalk {
     fn token_pass(
         &self,
         segments: &mut [Segment<'_, DeviceSequence>],
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<QwenHidden, BackendError> {
         let mut steps: Vec<Option<StepOutput>> = (0..segments.len()).map(|_| None).collect();
         let mut forward: Vec<usize> = Vec::new();
         for index in 0..segments.len() {
@@ -245,24 +259,25 @@ impl QwenWalk {
                 steps[index] = Some(step);
             }
         }
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?;
-        pending.clear();
-        for step in steps {
-            pending.push_back(step.ok_or_else(|| {
-                BackendError::new("qwen4_device", "a token pass left a member without a step")
-            })?);
-        }
-        Ok(Hidden::new(segments.len()))
+        let steps = steps
+            .into_iter()
+            .map(|step| {
+                step.ok_or_else(|| {
+                    BackendError::new("qwen4_device", "a token pass left a member without a step")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(QwenHidden {
+            rows: segments.len(),
+            steps,
+        })
     }
 
     /// A verify pass: every segment's anchor token and drafts, one batch.
     fn verify_pass(
         &self,
         segments: &mut [Segment<'_, DeviceSequence>],
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<QwenHidden, BackendError> {
         let mut drafts = Vec::with_capacity(segments.len());
         let mut confidence = Vec::with_capacity(segments.len());
         let mut tokens = Vec::with_capacity(segments.len());
@@ -289,13 +304,10 @@ impl QwenWalk {
             .map(|segment| &mut *segment.seq)
             .collect::<Vec<_>>();
         let steps = self.batch(&mut members, &drafts, &confidence, &tokens)?;
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?;
-        pending.clear();
-        pending.extend(steps);
-        Ok(Hidden::new(segments.len()))
+        Ok(QwenHidden {
+            rows: segments.len(),
+            steps,
+        })
     }
 }
 
@@ -441,12 +453,7 @@ impl Drafter<QwenWalk> for QwenDrafter {
         _depths: &[usize],
     ) -> Result<Vec<Self::Rows>, BackendError> {
         let members = segments.len();
-        walk.verify_pass(segments)?;
-        let mut pending = walk
-            .pending
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?;
-        let steps: Vec<StepOutput> = pending.drain(..).collect();
+        let steps = walk.verify_pass(segments)?.steps;
         if steps.len() != members {
             return Err(BackendError::new(
                 "qwen4_device",
@@ -473,7 +480,7 @@ impl Drafter<QwenWalk> for QwenDrafter {
     /// drafts, which is the batch buffers' width. `share_rows` spends it on drafts only, so a
     /// chain's own depth still bounds what a member takes.
     fn budget(&self, seqs: usize) -> usize {
-        seqs.saturating_mul(1 + self.depth)
+        DraftBudget::AnchorsAndDrafts.rows(seqs, self.depth)
     }
 
     fn ready(&self, seq: &DeviceSequence, token: u32) -> bool {
@@ -518,6 +525,7 @@ impl Drafter<QwenWalk> for QwenDrafter {
 
 impl Walk for QwenWalk {
     type Seq = DeviceSequence;
+    type Hidden = QwenHidden;
     type Drafter = QwenDrafter;
     type Vision = sparkflash_runtime::NoVision;
 
@@ -541,8 +549,7 @@ impl Walk for QwenWalk {
         &self.layout
     }
 
-    fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError> {
-        let _ = memory;
+    fn open(&self) -> Result<Self::Seq, BackendError> {
         let mut seq = DeviceSequence::allocate(Arc::clone(&self.shared), self.limits.context)?;
         // Without joint rounds the arm drafts nothing, exactly as the fusion's own policy did: a
         // member would otherwise run the MTP's prompt pass and then throw every chain away.
@@ -572,7 +579,7 @@ impl Walk for QwenWalk {
         &self,
         segments: &mut [Segment<'_, Self::Seq>],
         pass: Pass<'_>,
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<QwenHidden, BackendError> {
         let hidden = match pass.kind {
             PassKind::TokenRows => self.token_pass(segments)?,
             PassKind::Verify { .. } => self.verify_pass(segments)?,
@@ -585,13 +592,12 @@ impl Walk for QwenWalk {
                 }
                 let segment = &mut segments[0];
                 let rows = segment.rows.len();
-                self.pending
-                    .lock()
-                    .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?
-                    .clear();
                 let (seq, tokens) = (&mut *segment.seq, segment.rows);
                 self.prompt_chunk(seq, tokens, pass.prompt_end)?;
-                Hidden::new(rows)
+                QwenHidden {
+                    rows,
+                    steps: Vec::new(),
+                }
             }
             PassKind::Paired { .. } => {
                 return Err(BackendError::new(
@@ -601,22 +607,18 @@ impl Walk for QwenWalk {
             }
         };
         if let Some(hook) = pass.hook {
-            hook.after_layers(&hidden)?;
+            hook.after_layers(&Hidden::new(hidden.rows))?;
         }
         Ok(hidden)
     }
 
     fn head(
         &self,
-        hidden: &Hidden,
+        hidden: &mut QwenHidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?;
-        if !pending.is_empty() {
-            let steps: Vec<StepOutput> = pending.drain(..).collect();
+        if !hidden.steps.is_empty() {
+            let steps = std::mem::take(&mut hidden.steps);
             if steps.len() != rows.len() {
                 return Err(BackendError::new(
                     "qwen4_device",
@@ -629,7 +631,6 @@ impl Walk for QwenWalk {
             }
             return Ok(steps);
         }
-        drop(pending);
         // A prompt head: the last chunk's deferred row, folded into logits here and chosen with
         // the prompt in the sampler.
         let logits = match rows.first_mut() {
@@ -646,6 +647,8 @@ impl Walk for QwenWalk {
         for row in rows.iter_mut() {
             let token = match &row.input {
                 HeadInput::Prompt(tokens) => {
+                    // Not [HeadInput::record]: that resets the sampler first, and this arm has
+                    // always recorded a prompt onto whatever [Walk::set_sampling] left.
                     row.seq.sampler.record_prompt(tokens);
                     let position = row.seq.position;
                     // The point is the prompt's end, before any draft past it, exactly as the
@@ -688,7 +691,6 @@ impl Walk for QwenWalk {
                 draft: Vec::new(),
             });
         }
-        let _ = hidden;
         Ok(steps)
     }
 }
@@ -702,15 +704,7 @@ impl LaneState for DeviceSequence {
         if self.rewind_point() == Some(at) {
             return Ok(());
         }
-        if at != self.position {
-            return Err(BackendError::new(
-                "qwen4_device",
-                format!(
-                    "a checkpoint is asked for position {at}, the sequence is at {}",
-                    self.position
-                ),
-            ));
-        }
+        check_checkpoint("qwen4_device", at, self.position)?;
         self.keep_point()
     }
 
@@ -727,15 +721,7 @@ impl DeviceSequence {
     /// The runtime's rewind: a prompt end restores the arm's point, and zero clears the state a
     /// fresh sequence would have.
     pub(super) fn rewind_state(&mut self, to: usize) -> Result<(), BackendError> {
-        if to > self.position {
-            return Err(BackendError::new(
-                "qwen4_device",
-                format!(
-                    "the rewind is to position {to}, the sequence is at {}",
-                    self.position
-                ),
-            ));
-        }
+        check_rewind("qwen4_device", to, self.position)?;
         if to == self.position {
             return Ok(());
         }

@@ -2385,7 +2385,24 @@ Three findings, each with the change it implies.
    behaviour of the other two (one segment a bulk pass, a paired pass refused, the pass hook
    called); its 91 tests pass unchanged. Next, `conformance!` emits the tick-profile and
    compute-row tests from the arm's stated chunk list and member cap.
-3. **The contract** (finding 3), one item at a time, each gated by the generated checks.
+3. **The contract** (finding 3). Done for what was a real duplication:
+   * `Walk` gains `type Hidden: Residual`; `walk` returns it and `head` takes it by `&mut`, so
+     a pass's answers travel in the value. GLM's two sequence fields, Qwen's queue under a lock
+     and Inkling's three fields are gone. The runtime reads `Residual::rows` and nothing else;
+     a `WalkHook` still sees the plain `Hidden`. Dense names `Hidden` itself: its scratch is
+     the device buffer the residual lives in, not a copy carried between the two calls.
+   * `HeadInput::record` is the one sampler record a head makes for a row (a prompt resets and
+     records the prompt, a token or verify row records its token). Dense, GLM and Inkling call
+     it. Qwen's token and verify rows are recorded inside its batch during the walk, and its
+     prompt record has never reset the sampler, so its head is unchanged. The choice after the
+     record is three different rules (dense's device argmax, GLM's and Qwen's end-of-turn list,
+     Inkling's Gumbel draw) and stays with the arms.
+   * `check_checkpoint` and `check_rewind` are the bounds checks of every `LaneState`.
+   * `Walk::open` takes no argument; the runtime keeps the lane's reservation with the slot as
+     before, and the accounting it prints is unchanged.
+   * `DraftBudget` (`AnchorsAndDrafts`, `OnePass(rows)`) is the budget rule of Qwen, GLM and
+     Inkling, and `ExpertUnionWall::with_experts` builds each arm's wall from its fitted
+     constant and the checkpoint's expert counts.
 4. **Retire `FusedEngine`.** Two users remain: dense in a TP group (its lane frames cannot carry
    a chunk's rows yet) and Inkling's group with images. Both need a group.
 5. **Dory onto `Walk`.** It is the only served model with no reuse at TP 1 and the only one whose

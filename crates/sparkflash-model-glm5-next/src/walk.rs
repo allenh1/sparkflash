@@ -48,9 +48,10 @@ use sparkflash_model::ledger::State;
 use sparkflash_model::{DepthPolicy, Queue, Speculator, kept_to_end, verdict};
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{
-    ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden, LaneMemory,
-    LaneState, Limits, NoVision, OutputConstraint, Pass, PassKind, PassMask, Region, Runtime,
-    Segment, Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
+    ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, HeadRow, LaneState, Limits,
+    NoVision, OutputConstraint, Pass, PassKind, PassMask, Region, Residual, Runtime, Segment,
+    Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities, check_checkpoint,
+    check_rewind,
 };
 use sparkflash_weights::tp::{BitGatherHandle, TpRuntime};
 
@@ -91,7 +92,8 @@ const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
 /// The rows a verified chain has, its anchor included.
 type Chain = Vec<u32>;
 
-/// A round the walk verified for one sequence, waiting for [Walk::head] to keep its leading run.
+/// A round the walk verified for one sequence, waiting for [Walk::head] or [GlmDrafter] to keep
+/// its leading run.
 struct Verified {
     /// The anchor followed by the drafts the share left.
     chunk: Chain,
@@ -99,6 +101,40 @@ struct Verified {
     confidence: Vec<f32>,
     /// One row of full-vocabulary logits for a row of `chunk`.
     rows: Vec<Vec<f32>>,
+}
+
+/// What one segment of a pass left on the host for its head.
+struct Left {
+    /// The pass's row after this segment's last, so a head row finds its segment.
+    end: usize,
+    /// The round a verify pass ran for the segment's sequence.
+    verified: Option<Verified>,
+    /// A bulk chunk's last row of logits, which [DeviceRank::prefill_chunk] leaves on the host.
+    prompt_logits: Option<Vec<f32>>,
+}
+
+/// What a GLM pass hands its head: the row count, and what each segment left on the host.
+///
+/// A token row leaves nothing here: the rank keeps the last kept row's logits and the head
+/// reads them back. A prompt chunk that is not the prompt's last is never headed, and its
+/// logits go when its value does.
+pub struct GlmHidden {
+    rows: usize,
+    /// One entry a segment of a bulk or verify pass, in order; empty for a token pass.
+    left: Vec<Left>,
+}
+
+impl GlmHidden {
+    /// What the segment holding `row` left, when the pass left anything.
+    fn left(&mut self, row: usize) -> Option<&mut Left> {
+        self.left.iter_mut().find(|left| row < left.end)
+    }
+}
+
+impl Residual for GlmHidden {
+    fn rows(&self) -> usize {
+        self.rows
+    }
 }
 
 /// One sequence's device state, as the runtime drives it.
@@ -117,10 +153,6 @@ pub struct GlmSequence {
     pending: Queue,
     /// The drafter's confidence in each of the last round's drafts.
     confidence: Vec<f32>,
-    /// The last round the walk verified, waiting for its head.
-    verified: Option<Verified>,
-    /// The last bulk chunk's logits, which [DeviceRank::prefill_chunk] leaves on the host.
-    prompt_logits: Option<Vec<f32>>,
     /// Whether a prompt is running a chunk at a time ([Self::bulk_chunk]).
     prefill_open: bool,
 }
@@ -139,8 +171,6 @@ impl GlmSequence {
             spec,
             pending: Queue::new(),
             confidence: Vec::new(),
-            verified: None,
-            prompt_logits: None,
             prefill_open: false,
         }
     }
@@ -251,7 +281,7 @@ impl GlmSequence {
         })
     }
 
-    /// Forwards one bulk prompt chunk and keeps its last row's logits for the head.
+    /// Forwards one bulk prompt chunk and answers its last row's logits, for the head.
     ///
     /// The first chunk asks [DeviceRank::begin_prefill] which path the prompt takes: the token
     /// path whole (a prompt below [MIN_PREFILL_ROWS], or a rank with no chunk scratch), or the
@@ -267,15 +297,12 @@ impl GlmSequence {
         rank: &mut DeviceRank,
         rows: &[u32],
         after: usize,
-    ) -> Result<(), BackendError> {
+    ) -> Result<Vec<f32>, BackendError> {
         let first = !self.prefill_open;
         if first {
-            // A new prompt's tokens replace any chain the last one left queued, and no round of
-            // the last turn's is still waiting for its head.
+            // A new prompt's tokens replace any chain the last one left queued.
             self.pending.clear();
             self.confidence.clear();
-            self.verified = None;
-            self.prompt_logits = None;
         }
         let end = self.sequence.position() + rows.len() + after;
         let logits = if first {
@@ -309,8 +336,7 @@ impl GlmSequence {
                 end,
             )?
         };
-        self.prompt_logits = Some(logits);
-        Ok(())
+        Ok(logits)
     }
 }
 
@@ -320,15 +346,7 @@ impl LaneState for GlmSequence {
     }
 
     fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
-        if at != self.sequence.position() {
-            return Err(BackendError::new(
-                "glm5_device",
-                format!(
-                    "the checkpoint is asked for position {at}, the sequence is at {}",
-                    self.sequence.position()
-                ),
-            ));
-        }
+        check_checkpoint("glm5_device", at, self.sequence.position())?;
         let rank = self
             .shared
             .rank
@@ -338,13 +356,7 @@ impl LaneState for GlmSequence {
     }
 
     fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-        let from = self.sequence.position();
-        if to > from {
-            return Err(BackendError::new(
-                "glm5_device",
-                format!("the rewind is to position {to}, the sequence is at {from}"),
-            ));
-        }
+        check_rewind("glm5_device", to, self.sequence.position())?;
         let rank = self
             .shared
             .rank
@@ -358,8 +370,6 @@ impl LaneState for GlmSequence {
         drop(rank);
         self.pending.clear();
         self.confidence.clear();
-        self.verified = None;
-        self.prompt_logits = None;
         self.prefill_open = false;
         Ok(())
     }
@@ -376,9 +386,7 @@ impl LaneState for GlmSequence {
 /// The drafts one verify may hold: the anchors take one row a member, and the rest of
 /// [MAX_ROWS] is shared among the members' chains. This is the [Drafter::budget] the row share
 /// reads, and it keeps a verify to one rank step whatever depth the drafter proposes.
-fn glm_draft_budget(seqs: usize, depth: usize) -> usize {
-    (seqs * depth).min(MAX_ROWS.saturating_sub(seqs))
-}
+const DRAFT_BUDGET: DraftBudget = DraftBudget::OnePass(MAX_ROWS);
 
 /// The walk's [Limits]: the rank's prompt chunk, the served context, and the rank's verify
 /// width as the member cap. A drafting walk's batch is a verify, not a prompt chunk.
@@ -445,8 +453,8 @@ impl Drafter<GlmWalk> for GlmDrafter {
     }
 
     /// One [DeviceRank::verify_batch] over every segment's anchor and drafts, as the old serving
-    /// fusion ran it. The walk stores each member's rows and confidence on
-    /// its sequence; this takes them back for [Drafter::settle].
+    /// fusion ran it. The walk hands each member's rows and confidence back in its
+    /// [GlmHidden]; this takes them for [Drafter::settle].
     fn verify(
         &self,
         walk: &GlmWalk,
@@ -455,15 +463,19 @@ impl Drafter<GlmWalk> for GlmDrafter {
     ) -> Result<Vec<Self::Rows>, BackendError> {
         let members = segments.len();
         let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
-        walk.walk(
+        let mut hidden = walk.walk(
             segments,
             Pass::verify(rows, OutputConstraint::new(&[], rows)),
         )?;
         let mut answers = Vec::with_capacity(members);
-        for segment in segments.iter_mut() {
-            let verified = segment.seq.verified.take().ok_or_else(|| {
-                BackendError::new("glm5_device", "a member walks a round it never verified")
-            })?;
+        for member in 0..members {
+            let verified = hidden
+                .left
+                .get_mut(member)
+                .and_then(|left| left.verified.take())
+                .ok_or_else(|| {
+                    BackendError::new("glm5_device", "a member walks a round it never verified")
+                })?;
             answers.push(VerifyRows {
                 confidence: verified.confidence,
                 rows: verified.rows,
@@ -504,7 +516,7 @@ impl Drafter<GlmWalk> for GlmDrafter {
     /// One rank step holds at most [MAX_ROWS] rows: the anchors take one a member, and every
     /// member's drafts share the rest.
     fn budget(&self, seqs: usize) -> usize {
-        glm_draft_budget(seqs, self.depth)
+        DRAFT_BUDGET.rows(seqs, self.depth)
     }
 
     fn ready(&self, seq: &GlmSequence, token: u32) -> bool {
@@ -516,7 +528,6 @@ impl Drafter<GlmWalk> for GlmDrafter {
     fn give_back(&self, seq: &mut GlmSequence, _to: usize) -> Result<(), BackendError> {
         seq.pending.clear();
         seq.confidence.clear();
-        seq.verified = None;
         Ok(())
     }
 
@@ -567,11 +578,7 @@ impl GlmWalk {
             (
                 plan,
                 rank.prefill_rows(),
-                ExpertUnionWall {
-                    experts: config.n_routed_experts,
-                    top_k: config.num_experts_per_tok,
-                    ..JOINT_WALL
-                },
+                JOINT_WALL.with_experts(config.n_routed_experts, config.num_experts_per_tok),
                 rank.has_block_drafter(),
             )
         };
@@ -634,6 +641,7 @@ pub(crate) fn runtime(
 
 impl Walk for GlmWalk {
     type Seq = GlmSequence;
+    type Hidden = GlmHidden;
     /// The checkpoint's MTP layer or the loaded DFlash 2 block drafter, as the runtime's round.
     type Drafter = GlmDrafter;
     type Vision = NoVision;
@@ -663,8 +671,7 @@ impl Walk for GlmWalk {
         &self.layout
     }
 
-    fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError> {
-        let _ = memory;
+    fn open(&self) -> Result<Self::Seq, BackendError> {
         let rank = self
             .shared
             .rank
@@ -709,7 +716,7 @@ impl Walk for GlmWalk {
         &self,
         segments: &mut [Segment<'_, Self::Seq>],
         pass: Pass<'_>,
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<GlmHidden, BackendError> {
         let after = pass.prompt_end.unwrap_or(0);
         let mut rank = self
             .shared
@@ -719,13 +726,19 @@ impl Walk for GlmWalk {
         match pass.kind {
             PassKind::Bulk { .. } | PassKind::Paired { .. } => {
                 let mut rows = 0;
+                let mut left = Vec::with_capacity(segments.len());
                 for segment in segments.iter_mut() {
                     rows += segment.rows.len();
                     let words = segment.rows;
                     let seq = &mut *segment.seq;
-                    seq.bulk_chunk(&mut rank, words, after)?;
+                    let logits = seq.bulk_chunk(&mut rank, words, after)?;
+                    left.push(Left {
+                        end: rows,
+                        verified: None,
+                        prompt_logits: Some(logits),
+                    });
                 }
-                Ok(Hidden::new(rows))
+                Ok(GlmHidden { rows, left })
             }
             PassKind::Verify { .. } => {
                 let mut rows = 0;
@@ -739,14 +752,24 @@ impl Walk for GlmWalk {
                 let verified =
                     rank.verify_batch(&self.shared.tp, &self.shared.gather, &mut batch)?;
                 drop(batch);
-                for (segment, rows) in segments.iter_mut().zip(verified) {
-                    segment.seq.verified = Some(Verified {
-                        chunk: segment.rows.to_vec(),
-                        confidence: segment.seq.confidence.clone(),
-                        rows,
-                    });
-                }
-                Ok(Hidden::new(rows))
+                let mut end = 0;
+                let left = segments
+                    .iter()
+                    .zip(verified)
+                    .map(|(segment, rows)| {
+                        end += segment.rows.len();
+                        Left {
+                            end,
+                            verified: Some(Verified {
+                                chunk: segment.rows.to_vec(),
+                                confidence: segment.seq.confidence.clone(),
+                                rows,
+                            }),
+                            prompt_logits: None,
+                        }
+                    })
+                    .collect();
+                Ok(GlmHidden { rows, left })
             }
             PassKind::TokenRows => self.token_rows(&mut rank, segments),
         }
@@ -754,7 +777,7 @@ impl Walk for GlmWalk {
 
     fn head(
         &self,
-        hidden: &Hidden,
+        hidden: &mut GlmHidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
         let rank = self
@@ -771,26 +794,11 @@ impl Walk for GlmWalk {
                 ));
             }
             let seq = &mut *row.seq;
-            let fed = match &row.input {
-                HeadInput::Prompt(tokens) => {
-                    // The prompt's chunks are done: the next prompt starts a new one.
-                    seq.prefill_open = false;
-                    // Its sampler history is the whole prompt: the penalties count every token
-                    // the request reads, however many chunks the prompt ran in.
-                    seq.sampler.reset();
-                    seq.sampler.record_prompt(tokens);
-                    None
-                }
-                HeadInput::Token(token) => {
-                    seq.sampler.record(*token);
-                    Some(*token)
-                }
-                HeadInput::Verify { rows, row: index } => {
-                    let token = rows.get(*index).copied().unwrap_or_default();
-                    seq.sampler.record(token);
-                    Some(token)
-                }
-            };
+            let fed = row.input.record(&mut seq.sampler);
+            if fed.is_none() {
+                // The prompt's chunks are done: the next prompt starts a new one.
+                seq.prefill_open = false;
+            }
             // A verify already consumed this token and produced the answer: hand back the row it
             // sampled, exactly as the one-token step it stands in for would have.
             if let Some(token) = fed
@@ -809,14 +817,15 @@ impl Walk for GlmWalk {
                 });
                 continue;
             }
-            if let Some(verified) = seq.verified.take() {
+            let mut left = hidden.left(row.row);
+            if let Some(verified) = left.as_mut().and_then(|left| left.verified.take()) {
                 steps.push(seq.settle(&rank, verified)?);
                 continue;
             }
             // The greedy path leaves each row's pick on the device and the last kept row's
             // logits behind it, so a step reads back one vocabulary row, not one a row. A bulk
             // prompt's last row came back from prefill_chunk instead.
-            let logits = match seq.prompt_logits.take() {
+            let logits = match left.and_then(|left| left.prompt_logits.take()) {
                 Some(logits) => logits,
                 None => rank.last_logits(&seq.sequence)?,
             };
@@ -847,7 +856,7 @@ impl GlmWalk {
         &self,
         rank: &mut DeviceRank,
         segments: &mut [Segment<'_, GlmSequence>],
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<GlmHidden, BackendError> {
         let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
         for segment in segments.iter_mut() {
             // A step ends any prompt that was running a chunk at a time.
@@ -858,7 +867,10 @@ impl GlmWalk {
             .map(|segment| (&mut segment.seq.sequence, segment.rows))
             .collect();
         rank.forward_batch_greedy(&self.shared.tp, &self.shared.gather, &mut batch)?;
-        Ok(Hidden::new(rows))
+        Ok(GlmHidden {
+            rows,
+            left: Vec::new(),
+        })
     }
 }
 
@@ -1090,7 +1102,7 @@ mod tests {
     fn the_budget_caps_anchors_and_drafts_to_one_verify() {
         for seqs in 1..=MAX_ROWS {
             for depth in 0..MAX_ROWS {
-                let drafts = glm_draft_budget(seqs, depth);
+                let drafts = DRAFT_BUDGET.rows(seqs, depth);
                 assert!(
                     seqs + drafts <= MAX_ROWS,
                     "{seqs} member(s) at depth {depth} budget {drafts} rows"
@@ -1099,12 +1111,12 @@ mod tests {
             }
         }
         // Four members and a three-deep chain share four draft rows, so the verify is eight.
-        assert_eq!(glm_draft_budget(4, 3), 4);
-        assert_eq!(glm_draft_budget(1, 3), 3);
+        assert_eq!(DRAFT_BUDGET.rows(4, 3), 4);
+        assert_eq!(DRAFT_BUDGET.rows(1, 3), 3);
     }
 
     // The runtime's CPU walk shaped like GLM's: its verify width is [MAX_ROWS], its budget is
-    // [glm_draft_budget], its wall is the arm's and its chains are as deep as the arm proposes.
+    // [DRAFT_BUDGET], its wall is the arm's and its chains are as deep as the arm proposes.
     // The runtime's policies can be checked with no device; the device path is compiled and
     // stays `#[ignore]`d.
 
@@ -1120,7 +1132,7 @@ mod tests {
             depth,
         )
         .with_right_picks()
-        .with_budget(glm_draft_budget)
+        .with_budget(DRAFT_BUDGET)
         .with_wall(Box::new(JOINT_WALL))
     }
 

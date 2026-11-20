@@ -66,15 +66,17 @@ pub use group::{
     mirror_tick_lanes, mirror_tick_lanes_seen, mirror_ticks_until_the_group_ends,
     mirror_until_the_group_ends, watched_hub,
 };
-pub use layout::{LaneState, Limits, Region, StateKind, StateLayout};
+pub use layout::{
+    LaneState, Limits, Region, StateKind, StateLayout, check_checkpoint, check_rewind,
+};
 pub use ledger::{Ledger, Mode, Strategy};
 pub use pool::{LaneMemory, LanePool};
 pub use resume::{Restore, Rewind, checkpoint_after, rewind_plan};
 pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
 pub use runtime::{Runtime, RuntimeSession, RuntimeSlot, StepMode, ledger_for};
-pub use share::{BandWall, ExpertUnionWall, StepWall, share_rows};
+pub use share::{BandWall, DraftBudget, ExpertUnionWall, StepWall, share_rows};
 pub use walk::{
     Absent, ComputeDeclaration, Draft, Drafter, HeadInput, HeadRow, Hidden, NoVision,
-    OutputConstraint, Pass, PassKind, PassMask, Segment, Segments, Vision, Walk, WalkCapabilities,
-    WalkHook,
+    OutputConstraint, Pass, PassKind, PassMask, Residual, Segment, Segments, Vision, Walk,
+    WalkCapabilities, WalkHook,
 };

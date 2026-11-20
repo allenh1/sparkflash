@@ -27,9 +27,9 @@ use std::sync::Mutex;
 use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
 use sparkflash_model::verdict;
 use sparkflash_runtime::{
-    Draft, Drafter, HeadInput, HeadRow, Hidden, LaneMemory, LaneState, Limits, NoVision,
-    OutputConstraint, Pass, PassKind, Segment, StateKind, StateLayout, StepWall, TickConfig,
-    TickEngine, TickEvent, Walk, WalkCapabilities,
+    Draft, Drafter, HeadInput, HeadRow, Hidden, LaneState, Limits, NoVision, OutputConstraint,
+    Pass, PassKind, Segment, StateKind, StateLayout, StepWall, TickConfig, TickEngine, TickEvent,
+    Walk, WalkCapabilities, check_checkpoint, check_rewind,
 };
 
 /// The model's own pick after `token`: the plain path's next token.
@@ -62,20 +62,13 @@ impl LaneState for Seq {
     }
 
     fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
-        if at != self.rows.len() {
-            return Err(BackendError::new(
-                "draft",
-                "a checkpoint is at the position",
-            ));
-        }
+        check_checkpoint("draft", at, self.rows.len())?;
         self.checkpoint = Some(self.rows.clone());
         Ok(())
     }
 
     fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-        if to > self.rows.len() {
-            return Err(BackendError::new("draft", "a rewind past the position"));
-        }
+        check_rewind("draft", to, self.rows.len())?;
         match (to, self.checkpoint.take()) {
             (0, _) => self.rows.clear(),
             (_, Some(rows)) if rows.len() >= to => self.rows = rows[..to].to_vec(),
@@ -142,6 +135,7 @@ struct DraftDrafter {
 
 impl Walk for DraftWalk {
     type Seq = Seq;
+    type Hidden = Hidden;
     type Drafter = DraftDrafter;
     type Vision = NoVision;
 
@@ -151,7 +145,7 @@ impl Walk for DraftWalk {
         &self.layout
     }
 
-    fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+    fn open(&self) -> Result<Self::Seq, BackendError> {
         Ok(Seq::default())
     }
 
@@ -194,7 +188,7 @@ impl Walk for DraftWalk {
 
     fn head(
         &self,
-        _hidden: &Hidden,
+        _hidden: &mut Hidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
         Ok(rows

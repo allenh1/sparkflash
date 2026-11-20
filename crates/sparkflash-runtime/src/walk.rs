@@ -29,12 +29,12 @@
 //! The trait carries no `Send` or `Sync` bound. DeepSeek's sequence is single-threaded; an
 //! engine that needs the bounds asks for them at its own implementation.
 
+use sparkflash_model::Sampler;
 use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_model::vision::VisionImage;
 
 use crate::layout::{LaneState, Limits, StateKind, StateLayout};
-use crate::pool::LaneMemory;
 use crate::share::StepWall;
 
 /// What a walk is for.
@@ -242,12 +242,25 @@ impl<'a, S> Segment<'a, S> {
     }
 }
 
+/// What a walk hands its head: [`Walk::Hidden`].
+///
+/// The runtime reads the row count and nothing else. Everything a head needs from the walk that
+/// ran before it travels in the value: the logits a prompt chunk left on the host, a verify's
+/// rows, the steps a batch already resolved. An arm therefore keeps no side copy of a pass's
+/// answers on its walk or its sequences, and a value that is never headed (a prompt chunk that
+/// is not the last) is dropped with nothing to clear.
+pub trait Residual {
+    /// The number of residual rows the walk produced.
+    fn rows(&self) -> usize;
+}
+
 /// The residual rows a walk left, and where in the arm's buffer they start.
 ///
-/// The arm interprets the fields; the runtime only passes the value back to [`Walk::head`] and
-/// reads [`Hidden::rows`] to know how many rows it may ask for. An arm that keeps its residual
-/// on the device puts the device offset in `first`; one that copies it back to the host puts the
-/// host offset there. No field is a pointer, so the value is `Send` and a trace can record it.
+/// This is the [`Walk::Hidden`] of an arm whose residual stays in its own device buffers, and
+/// the value every arm shows a [`WalkHook`]. The arm interprets the fields; the runtime reads
+/// only the row count. An arm that keeps its residual on the device puts the device offset in
+/// `first`; one that copies it back to the host puts the host offset there. No field is a
+/// pointer, so the value is `Send` and a trace can record it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Hidden {
     /// The number of residual rows the walk produced.
@@ -267,6 +280,12 @@ impl Hidden {
     #[must_use]
     pub const fn at(first: usize, rows: usize) -> Self {
         Self { rows, first }
+    }
+}
+
+impl Residual for Hidden {
+    fn rows(&self) -> usize {
+        self.rows
     }
 }
 
@@ -292,12 +311,41 @@ pub enum HeadInput<'a> {
     },
 }
 
+impl HeadInput<'_> {
+    /// Records what the row extends in its sequence's sampler, before the row's token is chosen,
+    /// and answers the token the row consumed (`None` for a prompt).
+    ///
+    /// A prompt resets the sampler and records the whole prompt, so the penalties count every
+    /// token the request reads however many chunks it ran in. A token row records its token. A
+    /// verify row records the row it stands for, so the choice sees the history the one-token
+    /// step would have seen. A head calls this once a row and records nothing else: the chosen
+    /// token is recorded by the row that consumes it, and a second record would count it twice.
+    pub fn record(&self, sampler: &mut Sampler) -> Option<u32> {
+        match self {
+            Self::Prompt(tokens) => {
+                sampler.reset();
+                sampler.record_prompt(tokens);
+                None
+            }
+            Self::Token(token) => {
+                sampler.record(*token);
+                Some(*token)
+            }
+            Self::Verify { rows, row } => {
+                let token = rows.get(*row).copied().unwrap_or_default();
+                sampler.record(token);
+                Some(token)
+            }
+        }
+    }
+}
+
 /// One residual row to turn into a token, and the sequence whose sampler takes it.
 #[derive(Debug)]
 pub struct HeadRow<'a, S> {
     /// The sequence whose sampler chooses the token.
     pub seq: &'a mut S,
-    /// The row of [`Hidden`] to read.
+    /// The row of the walk's [`Walk::Hidden`] to read.
     pub row: usize,
     /// What the row extends.
     pub input: HeadInput<'a>,
@@ -752,12 +800,17 @@ impl<W: Walk + ?Sized> Vision<W> for NoVision {
 ///
 /// Every item here is required except [`Walk::capabilities`], which reads the associated
 /// constant, and [`Walk::cpu`], which is a conformance hook. A missing `layout`, `open`,
-/// `limits`, `drafter`, `walk`, `head`, capability value, sequence state, drafter or vision
-/// type stops the arm compiling.
+/// `limits`, `drafter`, `walk`, `head`, capability value, sequence state, hidden, drafter or
+/// vision type stops the arm compiling.
 pub trait Walk: 'static {
     /// One sequence's device state. It must expose checkpoint and rewind, because the runtime
     /// owns reuse and cannot restore an arm's state through a witness.
     type Seq: LaneState;
+
+    /// What [`Walk::walk`] hands [`Walk::head`]. An arm whose residual stays in its device
+    /// buffers names [`Hidden`]; an arm whose pass leaves answers on the host (a chunk's last
+    /// logits, a verify's rows, a batch's resolved steps) names a type that carries them.
+    type Hidden: Residual;
 
     /// The draft source. An arm without one names [`Absent`]; there is no default.
     type Drafter: Drafter<Self>;
@@ -772,12 +825,12 @@ pub trait Walk: 'static {
     /// Which state grows with position and which is recurrent.
     fn layout(&self) -> &StateLayout;
 
-    /// Opens one sequence on `memory`. The reservation is for accounting; the arm owns the
-    /// bytes.
+    /// Opens one sequence. The arm owns its bytes; the runtime keeps the lane's reservation
+    /// ([`crate::LaneMemory`]) with the slot, where its accounting reads it.
     ///
     /// # Errors
     /// A device allocation, an unreadable checkpoint or an exhausted lane.
-    fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError>;
+    fn open(&self) -> Result<Self::Seq, BackendError>;
 
     /// The most rows one pass may hold, the members one batch may hold, and the context.
     ///
@@ -820,15 +873,19 @@ pub trait Walk: 'static {
         &self,
         segments: &mut [Segment<'_, Self::Seq>],
         pass: Pass<'_>,
-    ) -> Result<Hidden, BackendError>;
+    ) -> Result<Self::Hidden, BackendError>;
 
     /// Turns the requested residual rows into tokens, on the device.
+    ///
+    /// `hidden` is the value the walk before it returned, and the head may take what it holds:
+    /// the runtime heads a row once. Each row's sampler bookkeeping is [`HeadInput::record`],
+    /// called before the row's token is chosen.
     ///
     /// # Errors
     /// A backend failure, or a row outside `hidden`.
     fn head(
         &self,
-        hidden: &Hidden,
+        hidden: &mut Self::Hidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError>;
 
