@@ -76,6 +76,7 @@ import json
 import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -1871,6 +1872,41 @@ def model_evidence_problems(registry: dict, read: Callable[[str], bytes | None],
     return problems
 
 
+def rust_registry_check(path: Path) -> tuple[bool, str]:
+    """Parse `path` with the Rust registry parser a serving binary uses.
+
+    The Python gate validated a registry the Rust parser refused (version 2's `[[retired]]`
+    reference), so the gate runs the real parser. Returns (ran, problem); a deliberate
+    SPARKFLASH_SKIP_RUST_REGISTRY=1 reports as ran with a note.
+    """
+    if os.environ.get("SPARKFLASH_SKIP_RUST_REGISTRY") == "1":
+        return True, "skipped by SPARKFLASH_SKIP_RUST_REGISTRY=1"
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        return False, "cargo is not on PATH, so the Rust registry parse did not run"
+    command = [
+        cargo,
+        "run",
+        "-q",
+        "-p",
+        "sparkflash-model",
+        "--example",
+        "validate_registry",
+        "--",
+        str(path),
+    ]
+    try:
+        run = subprocess.run(
+            command, cwd=REPO, capture_output=True, text=True, timeout=900, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, f"the Rust registry parse did not finish: {error}"
+    if run.returncode != 0:
+        lines = (run.stderr or run.stdout).strip().splitlines()[-3:]
+        return True, "the Rust registry parse refused the registry: " + " / ".join(lines)
+    return True, "ok"
+
+
 def run_ci(base_argument: str | None) -> int:
     base = resolve_base(base_argument)
     read_base, read_head = read_at(base), read_at(None)
@@ -1880,6 +1916,9 @@ def run_ci(base_argument: str | None) -> int:
     if head_text is None:
         raise NumericsFailure(f"{REGISTRY} does not exist")
     head_registry = parse_registry(head_text.decode(), REGISTRY, require_bar=True)
+    # The binary parses the same text with the Rust registry schema; a gate that only reads TOML
+    # would accept a registry the next release aborts on.
+    parsed, rust_state = rust_registry_check(REPO / REGISTRY)
     # The working tree, not HEAD: a local run checks what is about to be committed too.
     paths = (NUMERICS, "docs/numerics", f":(glob){PROFILE_GLOB}", CLASSIFICATION)
     diff = git("diff", "--name-status", "--no-renames", base, "--", *paths).stdout.decode()
@@ -1900,6 +1939,8 @@ def run_ci(base_argument: str | None) -> int:
     findings = declaration_findings(
         base_registry, head_registry, read_base, read_head, changed, forced
     )
+    if not parsed or (rust_state != "ok" and "skipped" not in rust_state):
+        findings.append(f"the Rust registry parse: {rust_state}")
     anchor_checks, anchor_coverage = anchor_findings(head_registry, read_head, capture_paths)
     findings += anchor_checks
     coverage_results, coverage_checks = coverage_row_findings(head_registry, read_head)
@@ -1911,6 +1952,7 @@ def run_ci(base_argument: str | None) -> int:
     prerequisites = head_registry["prerequisites"]
     configs, anchors = len(head_registry["config"]), len(head_registry["anchor"])
     missing = missing_prerequisites(head_registry)
+    print(f"numerics ci: Rust registry parse: {rust_state}")
     print(
         f"numerics ci: base {base[:12]}, {configs} configuration(s), {anchors} anchor(s), "
         f"{len(head_registry['coverage'])} coverage row(s), "
