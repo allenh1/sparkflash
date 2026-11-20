@@ -2307,15 +2307,23 @@ Measured at this tip, by reading (line ranges are in the two sweeps' notes, not 
   twenty of comment, near-identical between GLM, Qwen and dense.
 * **Outside the crate.** About 25 edits in about 15 files on the cheapest route: the descriptor
   and `MODELS` row, the `Arm` impl and `ARMS` entry, the `ARM_LEDGERS` row, the workspace and
-  both CI files (a test enforces those), then the sites `ARMS` does not derive: `TYPED_PACKS` and
-  a roughly 20-item `PackArm` impl or a family arm in `dynamic.rs`, the codec and `Dialect`
-  match, a response engine, the converter's branch and its `released` list, the web console's
-  `deployment_for` row, the launch script's environment pattern, and `onboard-gate.sh`'s crate
-  case. `PackArm::PROFILE_TOML` and `DEFAULT_CONTEXT`, the converter's `released` list and
-  default world, and the console's world size all repeat a field `Arm` already has.
-* **Two traps.** The CLI line gate has no headroom: the CLI is 35,972 lines and the gate is
-  `< 35,973`, so any CLI edit must delete as many lines as it adds. And the group default context
-  in `dynamic.rs` is Inkling's constant applied to every `--rank` group.
+  both CI files (a test enforces those), then the sites `ARMS` does not derive: a `PackArm`
+  impl or a family arm in `dynamic.rs`, the codec and `Dialect` match, a response engine, the
+  converter's branch, the web console's `deployment_for` row, the launch script's environment
+  pattern, and `onboard-gate.sh`'s crate case. The console's world size still repeats a field
+  `Arm` already has.
+  The first cut of step 1 below took the repeats out of the CLI. `PackArm` is now a family's code
+  only (configuration, open, codec, response layer); a release is a `Release` impl on the model
+  crate's marker type, about ten lines, whose model id, profile, default context and output cap
+  are read from its `ARMS` entry and the registry. `TYPED_PACKS` rows are built from that
+  (`TypedPack::of::<R>()`), and both routes read the one table: `--model` by weights, a dynamic
+  `--checkpoint` by family (`typed_for_checkpoint`), so `dynamic.rs` names no released pack
+  family. The converter's default world and `released` flag are `Arm::conversion()`. A second
+  release of a served family (an FP8 or a smaller sibling) is an `ARMS` entry, a `Release` impl
+  and one table row; `QwenFp8Arm` and `Qwen36Arm`, 165 lines of delegation, are gone.
+* **Two traps.** The CLI line gate has little headroom: the CLI is 35,905 lines and the gate is
+  `< 35,973`. And the group default context in `dynamic.rs` is Inkling's constant applied to
+  every `--rank` group (no other family reaches it today: `--rank` is refused for them).
 
 Against the plan's test for done (a family supplies its `Architecture` mapping, the arithmetic of
 its own parts, and its weight names, tokenizer and template), the gap is these four, in this
@@ -2365,6 +2373,11 @@ Three findings, each with the change it implies.
    the console's deployment rows read `ARMS`. This is the step that turns "25 edits in 15 files"
    into one declaration, and it lowers the CLI line gate as it goes. The group halves need a
    group to verify.
+   Done so far: the release identity, the typed-pack table and the converter's two lists read
+   `ARMS` (see "Outside the crate"). Left: the `WalkArm` entry itself, which moves Inkling and
+   dense off their own arms in `dynamic.rs`; the codec's tokenizer sniffing and `Dialect` match;
+   the converter's per-family branches; the console's deployment rows. The pack drivers' group
+   halves (`serve_group`, `serve_group_lanes`) compile on the new split and owe one group run.
 2. **The scaffolding.** One parametrised CPU shape walk in the runtime replaces the three copies:
    done, as `sparkflash_runtime::testing` (`ShapeWalk` with the arm's layout, limits, budget rule
    and step wall; `prompt` and `decode` drive a tick engine to a request's answer). An arm states

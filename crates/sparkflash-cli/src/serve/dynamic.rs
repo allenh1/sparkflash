@@ -49,7 +49,6 @@ use sparkflash_ops::plan::KernelPhase;
 use sparkflash_ops::resolver::{Availability, KernelResolver};
 
 use super::dynamic_host::DynamicHostBackend;
-use super::pack::PackArm;
 use super::{ServeOptions, pack, serve_with_seam};
 
 /// A checkpoint resolved from `--model` or `--checkpoint`, with its execution plan.
@@ -358,17 +357,14 @@ fn codec(
 }
 
 /// Whether a checkpoint family is served by a released device arm (rather than the host
-/// reference), and therefore judged by the kernel catalogue. A Qwen3.5-MoE checkpoint is when
-/// the device arm has its formats ([pack::qwen35_on_device]).
+/// reference), and therefore judged by the kernel catalogue: a typed pack that takes the
+/// checkpoint ([pack::typed_for_checkpoint]; a Qwen3.5-MoE checkpoint is one when the device arm
+/// has its formats), or Dory with its images.
 fn device_family(family: &str, directory: &Path) -> bool {
-    match family {
-        "qwen4_exp" | "qwen4_exp_text" | "glm5_next" => true,
-        "qwen3_5_moe" | "qwen3_5_moe_text" => pack::qwen35_on_device(directory),
-        // A Dory checkpoint is judged by the kernel catalogue only when this build carries the
-        // Dory/Qwen cubins; otherwise the CPU host reference is its executor.
-        "dory" => sparkflash_model_dory::DoryDeviceBackend::available(),
-        _ => false,
-    }
+    // A Dory checkpoint is judged by the kernel catalogue only when this build carries the
+    // Dory/Qwen cubins; otherwise the CPU host reference is its executor.
+    pack::typed_for_checkpoint(family, directory).is_some()
+        || (family == "dory" && sparkflash_model_dory::DoryDeviceBackend::available())
 }
 
 /// The typed profile a family serves: its carried preset when one exists, else the default with
@@ -506,10 +502,8 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     // Only a family the match below sends to serve_novel steps lanes on this path (the shared
     // dense device arm); every other family keeps one request at a time here, as before.
     let family = checkpoint.plan.family();
-    let novel = !matches!(
-        family,
-        "qwen4_exp" | "qwen4_exp_text" | "glm5_next" | "inkling2" | "dory"
-    ) && !(on_device && matches!(family, "qwen3_5_moe" | "qwen3_5_moe_text"));
+    let typed = pack::typed_for_checkpoint(family, &checkpoint.directory);
+    let novel = typed.is_none() && !matches!(family, "inkling2" | "dory");
     #[cfg(feature = "tp4-serve")]
     if options.tp4.is_some() && !novel {
         return Err(format!(
@@ -531,33 +525,10 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             checkpoint.model_id
         ));
     }
+    if let Some(typed) = typed {
+        return (typed.serve_identity)(options, checkpoint.directory, descriptor, seam, context);
+    }
     match checkpoint.plan.family() {
-        "qwen4_exp" | "qwen4_exp_text" => super::pack::serve_arm_identity::<super::pack::QwenArm>(
-            options,
-            checkpoint.directory,
-            descriptor,
-            seam,
-            context,
-            super::pack::QwenArm::respond,
-        ),
-        "qwen3_5_moe" | "qwen3_5_moe_text" if on_device => {
-            super::pack::serve_arm_identity::<super::pack::Qwen36Arm>(
-                options,
-                checkpoint.directory,
-                descriptor,
-                seam,
-                context,
-                super::pack::Qwen36Arm::respond,
-            )
-        }
-        "glm5_next" => super::pack::serve_arm_identity::<super::pack::GlmArm>(
-            options,
-            checkpoint.directory,
-            descriptor,
-            seam,
-            context,
-            super::pack::GlmArm::respond,
-        ),
         "inkling2" if options.group.is_some() => {
             serve_inkling_group(options, checkpoint, descriptor, seam, dialect, context)
         }

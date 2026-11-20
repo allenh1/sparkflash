@@ -319,7 +319,7 @@ alone. A lone lane runs at 18 tok/s with joint rounds off, against 42 unfused. T
 gap, not a correctness one, and it is not yet explained.
 
 GLM's group (`--tp4-rank`, `--fuse-batch --concurrency N`) opens every rank as `N` lanes
-(`PackArm::OPEN_LANES`, `open_glm_lanes`). Rank 0 serves its backend through the host driver
+(`PackArm::open_lanes`, `open_glm_lanes`). Rank 0 serves its backend through the host driver
 exactly as one node does (`serve_backend`). Every lane's prompt, step, give-back and release is
 broadcast before it runs, and each worker replays them over its own lanes (`mirror_lanes`).
 

@@ -94,15 +94,17 @@ fn a_group_steps_fused_lanes_unless_told_one_at_a_time() {
 
 #[test]
 fn every_rank_of_a_group_derives_the_same_window() {
-    use pack::{GlmArm, PackArm, QwenArm};
+    use pack::{PackArm, QwenArm, Release};
+    use sparkflash_model::{Glm, Qwen};
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = QwenArm::write_fixture(dir.path()).expect("fixture");
+    let config = Qwen::tiny();
+    QwenArm::write_fixture(dir.path(), &config).expect("fixture");
     // A file in the checkpoint names its directory.
     let file = dir.path().join(CHECKPOINT_CONFIG_NAME);
     assert_eq!(pack::checkpoint_directory(&file), dir.path());
-    let read = pack::read_config::<QwenArm>(dir.path()).expect("config");
+    let read = pack::read_config::<Qwen>(dir.path()).expect("config");
     assert_eq!(read.max_position_embeddings, config.max_position_embeddings);
-    assert!(config.max_position_embeddings < QwenArm::DEFAULT_CONTEXT);
+    assert!(config.max_position_embeddings < Qwen::default_context());
     // Without --context the pack's default is capped by the checkpoint's window, the same
     // figure on every rank.
     for rank in 0..2 {
@@ -111,7 +113,7 @@ fn every_rank_of_a_group_derives_the_same_window() {
                 .expect("parses");
         options.tp4.as_mut().expect("group").rank = rank;
         assert_eq!(
-            pack::pack_context::<QwenArm>(&options, &read),
+            pack::pack_context::<Qwen>(&options, &read),
             Ok(config.max_position_embeddings)
         );
     }
@@ -122,13 +124,13 @@ fn every_rank_of_a_group_derives_the_same_window() {
         "1000000",
     ]))
     .expect("parses");
-    let error = pack::pack_context::<QwenArm>(&wide, &read).expect_err("past the window");
+    let error = pack::pack_context::<Qwen>(&wide, &read).expect_err("past the window");
     assert!(error.contains("outside 1..="), "{error}");
     // A checkpoint without a config.json is refused rather than served from a carried release.
     let empty = tempfile::tempdir().expect("tempdir");
-    let error = pack::read_config::<GlmArm>(empty.path()).expect_err("no config");
+    let error = pack::read_config::<Glm>(empty.path()).expect_err("no config");
     assert!(error.contains("has no config.json"), "{error}");
-    let error = pack::read_config::<QwenArm>(empty.path()).expect_err("no config");
+    let error = pack::read_config::<Qwen>(empty.path()).expect_err("no config");
     assert!(
         error.contains("cannot read the Qwen3.8-Flash-Next configuration"),
         "{error}"
@@ -1224,7 +1226,8 @@ fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
 
 #[test]
 fn glm_drafting_reads_the_carried_profile_and_refuses_a_count_it_cannot_draft() {
-    use pack::{GlmArm, PackArm};
+    use pack::Release;
+    use sparkflash_model::Glm;
     use sparkflash_model::profile::{DepthMode, SpeculationProfile};
     use sparkflash_model_glm5_next::glm_drafting;
     let drafts = |spec: &SpeculationProfile, block, most| {
@@ -1234,13 +1237,13 @@ fn glm_drafting_reads_the_carried_profile_and_refuses_a_count_it_cannot_draft() 
     };
     // The carried profile: the MTP layer's chain of three, adaptive as DeepSeek's is, and a block
     // drafter's whole block.
-    let carried = GlmArm::profile_from(|_| None)
+    let carried = Glm::profile_from(|_| None)
         .expect("the carried profile")
         .speculation;
     assert_eq!(drafts(&carried, false, 15), Ok(Some((3, true))));
     assert_eq!(drafts(&carried, true, 7), Ok(Some((7, true))));
     // The environment picks the chain and the rule.
-    let env = GlmArm::profile_from(|name| match name {
+    let env = Glm::profile_from(|name| match name {
         "SPARKFLASH_DRAFT_DRAFTS" => Some("2".to_owned()),
         "SPARKFLASH_DRAFT_POLICY" => Some("fixed".to_owned()),
         _ => None,

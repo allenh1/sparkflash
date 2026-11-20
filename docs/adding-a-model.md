@@ -380,13 +380,17 @@ the mechanism there; never copy it into the arm.
 | splitting a streamed answer into text and `<tool_call>` bodies | `sparkflash_api::tool_block::BlockSplitter` (the family parses the body) |
 | deterministic fixture weights and hash-table sizes | `sparkflash_weights::rng::{splitmix64, is_prime}` |
 
-A served arm implements `PackArm` (its ids, fixture, configuration, descriptor, tokenizer, open
-and response layer) and adds a `Pack` variant. Its descriptor is `PackIdentity`'s, its cache claim
+A served family implements `PackArm` (its fixture, configuration, descriptor, tokenizer, open
+and response layer). Each release of it implements `Release` on its `sparkflash_model` marker
+type (the family's `PackArm`, a display name, a fixture name and a tiny configuration; the model
+id, profile, default context and output cap come from its `ARMS` entry) and adds one
+`TypedPack::of::<R>()` row to `TYPED_PACKS`, which serves both `--model` and a dynamic
+`--checkpoint` of that family. Its descriptor is `PackIdentity`'s, its cache claim
 is a `KvPlan` derived from its own geometry, and its speculative path is `spec`'s: a decode drafts,
 one verify decides what survives, and the queue hands the rest back one token at a time. The shared driver then finds the checkpoint
 (`--checkpoint`, the hub cache or the fixture), derives the context on every rank of a group from
 the same configuration, and refuses at parse time any option the arm does not apply
-(`Pack::unapplied`). A group whose arm opens lanes (`PackArm::OPEN_LANES`: GLM's and Qwen's)
+(`Pack::unapplied`). A group whose arm opens lanes (`PackArm::open_lanes`: GLM's and Qwen's)
 steps four fused lanes by default (`--fuse-batch --concurrency N` for another count,
 `--concurrency 1` for one request at a time); a group whose arm opens none serves one request at a
 time and refuses `--concurrency` and `--fuse-batch`. `--kv-budget-gib` is refused in any group,

@@ -17,8 +17,8 @@
 //! A pack owns the arithmetic, the chat template and the token ids. The process around it is the
 //! same for every pack and lives here once: resolve the checkpoint and its configuration, check
 //! the window, build the prompt seam before any weight is uploaded, open the backend, start the
-//! driver, serve the router. [`PackArm`] is the part that differs, one impl a pack, and [`Pack`]
-//! is the list of packs `--model` can name.
+//! driver, serve the router. [`PackArm`] is the code that differs, one impl a family; [`Release`]
+//! names one release of it by its `sparkflash_model::ARMS` entry; [`Pack`] is what `--model` names.
 //!
 //! An arm serves on one node behind the generic host driver ([`serve_host`]), or as one process of
 //! a tensor-parallel group whose rank 0 owns HTTP, the tokenizer, the chat template and streaming
@@ -71,8 +71,8 @@ pub(super) const DORY_PROFILE_TOML: &str =
 /// typed profile; a novel family gets `ModelProfile::default()` plus the declared environment
 /// overrides, which is the documented fallback (issue #17 step 2.2).
 pub(super) fn profile_toml_for_family(family: &str) -> Option<&'static str> {
-    // The family spelling and the profile beside it are one fact in `ARMS`; a released pack's
-    // `PackArm::PROFILE_TOML` is the same TOML the table carries (a test holds them equal).
+    // The family spelling and the profile beside it are one fact in `ARMS`; a [`Release`] reads
+    // its profile from the same entry.
     sparkflash_model::arm_for_family(family).and_then(|arm| arm.profile_toml())
 }
 
@@ -85,25 +85,14 @@ pub(super) fn profile_toml_for_family(family: &str) -> Option<&'static str> {
 pub(super) type GroupLanesOpen =
     fn(&Tp4RankConfig, Option<usize>) -> Result<(Option<Box<dyn ModelBackend>>, usize), String>;
 
-/// What one pack's serving arm supplies; [`serve_host`] and [`serve_group`] are the rest.
+/// What one pack's serving arm supplies: the family's code. Which release it serves is a
+/// [Release]; [`serve_host`] and [`serve_group`] are the rest.
 pub(super) trait PackArm {
     /// The pack's parsed `config.json`.
     type Config;
     /// The pack's single-node device backend.
     type Backend: ModelBackend + 'static;
 
-    /// The id `/v1/models` reports and the hub cache resolves.
-    const MODEL_ID: &'static str;
-    /// The pack's carried typed profile (the TOML in its own crate).
-    const PROFILE_TOML: &'static str;
-    /// The name startup messages use.
-    const NAME: &'static str;
-    /// The tiny fixture's directory stem: `sparkflash-{FIXTURE}-fixture-{pid}`.
-    const FIXTURE: &'static str;
-    /// The pack's output ceiling; the CLI default belongs to the V4.1 surface and may be larger.
-    const MAX_OUTPUT_TOKENS: usize;
-    /// The window served without `--context`, capped by the checkpoint's own.
-    const DEFAULT_CONTEXT: usize;
     /// Whether the single-node arm steps its sessions as one batch under `--fuse-batch`.
     const FUSED_BATCH: bool;
     /// Whether the single-node arm sizes its caches against `--kv-budget-gib`.
@@ -125,8 +114,8 @@ pub(super) trait PackArm {
         lanes: Option<usize>,
     ) -> Result<(Option<Box<dyn ModelBackend>>, usize), String>;
 
-    /// Writes the tiny fixture `--synthetic` serves into `directory`.
-    fn write_fixture(directory: &Path) -> Result<Self::Config, String>;
+    /// Writes the tiny checkpoint of `config` that `--synthetic` serves into `directory`.
+    fn write_fixture(directory: &Path, config: &Self::Config) -> Result<(), String>;
     /// The configuration of the checkpoint in `directory`.
     fn read_config(directory: &Path) -> Result<Self::Config, String>;
     /// The shared architecture the typed configuration carries, with the producer correction the
@@ -170,6 +159,54 @@ pub(super) trait PackArm {
     fn check_profile(_profile: &ModelProfile) -> Result<(), String> {
         Ok(())
     }
+}
+
+/// The typed configuration of a release's arm.
+pub(super) type ConfigOf<R> = <<R as Release>::Arm as PackArm>::Config;
+
+/// One release a pack arm serves: a [sparkflash_model::ARMS] entry over the arm's code.
+///
+/// The id, the carried profile, the default window and the output ceiling are the registry's
+/// (`ARM` and its descriptor); a release states only what the registry does not hold. A second
+/// release of a family is one impl here and one row in [TYPED_PACKS].
+pub(super) trait Release {
+    /// The arm whose code serves this release.
+    type Arm: PackArm;
+    /// The release's registration: its served id, weights selector, profile and default window.
+    const ARM: &'static dyn sparkflash_model::Arm;
+    /// The name startup messages use.
+    const NAME: &'static str;
+    /// The tiny fixture's directory stem: `sparkflash-{FIXTURE}-fixture-{pid}`.
+    const FIXTURE: &'static str;
+
+    /// The tiny configuration `--synthetic` serves.
+    fn tiny() -> ConfigOf<Self>;
+
+    /// Whether the arm serves the checkpoint in `directory`. A family with releases the arm has
+    /// no kernels for answers per checkpoint; the default takes every one.
+    fn takes(_directory: &Path) -> bool {
+        true
+    }
+
+    /// The id `/v1/models` reports and the hub cache resolves.
+    fn model_id() -> &'static str {
+        Self::ARM.model_id()
+    }
+
+    /// The window served without `--context`, capped by the checkpoint's own.
+    fn default_context() -> usize {
+        Self::ARM.default_context()
+    }
+
+    /// The release's output ceiling; the CLI default belongs to the V4.1 surface and may be
+    /// larger.
+    fn max_output_tokens() -> usize {
+        Self::ARM
+            .weights()
+            .first()
+            .and_then(|weights| sparkflash_model::find_model_by_weights(weights))
+            .map_or(usize::MAX, |model| model.max_output_tokens)
+    }
 
     /// Parse the carried profile and apply the process environment as overrides.
     ///
@@ -177,13 +214,16 @@ pub(super) trait PackArm {
     /// [sparkflash_model::profile::ENV_OVERRIDES]. An out-of-domain value is refused by
     /// [ModelProfile::validate].
     fn profile_from(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelProfile, String> {
-        let mut profile = ModelProfile::from_toml(Self::PROFILE_TOML)
-            .map_err(|error| format!("the {} profile: {error}", Self::NAME))?;
+        let named = |error: String| format!("the {} profile: {error}", Self::NAME);
+        let toml = Self::ARM
+            .profile_toml()
+            .ok_or_else(|| named("this build carries none".to_owned()))?;
+        let mut profile =
+            ModelProfile::from_toml(toml).map_err(|error| named(error.to_string()))?;
         profile
             .apply_env(lookup)
-            .map_err(|error| format!("the {} profile: {error}", Self::NAME))?;
-        Self::check_profile(&profile)
-            .map_err(|error| format!("the {} profile: {error}", Self::NAME))?;
+            .map_err(|error| named(error.to_string()))?;
+        Self::Arm::check_profile(&profile).map_err(named)?;
         Ok(profile)
     }
 
@@ -200,13 +240,6 @@ impl PackArm for QwenArm {
     type Config = Qwen4ExpConfig;
     type Backend = sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
 
-    const MODEL_ID: &'static str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID;
-    const NAME: &'static str = sparkflash_model_qwen4_exp::rank::ARM_NAME;
-    const FIXTURE: &'static str = "qwen4";
-    const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::QWEN38_MAX_OUTPUT_TOKENS;
-    const DEFAULT_CONTEXT: usize = sparkflash_model::descriptor::QWEN38_CONTEXT_TOKENS;
-    const PROFILE_TOML: &'static str =
-        include_str!("../../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.toml");
     const FUSED_BATCH: bool = true;
     const KV_BUDGET: bool = true;
     #[cfg(feature = "tp4-serve")]
@@ -219,10 +252,8 @@ impl PackArm for QwenArm {
         open_qwen_lanes(config, lanes)
     }
 
-    fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
-        let config = Qwen4ExpConfig::tiny();
-        sparkflash_model_qwen4_exp::write_synthetic_checkpoint(directory, &config, 7)?;
-        Ok(config)
+    fn write_fixture(directory: &Path, config: &Self::Config) -> Result<(), String> {
+        sparkflash_model_qwen4_exp::write_synthetic_checkpoint(directory, config, 7)
     }
 
     fn read_config(directory: &Path) -> Result<Self::Config, String> {
@@ -312,7 +343,7 @@ impl PackArm for QwenArm {
         if let Some(path) = &converted {
             eprintln!(
                 "sparkflash serve: {} weights from converted {}",
-                Self::NAME,
+                sparkflash_model_qwen4_exp::rank::ARM_NAME,
                 path.display()
             );
         }
@@ -330,169 +361,52 @@ impl PackArm for QwenArm {
     }
 }
 
+impl Release for sparkflash_model::Qwen {
+    type Arm = QwenArm;
+    const ARM: &'static dyn sparkflash_model::Arm = &Self;
+    const NAME: &'static str = sparkflash_model_qwen4_exp::rank::ARM_NAME;
+    const FIXTURE: &'static str = "qwen4";
+
+    fn tiny() -> Qwen4ExpConfig {
+        Qwen4ExpConfig::tiny()
+    }
+}
+
 /// Qwen3.8-Flash-Next, the official FP8 checkpoint: the same arm and profile with the FP8
 /// release's served id, so --model qwen3.8-flash-next-fp8 resolves the FP8 snapshot rather than
 /// the NVFP4 one. The checkpoint's own quantization_config selects the expert format.
-pub(super) struct QwenFp8Arm;
-
-impl PackArm for QwenFp8Arm {
-    type Config = Qwen4ExpConfig;
-    type Backend = sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
-
-    const MODEL_ID: &'static str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_ID;
+impl Release for sparkflash_model::QwenFp8 {
+    type Arm = QwenArm;
+    const ARM: &'static dyn sparkflash_model::Arm = &Self;
     const NAME: &'static str = "Qwen3.8-Flash-Next (FP8)";
-    const FIXTURE: &'static str = QwenArm::FIXTURE;
-    const MAX_OUTPUT_TOKENS: usize = QwenArm::MAX_OUTPUT_TOKENS;
-    const DEFAULT_CONTEXT: usize = QwenArm::DEFAULT_CONTEXT;
-    const PROFILE_TOML: &'static str = QwenArm::PROFILE_TOML;
-    const FUSED_BATCH: bool = QwenArm::FUSED_BATCH;
-    const KV_BUDGET: bool = QwenArm::KV_BUDGET;
-    #[cfg(feature = "tp4-serve")]
-    const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
-    #[cfg(feature = "tp4-serve")]
-    fn open_lanes(
-        config: &Tp4RankConfig,
-        lanes: Option<usize>,
-    ) -> Result<(Option<Box<dyn ModelBackend>>, usize), String> {
-        <QwenArm as PackArm>::open_lanes(config, lanes)
-    }
+    const FIXTURE: &'static str = "qwen4";
 
-    fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
-        <QwenArm as PackArm>::write_fixture(directory)
-    }
-
-    fn read_config(directory: &Path) -> Result<Self::Config, String> {
-        <QwenArm as PackArm>::read_config(directory)
-    }
-
-    fn architecture(config: &Self::Config) -> &sparkflash_model::Architecture {
-        <QwenArm as PackArm>::architecture(config)
-    }
-
-    fn window(config: &Self::Config) -> usize {
-        <QwenArm as PackArm>::window(config)
-    }
-
-    fn descriptor(config: &Self::Config, context: usize) -> Result<ModelDescriptor, String> {
-        <QwenArm as PackArm>::descriptor(config, context)
-    }
-
-    fn codec(tokenizer: &Path, config: &Self::Config) -> Result<Arc<dyn PromptCodec>, String> {
-        <QwenArm as PackArm>::codec(tokenizer, config)
-    }
-
-    fn check_host(
-        options: &ServeOptions,
-        config: &Self::Config,
-        context: usize,
-        profile: &ModelProfile,
-    ) -> Result<(), String> {
-        <QwenArm as PackArm>::check_host(options, config, context, profile)
-    }
-
-    fn open_host(
-        directory: &Path,
-        config: Self::Config,
-        context: usize,
-        profile: &ModelProfile,
-        plan: Option<&EnginePlan>,
-    ) -> Result<Self::Backend, String> {
-        <QwenArm as PackArm>::open_host(directory, config, context, profile, plan)
-    }
-
-    fn fuse(backend: &mut Self::Backend, concurrency: usize) -> Result<(), String> {
-        <QwenArm as PackArm>::fuse(backend, concurrency)
-    }
-
-    fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine> {
-        <QwenArm as PackArm>::respond(driver)
+    fn tiny() -> Qwen4ExpConfig {
+        Qwen4ExpConfig::tiny()
     }
 }
 
 /// Qwen3.6-35B-A3B, the official FP8 checkpoint: the Qwen arm's device backend over the
 /// Qwen3.5-MoE family (plain residual, full gated attention, E4M3 128x128-tile dense and expert
 /// weights). The family and stored formats select the kernels; [identity_for] refuses a release
-/// of the family this build has no kernel or identity for.
+/// of the family this build has no kernel or identity for, and such a checkpoint (the BF16
+/// release) stays on the dynamic host path that served the family before the arm.
 ///
 /// [identity_for]: sparkflash_model_qwen4_exp::device::identity_for
-pub(super) struct Qwen36Arm;
-
-impl PackArm for Qwen36Arm {
-    type Config = Qwen4ExpConfig;
-    type Backend = sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
-
-    const MODEL_ID: &'static str = sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID;
+impl Release for sparkflash_model::Qwen36 {
+    type Arm = QwenArm;
+    const ARM: &'static dyn sparkflash_model::Arm = &Self;
     const NAME: &'static str = "Qwen3.6-35B-A3B (FP8)";
     const FIXTURE: &'static str = "qwen36";
-    const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::QWEN36_MAX_OUTPUT_TOKENS;
-    const DEFAULT_CONTEXT: usize = sparkflash_model::descriptor::QWEN36_CONTEXT_TOKENS;
-    const PROFILE_TOML: &'static str =
-        include_str!("../../../sparkflash-model-qwen4-exp/config/qwen36_35b_a3b_fp8.toml");
-    const FUSED_BATCH: bool = QwenArm::FUSED_BATCH;
-    const KV_BUDGET: bool = QwenArm::KV_BUDGET;
-    #[cfg(feature = "tp4-serve")]
-    const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
-    #[cfg(feature = "tp4-serve")]
-    fn open_lanes(
-        config: &Tp4RankConfig,
-        lanes: Option<usize>,
-    ) -> Result<(Option<Box<dyn ModelBackend>>, usize), String> {
-        <QwenArm as PackArm>::open_lanes(config, lanes)
+
+    fn tiny() -> Qwen4ExpConfig {
+        Qwen4ExpConfig::tiny_qwen35_moe(sparkflash_model_qwen4_exp::config::DenseQuant::Fp8Block)
     }
 
-    fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
-        let config = Qwen4ExpConfig::tiny_qwen35_moe(
-            sparkflash_model_qwen4_exp::config::DenseQuant::Fp8Block,
-        );
-        sparkflash_model_qwen4_exp::write_synthetic_checkpoint(directory, &config, 7)?;
-        Ok(config)
-    }
-
-    fn read_config(directory: &Path) -> Result<Self::Config, String> {
-        <QwenArm as PackArm>::read_config(directory)
-    }
-
-    fn architecture(config: &Self::Config) -> &sparkflash_model::Architecture {
-        <QwenArm as PackArm>::architecture(config)
-    }
-
-    fn window(config: &Self::Config) -> usize {
-        <QwenArm as PackArm>::window(config)
-    }
-
-    fn descriptor(config: &Self::Config, context: usize) -> Result<ModelDescriptor, String> {
-        <QwenArm as PackArm>::descriptor(config, context)
-    }
-
-    fn codec(tokenizer: &Path, config: &Self::Config) -> Result<Arc<dyn PromptCodec>, String> {
-        <QwenArm as PackArm>::codec(tokenizer, config)
-    }
-
-    fn check_host(
-        options: &ServeOptions,
-        config: &Self::Config,
-        context: usize,
-        profile: &ModelProfile,
-    ) -> Result<(), String> {
-        <QwenArm as PackArm>::check_host(options, config, context, profile)
-    }
-
-    fn open_host(
-        directory: &Path,
-        config: Self::Config,
-        context: usize,
-        profile: &ModelProfile,
-        plan: Option<&EnginePlan>,
-    ) -> Result<Self::Backend, String> {
-        <QwenArm as PackArm>::open_host(directory, config, context, profile, plan)
-    }
-
-    fn fuse(backend: &mut Self::Backend, concurrency: usize) -> Result<(), String> {
-        <QwenArm as PackArm>::fuse(backend, concurrency)
-    }
-
-    fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine> {
-        <QwenArm as PackArm>::respond(driver)
+    fn takes(directory: &Path) -> bool {
+        Qwen4ExpConfig::from_checkpoint_dir(directory)
+            .ok()
+            .is_some_and(|config| sparkflash_model_qwen4_exp::device::identity_for(&config).is_ok())
     }
 }
 
@@ -506,13 +420,6 @@ impl PackArm for GlmArm {
     type Config = Glm5NextConfig;
     type Backend = sparkflash_model_glm5_next::Glm5NextDeviceBackend;
 
-    const MODEL_ID: &'static str = sparkflash_model::descriptor::GLM53_FLASH_ID;
-    const NAME: &'static str = sparkflash_model_glm5_next::rank::ARM_NAME;
-    const FIXTURE: &'static str = "glm53";
-    const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::GLM53_MAX_OUTPUT_TOKENS;
-    const DEFAULT_CONTEXT: usize = sparkflash_model::descriptor::GLM53_CONTEXT_TOKENS;
-    const PROFILE_TOML: &'static str =
-        include_str!("../../../sparkflash-model-glm5-next/config/glm53_flash.toml");
     const FUSED_BATCH: bool = true;
     const KV_BUDGET: bool = true;
     #[cfg(feature = "tp4-serve")]
@@ -528,18 +435,14 @@ impl PackArm for GlmArm {
     fn check_profile(profile: &ModelProfile) -> Result<(), String> {
         sparkflash_model::profile::refuse_tensor_core_decode(
             "GLM",
-            Self::MODEL_ID,
+            sparkflash_model::descriptor::GLM53_FLASH_ID,
             "docs/numerics/glm53/v3-gemv.md",
             profile,
         )
     }
 
-    fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
-        let config = Glm5NextConfig::tiny();
-        sparkflash_model_glm5_next::checkpoint::write_synthetic_checkpoint(
-            directory, &config, 7, 2,
-        )?;
-        Ok(config)
+    fn write_fixture(directory: &Path, config: &Self::Config) -> Result<(), String> {
+        sparkflash_model_glm5_next::checkpoint::write_synthetic_checkpoint(directory, config, 7, 2)
     }
 
     /// The checkpoint's `config.json`. A checkpoint without one is refused rather than served
@@ -590,7 +493,7 @@ impl PackArm for GlmArm {
         if config.num_hidden_layers >= 45 {
             return Err(format!(
                 "{} is the released 321B-parameter FP8 checkpoint (328.3 GB): one TP=1 rank cannot hold it. Serve the tiny fixture at TP=1 (--synthetic), or serve the release with the four-rank group: build with --features tp4-serve and pass --tp4-rank/--tp4-world-size/--tp4-peers with --checkpoint.",
-                Self::MODEL_ID
+                sparkflash_model::descriptor::GLM53_FLASH_ID
             ));
         }
         // Each worker opens its own window: at the 1M default that is 18.8 GiB of caches a
@@ -663,17 +566,15 @@ impl PackArm for GlmArm {
     }
 }
 
-/// Whether the Qwen3.5-MoE checkpoint in `directory` is one the device arm serves.
-///
-/// The family is many releases and formats; the device arm takes the ones it has kernels and an
-/// identity for ([identity_for]), and the rest (the BF16 release) stay on the dynamic host path
-/// that served the family before the arm.
-///
-/// [identity_for]: sparkflash_model_qwen4_exp::device::identity_for
-pub(super) fn qwen35_on_device(directory: &Path) -> bool {
-    Qwen4ExpConfig::from_checkpoint_dir(directory)
-        .ok()
-        .is_some_and(|config| sparkflash_model_qwen4_exp::device::identity_for(&config).is_ok())
+impl Release for sparkflash_model::Glm {
+    type Arm = GlmArm;
+    const ARM: &'static dyn sparkflash_model::Arm = &Self;
+    const NAME: &'static str = sparkflash_model_glm5_next::rank::ARM_NAME;
+    const FIXTURE: &'static str = "glm53";
+
+    fn tiny() -> Glm5NextConfig {
+        Glm5NextConfig::tiny()
+    }
 }
 
 /// The lane count the options record before an arm answers, and the dynamic dense arm's own
@@ -684,55 +585,75 @@ pub(super) fn qwen35_on_device(directory: &Path) -> bool {
 /// `--concurrency`, so flag validation has a number before any device is opened.
 pub(super) const GROUP_LANES: usize = 4;
 
-/// One typed pack: a [PackArm] this build carries, selected by its registry weights selector.
-struct TypedPack {
-    /// The weights selector that names this entry's [sparkflash_model::Arm].
-    weights: &'static str,
+/// Serves a resolved checkpoint of a pack's family under the checkpoint's own identity
+/// ([serve_arm_identity]).
+type ServeIdentity = fn(
+    &ServeOptions,
+    PathBuf,
+    ModelDescriptor,
+    Arc<dyn PromptCodec>,
+    usize,
+) -> Result<ExitCode, String>;
+
+/// One typed pack: a [Release] this build carries, as the serving paths read it.
+pub(super) struct TypedPack {
+    /// The release's [sparkflash_model::ARMS] entry: its weights selector and its families.
+    arm: &'static dyn sparkflash_model::Arm,
+    /// Whether the arm serves the checkpoint in a directory ([Release::takes]).
+    takes: fn(&Path) -> bool,
     /// Whether the single-node arm steps its sessions as one batch under `--fuse-batch`.
     fused_batch: bool,
     /// Whether the single-node arm sizes its caches against `--kv-budget-gib`.
     kv_budget: bool,
-    /// Serves this pack through [serve_arm] or [serve_arm_identity].
+    /// Serves the release `--model` names, on one node or as a rank of its group.
     serve: fn(&ServeOptions) -> Result<ExitCode, String>,
+    /// Serves a checkpoint of the family under its own id, window and tokenizer.
+    pub(super) serve_identity: ServeIdentity,
 }
 
-/// The typed packs this build serves, one entry a [PackArm].
+impl TypedPack {
+    const fn of<R: Release>() -> Self {
+        Self {
+            arm: R::ARM,
+            takes: R::takes,
+            fused_batch: R::Arm::FUSED_BATCH,
+            kv_budget: R::Arm::KV_BUDGET,
+            serve: serve_arm::<R>,
+            serve_identity: serve_arm_identity::<R>,
+        }
+    }
+}
+
+/// The typed packs this build serves, one row a [Release].
 ///
 /// A new family adds an [sparkflash_model::ARMS] entry and, when it brings its own arithmetic and
-/// boot, one entry here plus its `PackArm` impl. The [Pack] identity is the descriptor's weights
-/// selector, so a second release of one arm (Qwen's FP8 snapshot) is a selector, not a variant.
+/// boot, its [PackArm] and [Release] impls and one row here; a second release of a family this
+/// build already serves is the `ARMS` entry, a `Release` impl and a row. Both the preset route
+/// ([Pack::serve]) and the dynamic route ([typed_for_checkpoint]) read this table.
 static TYPED_PACKS: &[TypedPack] = &[
-    TypedPack {
-        weights: sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID,
-        fused_batch: QwenArm::FUSED_BATCH,
-        kv_budget: QwenArm::KV_BUDGET,
-        serve: serve_arm::<QwenArm>,
-    },
-    TypedPack {
-        weights: sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
-        fused_batch: QwenFp8Arm::FUSED_BATCH,
-        kv_budget: QwenFp8Arm::KV_BUDGET,
-        serve: serve_arm::<QwenFp8Arm>,
-    },
-    TypedPack {
-        weights: sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
-        fused_batch: Qwen36Arm::FUSED_BATCH,
-        kv_budget: Qwen36Arm::KV_BUDGET,
-        serve: serve_arm::<Qwen36Arm>,
-    },
-    TypedPack {
-        weights: sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID,
-        fused_batch: GlmArm::FUSED_BATCH,
-        kv_budget: GlmArm::KV_BUDGET,
-        serve: serve_arm::<GlmArm>,
-    },
+    TypedPack::of::<sparkflash_model::Qwen>(),
+    TypedPack::of::<sparkflash_model::QwenFp8>(),
+    TypedPack::of::<sparkflash_model::Qwen36>(),
+    TypedPack::of::<sparkflash_model::Glm>(),
 ];
 
-/// The typed pack a weights selector names, if this build carries its [PackArm].
+/// The typed pack a weights selector names, if this build carries its [Release].
 fn typed_pack(weights: &str) -> Option<&'static TypedPack> {
+    TYPED_PACKS.iter().find(|entry| {
+        entry
+            .arm
+            .weights()
+            .iter()
+            .any(|own| own.eq_ignore_ascii_case(weights))
+    })
+}
+
+/// The typed pack that serves the checkpoint of `family` in `directory`: the first release of
+/// that family whose arm takes the checkpoint.
+pub(super) fn typed_for_checkpoint(family: &str, directory: &Path) -> Option<&'static TypedPack> {
     TYPED_PACKS
         .iter()
-        .find(|entry| entry.weights.eq_ignore_ascii_case(weights))
+        .find(|entry| entry.arm.families().contains(&family) && (entry.takes)(directory))
 }
 
 /// How a pack's process is served.
@@ -823,9 +744,7 @@ impl Pack {
         let architecture = sparkflash_model::Architecture::from_json(&text).ok()?;
         let descriptor = sparkflash_model::find_model_by_type(&architecture.family)?;
         let pack = Self::from_descriptor(descriptor)?;
-        if pack.has_weights(sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID)
-            && !qwen35_on_device(directory)
-        {
+        if typed_pack(&descriptor.weights_id).is_some_and(|typed| !(typed.takes)(directory)) {
             return None;
         }
         Some(pack)
@@ -998,12 +917,12 @@ impl Pack {
     }
 }
 
-fn serve_arm<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
+fn serve_arm<R: Release>(options: &ServeOptions) -> Result<ExitCode, String> {
     #[cfg(feature = "tp4-serve")]
     if let Some(tp4) = options.tp4.as_ref() {
-        return serve_group::<A>(options, tp4);
+        return serve_group::<R>(options, tp4);
     }
-    serve_host::<A>(options)
+    serve_host::<R>(options)
 }
 
 /// The directory a checkpoint path names: the path itself, or the directory holding the file.
@@ -1013,9 +932,9 @@ fn serve_arm<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
 pub(super) use sparkflash_serve::tp4::checkpoint_directory;
 
 /// The configuration of the checkpoint in `directory`, with the pack named in a refusal.
-pub(super) fn read_config<A: PackArm>(directory: &Path) -> Result<A::Config, String> {
-    A::read_config(directory)
-        .map_err(|error| format!("cannot read the {} configuration: {error}", A::NAME))
+pub(super) fn read_config<R: Release>(directory: &Path) -> Result<ConfigOf<R>, String> {
+    R::Arm::read_config(directory)
+        .map_err(|error| format!("cannot read the {} configuration: {error}", R::NAME))
 }
 
 /// Turns the profile's speculation section into the GLM arm's drafter and depth.
@@ -1075,12 +994,12 @@ pub(super) fn admit(
 }
 
 /// The window this run serves: `--context`, else the pack's default capped by the checkpoint's.
-pub(super) fn pack_context<A: PackArm>(
+pub(super) fn pack_context<R: Release>(
     options: &ServeOptions,
-    config: &A::Config,
+    config: &ConfigOf<R>,
 ) -> Result<usize, String> {
-    let window = A::window(config);
-    let context = options.context.unwrap_or(A::DEFAULT_CONTEXT.min(window));
+    let window = R::Arm::window(config);
+    let context = options.context.unwrap_or(R::default_context().min(window));
     if context == 0 || context > window {
         return Err(format!("context limit {context} is outside 1..={window}"));
     }
@@ -1092,10 +1011,10 @@ pub(super) fn pack_context<A: PackArm>(
 /// It is built before the checkpoint is opened. Opening a released checkpoint uploads tens of
 /// gigabytes; discovering afterwards that the tokenizer is missing (or names a vocabulary whose
 /// special ids disagree with the configuration) would waste the upload and leave the GPU full.
-fn pack_seam<A: PackArm>(
+fn pack_seam<R: Release>(
     options: &ServeOptions,
     directory: &Path,
-    config: &A::Config,
+    config: &ConfigOf<R>,
 ) -> Result<(PathBuf, Arc<dyn PromptCodec>), String> {
     let tokenizer = options
         .tokenizer
@@ -1104,33 +1023,34 @@ fn pack_seam<A: PackArm>(
     if !tokenizer.is_file() {
         return Err(format!(
             "--model {} needs --tokenizer FILE, or a tokenizer.json beside the checkpoint at {}",
-            A::MODEL_ID,
+            R::model_id(),
             tokenizer.display()
         ));
     }
-    let seam = A::codec(&tokenizer, config)?;
+    let seam = R::Arm::codec(&tokenizer, config)?;
     Ok((tokenizer, seam))
 }
 
 /// The checkpoint a single-node arm serves: the tiny fixture under `--synthetic`, else
 /// `--checkpoint`, else the hub cache's snapshot of the pack's id.
-fn host_checkpoint<A: PackArm>(options: &ServeOptions) -> Result<(PathBuf, A::Config), String> {
+fn host_checkpoint<R: Release>(options: &ServeOptions) -> Result<(PathBuf, ConfigOf<R>), String> {
     if options.synthetic {
         let directory = std::env::temp_dir().join(format!(
             "sparkflash-{}-fixture-{}",
-            A::FIXTURE,
+            R::FIXTURE,
             std::process::id()
         ));
-        let config = A::write_fixture(&directory).map_err(|error| {
+        let config = R::tiny();
+        R::Arm::write_fixture(&directory, &config).map_err(|error| {
             format!(
                 "cannot write the tiny {} fixture to {}: {error}",
-                A::NAME,
+                R::NAME,
                 directory.display()
             )
         })?;
         eprintln!(
             "sparkflash serve: serving the tiny {} fixture at {} with a byte codec: this exercises the serving path, it is not the released model",
-            A::NAME,
+            R::NAME,
             directory.display()
         );
         return Ok((directory, config));
@@ -1141,7 +1061,7 @@ fn host_checkpoint<A: PackArm>(options: &ServeOptions) -> Result<(PathBuf, A::Co
             // The caller's id, not the arm's compile-time one: a cached fine-tune named on the
             // command line must load its own snapshot (issue #17). A canonical weight selector
             // still maps to its registry id, so the alias and the served id resolve alike.
-            let requested = options.model.as_deref().unwrap_or(A::MODEL_ID);
+            let requested = options.model.as_deref().unwrap_or(R::model_id());
             let id = sparkflash_model::find_model(requested)
                 .map_or_else(|| requested.to_owned(), |model| model.id.clone());
             sparkflash_weights::hub::cached_model_dir(&id).ok_or_else(|| {
@@ -1151,7 +1071,7 @@ fn host_checkpoint<A: PackArm>(options: &ServeOptions) -> Result<(PathBuf, A::Co
             })?
         }
     };
-    let config = read_config::<A>(&directory)?;
+    let config = read_config::<R>(&directory)?;
     Ok((directory, config))
 }
 
@@ -1186,12 +1106,12 @@ fn check_backend_plan(plan: &EnginePlan, family: &str, layers: usize) -> Result<
 /// executes is resolved to a loadable image before the arm opens a weight. The check is skipped
 /// for the synthetic fixture, which exercises the serving path without claiming this build's
 /// device images.
-fn check_plan<A: PackArm>(
+fn check_plan<R: Release>(
     directory: &Path,
-    config: &A::Config,
+    config: &ConfigOf<R>,
     world: usize,
 ) -> Result<EnginePlan, String> {
-    check_plan_with::<A>(directory, config, world, Availability::runtime_env())
+    check_plan_with::<R>(directory, config, world, Availability::runtime_env())
 }
 
 /// [check_plan] under an explicit availability policy.
@@ -1201,17 +1121,21 @@ fn check_plan<A: PackArm>(
 /// runs the 14-patch tower, and those two arms do not. The catalogue's own
 /// [KernelResolver::boot_check] still refuses the 16-patch tower on the plan itself, so this
 /// does not weaken the catalogue's patch constraint.
-fn check_plan_with<A: PackArm>(
+fn check_plan_with<R: Release>(
     directory: &Path,
-    config: &A::Config,
+    config: &ConfigOf<R>,
     world: usize,
     availability: Availability,
 ) -> Result<EnginePlan, String> {
     // Plan the architecture the arm parsed, not a second raw view of the document: the Qwen FP8
     // bridge corrects the producer's global fp8 flag, and the boot plan must see that correction.
-    let plan =
-        EnginePlan::for_architecture(A::architecture(config).clone(), Target::Sm121, world, 0)
-            .map_err(|error| format!("cannot plan the {} checkpoint: {error}", A::NAME))?;
+    let plan = EnginePlan::for_architecture(
+        R::Arm::architecture(config).clone(),
+        Target::Sm121,
+        world,
+        0,
+    )
+    .map_err(|error| format!("cannot plan the {} checkpoint: {error}", R::NAME))?;
     let resolver = KernelResolver::new(Target::Sm121, availability);
     // Prove both passes: a plan that resolves only because a decode symbol was accepted for a
     // prefill request has not booted, it has half-booted.
@@ -1220,54 +1144,54 @@ fn check_plan_with<A: PackArm>(
         .err()
         .unwrap_or_default();
     if failures.is_empty() {
-        eprintln!("sparkflash serve: {} plan {}", A::NAME, plan.boot_summary());
+        eprintln!("sparkflash serve: {} plan {}", R::NAME, plan.boot_summary());
         return Ok(plan);
     }
     let reasons: Vec<String> = failures.iter().map(ToString::to_string).collect();
     Err(format!(
         "{} cannot execute {} at TP{world}: {}",
-        A::NAME,
+        R::NAME,
         directory.display(),
         reasons.join("; ")
     ))
 }
 
 /// A pack's single-node arm: its device backend behind the generic host driver.
-fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
-    let (directory, config) = host_checkpoint::<A>(options)?;
-    let context = pack_context::<A>(options, &config)?;
+fn serve_host<R: Release>(options: &ServeOptions) -> Result<ExitCode, String> {
+    let (directory, config) = host_checkpoint::<R>(options)?;
+    let context = pack_context::<R>(options, &config)?;
     let plan = if options.synthetic {
         None
     } else {
-        Some(check_plan::<A>(&directory, &config, 1)?)
+        Some(check_plan::<R>(&directory, &config, 1)?)
     };
-    let profile = A::profile()?;
+    let profile = R::profile()?;
     sparkflash_model::install_active(profile.clone());
     eprintln!(
         "sparkflash serve: {} profile model={} family={} weights={}",
-        A::NAME,
+        R::NAME,
         profile.model.as_deref().unwrap_or("-"),
         profile.family.as_deref().unwrap_or("-"),
         profile.weights.as_deref().unwrap_or("-")
     );
-    A::check_host(options, &config, context, &profile)?;
+    R::Arm::check_host(options, &config, context, &profile)?;
     let released_seam = if options.synthetic {
         None
     } else {
-        Some(pack_seam::<A>(options, &directory, &config)?.1)
+        Some(pack_seam::<R>(options, &directory, &config)?.1)
     };
-    let mut backend =
-        A::open_host(&directory, config, context, &profile, plan.as_ref()).map_err(|error| {
+    let mut backend = R::Arm::open_host(&directory, config, context, &profile, plan.as_ref())
+        .map_err(|error| {
             format!(
                 "cannot open {} at {}: {error}",
-                A::NAME,
+                R::NAME,
                 directory.display()
             )
         })?;
     // One pooled session a concurrent request: the driver opens exactly `concurrency` sessions, so
     // a smaller pool would make a request wait for a slot it asked for at start-up.
     if options.fuse_batch {
-        A::fuse(&mut backend, options.concurrency)
+        R::Arm::fuse(&mut backend, options.concurrency)
             .map_err(|error| format!("cannot fuse the batch: {error}"))?;
     }
     let descriptor = backend.descriptor().clone();
@@ -1281,12 +1205,12 @@ fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
     );
     // The byte codec's output is arbitrary text, not the released template's channels, so the
     // fixture stays on the raw driver.
-    let respond = (!options.synthetic).then_some(A::respond as Respond);
+    let respond = (!options.synthetic).then_some(R::Arm::respond as Respond);
     serve_backend(
         options,
         Box::new(backend),
         seam,
-        options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
+        options.max_tokens.min(R::max_output_tokens()),
         1,
         respond,
         &banner,
@@ -1368,37 +1292,36 @@ impl<B: ModelBackend> ModelBackend for DescriptorBackend<B> {
 ///
 /// This is the dynamic path for a cached fine-tune whose `model_type` is a released family: the
 /// arm's arithmetic and profile are used, while the descriptor, context and tokenizer are the
-/// checkpoint's. `respond` is the arm's response dialect (`A::respond`).
-pub(super) fn serve_arm_identity<A: PackArm>(
+/// checkpoint's, and the response dialect is the arm's ([PackArm::respond]).
+pub(super) fn serve_arm_identity<R: Release>(
     options: &ServeOptions,
     directory: PathBuf,
     descriptor: ModelDescriptor,
     seam: Arc<dyn PromptCodec>,
     context: usize,
-    respond: fn(Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine>,
 ) -> Result<ExitCode, String> {
-    let config = read_config::<A>(&directory)?;
-    let window = A::window(&config);
+    let config = read_config::<R>(&directory)?;
+    let window = R::Arm::window(&config);
     if context == 0 || context > window {
         return Err(format!(
             "context limit {context} is outside 1..={window} for {}",
             descriptor.id
         ));
     }
-    let plan = check_plan::<A>(&directory, &config, 1)?;
-    let profile = A::profile()?;
+    let plan = check_plan::<R>(&directory, &config, 1)?;
+    let profile = R::profile()?;
     sparkflash_model::install_active(profile.clone());
-    A::check_host(options, &config, context, &profile)?;
-    let mut backend =
-        A::open_host(&directory, config, context, &profile, Some(&plan)).map_err(|error| {
+    R::Arm::check_host(options, &config, context, &profile)?;
+    let mut backend = R::Arm::open_host(&directory, config, context, &profile, Some(&plan))
+        .map_err(|error| {
             format!(
                 "cannot open {} at {}: {error}",
-                A::NAME,
+                R::NAME,
                 directory.display()
             )
         })?;
     if options.fuse_batch {
-        A::fuse(&mut backend, options.concurrency)
+        R::Arm::fuse(&mut backend, options.concurrency)
             .map_err(|error| format!("cannot fuse the batch: {error}"))?;
     }
     let banner = format!(
@@ -1415,9 +1338,9 @@ pub(super) fn serve_arm_identity<A: PackArm>(
         options,
         Box::new(backend),
         seam,
-        options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
+        options.max_tokens.min(R::max_output_tokens()),
         1,
-        Some(respond),
+        Some(R::Arm::respond),
         &banner,
         options.concurrency,
     )
@@ -1449,7 +1372,7 @@ pub(super) fn pack_cluster_snapshot(model: &str, context: usize) -> ClusterStats
 /// streaming; the other ranks run the control worker and never load a tokenizer. The control
 /// channel and the request loop are the V4.1 group's.
 #[cfg(feature = "tp4-serve")]
-fn serve_group<A: PackArm>(
+fn serve_group<R: Release>(
     options: &ServeOptions,
     tp4: &Tp4ServeOptions,
 ) -> Result<ExitCode, String> {
@@ -1459,7 +1382,7 @@ fn serve_group<A: PackArm>(
     let directory = match options.checkpoint.as_deref() {
         Some(checkpoint) => checkpoint_directory(checkpoint),
         None => {
-            let requested = options.model.as_deref().unwrap_or(A::MODEL_ID);
+            let requested = options.model.as_deref().unwrap_or(R::model_id());
             let id = sparkflash_model::find_model(requested)
                 .map_or_else(|| requested.to_owned(), |model| model.id.clone());
             sparkflash_weights::hub::cached_model_dir(&id).ok_or_else(|| {
@@ -1469,63 +1392,70 @@ fn serve_group<A: PackArm>(
             })?
         }
     };
-    let config = read_config::<A>(&directory)?;
+    let config = read_config::<R>(&directory)?;
     // Every rank derives the window from the same configuration, so the group agrees on the
     // sequence width without rank 0 sending it.
-    let context = pack_context::<A>(options, &config)?;
-    check_plan::<A>(&directory, &config, tp4.world_size)?;
+    let context = pack_context::<R>(options, &config)?;
+    check_plan::<R>(&directory, &config, tp4.world_size)?;
     // The pack's carried profile is the source of truth for this arm, exactly as it is on the
     // single-node path (serve_host installs it). Without this the four-rank arm read
     // ModelProfile::default() everywhere it asked active_profile(), so every setting the file
     // makes - the speculation depth, the prefill chunk, the plan's threads - was inert here and
     // only an environment override had any effect.
-    let profile = A::profile()?;
+    let profile = R::profile()?;
     sparkflash_model::install_active(profile.clone());
     if tp4.rank == 0 {
         eprintln!(
             "sparkflash serve: {} profile model={} family={} weights={}",
-            A::NAME,
+            R::NAME,
             profile.model.as_deref().unwrap_or("-"),
             profile.family.as_deref().unwrap_or("-"),
             profile.weights.as_deref().unwrap_or("-")
         );
     }
     if options.fuse_batch {
-        return serve_group_lanes::<A>(options, tp4, &directory, &config, context, A::open_lanes);
+        return serve_group_lanes::<R>(
+            options,
+            tp4,
+            &directory,
+            &config,
+            context,
+            R::Arm::open_lanes,
+        );
     }
     if tp4.rank != 0 {
-        pack_tp4_worker(options, tp4, context, A::OPEN_RANK)
+        pack_tp4_worker(options, tp4, context, R::Arm::OPEN_RANK)
             .map_err(|message| format!("rank {}: {message}", tp4.rank))?;
         return Ok(ExitCode::SUCCESS);
     }
     // The prompt seam and the detokenizer are the same file; load it before the rank upload so a
     // missing tokenizer costs a startup message, not a load.
-    let (tokenizer, seam) = pack_seam::<A>(options, &directory, &config)?;
-    let descriptor = A::descriptor(&config, context)?;
+    let (tokenizer, seam) = pack_seam::<R>(options, &directory, &config)?;
+    let descriptor = R::Arm::descriptor(&config, context)?;
     let mut rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
     rank_config.context = context;
     let spec = Tp4EngineSpec {
-        model: A::MODEL_ID.to_owned(),
+        model: R::model_id().to_owned(),
         vocab_size: descriptor.vocab_size,
         capabilities: descriptor.capabilities,
-        cluster: pack_cluster_snapshot(A::MODEL_ID, context),
+        cluster: pack_cluster_snapshot(R::model_id(), context),
         tokenizer,
-        open: A::OPEN_RANK,
+        open: R::Arm::OPEN_RANK,
     };
     let driver = Tp4Driver::start(
         spec,
         rank_config,
-        options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
+        options.max_tokens.min(R::max_output_tokens()),
     )?;
     println!(
         "sparkflash serve: {} TP={} rank 0 on {}; control {}; workers never detokenize",
-        A::MODEL_ID,
+        R::model_id(),
         tp4.world_size,
         tp4.peers[0],
         tp4.control_port
     );
     let metrics = driver.metrics();
-    let engine = A::respond(Arc::new(driver));
+    let engine = R::Arm::respond(Arc::new(driver));
     let numerics = ConfigKey::tp(
         descriptor.id.clone(),
         tp4.world_size,
@@ -1542,11 +1472,11 @@ fn serve_group<A: PackArm>(
 /// ([`PackArm::open_lanes`]), rank 0 serves its backend through the host driver as one node
 /// does, and each worker mirrors rank 0's lanes until the group ends.
 #[cfg(feature = "tp4-serve")]
-fn serve_group_lanes<A: PackArm>(
+fn serve_group_lanes<R: Release>(
     options: &ServeOptions,
     tp4: &Tp4ServeOptions,
     directory: &Path,
-    config: &A::Config,
+    config: &ConfigOf<R>,
     context: usize,
     open: GroupLanesOpen,
 ) -> Result<ExitCode, String> {
@@ -1560,13 +1490,13 @@ fn serve_group_lanes<A: PackArm>(
         return Ok(ExitCode::SUCCESS);
     }
     // The tokenizer before the rank upload, as the one-request group loads it.
-    let (_, seam) = pack_seam::<A>(options, directory, config)?;
+    let (_, seam) = pack_seam::<R>(options, directory, config)?;
     let (backend, lanes) = open(&rank_config, requested)?;
-    let backend = backend.ok_or_else(|| format!("{} rank 0 opened no lanes", A::NAME))?;
+    let backend = backend.ok_or_else(|| format!("{} rank 0 opened no lanes", R::NAME))?;
     let banner = format!(
         "sparkflash serve: {} TP={} rank 0 on {}; control {}; {} fused lanes; workers never \
          detokenize",
-        A::MODEL_ID,
+        R::model_id(),
         tp4.world_size,
         tp4.peers[0],
         tp4.control_port,
@@ -1576,9 +1506,9 @@ fn serve_group_lanes<A: PackArm>(
         options,
         backend,
         seam,
-        options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
+        options.max_tokens.min(R::max_output_tokens()),
         tp4.world_size,
-        Some(A::respond),
+        Some(R::Arm::respond),
         &banner,
         lanes,
     )
@@ -1586,7 +1516,21 @@ fn serve_group_lanes<A: PackArm>(
 
 #[cfg(test)]
 mod tests {
+    use sparkflash_model::{Glm, Qwen, Qwen36, QwenFp8};
+
     use super::*;
+
+    /// The profile a release carries.
+    fn toml<R: Release>() -> &'static str {
+        R::ARM.profile_toml().expect("a release carries a profile")
+    }
+
+    /// Writes a release's tiny fixture into `directory`.
+    fn fixture<R: Release>(directory: &Path) -> ConfigOf<R> {
+        let config = R::tiny();
+        R::Arm::write_fixture(directory, &config).expect("the fixture writes");
+        config
+    }
 
     const GLM_CONFIG: &str =
         include_str!("../../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
@@ -1595,14 +1539,45 @@ mod tests {
     const DEEPSEEK_CONFIG: &str = include_str!(
         "../../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
     );
+    /// A release states no id, window or ceiling of its own: every row of the table resolves in
+    /// the registry, which holds the ones each pack arm used to repeat.
+    #[test]
+    fn a_release_reads_its_identity_from_the_registry() {
+        for pack in TYPED_PACKS {
+            let weights = pack.arm.weights().first().expect("a release has weights");
+            let model = sparkflash_model::find_model_by_weights(weights)
+                .unwrap_or_else(|| panic!("{weights} is not in the registry"));
+            assert_eq!(model.id, pack.arm.model_id());
+            assert_eq!(model.context_tokens, pack.arm.default_context());
+            assert!(
+                pack.arm.profile_toml().is_some(),
+                "{weights} has no profile"
+            );
+        }
+        use sparkflash_model::descriptor::{QWEN36_MAX_OUTPUT_TOKENS, QWEN38_MAX_OUTPUT_TOKENS};
+        assert_eq!(Qwen36::max_output_tokens(), QWEN36_MAX_OUTPUT_TOKENS);
+        assert_eq!(QwenFp8::max_output_tokens(), QWEN38_MAX_OUTPUT_TOKENS);
+    }
+
     #[test]
     fn the_arms_table_carries_the_same_profile_as_the_pack() {
+        // A typed pack reads its own entry and the dynamic route reads the family's first: every
+        // release of a family carries one profile, so the two routes cannot serve two settings.
+        for pack in TYPED_PACKS {
+            for family in pack.arm.families() {
+                assert_eq!(
+                    profile_toml_for_family(family),
+                    pack.arm.profile_toml(),
+                    "{} and the {family} family carry two profiles",
+                    pack.arm.id()
+                );
+            }
+        }
         for (family, toml) in [
             ("deepseek_v41", DEEPSEEK_PROFILE_TOML),
-            ("qwen4_exp", QwenArm::PROFILE_TOML),
-            ("qwen4_exp_text", QwenArm::PROFILE_TOML),
-            ("qwen3_5_moe", Qwen36Arm::PROFILE_TOML),
-            ("glm5_next", GlmArm::PROFILE_TOML),
+            ("qwen4_exp", toml::<Qwen>()),
+            ("qwen3_5_moe", toml::<Qwen36>()),
+            ("glm5_next", toml::<Glm>()),
             ("dory", DORY_PROFILE_TOML),
             ("inkling2", sparkflash_model_inkling2::PROFILE_TOML),
         ] {
@@ -1619,8 +1594,8 @@ mod tests {
     fn every_carried_profile_parses_and_keeps_its_registry_identity() {
         for (name, toml) in [
             ("DeepSeek-V4.1-Flash", DEEPSEEK_PROFILE_TOML),
-            ("Qwen3.8-Flash-Next", QwenArm::PROFILE_TOML),
-            ("GLM-5.3-Flash", GlmArm::PROFILE_TOML),
+            ("Qwen3.8-Flash-Next", toml::<Qwen>()),
+            ("GLM-5.3-Flash", toml::<Glm>()),
             ("Dory1.0-4B", DORY_PROFILE_TOML),
         ] {
             let profile = ModelProfile::from_toml(toml)
@@ -1652,12 +1627,12 @@ mod tests {
 
     #[test]
     fn a_profile_environment_override_wins_over_the_carried_toml() {
-        let carried = ModelProfile::from_toml(QwenArm::PROFILE_TOML).expect("the carried profile");
+        let carried = ModelProfile::from_toml(toml::<Qwen>()).expect("the carried profile");
         assert_eq!(carried.prefill.chunk, Some(4096));
         // The block drafter's whole width: seven drafts, with the adaptive policy choosing how
         // many of them a step verifies (the measured table is beside the setting).
         assert_eq!(carried.speculation.depth, Some(7));
-        let overridden = QwenArm::profile_from(|name| match name {
+        let overridden = Qwen::profile_from(|name| match name {
             "SPARKFLASH_QWEN4_PREFILL_CHUNK" => Some("2048".to_owned()),
             "SPARKFLASH_DRAFT_DEPTH" => Some("5".to_owned()),
             _ => None,
@@ -1671,7 +1646,7 @@ mod tests {
     fn glm_refuses_tensor_core_decode_where_its_profile_is_read() {
         // Version 3's token row is the tiled row GEMV, so the switch that would run the FP8 body
         // is refused with that row's reason.
-        let error = GlmArm::profile_from(|name| match name {
+        let error = Glm::profile_from(|name| match name {
             "SPARKFLASH_DECODE_MMA" => Some("on".to_owned()),
             _ => None,
         })
@@ -1679,9 +1654,9 @@ mod tests {
         assert!(error.contains("row GEMV"), "{error}");
         // The carried profile leaves the field unset, and the code default is the GEMV; =off is
         // the same route and is accepted.
-        let carried = GlmArm::profile_from(|_| None).expect("the carried GLM profile boots");
+        let carried = Glm::profile_from(|_| None).expect("the carried GLM profile boots");
         assert_eq!(carried.decode.tensor_cores, None);
-        GlmArm::profile_from(|name| match name {
+        Glm::profile_from(|name| match name {
             "SPARKFLASH_DECODE_MMA" => Some("off".to_owned()),
             _ => None,
         })
@@ -1868,9 +1843,9 @@ mod tests {
         let cache = tempfile::tempdir().expect("an empty hub cache");
         unsafe { std::env::set_var("HF_HUB_CACHE", cache.path()) };
         let directory = tempfile::tempdir().expect("a temporary checkpoint");
-        let config = <QwenArm as PackArm>::write_fixture(directory.path()).expect("the fixture");
+        let config = fixture::<Qwen>(directory.path());
         let context = <QwenArm as PackArm>::window(&config).min(4_096);
-        let profile = <QwenArm as PackArm>::profile_from(|_| None).expect("the profile");
+        let profile = Qwen::profile_from(|_| None).expect("the profile");
         let backend =
             <QwenArm as PackArm>::open_host(directory.path(), config, context, &profile, None)
                 .expect("the Qwen fixture opens");
@@ -1878,11 +1853,11 @@ mod tests {
         assert!(qwen > 0, "Qwen states no lane width");
 
         let directory = tempfile::tempdir().expect("a temporary checkpoint");
-        let config = <QwenFp8Arm as PackArm>::write_fixture(directory.path()).expect("the fixture");
-        let context = <QwenFp8Arm as PackArm>::window(&config).min(4_096);
-        let profile = <QwenFp8Arm as PackArm>::profile_from(|_| None).expect("the profile");
+        let config = fixture::<QwenFp8>(directory.path());
+        let context = <QwenArm as PackArm>::window(&config).min(4_096);
+        let profile = QwenFp8::profile_from(|_| None).expect("the profile");
         let backend =
-            <QwenFp8Arm as PackArm>::open_host(directory.path(), config, context, &profile, None)
+            <QwenArm as PackArm>::open_host(directory.path(), config, context, &profile, None)
                 .expect("the FP8 fixture opens");
         assert_eq!(
             backend.lane_limit().expect("the FP8 lane width"),
@@ -1891,11 +1866,11 @@ mod tests {
         );
 
         let directory = tempfile::tempdir().expect("a temporary checkpoint");
-        let config = <Qwen36Arm as PackArm>::write_fixture(directory.path()).expect("the fixture");
-        let context = <Qwen36Arm as PackArm>::window(&config).min(4_096);
-        let profile = <Qwen36Arm as PackArm>::profile_from(|_| None).expect("the profile");
+        let config = fixture::<Qwen36>(directory.path());
+        let context = <QwenArm as PackArm>::window(&config).min(4_096);
+        let profile = Qwen36::profile_from(|_| None).expect("the profile");
         let backend =
-            <Qwen36Arm as PackArm>::open_host(directory.path(), config, context, &profile, None)
+            <QwenArm as PackArm>::open_host(directory.path(), config, context, &profile, None)
                 .expect("the Qwen3.6 fixture opens");
         assert!(
             backend.lane_limit().expect("the Qwen3.6 lane width") > 0,
@@ -1938,7 +1913,7 @@ mod tests {
         let options = |concurrency: &str| {
             ServeOptions::parse(vec![
                 "--model".to_owned(),
-                GlmArm::MODEL_ID.to_owned(),
+                Glm::model_id().to_owned(),
                 "--synthetic".to_owned(),
                 "--context".to_owned(),
                 context.to_string(),
@@ -1949,7 +1924,7 @@ mod tests {
             ])
             .expect("the GLM host options parse")
         };
-        let profile = GlmArm::profile_from(|_| None).expect("the carried profile parses");
+        let profile = Glm::profile_from(|_| None).expect("the carried profile parses");
         let over = options("64");
         let error = GlmArm::check_host(&over, &config, context, &profile)
             .expect_err("the f32 latent the rank allocates is over 1 GiB at 64 sessions");
@@ -2008,10 +1983,9 @@ mod tests {
             r#"{"eos_token_id": [248044]}"#,
         )
         .expect("the carried generation config is written");
-        let config =
-            QwenFp8Arm::read_config(directory.path()).expect("the FP8 serving configuration");
+        let config = QwenArm::read_config(directory.path()).expect("the FP8 serving configuration");
         for world in [1, 4] {
-            let plan = check_plan_with::<QwenFp8Arm>(
+            let plan = check_plan_with::<QwenFp8>(
                 directory.path(),
                 &config,
                 world,
@@ -2071,12 +2045,11 @@ mod tests {
         )
         .expect("the carried generation config is written");
         let config =
-            Qwen36Arm::read_config(directory.path()).expect("the Qwen3.6 serving configuration");
+            QwenArm::read_config(directory.path()).expect("the Qwen3.6 serving configuration");
         sparkflash_model_qwen4_exp::device::identity_for(&config)
             .expect("the FP8 release has a device identity");
-        let plan =
-            check_plan_with::<Qwen36Arm>(directory.path(), &config, 1, Availability::Catalogue)
-                .unwrap_or_else(|error| panic!("Qwen3.6 FP8 TP1: {error}"));
+        let plan = check_plan_with::<Qwen36>(directory.path(), &config, 1, Availability::Catalogue)
+            .unwrap_or_else(|error| panic!("Qwen3.6 FP8 TP1: {error}"));
         assert_eq!(
             plan.precision().experts,
             sparkflash_ops::plan::Precision::Fp8E4M3
@@ -2095,12 +2068,11 @@ mod tests {
     #[test]
     fn the_single_rank_serve_open_uses_the_engine_builder() {
         let qwen_directory = tempfile::tempdir().expect("a temporary Qwen checkpoint");
-        let qwen_config = <QwenArm as PackArm>::write_fixture(qwen_directory.path())
-            .expect("the Qwen fixture writes");
+        let qwen_config = fixture::<Qwen>(qwen_directory.path());
         let qwen_plan =
             EnginePlan::for_architecture(qwen_config.architecture.clone(), Target::Sm121, 2, 0)
                 .expect("the tiny Qwen architecture plans at TP2");
-        let profile = <QwenArm as PackArm>::profile_from(|_| None).expect("the Qwen profile");
+        let profile = Qwen::profile_from(|_| None).expect("the Qwen profile");
         let error = <QwenArm as PackArm>::open_host(
             qwen_directory.path(),
             qwen_config,
@@ -2115,12 +2087,11 @@ mod tests {
         );
 
         let glm_directory = tempfile::tempdir().expect("a temporary GLM checkpoint");
-        let glm_config = <GlmArm as PackArm>::write_fixture(glm_directory.path())
-            .expect("the GLM fixture writes");
+        let glm_config = fixture::<Glm>(glm_directory.path());
         let glm_plan =
             EnginePlan::for_architecture(glm_config.architecture.clone(), Target::Sm121, 2, 0)
                 .expect("the tiny GLM architecture plans at TP2");
-        let profile = <GlmArm as PackArm>::profile_from(|_| None).expect("the GLM profile");
+        let profile = Glm::profile_from(|_| None).expect("the GLM profile");
         let error = <GlmArm as PackArm>::open_host(
             glm_directory.path(),
             glm_config,
@@ -2148,25 +2119,24 @@ mod tests {
             return;
         }
         let directory = tempfile::tempdir().expect("a temporary Qwen checkpoint");
-        let config =
-            <QwenArm as PackArm>::write_fixture(directory.path()).expect("the Qwen fixture writes");
+        let config = fixture::<Qwen>(directory.path());
         let window = <QwenArm as PackArm>::window(&config);
         let context = window / 2;
         assert!(context < window);
         let options = ServeOptions::parse(vec![
             "--model".to_owned(),
-            QwenArm::MODEL_ID.to_owned(),
+            Qwen::model_id().to_owned(),
             "--checkpoint".to_owned(),
             directory.path().to_string_lossy().into_owned(),
             "--context".to_owned(),
             context.to_string(),
         ])
         .expect("the Qwen serve options parse");
-        let admitted = pack_context::<QwenArm>(&options, &config).expect("the context is admitted");
+        let admitted = pack_context::<Qwen>(&options, &config).expect("the context is admitted");
         assert_eq!(admitted, context);
         let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
             .expect("the tiny Qwen architecture plans");
-        let profile = <QwenArm as PackArm>::profile_from(|_| None).expect("the Qwen profile");
+        let profile = Qwen::profile_from(|_| None).expect("the Qwen profile");
         let backend = <QwenArm as PackArm>::open_host(
             directory.path(),
             config,
@@ -2190,25 +2160,24 @@ mod tests {
             return;
         }
         let directory = tempfile::tempdir().expect("a temporary GLM checkpoint");
-        let config =
-            <GlmArm as PackArm>::write_fixture(directory.path()).expect("the GLM fixture writes");
+        let config = fixture::<Glm>(directory.path());
         let window = <GlmArm as PackArm>::window(&config);
         let context = window / 2;
         assert!(context < window);
         let options = ServeOptions::parse(vec![
             "--model".to_owned(),
-            GlmArm::MODEL_ID.to_owned(),
+            Glm::model_id().to_owned(),
             "--checkpoint".to_owned(),
             directory.path().to_string_lossy().into_owned(),
             "--context".to_owned(),
             context.to_string(),
         ])
         .expect("the GLM serve options parse");
-        let admitted = pack_context::<GlmArm>(&options, &config).expect("the context is admitted");
+        let admitted = pack_context::<Glm>(&options, &config).expect("the context is admitted");
         assert_eq!(admitted, context);
         let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
             .expect("the tiny GLM architecture plans");
-        let profile = <GlmArm as PackArm>::profile_from(|_| None).expect("the GLM profile");
+        let profile = Glm::profile_from(|_| None).expect("the GLM profile");
         let backend = <GlmArm as PackArm>::open_host(
             directory.path(),
             config.clone(),

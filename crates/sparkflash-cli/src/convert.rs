@@ -199,17 +199,18 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
         // refusal naming the file, never a silent fall-through to DeepSeek's loader.
         let architecture = Architecture::from_checkpoint_dir(&checkpoint_dir)
             .map_err(|error| unparsed(error.to_string()))?;
-        let world = world_size.unwrap_or_else(|| default_convert_world(&architecture.family));
+        // The family's registration states how its checkpoint converts: the world the release
+        // shards at, and whether this build has a converter for it at all.
+        let conversion =
+            sparkflash_model::arm_for_family(&architecture.family).map(|arm| arm.conversion());
+        let world = world_size.unwrap_or_else(|| conversion.map_or(1, |own| own.world_size));
         if expert_split.is_some() && architecture.family != "inkling2" {
             return Err(format!(
                 "--expert-split is Inkling-2's rank-file layout, and this checkpoint is {:?}",
                 architecture.family
             ));
         }
-        let released = matches!(
-            architecture.family.as_str(),
-            "qwen4_exp" | "qwen4_exp_text" | GLM_MODEL_TYPE | "deepseek_v41" | "inkling2"
-        );
+        let released = conversion.is_some_and(|own| own.released);
         if !released && world != 1 {
             return Err(format!(
                 "{} (model_type {:?}) is a dynamic host checkpoint, whose raw walk order is TP1; --tp-world-size {world} would write {world} whole copies, not a shard",
@@ -418,14 +419,6 @@ fn resolve_convert_model(model: &str) -> Result<PathBuf, String> {
             "{id} is not in the Hugging Face cache (HF_HUB_CACHE is unset); run hf download {id} or pass --checkpoint DIR"
         ),
     })
-}
-
-/// The world a family converts at when the operator names none.
-fn default_convert_world(family: &str) -> usize {
-    match family {
-        "deepseek_v41" | GLM_MODEL_TYPE => 4,
-        _ => 1,
-    }
 }
 
 /// What a dynamic rank file records beside its slots. It stores raw checkpoint tensors in the
