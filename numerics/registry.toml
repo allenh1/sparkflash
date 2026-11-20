@@ -219,13 +219,25 @@ world = 1
 profile = "reference"
 plan = "tp"
 arch = "sm_121a"
-version = 1
+version = 2
 evidence = "logprobs"
+reference = "references/dory10-tp1-sm121a-v2.json"
+fingerprint = "4f3af7e00edbf29f5d649a519fe258dd77e412725fb292acd4addbfee3955abc"
+captured = "2026-11-19"
+report = "docs/numerics/dory10/v2-gemv.md"
+approved = { decision = "The few-row body is 33% slower at one lane; Dory returns to the row GEMV as version 2", date = "2026-11-19", report = "docs/numerics/dory10/v2-gemv.md" }
+note = "Version 2 returns Dory's one-to-eight-row projections to the row GEMV, on the pre-change build 84f07db7 (binary 4de25a5e still). The speed rule decided it: body 17.77 and 17.55 tok/s against GEMV 26.19 and 26.15 at world 1, one process, context 8192 (ratios 0.679 and 0.671), and one-process Dory accepts one lane only, so the 16-lane half of the rule degenerates to the single number. The floor's forced comparison against version 1's reference over 1024 positions is a precision tail: mean delta -3.062e-05, mean absolute 4.962e-04, max 1.006e-02, top-1 100%; the capital known answer is Paris, and the two empty probes are a 128-token reasoning-budget artifact recorded in the report. The reference's own mean NLL is 0.1616 a token. The world-2 ring capture stays bit-identical to version 1's reference (numerics/captures/dory10/world2-ring.json), so the ring still needs no entry of its own."
+
+[[retired]]
+model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
+world = 1
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
 reference = "references/dory10-tp1-sm121a.json"
 fingerprint = "99715d0072eab1e1cef89dbfe990faa2de2b053320c61b25726855aa460e22e3"
-captured = "2026-11-19"
-report = "docs/numerics/dory10/v1-few-row-decode.md"
-note = "The released checkpoint's first reference, single process at world 1: two captures bit-identical and `check` passing on two boots. It pins the arithmetic the decode change lands (projections on the wide tile's few-row body, q4p_dense_rows), so version 1 is the change itself and not a bump. The world-2 recurrence ring was captured on 2026-11-19 and is bit-identical to this reference (8/8 prompts, 1024/1024 logprobs, top-1 100%; numerics/captures/dory10/world2-ring.json), so the ring needs no entry of its own. Its speed, its distance from the row-GEMV decode and the ring's speed against a single process are unmeasured (docs/numerics/dory10/v1-few-row-decode.md). The world-2 ring capture was taken on the binary ef3d022e, whose own card names no commit; its commit a6ef32e4 is inferred from the staged source tree, whose Cargo.toml, crates/sparkflash-model-glm5-next/src/lib.rs and crates/sparkflash-cli/src/serve.rs match it byte for byte."
+reason = "the few-row body is 33% slower at one lane; version 2 returns to the row GEMV"
 
 [[retired]]
 model = "zai-org/GLM-5.3-Flash"

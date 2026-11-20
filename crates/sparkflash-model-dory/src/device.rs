@@ -392,6 +392,8 @@ struct Kernels {
     gemv4_bf16: Bound,
     /// The wide tile's few-row BF16 body (`q4p_dense_rows`): a decode row is
     /// `dory_mma_wide`'s row, and the body takes the matrix's packed copy where there is one.
+    /// Version 2 serves the row GEMV, so only the typed admission and its tests read it.
+    #[allow(dead_code)]
     dense_rows: Bound,
     mma_wide: Bound,
     mma_wide4: Bound,
@@ -2460,6 +2462,7 @@ fn packed_for(matrix: &DeviceMat, input: Deviceptr) -> Option<Packed> {
 /// packed copy can be handed to the body: a route that has only a matrix, or a `Packed` of it,
 /// has no operand to pass and falls back to the GEMV.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct Bf16Rows<'a> {
     matrix: &'a DeviceMat,
 }
@@ -2467,6 +2470,7 @@ struct Bf16Rows<'a> {
 impl<'a> Bf16Rows<'a> {
     /// The matrix's own BF16 rows, if the packed set left them: [PackedSet::keeps_bf16_rows] is
     /// the placement's answer, and this is the only way to make the body's operand.
+    #[allow(dead_code)]
     fn of(matrix: &'a DeviceMat, packed: &PackedSet) -> Option<Self> {
         packed.keeps_bf16_rows().then_some(Self { matrix })
     }
@@ -2480,6 +2484,7 @@ impl<'a> Bf16Rows<'a> {
 /// Whether the few-row body takes a projection of BF16 rows at `batch` rows: whole eight-column
 /// writes, a whole 32-column K run and a 16-byte-aligned activation, which every projection the
 /// arm serves has. The operand is the typed rows, so the shape is checked on rows the set kept.
+#[allow(dead_code)]
 fn dense_rows_fits(rows: Bf16Rows<'_>, input: Deviceptr, batch: usize) -> bool {
     let matrix = rows.matrix();
     (1..=TOKEN_ROWS).contains(&batch)
@@ -2493,6 +2498,7 @@ fn dense_rows_fits(rows: Bf16Rows<'_>, input: Deviceptr, batch: usize) -> bool {
 /// tile's few-row body: each output's row is `dory_mma_wide`'s row, read from the matrix's BF16
 /// rows. (The body's packed path is Qwen's packed copy of the same words; the arm's packed copies
 /// stay with the wider row GEMV.)
+#[allow(dead_code)]
 fn dense_rows(
     cuda: &Cuda,
     kernels: &Kernels,
@@ -2536,7 +2542,7 @@ fn dense_rows(
 fn gemv_batch(
     cuda: &Cuda,
     kernels: &Kernels,
-    packed: &PackedSet,
+    _packed: &PackedSet,
     matrix: &DeviceMat,
     input: Deviceptr,
     output: Deviceptr,
@@ -2575,14 +2581,10 @@ fn gemv_batch(
         }
         Route::RowGemv => {}
     }
-    // A decode step, a verify or a few lanes: the wide tile's few-row body, so the row is the
-    // prompt tile's. A shape it does not take, or a matrix whose BF16 rows the packed set did not
-    // leave in place, keeps the packed or BF16 row GEMV.
-    if let Some(rows) = Bf16Rows::of(matrix, packed)
-        && dense_rows_fits(rows, input, batch)
-    {
-        return dense_rows(cuda, kernels, &[(rows, output)], input, batch);
-    }
+    // A decode step, a verify or a few lanes: the packed or BF16 row GEMV. The wide tile's
+    // few-row body is not the served route - the speed rule measured it 33% slower (version 2's
+    // report, docs/numerics/dory10/v2-gemv.md) - but its typed admission stays below for the
+    // device tests and the next route that adopts it.
     if let Some(rows) = packed_for(matrix, input) {
         let call = packed::gemv(rows, input, output, (matrix.rows, matrix.columns), batch, 1)
             .map_err(|error| BackendError::new(DEVICE, error))?;
@@ -2633,26 +2635,6 @@ fn gemv_group(
     let Some(&(first, first_output)) = projections.first() else {
         return Ok(());
     };
-    // Up to four few-row projections of one input as one q4p_dense_rows launch: each output's
-    // row is dory_mma_wide's, and the launch is the tile's chain cut for the rows. Every
-    // projection's operand must be rows the packed set kept, so the body is never handed a copy
-    // or an in-place slot.
-    let rows: Option<Vec<Bf16Rows<'_>>> = projections
-        .iter()
-        .map(|(matrix, _)| Bf16Rows::of(matrix, packed))
-        .collect();
-    if let Some(rows) = rows
-        && rows.iter().all(|rows| dense_rows_fits(*rows, input, batch))
-    {
-        // One launch a matrix: the body's chain is per matrix and row, so a matrix's output is
-        // the bytes its lone launch gives it, packed copy or not (the grouped launch is what
-        // the arm's old fused GEMV was; the rows body's launch does not need to fuse to keep
-        // the bits).
-        for (rows, (_, output)) in rows.iter().zip(projections) {
-            dense_rows(cuda, kernels, &[(*rows, *output)], input, batch)?;
-        }
-        return Ok(());
-    }
     // A missing slot is zero rows of the first matrix: the kernel never reaches it.
     let slot = |index: usize| {
         projections

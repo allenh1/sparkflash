@@ -132,8 +132,8 @@ against version 1 (1,024 tokens) is a precision tail: mean NLL delta -3.062e-05,
 4.962e-04, max 1.006e-02, top-1 100.0000%, mean KL 2.586e-06. The reference's own mean NLL is
 0.1616 a token. Known answers: "the capital of France" answers "Paris"; the arithmetic and READY
 probes spent their 128-token budget inside `reasoning_content` and returned empty `content`, which
-is recorded as observed rather than retried. The registry declaration (version 2, retiring version
-1 with this reason) is the next change; the code still serves the body until it lands.
+is recorded as observed rather than retried. **Version 2 landed** (`docs/numerics/dory10/v2-gemv.md`);
+the body's routing glue is removed and its typed admission stays, test-only.
 
 ## Reading
 
