@@ -187,3 +187,17 @@ The body covers the FP8 precision of GLM's decode while `decode.tensor_cores` is
 shipped default); `off` puts those parts on the same tiled GEMV the BF16 projections always take,
 and the `WAIVERS` lines in `crates/sparkflash-ops/src/parts.rs` say so and cite
 `glm_decode_fp8b128_rows`.
+
+## Version 3: the speed rule holds the body back
+
+The speed A/B this report left unmeasured was taken under the written rule (served concurrency
+four lanes, drafting as served) on one build, `18a76075` (binary `102d216d`), alternating
+`SPARKFLASH_DECODE_MMA` across four fresh boots. The body is **slower on both axes in both
+pairs**: ON 42.06 single / 56.22 four-lane against OFF 46.20 / 61.50, and ON 41.78 / 47.93
+against OFF 46.35 / 61.42 tok/s. The clean ON/OFF ratios are about 0.91 single and 0.91 four-lane
+(the loaded ON boot's four-lane median was 0.78), against a +2% four-lane bar and a -3% single
+guard. So the +1.373e-01 mean NLL quality shift buys nothing in speed.
+
+GLM returns to the tiled row GEMV as **version 3** (`docs/numerics/glm53/v3-gemv.md`), whose
+reference is version 1's own card; this version is retired with that reason and the committed
+monitor pair stays as the body's evidence. The full numbers are in the version 3 report.

@@ -1290,7 +1290,7 @@ impl DeviceLinear {
 /// default and in the shipped `glm53_flash.toml`, where `SPARKFLASH_DECODE_MMA=off` is the
 /// only opt-out. The value is fixed when the rank loads, as the profile is.
 fn decode_tensor_cores(profile: &sparkflash_model::ModelProfile) -> bool {
-    profile.decode.tensor_cores.unwrap_or(true)
+    profile.decode.tensor_cores.unwrap_or(false)
 }
 
 /// The FP8 tile body's row rule: one to [MAX_ROWS] token rows take it, and a prefill-sized
@@ -7688,41 +7688,43 @@ mod tests {
     }
 
     /// The shipped `glm53_flash.toml` leaves `decode.tensor_cores` unset and the code default
-    /// is on, so the one-to-eight-row FP8 parts take the tile's few-row body: the value version
-    /// 2's capture measured. A future edit that moved either default would move the served bits
-    /// with no capture, so this test holds both the field and the routing by value.
+    /// is now off, so the one-to-eight-row FP8 parts take the tiled row GEMV: version 3's
+    /// arithmetic, and version 1's bits. A future edit that moved either default would move the
+    /// served bits with no capture, so this test holds both the field and the routing by value.
     #[test]
-    fn the_shipped_profile_decodes_on_the_token_body() {
+    fn the_shipped_profile_decodes_on_the_row_gemv() {
         let mut profile =
             sparkflash_model::ModelProfile::from_toml(include_str!("../config/glm53_flash.toml"))
                 .expect("the shipped GLM profile");
         assert_eq!(profile.decode.tensor_cores, None, "the file names no value");
         assert!(
-            decode_tensor_cores(&profile),
-            "the code default is the body"
+            !decode_tensor_cores(&profile),
+            "the code default is the tiled GEMV"
         );
         let fp8 = DeviceLinear::view(Deviceptr(0), 256, 512, true, Some(Deviceptr(0)));
         for rows in 1..=MAX_ROWS {
             assert!(
                 matches!(
                     token_route(&fp8, Deviceptr(8), rows, decode_tensor_cores(&profile)),
-                    TokenRoute::TokenBody(_)
+                    TokenRoute::TiledGemv
                 ),
                 "{rows} rows of the shipped profile"
             );
         }
-        // `SPARKFLASH_DECODE_MMA=off` is the same typed field, so it selects the tiled GEMV.
+        // `SPARKFLASH_DECODE_MMA=on` is the same typed field and still selects the tile's
+        // few-row body at the device level; the serve check refuses it on version 3, whose
+        // reference is the GEMV.
         profile
-            .apply_env(|name| (name == "SPARKFLASH_DECODE_MMA").then(|| "off".to_owned()))
-            .expect("off is a switch value");
-        assert_eq!(profile.decode.tensor_cores, Some(false));
+            .apply_env(|name| (name == "SPARKFLASH_DECODE_MMA").then(|| "on".to_owned()))
+            .expect("on is a switch value");
+        assert_eq!(profile.decode.tensor_cores, Some(true));
         for rows in 1..=MAX_ROWS {
             assert!(
                 matches!(
                     token_route(&fp8, Deviceptr(8), rows, decode_tensor_cores(&profile)),
-                    TokenRoute::TiledGemv
+                    TokenRoute::TokenBody(_)
                 ),
-                "{rows} rows with SPARKFLASH_DECODE_MMA=off"
+                "{rows} rows with SPARKFLASH_DECODE_MMA=on"
             );
         }
     }

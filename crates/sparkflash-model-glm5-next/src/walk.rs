@@ -982,16 +982,15 @@ mod tests {
         }
     }
 
-    /// The CLI's profile check and the ledger's token row are one constant: the row states the
-    /// tile's few-row body, so `decode.tensor_cores = true` is accepted and the boot line says
-    /// what the arm runs instead of naming a gap it does not have.
+    /// The CLI's profile check and the ledger's token row are one constant: version 3 states the
+    /// tiled row GEMV, so `decode.tensor_cores = true` is refused with the row's reason and the
+    /// boot line says which arithmetic runs.
     #[test]
     fn the_token_row_and_the_profile_check_are_one_source() {
-        let State::Native(detail) = crate::TOKEN_DECODE else {
-            panic!("GLM decodes on the tile's few-row body; the CLI reads this row");
+        let State::Off(detail) = crate::TOKEN_DECODE else {
+            panic!("GLM version 3 decodes on the tiled row GEMV; the CLI reads this row");
         };
-        assert!(detail.contains("few-row body"), "{detail}");
-        assert!(detail.contains("tiled GEMV"), "{detail}");
+        assert!(detail.contains("row GEMV"), "{detail}");
         assert_eq!(
             <GlmWalk as Walk>::CAPABILITIES.compute.token,
             crate::TOKEN_DECODE
@@ -1000,8 +999,8 @@ mod tests {
         ledger.set(Strategy::Lanes, Mode::native("one segment a walk"));
         let line = ledger.line();
         assert!(
-            line.contains(&format!("tensor-core decode native ({detail})")),
-            "the boot line states the body: {line}"
+            line.contains(&format!("tensor-core decode off ({detail})")),
+            "the boot line states the row GEMV: {line}"
         );
         assert!(
             !line.contains("does not state it"),

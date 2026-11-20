@@ -176,14 +176,14 @@ world = 4
 profile = "reference"
 plan = "tp"
 arch = "sm_121a"
-version = 2
+version = 3
 evidence = "logprobs"
-reference = "references/glm53-tp4-sm121a-v2.json"
-fingerprint = "451be41bb5fbe34db4646d2167647fad282be34b2f144523fe4549d101be30fa"
-report = "docs/numerics/glm53/v2-fp8-token-body.md"
-captured = "2026-11-19"
-approved = { decision = "tensor-core decode on every arm is an approved arithmetic change", date = "2026-11-18", report = "docs/numerics/glm53/v2-fp8-token-body.md" }
-note = "Version 2: the one-to-eight-row FP8 projections run the shared tile's few-row body (glm_decode_fp8b128_rows) instead of the tiled row GEMV (q4e_gemv_tiled_e4m3_block). The separation capture settles attribution: the same build with SPARKFLASH_DECODE_MMA=off, which runs the GEMV, reproduces version 1's reference exactly (0 of 997 positions differ, top-1 100%), so the whole +1.373e-01 mean NLL and 93.38% top-1 agreement is the body's. Decode takes f32 activations where the bulk prefill takes the q8 path, so a continued turn is not a cold one; known and accepted, not a defect. The tail is recorded in the report: 11 positions above 5 nats, worst 1.446e+01 at translation position 80, spread across six of the eight prompts with no shape or position pattern. Approved by the owner on 2026-11-18 (decision above); the coverage and monitor prerequisites are not yet on."
+reference = "references/glm53-tp4-sm121a.json"
+fingerprint = "827ec5f682d512ccc73f10e6145a1ada548fbc027710d09330b34da61c3bafd6"
+report = "docs/numerics/glm53/v3-gemv.md"
+captured = "2026-11-05"
+approved = { decision = "The FP8 tile body is slower in both measured pairs; GLM returns to the row GEMV as version 3", date = "2026-11-19", report = "docs/numerics/glm53/v3-gemv.md" }
+note = "Version 3 returns the one-to-eight-row FP8 projections to the tiled row GEMV, which are version 1's bits; the reference is version 1's own card and the v2 report's separation capture showed SPARKFLASH_DECODE_MMA=off reproduces it exactly. The speed rule decided it: one build (18a76075) alternating the switch across four fresh boots gave ON 42.06/56.22 and 41.78/47.93 tok/s against OFF 46.20/61.50 and 46.35/61.42 (single/four-lane); the body is 8.6-9.9% worse single and 8.6% worse at four lanes in the clean pair (-22% in the loaded one), against a +2% four-lane bar and a -3% single guard. The code default for decode.tensor_cores is now off and the serving check refuses =true; the body stays in the catalogue and in the committed monitor pair (glm53-tp4-v2-candidate.json), which still passes at its bars."
 
 # Inkling-2-Small and Dory1.0-4B were registered before their first capture: both entries named
 # the configuration, version and evidence and left `reference` and `fingerprint` out. That is the
@@ -226,6 +226,17 @@ fingerprint = "99715d0072eab1e1cef89dbfe990faa2de2b053320c61b25726855aa460e22e3"
 captured = "2026-11-19"
 report = "docs/numerics/dory10/v1-few-row-decode.md"
 note = "The released checkpoint's first reference, single process at world 1: two captures bit-identical and `check` passing on two boots. It pins the arithmetic the decode change lands (projections on the wide tile's few-row body, q4p_dense_rows), so version 1 is the change itself and not a bump. The world-2 recurrence ring was captured on 2026-11-19 and is bit-identical to this reference (8/8 prompts, 1024/1024 logprobs, top-1 100%; numerics/captures/dory10/world2-ring.json), so the ring needs no entry of its own. Its speed, its distance from the row-GEMV decode and the ring's speed against a single process are unmeasured (docs/numerics/dory10/v1-few-row-decode.md). The world-2 ring capture was taken on the binary ef3d022e, whose own card names no commit; its commit a6ef32e4 is inferred from the staged source tree, whose Cargo.toml, crates/sparkflash-model-glm5-next/src/lib.rs and crates/sparkflash-cli/src/serve.rs match it byte for byte."
+
+[[retired]]
+model = "zai-org/GLM-5.3-Flash"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 2
+reference = "references/glm53-tp4-sm121a-v2.json"
+fingerprint = "451be41bb5fbe34db4646d2167647fad282be34b2f144523fe4549d101be30fa"
+reason = "the FP8 few-row body is slower in both measured pairs; version 3 returns to the row GEMV"
 
 [[retired]]
 model = "thinkingmachines/Inkling-2-Small"

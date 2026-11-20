@@ -527,9 +527,8 @@ impl PackArm for GlmArm {
 
     fn check_profile(profile: &ModelProfile) -> Result<(), String> {
         // The ledger's tensor-core decode row, the serving walk's capability and this check are
-        // one constant ([sparkflash_model_glm5_next::TOKEN_DECODE]): GLM's row states the tile's
-        // few-row body, so `decode.tensor_cores = true` is accepted and runs it. A row that ever
-        // goes off refuses the switch with the row's own reason.
+        // one constant ([sparkflash_model_glm5_next::TOKEN_DECODE]): version 3's row states the
+        // tiled row GEMV, so `decode.tensor_cores = true` is refused with the row's own reason.
         let sparkflash_model::ledger::State::Off(why) = sparkflash_model_glm5_next::TOKEN_DECODE
         else {
             return Ok(());

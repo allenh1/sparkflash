@@ -89,22 +89,21 @@ pub const DEFAULT_DEVICE_CONTEXT: usize = sparkflash_model::descriptor::GLM53_CO
 /// The output ceiling the serving arm advertises for one request.
 pub const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::GLM53_MAX_OUTPUT_TOKENS;
 
-/// What the arm states of its token (one-to-eight row) step: the tile's few-row body.
+/// What the arm states of its token (one-to-eight row) step: the tiled row GEMV.
 ///
-/// A decode step's block-scaled FP8 projections run the shared tile's few-row body
-/// (`glm_decode_fp8b128_rows`) over the same E4M3 codes, f32 128 x 128 block scales and f32
-/// activations the tiled GEMV read; the BF16 projections of the same step run the tiled GEMV,
-/// whose bits a verified row is defined by. The switch (`decode.tensor_cores`,
-/// `SPARKFLASH_DECODE_MMA`) chooses the FP8 parts: on - the code default, and the value the
-/// shipped `glm53_flash.toml` implies by leaving the field unset - is the body; off puts them
-/// back on the tiled GEMV. Every FP8 part the body fits runs it under `true`, so no shape makes
-/// the switch a refusal.
+/// Version 2 ran a decode step's block-scaled FP8 projections on the shared tile's few-row body
+/// (`glm_decode_fp8b128_rows`); the written speed rule measured it slower at one request and at
+/// four lanes, in both alternated pairs, so version 3 goes back to the tiled GEMV the BF16
+/// projections already used - the arithmetic version 1 declared. The switch (`decode.tensor_cores`,
+/// `SPARKFLASH_DECODE_MMA`) is still read, and `=true` is refused with this row's reason: the
+/// body remains selectable only by a build that changes this constant, so the arm cannot serve
+/// arithmetic its reference does not describe (docs/numerics/glm53/v3-gemv.md).
 ///
 /// The declaration, the boot ledger's tensor-core decode row ([crate::walk::GlmWalk]'s
 /// [sparkflash_runtime::WalkCapabilities]) and the CLI's GLM profile check are this one
-/// constant, so an arm that stops running the body stops accepting the switch by the same edit.
-pub const TOKEN_DECODE: sparkflash_model::ledger::State = sparkflash_model::ledger::State::Native(
-    "the FP8 parts on the tile's few-row body, the BF16 parts on the tiled GEMV",
+/// constant.
+pub const TOKEN_DECODE: sparkflash_model::ledger::State = sparkflash_model::ledger::State::Off(
+    "row GEMV; decode.tensor_cores=true is refused",
 );
 
 pub mod architecture;
