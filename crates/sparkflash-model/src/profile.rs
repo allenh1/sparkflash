@@ -1114,6 +1114,31 @@ const TEXT_FIELDS: &[(&str, TextField)] = &[
     }),
 ];
 
+/// The one refusal for a non-DeepSeek arm whose decode is the row GEMV.
+///
+/// Every released arm except DeepSeek measured its tensor-core decode under the written speed
+/// rule and kept the row GEMV (docs/NUMERICS.md). The message is the same on every arm and cites
+/// that arm's report, so an operator reads one shape: `decode.tensor_cores = true` is refused,
+/// and unsetting it (or `off`) runs the arithmetic the reference describes.
+///
+/// # Errors
+/// `profile.decode.tensor_cores` is `Some(true)`.
+pub fn refuse_tensor_core_decode(
+    arm: &str,
+    model: &str,
+    report: &str,
+    profile: &ModelProfile,
+) -> Result<(), String> {
+    if profile.decode.tensor_cores != Some(true) {
+        return Ok(());
+    }
+    Err(format!(
+        "the {arm} arm ({model}) serves its decode on the row GEMV since the speed rule ({report}); \
+         the tensor-core decode route is measured and held back. Unset SPARKFLASH_DECODE_MMA, or \
+         set it to off, to run the arithmetic the reference describes"
+    ))
+}
+
 /// The fields whose override value names one of a closed set of variants.
 #[cfg(test)]
 const ENUM_FIELDS: &[&str] = &[

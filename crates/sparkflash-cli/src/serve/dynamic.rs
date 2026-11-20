@@ -390,14 +390,13 @@ fn profile_with(
     profile
         .apply_env(lookup)
         .map_err(|error| format!("the {} profile: {error}", architecture.family))?;
-    if architecture.family == "inkling2" && profile.decode.tensor_cores == Some(true) {
-        return Err(format!(
-            "the Inkling arm ({}) decodes on its row token GEMV and never reads the tensor-core \
-             tile, but decode.tensor_cores = true (SPARKFLASH_DECODE_MMA=on) is set. Set \
-             SPARKFLASH_DECODE_MMA=off, or unset it, to run the row GEMV Inkling serves; its \
-             tensor-core decode is a later phase",
-            sparkflash_model::descriptor::INKLING2_SMALL_ID
-        ));
+    if architecture.family == "inkling2" {
+        sparkflash_model::profile::refuse_tensor_core_decode(
+            "Inkling",
+            sparkflash_model::descriptor::INKLING2_SMALL_ID,
+            "docs/numerics/inkling2/v2-clean-head.md",
+            &profile,
+        )?;
     }
     Ok(profile)
 }
@@ -1102,7 +1101,11 @@ mod tests {
         .expect_err("Inkling reads decode.tensor_cores and cannot honour it");
         assert!(error.contains("Inkling"), "{error}");
         assert!(error.contains("SPARKFLASH_DECODE_MMA"), "{error}");
-        assert!(error.contains("row token GEMV"), "{error}");
+        assert!(error.contains("row GEMV"), "{error}");
+        assert!(
+            error.contains("docs/numerics/inkling2/v2-clean-head.md"),
+            "{error}"
+        );
         profile_with(&architecture, |_| None).expect("the carried Inkling profile boots");
     }
 

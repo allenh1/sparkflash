@@ -168,17 +168,12 @@ pub(super) trait PackArm {
     /// # Errors
     /// A field this arm cannot serve.
     fn check_profile(profile: &ModelProfile) -> Result<(), String> {
-        // Version 2's speed rule: the tensor-core decode was 2.45% behind the token kernels at
-        // the arm's default one lane, so the switch that would run it is refused.
-        if profile.decode.tensor_cores == Some(true) {
-            return Err(format!(
-                "the Qwen arm ({}) serves its decode on the token kernels since the speed rule \
-                 (docs/numerics/qwen38/v2-token-kernels.md); the tensor-core decode measured \
-                 2.45% slower at one lane. Unset SPARKFLASH_DECODE_MMA, or set it to off",
-                Self::MODEL_ID
-            ));
-        }
-        Ok(())
+        sparkflash_model::profile::refuse_tensor_core_decode(
+            "Qwen",
+            Self::MODEL_ID,
+            "docs/numerics/qwen38/v2-token-kernels.md",
+            profile,
+        )
     }
 
     /// Parse the carried profile and apply the process environment as overrides.
@@ -536,21 +531,12 @@ impl PackArm for GlmArm {
     }
 
     fn check_profile(profile: &ModelProfile) -> Result<(), String> {
-        // The ledger's tensor-core decode row, the serving walk's capability and this check are
-        // one constant ([sparkflash_model_glm5_next::TOKEN_DECODE]): version 3's row states the
-        // tiled row GEMV, so `decode.tensor_cores = true` is refused with the row's own reason.
-        let sparkflash_model::ledger::State::Off(why) = sparkflash_model_glm5_next::TOKEN_DECODE
-        else {
-            return Ok(());
-        };
-        if profile.decode.tensor_cores == Some(true) {
-            return Err(format!(
-                "the GLM arm ({}) cannot honour decode.tensor_cores = true: {why}. Unset \
-                 SPARKFLASH_DECODE_MMA, or set it to off, to run the row GEMV the arm serves",
-                Self::MODEL_ID
-            ));
-        }
-        Ok(())
+        sparkflash_model::profile::refuse_tensor_core_decode(
+            "GLM",
+            Self::MODEL_ID,
+            "docs/numerics/glm53/v3-gemv.md",
+            profile,
+        )
     }
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {

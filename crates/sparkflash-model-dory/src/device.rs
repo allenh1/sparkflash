@@ -524,13 +524,12 @@ fn profile_refusal(profile: &sparkflash_model::profile::ModelProfile) -> Result<
                 .to_owned(),
         );
     }
-    if profile.decode.tensor_cores == Some(true) {
-        return Err(
-            "the Dory device arm's decode attention is a warp-dot/FMA kernel, not a tensor-core \
-             kernel, but the profile sets decode.tensor_cores = true"
-                .to_owned(),
-        );
-    }
+    sparkflash_model::profile::refuse_tensor_core_decode(
+        "Dory",
+        sparkflash_model::descriptor::DORY1_0_4B_BF16_ID,
+        "docs/numerics/dory10/v2-gemv.md",
+        profile,
+    )?;
     if profile.speculation.enabled == Some(true) {
         return Err(
             "Dory's loop-1 drafting is selected by --recurrence-draft-lanes on a recurrence \
@@ -2848,7 +2847,10 @@ mod tests {
         assert!(
             refused(|profile| profile.prefill.exact = Some(true)).contains("not bit-identical")
         );
-        assert!(refused(|profile| profile.decode.tensor_cores = Some(true)).contains("warp-dot"));
+        assert!(
+            refused(|profile| profile.decode.tensor_cores = Some(true))
+                .contains("docs/numerics/dory10/v2-gemv.md")
+        );
         assert!(refused(|profile| profile.speculation.enabled = Some(true)).contains("drafting"));
         assert!(refused(|profile| profile.sequence.parallel = Some(true)).contains("sequence"));
         assert!(refused(|profile| profile.runtime.concurrency = Some(4)).contains("one sequence"));
