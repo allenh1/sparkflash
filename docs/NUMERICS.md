@@ -185,6 +185,11 @@ The card's `floor` object sits outside the fingerprint, like the server card, an
   `mean_abs_delta`, `max_abs_delta` and `top1_agreement`.
 - `known_answers`: the fixed prompt set's greedy decodes, each with its prompt, expected text,
   the text the model produced, and whether it passed; at least one names an expected answer.
+  The probe goes through the chat template and says what it wants ("Answer with the number only:
+  what is 2 + 2?"), not a bare continuation ("2+2="), which asks the model to continue web text:
+  version 2's floor recorded "5 ... I have a 2+2=5 problem" for the bare form, which is a
+  corpus completion, not an arithmetic answer. A failed known answer is fixed by changing the
+  probe or the model, never waved through because two builds agree.
 - `nll_per_token`: the reference's own mean NLL on its natural-text prompts.
 - `explanation`: null, or the reason a bar below is deliberately exceeded.
 
@@ -200,6 +205,33 @@ An anchor is frozen, but a replacement may be recorded with
 `replaces = { reference, fingerprint, reason }` naming the card and fingerprint it supersedes -
 for an anchor that pinned a defect rather than the arithmetic. The old card stays in history,
 unchanged, and the new card carries its own build and floor.
+
+### The speed rule
+
+Tensor cores are expected to lose a little at one row and win at several, so a one-row-only A/B
+tests the wrong thing. One rule judges every arm, written here before any run:
+
+> A tensor-core decode route is kept when, on alternated fresh-boot pairs, the served
+> concurrency's aggregate tok/s is at least +2% better **and** single-request tok/s is no more
+> than 3% worse, both pairs agreeing. Otherwise the arm keeps its row GEMV for that route,
+> recorded with the numbers.
+
+Served concurrency is the arm's default lane count (Inkling 4, GLM 4, Dory 16, Qwen its
+default), with drafting as served. The measurement itself:
+
+- a fresh boot for every sample, with the arm's launcher, checkpoint, launcher flags and
+  drafting as served; the routes alternate across boots (A then B, B then A), at least two pairs;
+- at each boot, after two warm-up requests, **single-request** decode: three greedy requests of
+  256 tokens, tokens over wall time, median;
+- **served concurrency**: one request a lane at the arm's default lane count, same shape,
+  aggregate completion tokens over the wall time of the slowest lane, repeated; median;
+- the aggregate decides; the single-request number is the guard; both pairs must agree. Record
+  every number and the verdict (kept or held back) in the arm's numerics report, so a route held
+  back says which bar it missed.
+
+The rule applies to every route from now on, not only decode. A route that was already in
+service when the rule was written is measured once at the next window and recorded; if it fails,
+it becomes a declared version whose reference is the row-GEMV arithmetic.
 
 ### The served identity
 
@@ -260,6 +292,10 @@ the push's previous tip, or the merge base with `main`). It fails:
   same. A reference without `build_source` predates the build record and is grandfathered;
 - a reference or `[[anchor]]` this change adds that carries `build_source` but no correctness
   floor, or whose floor misses a bar without an explanation (see *The correctness floor* above);
+- a registry the serving binary's own parser refuses: `ci` runs
+  `cargo run -p sparkflash-model --example validate_registry` on `numerics/registry.toml`, so
+  the Python gate and the binary share one parser. The version 2 declaration's `[[retired]]`
+  reference passed the Python gate and aborted the next release at boot; this closes that gap;
 - a fingerprint that does not match its file, or a reference file no entry names;
 - a removed configuration without a `[[retired]]` entry;
 - an edited or deleted file under `numerics/captures/`, which holds the evidence behind reports;
