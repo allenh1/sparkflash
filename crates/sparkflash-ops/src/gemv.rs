@@ -239,10 +239,89 @@ fn split_rounds(tiles: usize, rounds: usize) -> usize {
     rounds.div_ceil(rounds.div_ceil(wanted))
 }
 
-/// Whether the tiled GEMV can read these operands: aligned rows of whole 16-byte chunks.
+mod sealed {
+    /// Keeps [super::TiledOperand] closed: a matrix kind outside this crate cannot claim a
+    /// tiled kernel reads it.
+    pub trait Tiled {}
+}
+
+/// A matrix a tiled GEMV reads, typed by the plane its kernel takes: BF16 rows, or E4M3 codes
+/// with a row scale or a block-scale tile. [tiled_operands] takes one, so the predicate names
+/// the operand kind where the launch is written, and a packed BF16 copy ([crate::packed::Packed])
+/// or a matrix of a format no tiled kernel reads cannot be presented to it.
+///
+/// A packed copy is not a tiled operand:
+///
+/// ```compile_fail,E0277
+/// use sparkflash_kernels::cuda_driver::Deviceptr;
+/// use sparkflash_ops::gemv::tiled_operands;
+/// use sparkflash_ops::packed::{Packed, Tiled};
+/// let copy: Packed<Tiled> = unsafe { std::mem::zeroed() };
+/// let _ = tiled_operands(&copy, Deviceptr(0));
+/// ```
+///
+/// And an FP8 matrix is not the BF16 tiled GEMV's operand, which has no codes path:
+///
+/// ```compile_fail,E0277
+/// use sparkflash_kernels::cuda_driver::Deviceptr;
+/// use sparkflash_ops::formats::{Fp8E4m3, Mat};
+/// use sparkflash_ops::gemv::tiled_operands;
+/// let fp8: Mat<Fp8E4m3> = todo!("the uploaded FP8 matrix");
+/// let _ = tiled_operands(&fp8, Deviceptr(0));
+/// ```
+pub trait TiledOperand: sealed::Tiled {
+    /// The address of the plane the kernel reads.
+    fn plane(&self) -> Deviceptr;
+    /// The values in a row.
+    fn columns(&self) -> usize;
+}
+
+impl sealed::Tiled for GpuMatE4m3 {}
+impl TiledOperand for GpuMatE4m3 {
+    fn plane(&self) -> Deviceptr {
+        self.weight
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+}
+
+impl sealed::Tiled for GpuMatE4m3Tile {}
+impl TiledOperand for GpuMatE4m3Tile {
+    fn plane(&self) -> Deviceptr {
+        self.weight
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+}
+
+impl sealed::Tiled for crate::formats::Mat<crate::formats::Bf16> {}
+impl TiledOperand for crate::formats::Mat<crate::formats::Bf16> {
+    fn plane(&self) -> Deviceptr {
+        self.data()
+    }
+
+    fn columns(&self) -> usize {
+        self.columns()
+    }
+}
+
+/// Whether the tiled GEMV can read this matrix's plane and the activation rows it meets: rows of
+/// whole 16-byte chunks, and a K run of whole eight-value steps. The matrix is the typed operand,
+/// so the check is written on the kind its launch reads.
 #[must_use]
-pub fn tiled_operands(pointers: &[Deviceptr], columns: usize) -> bool {
-    columns.is_multiple_of(8) && pointers.iter().all(|pointer| pointer.0.is_multiple_of(16))
+pub fn tiled_operand(matrix: &impl TiledOperand, columns: usize) -> bool {
+    columns.is_multiple_of(8) && matrix.plane().0.is_multiple_of(16)
+}
+
+/// Whether the tiled GEMV can read a launch's matrix and its activations: whole 16-byte chunks in
+/// both, and a K run of whole eight-value steps.
+#[must_use]
+pub fn tiled_operands(matrix: &impl TiledOperand, input: Deviceptr) -> bool {
+    input.0.is_multiple_of(16) && tiled_operand(matrix, matrix.columns())
 }
 
 /// output = matrix input over an E4M3 matrix for up to GEMV_MAX_BATCH rows.
@@ -258,7 +337,7 @@ pub fn gemv_e4m3(
     output: Deviceptr,
     rows: usize,
 ) -> Result<(), BackendError> {
-    if rows > GEMV_MAX_BATCH || !tiled_operands(&[matrix.weight, input], matrix.columns) {
+    if rows > GEMV_MAX_BATCH || !tiled_operands(matrix, input) {
         return Err(BackendError::new(
             "gemv_e4m3",
             format!(
@@ -307,7 +386,7 @@ pub fn gemv_e4m3_tile(
 ) -> Result<(), BackendError> {
     if rows > GEMV_MAX_BATCH
         || !matrix.columns.is_multiple_of(E4M3_TILE)
-        || !tiled_operands(&[matrix.weight, input], matrix.columns)
+        || !tiled_operands(matrix, input)
     {
         return Err(BackendError::new(
             "gemv_e4m3_tile",
@@ -359,5 +438,31 @@ mod tests {
     #[test]
     fn the_scratch_is_inside_the_reserved_partial_region() {
         const { assert!(TILED_GEMV_PARTIALS <= 4 << 20) };
+    }
+
+    /// The tiled admission is written on the typed operand: the matrix's own plane and the
+    /// activations are 16-byte loads and the K run whole eight-value steps. A matrix of another
+    /// kind, or a packed copy, is refused at the call (the [TiledOperand] doctests); this pins
+    /// the shape rule over one kind.
+    #[test]
+    fn the_tiled_admission_is_the_typed_operand() {
+        let matrix = GpuMatE4m3 {
+            weight: Deviceptr(0x1000),
+            scales: Deviceptr(0x9000),
+            rows: 64,
+            columns: 512,
+        };
+        assert!(tiled_operand(&matrix, 512));
+        assert!(tiled_operands(&matrix, Deviceptr(0x2000)));
+        // An activation off a 16-byte load, and a K run off whole eight-value steps.
+        assert!(!tiled_operands(&matrix, Deviceptr(0x2004)));
+        assert!(!tiled_operand(&matrix, 500));
+        // A plane off a 16-byte load is not a tiled operand's.
+        let misaligned = GpuMatE4m3 {
+            weight: Deviceptr(0x1004),
+            ..matrix
+        };
+        assert!(!tiled_operand(&misaligned, 512));
+        assert!(!tiled_operands(&misaligned, Deviceptr(0x2000)));
     }
 }

@@ -253,8 +253,8 @@ pub const MAX_INDEXER_HEAD_DIM: usize = 128;
 const GEMM_TILE_TOKENS: usize = 128;
 
 use sparkflash_ops::engine_plan::EnginePlan;
-use sparkflash_ops::gemv::tiled_operands;
 pub use sparkflash_ops::gemv::{GEMV_MAX_BATCH, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS};
+use sparkflash_ops::gemv::{tiled_operand, tiled_operands};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 
 /// Below this many tokens the GEMM's fixed 128-token tile wastes more work than the extra weight
@@ -4703,9 +4703,7 @@ impl DeviceSequence {
         if batch > GEMV_MAX_BATCH {
             return self.gemv_grouped(matrix, input, output, batch);
         }
-        if matrix.columns() >= TILED_GEMV_MIN_COLUMNS
-            && tiled_operands(&[matrix.data(), input], matrix.columns())
-        {
+        if matrix.columns() >= TILED_GEMV_MIN_COLUMNS && tiled_operands(matrix, input) {
             let tiles = matrix.rows().div_ceil(32);
             return self.launch(
                 self.backend.kernels.gemv_tiled_bf16,
@@ -5059,13 +5057,15 @@ impl DeviceSequence {
         //
         // The tiled passes take four streams, a warp's four rows; the shape alone decides, so a
         // verify's rows and the one-token step always go the same way.
+        // Each weight's K run is its own typed operand's: the down and inject passes read the
+        // normed width, the up pass the bottleneck.
         let tiled = config.hc_count == 4
-            && tiled_operands(&[mix.down.data(), mix.up.data()], width)
-            && tiled_operands(&[mix.up.data()], config.hc_lowrank)
+            && tiled_operand(&mix.down, width)
+            && tiled_operand(&mix.up, config.hc_lowrank)
             && block
                 .inject
                 .as_ref()
-                .is_none_or(|weights| tiled_operands(&[weights.data()], width));
+                .is_none_or(|weights| tiled_operand(weights, width));
         let mut base = first;
         while base < first + batch {
             let count = GEMV_MAX_BATCH.min(first + batch - base);

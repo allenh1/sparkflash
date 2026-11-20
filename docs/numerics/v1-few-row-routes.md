@@ -58,8 +58,8 @@ Every route that offers a packed BF16 copy to a few-row or token body, on every 
 | GLM-5-next | Decode BF16 part, 1-8 rows: `device.rs:4149` (`gemv_small`), packed filter `:4172` | `q4e_gemv_tiled_packed_parts` | Tiled. The set is `PackedSet<Tiled>`, its copy is `Packed<Tiled>`, and the launch reads `tiled_planes()` (`:4177`, `:4204`). | GPU: `sparkflash-model-qwen4-exp tests/glm_prefill.rs::the_packed_tiled_gemv_is_the_bf16_ones_bits` (skipped here); type: `Packed<Tiled>::tiled_planes` compile-fail doctest |
 | GLM-5-next | FP8 decode part, 1-8 rows: `device.rs:1309` (`fp8_token_body_fits`), launch `:1373` | `q4p_dense_fp8` | Not the packed form: the operand is `CodePlanes<Fp8E4m3>`, made only by `DeviceLinear::fp8_planes` from an E4M3 `Mat` with its scale plane. `TokenRoute::TokenBody` carries the operand to the launch, so a BF16 part has none and keeps the tiled GEMV. Shape still decides the eight-row band, the 128-column K and the part starts. | CPU: `sparkflash-model-glm5-next device::tests::the_fp8_token_body_takes_one_to_eight_rows`, `device::tests::the_decode_switch_picks_the_token_body_or_the_tiled_gemv`; `sparkflash-ops formats::tests::only_a_code_format_offers_its_planes`; doctests `CodePlanes::of` |
 | Qwen4-exp | Few-row tile, 1-16 rows: `device/prefill.rs:786` (`dense_rows_launch`), copy at `:804` | `q4p_dense_rows` | Tiled. `self.backend.packed` is `PackedSet<Tiled>`; the copy is `body_copy(...)` -> `Packed<Tiled>` and its arguments come from `tiled_planes()` (`:807`). | GPU: `sparkflash-model-qwen4-exp tests/few_rows.rs::a_packed_copy_gives_the_bf16_rows_bits` (skipped here); CPU: `packed::tests::the_body_copy_is_the_tiled_sets_only` |
-| Qwen4-exp | Tiled BF16 decode GEMV: `device.rs:4665` | `q4e_gemv_tiled_bf16` | No packed copy: the set is beside the BF16 rows, and this launch reads `matrix.data()`. Shape decides it, and shape is all it needs. | Existing coverage |
-| Qwen4-exp | Hyper down/up tiled: `device.rs:5020` | `q4e_hyper_down_tiled`, `q4e_hyper_up_tiled` | No packed copy (BF16/FP8 rows), shape decides. | Existing coverage |
+| Qwen4-exp | Tiled BF16 decode GEMV: `device.rs:4707` | `q4e_gemv_tiled_bf16` | Not a packed copy: the operand is the `Mat<Bf16>` itself, the only kind that implements `TiledOperand`, so `tiled_operands(matrix, input)` is written on the kind the launch reads. A `Packed` copy and a `Mat<Fp8E4m3>` are not a `TiledOperand` (compile errors, doctests). Shape still decides the 16-byte rows and the whole eight-value K. | CPU: `sparkflash-ops gemv::tests::the_tiled_admission_is_the_typed_operand`; doctests `gemv::TiledOperand` |
+| Qwen4-exp | Hyper down/up tiled: `device.rs:5063` | `q4e_hyper_down_tiled`, `q4e_hyper_up_tiled` | Not a packed copy: each weight is its own `Mat<Bf16>` operand, checked against its own K run (`tiled_operand(&mix.down, width)`, `tiled_operand(&mix.up, config.hc_lowrank)`, the inject weight against `width`), so the predicate names the kind at the launch. Shape still decides. | CPU: `sparkflash-ops gemv::tests::the_tiled_admission_is_the_typed_operand` |
 | Dory-10 | Few-row body, 1-8 rows: `device.rs:2579` (`Bf16Rows::of`), `dense_rows` `:2495` | `q4p_dense_rows` | The matrix's own BF16 rows, as a type: the body takes `Bf16Rows`, which only `Bf16Rows::of` makes, and that asks `PackedSet::keeps_bf16_rows`. Only a set that packs `Placement::Beside` the rows answers yes; an in-place set offers no operand, and a `Packed` copy is not a `Bf16Rows` at all, so the body can no longer be chosen by shape. Shape still decides the band and the alignment. | CPU: `sparkflash-model-dory device::tests::the_few_row_body_takes_only_rows_a_beside_set_kept`; `sparkflash-ops packed::tests::only_the_beside_set_keeps_the_bf16_rows`; `device::tests::the_decode_band_takes_the_wide_tiles_few_row_body_from_one_to_eight` |
 | Dory-10 | Token row GEMV / fused four: `device.rs:2548`, `:2656` | `q4e_gemv_packed`, `q4e_gemv4_packed` | Walk. `packed_for` returns the `DeviceMat.packed` built by a `PackedSet<Walk>`, and `packed::gemv`/`gemv4` take only `Packed<Walk>`. | CPU: `sparkflash-ops packed::tests::the_fused_call_lays_out_every_slot`; doctests |
 | Dense | Token projection: `lib.rs:2630` (`project_bf16`), packed call `:2646` | `q4e_gemv_packed` | Walk. `self.packed` is `PackedSet<Walk>`; the call is `packed::gemv`, which takes only `Packed<Walk>`. The arm declares no tensor-core token body. | CPU: ops packed tests; doctests |
@@ -90,8 +90,11 @@ shape-only decisions are:
   `sparkflash_ops::formats` (GLM's FP8 part), `ExpertCodes` (Inkling's band), and Qwen's
   `ExpertOperand`, which carries the table with its code format. What remains shape-only is the
   band and the block tiling, which are launch facts of a known-format operand.
-- **`tiled_operands`** (Qwen device.rs:4665, 5020): an alignment/shape predicate over BF16 and
-  FP8 matrix pointers, not over packed copies.
+- **`tiled_operand` / `tiled_operands`** (Qwen device.rs:4707, 5063): now a predicate over a
+  typed operand (`TiledOperand`: `Mat<Bf16>`, `GpuMatE4m3`, `GpuMatE4m3Tile`), so the kind is
+  named where the launch is written and a packed copy cannot be presented. What remains shape-only
+  is the 16-byte alignment and the whole eight-value K run, which are launch facts of a
+  known-format operand.
 
 ## Tests
 
@@ -128,3 +131,7 @@ The wrong-layout hand-offs are refused at compile time, and the refusal is pinne
   `device::tests::the_expert_operand_carries_its_code_format`: an NVFP4 table yields the
   per-tensor scale pair and an FP8 table yields only its table, so the token body's launch reads
   the pointers of the format it was admitted for.
+- `cargo test -p sparkflash-ops --lib` runs
+  `gemv::tests::the_tiled_admission_is_the_typed_operand`, which pins the 16-byte and eight-value
+  rule over one typed operand. The doctests on `gemv::TiledOperand` are the compile-fail cases: a
+  `Packed<Tiled>` copy, and a `Mat<Fp8E4m3>` where the BF16 tiled GEMV's operand is required.

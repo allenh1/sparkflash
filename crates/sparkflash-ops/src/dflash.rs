@@ -1018,7 +1018,7 @@ pub fn gemv_e4m3(
     output: Deviceptr,
     rows: usize,
 ) -> Result<(), BackendError> {
-    if rows > GEMV_MAX_BATCH || !tiled_operands(&[matrix.weight, input], matrix.columns) {
+    if rows > GEMV_MAX_BATCH || !tiled_operands(matrix, input) {
         return Err(BackendError::new(
             DOMAIN,
             format!(
