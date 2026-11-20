@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_ops::calls::Call;
-use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement, Walk, packable};
+use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement, Tiled, Walk, packable};
 use sparkflash_weights::DType;
 
 use super::{Entry, Kernels, Shared, Weights};
@@ -64,7 +64,13 @@ fn dense_slots(plans: &[&InklingDevicePlan]) -> (BTreeSet<usize>, Option<usize>)
     (dense.difference(&other).copied().collect(), head)
 }
 
-/// Packs every dense projection the form takes, in place, or none under [Form::Checkpoint].
+/// Packs every dense projection the form takes, in place, or none under [Form::Checkpoint], and
+/// the head's tiled packed copy beside the head's walk one.
+///
+/// The returned pair is (the dense set, the head's tiled set). The head's tiled copy is packed
+/// first, while its BF16 rows are still there to verify against, and the in-place walk pack then
+/// overwrites them. The head keeps the walk copy because the chunk's wider head walk is the row
+/// GEMV's (a shape the few-row body does not cover), and that copy is what the GEMV reads.
 ///
 /// # Errors
 /// A driver failure, or a matrix whose packed rows do not unpack to its BF16 rows.
@@ -74,14 +80,19 @@ pub(super) fn pack_dense(
     plans: &[&InklingDevicePlan],
     weights: &Weights,
     form: Form,
-) -> Result<PackedSet, String> {
+) -> Result<(PackedSet<Walk>, PackedSet<Tiled>), String> {
     let mut dense = PackedSet::new(form, Placement::InPlace);
+    let mut head = PackedSet::new(form, Placement::Beside).tiled();
     if form == Form::Checkpoint || plans.is_empty() {
-        return Ok(dense);
+        return Ok((dense, head));
     }
     let served = plans[0].served();
-    let (slots, head) = dense_slots(plans);
+    let (slots, head_slot) = dense_slots(plans);
     let mut candidates = Vec::new();
+    // The head's own entry in [dense_slots]: the epilogue's `(Op::Gemv, Target::Project(
+    // Projection::Head))` step's first weight, the unembed/logit matrix
+    // (`model.llm.unembed.weight`), never a matrix index or a size guess.
+    let mut head_matrix = None;
     // The scratch holds the widest matrix but the head as BF16 (what a prompt tile unpacks) and
     // is what the load packs through, a group of rows at a time.
     let mut scratch_bytes = 0usize;
@@ -94,13 +105,26 @@ pub(super) fn pack_dense(
         if spec.dtype != DType::BF16 || slot.bytes != rows * columns * 2 {
             continue;
         }
-        if Some(index) != head && packable(rows, columns) {
+        if Some(index) == head_slot && packable(rows, columns) {
+            head_matrix = Some((slot.pointer, rows, columns));
+        }
+        if Some(index) != head_slot && packable(rows, columns) {
             scratch_bytes = scratch_bytes.max(rows * columns * 2);
         }
         candidates.push((slot.pointer, rows, columns));
     }
-    dense.pack(cuda, &kernels.packed, &candidates, scratch_bytes)?;
-    Ok(dense)
+    // Beside the BF16 rows, so read and verify them before the in-place pack replaces them.
+    if let Some(matrix) = head_matrix {
+        head.pack(cuda, &kernels.packed, &[matrix], 0)?;
+    }
+    if let Err(error) = dense.pack(cuda, &kernels.packed, &candidates, scratch_bytes) {
+        // A set frees a failed pack's own allocations, but not one an earlier call left in it.
+        let held: Vec<Deviceptr> = head.allocations().collect();
+        let refs: Vec<&Deviceptr> = held.iter().collect();
+        cuda.free_buffers(&refs);
+        return Err(error);
+    }
+    Ok((dense, head))
 }
 
 impl Shared {
