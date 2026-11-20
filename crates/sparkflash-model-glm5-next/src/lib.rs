@@ -102,9 +102,8 @@ pub const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::GLM53_MAX_OUT
 /// The declaration, the boot ledger's tensor-core decode row ([crate::walk::GlmWalk]'s
 /// [sparkflash_runtime::WalkCapabilities]) and the CLI's GLM profile check are this one
 /// constant.
-pub const TOKEN_DECODE: sparkflash_model::ledger::State = sparkflash_model::ledger::State::Off(
-    "row GEMV; decode.tensor_cores=true is refused",
-);
+pub const TOKEN_DECODE: sparkflash_model::ledger::State =
+    sparkflash_model::ledger::State::Off("row GEMV; decode.tensor_cores=true is refused");
 
 pub mod architecture;
 pub mod checkpoint;
