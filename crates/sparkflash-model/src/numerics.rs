@@ -555,6 +555,22 @@ pub struct AnchorEntry {
     /// What a reader should know about this anchor.
     #[serde(default)]
     pub note: Option<String>,
+    /// The anchor this one replaces, when it pinned a defect: a replacement is recorded, never a
+    /// silent edit (docs/NUMERICS.md §5).
+    #[serde(default)]
+    pub replaces: Option<Replaces>,
+}
+
+/// The card and fingerprint an anchor replaced, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Replaces {
+    /// The superseded anchor's reference file, relative to `numerics/`.
+    pub reference: String,
+    /// The superseded anchor's fingerprint.
+    pub fingerprint: String,
+    /// Why the old anchor was wrong.
+    pub reason: String,
 }
 
 /// A configuration that is no longer served. Re-adding it takes a version above this one, so a
@@ -576,6 +592,14 @@ pub struct RetiredEntry {
     pub version: u32,
     /// Why it was retired.
     pub reason: String,
+    /// The capture the retired version left in history, when it had one: a path under
+    /// `references/`. A retired configuration keeps its last reference named, so the declaration
+    /// check does not report that capture as orphaned (docs/NUMERICS.md §5).
+    #[serde(default)]
+    pub reference: Option<String>,
+    /// The retired capture's fingerprint, when [Self::reference] is set.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 impl RetiredEntry {
@@ -742,6 +766,15 @@ impl Registry {
                 Some(&anchor.fingerprint),
                 &anchor.captured,
             )?;
+            if let Some(replaces) = &anchor.replaces {
+                check_reference_bits(&key, Some(&replaces.reference), Some(&replaces.fingerprint))?;
+                if replaces.reason.trim().is_empty() {
+                    return Err(NumericsError::Invalid(format!(
+                        "{}: replaces.reason is empty",
+                        anchor.model
+                    )));
+                }
+            }
             if !anchored.insert(anchor.model.clone()) {
                 return Err(NumericsError::Invalid(format!(
                     "{} has more than one anchor; an anchor is frozen, never replaced",
@@ -751,6 +784,11 @@ impl Registry {
         }
         for retired in &self.retired {
             check_key(&retired.key())?;
+            check_reference_bits(
+                &retired.key(),
+                retired.reference.as_deref(),
+                retired.fingerprint.as_deref(),
+            )?;
         }
         Ok(())
     }
@@ -881,6 +919,21 @@ fn check_reference(
     fingerprint: Option<&str>,
     captured: &str,
 ) -> Result<(), NumericsError> {
+    check_reference_bits(key, reference, fingerprint)?;
+    if !is_date(captured) {
+        return Err(NumericsError::Invalid(format!(
+            "{key}: captured {captured:?} is not a YYYY-MM-DD date"
+        )));
+    }
+    Ok(())
+}
+
+/// The reference/fingerprint pair's shape, without the capture date (a retired entry has none).
+fn check_reference_bits(
+    key: &ConfigKey,
+    reference: Option<&str>,
+    fingerprint: Option<&str>,
+) -> Result<(), NumericsError> {
     match (reference, fingerprint) {
         (None, None) => {}
         (Some(reference), Some(fingerprint)) => {
@@ -910,11 +963,6 @@ fn check_reference(
                  uncaptured configuration"
             )));
         }
-    }
-    if !is_date(captured) {
-        return Err(NumericsError::Invalid(format!(
-            "{key}: captured {captured:?} is not a YYYY-MM-DD date"
-        )));
     }
     Ok(())
 }
@@ -1369,6 +1417,22 @@ mod tests {
                 .to_string();
             assert!(error.contains(needle), "{needle}: {error}");
         }
+    }
+
+    #[test]
+    fn a_retired_configuration_may_name_the_capture_it_kept() {
+        let retired = format!(
+            "[[retired]]\nmodel = \"{QWEN}\"\nworld = 4\nprofile = \"reference\"\n\
+             plan = \"tp\"\narch = \"sm_121a\"\nversion = 2\n\
+             reference = \"references/qwen38-tp4-sm121a.json\"\n\
+             fingerprint = \"{FINGERPRINT}\"\nreason = \"test\"\n"
+        );
+        Registry::from_toml(&registry_with(&retired)).unwrap();
+        let without = retired.replace(&format!("fingerprint = \"{FINGERPRINT}\"\n"), "");
+        let error = Registry::from_toml(&registry_with(&without))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fingerprint"), "{error}");
     }
 
     #[test]
