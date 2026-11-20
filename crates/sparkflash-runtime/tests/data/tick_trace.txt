@@ -8,61 +8,59 @@ t=1 clock=450 decode seqs=1 rows=4 plan=spec
 t=2 clock=490 hold 0
 t=2 clock=490 prefill seq=2 from=0 rows=2000 to=2000 target=2000 path=bulk
 t=2 clock=490 decode seqs=2 rows=7 plan=shared
-t=3 clock=530 hold 1
+t=3 clock=530 hold 0
+t=3 clock=530 prefill seq=1 from=0 rows=2048 to=2048 target=30000 path=bulk
 t=3 clock=530 decode seqs=2 rows=7 plan=shared
-t=4 clock=570 hold 0
-t=4 clock=570 prefill seq=1 from=0 rows=2048 to=2048 target=30000 path=bulk
+t=4 clock=570 hold 1
 t=4 clock=570 decode seqs=2 rows=7 plan=shared
-t=5 clock=610 hold 1
+t=5 clock=610 hold 0
+t=5 clock=610 prefill seq=1 from=2048 rows=2048 to=4096 target=30000 path=bulk
 t=5 clock=610 decode seqs=2 rows=7 plan=shared
-t=6 clock=650 hold 0
-t=6 clock=650 prefill seq=1 from=2048 rows=2048 to=4096 target=30000 path=bulk
+t=6 clock=650 hold 1
 t=6 clock=650 decode seqs=2 rows=7 plan=shared
-t=7 clock=690 hold 1
+t=7 clock=690 hold 0
+t=7 clock=690 prefill seq=1 from=4096 rows=2048 to=6144 target=30000 path=bulk
 t=7 clock=690 decode seqs=2 rows=7 plan=shared
-t=8 clock=730 hold 0
-t=8 clock=730 prefill seq=1 from=4096 rows=2048 to=6144 target=30000 path=bulk
+t=8 clock=730 hold 1
 t=8 clock=730 decode seqs=2 rows=7 plan=shared
-t=9 clock=770 hold 1
+t=9 clock=770 hold 0
+t=9 clock=770 prefill seq=1 from=6144 rows=2048 to=8192 target=30000 path=bulk
 t=9 clock=770 decode seqs=2 rows=7 plan=shared
-t=10 clock=810 hold 0
-t=10 clock=810 prefill seq=1 from=6144 rows=2048 to=8192 target=30000 path=bulk
+t=10 clock=810 hold 1
 t=10 clock=810 decode seqs=2 rows=7 plan=shared
-t=11 clock=1260 hold 1
+t=11 clock=1260 hold 0
+t=11 clock=1260 prefill seq=1 from=8192 rows=2048 to=10240 target=30000 path=bulk
 t=11 clock=1260 decode seqs=1 rows=4 plan=spec
-t=12 clock=1300 hold 0
-t=12 clock=1300 prefill seq=1 from=8192 rows=2048 to=10240 target=30000 path=bulk
+t=12 clock=1300 hold 1
 t=12 clock=1300 decode seqs=1 rows=4 plan=spec
 t=13 clock=1340 hold 1
 t=13 clock=1340 decode seqs=1 rows=4 plan=spec
-t=14 clock=1380 hold 0
-t=14 clock=1380 prefill seq=1 from=10240 rows=2048 to=12288 target=30000 path=bulk
+t=14 clock=1380 hold 1
 t=14 clock=1380 decode seqs=1 rows=4 plan=spec
 t=15 clock=1420 hold 1
 t=15 clock=1420 decode seqs=1 rows=4 plan=spec
-t=16 clock=1460 hold 0
-t=16 clock=1460 prefill seq=1 from=12288 rows=2048 to=14336 target=30000 path=bulk
+t=16 clock=1460 hold 1
 t=16 clock=1460 decode seqs=1 rows=4 plan=spec
-t=17 clock=1500 hold 0
-t=17 clock=1500 prefill seq=1 from=14336 rows=2048 to=16384 target=30000 path=bulk
+t=17 clock=1500 hold 1
 t=17 clock=1500 decode seqs=1 rows=4 plan=spec
-t=18 clock=1540 hold 0
-t=18 clock=1540 prefill seq=1 from=16384 rows=2048 to=18432 target=30000 path=bulk
+t=18 clock=1540 hold 1
 t=18 clock=1540 decode seqs=1 rows=4 plan=spec
-t=19 clock=1580 place seq=4 lane=0 shared=18432 start=18432 target=25000 path=bulk
+t=19 clock=1580 place seq=4 lane=0 shared=10240 start=10240 target=25000 path=bulk
 t=19 clock=1580 hold 0
-t=19 clock=1580 prefill seq=4 from=18432 rows=2048 to=20480 target=25000 path=bulk
+t=19 clock=1580 prefill seq=4 from=10240 rows=2048 to=12288 target=25000 path=bulk
 t=19 clock=1580 decode seqs=1 rows=4 plan=spec
 t=20 clock=1620 hold 0
-t=20 clock=1620 prefill seq=4 from=20480 rows=2048 to=22528 target=25000 path=bulk
+t=20 clock=1620 prefill seq=4 from=12288 rows=2048 to=14336 target=25000 path=bulk
 t=20 clock=1620 decode seqs=1 rows=4 plan=spec
 t=21 clock=2070 hold 0
-t=21 clock=2070 prefill seq=4 from=22528 rows=2048 to=24576 target=25000 path=bulk
+t=21 clock=2070 prefill seq=4 from=14336 rows=2048 to=16384 target=25000 path=bulk
 t=21 clock=2070 decode seqs=1 rows=4 plan=spec
 t=22 clock=2110 hold 0
-t=22 clock=2110 prefill seq=4 from=24576 rows=424 to=25000 target=25000 path=bulk
-t=22 clock=2110 decode seqs=2 rows=7 plan=shared
+t=22 clock=2110 prefill seq=4 from=16384 rows=2048 to=18432 target=25000 path=bulk
+t=22 clock=2110 decode seqs=1 rows=4 plan=spec
 t=23 clock=2150 hold 0
+t=23 clock=2150 prefill seq=4 from=18432 rows=4027 to=22459 target=25000 path=bulk
+t=23 clock=2150 prefill seq=4 from=22459 rows=2541 to=25000 target=25000 path=bulk
 t=23 clock=2150 decode seqs=1 rows=4 plan=spec
 t=24 clock=2190 hold 0
 t=24 clock=2190 decode seqs=1 rows=4 plan=spec

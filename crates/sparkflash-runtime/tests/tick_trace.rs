@@ -102,3 +102,61 @@ fn the_replayed_scheduler_makes_the_committed_decisions() {
     assert!(got.contains("plan=shared"));
     assert!(got.contains("plan=spec"));
 }
+
+/// Prompts whose rests are one chunk each end in one tick, a rows state each; one that shares
+/// most of its rest with a picked prompt waits for it; and an idle tick runs a chunk a state of a
+/// long prompt, the decoder's rows split off at its end.
+#[test]
+fn short_prompts_end_together_and_a_long_one_takes_a_chunk_a_state() {
+    let mut replay = Replay::new(Config::deepseek(4));
+    let lead = tokens(5, 1_500);
+    replay.admit(1, lead.clone(), 1_500);
+    replay.admit(2, tokens(6, 900), 900);
+    replay.admit(3, tokens(7, 1_800), 1_800);
+    // Its first 1,000 rows of 1,200 are the first prompt's.
+    replay.admit(4, shares(&lead[..1_000], 1_200), 1_200);
+    for cost in [100u64, 40, 40] {
+        replay.tick(cost);
+    }
+    for id in 1..=4 {
+        replay.finish(id);
+    }
+    replay.admit(5, tokens(8, 15_000), 15_000);
+    for cost in [40u64, 300, 300] {
+        replay.tick(cost);
+    }
+    let got = replay.trace().render();
+    let want = "\
+t=1 clock=100 place seq=1 lane=0 shared=0 start=0 target=1500 path=bulk
+t=1 clock=100 place seq=2 lane=1 shared=0 start=0 target=900 path=bulk
+t=1 clock=100 place seq=3 lane=2 shared=0 start=0 target=1800 path=bulk
+t=1 clock=100 place seq=4 lane=3 shared=0 start=0 target=1200 path=bulk
+t=1 clock=100 hold 0
+t=1 clock=100 prefill seq=2 from=0 rows=900 to=900 target=900 path=bulk
+t=1 clock=100 prefill seq=4 from=0 rows=1200 to=1200 target=1200 path=bulk
+t=1 clock=100 prefill seq=3 from=0 rows=1800 to=1800 target=1800 path=bulk
+";
+    // In prefill order (fewest rows left first) the fourth prompt is picked before the first,
+    // which shares 1,000 rows with it; the first then waits for it and the third takes the last
+    // rows state.
+    assert!(
+        got.starts_with(want),
+        "the first tick ends three prompts together and keeps the sharing one back:\n{got}"
+    );
+    // It runs alone the tick after: the replay models no copy, so it computes its rows.
+    assert!(
+        got.contains("t=2 clock=140 prefill seq=1 from=0 rows=1500 to=1500 target=1500 path=bulk"),
+        "{got}"
+    );
+    // The long prompt, with nothing decoding: three chunks in a tick, then the rows before the
+    // decoder's and the decoder's own.
+    for line in [
+        "t=4 clock=220 prefill seq=5 from=0 rows=4096 to=4096 target=15000 path=bulk",
+        "t=4 clock=220 prefill seq=5 from=4096 rows=4096 to=8192 target=15000 path=bulk",
+        "t=4 clock=220 prefill seq=5 from=8192 rows=4096 to=12288 target=15000 path=bulk",
+        "t=5 clock=520 prefill seq=5 from=12288 rows=171 to=12459 target=15000 path=bulk",
+        "t=5 clock=520 prefill seq=5 from=12459 rows=2541 to=15000 target=15000 path=bulk",
+    ] {
+        assert!(got.contains(line), "missing {line}:\n{got}");
+    }
+}

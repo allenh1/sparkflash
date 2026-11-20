@@ -144,6 +144,16 @@ pub fn hold_prefill(
     share > 0.0 && since_ms < chunk_ms * share / (1.0 - share)
 }
 
+/// The rows that restart the decoders' share clock, when a tick's prefill of a prompt with
+/// `left` rows to go ran `ran` of them: a long prompt's chunk only. A short rest (a turn that
+/// reuses a cached prefix, a prompt that ends in one chunk) leaves the last long chunk's cost
+/// and the time since it standing, so it neither resets what the decoders are owed nor passes
+/// for a long chunk's cost a row.
+#[must_use]
+pub fn long_chunk(left: usize, ran: usize) -> Option<usize> {
+    (left > SHARE_MIN_ROWS && ran > 0).then_some(ran)
+}
+
 /// The prefilling sequences in the order their chunks run, each as (rows left, index): the
 /// fewest rows left first (ties to the oldest), so a turn that reuses a cached prefix does not
 /// wait behind a long cold prompt.
@@ -228,6 +238,286 @@ pub fn bulk_rows(
         left
     } else {
         budget
+    }
+}
+
+/// The chunks one tick runs of a prompt at row `p` of `target`, each as (first row, rows): one,
+/// or with `ways` rows states several consecutive ones while another chunk of more than
+/// `rows_max` rows follows, each split as [bulk_rows] splits a chunk another follows. `pending`
+/// answers the rows a slot's chunk at a row already has in flight (reads submitted under the
+/// tick before), which keep their size; a scheduler with nothing in flight answers `None`.
+///
+/// The chunks interleave on the device and compute what they would one after the other, so a
+/// host may run them either way; the decision is how many rows the tick takes and where each
+/// chunk ends.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn tick_chunks(
+    p: usize,
+    target: usize,
+    budget: usize,
+    most: usize,
+    split: Option<usize>,
+    ways: usize,
+    rows_max: usize,
+    pending: impl Fn(usize, usize) -> Option<usize>,
+) -> Vec<(usize, usize)> {
+    let rows = |at: usize, slot: usize| {
+        bulk_rows(
+            target - at,
+            budget,
+            most,
+            split.filter(|_| slot + 1 < ways),
+            rows_max,
+        )
+    };
+    let n = pending(0, p).unwrap_or_else(|| rows(p, 0));
+    let mut chunks = vec![(p, n)];
+    let several = ways > 1 && n > rows_max && p + n < target && rows(p + n, 1) > rows_max;
+    if !several {
+        return chunks;
+    }
+    let mut end = p + n;
+    for slot in 1..ways {
+        if end >= target || rows(end, slot) <= rows_max {
+            break;
+        }
+        let n = pending(slot, end).unwrap_or_else(|| rows(end, slot));
+        chunks.push((end, n));
+        end += n;
+    }
+    chunks
+}
+
+/// The scheduler state [together] reads and the two things it asks of it. Sequences are named
+/// by the index [prefill_order] carries.
+pub trait TogetherHost {
+    /// The host's failure: a copy or a lane that could not be backed is the tick's failure.
+    type Error;
+
+    /// The prefilling sequences, as [prefill_order] orders them.
+    fn order(&self) -> Vec<(usize, usize)>;
+
+    /// Copies the rows another lane already holds of sequence `index`'s prompt, when the host
+    /// adopts; its position afterwards is what [Self::whole] and [Self::pos] read.
+    ///
+    /// # Errors
+    /// The copy failed.
+    fn adopt(&mut self, index: usize) -> Result<(), Self::Error>;
+
+    /// Sequence `index`'s rows left, when its prompt's rest is one whole chunk within `budget`
+    /// ([whole_chunk_fits]) that may share a tick: a bulk prefill on a lane, without images.
+    fn whole(&self, index: usize, budget: usize) -> Option<usize>;
+
+    /// How many leading tokens sequence `other` shares with picked sequence `lead`.
+    fn shared(&self, lead: usize, other: usize) -> usize;
+
+    /// The position sequence `index`'s prefill stands at.
+    fn pos(&self, index: usize) -> usize;
+
+    /// Backs sequence `index`'s lane for its prompt and the decode after it without preempting
+    /// anything; false when it cannot.
+    ///
+    /// # Errors
+    /// The lane memory failed.
+    fn back(&mut self, index: usize) -> Result<bool, Self::Error>;
+}
+
+/// The most rows the prompts that end together in one tick hold in all: a busy chunk's beside
+/// decoders, a chunk a rows state otherwise.
+#[must_use]
+pub fn together_most(budget: usize, ways: usize, decoding: bool) -> usize {
+    if decoding { budget } else { budget * ways }
+}
+
+/// Whether a sequence at `pos` with `left` rows to go waits for a picked one it shares `shared`
+/// leading tokens with: once that one has run, it copies half its rest or more (and at least
+/// [ADOPT_MIN] rows) instead of computing them.
+#[must_use]
+pub fn waits_for_lead(shared: usize, pos: usize, left: usize) -> bool {
+    shared >= pos + ADOPT_MIN.max(left / 2)
+}
+
+/// The sequences whose prompts end together in this tick, sequence `index` (the first in
+/// [prefill_order]) first: while one of the `ways` rows states is left, the next sequences in
+/// prefill order whose rest is one whole chunk, as many rows in all as [together_most], each
+/// one's lane backed without preempting anything. One that would copy from a picked one once
+/// that has run ([waits_for_lead]) waits for it instead. Just `index` when nothing joins it.
+///
+/// The host passes `ways` 1 when its tick cannot run prompts together at all (one rows state, a
+/// group not attached, reads already staged for a bulk tick).
+///
+/// # Errors
+/// The host's [TogetherHost::adopt] or [TogetherHost::back] failed.
+pub fn together<H: TogetherHost + ?Sized>(
+    host: &mut H,
+    index: usize,
+    ways: usize,
+    budget: usize,
+    decoding: bool,
+) -> Result<Vec<usize>, H::Error> {
+    let mut picked = vec![index];
+    if ways <= 1 {
+        return Ok(picked);
+    }
+    let most = together_most(budget, ways, decoding);
+    let mut rows = match host.whole(index, budget) {
+        Some(left) if host.back(index)? => left,
+        _ => return Ok(picked),
+    };
+    for (_, other) in host.order() {
+        if picked.len() == ways {
+            break;
+        }
+        if other == index {
+            continue;
+        }
+        host.adopt(other)?;
+        let Some(left) = host.whole(other, budget) else {
+            continue;
+        };
+        if rows + left > most {
+            break;
+        }
+        let pos = host.pos(other);
+        let waits = picked
+            .iter()
+            .any(|&lead| waits_for_lead(host.shared(lead, other), pos, left));
+        if !waits && host.back(other)? {
+            rows += left;
+            picked.push(other);
+        }
+    }
+    Ok(picked)
+}
+
+/// A scheduler's clock for the decoders' share ([DecodeShare]): the last long prefill chunk's
+/// tick (ms, and ms a row) and the ticks' time since it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShareClock {
+    /// The tick that ran the last long chunk, in ms.
+    pub chunk_ms: f64,
+    /// That tick's ms a row.
+    pub row_ms: f64,
+    /// The ticks' time since it, in ms.
+    pub since_chunk_ms: f64,
+}
+
+impl ShareClock {
+    /// [hold_prefill] on this clock.
+    #[must_use]
+    pub fn hold(
+        &self,
+        share: &DecodeShare,
+        order: &[(usize, usize)],
+        age_ms: impl Fn(usize) -> f64,
+        decoding: bool,
+    ) -> bool {
+        self.hold_since(share, order, age_ms, decoding, self.since_chunk_ms)
+    }
+
+    /// [Self::hold] as it will stand once `since_ms` has passed since the last long chunk: the
+    /// answer a scheduler sends ahead under a tick's device work.
+    #[must_use]
+    pub fn hold_since(
+        &self,
+        share: &DecodeShare,
+        order: &[(usize, usize)],
+        age_ms: impl Fn(usize) -> f64,
+        decoding: bool,
+        since_ms: f64,
+    ) -> bool {
+        hold_prefill(
+            share,
+            order,
+            age_ms,
+            decoding,
+            self.row_ms,
+            self.chunk_ms,
+            since_ms,
+        )
+    }
+
+    /// Ends a tick of `tick_ms` that ran [tick_prefill]'s `long_chunk`: a long chunk restarts
+    /// the clock with the tick's cost, anything else adds the tick to the time since.
+    pub fn settle(&mut self, long_chunk: Option<usize>, tick_ms: f64) {
+        match long_chunk {
+            Some(ran) => {
+                self.chunk_ms = tick_ms;
+                self.row_ms = tick_ms / ran as f64;
+                self.since_chunk_ms = 0.0;
+            }
+            None => self.since_chunk_ms += tick_ms,
+        }
+    }
+}
+
+/// What [tick_prefill] asks of the scheduler that hosts it, on top of [TogetherHost]: its state,
+/// and the two ways a tick's prompt rows run. The rule that chooses between them is not the
+/// host's.
+pub trait TickHost: TogetherHost {
+    /// Whether any sequence is decoding.
+    fn decoding(&self) -> bool;
+
+    /// The rows left of sequence `index`'s prefill; 0 when it is not prefilling.
+    fn left(&self, index: usize) -> usize;
+
+    /// The bulk chunk a tick runs ([bulk_budget]'s first).
+    fn budget(&self, decoding: bool) -> usize;
+
+    /// The rows states prompts may end together on this tick: 1 when it cannot run them
+    /// together at all ([together]).
+    fn ways(&self) -> usize;
+
+    /// Runs the whole rests of the `picked` sequences as one tick. Returns the rows run.
+    ///
+    /// # Errors
+    /// The pass failed.
+    fn prefill_together(&mut self, picked: &[usize]) -> Result<usize, Self::Error>;
+
+    /// Runs this tick's prefill of sequence `index` alone: its exact rows steps, one bulk
+    /// chunk, or several ([tick_chunks]). Returns the rows run.
+    ///
+    /// # Errors
+    /// A step failed.
+    fn prefill_one(&mut self, index: usize, decoding: bool) -> Result<usize, Self::Error>;
+}
+
+/// The prompt half of one tick, after the placements and with the tick's `hold`
+/// ([ShareClock::hold], rank 0's in a group): the first sequence in [prefill_order] copies what
+/// another lane holds, then, unless the hold keeps a long prompt back for the decoders, either
+/// ends together with the prompts [together] picks or runs its own prefill. Returns the long
+/// chunk's rows ([long_chunk]) for [ShareClock::settle].
+///
+/// Every scheduler runs this one function: DeepSeek's `Batch`, the tick engine and the replay.
+///
+/// # Errors
+/// The host's.
+pub fn tick_prefill<H: TickHost + ?Sized>(
+    host: &mut H,
+    hold: bool,
+) -> Result<Option<usize>, H::Error> {
+    let decoding = host.decoding();
+    let Some(&(_, index)) = host.order().first() else {
+        return Ok(None);
+    };
+    // The rows another lane holds are copied, not run: the share clock counts only the rows a
+    // chunk computes.
+    host.adopt(index)?;
+    let left = host.left(index);
+    if hold && decoding && left > SHARE_MIN_ROWS {
+        return Ok(None);
+    }
+    let budget = host.budget(decoding);
+    let ways = host.ways();
+    let picked = together(host, index, ways, budget, decoding)?;
+    if picked.len() > 1 {
+        // Short rests only: no long chunk for the decoders' share.
+        host.prefill_together(&picked)?;
+        Ok(None)
+    } else {
+        let ran = host.prefill_one(index, decoding)?;
+        Ok(long_chunk(left, ran))
     }
 }
 
@@ -629,10 +919,10 @@ pub mod replay {
     use sparkflash_model::vision::ImageSpan;
 
     use super::{
-        Clock, Decision, DecodePlan, DecodeShare, InjectedClock, LaneCandidate, SHARE_MIN_ROWS,
-        StepModel, TickRows, TickTrace, band, bulk_budget, bulk_from, bulk_rows, common_prefix,
-        decode_plan, decoder_resume, hold_prefill, pick_lane, prefill_order, reusable_shared,
-        runs_decoder, skip_end_after, tick_rows, whole_chunk_fits,
+        Clock, Decision, DecodePlan, DecodeShare, InjectedClock, LaneCandidate, ShareClock,
+        StepModel, TickHost, TickRows, TickTrace, TogetherHost, band, bulk_budget, bulk_from,
+        common_prefix, decode_plan, decoder_resume, pick_lane, prefill_order, reusable_shared,
+        runs_decoder, skip_end_after, tick_chunks, tick_prefill, tick_rows, whole_chunk_fits,
     };
     use crate::share_rows;
 
@@ -650,6 +940,10 @@ pub mod replay {
         pub share: DecodeShare,
         pub prefix_reuse_min_rows: usize,
         pub bulk_cap: Option<usize>,
+        /// The bulk rows states: how many chunks one tick may run at once, as several
+        /// consecutive chunks of one prompt ([tick_chunks]) or as several prompts' whole rests
+        /// ([together]). 1 runs one chunk a tick.
+        pub ways: usize,
         pub reuse: bool,
         pub exchange: bool,
         pub decoder_skip: bool,
@@ -674,6 +968,7 @@ pub mod replay {
                 share: DecodeShare::new(0.5, 200_000.0),
                 prefix_reuse_min_rows: 256,
                 bulk_cap: Some(4096),
+                ways: 3,
                 reuse: true,
                 exchange: true,
                 decoder_skip: true,
@@ -691,6 +986,17 @@ pub mod replay {
                 exact_tick_rows: self.exact_tick_rows,
                 rows_max: self.rows_max,
                 chunk_min: self.chunk_min,
+            }
+        }
+
+        /// The rows states a bulk tick may use: [Self::ways] with the exchange and a bulk path,
+        /// else one.
+        #[must_use]
+        pub fn bulk_ways(&self) -> usize {
+            if self.exchange && self.bulk_cap.is_some() {
+                self.ways.max(1)
+            } else {
+                1
             }
         }
     }
@@ -746,9 +1052,79 @@ pub mod replay {
         seqs: Vec<Seq>,
         /// Sequences to admit before a tick, oldest first.
         pending: VecDeque<(u64, u64, Vec<u32>)>,
-        chunk_ms: f64,
-        row_ms: f64,
-        since_chunk_ms: f64,
+        share_clock: ShareClock,
+    }
+
+    /// The replay models no lane memory and no adoption: a lane is always backed and nothing is
+    /// copied, so [together] decides from the prompts alone.
+    impl TogetherHost for Replay {
+        type Error = std::convert::Infallible;
+
+        fn order(&self) -> Vec<(usize, usize)> {
+            self.prefill_order()
+        }
+
+        fn adopt(&mut self, _index: usize) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn whole(&self, index: usize, budget: usize) -> Option<usize> {
+            let seq = &self.seqs[index];
+            let (Phase::Prefill { target, bulk: true }, Some(_)) = (seq.phase, seq.lane) else {
+                return None;
+            };
+            let left = target - seq.pos;
+            (!seq.done
+                && whole_chunk_fits(
+                    left,
+                    budget,
+                    self.cfg.decoder_skip,
+                    self.cfg.decoder_warm,
+                    self.cfg.rows_max,
+                ))
+            .then_some(left)
+        }
+
+        fn shared(&self, lead: usize, other: usize) -> usize {
+            common_prefix(&self.seqs[lead].tokens, &[], &self.seqs[other].tokens, &[])
+        }
+
+        fn pos(&self, index: usize) -> usize {
+            self.seqs[index].pos
+        }
+
+        fn back(&mut self, _index: usize) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    impl TickHost for Replay {
+        fn decoding(&self) -> bool {
+            Replay::decoding(self)
+        }
+
+        fn left(&self, index: usize) -> usize {
+            match self.seqs[index].phase {
+                Phase::Prefill { target, .. } => target.saturating_sub(self.seqs[index].pos),
+                Phase::Waiting | Phase::Decode => 0,
+            }
+        }
+
+        fn budget(&self, decoding: bool) -> usize {
+            bulk_budget(&self.cfg.tick_rows(), self.cfg.bulk_cap, decoding).0
+        }
+
+        fn ways(&self) -> usize {
+            self.cfg.bulk_ways()
+        }
+
+        fn prefill_together(&mut self, picked: &[usize]) -> Result<usize, Self::Error> {
+            Ok(Replay::prefill_together(self, picked))
+        }
+
+        fn prefill_one(&mut self, index: usize, _decoding: bool) -> Result<usize, Self::Error> {
+            Ok(self.prefill(index).unwrap_or(0))
+        }
     }
 
     impl Replay {
@@ -762,9 +1138,7 @@ pub mod replay {
                 tick: 0,
                 seqs: Vec::new(),
                 pending: VecDeque::new(),
-                chunk_ms: 0.0,
-                row_ms: 0.0,
-                since_chunk_ms: 0.0,
+                share_clock: ShareClock::default(),
             }
         }
 
@@ -830,35 +1204,20 @@ pub mod replay {
             let decoding = self.decoding();
             let order = self.prefill_order();
             let now = self.clock.now_ms();
-            let hold = hold_prefill(
+            let hold = self.share_clock.hold(
                 &self.cfg.share,
                 &order,
                 |index| (now - self.seqs[index].admitted_ms) as f64,
                 decoding,
-                self.row_ms,
-                self.chunk_ms,
-                self.since_chunk_ms,
             );
             self.trace
                 .record(self.tick, self.clock.now_ms(), Decision::Hold { hold });
-            let mut long_chunk = None;
-            if let Some(&(_, index)) = order.first() {
-                let left = match self.seqs[index].phase {
-                    Phase::Prefill { target, .. } => target.saturating_sub(self.seqs[index].pos),
-                    Phase::Waiting | Phase::Decode => 0,
-                };
-                if !(hold && decoding && left > SHARE_MIN_ROWS) {
-                    long_chunk = self.prefill(index);
-                }
-            }
+            let long_chunk = match tick_prefill(self, hold) {
+                Ok(long_chunk) => long_chunk,
+                Err(never) => match never {},
+            };
             self.decode();
-            if let Some(ran) = long_chunk {
-                self.chunk_ms = cost_ms as f64;
-                self.row_ms = cost_ms as f64 / ran as f64;
-                self.since_chunk_ms = 0.0;
-            } else {
-                self.since_chunk_ms += cost_ms as f64;
-            }
+            self.share_clock.settle(long_chunk, cost_ms as f64);
             self.seqs.retain(|seq| !seq.done);
         }
 
@@ -953,40 +1312,48 @@ pub mod replay {
                 return None;
             };
             let from = self.seqs[index].pos;
-            let left = target - from;
             let lane = self.seqs[index].lane?;
             let id = self.seqs[index].id;
             let mut ran = 0;
             if bulk {
                 let cap = self.cfg.bulk_cap;
-                let (budget, most) = bulk_budget(&self.cfg.tick_rows(), cap, self.decoding());
-                let fits = whole_chunk_fits(
-                    left,
+                let decoding = self.decoding();
+                let (budget, most) = bulk_budget(&self.cfg.tick_rows(), cap, decoding);
+                // Several chunks at once only with nothing decoding: a tick with decoders runs
+                // one short chunk.
+                let ways = if decoding { 1 } else { self.cfg.bulk_ways() };
+                let split = self.cfg.decoder_skip.then_some(self.cfg.decoder_warm);
+                let chunks = tick_chunks(
+                    from,
+                    target,
                     budget,
-                    self.cfg.decoder_skip,
-                    self.cfg.decoder_warm,
-                    self.cfg.rows_max,
-                );
-                let rows = bulk_rows(
-                    left,
-                    if fits { most } else { budget },
                     most,
-                    None,
+                    split,
+                    ways,
                     self.cfg.rows_max,
-                )
-                .min(left);
-                ran = rows;
-                self.trace.record(
-                    self.tick,
-                    self.clock.now_ms(),
-                    Decision::Prefill {
-                        seq: id,
-                        from,
-                        rows,
-                        target,
-                        bulk: true,
-                    },
+                    |_, _| None,
                 );
+                for (p, rows) in chunks {
+                    self.trace.record(
+                        self.tick,
+                        self.clock.now_ms(),
+                        Decision::Prefill {
+                            seq: id,
+                            from: p,
+                            rows,
+                            target,
+                            bulk: true,
+                        },
+                    );
+                    self.lanes[lane].skip_end = skip_end_after(
+                        self.lanes[lane].skip_end,
+                        p,
+                        rows,
+                        !self.cfg.decoder_skip
+                            || runs_decoder(p, rows, target, self.cfg.decoder_warm),
+                    );
+                    ran += rows;
+                }
             } else {
                 let steps = tick_rows(
                     &self.cfg.tick_rows(),
@@ -1025,13 +1392,6 @@ pub mod replay {
             }
             if bulk {
                 let end = from + ran;
-                self.lanes[lane].skip_end = skip_end_after(
-                    self.lanes[lane].skip_end,
-                    from,
-                    ran,
-                    !self.cfg.decoder_skip
-                        || runs_decoder(from, ran, target, self.cfg.decoder_warm),
-                );
                 self.seqs[index].pos = end;
                 self.lanes[lane]
                     .resident
@@ -1041,6 +1401,48 @@ pub mod replay {
                 self.seqs[index].phase = Phase::Decode;
             }
             Some(ran)
+        }
+
+        /// The rests of the `picked` sequences ([together]) as one tick: each one's rest a
+        /// whole chunk on its own lane.
+        fn prefill_together(&mut self, picked: &[usize]) -> usize {
+            let mut ran = 0;
+            for &index in picked {
+                let Phase::Prefill { target, .. } = self.seqs[index].phase else {
+                    continue;
+                };
+                let Some(lane) = self.seqs[index].lane else {
+                    continue;
+                };
+                let from = self.seqs[index].pos;
+                let rows = target - from;
+                let id = self.seqs[index].id;
+                self.trace.record(
+                    self.tick,
+                    self.clock.now_ms(),
+                    Decision::Prefill {
+                        seq: id,
+                        from,
+                        rows,
+                        target,
+                        bulk: true,
+                    },
+                );
+                self.lanes[lane].skip_end = skip_end_after(
+                    self.lanes[lane].skip_end,
+                    from,
+                    rows,
+                    !self.cfg.decoder_skip
+                        || runs_decoder(from, rows, target, self.cfg.decoder_warm),
+                );
+                self.seqs[index].pos = target;
+                self.lanes[lane]
+                    .resident
+                    .extend_from_slice(&self.seqs[index].tokens[from..target]);
+                self.seqs[index].phase = Phase::Decode;
+                ran += rows;
+            }
+            ran
         }
 
         fn decode(&mut self) -> usize {
@@ -1144,6 +1546,184 @@ pub mod replay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_long_prompt_s_chunk_restarts_the_decoders_share() {
+        assert_eq!(long_chunk(30_000, 2_048), Some(2_048));
+        // A short rest is not a long chunk, and neither is a tick that ran nothing.
+        assert_eq!(long_chunk(SHARE_MIN_ROWS, 2_048), None);
+        assert_eq!(long_chunk(2_000, 2_000), None);
+        assert_eq!(long_chunk(30_000, 0), None);
+    }
+
+    #[test]
+    fn one_rows_state_runs_bulk_rows_chunk() {
+        for (p, target) in [(0, 30_000), (28_000, 30_000), (0, 100), (4_096, 8_192)] {
+            let chunks = tick_chunks(p, target, 4_096, 4_096, Some(2_541), 1, 64, |_, _| None);
+            assert_eq!(
+                chunks,
+                vec![(p, bulk_rows(target - p, 4_096, 4_096, None, 64))]
+            );
+        }
+    }
+
+    #[test]
+    fn a_tick_runs_a_chunk_a_rows_state_and_splits_the_decoder_s_rows_off() {
+        // A long way from the end: three whole chunks, one a state.
+        assert_eq!(
+            tick_chunks(0, 30_000, 4_096, 4_096, Some(2_541), 3, 64, |_, _| None),
+            vec![(0, 4_096), (4_096, 4_096), (8_192, 4_096)]
+        );
+        // Near the end the rows before the decoder's take one chunk and the decoder's the next.
+        assert_eq!(
+            tick_chunks(18_432, 25_000, 4_096, 4_096, Some(2_541), 3, 64, |_, _| {
+                None
+            }),
+            vec![(18_432, 4_027), (22_459, 2_541)]
+        );
+        // A rest of one chunk is one chunk, and a tail of at most R_MAX rows gets none of its own.
+        assert_eq!(
+            tick_chunks(0, 2_000, 4_096, 4_096, Some(2_541), 3, 64, |_, _| None),
+            vec![(0, 2_000)]
+        );
+        assert_eq!(
+            tick_chunks(0, 4_096 + 64, 4_096, 4_096, None, 3, 64, |_, _| None),
+            vec![(0, 4_096)]
+        );
+        // A chunk whose reads are in flight keeps the rows they were submitted for.
+        assert_eq!(
+            tick_chunks(0, 30_000, 4_096, 4_096, Some(2_541), 3, 64, |slot, at| {
+                (slot == 0 && at == 0).then_some(2_048)
+            }),
+            vec![(0, 2_048), (2_048, 4_096), (6_144, 4_096)]
+        );
+    }
+
+    /// A [TogetherHost] over a list of prompts: (position, target, tokens), every lane backed
+    /// unless named in `unbacked`.
+    struct Prompts {
+        seqs: Vec<(usize, usize, Vec<u32>)>,
+        unbacked: Vec<usize>,
+        adopted: Vec<usize>,
+    }
+
+    impl TogetherHost for Prompts {
+        type Error = std::convert::Infallible;
+
+        fn order(&self) -> Vec<(usize, usize)> {
+            prefill_order(
+                self.seqs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (pos, target, _))| (target - pos, index)),
+            )
+        }
+
+        fn adopt(&mut self, index: usize) -> Result<(), Self::Error> {
+            self.adopted.push(index);
+            Ok(())
+        }
+
+        fn whole(&self, index: usize, budget: usize) -> Option<usize> {
+            let (pos, target, _) = &self.seqs[index];
+            let left = target - pos;
+            whole_chunk_fits(left, budget, true, 2_541, 64).then_some(left)
+        }
+
+        fn shared(&self, lead: usize, other: usize) -> usize {
+            common_prefix(&self.seqs[lead].2, &[], &self.seqs[other].2, &[])
+        }
+
+        fn pos(&self, index: usize) -> usize {
+            self.seqs[index].0
+        }
+
+        fn back(&mut self, index: usize) -> Result<bool, Self::Error> {
+            Ok(!self.unbacked.contains(&index))
+        }
+    }
+
+    fn prompt(seed: u32, len: usize) -> Vec<u32> {
+        (0..len as u32).map(|i| seed * 100_000 + i).collect()
+    }
+
+    fn picked(host: &mut Prompts, index: usize, ways: usize, decoding: bool) -> Vec<usize> {
+        let budget = if decoding { 2_048 } else { 4_096 };
+        match together(host, index, ways, budget, decoding) {
+            Ok(picked) => picked,
+            Err(never) => match never {},
+        }
+    }
+
+    #[test]
+    fn short_rests_end_together_a_rows_state_each() {
+        let mut host = Prompts {
+            seqs: vec![
+                (0, 1_500, prompt(1, 1_500)),
+                (0, 900, prompt(2, 900)),
+                (0, 1_800, prompt(3, 1_800)),
+                (0, 2_000, prompt(4, 2_000)),
+            ],
+            unbacked: Vec::new(),
+            adopted: Vec::new(),
+        };
+        // The fewest rows left leads; the next two in prefill order join; a fourth has no state.
+        assert_eq!(picked(&mut host, 1, 3, false), vec![1, 0, 2]);
+        // Every sequence looked at had its copy first, in prefill order.
+        assert_eq!(host.adopted, vec![0, 2]);
+        // One rows state runs one prompt, and so does a host that passes one way.
+        assert_eq!(picked(&mut host, 1, 1, false), vec![1]);
+        // Beside decoders the rows in all are one busy chunk's: 900 + 1,500 is over 2,048.
+        assert_eq!(picked(&mut host, 1, 3, true), vec![1]);
+        host.seqs[0] = (0, 1_000, prompt(1, 1_000));
+        assert_eq!(picked(&mut host, 1, 3, true), vec![1, 0]);
+    }
+
+    #[test]
+    fn a_rest_that_is_not_one_chunk_does_not_join_and_does_not_lead() {
+        let mut host = Prompts {
+            seqs: vec![
+                (0, 900, prompt(1, 900)),
+                (0, 30_000, prompt(2, 30_000)),
+                (0, 40, prompt(3, 40)),
+                (0, 1_200, prompt(4, 1_200)),
+            ],
+            unbacked: Vec::new(),
+            adopted: Vec::new(),
+        };
+        // A rest of at most R_MAX rows takes the exact rows, alone.
+        assert_eq!(picked(&mut host, 2, 3, false), vec![2]);
+        assert!(host.adopted.is_empty());
+        // The long prompt is skipped, not a stop: the one after it still joins.
+        assert_eq!(picked(&mut host, 0, 3, false), vec![0, 2 + 1]);
+        // A lead whose lane cannot be backed runs alone, and so the tick is its own.
+        host.unbacked = vec![0];
+        assert_eq!(picked(&mut host, 0, 3, false), vec![0]);
+        // One that cannot be backed is passed over for the next.
+        host.unbacked = vec![3];
+        host.seqs.push((0, 1_300, prompt(5, 1_300)));
+        assert_eq!(picked(&mut host, 0, 3, false), vec![0, 4]);
+    }
+
+    #[test]
+    fn a_prompt_that_would_copy_from_a_picked_one_waits_for_it() {
+        let lead = prompt(1, 1_000);
+        let mut follower = lead.clone();
+        follower.extend(prompt(2, 400));
+        let mut host = Prompts {
+            seqs: vec![(0, 1_000, lead), (0, 1_400, follower)],
+            unbacked: Vec::new(),
+            adopted: Vec::new(),
+        };
+        // 1,000 shared rows are over half of its 1,400: it waits, and copies them next tick.
+        assert_eq!(picked(&mut host, 0, 3, false), vec![0]);
+        assert!(waits_for_lead(1_000, 0, 1_400));
+        // Sharing less than half its rest (or under ADOPT_MIN), it runs beside the lead.
+        assert!(!waits_for_lead(600, 0, 1_400));
+        assert!(!waits_for_lead(ADOPT_MIN - 1, 0, 100));
+        host.seqs[1].2[600] = 7;
+        assert_eq!(picked(&mut host, 0, 3, false), vec![0, 1]);
+    }
 
     #[test]
     fn the_queue_takes_the_longest_prefix_then_the_least_recent_lane() {

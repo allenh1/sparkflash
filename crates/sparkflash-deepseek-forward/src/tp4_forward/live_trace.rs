@@ -22,23 +22,26 @@
 //!    [tick::decoder_resume], [tick::bulk_from]);
 //! 2. record the tick's hold, which `Batch` receives from rank 0 (here `Self::hold_prefill`
 //!    answers it before the tick, as rank 0 does);
-//! 3. run the first prefill in [tick::prefill_order], unless the hold keeps a long one back;
+//! 3. run the tick's prompt half, [tick::tick_prefill]: the function `Batch::tick` itself runs,
+//!    so only the two prefills it calls back into are modelled here;
 //! 4. run the decode plan ([tick::decode_plan]).
 //!
 //! It records through the same [TickTrace] as the device path. The test builds the same fixed
 //! workload as `sparkflash-runtime/tests/tick_trace.rs` and requires the two traces to be
 //! identical text, so a change to the shared decision functions on one side cannot drift from the
-//! other unnoticed. It does **not** exercise the device-only decisions of `Batch` (lane memory,
-//! adoption, paired chunks, preemption or the actual step): those need the device gate.
+//! other unnoticed. Several chunks a tick and prompts that end together are decided by the shared
+//! [tick::tick_chunks] and [tick::together] on both sides. It does **not** exercise the
+//! device-only decisions of `Batch` (lane memory, adoption, reads in flight, preemption or the
+//! actual step): those need the device gate.
 
 use sparkflash_model::speculation::{DepthPolicy, StepCost};
 use sparkflash_runtime::share_rows;
 use sparkflash_runtime::tick::replay::{Config, Replay};
 use sparkflash_runtime::tick::{
-    Clock, Decision, DecodePlan, InjectedClock, LaneCandidate, SHARE_MIN_ROWS, TickRows, TickTrace,
-    band, bulk_budget, bulk_from, bulk_rows, common_prefix, decode_plan, decoder_resume,
-    hold_prefill, pick_lane, prefill_order, reusable_shared, runs_decoder, skip_end_after,
-    tick_rows, whole_chunk_fits,
+    Clock, Decision, DecodePlan, InjectedClock, LaneCandidate, ShareClock, TickHost, TickRows,
+    TickTrace, TogetherHost, band, bulk_budget, bulk_from, common_prefix, decode_plan,
+    decoder_resume, pick_lane, prefill_order, reusable_shared, runs_decoder, skip_end_after,
+    tick_chunks, tick_prefill, tick_rows, whole_chunk_fits,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,9 +95,79 @@ struct LiveBatch {
     lanes: Vec<Lane>,
     seqs: Vec<Seq>,
     pending: std::collections::VecDeque<(u64, u64, Vec<u32>)>,
-    chunk_ms: f64,
-    row_ms: f64,
-    since_chunk_ms: f64,
+    share_clock: ShareClock,
+}
+
+/// `Batch::together`'s answers without the device: no lane memory to back and no copy between
+/// lanes, as the replay models them.
+impl TogetherHost for LiveBatch {
+    type Error = std::convert::Infallible;
+
+    fn order(&self) -> Vec<(usize, usize)> {
+        self.prefill_order()
+    }
+
+    fn adopt(&mut self, _index: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn whole(&self, index: usize, budget: usize) -> Option<usize> {
+        let seq = &self.seqs[index];
+        let (Phase::Prefill { target, bulk: true }, Some(_)) = (seq.phase, seq.lane) else {
+            return None;
+        };
+        let left = target - seq.pos;
+        (!seq.done
+            && whole_chunk_fits(
+                left,
+                budget,
+                self.cfg.decoder_skip,
+                self.cfg.decoder_warm,
+                self.cfg.rows_max,
+            ))
+        .then_some(left)
+    }
+
+    fn shared(&self, lead: usize, other: usize) -> usize {
+        common_prefix(&self.seqs[lead].tokens, &[], &self.seqs[other].tokens, &[])
+    }
+
+    fn pos(&self, index: usize) -> usize {
+        self.seqs[index].pos
+    }
+
+    fn back(&mut self, _index: usize) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+impl TickHost for LiveBatch {
+    fn decoding(&self) -> bool {
+        LiveBatch::decoding(self)
+    }
+
+    fn left(&self, index: usize) -> usize {
+        match self.seqs[index].phase {
+            Phase::Prefill { target, .. } => target.saturating_sub(self.seqs[index].pos),
+            Phase::Waiting | Phase::Decode => 0,
+        }
+    }
+
+    fn budget(&self, decoding: bool) -> usize {
+        bulk_budget(&self.tick_rows_config(), self.cfg.bulk_cap, decoding).0
+    }
+
+    fn ways(&self) -> usize {
+        self.cfg.bulk_ways()
+    }
+
+    fn prefill_together(&mut self, picked: &[usize]) -> Result<usize, Self::Error> {
+        Ok(LiveBatch::prefill_together(self, picked))
+    }
+
+    fn prefill_one(&mut self, index: usize, _decoding: bool) -> Result<usize, Self::Error> {
+        Ok(self.prefill(index).unwrap_or(0))
+    }
 }
 
 impl LiveBatch {
@@ -107,9 +180,7 @@ impl LiveBatch {
             ticks: 0,
             seqs: Vec::new(),
             pending: std::collections::VecDeque::new(),
-            chunk_ms: 0.0,
-            row_ms: 0.0,
-            since_chunk_ms: 0.0,
+            share_clock: ShareClock::default(),
         }
     }
 
@@ -165,14 +236,11 @@ impl LiveBatch {
     /// exactly as `Batch::hold_prefill` is.
     fn hold_prefill(&self) -> bool {
         let order = self.prefill_order();
-        hold_prefill(
+        self.share_clock.hold(
             &self.cfg.share,
             &order,
             |index| (self.clock.now_ms() - self.seqs[index].admitted_ms) as f64,
             self.decoding(),
-            self.row_ms,
-            self.chunk_ms,
-            self.since_chunk_ms,
         )
     }
 
@@ -265,36 +333,42 @@ impl LiveBatch {
             return None;
         };
         let from = self.seqs[index].pos;
-        let left = target - from;
         let lane = self.seqs[index].lane?;
         let id = self.seqs[index].id;
         let mut ran = 0;
         if bulk {
             let cap = self.cfg.bulk_cap;
-            let (budget, most) = bulk_budget(&self.tick_rows_config(), cap, self.decoding());
-            let fits = whole_chunk_fits(
-                left,
-                budget,
-                self.cfg.decoder_skip,
-                self.cfg.decoder_warm,
-                self.cfg.rows_max,
-            );
-            let rows = bulk_rows(
-                left,
-                if fits { most } else { budget },
-                most,
-                None,
-                self.cfg.rows_max,
-            )
-            .min(left);
-            ran = rows;
-            self.record(Decision::Prefill {
-                seq: id,
+            let decoding = self.decoding();
+            let (budget, most) = bulk_budget(&self.tick_rows_config(), cap, decoding);
+            // `Batch::pairs`: several chunks only with nothing decoding.
+            let ways = if decoding { 1 } else { self.cfg.bulk_ways() };
+            let split = self.cfg.decoder_skip.then_some(self.cfg.decoder_warm);
+            let chunks = tick_chunks(
                 from,
-                rows,
                 target,
-                bulk: true,
-            });
+                budget,
+                most,
+                split,
+                ways,
+                self.cfg.rows_max,
+                |_, _| None,
+            );
+            for (p, rows) in chunks {
+                self.record(Decision::Prefill {
+                    seq: id,
+                    from: p,
+                    rows,
+                    target,
+                    bulk: true,
+                });
+                self.lanes[lane].skip_end = skip_end_after(
+                    self.lanes[lane].skip_end,
+                    p,
+                    rows,
+                    !self.cfg.decoder_skip || runs_decoder(p, rows, target, self.cfg.decoder_warm),
+                );
+                ran += rows;
+            }
         } else {
             let steps = tick_rows(
                 &self.tick_rows_config(),
@@ -329,12 +403,6 @@ impl LiveBatch {
         }
         if bulk {
             let end = from + ran;
-            self.lanes[lane].skip_end = skip_end_after(
-                self.lanes[lane].skip_end,
-                from,
-                ran,
-                !self.cfg.decoder_skip || runs_decoder(from, ran, target, self.cfg.decoder_warm),
-            );
             self.seqs[index].pos = end;
             self.lanes[lane]
                 .resident
@@ -344,6 +412,42 @@ impl LiveBatch {
             self.seqs[index].phase = Phase::Decode;
         }
         Some(ran)
+    }
+
+    /// `Batch::prefill_together`: each picked sequence's rest a whole chunk on its own lane.
+    fn prefill_together(&mut self, picked: &[usize]) -> usize {
+        let mut ran = 0;
+        for &index in picked {
+            let Phase::Prefill { target, .. } = self.seqs[index].phase else {
+                continue;
+            };
+            let Some(lane) = self.seqs[index].lane else {
+                continue;
+            };
+            let from = self.seqs[index].pos;
+            let rows = target - from;
+            let id = self.seqs[index].id;
+            self.record(Decision::Prefill {
+                seq: id,
+                from,
+                rows,
+                target,
+                bulk: true,
+            });
+            self.lanes[lane].skip_end = skip_end_after(
+                self.lanes[lane].skip_end,
+                from,
+                rows,
+                !self.cfg.decoder_skip || runs_decoder(from, rows, target, self.cfg.decoder_warm),
+            );
+            self.seqs[index].pos = target;
+            self.lanes[lane]
+                .resident
+                .extend_from_slice(&self.seqs[index].tokens[from..target]);
+            self.seqs[index].phase = Phase::Decode;
+            ran += rows;
+        }
+        ran
     }
 
     fn decode(&mut self) -> usize {
@@ -448,27 +552,14 @@ impl LiveBatch {
             });
         }
         self.place();
-        let decoding = self.decoding();
         self.record(Decision::Hold { hold });
-        let order = self.prefill_order();
-        let mut long_chunk = None;
-        if let Some(&(_, index)) = order.first() {
-            let left = match self.seqs[index].phase {
-                Phase::Prefill { target, .. } => target.saturating_sub(self.seqs[index].pos),
-                Phase::Waiting | Phase::Decode => 0,
-            };
-            if !(hold && decoding && left > SHARE_MIN_ROWS) {
-                long_chunk = self.prefill(index);
-            }
-        }
+        // The prompt half is the function `Batch::tick` runs.
+        let long_chunk = match tick_prefill(self, hold) {
+            Ok(long_chunk) => long_chunk,
+            Err(never) => match never {},
+        };
         self.decode();
-        if let Some(ran) = long_chunk {
-            self.chunk_ms = cost_ms as f64;
-            self.row_ms = cost_ms as f64 / ran as f64;
-            self.since_chunk_ms = 0.0;
-        } else {
-            self.since_chunk_ms += cost_ms as f64;
-        }
+        self.share_clock.settle(long_chunk, cost_ms as f64);
         self.seqs.retain(|seq| !seq.done);
     }
 }

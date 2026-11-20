@@ -199,18 +199,30 @@ pub struct Limits {
     pub members: usize,
     /// The most positions a sequence may hold.
     pub context: usize,
+    /// The most chunks one paired pass may hold: the arm's bulk rows states. 1 for an arm whose
+    /// pass holds one prompt's chunk; an arm that declares the paired pass
+    /// ([crate::PassMask::PAIRED]) states how many prompts' chunks it takes at once.
+    pub chunks: usize,
 }
 
 impl Limits {
     /// Limits of `rows` rows a pass and `context` positions a sequence, with as many members a
-    /// batch as rows a pass.
+    /// batch as rows a pass and one chunk a pass.
     #[must_use]
     pub const fn new(rows: usize, context: usize) -> Self {
         Self {
             rows,
             members: rows,
             context,
+            chunks: 1,
         }
+    }
+
+    /// The same limits with `chunks` chunks a paired pass.
+    #[must_use]
+    pub const fn with_chunks(mut self, chunks: usize) -> Self {
+        self.chunks = chunks;
+        self
     }
 
     /// The same limits with `members` members a batch.

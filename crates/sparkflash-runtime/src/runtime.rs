@@ -313,6 +313,17 @@ impl<W: Walk> Runtime<W> {
         let step = steps
             .pop()
             .ok_or_else(|| BackendError::new("runtime", "the head answered no step"))?;
+        self.settle_prompt(slot, &prompt)?;
+        Ok(Part::Done(step))
+    }
+
+    /// What a slot keeps once its prompt has ended and its first token is headed: the rewind
+    /// point, the images it holds and no staged vision rows.
+    fn settle_prompt(
+        &self,
+        slot: &mut RuntimeSlot<W>,
+        prompt: &PromptState,
+    ) -> Result<(), BackendError> {
         if self.rewind {
             slot.point = Some(prompt.tokens.len());
             if checkpoint_after(&self.layout, prompt.tokens.len()).is_some() {
@@ -325,7 +336,105 @@ impl<W: Walk> Runtime<W> {
         if W::Vision::PRESENT {
             W::Vision::clear(&self.walk, &mut slot.seq);
         }
-        Ok(Part::Done(step))
+        Ok(())
+    }
+
+    /// Ends the prompts of `slots` in one paired pass ([Pass::paired]): each slot's whole rest
+    /// is one chunk, one segment a prompt, and each prompt's last row is headed. The steps come
+    /// back in the slots' order.
+    ///
+    /// This is the execution of [crate::tick::together]'s decision. A prompt with fresh images
+    /// does not pair (its tower rows are a single chunk's), and the arm must have declared the
+    /// pass and as many chunks ([Limits::chunks]).
+    ///
+    /// # Errors
+    /// A backend failure, a slot with no prompt in parts or with fresh images, an arm that does
+    /// not take this many chunks, or the hook's own failure. The pass fails whole: no slot keeps
+    /// a prompt in parts after it.
+    pub fn run_parts_paired(
+        &self,
+        slots: &mut [&mut RuntimeSlot<W>],
+        hook: Option<&mut dyn crate::walk::WalkHook>,
+    ) -> Result<Vec<StepOutput>, BackendError> {
+        if !W::CAPABILITIES.passes.contains(crate::PassMask::PAIRED)
+            || slots.len() > self.limits.chunks
+        {
+            return Err(BackendError::new(
+                "runtime",
+                format!(
+                    "{} does not take {} prompts' chunks in one pass (its paired pass holds {})",
+                    std::any::type_name::<W>(),
+                    slots.len(),
+                    if W::CAPABILITIES.passes.contains(crate::PassMask::PAIRED) {
+                        self.limits.chunks
+                    } else {
+                        0
+                    }
+                ),
+            ));
+        }
+        let mut prompts = Vec::with_capacity(slots.len());
+        for slot in slots.iter_mut() {
+            let prompt = slot.prompt.take().ok_or_else(|| {
+                BackendError::new("runtime", "the sequence has no prompt in parts")
+            })?;
+            if !prompt.fresh.is_empty() {
+                return Err(BackendError::new(
+                    "runtime",
+                    "a prompt with images does not share a paired pass",
+                ));
+            }
+            prompts.push(prompt);
+        }
+        let hidden = {
+            let mut segments: Vec<Segment<'_, W::Seq>> = slots
+                .iter_mut()
+                .zip(&prompts)
+                .map(|(slot, prompt)| Segment::new(&mut slot.seq, &prompt.tokens[prompt.next..]))
+                .collect();
+            let mut pass = Pass::paired(segments.len()).with_prompt_end(0);
+            if let Some(hook) = hook {
+                pass = pass.with_hook(hook);
+            }
+            self.walk.walk(&mut segments, pass)?
+        };
+        let rows: usize = prompts
+            .iter()
+            .map(|prompt| prompt.tokens.len() - prompt.next)
+            .sum();
+        if hidden.rows != rows {
+            return Err(BackendError::new(
+                "runtime",
+                format!(
+                    "a paired walk of {rows} rows left {} residual rows",
+                    hidden.rows
+                ),
+            ));
+        }
+        let mut last = 0;
+        let mut head_rows = Vec::with_capacity(slots.len());
+        for (slot, prompt) in slots.iter_mut().zip(&prompts) {
+            let rest = &prompt.tokens[prompt.next..];
+            slot.history.extend_from_slice(rest);
+            last += rest.len();
+            head_rows.push(HeadRow::prompt(&mut slot.seq, last - 1, &prompt.tokens));
+        }
+        let steps = self.walk.head(&hidden, &mut head_rows)?;
+        drop(head_rows);
+        if steps.len() != slots.len() {
+            return Err(BackendError::new(
+                "runtime",
+                format!(
+                    "the head answered {} steps for {} prompts",
+                    steps.len(),
+                    slots.len()
+                ),
+            ));
+        }
+        for (slot, prompt) in slots.iter_mut().zip(&prompts) {
+            self.settle_prompt(slot, prompt)?;
+        }
+        Ok(steps)
     }
 
     /// One real verify over the anchor and drafts of several members.

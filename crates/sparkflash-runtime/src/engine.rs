@@ -66,9 +66,9 @@ use crate::ledger::{Ledger, Mode, Strategy};
 use crate::runtime::{Runtime, RuntimeSlot, StepMode};
 use crate::tick::{
     Clock, Decision, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, QUEUE,
-    SHARE_MIN_ROWS, StepModel, TickRows, TickTrace, TraceSink, WallClock, bulk_budget, bulk_from,
-    bulk_rows, common_prefix, decode_plan, hold_prefill, pick_lane, prefill_order, reusable_shared,
-    tick_rows, whole_chunk_fits,
+    ShareClock, StepModel, TickHost, TickRows, TickTrace, TogetherHost, TraceSink, WallClock,
+    bulk_budget, bulk_from, common_prefix, decode_plan, pick_lane, prefill_order, reusable_shared,
+    tick_chunks, tick_prefill, tick_rows, whole_chunk_fits,
 };
 use crate::walk::{Drafter, Hidden, PassMask, Vision, Walk, WalkHook};
 
@@ -106,6 +106,11 @@ pub struct TickConfig {
     pub prefix_reuse_min_rows: usize,
     /// The most rows a bulk chunk may hold, when the arm has a bulk path.
     pub bulk_cap: Option<usize>,
+    /// The chunks one tick may run at once: several consecutive chunks of one prompt
+    /// (crate::tick::tick_chunks) or several prompts' whole rests in one paired pass
+    /// (crate::tick::together). 1 runs one chunk a tick. An arm states it as [Limits::chunks]
+    /// beside the paired pass; a group runs one, its wire having no paired frame yet.
+    pub ways: usize,
     /// Whether a lane's held prefix is looked up at all.
     pub reuse: bool,
     /// Whether a prefill may take the bulk path, the exchange being present.
@@ -144,6 +149,7 @@ impl TickConfig {
             share: DecodeShare::new(0.5, 200_000.0),
             prefix_reuse_min_rows: PREFIX_REUSE_MIN_ROWS,
             bulk_cap: Some(4096),
+            ways: 3,
             reuse: true,
             exchange: true,
             decoder_skip: true,
@@ -176,6 +182,12 @@ impl TickConfig {
             share: DecodeShare::new(0.5, 200_000.0),
             prefix_reuse_min_rows: PREFIX_REUSE_MIN_ROWS,
             bulk_cap: Some(chunk),
+            // Several chunks a tick need the paired pass; an arm without it runs one.
+            ways: if W::CAPABILITIES.passes.contains(PassMask::PAIRED) {
+                limits.chunks.max(1)
+            } else {
+                1
+            },
             reuse: true,
             // Dense (and every arm but DeepSeek) has no row exchange to pair chunks over.
             exchange: false,
@@ -431,10 +443,98 @@ pub struct TickEngine<W: Walk> {
     trace: Option<TraceSink>,
     tick: u64,
     last_ms: u64,
-    chunk_ms: f64,
-    row_ms: f64,
-    since_chunk_ms: f64,
+    share_clock: ShareClock,
     next_id: u64,
+}
+
+/// One tick of the engine as crate::tick::tick_prefill sees it: the engine, the tick's time and
+/// the events it has made so far.
+struct Ticking<'t, W: Walk> {
+    engine: &'t mut TickEngine<W>,
+    now: u64,
+    events: &'t mut Vec<TickEvent>,
+}
+
+/// The engine's answers to crate::tick::together. It adopts nothing yet (a lane's prefix is
+/// reused at placement, not copied between lanes), and a placed prompt's lane already has its
+/// room ([TickEngine::ensure_room]), so nothing is copied and every lane is backed.
+impl<W: Walk> TogetherHost for Ticking<'_, W> {
+    type Error = std::convert::Infallible;
+
+    fn order(&self) -> Vec<(usize, usize)> {
+        self.engine.prefill_order()
+    }
+
+    fn adopt(&mut self, _index: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn whole(&self, index: usize, budget: usize) -> Option<usize> {
+        let request = &self.engine.requests[index];
+        let (Phase::Prefill { bulk: true, .. }, Some(_)) = (request.phase, request.lane) else {
+            return None;
+        };
+        let left = self.engine.left(index);
+        (!request.done
+            && request.images.is_empty()
+            && whole_chunk_fits(
+                left,
+                budget,
+                self.engine.config.decoder_skip,
+                self.engine.config.decoder_warm,
+                self.engine.config.rows_max,
+            ))
+        .then_some(left)
+    }
+
+    fn shared(&self, lead: usize, other: usize) -> usize {
+        let other = &self.engine.requests[other];
+        common_prefix(
+            &self.engine.requests[lead].tokens,
+            &[],
+            &other.tokens,
+            &other.images,
+        )
+    }
+
+    fn pos(&self, index: usize) -> usize {
+        let request = &self.engine.requests[index];
+        request
+            .lane
+            .and_then(|lane| self.engine.slots[lane].as_ref())
+            .map_or(0, |slot| slot.history().len())
+    }
+
+    fn back(&mut self, _index: usize) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+impl<W: Walk> TickHost for Ticking<'_, W> {
+    fn decoding(&self) -> bool {
+        self.engine.decoding()
+    }
+
+    fn left(&self, index: usize) -> usize {
+        self.engine.left(index)
+    }
+
+    fn budget(&self, decoding: bool) -> usize {
+        let config = &self.engine.config;
+        bulk_budget(&config.tick_rows(), config.bulk_cap, decoding).0
+    }
+
+    fn ways(&self) -> usize {
+        self.engine.bulk_ways()
+    }
+
+    fn prefill_together(&mut self, picked: &[usize]) -> Result<usize, Self::Error> {
+        Ok(self.engine.prefill_together(self.now, picked, self.events))
+    }
+
+    fn prefill_one(&mut self, index: usize, _decoding: bool) -> Result<usize, Self::Error> {
+        Ok(self.engine.prefill(self.now, index, self.events))
+    }
 }
 
 impl<W: Walk> TickEngine<W> {
@@ -481,9 +581,7 @@ impl<W: Walk> TickEngine<W> {
             trace,
             tick: 0,
             last_ms: 0,
-            chunk_ms: 0.0,
-            row_ms: 0.0,
-            since_chunk_ms: 0.0,
+            share_clock: ShareClock::default(),
             next_id: 0,
         })
     }
@@ -491,7 +589,8 @@ impl<W: Walk> TickEngine<W> {
     /// The same engine with config (a gate's fixed workload, or DeepSeek's defaults).
     ///
     /// # Errors
-    /// A configuration whose lane count differs, or whose width the walk cannot hold.
+    /// A configuration whose lane count differs, or whose width or chunks a tick the walk
+    /// cannot hold.
     pub fn with_config(mut self, config: TickConfig) -> Result<Self, BackendError> {
         if config.lanes != self.config.lanes {
             return Err(BackendError::new(
@@ -525,6 +624,20 @@ impl<W: Walk> TickEngine<W> {
                 format!(
                     "the config batches {} members and the walk verifies {}",
                     config.members, limits.members
+                ),
+            ));
+        }
+        let chunks = if W::CAPABILITIES.passes.contains(PassMask::PAIRED) {
+            limits.chunks.max(1)
+        } else {
+            1
+        };
+        if config.ways == 0 || config.ways > chunks {
+            return Err(BackendError::new(
+                "tick",
+                format!(
+                    "the config runs {} chunks a tick and the walk's pass holds {chunks}",
+                    config.ways
                 ),
             ));
         }
@@ -567,6 +680,9 @@ impl<W: Walk> TickEngine<W> {
     pub fn with_group(mut self, group: TickGroup) -> Self {
         self.group = Some(group);
         self.config.exchange = true;
+        // The wire carries a chunk's rows a lane ([TickGroup::rows]) and no paired frame, so a
+        // worker could not mirror several prompts in one pass: a group runs one chunk a tick.
+        self.config.ways = 1;
         self
     }
 
@@ -872,31 +988,24 @@ impl<W: Walk> TickEngine<W> {
         self.place(now, &mut events);
         let decoding = self.decoding();
         let order = self.prefill_order();
-        let hold = hold_prefill(
+        let hold = self.share_clock.hold(
             &self.config.share,
             &order,
             |index| (now - self.requests[index].admitted_ms) as f64,
             decoding,
-            self.row_ms,
-            self.chunk_ms,
-            self.since_chunk_ms,
         );
         self.record(now, Decision::Hold { hold });
-        let mut ran = 0usize;
-        if let Some(&(_, index)) = order.first() {
-            let left = self.left(index);
-            if !(hold && decoding && left > SHARE_MIN_ROWS) {
-                ran = self.prefill(now, index, &mut events);
-            }
-        }
+        let mut ticking = Ticking {
+            engine: self,
+            now,
+            events: &mut events,
+        };
+        let long_chunk = match tick_prefill(&mut ticking, hold) {
+            Ok(long_chunk) => long_chunk,
+            Err(never) => match never {},
+        };
         self.decode(now, &mut events);
-        if ran > 0 {
-            self.chunk_ms = cost_ms as f64;
-            self.row_ms = cost_ms as f64 / ran as f64;
-            self.since_chunk_ms = 0.0;
-        } else {
-            self.since_chunk_ms += cost_ms as f64;
-        }
+        self.share_clock.settle(long_chunk, cost_ms as f64);
         self.requests.retain(|request| !request.done);
         self.flush_trace();
         Ok(events)
@@ -1139,75 +1248,84 @@ impl<W: Walk> TickEngine<W> {
         else {
             return 0;
         };
-        let left = target - from;
         let id = self.requests[index].id;
         let mut ran = 0usize;
         let decoding = self.decoding();
         if bulk {
             let (budget, most) =
                 bulk_budget(&self.config.tick_rows(), self.config.bulk_cap, decoding);
-            let fits = whole_chunk_fits(
-                left,
+            // Several chunks at once only with nothing decoding (a tick with decoders runs one
+            // short chunk) and without images (their tower rows are a single chunk's).
+            let ways = if decoding || !self.requests[index].images.is_empty() {
+                1
+            } else {
+                self.bulk_ways()
+            };
+            let split = self.config.decoder_skip.then_some(self.config.decoder_warm);
+            let chunks = tick_chunks(
+                from,
+                target,
                 budget,
-                self.config.decoder_skip,
-                self.config.decoder_warm,
-                self.config.rows_max,
-            );
-            let rows = bulk_rows(
-                left,
-                if fits { most } else { budget },
                 most,
-                None,
+                split,
+                ways,
                 self.config.rows_max,
-            )
-            .min(left);
-            self.record(
-                now,
-                Decision::Prefill {
-                    seq: id.0,
-                    from,
-                    rows,
-                    target,
-                    bulk: true,
-                },
+                |_, _| None,
             );
-            ran = rows;
-            let decoder = !self.config.decoder_skip
-                || crate::tick::runs_decoder(from, rows, target, self.config.decoder_warm);
-            self.lanes[lane].skip_end =
-                crate::tick::skip_end_after(self.lanes[lane].skip_end, from, rows, decoder);
-            // The exact rows this chunk runs travel before it does; every rank runs this many,
-            // not its own ChunkPolicy's chunk.
-            if let Some(group) = self.group.as_ref()
-                && let Err(error) = group.rows(lane, rows)
-            {
-                group.out_of_step(&error.to_string());
-            }
-            let mut ahead = self.ahead();
-            let slot = self.slots[lane]
-                .as_mut()
-                .expect("a lane serving a prompt has its slot");
-            match self
-                .runtime
-                .run_part_rows_hooked(slot, rows, Some(&mut ahead))
-            {
-                Ok(part) => {
-                    let tokens = self.requests[index].tokens[from..from + rows].to_vec();
-                    self.lanes[lane].resident.extend_from_slice(&tokens);
-                    if let Some(plan) = ahead.plan {
-                        self.ahead = Some((ahead.decoding, plan));
-                    }
-                    if let Part::Done(step) = part {
-                        self.finish_prompt(index, step, events);
-                    }
+            // The tick's chunks compute what they would one after the other, so they run that
+            // way here; an arm that interleaves them does it inside its own pass.
+            for (p, rows) in chunks {
+                let rows = rows.min(target - p);
+                self.record(
+                    now,
+                    Decision::Prefill {
+                        seq: id.0,
+                        from: p,
+                        rows,
+                        target,
+                        bulk: true,
+                    },
+                );
+                let decoder = !self.config.decoder_skip
+                    || crate::tick::runs_decoder(p, rows, target, self.config.decoder_warm);
+                self.lanes[lane].skip_end =
+                    crate::tick::skip_end_after(self.lanes[lane].skip_end, p, rows, decoder);
+                // The exact rows this chunk runs travel before it does; every rank runs this
+                // many, not its own ChunkPolicy's chunk.
+                if let Some(group) = self.group.as_ref()
+                    && let Err(error) = group.rows(lane, rows)
+                {
+                    group.out_of_step(&error.to_string());
                 }
-                Err(error) => {
-                    // The frame went out before the rows ran: the worker is inside the same walk,
-                    // so rank 0 cannot serve on past its failure.
-                    if let Some(group) = self.group.as_ref() {
-                        group.out_of_step(&error.to_string());
+                let mut ahead = self.ahead();
+                let slot = self.slots[lane]
+                    .as_mut()
+                    .expect("a lane serving a prompt has its slot");
+                match self
+                    .runtime
+                    .run_part_rows_hooked(slot, rows, Some(&mut ahead))
+                {
+                    Ok(part) => {
+                        ran += rows;
+                        let tokens = self.requests[index].tokens[p..p + rows].to_vec();
+                        self.lanes[lane].resident.extend_from_slice(&tokens);
+                        if let Some(plan) = ahead.plan {
+                            self.ahead = Some((ahead.decoding, plan));
+                        }
+                        if let Part::Done(step) = part {
+                            self.finish_prompt(index, step, events);
+                            break;
+                        }
                     }
-                    self.fail(index, error, events);
+                    Err(error) => {
+                        // The frame went out before the rows ran: the worker is inside the same
+                        // walk, so rank 0 cannot serve on past its failure.
+                        if let Some(group) = self.group.as_ref() {
+                            group.out_of_step(&error.to_string());
+                        }
+                        self.fail(index, error, events);
+                        break;
+                    }
                 }
             }
         } else {
@@ -1271,6 +1389,101 @@ impl<W: Walk> TickEngine<W> {
             }
         }
         ran
+    }
+
+    /// The chunks a bulk tick may run at once: [TickConfig::ways] with a bulk path, and one for
+    /// a group.
+    fn bulk_ways(&self) -> usize {
+        if self.group.is_some() || self.config.bulk_cap.is_none() {
+            1
+        } else {
+            self.config.ways.max(1)
+        }
+    }
+
+    /// Ends the prompts of the `picked` requests (crate::tick::together) in one paired pass:
+    /// each one's rest a whole chunk on its own lane, each sampling its first token. Returns the
+    /// rows run.
+    fn prefill_together(
+        &mut self,
+        now: u64,
+        picked: &[usize],
+        events: &mut Vec<TickEvent>,
+    ) -> usize {
+        let mut chunks = Vec::with_capacity(picked.len());
+        for &index in picked {
+            let Phase::Prefill { target, .. } = self.requests[index].phase else {
+                continue;
+            };
+            let Some(lane) = self.requests[index].lane else {
+                continue;
+            };
+            let Some(from) = self.slots[lane]
+                .as_ref()
+                .map(RuntimeSlot::history)
+                .map(<[u32]>::len)
+            else {
+                continue;
+            };
+            chunks.push((index, lane, from, target));
+        }
+        for &(index, lane, from, target) in &chunks {
+            let rows = target - from;
+            self.record(
+                now,
+                Decision::Prefill {
+                    seq: self.requests[index].id.0,
+                    from,
+                    rows,
+                    target,
+                    bulk: true,
+                },
+            );
+            let decoder = !self.config.decoder_skip
+                || crate::tick::runs_decoder(from, rows, target, self.config.decoder_warm);
+            self.lanes[lane].skip_end =
+                crate::tick::skip_end_after(self.lanes[lane].skip_end, from, rows, decoder);
+        }
+        let mut ahead = self.ahead();
+        // The slots leave their lanes for the pass, in the picked order, and go straight back.
+        let mut held: Vec<RuntimeSlot<W>> = chunks
+            .iter()
+            .filter_map(|&(_, lane, ..)| self.slots[lane].take())
+            .collect();
+        let ran = if held.len() == chunks.len() {
+            let mut slots: Vec<&mut RuntimeSlot<W>> = held.iter_mut().collect();
+            self.runtime.run_parts_paired(&mut slots, Some(&mut ahead))
+        } else {
+            Err(BackendError::new(
+                "tick",
+                "a lane ending its prompt has no slot",
+            ))
+        };
+        for (slot, &(_, lane, ..)) in held.drain(..).zip(&chunks) {
+            self.slots[lane] = Some(slot);
+        }
+        if let Some(plan) = ahead.plan {
+            self.ahead = Some((ahead.decoding, plan));
+        }
+        match ran {
+            Ok(steps) => {
+                let mut rows = 0;
+                for (step, &(index, lane, from, target)) in steps.into_iter().zip(&chunks) {
+                    let tokens = self.requests[index].tokens[from..target].to_vec();
+                    self.lanes[lane].resident.extend_from_slice(&tokens);
+                    rows += target - from;
+                    self.finish_prompt(index, step, events);
+                }
+                rows
+            }
+            Err(error) => {
+                // The pass fails whole: every prompt in it fails with it.
+                for &(index, ..) in &chunks {
+                    self.fail(index, BackendError::new("tick", error.to_string()), events);
+                }
+                0
+            }
+        }
     }
 
     /// The tick-ahead hook for the next prefill: its decode-row count is fixed at the tick's

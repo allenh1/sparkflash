@@ -22,18 +22,22 @@
 //! names: a prompt that finishes its prefill is headed in that tick and its decode row is fed by
 //! the caller on the next, where the replay decodes it in the same tick.
 //!
-//! What this cannot see: the device. Lane memory, growth, adoption from another lane, paired
-//! chunks, preemption and the drafter's depth need a cluster; they are named in
-//! docs/engine/04-onboarding-review.md.
+//! A second workload pins the batched prompts: several prompts' whole rests in one paired pass,
+//! each headed from its own last row, and a chunk a rows state of a long prompt.
+//!
+//! What this cannot see: the device. Lane memory, growth, adoption from another lane, the
+//! chunks' interleaving on the device, preemption and the drafter's depth need a cluster; they
+//! are named in docs/engine/04-onboarding-review.md.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, StepOutput};
 use sparkflash_runtime::tick::{Clock, QUEUE};
 use sparkflash_runtime::{
     Absent, ComputeDeclaration, HeadRow, Hidden, LaneMemory, LaneState, Limits, NoVision, Pass,
-    Segment, StateKind, StateLayout, TickConfig, TickEngine, TickEvent, Walk, WalkCapabilities,
+    PassKind, Segment, StateKind, StateLayout, TickConfig, TickEngine, TickEvent, Walk,
+    WalkCapabilities,
 };
 
 /// A clock the test advances before each tick, so the engine's cost model reads the same scripted
@@ -84,6 +88,9 @@ struct ReplayWalk {
     limits: Limits,
     /// How many walks the engine asked for the tick-ahead hook.
     hooks: Arc<AtomicUsize>,
+    /// Every pass and head the engine ran, as text: the pass shape with each segment's rows,
+    /// and the residual rows a head read.
+    passes: Arc<Mutex<Vec<String>>>,
 }
 
 impl ReplayWalk {
@@ -94,8 +101,10 @@ impl ReplayWalk {
     fn new_with_hooks(rows: usize, context: usize, hooks: Arc<AtomicUsize>) -> Self {
         Self {
             layout: StateLayout::new(Vec::new()),
-            limits: Limits::new(rows, context),
+            // Three chunks a paired pass: DeepSeek's three bulk rows states.
+            limits: Limits::new(rows, context).with_chunks(3),
             hooks,
+            passes: Arc::default(),
         }
     }
 }
@@ -142,10 +151,22 @@ impl Walk for ReplayWalk {
         mut pass: Pass<'_>,
     ) -> Result<Hidden, BackendError> {
         let mut rows = 0;
+        let mut each = Vec::new();
         for segment in segments {
             segment.seq.rows.extend_from_slice(segment.rows);
             rows += segment.rows.len();
+            each.push(segment.rows.len().to_string());
         }
+        let shape = match pass.kind {
+            PassKind::TokenRows => "rows",
+            PassKind::Bulk { .. } => "bulk",
+            PassKind::Paired { .. } => "paired",
+            PassKind::Verify { .. } => "verify",
+        };
+        self.passes
+            .lock()
+            .expect("the pass log")
+            .push(format!("{shape} {}", each.join("+")));
         let hidden = Hidden::new(rows);
         if let Some(hook) = pass.hook.take() {
             self.hooks.fetch_add(1, Ordering::Relaxed);
@@ -160,6 +181,11 @@ impl Walk for ReplayWalk {
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
         let _ = hidden;
+        let read: Vec<String> = rows.iter().map(|row| row.row.to_string()).collect();
+        self.passes
+            .lock()
+            .expect("the pass log")
+            .push(format!("head {}", read.join(",")));
         Ok(rows
             .iter_mut()
             .map(|row| {
@@ -388,5 +414,101 @@ fn the_engine_makes_the_committed_decisions() {
     assert!(
         got.contains("plan=plain"),
         "a non-drafting walk steps plain rows"
+    );
+}
+
+/// Four prompts on four lanes, nothing decoding: three end in one paired pass (a rows state
+/// each, in prefill order), each headed from its own last row; the fourth, which shares most of
+/// its rest with a picked one, waits and runs alone the tick after, beside the decoders.
+#[test]
+fn short_prompts_end_in_one_paired_pass_each_headed_from_its_own_row() {
+    let clock = ScriptedClock::default();
+    let walk = ReplayWalk::new(8_192, 200_000);
+    let passes = Arc::clone(&walk.passes);
+    let mut engine = TickEngine::new(walk, 4)
+        .expect("the engine starts")
+        .with_config(TickConfig::deepseek(4))
+        .expect("the deepseek config fits the walk")
+        .with_clock(Box::new(clock.clone()))
+        .with_trace();
+    let lead = tokens(5, 1_500);
+    let ids = [
+        engine
+            .admit(&lead, &[], Sampling::default())
+            .expect("seq 0"),
+        engine
+            .admit(&tokens(6, 900), &[], Sampling::default())
+            .expect("seq 1"),
+        engine
+            .admit(&tokens(7, 1_800), &[], Sampling::default())
+            .expect("seq 2"),
+        engine
+            .admit(&shares(&lead[..1_000], 1_200), &[], Sampling::default())
+            .expect("seq 3"),
+    ];
+    clock.advance(100);
+    let first = engine.tick().expect("the first tick");
+    let ended: Vec<u64> = first
+        .iter()
+        .map(|event| match event {
+            TickEvent::Prompt { id, step } => {
+                assert!(step.next_token.is_some());
+                id.0
+            }
+            TickEvent::Decode { id, .. } => panic!("request {} decoded", id.0),
+            TickEvent::Failed { id, error } => panic!("request {} failed: {error}", id.0),
+        })
+        .collect();
+    // Fewest rows left first: 900, then the 1,200 that shares with the lead of 1,500 (so that
+    // one waits), then 1,800.
+    assert_eq!(ended, vec![ids[1].0, ids[3].0, ids[2].0]);
+    assert_eq!(
+        *passes.lock().expect("the pass log"),
+        vec![
+            "paired 900+1200+1800".to_string(),
+            "head 899,2099,3899".to_string()
+        ],
+        "one pass, one segment a prompt, each prompt's last row headed"
+    );
+    clock.advance(40);
+    let second = engine.tick().expect("the second tick");
+    assert!(
+        matches!(second.as_slice(), [TickEvent::Prompt { id, .. }] if *id == ids[0]),
+        "the prompt that waited ends alone"
+    );
+    let trace = engine.trace().expect("the engine keeps a trace").render();
+    let want = "\
+t=1 clock=100 place seq=0 lane=0 shared=0 start=0 target=1500 path=bulk
+t=1 clock=100 place seq=1 lane=1 shared=0 start=0 target=900 path=bulk
+t=1 clock=100 place seq=2 lane=2 shared=0 start=0 target=1800 path=bulk
+t=1 clock=100 place seq=3 lane=3 shared=0 start=0 target=1200 path=bulk
+t=1 clock=100 hold 0
+t=1 clock=100 prefill seq=1 from=0 rows=900 to=900 target=900 path=bulk
+t=1 clock=100 prefill seq=3 from=0 rows=1200 to=1200 target=1200 path=bulk
+t=1 clock=100 prefill seq=2 from=0 rows=1800 to=1800 target=1800 path=bulk
+t=2 clock=140 hold 0
+t=2 clock=140 prefill seq=0 from=0 rows=1500 to=1500 target=1500 path=bulk
+";
+    assert_eq!(trace, want);
+    assert_eq!(
+        passes.lock().expect("the pass log")[2..],
+        ["bulk 1500".to_string(), "head 1499".to_string()]
+    );
+}
+
+/// A config that asks for more chunks a tick than the walk's paired pass holds is refused, not
+/// run one at a time.
+#[test]
+fn a_config_with_more_chunks_than_the_pass_holds_is_refused() {
+    let mut walk = ReplayWalk::new(8_192, 200_000);
+    walk.limits = walk.limits.with_chunks(2);
+    let error = TickEngine::new(walk, 3)
+        .expect("the engine starts")
+        .with_config(TickConfig::deepseek(3))
+        .err()
+        .expect("three chunks do not fit a pass of two");
+    assert!(
+        error.to_string().contains("3 chunks a tick"),
+        "the refusal names the chunks: {error}"
     );
 }
