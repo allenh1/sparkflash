@@ -29,7 +29,7 @@ Without being asked, the result then has all of:
 | Tensor-core prompt pass | every GEMM-class part runs on the MMA tile when rows allow |
 | Chunked prefill | a prompt of any length runs in bounded chunks |
 | Concurrent requests | several sequences share a pass, alone and in a TP group |
-| Tensor-core decode | the one-to-eight row step uses the tensor cores too |
+| Tensor-core decode | optional: the one-to-eight row step uses the tensor cores only where the written speed rule won, and the default is the row GEMV over the arm's packed copy |
 | Stored-format arithmetic | NVFP4 stays NVFP4, FP8 stays FP8; nothing widens unseen |
 | KV reuse | a continued turn extends the cache; a changed turn rewinds it |
 | Drafting | a published draft head is used, in lanes and in joint rounds |
@@ -304,15 +304,22 @@ or never.
 * Row dispatch moves into `sparkflash-ops`. Thresholds become a property of the symbol, not an
   arm constant. Each released arm's present thresholds are kept as a named legacy policy so its
   bits do not move. A new arm cannot name a policy; it gets the default.
-* The two tensor-core decode implementations become the shared token body per precision. BF16 and
+* The tensor-core decode implementations become the shared token body per precision. BF16 and
   NVFP4 exist in Qwen's, MX FP8 in DeepSeek's. FP8 E4M3 and the packed BF16 form have to be
   written.
 
-One rule comes with this, learned on Qwen (D68): **a part has one arithmetic image per
-precision, and it is the tile's.** The prompt body and the token body must give the same bits for
-the same row, or a continued turn differs from a cold one. A few-row body may be a different
-kernel, as Qwen's `q4p_*_rows` twins are, but it must reproduce the tile's bits. The generated
-tests in mechanism 6 check it.
+**The default for a one-to-eight-row step is the row GEMV over the arm's packed copy.** A
+tensor-core decode route is optional: an arm adopts one only by passing the written speed rule
+(docs/NUMERICS.md, *The speed rule*), and the four measured arms did not - Inkling's tiled head,
+GLM's FP8 few-row body, Dory's few-row body and Qwen's tensor-core decode all lost at the served
+concurrency or at one request, and each arm's report records the numbers. The shared token bodies,
+the typed operands and their `compile_fail` pins stay, and DeepSeek's `opt_gemv_mma` path is the
+one tensor-core decode in service.
+
+One rule still comes with the shared bodies, learned on Qwen (D68): **where a few-row body runs, a
+part has one arithmetic image per precision, and it is the tile's.** A few-row body may be a
+different kernel, but it must reproduce the tile's bits, and the generated tests in mechanism 6
+check it. The row GEMV is the reference arithmetic every such route is measured against.
 
 The compiler cannot see inside a `.cu` file. A kernels test closes that gap mechanically: a symbol
 declared `TensorCore` must include the shared tile header.
@@ -473,7 +480,7 @@ under the same clause, after DeepSeek. Nothing else waits on it.
 | What no longer has to be said | What makes it true | A miss shows up as |
 |---|---|---|
 | Use the tensor cores for the prompt pass | catalogue assertion; dispatch in the stack | compile error |
-| Use the tensor cores for decode | the same assertion, token pass | compile error, or a cited waiver |
+| Use the tensor cores for decode | optional; the ledger states the row GEMV and the arm's speed-rule report | a cited report, or the optional route is gone |
 | Chunk the prefill | the runtime drives `walk`; an arm has no prefill | not expressible |
 | Support concurrent requests | `walk` takes segments; the runtime owns lanes | not expressible |
 | Support parallel requests in a TP group | group lanes for any `Walk` | not expressible |
@@ -505,7 +512,7 @@ The order puts speed for the next model first (phases 1, 3, 4), then the approve
 | 2 | One registration | neutral | M |
 | 3 | The stack chooses the kernel; typed API for new code | neutral | M to L |
 | 4 | The default arm gets everything | dense arm moves | M |
-| 5 | Tensor-core decode on GLM, Inkling, Dory | once per arm | M each |
+| 5 | Tensor-core decode measured on GLM, Inkling, Dory (and Qwen) | measured, not adopted | — |
 | 6 | DeepSeek's scheduler becomes the runtime's engine | neutral | L |
 | 7 | Released arms' call sites take the typed API | neutral | L |
 | 8 | The onboard command, the mandatory token, the docs | neutral | S |
@@ -670,9 +677,24 @@ check.
 GLM goes first because its FP8 token body is the one phase 4 also needs, and a released model
 with real weights is a better test bed for it than a fixture.
 
-Expect the one-row step to be flat or slightly slower and the several-row step to be faster, as
-on DeepSeek and Qwen. An arm whose one-row step loses more than its few-row twin can win back
-keeps a waiver for that row band, with the number.
+**Closed as "measured, not adopted".** The plan expected the one-row step to be flat or slightly
+slower and the several-row step to be faster, as on DeepSeek and Qwen; the written speed rule
+(docs/NUMERICS.md) measured all four released arms and none won. Each report holds the numbers:
+
+- Inkling's tiled head: correct (top-1 100%, max 2.7e-03 nat) but 0.9387/0.9461 and 0.9608/0.9941
+  of the row GEMV at one and four lanes -
+  `docs/numerics/inkling2/v2-clean-head.md`.
+- GLM-5.3's FP8 few-row body: 0.91 on both axes in both pairs -
+  `docs/numerics/glm53/v3-gemv.md`.
+- Dory's few-row body: 0.679/0.671 at one lane -
+  `docs/numerics/dory10/v2-gemv.md`.
+- Qwen's tensor-core decode: 0.9731/0.9780 at its default one lane -
+  `docs/numerics/qwen38/v2-token-kernels.md`.
+
+Every arm therefore serves its row GEMV (or token kernels for Qwen's decode) and the optional
+tensor-core route is a typed, measured, held-back path. **For a later attempt**, start from
+DeepSeek's `opt_gemv_mma`, which is the one tensor-core decode in service - not from the prompt
+tiles, whose few-row bodies lost on every released arm. Not scheduled.
 
 #### The two token bodies that were missing
 
