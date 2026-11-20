@@ -39,6 +39,7 @@ pub mod fused;
 pub mod group;
 pub mod layout;
 pub mod ledger;
+pub mod part;
 pub mod pool;
 pub mod resume;
 pub mod rounds;
@@ -68,6 +69,7 @@ pub use group::{
 };
 pub use layout::{LaneState, Limits, Region, StateKind, StateLayout};
 pub use ledger::{Ledger, Mode, Strategy};
+pub use part::{PartBody, PartExec, PartHost, PartMaker, PartRegistry, RankSplit};
 pub use pool::{LaneMemory, LanePool};
 pub use resume::{Restore, Rewind, checkpoint_after, rewind_plan};
 pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
