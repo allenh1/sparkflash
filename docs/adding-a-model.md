@@ -33,6 +33,8 @@ Before any code is written it prints:
 
 - the one `ScanReport` per target and TP: every part the stack names, whether a kernel resolves
   for both passes, and every unread config key or unclaimed tensor with its fix;
+- which matrix-product parts have only a row body or no tensor-core body for a pass, and whether
+  a `WAIVERS` line covers the gap, so a `PartExec` or a waiver is the next edit;
 - the stored format of each weight class, read from `quantization_config` at the top level or
   under `text_config`;
 - the config switches the parser does not model yet (`Architecture::unmodelled_features`), which

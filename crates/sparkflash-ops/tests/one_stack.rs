@@ -162,6 +162,79 @@ fn the_language_stack_walk_matches_the_scan_and_the_plan_order() {
     }
 }
 
+#[test]
+fn the_vision_stack_parts_match_the_plan_and_the_declared_set() {
+    use sparkflash_model::stack::StackKind;
+    use sparkflash_model::{Architecture, Part, Target};
+    use sparkflash_ops::parts::is_vision_part;
+    use sparkflash_ops::{ScanInputs, ScanStatus, scan};
+
+    for (name, config) in [
+        (
+            "deepseek",
+            include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            ),
+        ),
+        (
+            "glm",
+            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+        ),
+        (
+            "inkling",
+            include_str!("../../sparkflash-model-inkling2/config/inkling2_small.hf.json"),
+        ),
+        (
+            "qwen",
+            include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json"),
+        ),
+    ] {
+        let architecture = Architecture::from_json(config).expect("the config parses");
+        let stack = architecture
+            .stacks()
+            .into_iter()
+            .find(|stack| stack.kind == StackKind::Vision)
+            .expect("a vision stack");
+        let mut declared: Vec<Part> = architecture
+            .parts()
+            .iter()
+            .filter(|part| is_vision_part(*part))
+            .collect();
+        let mut from_stack: Vec<Part> = stack.parts().map(|instance| instance.part).collect();
+        let plan =
+            sparkflash_ops::EnginePlan::from_json(config, Target::Sm121, 1, 0).expect("the plan");
+        let mut from_plan: Vec<Part> = plan
+            .globals()
+            .iter()
+            .filter(|requirement| is_vision_part(requirement.part))
+            .map(|requirement| requirement.part)
+            .collect();
+        declared.sort();
+        from_stack.sort();
+        from_plan.sort();
+        assert_eq!(declared, from_stack, "{name}: parts() and the stack");
+        assert_eq!(declared, from_plan, "{name}: parts() and the plan");
+
+        let report = scan(ScanInputs {
+            config,
+            tensors: None,
+            target: Target::Sm121,
+            world: 1,
+        });
+        let mut from_scan: Vec<Part> = report
+            .rows
+            .iter()
+            .filter(|row| {
+                row.stack == StackKind::Vision
+                    && !matches!(row.status, ScanStatus::UnknownKey { .. })
+            })
+            .map(|row| row.part)
+            .collect();
+        from_scan.sort();
+        assert_eq!(declared, from_scan, "{name}: parts() and the scan");
+    }
+}
+
 fn model_families() -> Vec<String> {
     let mut families: Vec<String> = std::fs::read_dir(workspace_root().join("crates"))
         .expect("the workspace has a crates directory")

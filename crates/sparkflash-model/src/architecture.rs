@@ -3247,17 +3247,33 @@ fn vision(
 /// not arithmetic the shared description reads. Every other key is reported as unread until the
 /// reader that owns it actually consumes it.
 fn record_quantized_layers(root: &Value) {
+    const LAYER_KEYS: &[&str] = &[
+        "quant_algo",
+        "group_size",
+        "dynamic",
+        "scale_fmt",
+        "fmt",
+        "type",
+        "num_bits",
+        "targets",
+        "weights",
+        "input_activations",
+    ];
+    fn record_entry(value: &Value) {
+        for key in LAYER_KEYS {
+            if let Some(child) = read_key(value, key)
+                && child.is_object()
+            {
+                record_entry(child);
+            }
+        }
+    }
     if let Some(quantization) = read_key(root, "quantization_config")
         && let Some(layers) = read_key(quantization, "quantized_layers")
     {
-        record_entries_deep(layers);
-    }
-}
-
-/// Record every key at every depth of a metadata object as consumed.
-fn record_entries_deep(value: &Value) {
-    for (_, child) in crate::coverage::entries(value) {
-        record_entries_deep(child);
+        for (_, entry) in crate::coverage::entries(layers) {
+            record_entry(entry);
+        }
     }
 }
 /// A DFlash 2 drafter checks its target by width, vocabulary and backbone depth.

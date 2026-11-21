@@ -17,7 +17,8 @@
 //!
 //! These are the interim expectations before the layout reader's stack tensor roles land: a plan
 //! claims what its family planner names, and a tower no shared planner describes is reported as
-//! unclaimed rather than dropped. A machine without the snapshots skips every case cleanly.
+//! unclaimed rather than dropped. The test is ignored by default because it needs the pinned
+//! snapshots; an explicit `--ignored` run fails when none of them is present.
 //!
 //! This file is an integration test, deliberately outside `scan_report.rs`: the scan's vocabulary
 //! must name no model family or crate, and a test that names released repositories would otherwise
@@ -93,6 +94,7 @@ fn unclaimed_groups(report: &ScanReport) -> Vec<(String, usize)> {
 }
 
 #[test]
+#[ignore = "needs the pinned snapshots in the Hugging Face cache; run with --ignored"]
 fn the_real_snapshots_report_their_interim_claim_state() {
     // Integration dependency: these expectations are the shared checkpoint plan's state
     // before piece A's stack tensor roles land. When A claims a tower, its group leaves this
@@ -123,7 +125,7 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         },
         Snapshot {
             repo: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
-            revision: "ee517dd388a9b348890ae1e00dacc5eb4d0c750d",
+            revision: "f6c832e6963ddb74f62c75813a3e8c74b1af67b1",
             // The one shared checkpoint plan is spelled `model.layers.*`; this checkpoint is
             // `backbone.*`. The plan cannot claim it, and no tensor is silently unclaimed.
             expectation: SnapshotExpectation::PlanFailure {
@@ -225,7 +227,8 @@ fn the_real_snapshots_report_their_interim_claim_state() {
             }
         }
     }
-    if checked == 0 {
-        eprintln!("no real snapshot is present in this machine's Hub cache; skipped");
-    }
+    assert!(
+        checked > 0,
+        "no pinned snapshot is present in this machine's Hub cache; the ignored test checked nothing"
+    );
 }

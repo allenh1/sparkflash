@@ -2620,6 +2620,31 @@ pub struct TensorCoreGaps {
     pub needing: std::collections::BTreeSet<String>,
 }
 
+/// The operator-facing tensor-core section of `sparkflash onboard`.
+#[must_use]
+pub fn tensor_core_gap_report(architecture: &Architecture, target: Target) -> String {
+    use std::fmt::Write as _;
+    let gaps = tensor_core_gaps(architecture, target);
+    let mut out = format!("tensor-core coverage at {}:\n", target.name());
+    if gaps.waived.is_empty() && gaps.needing.is_empty() {
+        let _ = writeln!(
+            out,
+            "  every matrix-product part has a tensor-core body in both passes"
+        );
+        return out;
+    }
+    for gap in &gaps.waived {
+        let _ = writeln!(out, "  waived: {gap}");
+    }
+    for gap in &gaps.needing {
+        let _ = writeln!(
+            out,
+            "  needs a tensor-core body (write a PartExec or add a WAIVERS line): {gap}"
+        );
+    }
+    out
+}
+
 /// [TensorCoreGaps] for `architecture` at `target`.
 #[must_use]
 pub fn tensor_core_gaps(architecture: &Architecture, target: Target) -> TensorCoreGaps {

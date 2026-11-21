@@ -297,13 +297,17 @@ pub fn fit_cached(model: &CachedModel, cluster: &Cluster) -> Fit {
             bytes,
             measured: true,
         });
-    let tensors = sparkflash_weights::tensor_index::read_local(snapshot)
-        .ok()
-        .map(|index| TensorIndex::from_reader(&index));
     let lacks: Vec<String> = if model.complete && document.is_some() && weights.is_none() {
         vec![NO_SAFETENSORS.to_owned()]
     } else {
         Vec::new()
+    };
+    let tensors = match sparkflash_weights::tensor_index::read_local(snapshot) {
+        Ok(index) => Some(TensorIndex::from_reader(&index)),
+        Err(error) => {
+            eprintln!("sparkflash web: tensor index for {}: {error}", model.id);
+            None
+        }
     };
     fit::judge(
         &Evidence {
@@ -513,12 +517,18 @@ impl HubHit {
         // explicit inspection reads the shard headers, so its scan can compare tensors without
         // downloading a weight.
         let tensors = if fetch_any {
-            self.sha
+            match self
+                .sha
                 .as_deref()
-                .and_then(|revision| {
-                    sparkflash_weights::tensor_index::read_hub(&self.id, revision).ok()
-                })
-                .map(|index| TensorIndex::from_reader(&index))
+                .map(|revision| sparkflash_weights::tensor_index::read_hub(&self.id, revision))
+            {
+                Some(Ok(index)) => Some(TensorIndex::from_reader(&index)),
+                Some(Err(error)) => {
+                    eprintln!("sparkflash web: tensor index for {}: {error}", self.id);
+                    None
+                }
+                None => None,
+            }
         } else {
             None
         };

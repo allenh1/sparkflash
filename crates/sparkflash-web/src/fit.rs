@@ -459,7 +459,12 @@ pub fn architecture(text: &str) -> Result<Architecture, String> {
 ///
 /// # Errors
 /// Each missing piece, named for the operator.
-fn scan_gaps(config: &str, architecture: &Architecture, world: usize) -> Result<(), Vec<String>> {
+fn scan_gaps(
+    config: &str,
+    architecture: &Architecture,
+    world: usize,
+    tensors: Option<&TensorIndex>,
+) -> Result<(), Vec<String>> {
     let profile = profile_for_model_type(&architecture.family);
     if let Some(profile) = profile
         && !profile.worlds.contains(&world)
@@ -479,7 +484,7 @@ fn scan_gaps(config: &str, architecture: &Architecture, world: usize) -> Result<
     }
     let report = scan(ScanInputs {
         config,
-        tensors: None,
+        tensors,
         target: Target::Sm121,
         world,
     });
@@ -566,7 +571,7 @@ pub fn launch_check(text: &str) -> LaunchCheck {
             match profile_for_model_type(&architecture.family) {
                 None => gaps.push(no_engine(&architecture.family)),
                 Some(profile) => {
-                    if let Err(more) = scan_gaps(text, &architecture, profile.world_size) {
+                    if let Err(more) = scan_gaps(text, &architecture, profile.world_size, None) {
                         gaps.extend(more);
                     }
                 }
@@ -648,6 +653,7 @@ pub fn judge(evidence: &Evidence<'_>, cluster: &Cluster) -> Fit {
                 profile,
                 blocked,
                 weights: evidence.weights,
+                tensors: evidence.tensors,
                 window,
                 cluster,
             })
@@ -682,6 +688,7 @@ struct ConfigurationInputs<'a> {
     profile: Option<&'a ModelProfile>,
     blocked: bool,
     weights: Option<WeightBytes>,
+    tensors: Option<&'a TensorIndex>,
     window: Option<usize>,
     cluster: &'a Cluster,
 }
@@ -694,12 +701,14 @@ fn configuration(inputs: ConfigurationInputs<'_>) -> Configuration {
         profile,
         blocked,
         weights,
+        tensors,
         window,
         cluster,
     } = inputs;
     let mut reasons = Vec::new();
     let mut notes = Vec::new();
-    let derived = architecture.map(|(architecture, key)| derive(config, architecture, key, world));
+    let derived =
+        architecture.map(|(architecture, key)| derive(config, architecture, key, world, tensors));
     let architecture = architecture.map(|(architecture, _)| architecture);
     let engine_ready = match &derived {
         Some(derived) => match &derived.gaps {
@@ -872,13 +881,20 @@ fn derive(
     architecture: &Architecture,
     key: Option<u64>,
     world: usize,
+    tensors: Option<&TensorIndex>,
 ) -> Derived {
     let compute = || Derived {
         // The architecture came from this same document; a report over no document is not a
         // claim that the checkpoint is clean.
-        gaps: config.map_or(Ok(()), |config| scan_gaps(config, architecture, world)),
+        gaps: config.map_or(Ok(()), |config| {
+            scan_gaps(config, architecture, world, tensors)
+        }),
         planned: planned_rank_bytes(architecture, world),
     };
+    // A cached snapshot has a tensor index; the memo is keyed by the document alone.
+    if tensors.is_some() {
+        return compute();
+    }
     let Some(key) = key else {
         return compute();
     };

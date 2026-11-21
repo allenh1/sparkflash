@@ -233,6 +233,10 @@ pub fn read_local(dir: &Path) -> Result<TensorIndex, IndexError> {
             .file_name()
             .map_or_else(|| label.clone(), |name| name.to_string_lossy().into_owned());
         for (name, descriptor) in header.tensors {
+            // The loader checks that the declared byte range agrees with the stored dtype and
+            // shape. Do it here too, so a header the index blesses is a header the loader reads.
+            crate::safetensors::logical_spec(&name, &descriptor)
+                .map_err(|error| header_error(&label, error))?;
             let indexed = IndexedTensor {
                 name: name.clone(),
                 dtype: descriptor.dtype,
@@ -338,7 +342,7 @@ pub fn read_hub(repo: &str, revision: &str) -> Result<TensorIndex, IndexError> {
             detail: "the repository names a sharded checkpoint with no shard files".to_owned(),
         });
     }
-    let mut tensors: BTreeMap<String, IndexedTensor> = BTreeMap::new();
+    let mut tensors: BTreeMap<String, (String, IndexedTensor)> = BTreeMap::new();
     for shard in shards {
         if !is_shard_name(&shard) {
             return Err(IndexError::Malformed {
@@ -351,26 +355,33 @@ pub fn read_hub(repo: &str, revision: &str) -> Result<TensorIndex, IndexError> {
         let url = format!("{base}/{shard}");
         let header = read_remote_header(&agent, &url)?;
         for (name, descriptor) in header.tensors {
-            if let Some(first) = tensors.get(&name) {
+            crate::safetensors::logical_spec(&name, &descriptor)
+                .map_err(|error| header_error(&url, error))?;
+            if let Some((first, _)) = tensors.get(&name) {
                 return Err(IndexError::Malformed {
                     subject: source.clone(),
                     detail: format!(
-                        "the tensor {name} is described by two shards ({}'s and {shard}'s); one name must have one descriptor",
-                        first.name
+                        "the tensor {name} is described by two shards ({first} and {shard}); one name must have one descriptor"
                     ),
                 });
             }
             tensors.insert(
                 name.clone(),
-                IndexedTensor {
-                    name,
-                    dtype: descriptor.dtype,
-                    shape: descriptor.shape,
-                },
+                (
+                    shard.clone(),
+                    IndexedTensor {
+                        name,
+                        dtype: descriptor.dtype,
+                        shape: descriptor.shape,
+                    },
+                ),
             );
         }
     }
-    Ok(TensorIndex::new(source, tensors.into_values().collect()))
+    Ok(TensorIndex::new(
+        source,
+        tensors.into_values().map(|(_, tensor)| tensor).collect(),
+    ))
 }
 
 /// A failed Hub request: its HTTP status when the Hub answered.
@@ -694,6 +705,22 @@ mod tests {
         };
         assert!(subject.contains("model.safetensors"), "{subject}");
         assert!(detail.contains("declared header length"), "{detail}");
+    }
+
+    #[test]
+    fn a_header_byte_range_that_does_not_fit_its_dtype_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let header = br#"{"x":{"dtype":"BF16","shape":[4,8],"data_offsets":[0,1]}}"#;
+        let mut file = Vec::new();
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(header);
+        file.push(0);
+        std::fs::write(dir.path().join(SINGLE_FILE_NAME), file).expect("fixture");
+        let error = read_local(dir.path()).expect_err("one byte cannot store 32 BF16 values");
+        let IndexError::Malformed { detail, .. } = error else {
+            panic!("expected a malformed header, got {error:?}");
+        };
+        assert!(detail.contains("stores 1 bytes"), "{detail}");
     }
 
     #[test]

@@ -149,10 +149,16 @@ fn load(id: Option<&str>, config: Option<&Path>) -> Result<Input, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let mut input = from_text(id, &text, format!("--config {}", path.display()))?;
-        input.tensors = path
-            .parent()
-            .and_then(|directory| sparkflash_weights::tensor_index::read_local(directory).ok())
-            .map(|index| sparkflash_ops::TensorIndex::from_reader(&index));
+        input.tensors =
+            path.parent().and_then(
+                |directory| match sparkflash_weights::tensor_index::read_local(directory) {
+                    Ok(index) => Some(sparkflash_ops::TensorIndex::from_reader(&index)),
+                    Err(error) => {
+                        eprintln!("sparkflash onboard: tensor index: {error}");
+                        None
+                    }
+                },
+            );
         return Ok(input);
     }
     let Some(id) = id else {
@@ -168,9 +174,13 @@ fn load(id: Option<&str>, config: Option<&Path>) -> Result<Input, String> {
         let architecture = Architecture::from_checkpoint_dir(&directory)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let unmodelled = unmodelled(&text);
-        let tensors = sparkflash_weights::tensor_index::read_local(&directory)
-            .ok()
-            .map(|index| sparkflash_ops::TensorIndex::from_reader(&index));
+        let tensors = match sparkflash_weights::tensor_index::read_local(&directory) {
+            Ok(index) => Some(sparkflash_ops::TensorIndex::from_reader(&index)),
+            Err(error) => {
+                eprintln!("sparkflash onboard: tensor index: {error}");
+                None
+            }
+        };
         return Ok(Input {
             id: Some(id.to_owned()),
             source: format!("hub cache {}", directory.display()),
@@ -182,9 +192,13 @@ fn load(id: Option<&str>, config: Option<&Path>) -> Result<Input, String> {
     }
     let text = fetch(id)?;
     let mut input = from_text(Some(id), &text, format!("the Hub ({id})"))?;
-    input.tensors = sparkflash_weights::tensor_index::read_hub(id, "main")
-        .ok()
-        .map(|index| sparkflash_ops::TensorIndex::from_reader(&index));
+    input.tensors = match sparkflash_weights::tensor_index::read_hub(id, "main") {
+        Ok(index) => Some(sparkflash_ops::TensorIndex::from_reader(&index)),
+        Err(error) => {
+            eprintln!("sparkflash onboard: tensor index: {error}");
+            None
+        }
+    };
     Ok(input)
 }
 
@@ -318,6 +332,7 @@ fn render(input: &Input) -> String {
     let _ = writeln!(out, "serving defaults (DEFAULTS): {defaults}");
 
     render_formats(&mut out, architecture, input, arm.is_some());
+    render_tensor_core(&mut out, architecture);
     render_scan(&mut out, input);
     render_fit(&mut out, architecture, arm.map(|arm| arm.default_context()));
     out
@@ -385,6 +400,14 @@ fn render_formats(out: &mut String, architecture: &Architecture, input: &Input, 
             );
         }
     }
+}
+
+/// The tensor-core section `onboard` has always printed; the shared op library formats it.
+fn render_tensor_core(out: &mut String, architecture: &Architecture) {
+    out.push_str(&sparkflash_ops::parts::tensor_core_gap_report(
+        architecture,
+        TARGET,
+    ));
 }
 
 /// The one scan report, in the same plain text the console's plain view prints.
@@ -516,6 +539,10 @@ mod tests {
         assert!(
             text.contains("coverage: tensors"),
             "no coverage in:\n{text}"
+        );
+        assert!(
+            text.contains("tensor-core coverage at sm121:"),
+            "no tensor-core section in:\n{text}"
         );
         assert!(text.contains("clean: "), "no clean line in:\n{text}");
         assert!(

@@ -578,6 +578,9 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
                 detail: format!("vision_config does not state {missing}"),
                 fix: facts[0].fix().to_owned(),
             };
+            if facts.contains(&VisionFact::Position) {
+                row.shape = Shape::unknown();
+            }
             row.format = None;
         }
     }

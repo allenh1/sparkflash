@@ -68,6 +68,7 @@ pub struct ConfigCoverage {
     read: BTreeSet<String>,
     unknown: Vec<UnknownKey>,
     ignored: Vec<IgnoredKey>,
+    checked: bool,
 }
 
 /// Whether a config-key check ran and what it found.
@@ -129,13 +130,15 @@ impl ConfigCoverage {
     /// Whether the check ran and every key was read or ignorably listed.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.unknown.is_empty()
+        self.checked && self.unknown.is_empty()
     }
 
     /// The state the scan report records for its config-key coverage.
     #[must_use]
     pub fn state(&self) -> KeyCoverageState {
-        if self.is_clean() {
+        if !self.checked {
+            KeyCoverageState::NotChecked
+        } else if self.is_clean() {
             KeyCoverageState::Clean
         } else {
             KeyCoverageState::Dirty
@@ -270,6 +273,7 @@ impl Recorder {
             read: self.reads,
             unknown,
             ignored,
+            checked: true,
         }
     }
 }

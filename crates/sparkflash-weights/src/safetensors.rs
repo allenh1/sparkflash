@@ -1158,7 +1158,10 @@ fn relabel_to(error: WeightError, name: &str, shard: &str) -> WeightError {
 /// quantisation). Everything else maps word for word. A word this checkpoint does not use is a
 /// malformed tensor rather than a panic, and the header's own byte length has to agree with the
 /// dtype and shape it declares, which catches a header whose offsets and descriptor disagree.
-fn logical_spec(name: &str, descriptor: &TensorHeader) -> Result<TensorSpec, WeightError> {
+pub(crate) fn logical_spec(
+    name: &str,
+    descriptor: &TensorHeader,
+) -> Result<TensorSpec, WeightError> {
     let mut shape = descriptor.shape.clone();
     let dtype = match descriptor.dtype.as_str() {
         "F32" => DType::F32,
