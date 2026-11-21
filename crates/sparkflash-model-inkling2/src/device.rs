@@ -85,7 +85,7 @@ mod walk;
 
 pub use walk::{InklingDrafter, InklingSequence, InklingWalk};
 
-use chunk::{BandOut, Rows, band_exchange, band_mix, exchange_gather, exchange_sum, walk_rows};
+use chunk::{BandOut, band_exchange, band_mix, exchange_gather, exchange_sum};
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 use packed::pack_dense;
@@ -4295,7 +4295,34 @@ struct State {
     position: usize,
 }
 
+/// What a walk reads of one sequence's [State]: its caches, its convolution histories, its
+/// one-row arena and the position its next row lands at. A view copies the state's device
+/// addresses, which the lane's reservation fixes for the sequence's life, so a walk staged over
+/// several calls holds it without borrowing the sequence; the walk's caller moves the position on
+/// once the rows are in.
+#[derive(Clone)]
+struct LaneView {
+    keys: Vec<Deviceptr>,
+    values: Vec<Deviceptr>,
+    tables: Vec<Option<KeyTables>>,
+    conv: Vec<[Deviceptr; 4]>,
+    scratch: Scratch,
+    position: usize,
+}
+
 impl State {
+    /// The sequence as a walk reads it now.
+    fn view(&self) -> LaneView {
+        LaneView {
+            keys: self.keys.clone(),
+            values: self.values.clone(),
+            tables: self.tables.clone(),
+            conv: self.conv.clone(),
+            scratch: self.scratch.clone(),
+            position: self.position,
+        }
+    }
+
     fn allocate(shared: &Shared) -> Result<Self, String> {
         let plan = &shared.plan;
         let cuda = &shared.cuda;
@@ -4459,6 +4486,7 @@ impl State {
 /// `history` rows in front of their first row. Those rows are the previous launch's tail, so the
 /// multi-row convolution entry needs no branch on a chunk's first rows and no separate state; the
 /// pointers stored here already address row zero, and the headroom is arithmetic on the offset.
+#[derive(Clone)]
 struct Scratch {
     x: Deviceptr,
     /// The block-attention residual's output: `[rows][nq][hidden]`, three rows a row on a full
@@ -4777,14 +4805,6 @@ impl Scratch {
 struct InklingDeviceSession {
     shared: Arc<Shared>,
     state: State,
-    /// The chunk buffer and its device state.
-    ///
-    /// A chunk's rows are walked together rather than one at a time, and two of the braids they
-    /// need are per-pass rather than per-layer: the block summary stack the rows push as they
-    /// cross a boundary, and the four-tap histories the last row of each convolution leaves.
-    /// [Chunk::open] copies the sequence's own stack and histories in, [Chunk::close] copies them
-    /// back, and the chunk's working copies are sized for one pass of the chunk width's rows.
-    chunk: Option<Chunk>,
     history: Vec<u32>,
     /// The prompt's encoded image rows, in prompt order, while its chunks still read them.
     ///
@@ -4878,6 +4898,7 @@ impl Boundary {
 
 /// The device state one prefill chunk walks in: `rows` rows of every scratch buffer, and a working
 /// copy of the two pieces of state a chunk advances per pass rather than per layer.
+#[derive(Clone)]
 struct Chunk {
     /// The widest chunk this buffer holds.
     rows: usize,
@@ -5021,12 +5042,10 @@ impl VerifyTails {
     }
 }
 
-/// A sequence's verify buffer: a split chunk buffer as deep as its deepest round, every row
-/// answered, the [VerifyTails] that let it keep a leading run of the rows, and the restore's
-/// table: for every (layer, slot) of `conv`, the slot's tail, the sequence's history it
-/// restores, and its channels.
+/// A sequence's verify buffer: the [VerifyTails] that let it keep a leading run of a round's
+/// rows, as deep as its deepest round, and the restore's table: for every (layer, slot) of
+/// `conv`, the slot's tail, the sequence's history it restores, and its channels.
 struct VerifyBuffer {
-    chunk: Chunk,
     tails: VerifyTails,
     restore: Deviceptr,
     entries: usize,
@@ -5034,16 +5053,10 @@ struct VerifyBuffer {
 
 impl VerifyBuffer {
     fn allocate(shared: &Shared, rows: usize, conv: &[[Deviceptr; 4]]) -> Result<Self, String> {
-        let chunk = Chunk::allocate(shared, rows, rows, true)?;
-        let free_chunk = || {
-            let pointers = chunk.buffers();
-            shared.cuda.free_buffers(&[&pointers[0], &pointers[1]]);
-        };
         let mut total = 0usize;
         let base = shared
             .cuda
-            .alloc(VerifyTails::bytes(rows, shared), &mut total)
-            .inspect_err(|_| free_chunk())?;
+            .alloc(VerifyTails::bytes(rows, shared), &mut total)?;
         let tails = VerifyTails::new(shared, base, rows);
         let mut table = Vec::with_capacity(conv.len() * 4 * 3 * 8);
         for (layer, slots) in conv.iter().enumerate() {
@@ -5068,21 +5081,16 @@ impl VerifyBuffer {
                     .map(|()| restore)
                     .inspect_err(|_| shared.cuda.free_buffers(&[&restore]))
             })
-            .inspect_err(|_| {
-                free_chunk();
-                shared.cuda.free_buffers(&[&base]);
-            })?;
+            .inspect_err(|_| shared.cuda.free_buffers(&[&base]))?;
         Ok(Self {
-            chunk,
             tails,
             restore,
             entries,
         })
     }
 
-    fn buffers(&self) -> [Deviceptr; 4] {
-        let [arena, summaries] = self.chunk.buffers();
-        [arena, summaries, self.tails.base, self.restore]
+    fn buffers(&self) -> [Deviceptr; 2] {
+        [self.tails.base, self.restore]
     }
 }
 
@@ -5274,9 +5282,6 @@ impl Drop for InklingDeviceSession {
         let shared = Arc::clone(&self.shared);
         self.state.free_lane(&shared);
         let mut pointers = self.state.buffers();
-        if let Some(chunk) = &self.chunk {
-            pointers.extend(chunk.buffers());
-        }
         if let Some(verify) = &self.verify {
             pointers.extend(verify.buffers());
         }
@@ -5313,53 +5318,21 @@ impl InklingDeviceSession {
         self.speculator.reset();
     }
 
-    /// One token's step, drafting first when this rank drafts: the next draft of the last verify
-    /// takes that draft's row; any other token ends the round and steps.
+    /// The step the last verify holds for `token` ([Self::held]): the next draft's row. Any
+    /// other token steps through a shared walk, never here.
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        if let Some(round) = self.round.as_mut()
-            && round.chunk.get(round.fed) == Some(&token)
-        {
-            let logits = round.rows[round.fed].clone();
-            round.fed += 1;
-            round.marks.push(self.sampler.mark());
-            return Ok(self.decoded(token, logits));
-        }
-        self.settle()?;
-        if self.state.position >= self.shared.context {
-            return Err(BackendError::new("context", "the context is exhausted"));
-        }
-        // The round's token and every draft it may verify.
-        let rows = self.state.position + 1 + self.shared.draft.map_or(0, |(_, depth)| depth);
-        self.state
-            .grow(&self.shared, rows)
-            .map_err(|error| BackendError::new("context", error))?;
-        let (drafts, confidence) = self.draft(token)?;
-        if drafts.is_empty() {
-            let position = self.state.position;
-            let logits = self.step(token)?;
-            self.inject(1, position)?;
-            // A round that verifies nothing is still a round: the policy weighs the next depth at
-            // the rate its rounds have made.
-            self.speculator.observe(&confidence, 0, 1);
-            return Ok(self.decoded(token, logits));
-        }
-        let start = self.state.position;
-        let mut chunk = Vec::with_capacity(drafts.len() + 1);
-        chunk.push(token);
-        chunk.extend_from_slice(&drafts);
-        let rows = self.verify_rows(&chunk)?;
-        let logits = rows
-            .first()
-            .cloned()
-            .ok_or_else(|| Self::fail("a verify answered no row"))?;
-        self.round = Some(Round {
-            start,
-            chunk,
-            confidence,
-            rows,
-            fed: 1,
-            marks: Vec::new(),
-        });
+        let Some(round) = self
+            .round
+            .as_mut()
+            .filter(|round| round.chunk.get(round.fed) == Some(&token))
+        else {
+            return Err(Self::fail(format!(
+                "token {token} is not the next draft the last verify holds"
+            )));
+        };
+        let logits = round.rows[round.fed].clone();
+        round.fed += 1;
+        round.marks.push(self.sampler.mark());
         Ok(self.decoded(token, logits))
     }
 
@@ -5391,7 +5364,6 @@ impl InklingDeviceSession {
             boundary: None,
             shared: Arc::clone(shared),
             state,
-            chunk: None,
             history: Vec::new(),
             images: None,
             last_logits: Vec::new(),
@@ -5577,18 +5549,6 @@ impl InklingDeviceSession {
         self.output(logits)
     }
 
-    /// The drafts to verify after `anchor`, and the probability the drafter gave each draft it
-    /// made: none without a drafter, never more than the context has room for past the anchor,
-    /// and of DSpark's chain the leading drafts the depth policy picks from those probabilities.
-    fn draft(&mut self, anchor: u32) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
-        let (mut drafts, confidence) = self.draft_chain(anchor)?;
-        if matches!(self.shared.draft, Some((Drafter::Dspark, _))) {
-            let room = self.shared.context.saturating_sub(self.state.position + 1);
-            drafts.truncate(self.speculator.depth(&confidence, room));
-        }
-        Ok((drafts, confidence))
-    }
-
     /// The drafts after `anchor` before any depth is picked: DSpark's whole chain, with the
     /// probability it gave each draft, or prompt lookup's drafts at the policy's depth.
     fn draft_chain(&mut self, anchor: u32) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
@@ -5649,31 +5609,6 @@ impl InklingDeviceSession {
             .as_ref()
             .ok_or_else(|| Self::fail("a drafter state with no drafter on this rank"))?;
         drafter.inject(&shared, model, rows, position)
-    }
-
-    /// Walks `chunk` (an anchor and its drafts) as one verify and answers every row's logits;
-    /// the state is left past every row until [Self::settle] keeps what was fed.
-    fn verify_rows(&mut self, chunk: &[u32]) -> Result<Vec<Vec<f32>>, BackendError> {
-        if self.verify.is_none() {
-            let rows = self.speculator.max_depth() + 1;
-            self.verify = Some(
-                VerifyBuffer::allocate(&self.shared, rows, &self.state.conv).map_err(Self::fail)?,
-            );
-        }
-        let verify = self
-            .verify
-            .as_mut()
-            .expect("the verify buffer was just opened");
-        let tails = verify.tails;
-        walk_rows(
-            &self.shared,
-            Rows::Verify(&mut self.state, tails),
-            &mut verify.chunk,
-            chunk,
-            PrefillWalk::Chunk,
-            &[],
-            self.drafter.as_ref().map(DraftState::sink),
-        )
     }
 
     /// Ends the last round at the rows fed: the cache keeps them, and the convolution histories

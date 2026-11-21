@@ -335,18 +335,20 @@ impl InklingWalk {
                     let taps = seq.session.drafter.as_ref().map(DraftState::sink);
                     let mut held = self.lock_buffer(&self.buffer, "the lanes' row")?;
                     open_buffer(shared, &mut held, take, 1)?;
-                    let chunk = held.as_mut().expect("the row buffer was just opened");
-                    walk_rows(
+                    let chunk = held.as_ref().expect("the row buffer was just opened");
+                    let mut answered = walk_rows(
                         shared,
-                        Rows::Chunk(&mut seq.session.state),
+                        Rows::Chunk(Box::new(seq.session.state.view())),
                         chunk,
                         slice,
                         walk,
                         &pieces,
                         taps,
-                    )?
-                    .pop()
-                    .ok_or_else(|| BackendError::new(DEVICE, "a chunk answered no row"))?
+                    )?;
+                    seq.session.state.position += take;
+                    answered
+                        .pop()
+                        .ok_or_else(|| BackendError::new(DEVICE, "a chunk answered no row"))?
                 };
             seq.session
                 .inject(take, first)
@@ -444,14 +446,14 @@ impl InklingWalk {
                 tokens.len(),
                 tokens.len().next_power_of_two(),
             )?;
-            let chunk = held.as_mut().expect("the lanes' buffer was just opened");
-            let mut states: Vec<&mut super::State> = segments
-                .iter_mut()
-                .map(|segment| &mut segment.seq.session.state)
+            let chunk = held.as_ref().expect("the lanes' buffer was just opened");
+            let views = segments
+                .iter()
+                .map(|segment| segment.seq.session.state.view())
                 .collect();
             walk_rows(
                 shared,
-                Rows::Lanes(&mut states),
+                Rows::Lanes(views),
                 chunk,
                 &tokens,
                 PrefillWalk::Chunk,
@@ -459,6 +461,9 @@ impl InklingWalk {
                 None,
             )?
         };
+        for segment in segments.iter_mut() {
+            segment.seq.session.state.position += 1;
+        }
         Ok(InklingHidden::lanes(tokens.len(), rows))
     }
 
@@ -535,12 +540,12 @@ impl InklingWalk {
                         .map_err(|error| BackendError::new(DEVICE, error))?,
                 );
             }
-            let chunk = joint.as_mut().expect("the joint buffer was just opened");
-            let mut walked: Vec<Segment<'_>> = segments
-                .iter_mut()
+            let chunk = joint.as_ref().expect("the joint buffer was just opened");
+            let walked = segments
+                .iter()
                 .zip(&shapes)
                 .map(|(segment, &(depth, tails, taps))| Segment {
-                    state: &mut segment.seq.session.state,
+                    state: segment.seq.session.state.view(),
                     tails,
                     rows: depth + 1,
                     taps,
@@ -548,7 +553,7 @@ impl InklingWalk {
                 .collect();
             walk_rows(
                 shared,
-                Rows::Segments(&mut walked),
+                Rows::Segments(walked),
                 chunk,
                 &tokens,
                 PrefillWalk::Chunk,
@@ -556,6 +561,9 @@ impl InklingWalk {
                 None,
             )?
         };
+        for (segment, (depth, _, _)) in segments.iter_mut().zip(&shapes) {
+            segment.seq.session.state.position += depth + 1;
+        }
         let mut rows = walked.into_iter();
         Ok(shapes
             .iter()
@@ -647,9 +655,11 @@ impl Drafter<InklingWalk> for InklingDrafter {
 
     fn open_round(&self, seq: &mut InklingSequence, token: u32) -> Result<Draft, BackendError> {
         if !self.present {
-            // No drafter on this rank: the token's step is the plain one, and no row is left to
-            // verify.
-            return Ok(Draft::Held(seq.session.decode(token)?));
+            // No drafter on this rank: the runtime steps the token through a token pass.
+            return Err(BackendError::new(
+                DEVICE,
+                "this rank has no drafter: a round opens only where the arm drafts",
+            ));
         }
         match seq.session.open_round(token)? {
             Opened::Held(step) => Ok(Draft::Held(step)),

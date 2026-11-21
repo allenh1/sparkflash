@@ -756,34 +756,27 @@ fn probe_band(
 /// The schedule's wide stages (the norms, every projection, the router, the routed band, the
 /// residuals, the block-summary stacks and the collectives) read a row as a row, whoever's it
 /// is. Only four stages read a sequence's own state - the four convolutions' histories, the cache
-/// store, the attention and the position its scale is taken at - and those are what this names.
-pub(super) enum Rows<'s, 'a> {
+/// store, the attention and the position its scale is taken at - and those are what this names,
+/// each through the sequence's [LaneView].
+pub(super) enum Rows {
     /// A prompt chunk: consecutive positions of one sequence, from its next position on.
-    Chunk(&'s mut State),
+    Chunk(Box<LaneView>),
     /// Fused lanes: the next position of each lane's own sequence, one row a lane in the order
     /// given. The sequence stages run each lane's row through the decode step's own launch on
     /// that lane's state, so a lane's row is the bits its decode step alone would give it.
-    Lanes(&'s mut [&'a mut State]),
-    /// A speculative verify: an anchor and its drafts at consecutive positions of one sequence,
-    /// every row answered, each row the bits its own decode step would give it. The walk is
-    /// [PrefillWalk::Chunk], whose projections and band are the decode step's sums; the
-    /// convolutions are a chunk's, which take the decode entry's order; the attention is the
-    /// decode step's split walk over a split arena, each row against its own prefix; and the head
-    /// is the batched GEMV, whose row is the one-row launch's. Each layer's convolution inputs
-    /// are left in the [VerifyTails], so the session can keep any leading run of the rows.
-    Verify(&'s mut State, VerifyTails),
+    Lanes(Vec<LaneView>),
     /// Several sequences' verifies in one walk ([sparkflash_runtime::run_round]): each segment is
     /// one sequence's anchor and drafts at its consecutive positions, the segments' rows one after
     /// another in the order given. Each segment's sequence stages are the verify's on its own
     /// state, tails and drafter taps, so each row is the bits its own decode step would give it.
     /// A segment's convolutions read and leave their rows in its own tails, so the shared input
     /// rows are never written over.
-    Segments(&'s mut [Segment<'a>]),
+    Segments(Vec<Segment>),
 }
 
 /// One sequence's rows in a [Rows::Segments] walk.
-pub(super) struct Segment<'a> {
-    pub state: &'a mut State,
+pub(super) struct Segment {
+    pub state: LaneView,
     /// The sequence's verify tails: its convolutions' history and rows, for its settle.
     pub tails: VerifyTails,
     /// The anchor and the drafts verified with it.
@@ -903,312 +896,423 @@ impl ResidualChain {
     }
 }
 
-/// Run the chunk schedule over `tokens` and answer the logits: the last row's for a chunk, every
-/// row's for fused lanes.
+/// The chunk schedule's steps, run by the walk that [ChunkRun::begin] opened.
+fn chunk_schedule(shared: &Shared) -> Result<&InklingDevicePlan, BackendError> {
+    shared.prefill.as_ref().ok_or_else(|| {
+        device_error("this rank has no chunk schedule: rebuild with the prefill entries")
+    })
+}
+
+/// One block residual of a chunk walk: `rows` rows from row `first` of `partial` against their
+/// stacks of `blocks` summaries, through the walk's chain ([RESIDUAL_CHAIN_ENV]) when it chains
+/// and the per-call forms otherwise. `first` is where the residual's share of the carry starts.
+#[allow(clippy::too_many_arguments)]
+fn residual(
+    shared: &Shared,
+    chunk: &Chunk,
+    chain: &mut Option<ResidualChain>,
+    summaries: Deviceptr,
+    partial: Deviceptr,
+    queries: Deviceptr,
+    count: usize,
+    out: Deviceptr,
+    blocks: usize,
+    first: usize,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let scratch = &chunk.scratch;
+    let summary_stride = chunk.summary_stride;
+    let stats = scratch
+        .residual_stats
+        .offset(first * RESIDUAL_STATS_ROW * std::mem::size_of::<f32>());
+    match chain {
+        Some(chain) => chain.residual(
+            shared,
+            summaries,
+            partial,
+            queries,
+            count,
+            out,
+            stats,
+            blocks,
+            rows,
+            summary_stride,
+        ),
+        None => shared.block_residual(
+            summaries,
+            partial,
+            queries,
+            out,
+            scratch.residual_stats,
+            blocks,
+            count,
+            rows,
+            summary_stride,
+        ),
+    }
+    .map_err(device_error)
+}
+
+/// One walk of the chunk schedule over `tokens`, run as stages: [Self::begin] checks the rows,
+/// [Self::embed] runs the prologue, [Self::steps] any run of a layer's steps in order, and
+/// [Self::finish] the epilogue, answering the logits: the last row's for a chunk, every row's for
+/// fused lanes and segments.
 ///
 /// `walk` picks the dense projections' and the band's kernels: a prompt passes this rank's
-/// [PrefillWalk], and fused lanes pass [PrefillWalk::Chunk], whose sums are the decode step's.
-/// `images` are the chunk's image rows ([Injection]); fused lanes step text and pass none.
-pub(super) fn walk_rows(
-    shared: &Shared,
-    mut sequences: Rows<'_, '_>,
-    chunk: &mut Chunk,
-    tokens: &[u32],
+/// [PrefillWalk], and fused lanes and segments pass [PrefillWalk::Chunk], whose sums are the
+/// decode step's. `images` are the chunk's image rows ([Injection]); fused lanes step text and
+/// pass none. The run holds its sequences' [LaneView]s, so it borrows nothing between stages.
+pub(super) struct ChunkRun {
+    shared: Arc<Shared>,
+    sequences: Rows,
+    chunk: Chunk,
+    tokens: Vec<u32>,
     walk: PrefillWalk,
-    images: &[Injection],
-    taps: Option<TapSink>,
-) -> Result<Vec<Vec<f32>>, BackendError> {
-    let config = &shared.config;
-    let plan = &shared.plan;
-    let schedule = shared.prefill.as_ref().ok_or_else(|| {
-        device_error("this rank has no chunk schedule: rebuild with the prefill entries")
-    })?;
-    let rows = tokens.len();
-    if rows == 0 {
-        return Err(device_error("a chunk needs at least one row"));
-    }
-    if rows > chunk.rows {
-        return Err(device_error(format!(
-            "a chunk of {rows} rows is wider than the {}-row buffer",
-            chunk.rows
-        )));
-    }
-    // A chunk answers its last row; lanes answer every row, one a lane, and a verify every row.
-    let answers = match &sequences {
-        Rows::Chunk(_) => 1,
-        Rows::Verify(_, tails) => {
-            if rows > tails.rows {
-                return Err(device_error(format!(
-                    "a verify of {rows} rows is deeper than the {} rows its tails hold",
-                    tails.rows
-                )));
-            }
-            if walk != PrefillWalk::Chunk {
-                return Err(device_error(
-                    "a verify's rows are the decode step's sums: it walks PrefillWalk::Chunk",
-                ));
-            }
-            if tails.history != config.conv_history().max(1) {
-                return Err(device_error(format!(
-                    "the verify's tails hold {} history rows and the convolutions read {}",
-                    tails.history,
-                    config.conv_history().max(1)
-                )));
-            }
-            rows
-        }
-        Rows::Lanes(states) => {
-            if states.len() != rows {
-                return Err(device_error(format!(
-                    "{} lanes were given {rows} tokens: a lane steps one token",
-                    states.len()
-                )));
-            }
-            rows
-        }
-        Rows::Segments(segments) => {
-            let given: usize = segments.iter().map(|segment| segment.rows).sum();
-            if given != rows {
-                return Err(device_error(format!(
-                    "segments of {given} rows were given {rows} tokens"
-                )));
-            }
-            if walk != PrefillWalk::Chunk {
-                return Err(device_error(
-                    "a verify's rows are the decode step's sums: segments walk PrefillWalk::Chunk",
-                ));
-            }
-            for segment in segments.iter() {
-                let tails = &segment.tails;
-                if segment.rows == 0 || segment.rows > tails.rows {
-                    return Err(device_error(format!(
-                        "a segment of {} rows, and its tails hold 1..={}",
-                        segment.rows, tails.rows
-                    )));
-                }
-                if tails.history != config.conv_history().max(1) {
-                    return Err(device_error(format!(
-                        "a segment's tails hold {} history rows and the convolutions read {}",
-                        tails.history,
-                        config.conv_history().max(1)
-                    )));
-                }
-            }
-            rows
-        }
-    };
-    if answers > chunk.answers {
-        return Err(device_error(format!(
-            "{answers} answered rows need more than the buffer's {} logit rows",
-            chunk.answers
-        )));
-    }
-    let hidden = shared.hidden();
-    let kv_width = shared.kv_width();
-    let heads = shared.heads();
-    let head_dim = config.head_dim;
-    let kv_heads = plan.rank_kv_heads().max(1);
-    let groups = heads / kv_heads;
-    let history = config.conv_history().max(1);
-    let position = match &sequences {
-        Rows::Chunk(state) | Rows::Verify(state, _) => state.position,
-        Rows::Lanes(_) | Rows::Segments(_) => 0,
-    };
-    // Each row's absolute position, for the scale tables: a segment's rows are at its own.
-    let row_positions: Vec<usize> = match &sequences {
-        Rows::Segments(segments) => segments
-            .iter()
-            .flat_map(|segment| (0..segment.rows).map(|row| segment.state.position + row))
-            .collect(),
-        _ => (0..rows).map(|row| position + row).collect(),
-    };
-    // Each segment's first row in the walk.
-    let offsets: Vec<usize> = match &sequences {
-        Rows::Segments(segments) => segments
-            .iter()
-            .scan(0, |first, segment| {
-                let at = *first;
-                *first += segment.rows;
-                Some(at)
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    // Where the drafter's taps go: the walk's one sink over every row, or each segment's own over
-    // its rows.
-    let sinks: Vec<(TapSink, usize, usize)> = match &sequences {
-        Rows::Segments(segments) => segments
-            .iter()
-            .zip(&offsets)
-            .filter_map(|(segment, &first)| segment.taps.map(|sink| (sink, first, segment.rows)))
-            .collect(),
-        _ => taps.map(|sink| (sink, 0, rows)).into_iter().collect(),
-    };
-    let scratch = &chunk.scratch;
-    let weights = &shared.weights;
-    let weight = |index: usize| weights.get(index).pointer;
-    let run = |result: Result<(), String>| result.map_err(device_error);
-    let summary_stride = chunk.summary_stride;
-    let mut blocks = 0usize;
-    // The walk's block residuals chained ([RESIDUAL_CHAIN_ENV]) over more rows than the two-launch
-    // form takes; a decode-sized walk keeps the per-call forms. `first` is the residual's first
-    // row, where its share of the carry starts.
-    let mut chain = (shared.residual_chain && rows > RESIDUAL_SPLIT_PAIRS)
-        .then(|| ResidualChain::new(schedule, weights));
-    #[allow(clippy::too_many_arguments)]
-    let residual = |chain: &mut Option<ResidualChain>,
-                    summaries: Deviceptr,
-                    partial: Deviceptr,
-                    queries: Deviceptr,
-                    count: usize,
-                    out: Deviceptr,
-                    blocks: usize,
-                    first: usize,
-                    rows: usize|
-     -> Result<(), BackendError> {
-        let stats = scratch
-            .residual_stats
-            .offset(first * RESIDUAL_STATS_ROW * std::mem::size_of::<f32>());
-        run(match chain {
-            Some(chain) => chain.residual(
-                shared,
-                summaries,
-                partial,
-                queries,
-                count,
-                out,
-                stats,
-                blocks,
-                rows,
-                summary_stride,
-            ),
-            None => shared.block_residual(
-                summaries,
-                partial,
-                queries,
-                out,
-                scratch.residual_stats,
-                blocks,
-                count,
-                rows,
-                summary_stride,
-            ),
-        })
-    };
+    images: Vec<Injection>,
+    rows: usize,
+    answers: usize,
+    /// A chunk's first position; nothing for lanes and segments, whose rows are each their own.
+    position: usize,
+    /// Each row's absolute position, for the scale tables: a segment's rows are at its own.
+    row_positions: Vec<usize>,
+    /// Each segment's first row in the walk.
+    offsets: Vec<usize>,
+    /// Where the drafter's taps go: the walk's one sink over every row, or each segment's own
+    /// over its rows.
+    sinks: Vec<(TapSink, usize, usize)>,
+    /// The walk's block residuals chained ([RESIDUAL_CHAIN_ENV]) over more rows than the
+    /// two-launch form takes; a decode-sized walk keeps the per-call forms.
+    chain: Option<ResidualChain>,
+    /// The scale rule whose per-row table the walk uploaded last.
+    uploaded_tau: Option<TauRule>,
+    /// The summaries the rows' stacks hold.
+    blocks: usize,
+    /// The layer step the walk runs next.
+    cursor: usize,
+    /// The convolution the layer ran last, whose output the next residual add reads.
+    previous_conv: Option<ConvSlot>,
+    /// Whether this layer's band already gathered its mix rows into `mixed` (run_band_halves),
+    /// which is then what its ExpertDelta collective would have done.
+    band_gathered: bool,
+}
 
-    for step in schedule.prologue() {
-        match (step.op, step.target) {
-            (Op::Embed, _) => {
-                // The embedding is vocabulary-parallel: exactly one rank holds a token's row, so
-                // each owned token is widened where it lands and the gather below sums the rows
-                // with the zeros the other ranks contribute.
-                let rank_vocab = plan.rank_vocab();
-                let first = plan.tp().rank() * rank_vocab;
-                run(shared
-                    .cuda
-                    .memset_d8_async(scratch.x, 0, rows * hidden * std::mem::size_of::<f32>())
-                    .map_err(|error| error.to_string()))?;
-                let table = weight(step.weights[0]);
-                for (row, token) in tokens.iter().enumerate() {
-                    let Some(local) = (*token as usize)
-                        .checked_sub(first)
-                        .filter(|local| *local < rank_vocab)
-                    else {
-                        continue;
-                    };
-                    run(shared.call(
-                        shared.kernels.embed,
-                        sparkflash_ops::calls::embed(
-                            table.0,
-                            scratch
-                                .x
-                                .offset(row * hidden * std::mem::size_of::<f32>())
-                                .0,
-                            local as u32,
-                            (hidden, hidden),
-                        ),
-                    ))?;
-                }
-            }
-            (Op::Collective(Collective::EmbeddingRow), _) => {
-                exchange_sum(shared, scratch.x, rows * hidden)?;
-            }
-            (Op::RmsNorm, Target::Norm(NormRole::Embedding)) => {
-                let gain = weight(step.weights[0]);
-                run(shared.rmsnorm_rows(scratch.x, gain, scratch.x, rows, hidden, hidden, hidden))?;
-            }
-            (op, target) => {
-                return Err(device_error(format!(
-                    "the chunk prologue's {op:?} at {target:?} has no device dispatch"
-                )));
-            }
+impl ChunkRun {
+    /// Opens a walk of `tokens` over `sequences` in `chunk`'s buffers, once the rows are checked
+    /// against the buffer and the sequences.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn begin(
+        shared: &Arc<Shared>,
+        sequences: Rows,
+        chunk: &Chunk,
+        tokens: &[u32],
+        walk: PrefillWalk,
+        images: &[Injection],
+        taps: Option<TapSink>,
+    ) -> Result<Self, BackendError> {
+        let config = &shared.config;
+        let schedule = chunk_schedule(shared)?;
+        let rows = tokens.len();
+        if rows == 0 {
+            return Err(device_error("a chunk needs at least one row"));
         }
-    }
-    let stride = hidden * std::mem::size_of::<f32>();
-    for image in images {
-        if image.row + image.count > rows {
+        if rows > chunk.rows {
             return Err(device_error(format!(
-                "image rows {}..{} fall outside a {rows}-row chunk",
-                image.row,
-                image.row + image.count
+                "a chunk of {rows} rows is wider than the {}-row buffer",
+                chunk.rows
             )));
         }
-        run(shared.cuda.copy_dtod_async(
-            &scratch.x.offset(image.row * stride),
-            &image.source,
-            image.count * stride,
-        ))?;
+        // A chunk answers its last row; lanes answer every row, one a lane, and segments every row.
+        let answers = match &sequences {
+            Rows::Chunk(_) => 1,
+            Rows::Lanes(states) => {
+                if states.len() != rows {
+                    return Err(device_error(format!(
+                        "{} lanes were given {rows} tokens: a lane steps one token",
+                        states.len()
+                    )));
+                }
+                rows
+            }
+            Rows::Segments(segments) => {
+                let given: usize = segments.iter().map(|segment| segment.rows).sum();
+                if given != rows {
+                    return Err(device_error(format!(
+                        "segments of {given} rows were given {rows} tokens"
+                    )));
+                }
+                if walk != PrefillWalk::Chunk {
+                    return Err(device_error(
+                        "a verify's rows are the decode step's sums: segments walk PrefillWalk::Chunk",
+                    ));
+                }
+                for segment in segments.iter() {
+                    let tails = &segment.tails;
+                    if segment.rows == 0 || segment.rows > tails.rows {
+                        return Err(device_error(format!(
+                            "a segment of {} rows, and its tails hold 1..={}",
+                            segment.rows, tails.rows
+                        )));
+                    }
+                    if tails.history != config.conv_history().max(1) {
+                        return Err(device_error(format!(
+                            "a segment's tails hold {} history rows and the convolutions read {}",
+                            tails.history,
+                            config.conv_history().max(1)
+                        )));
+                    }
+                }
+                rows
+            }
+        };
+        if answers > chunk.answers {
+            return Err(device_error(format!(
+                "{answers} answered rows need more than the buffer's {} logit rows",
+                chunk.answers
+            )));
+        }
+        let position = match &sequences {
+            Rows::Chunk(state) => state.position,
+            Rows::Lanes(_) | Rows::Segments(_) => 0,
+        };
+        let row_positions: Vec<usize> = match &sequences {
+            Rows::Segments(segments) => segments
+                .iter()
+                .flat_map(|segment| (0..segment.rows).map(|row| segment.state.position + row))
+                .collect(),
+            _ => (0..rows).map(|row| position + row).collect(),
+        };
+        let offsets: Vec<usize> = match &sequences {
+            Rows::Segments(segments) => segments
+                .iter()
+                .scan(0, |first, segment| {
+                    let at = *first;
+                    *first += segment.rows;
+                    Some(at)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let sinks: Vec<(TapSink, usize, usize)> = match &sequences {
+            Rows::Segments(segments) => segments
+                .iter()
+                .zip(&offsets)
+                .filter_map(|(segment, &first)| {
+                    segment.taps.map(|sink| (sink, first, segment.rows))
+                })
+                .collect(),
+            _ => taps.map(|sink| (sink, 0, rows)).into_iter().collect(),
+        };
+        let chain = (shared.residual_chain && rows > RESIDUAL_SPLIT_PAIRS)
+            .then(|| ResidualChain::new(schedule, &shared.weights));
+        Ok(Self {
+            shared: Arc::clone(shared),
+            sequences,
+            chunk: chunk.clone(),
+            tokens: tokens.to_vec(),
+            walk,
+            images: images.to_vec(),
+            rows,
+            answers,
+            position,
+            row_positions,
+            offsets,
+            sinks,
+            chain,
+            uploaded_tau: None,
+            blocks: 0,
+            cursor: 0,
+            previous_conv: None,
+            band_gathered: false,
+        })
     }
-    probe(shared, "chunk embed_norm", scratch.x, rows, hidden)?;
 
-    // A layer's per-row scale table: null for a layer that does not scale (its kernels take the
-    // scalar `tau`, 1 at every position), otherwise the rule's factor at each row's position. The
-    // full layers share one rule, so the table goes up once a walk: an upload from pageable memory
-    // waits for the stream, and one a layer left the GPU idle between layers.
-    let mut uploaded_tau: Option<TauRule> = None;
-    let mut tau_table = |rule: TauRule| -> Result<Deviceptr, BackendError> {
-        if rule == TauRule::One {
-            return Ok(Deviceptr(0));
-        }
-        if uploaded_tau != Some(rule) {
-            let taus: Vec<f32> = row_positions.iter().map(|&at| rule.at(at)).collect();
-            run(shared
-                .cuda
-                .copy_htod(&scratch.taus, &row_bytes(&taus))
-                .map_err(|error| error.to_string()))?;
-            uploaded_tau = Some(rule);
-        }
-        Ok(scratch.taus)
-    };
+    /// The layers the chunk schedule walks, and each one's steps.
+    pub(super) fn layer_steps(&self) -> Result<Vec<usize>, BackendError> {
+        Ok(chunk_schedule(&self.shared)?
+            .layers()
+            .iter()
+            .map(|layer| layer.steps.len())
+            .collect())
+    }
 
-    for (index, layer) in schedule.layers().iter().enumerate() {
-        // The drafter's taps of this layer: every row's stream as the layer starts on it.
-        for &(sink, first, count) in &sinks {
-            if let Some(slot) = sink.slot(layer.index) {
-                sink.capture(
-                    shared,
-                    scratch
-                        .x
-                        .offset(first * hidden * std::mem::size_of::<f32>()),
-                    count,
-                    slot,
-                )?;
+    /// The prologue: each row's embedding, gathered across the ranks and normed, then the
+    /// image rows ([Injection]) over the normed rows.
+    pub(super) fn embed(&self) -> Result<(), BackendError> {
+        let shared: &Shared = &self.shared;
+        let plan = &shared.plan;
+        let schedule = chunk_schedule(shared)?;
+        let rows = self.rows;
+        let hidden = shared.hidden();
+        let scratch = &self.chunk.scratch;
+        let weights = &shared.weights;
+        let weight = |index: usize| weights.get(index).pointer;
+        let run = |result: Result<(), String>| result.map_err(device_error);
+        let tokens = &self.tokens;
+        let images = &self.images;
+        for step in schedule.prologue() {
+            match (step.op, step.target) {
+                (Op::Embed, _) => {
+                    // The embedding is vocabulary-parallel: exactly one rank holds a token's row,
+                    // so each owned token is widened where it lands and the gather below sums the
+                    // rows with the zeros the other ranks contribute.
+                    let rank_vocab = plan.rank_vocab();
+                    let first = plan.tp().rank() * rank_vocab;
+                    run(shared
+                        .cuda
+                        .memset_d8_async(scratch.x, 0, rows * hidden * std::mem::size_of::<f32>())
+                        .map_err(|error| error.to_string()))?;
+                    let table = weight(step.weights[0]);
+                    for (row, token) in tokens.iter().enumerate() {
+                        let Some(local) = (*token as usize)
+                            .checked_sub(first)
+                            .filter(|local| *local < rank_vocab)
+                        else {
+                            continue;
+                        };
+                        run(shared.call(
+                            shared.kernels.embed,
+                            sparkflash_ops::calls::embed(
+                                table.0,
+                                scratch
+                                    .x
+                                    .offset(row * hidden * std::mem::size_of::<f32>())
+                                    .0,
+                                local as u32,
+                                (hidden, hidden),
+                            ),
+                        ))?;
+                    }
+                }
+                (Op::Collective(Collective::EmbeddingRow), _) => {
+                    exchange_sum(shared, scratch.x, rows * hidden)?;
+                }
+                (Op::RmsNorm, Target::Norm(NormRole::Embedding)) => {
+                    let gain = weight(step.weights[0]);
+                    run(shared
+                        .rmsnorm_rows(scratch.x, gain, scratch.x, rows, hidden, hidden, hidden))?;
+                }
+                (op, target) => {
+                    return Err(device_error(format!(
+                        "the chunk prologue's {op:?} at {target:?} has no device dispatch"
+                    )));
+                }
+            }
+        }
+        let stride = hidden * std::mem::size_of::<f32>();
+        for image in images {
+            if image.row + image.count > rows {
+                return Err(device_error(format!(
+                    "image rows {}..{} fall outside a {rows}-row chunk",
+                    image.row,
+                    image.row + image.count
+                )));
+            }
+            run(shared.cuda.copy_dtod_async(
+                &scratch.x.offset(image.row * stride),
+                &image.source,
+                image.count * stride,
+            ))?;
+        }
+        probe(shared, "chunk embed_norm", scratch.x, rows, hidden)?;
+        Ok(())
+    }
+
+    /// Steps `from..to` of layer `index`'s chunk schedule, the layer's drafter taps first when
+    /// `from` is its first step. The layer's own cursor carries between the calls: a step that
+    /// went on past `to` (an attention half sums its delta as it runs, a band its mix) is not run
+    /// again by the next call.
+    pub(super) fn steps(
+        &mut self,
+        index: usize,
+        from: usize,
+        to: usize,
+    ) -> Result<(), BackendError> {
+        let mut chain = self.chain.take();
+        let mut uploaded_tau = self.uploaded_tau;
+        let mut blocks = self.blocks;
+        let (mut cursor, mut previous_conv, mut band_gathered) = if from == 0 {
+            (0, None, false)
+        } else {
+            (
+                self.cursor.max(from),
+                self.previous_conv,
+                self.band_gathered,
+            )
+        };
+        let shared: &Shared = &self.shared;
+        let config = &shared.config;
+        let plan = &shared.plan;
+        let schedule = chunk_schedule(shared)?;
+        let rows = self.rows;
+        let hidden = shared.hidden();
+        let chunk = &self.chunk;
+        let scratch = &chunk.scratch;
+        let sequences = &self.sequences;
+        let weights = &shared.weights;
+        let weight = |index: usize| weights.get(index).pointer;
+        let run = |result: Result<(), String>| result.map_err(device_error);
+        let kv_width = shared.kv_width();
+        let heads = shared.heads();
+        let head_dim = config.head_dim;
+        let kv_heads = plan.rank_kv_heads().max(1);
+        let groups = heads / kv_heads;
+        let history = config.conv_history().max(1);
+        let walk = self.walk;
+        let position = self.position;
+        let row_positions = &self.row_positions;
+        let offsets = &self.offsets;
+        let sinks = &self.sinks;
+        let summary_stride = chunk.summary_stride;
+        let layer = schedule
+            .layers()
+            .get(index)
+            .ok_or_else(|| device_error(format!("the chunk schedule has no layer {index}")))?;
+        let to = to.min(layer.steps.len());
+        // A layer's per-row scale table: null for a layer that does not scale (its kernels take the
+        // scalar `tau`, 1 at every position), otherwise the rule's factor at each row's position.
+        // The full layers share one rule, so the table goes up once a walk: an upload from pageable
+        // memory waits for the stream, and one a layer left the GPU idle between layers.
+        let mut tau_table = |rule: TauRule| -> Result<Deviceptr, BackendError> {
+            if rule == TauRule::One {
+                return Ok(Deviceptr(0));
+            }
+            if uploaded_tau != Some(rule) {
+                let taus: Vec<f32> = row_positions.iter().map(|&at| rule.at(at)).collect();
+                run(shared
+                    .cuda
+                    .copy_htod(&scratch.taus, &row_bytes(&taus))
+                    .map_err(|error| error.to_string()))?;
+                uploaded_tau = Some(rule);
+            }
+            Ok(scratch.taus)
+        };
+
+        if from == 0 {
+            // The drafter's taps of this layer: every row's stream as the layer starts on it.
+            for &(sink, first, count) in sinks {
+                if let Some(slot) = sink.slot(layer.index) {
+                    sink.capture(
+                        shared,
+                        scratch
+                            .x
+                            .offset(first * hidden * std::mem::size_of::<f32>()),
+                        count,
+                        slot,
+                    )?;
+                }
             }
         }
         let sliding = layer.sliding;
         let cache_rows = layer.kv_rows;
         let clips = shared.clip[index];
-        let mut previous_conv: Option<ConvSlot> = None;
-        // Whether this layer's band already gathered its mix rows into `mixed` (run_band_halves),
-        // which is then what its ExpertDelta collective would have done.
-        let mut band_gathered = false;
-        let mut cursor = 0usize;
-        while cursor < layer.steps.len() {
+        while cursor < to {
             let step = &layer.steps[cursor];
             match (step.op, step.target) {
                 (Op::BlockResidual, Target::Input(ResidualInput::Attention)) => {
                     let queries = weight(step.weights[0]);
                     residual(
+                        shared,
+                        chunk,
                         &mut chain,
                         chunk.summaries,
                         scratch.x,
@@ -1339,7 +1443,7 @@ pub(super) fn walk_rows(
                     };
                     let slot_index = conv_slot(slot);
                     match &sequences {
-                        Rows::Chunk(state) | Rows::Verify(state, _) => {
+                        Rows::Chunk(state) => {
                             // The seam: this slot's history in the row layout the chunk reads,
                             // and the tail this launch leaves back in the layout the next decode
                             // step reads.
@@ -1360,21 +1464,17 @@ pub(super) fn walk_rows(
                                 channels,
                                 history,
                             ))?;
-                            // A verify keeps its rows instead, and the round's settle restores the
-                            // history from them.
-                            if !keep_tail(shared, &sequences, chunk, index, slot_index, rows)? {
-                                run(shared.conv_history(
-                                    chunk
-                                        .conv_head(slot_index)
-                                        .offset(rows * channels * std::mem::size_of::<f32>()),
-                                    state.conv[index][slot_index],
-                                    channels,
-                                    false,
-                                ))?;
-                            }
+                            run(shared.conv_history(
+                                chunk
+                                    .conv_head(slot_index)
+                                    .offset(rows * channels * std::mem::size_of::<f32>()),
+                                state.conv[index][slot_index],
+                                channels,
+                                false,
+                            ))?;
                         }
                         Rows::Segments(segments) => {
-                            for (segment, &first) in segments.iter().zip(&offsets) {
+                            for (segment, &first) in segments.iter().zip(offsets) {
                                 let tail = segment.tails.at(index, slot_index);
                                 segment_input(
                                     shared, chunk, segment, index, slot_index, first, channels,
@@ -1439,7 +1539,7 @@ pub(super) fn walk_rows(
                     )?;
                     let slot_index = conv_slot(slot);
                     match &sequences {
-                        Rows::Chunk(state) | Rows::Verify(state, _) => {
+                        Rows::Chunk(state) => {
                             run(shared.conv_history(
                                 state.conv[index][slot_index],
                                 chunk.conv_head(slot_index),
@@ -1456,20 +1556,18 @@ pub(super) fn walk_rows(
                                 kv_width,
                                 history,
                             ))?;
-                            if !keep_tail(shared, &sequences, chunk, index, slot_index, rows)? {
-                                run(shared.conv_history(
-                                    chunk
-                                        .conv_head(slot_index)
-                                        .offset(rows * kv_width * std::mem::size_of::<f32>()),
-                                    state.conv[index][slot_index],
-                                    kv_width,
-                                    false,
-                                ))?;
-                            }
+                            run(shared.conv_history(
+                                chunk
+                                    .conv_head(slot_index)
+                                    .offset(rows * kv_width * std::mem::size_of::<f32>()),
+                                state.conv[index][slot_index],
+                                kv_width,
+                                false,
+                            ))?;
                         }
                         Rows::Segments(segments) => {
                             let byte = std::mem::size_of::<f32>();
-                            for (segment, &first) in segments.iter().zip(&offsets) {
+                            for (segment, &first) in segments.iter().zip(offsets) {
                                 let tail = segment.tails.at(index, slot_index);
                                 segment_input(
                                     shared, chunk, segment, index, slot_index, first, kv_width,
@@ -1510,10 +1608,7 @@ pub(super) fn walk_rows(
                     previous_conv = Some(slot);
                 }
                 (Op::KvStore, _) => match &sequences {
-                    // A verify's rows land where its decode steps would store them; the rows it
-                    // does not keep are past the position the session leaves, and the next rows
-                    // stored there overwrite them before any row reads them.
-                    Rows::Chunk(state) | Rows::Verify(state, _) => run(shared.launch(
+                    Rows::Chunk(state) => run(shared.launch(
                         shared.kernels.kv_store,
                         (flat(kv_width), rows as u32, 1),
                         (ELEMENT_BLOCK, 1, 1),
@@ -1533,7 +1628,7 @@ pub(super) fn walk_rows(
                     Rows::Segments(segments) => {
                         // Each segment's rows land where its verify alone would store them.
                         let byte = std::mem::size_of::<f32>();
-                        for (segment, &first) in segments.iter().zip(&offsets) {
+                        for (segment, &first) in segments.iter().zip(offsets) {
                             let at = first * kv_width * byte;
                             let state = &segment.state;
                             run(shared.launch(
@@ -1647,35 +1742,6 @@ pub(super) fn walk_rows(
                                 continue;
                             }
                         }
-                        Rows::Verify(state, _) => {
-                            // The decode step's attention, each row against its own prefix: the
-                            // split arena's passes are the decode step's, and the rows' scales are
-                            // the plan's rule at each row's position, as the decode step takes it.
-                            let taus = tau_table(layer.tau)?;
-                            run(shared.attention_rows(
-                                scratch,
-                                index,
-                                scratch.q,
-                                scratch.gate,
-                                state.keys[index],
-                                state.values[index],
-                                state.tables[index],
-                                scratch.rel,
-                                bank,
-                                scratch.sink,
-                                clips,
-                                scratch.attn_bf16,
-                                taus,
-                                rows,
-                                position,
-                                kv_heads,
-                                groups,
-                                if sliding { layer.window } else { 0 },
-                                if sliding { cache_rows } else { 0 },
-                                layer.rel_extent,
-                                layer.tau.at(position),
-                            ))?;
-                        }
                         Rows::Segments(segments) => {
                             // Each segment's rows as its verify alone runs them: the decode
                             // step's attention, each row against its own prefix, the segments
@@ -1683,7 +1749,7 @@ pub(super) fn walk_rows(
                             let taus = tau_table(layer.tau)?;
                             let byte = std::mem::size_of::<f32>();
                             let query_width = heads * head_dim;
-                            for (segment, &first) in segments.iter().zip(&offsets) {
+                            for (segment, &first) in segments.iter().zip(offsets) {
                                 let state = &segment.state;
                                 let at = state.position;
                                 let segment_taus = if taus.0 == 0 {
@@ -1822,6 +1888,8 @@ pub(super) fn walk_rows(
                 (Op::BlockResidual, Target::Input(ResidualInput::Mlp)) => {
                     let queries = weight(step.weights[0]);
                     residual(
+                        shared,
+                        chunk,
                         &mut chain,
                         chunk.summaries,
                         scratch.x,
@@ -1895,7 +1963,7 @@ pub(super) fn walk_rows(
             }
             cursor += 1;
         }
-        if trace_on() {
+        if to == layer.steps.len() && trace_on() {
             let mut bytes = vec![0u8; rows * hidden * std::mem::size_of::<f32>()];
             run(shared
                 .cuda
@@ -1914,190 +1982,203 @@ pub(super) fn walk_rows(
                 );
             }
         }
+        self.chain = chain;
+        self.uploaded_tau = uploaded_tau;
+        self.blocks = blocks;
+        self.cursor = cursor;
+        self.previous_conv = previous_conv;
+        self.band_gathered = band_gathered;
+        Ok(())
     }
 
-    // The epilogue belongs to the answered rows: a chunk's last row, whose head is what the sampler
-    // reads, or every lane's. Each answered row's block residual is that row's own chain.
-    let first = rows - answers;
-    let byte = std::mem::size_of::<f32>();
-    let rank_vocab = plan.rank_vocab();
-    let padded = rank_vocab * shared.exchange.world();
-    let unpadded = config.unpadded_vocab_size.min(padded).max(1);
-    let mut output_queries: Option<Deviceptr> = None;
-    for step in schedule.epilogue() {
-        match (step.op, step.target) {
-            (Op::BlockResidual, Target::Input(ResidualInput::Output)) => {
-                let queries = weight(step.weights[0]);
-                output_queries = Some(queries);
-                residual(
-                    &mut chain,
-                    chunk.summaries.offset(first * summary_stride * byte),
-                    scratch.x.offset(first * hidden * byte),
-                    queries,
-                    1,
-                    scratch.final_row,
-                    blocks,
-                    first,
-                    answers,
-                )?;
-            }
-            (Op::RmsNorm, Target::Norm(NormRole::Final)) => {
-                let gain = weight(step.weights[0]);
-                run(shared.rmsnorm(scratch.final_row, gain, scratch.final_row, answers, hidden))?;
-                if let Some(&(sink, _, _)) = sinks.first() {
-                    if answers == rows {
-                        for &(sink, first, count) in &sinks {
-                            sink.capture(
-                                shared,
-                                scratch.final_row.offset(first * hidden * byte),
-                                count,
-                                FINAL_TAP,
-                            )?;
-                        }
-                    } else {
-                        // A chunk answers its last row, and the drafter's last tap is every row's
-                        // normed output: the same per-row chain over all of them, into a buffer
-                        // the epilogue no longer reads.
-                        let queries = output_queries.ok_or_else(|| {
-                            device_error("the epilogue norms before its output residual")
-                        })?;
-                        residual(
-                            &mut chain,
-                            chunk.summaries,
-                            scratch.x,
-                            queries,
-                            1,
-                            scratch.q_in,
-                            blocks,
-                            0,
-                            rows,
-                        )?;
-                        run(shared.rmsnorm(scratch.q_in, gain, scratch.q_in, rows, hidden))?;
-                        sink.capture(shared, scratch.q_in, rows, FINAL_TAP)?;
-                    }
-                }
-            }
-            (Op::Gemv, Target::Project(Projection::Head)) => {
-                let matrix = weight(step.weights[0]);
-                // The head takes the row GEMV: the packed copy is the row walk's, and
-                // version 2 returned the head to the body that layout reads.
-                match &sequences {
-                    Rows::Chunk(_) => run(shared.gemv(
-                        matrix,
-                        scratch.final_row,
-                        scratch.logits,
-                        rank_vocab,
-                        hidden,
-                    ))?,
-                    // The lanes' or a verify's rows through the batched GEMV, whose row is the
-                    // one-row launch's bits.
-                    Rows::Lanes(_) | Rows::Verify(..) | Rows::Segments(_) => project(
+    /// The epilogue over the answered rows and their logits read back: a chunk's last row, every
+    /// lane's or every segment's row. The caller moves its sequences' positions on.
+    pub(super) fn finish(mut self) -> Result<Vec<Vec<f32>>, BackendError> {
+        let mut chain = self.chain.take();
+        let blocks = self.blocks;
+        let shared: &Shared = &self.shared;
+        let config = &shared.config;
+        let plan = &shared.plan;
+        let schedule = chunk_schedule(shared)?;
+        let rows = self.rows;
+        let hidden = shared.hidden();
+        let chunk = &self.chunk;
+        let scratch = &chunk.scratch;
+        let sequences = &self.sequences;
+        let weights = &shared.weights;
+        let weight = |index: usize| weights.get(index).pointer;
+        let run = |result: Result<(), String>| result.map_err(device_error);
+        let answers = self.answers;
+        let sinks = &self.sinks;
+        let summary_stride = chunk.summary_stride;
+        // The epilogue belongs to the answered rows: a chunk's last row, whose head is what the
+        // sampler reads, or every lane's. Each answered row's block residual is that row's own
+        // chain.
+        let first = rows - answers;
+        let byte = std::mem::size_of::<f32>();
+        let rank_vocab = plan.rank_vocab();
+        let padded = rank_vocab * shared.exchange.world();
+        let unpadded = config.unpadded_vocab_size.min(padded).max(1);
+        let mut output_queries: Option<Deviceptr> = None;
+        for step in schedule.epilogue() {
+            match (step.op, step.target) {
+                (Op::BlockResidual, Target::Input(ResidualInput::Output)) => {
+                    let queries = weight(step.weights[0]);
+                    output_queries = Some(queries);
+                    residual(
                         shared,
-                        PrefillWalk::Chunk,
-                        matrix,
+                        chunk,
+                        &mut chain,
+                        chunk.summaries.offset(first * summary_stride * byte),
+                        scratch.x.offset(first * hidden * byte),
+                        queries,
+                        1,
                         scratch.final_row,
-                        scratch.logits,
-                        rank_vocab,
-                        hidden,
+                        blocks,
+                        first,
                         answers,
-                    )?,
-                }
-            }
-            (Op::Collective(Collective::LogitSlice), _) => {
-                // A row's slices gather into that row's padded vocabulary, which is the layout
-                // the softcap trims; one gather a row keeps each round the decode step's width.
-                for answer in 0..answers {
-                    exchange_gather(
-                        shared,
-                        scratch.logits.offset(answer * rank_vocab * byte),
-                        scratch.logits_full.offset(answer * padded * byte),
-                        rank_vocab,
                     )?;
                 }
-            }
-            (Op::Collective(_), _) => {}
-            (Op::LogitSoftcap, _) => {
-                run(shared.launch(
-                    shared.kernels.logit_softcap,
-                    (flat(unpadded), answers as u32, 1),
-                    (ELEMENT_BLOCK, 1, 1),
-                    &[
-                        scratch.logits_full.0,
-                        scratch.logits_bf16.0,
-                        answers as u64,
-                        padded as u64,
-                        unpadded as u64,
-                        bits(config.final_logit_softcap.unwrap_or(0.0) as f32),
-                    ],
-                ))?;
-            }
-            (op, target) => {
-                return Err(device_error(format!(
-                    "the chunk epilogue's {op:?} at {target:?} has no device dispatch"
-                )));
+                (Op::RmsNorm, Target::Norm(NormRole::Final)) => {
+                    let gain = weight(step.weights[0]);
+                    run(shared.rmsnorm(
+                        scratch.final_row,
+                        gain,
+                        scratch.final_row,
+                        answers,
+                        hidden,
+                    ))?;
+                    if let Some(&(sink, _, _)) = sinks.first() {
+                        if answers == rows {
+                            for &(sink, first, count) in sinks {
+                                sink.capture(
+                                    shared,
+                                    scratch.final_row.offset(first * hidden * byte),
+                                    count,
+                                    FINAL_TAP,
+                                )?;
+                            }
+                        } else {
+                            // A chunk answers its last row, and the drafter's last tap is every
+                            // row's normed output: the same per-row chain over all of them, into a
+                            // buffer the epilogue no longer reads.
+                            let queries = output_queries.ok_or_else(|| {
+                                device_error("the epilogue norms before its output residual")
+                            })?;
+                            residual(
+                                shared,
+                                chunk,
+                                &mut chain,
+                                chunk.summaries,
+                                scratch.x,
+                                queries,
+                                1,
+                                scratch.q_in,
+                                blocks,
+                                0,
+                                rows,
+                            )?;
+                            run(shared.rmsnorm(scratch.q_in, gain, scratch.q_in, rows, hidden))?;
+                            sink.capture(shared, scratch.q_in, rows, FINAL_TAP)?;
+                        }
+                    }
+                }
+                (Op::Gemv, Target::Project(Projection::Head)) => {
+                    let matrix = weight(step.weights[0]);
+                    // The head takes the row GEMV: the packed copy is the row walk's, and
+                    // version 2 returned the head to the body that layout reads.
+                    match &sequences {
+                        Rows::Chunk(_) => run(shared.gemv(
+                            matrix,
+                            scratch.final_row,
+                            scratch.logits,
+                            rank_vocab,
+                            hidden,
+                        ))?,
+                        // The lanes' or a verify's rows through the batched GEMV, whose row is the
+                        // one-row launch's bits.
+                        Rows::Lanes(_) | Rows::Segments(_) => project(
+                            shared,
+                            PrefillWalk::Chunk,
+                            matrix,
+                            scratch.final_row,
+                            scratch.logits,
+                            rank_vocab,
+                            hidden,
+                            answers,
+                        )?,
+                    }
+                }
+                (Op::Collective(Collective::LogitSlice), _) => {
+                    // A row's slices gather into that row's padded vocabulary, which is the layout
+                    // the softcap trims; one gather a row keeps each round the decode step's width.
+                    for answer in 0..answers {
+                        exchange_gather(
+                            shared,
+                            scratch.logits.offset(answer * rank_vocab * byte),
+                            scratch.logits_full.offset(answer * padded * byte),
+                            rank_vocab,
+                        )?;
+                    }
+                }
+                (Op::Collective(_), _) => {}
+                (Op::LogitSoftcap, _) => {
+                    run(shared.launch(
+                        shared.kernels.logit_softcap,
+                        (flat(unpadded), answers as u32, 1),
+                        (ELEMENT_BLOCK, 1, 1),
+                        &[
+                            scratch.logits_full.0,
+                            scratch.logits_bf16.0,
+                            answers as u64,
+                            padded as u64,
+                            unpadded as u64,
+                            bits(config.final_logit_softcap.unwrap_or(0.0) as f32),
+                        ],
+                    ))?;
+                }
+                (op, target) => {
+                    return Err(device_error(format!(
+                        "the chunk epilogue's {op:?} at {target:?} has no device dispatch"
+                    )));
+                }
             }
         }
-    }
 
-    match &mut sequences {
-        Rows::Chunk(state) | Rows::Verify(state, _) => {
-            state.blocks = blocks;
-            state.position += rows;
-        }
-        Rows::Lanes(states) => {
-            for state in states.iter_mut() {
-                state.blocks = blocks;
-                state.position += 1;
-            }
-        }
-        Rows::Segments(segments) => {
-            for segment in segments.iter_mut() {
-                segment.state.blocks = blocks;
-                segment.state.position += segment.rows;
-            }
-        }
+        run(shared.cuda.synchronize().map_err(|error| error.to_string()))?;
+        // As the decode step: a doorbell round that was given up is reported before a read-back.
+        run(shared.exchange.check_device())?;
+        let mut bytes = vec![0u8; answers * unpadded * 2];
+        run(shared
+            .cuda
+            .copy_dtoh(&mut bytes, &scratch.logits_bf16)
+            .map_err(|error| error.to_string()))?;
+        let values: Vec<f32> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair)))
+            .collect();
+        Ok(values.chunks(unpadded).map(<[f32]>::to_vec).collect())
     }
-    run(shared.cuda.synchronize().map_err(|error| error.to_string()))?;
-    // As the decode step: a doorbell round that was given up is reported before a read-back.
-    run(shared.exchange.check_device())?;
-    let mut bytes = vec![0u8; answers * unpadded * 2];
-    run(shared
-        .cuda
-        .copy_dtoh(&mut bytes, &scratch.logits_bf16)
-        .map_err(|error| error.to_string()))?;
-    let values: Vec<f32> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair)))
-        .collect();
-    Ok(values.chunks(unpadded).map(<[f32]>::to_vec).collect())
 }
 
-/// A verify's copy of one layer's convolution input as the launch read it: the history rows
-/// before its first row, then its own rows. Nothing for any other walk. Answers whether it kept
-/// them: a verify leaves the sequence's history as it was, for the round's settle to restore
-/// from these rows, and every other walk writes its tail back to the history itself.
-fn keep_tail(
-    shared: &Shared,
-    sequences: &Rows<'_, '_>,
+/// The chunk schedule over `tokens` in one call: every stage of a [ChunkRun] in order.
+pub(super) fn walk_rows(
+    shared: &Arc<Shared>,
+    sequences: Rows,
     chunk: &Chunk,
-    layer: usize,
-    slot: usize,
-    rows: usize,
-) -> Result<bool, BackendError> {
-    let Rows::Verify(_, tails) = sequences else {
-        return Ok(false);
-    };
-    shared
-        .cuda
-        .copy_dtod_async(
-            &tails.at(layer, slot),
-            &chunk.conv_head(slot),
-            (tails.history + rows) * tails.channels(slot) * std::mem::size_of::<f32>(),
-        )
-        .map_err(device_error)?;
-    Ok(true)
+    tokens: &[u32],
+    walk: PrefillWalk,
+    images: &[Injection],
+    taps: Option<TapSink>,
+) -> Result<Vec<Vec<f32>>, BackendError> {
+    let mut run = ChunkRun::begin(shared, sequences, chunk, tokens, walk, images, taps)?;
+    run.embed()?;
+    for (index, steps) in run.layer_steps()?.into_iter().enumerate() {
+        run.steps(index, 0, steps)?;
+    }
+    run.finish()
 }
 
 /// A segment's convolution input in its own tails, as a verify's launch reads it: the sequence's
@@ -2106,7 +2187,7 @@ fn keep_tail(
 fn segment_input(
     shared: &Shared,
     chunk: &Chunk,
-    segment: &Segment<'_>,
+    segment: &Segment,
     layer: usize,
     slot: usize,
     first: usize,
