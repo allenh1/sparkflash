@@ -355,17 +355,15 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
 /// The output directory a conversion gets when the operator names none.
 ///
 /// Writing beside the checkpoint used to put rank files inside the Hugging Face cache (and, for a
-/// snapshot, inside the read-only revision directory). The default is the node's shared converted
-/// root (`~/.cache/sparkflash/converted`, [sparkflash_weights::home]), in the directory the
-/// control plane names for the same checkpoint: the hub folder (`models--org--repo`) or the
-/// checkpoint directory's name, then a hash of the checkpoint's path. Every checkout on the node
-/// then finds the same rank files, and a cache is never modified by a conversion.
+/// snapshot, inside the read-only revision directory). The default is the directory the console
+/// names for the same checkpoint under the node's shared converted root
+/// ([sparkflash_weights::home::converted_dir]), so a cache is never modified by a conversion.
 fn default_output_dir(checkpoint: &Path) -> PathBuf {
     let checkpoint_name = checkpoint.file_name().map_or_else(
         || "checkpoint".to_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
-    let name = match checkpoint
+    let scope = match checkpoint
         .parent()
         .and_then(Path::file_name)
         .and_then(std::ffi::OsStr::to_str)
@@ -380,10 +378,7 @@ fn default_output_dir(checkpoint: &Path) -> PathBuf {
             }),
         _ => checkpoint_name,
     };
-    let checkpoint = std::path::absolute(checkpoint).unwrap_or_else(|_| checkpoint.to_path_buf());
-    sparkflash_weights::home::expand_home(sparkflash_weights::home::CONVERTED_DIR).join(
-        sparkflash_weights::home::converted_scope(&name, &checkpoint),
-    )
+    sparkflash_weights::home::converted_dir(&scope, checkpoint)
 }
 
 /// The checkpoint a `--model ORG/REPO` selects, through the one hub resolver.

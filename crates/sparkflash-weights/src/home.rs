@@ -77,6 +77,15 @@ pub fn converted_scope(name: &str, checkpoint: &Path) -> String {
     scope
 }
 
+/// This node's converted directory for `checkpoint` (named `name`, as [converted_scope] takes it):
+/// [CONVERTED_DIR] expanded, then the scope of the checkpoint's absolute path. `sparkflash
+/// convert` writes here when no `--output-dir` names another, where the console looks for it.
+#[must_use]
+pub fn converted_dir(name: &str, checkpoint: &Path) -> PathBuf {
+    let checkpoint = std::path::absolute(checkpoint).unwrap_or_else(|_| checkpoint.to_path_buf());
+    expand_home(CONVERTED_DIR).join(converted_scope(name, &checkpoint))
+}
+
 /// `value` kept to `[A-Za-z0-9._-]`, every other run of characters one `-`, with no leading or
 /// trailing `-` or `.`.
 #[must_use]
