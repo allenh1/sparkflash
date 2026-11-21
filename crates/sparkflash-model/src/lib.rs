@@ -65,8 +65,8 @@ pub use arm::{
 };
 pub use arms::{
     ARMS, Arm, Conversion, Converter, DeepSeek, Dense, Deployment, Dialect, Dory, GROUP_LANES, Glm,
-    GroupDefaults, Inkling, Qwen, Qwen36, QwenFp8, Source, Tokenizer, arm_for_family,
-    arm_for_weights, numerics_status,
+    GroupDefaults, Inkling, Qwen, Qwen36, QwenFp8, Route, Source, Tokenizer, arm_for_family,
+    arm_for_weights, crate_for, numerics_status, weights_numerics_status,
 };
 pub use backend::{BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput};
 pub use capabilities::Capabilities;

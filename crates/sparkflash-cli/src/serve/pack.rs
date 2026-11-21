@@ -626,19 +626,10 @@ pub(super) fn typed_for_checkpoint(family: &str, directory: &Path) -> Option<&'s
         .find(|entry| entry.arm.families().contains(&family) && (entry.takes)(directory))
 }
 
-/// How a pack's process is served.
-///
-/// The variants are serving shapes, not families: every family is a descriptor and an
-/// [sparkflash_model::Arm] entry, and only the shape changes which code boots it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Route {
-    /// The V4.1 reference/TP4 engine, which serves the default DeepSeek arm.
-    Reference,
-    /// A typed [PackArm] behind the generic host driver (the Qwen releases and GLM).
-    Typed,
-    /// The dynamic path: a checkpoint's own arm (Dory, Inkling, or a novel family).
-    Dynamic,
-}
+/// How a pack's process is served: the route its [sparkflash_model::Arm] states in its
+/// [sparkflash_model::Source]. A [Route::Pack] arm is a [PackArm] behind the generic host driver
+/// and has a [TYPED_PACKS] row; a test below holds the two equal.
+pub(super) use sparkflash_model::Route;
 
 /// The packs the model registry knows, including the default DeepSeek arm.
 ///
@@ -690,14 +681,9 @@ impl Pack {
 
     /// The pack serving a registry descriptor, or `None` for a weights selector with no arm.
     fn from_descriptor(descriptor: &'static ModelDescriptor) -> Option<Self> {
-        sparkflash_model::arm_for_weights(&descriptor.weights_id)?;
-        let route = if descriptor.weights_id == sparkflash_model::descriptor::DEFAULT_WEIGHTS_ID {
-            Route::Reference
-        } else if typed_pack(&descriptor.weights_id).is_some() {
-            Route::Typed
-        } else {
-            Route::Dynamic
-        };
+        let route = sparkflash_model::arm_for_weights(&descriptor.weights_id)?
+            .source()
+            .route;
         Some(Self { descriptor, route })
     }
 
@@ -760,7 +746,7 @@ impl Pack {
             {
                 return Vec::new();
             }
-            Some(pack) if pack.route == Route::Typed => {
+            Some(pack) if pack.route == Route::Pack => {
                 sparkflash_ops::parts::serving_language(sparkflash_model::Target::Sm121)
             }
             Some(_) | None => sparkflash_ops::parts::serving(sparkflash_model::Target::Sm121),
@@ -773,7 +759,7 @@ impl Pack {
 
     /// Whether this pack has a typed [PackArm] (the DeepSeek arm is the reference path).
     pub(super) const fn has_pack_arm(self) -> bool {
-        matches!(self.route, Route::Typed)
+        matches!(self.route, Route::Pack)
     }
 
     /// Whether this pack is served by the V4.1 reference/TP4 engine.
@@ -867,7 +853,7 @@ impl Pack {
             Route::Reference => {
                 unreachable!("the DeepSeek pack is served by the default reference path")
             }
-            Route::Typed => {
+            Route::Pack => {
                 let pack = typed_pack(self.descriptor.weights_id.as_str())
                     .expect("a typed pack is in TYPED_PACKS");
                 (pack.serve)(options)
@@ -1531,6 +1517,27 @@ mod tests {
         assert_eq!(QwenFp8::max_output_tokens(), QWEN38_MAX_OUTPUT_TOKENS);
     }
 
+    /// The route an arm states and the typed-pack table agree both ways: a release whose arm says
+    /// [Route::Pack] and has no row fails here, not at boot, and a row whose arm says otherwise
+    /// would never be read.
+    #[test]
+    fn every_pack_route_arm_has_a_typed_pack_row() {
+        for arm in sparkflash_model::ARMS {
+            for weights in arm.weights() {
+                assert_eq!(
+                    typed_pack(weights).is_some(),
+                    arm.source().route == Route::Pack,
+                    "{} ({weights}) states {:?}",
+                    arm.id(),
+                    arm.source().route
+                );
+            }
+        }
+        for pack in TYPED_PACKS {
+            assert_eq!(pack.arm.source().route, Route::Pack, "{}", pack.arm.id());
+        }
+    }
+
     #[test]
     fn the_arms_table_carries_the_same_profile_as_the_pack() {
         // A typed pack reads its own entry and the dynamic route reads the family's first: every
@@ -1789,7 +1796,7 @@ mod tests {
                 plan.boot_summary()
             );
             match pack.route() {
-                Route::Typed => {
+                Route::Pack => {
                     assert!(pack.has_pack_arm(), "{}", arm.id());
                     assert!(pack.opens_group_lanes(), "{}", arm.id());
                     assert!(

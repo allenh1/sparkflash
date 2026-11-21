@@ -175,11 +175,28 @@ pub struct Deployment {
     pub lane_group: bool,
 }
 
+/// Which serving code boots an arm's checkpoint.
+///
+/// The arm states it, so the serving table cannot disagree with it: an arm that says [Self::Pack]
+/// and has no row in the CLI's typed-pack table fails a test there instead of falling through to
+/// the dynamic route at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// The V4.1 reference/TP4 engine.
+    Reference,
+    /// A typed pack arm behind the generic host driver: a `Release` impl and one typed-pack row.
+    Pack,
+    /// The dynamic path: the checkpoint's own arm, opened from its configuration.
+    Dynamic,
+}
+
 /// Where an arm's code lives and how the scripts name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Source {
     /// The crate that carries the arm.
     pub crate_name: &'static str,
+    /// The serving code that boots the arm.
+    pub route: Route,
     /// The prefixes of the environment switches that are the arm's own. Every rank of a group
     /// must see the same values, so a group launcher forwards each one.
     pub switches: &'static [&'static str],
@@ -236,6 +253,13 @@ pub fn check_profile(arm: &dyn Arm, profile: &crate::ModelProfile) -> Result<(),
 /// The numerics registry's status for an arm: the same classification `sparkflash arms` prints.
 #[must_use]
 pub fn numerics_status(arm: &dyn Arm) -> &'static str {
+    weights_numerics_status(arm.weights())
+}
+
+/// The numerics registry's status for a set of weight selectors: `captured` when any has a
+/// capture, else whether any has an entry at all.
+#[must_use]
+pub fn weights_numerics_status(weights: &[&str]) -> &'static str {
     let registry = match crate::numerics::Registry::embedded() {
         Ok(registry) => registry,
         Err(_) => return "none (the registry does not parse)",
@@ -246,7 +270,7 @@ pub fn numerics_status(arm: &dyn Arm) -> &'static str {
         let Some(model) = crate::find_model(&entry.model) else {
             continue;
         };
-        if arm.weights().contains(&model.weights_id.as_str()) {
+        if weights.contains(&model.weights_id.as_str()) {
             registered = true;
             captured |= entry.is_captured();
         }
@@ -323,6 +347,7 @@ impl Arm for DeepSeek {
     fn source(&self) -> Source {
         Source {
             crate_name: "sparkflash-model-deepseek-v41",
+            route: Route::Reference,
             switches: &[],
         }
     }
@@ -393,6 +418,7 @@ impl Arm for Qwen {
     fn source(&self) -> Source {
         Source {
             crate_name: "sparkflash-model-qwen4-exp",
+            route: Route::Pack,
             switches: &["SPARKFLASH_QWEN4_"],
         }
     }
@@ -588,6 +614,7 @@ impl Arm for Glm {
     fn source(&self) -> Source {
         Source {
             crate_name: "sparkflash-model-glm5-next",
+            route: Route::Pack,
             switches: &["SPARKFLASH_GLM_"],
         }
     }
@@ -660,6 +687,7 @@ impl Arm for Dory {
     fn source(&self) -> Source {
         Source {
             crate_name: "sparkflash-model-dory",
+            route: Route::Dynamic,
             // Its knobs are the profile's; SPARKFLASH_DORY_CUBIN is read when the kernels build.
             switches: &[],
         }
@@ -739,6 +767,7 @@ impl Arm for Inkling {
     fn source(&self) -> Source {
         Source {
             crate_name: "sparkflash-model-inkling2",
+            route: Route::Dynamic,
             switches: &["SPARKFLASH_INKLING_"],
         }
     }
@@ -799,6 +828,7 @@ impl Arm for Dense {
     fn source(&self) -> Source {
         Source {
             crate_name: "sparkflash-model-dense",
+            route: Route::Dynamic,
             switches: &["SPARKFLASH_DENSE_"],
         }
     }
@@ -829,9 +859,41 @@ pub fn arm_for_weights(weights: &str) -> Option<&'static dyn Arm> {
         .find(|arm| arm.weights().contains(&weights))
 }
 
+/// The crate an arm's code lives in, by the arm's id, its model id, its crate's name or that
+/// name without `sparkflash-model-`, ignoring case. `sparkflash arms --crate` prints it, and
+/// `scripts/onboard-gate.sh` reads an arm's conformance crate through that, so the script keeps no list of its own.
+#[must_use]
+pub fn crate_for(name: &str) -> Option<&'static str> {
+    ARMS.iter()
+        .map(|arm| (arm, arm.source().crate_name))
+        .find_map(|(arm, krate)| {
+            let short = krate.strip_prefix("sparkflash-model-").unwrap_or(krate);
+            [arm.id(), arm.model_id(), krate, short]
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(name))
+                .then_some(krate)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every arm resolves to its own crate by its id, its model id and its crate's short name,
+    /// and a name no arm has resolves to none.
+    #[test]
+    fn an_arm_names_its_crate() {
+        for arm in ARMS {
+            let krate = arm.source().crate_name;
+            let short = krate.strip_prefix("sparkflash-model-").unwrap_or(krate);
+            for name in [arm.id(), arm.model_id(), krate, short] {
+                let found = crate_for(&name.to_ascii_uppercase());
+                assert_eq!(found, Some(krate), "{name} resolves to {found:?}");
+            }
+        }
+        assert_eq!(crate_for("glm"), Some("sparkflash-model-glm5-next"));
+        assert_eq!(crate_for("no-such-arm"), None);
+    }
 
     #[test]
     fn every_arm_is_registered_once_and_names_its_items() {

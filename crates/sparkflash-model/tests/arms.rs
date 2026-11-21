@@ -141,13 +141,6 @@ fn every_arm_has_all_eleven_ledger_rows_and_a_numerics_status() {
             "{} leaves a strategy out",
             arm.id()
         );
-        for weights in arm.weights() {
-            assert!(
-                arm.ledger().weights_ids.contains(weights),
-                "{}'s ledger does not name {weights}",
-                arm.id()
-            );
-        }
         let status = sparkflash_model::numerics_status(*arm);
         assert!(
             status == "captured"

@@ -127,8 +127,6 @@ impl fmt::Display for State {
 pub struct ArmLedger {
     /// The name the ledger prints.
     pub arm: &'static str,
-    /// The registry weight selectors this arm serves; empty for an arm no registry model uses.
-    pub weights_ids: &'static [&'static str],
     /// Every strategy's mode. A [Strategy] missing here is refused at boot.
     pub rows: &'static [(Strategy, State)],
 }
@@ -142,16 +140,27 @@ pub fn ledger_for_arm(arm: &str) -> Option<&'static ArmLedger> {
 /// A ledger entry, by a registry weight selector the arm serves.
 #[must_use]
 pub fn ledger_for_weights(weights_id: &str) -> Option<&'static ArmLedger> {
-    ARM_LEDGERS
-        .iter()
-        .find(|ledger| ledger.weights_ids.contains(&weights_id))
+    crate::arm_for_weights(weights_id).map(|arm| arm.ledger())
+}
+
+impl ArmLedger {
+    /// The registry weight selectors this ledger answers for: every [crate::ARMS] entry whose
+    /// [crate::Arm::ledger] is this one, so a selector is named once, on its arm. Empty for a
+    /// ledger no registry model uses.
+    #[must_use]
+    pub fn weights(&self) -> Vec<&'static str> {
+        crate::ARMS
+            .iter()
+            .filter(|arm| arm.ledger().arm == self.arm)
+            .flat_map(|arm| arm.weights().iter().copied())
+            .collect()
+    }
 }
 
 /// Every serving arm's declaration.
 pub static ARM_LEDGERS: &[ArmLedger] = &[
     ArmLedger {
         arm: "DeepSeek",
-        weights_ids: &[crate::descriptor::DEFAULT_WEIGHTS_ID],
         rows: &[
             (
                 Strategy::Lanes,
@@ -200,11 +209,6 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
     },
     ArmLedger {
         arm: "Qwen",
-        weights_ids: &[
-            crate::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID,
-            crate::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
-            crate::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
-        ],
         rows: &[
             (Strategy::Lanes, State::Native("four fused lanes")),
             (
@@ -250,7 +254,6 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
     },
     ArmLedger {
         arm: "GLM",
-        weights_ids: &[crate::descriptor::GLM53_FLASH_WEIGHTS_ID],
         rows: &[
             (Strategy::Lanes, State::Native("four fused lanes")),
             (
@@ -296,7 +299,6 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
     },
     ArmLedger {
         arm: "Inkling",
-        weights_ids: &[crate::descriptor::INKLING2_SMALL_WEIGHTS_ID],
         rows: &[
             (Strategy::Lanes, State::Native("four fused lanes")),
             (
@@ -347,7 +349,6 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
     },
     ArmLedger {
         arm: "Dory",
-        weights_ids: &[crate::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID],
         rows: &[
             (
                 Strategy::Lanes,
@@ -399,7 +400,6 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
     },
     ArmLedger {
         arm: "dense",
-        weights_ids: &[],
         rows: &[
             (Strategy::Lanes, State::Native("four fused lanes")),
             (Strategy::PromptParts, State::Native("256-row chunks")),
@@ -490,7 +490,12 @@ mod tests {
             );
         }
         for ledger in ARM_LEDGERS {
-            for weights in ledger.weights_ids {
+            assert!(
+                crate::ARMS.iter().any(|arm| arm.ledger().arm == ledger.arm),
+                "the {} ledger has no ARMS entry",
+                ledger.arm
+            );
+            for weights in ledger.weights() {
                 assert!(
                     crate::find_model_by_weights(weights).is_some(),
                     "{} names {weights}, which no registry model uses",
