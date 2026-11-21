@@ -2176,10 +2176,12 @@ mod tests {
         let runtime =
             Runtime::new(ToyWalk::new(8, 64).rewind_short(1), 0).expect("the runtime starts");
         let mut slot = runtime.open_slot().expect("a slot");
-        runtime.prefill(&mut slot, &prompt).expect("the prompt");
+        runtime
+            .prefill_slot(&mut slot, &prompt)
+            .expect("the prompt");
         assert_eq!(slot.rewind_point(), Some(prompt.len() - 1));
         runtime
-            .prefill(&mut slot, &changed)
+            .prefill_slot(&mut slot, &changed)
             .expect("the changed turn parts from the point");
         assert_eq!(slot.history(), &changed);
 
@@ -2193,7 +2195,7 @@ mod tests {
         let runtime = Runtime::new(recurrent, 0).expect("the runtime starts");
         let mut slot = runtime.open_slot().expect("a slot");
         let refused = runtime
-            .prefill(&mut slot, &prompt)
+            .prefill_slot(&mut slot, &prompt)
             .expect_err("a moved point is refused");
         assert!(refused.message().contains("rewind point"), "{refused}");
     }
