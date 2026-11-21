@@ -2448,10 +2448,12 @@ Three findings, each with the change it implies.
 
 ## The 2026-11-21 sprint: one walk for the catalogue arms, and a command that writes a family
 
-No cluster was used. Device runs are on one GB10 host, CPU runs on a development machine. The
-commits are the ones after `d7704d02` on `onboard/sprint2`; nothing is pushed or deployed. No output bits of
-a released arm move: DeepSeek, GLM, Qwen, Inkling and Dory keep their walks, and the dense arm's
-move onto the shared walk is checked bit-equal by its generated checks and `part_plugin`.
+Device runs are on one GB10 host, CPU runs on a development machine, and the served TP 4 checks
+of the moved arms on the cluster (W4). The commits are the ones after `d7704d02` on
+`onboard/sprint2`; nothing is pushed or deployed. No output bits of a released arm move: the
+dense arm moved onto the shared walk first (W2), then GLM, Qwen, Inkling and Dory's
+single-process walk (W4), each checked bit-equal against a record of the code before it; DeepSeek
+keeps its own walk.
 
 ### W1: the served groups on one host
 
@@ -2535,6 +2537,68 @@ general parser changes read the release (per-head hashed Engram tables, a nested
 whose one part is its MLA, and the dense host takes that mixer once registered. It is not
 registered or served: the shared walk does not run its indexer, hyper-connection or Engram
 roles, the same three pieces W2.5 names, and it is refused by those names.
+
+### W4: GLM, Qwen, Inkling and Dory on `PlanWalk`
+
+Each released arm's walk is now `PlanWalk<Host>`: `GlmWalk`, `QwenWalk` (over `QwenHost`),
+`InklingWalk` and `DoryWalk` are the runtime's planned walk over the arm's own frames, parts and
+windows, and the old `impl Walk` of each is gone. The contract grew only by defaulted hooks, each
+added in its own commit before the arm that needed it, so no earlier host changed:
+
+| arm | hooks it added to `PlanHost` | what stays the arm's own |
+| --- | --- | --- |
+| GLM | `begin_window`, `abandon_window`, `regions`, `PlanWindow`, `PlanSeq::keep` | the rank's stages (mHC mix as the frame, the indexer inside its attention part); the legacy drivers the CLI's TP 4 path and `device_forward` still call |
+| Qwen | `walked_layers` (the host's `finish` runs a window's last layers: the overlapped halves), `KEEPS_LOGITS` | `forward_batch` for the unfused session; held answers reach the runtime only as `Draft::Held` |
+| Inkling | `type Vision`, `rewind_slack`, `choose` (the Gumbel chooser), `logits_width` | the chunk and row schedules, the session's round/settle/rewind, the DSpark drafter and the vision path |
+| Dory | `rewind_point` (its point one id short) | the recurrence group's ring scheduler and loop-1 drafting, which walk the same block schedule |
+
+The check: `sparkflash_runtime::record` writes each arm fixture's generated-check outputs
+(`SPARKFLASH_BITS_RECORD`), recorded once on the code before the moves; every move was gated on
+every fixture's record being equal, not only its own arm's. A second Qwen fixture,
+`Qwen38Fixture` (hyper-connections, PLE, QSA, MTP), was recorded first so the move covered 3.8's
+paths. At the tip every record line is equal: dense, GLM and Inkling 12/3/3 (TP 1/2/4), Qwen,
+Qwen 3.8 and Dory 12/1/1 (their fixtures have one rank).
+
+The fixtures cannot reach tensor-parallel sums, sequence parallelism, the overlapped halves, the
+gathered head or Inkling's exchanges, so the served gate ran on the cluster at release shapes,
+TP 4, old build (`a98340c1`) against new (`3acf80e4`), the same flags for both:
+
+| arm | lanes, greedy, equal to the old build's digests | lanes, sampled, equal | turns, old | turns, new |
+| --- | --- | --- | --- | --- |
+| GLM-5.3-Flash | PASS | PASS | FAIL | FAIL, same pattern |
+| Qwen3.8-Flash-Next NVFP4 | PASS | PASS | FAIL | FAIL, same pattern |
+| Inkling-2-Small, DSpark depth 7, both rails | PASS | PASS | FAIL | FAIL, same pattern |
+
+`turns` fails on both builds alike: replies equal their cold runs, and prefix reuse is absent
+(GLM) or occasional (Qwen, Inkling). The server logs the same reuse events on both builds; which
+turns hit depends on the reply text, which differs run to run. Qwen's think-dropped replies differ
+from cold on both builds. This is W1's shared-serving `turns` failure, not the move.
+
+Two gate notes. Two source trees must not share one `CARGO_TARGET_DIR`: an archive's files carry
+its commit time, so the newer tree's sources read as older than the first tree's artifacts and
+cargo relinks nothing (the first attempt built two identical binaries; the gate now builds each
+tree in its own target and refuses equal binaries). And `cargo test` without `--no-fail-fast`
+stops at the first failing crate, so a battery step with a known failure hides every crate after
+it.
+
+The battery at the tip, on one GB10 with `--no-fail-fast`: fmt, clippy and the release CLI build
+pass; workspace libraries 3,120 passed; the arms' integration tests 737 passed; the CLI's 338
+passed. The 7 failures are the ones the tip had before the moves: the CLI's two plan-aware opens,
+GLM's and Qwen's tiny `engine_builder` fixtures, and the laptop-only `qwen_text_alias`.
+
+Code grew: 51 files, +10,011 / -4,835 in `crates/` since `d7704d02`. The moves added each arm's
+host beside device code that the legacy entry points still call. The cuts that follow are GLM's
+legacy TP 4 drivers (`glm_tp4.rs`, `tp4_host.rs`, `rank.rs`'s `GlmTp4Rank`) once the CLI's TP 4
+path serves through the walk, and Qwen's `forward_batch` once the unfused session does.
+
+### What a new family still needs
+
+The walk is shared; the parts are not. A part is typed by its host (`PartHost`), so GLM's mHC
+frame and indexer, Qwen's PLE and QSA, and Inkling's exchanges are reachable only from their own
+hosts. That is why Hy4 is still refused: its indexer, hyper-connection and Engram roles exist in
+GLM's and Qwen's hosts but not in the dense host a new family builds on. The next step is one
+host whose frames and parts are the union of these, with the arms' hosts reduced to their
+configuration; a family that only recombines existing roles then needs no host of its own.
 
 ## Order and ownership
 
