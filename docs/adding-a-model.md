@@ -104,7 +104,7 @@ Each item the old checklist named is now refused by the compiler, a test or the 
 | no model crate depends on another (the shared host `sparkflash-model-dense` excepted) | `one_stack.rs` `no_model_crate_depends_on_another_model_crate` |
 | a GEMM-class part has a tensor-core body or a `WAIVERS` line naming the gap | the const assertion over `Part::ALL` in `sparkflash_ops::parts` |
 | a step whose part has no registered executor | refused by the part's name when the arm opens, before a tensor is read |
-| a layer role the walk does not run (compression, indexer, residual mixer, side lookup) | `sparkflash_runtime::plan_roles`, by name |
+| a layer role the walk does not run (compression, indexer, residual mixer, side lookup) | `sparkflash_runtime::plan_layer`, by name, for the roles its host does not frame |
 | the crate is a workspace member | cargo refuses to build a crate outside the workspace's `members` |
 | the crate is named in both CI files | `sparkflash-model/tests/arms.rs` `every_model_crate_is_named_in_both_ci_files` |
 | every model crate is some `ARMS` entry's crate | `every_model_crate_is_an_arms_crate` |

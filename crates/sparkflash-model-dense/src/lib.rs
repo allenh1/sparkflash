@@ -103,8 +103,8 @@ use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 use sparkflash_runtime::{
-    ChunkPolicy, GroupWire, LaneState, Limits, PartBody, Place, PlanBranch, PlanSeq, RankSplit,
-    Region, Serving, TextWire, Walk, WalkArm, walk_rows,
+    ChunkPolicy, GroupWire, LaneState, Limits, PartBody, PassKind, Place, PlanBranch, PlanPass,
+    PlanSeq, RankSplit, Region, Serving, TextWire, Walk, WalkArm, walk_rows,
 };
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, TensorSpec, WeightSource};
@@ -397,9 +397,9 @@ struct Layer {
     branches: Vec<Branch>,
 }
 
-/// One branch of a layer: the RMSNorm of the residual, the part over the normed rows, the group's
-/// sum of its output where the part leaves a rank's partial, and the residual add
-/// ([sparkflash_runtime::PlanBranch]; its slot is [LaneParts::regions]'s index).
+/// One branch of a layer: its frame is the RMSNorm of the residual before the part (the group's
+/// sum of a partial and the residual add after it are the host's exit), then the part over the
+/// normed rows ([sparkflash_runtime::PlanBranch]; its slot is [LaneParts::regions]'s index).
 type Branch = PlanBranch<Dense, Deviceptr>;
 
 /// Every branch of `layers`, in walk order: the order of [Branch::slot].
@@ -1117,7 +1117,11 @@ impl DenseDeviceBackend {
         // refused by name, not skipped.
         let steps = architecture.steps();
         for step in &steps {
-            let kinds = sparkflash_runtime::plan_roles(step)?;
+            let kinds = sparkflash_runtime::plan_layer(
+                step,
+                <Shared as sparkflash_runtime::PlanHost>::ROLES,
+            )?
+            .branches;
             parts
                 .require(kinds.into_iter().map(|(_, part)| part))
                 .map_err(|error| {
@@ -2418,7 +2422,12 @@ fn upload<'a>(
         open.whole = Some(Shape::of(architecture, index, Shard::whole(), &own)?);
         // The parts first, in forward order, then the norms each reads its input through.
         let mut built = Vec::new();
-        for (role, kind) in sparkflash_runtime::plan_roles(&steps[index])? {
+        for (role, kind) in sparkflash_runtime::plan_layer(
+            &steps[index],
+            <Shared as sparkflash_runtime::PlanHost>::ROLES,
+        )?
+        .branches
+        {
             let part = parts
                 .build(kind, &mut open)
                 .map_err(|error| format!("layer {index}'s part {}: {error}", kind.name()))?;
@@ -2429,7 +2438,7 @@ fn upload<'a>(
         let mut branches = Vec::with_capacity(built.len());
         for (role, part) in built {
             branches.push(Branch {
-                norm: match role {
+                frame: match role {
                     StepRole::Attention => input_norm,
                     _ => post_norm,
                 },
@@ -3600,7 +3609,20 @@ fn step(
         .zip(tokens.chunks(1))
         .map(|((sequence, _), token)| (&mut **sequence, token))
         .collect();
-    walk_rows(shared, scratch, &mut segments, PartBody::Token, None, trace)?;
+    let pass = PlanPass {
+        kind: PassKind::TokenRows,
+        prompt_end: None,
+    };
+    // The session's step keeps the row GEMV at every row count: no wide policy.
+    walk_rows(
+        shared,
+        scratch,
+        &mut segments,
+        PartBody::Token,
+        pass,
+        Some(None),
+        trace,
+    )?;
     let logits = head(shared, &scratch.buffers, 0, segments.len())?;
     Ok(segments
         .iter_mut()
@@ -3673,7 +3695,11 @@ impl DenseDeviceSession {
                 &self.scratch,
                 &mut [(&mut self.sequence, chunk)],
                 PartBody::Rows,
-                shared.policy,
+                PlanPass {
+                    kind: PassKind::Bulk { rows: chunk.len() },
+                    prompt_end: None,
+                },
+                Some(shared.policy),
                 self.trace.as_mut(),
             )?;
             last = chunk.len();
@@ -3714,7 +3740,11 @@ impl ModelSession for DenseDeviceSession {
                 &*scratch,
                 &mut [(&mut *sequence, chunk)],
                 PartBody::Rows,
-                shared.policy,
+                PlanPass {
+                    kind: PassKind::Bulk { rows: chunk.len() },
+                    prompt_end: None,
+                },
+                Some(shared.policy),
                 trace.as_mut(),
             )?;
             last = chunk.len();

@@ -14,13 +14,15 @@
 
 //! The walk every catalogue arm shares: [`PlanWalk`].
 //!
-//! A layer is a list of branches ([`PlanBranch`]): the norm of the residual, one part
-//! ([`PartExec`]) over the normed rows, the group's combine where the part leaves a rank's
-//! partial ([`RankSplit::Summed`]), and the residual add. This module owns that loop, the
-//! sequence around it ([`PlanSeq`]: its ids, its sampler, its rewind bounds) and the head's
-//! record-then-choose ([`HeadInput::record`]). The host ([`PlanHost`]) supplies only what needs
-//! its device: the embed, the norm, the combine, the add, the head's logits and its device pick,
-//! and the per-sequence lane memory ([`PlanLane`]).
+//! A layer is a list of branches ([`PlanBranch`]), each one part ([`PartExec`]) inside its
+//! frame: the host's entry from the residual into the part's input ([`PlanHost::enter`], a norm
+//! for a plain residual) and its exit back ([`PlanHost::leave`]: the group's combine where the
+//! part leaves a rank's partial, [`RankSplit::Summed`], then the add). A widened residual is a
+//! frame, not a branch: its streams' mix in and mix out are the host's entry and exit
+//! ([`PlanLayer::residual`]). This module owns that loop, the sequence around it ([`PlanSeq`]:
+//! its ids, its sampler, its rewind bounds) and the head's record-then-choose
+//! ([`HeadInput::record`]). The host supplies only what needs its device: the embed, the frames,
+//! the head's logits and its device pick, and the per-sequence lane memory ([`PlanLane`]).
 //!
 //! An arm whose every layer is catalogue parts therefore writes no walk: it is a host and its
 //! parts. A family with a part of its own adds one [`PartExec`] and registers it
@@ -37,22 +39,22 @@ use sparkflash_model::parts::Part as PartKind;
 use crate::layout::{LaneState, Limits, Region, StateLayout, check_checkpoint, check_rewind};
 use crate::part::{PartBody, PartExec, PartHost};
 use crate::walk::{
-    Absent, HeadRow, Hidden, NoVision, Pass, PassKind, Segment, Walk, WalkCapabilities,
+    Drafter, HeadRow, Hidden, NoVision, Pass, PassKind, Segment, Walk, WalkCapabilities,
 };
 
 /// A built part as a planned walk holds it: shared between the serving thread and its sessions.
 pub type PlanPart<P> = Box<dyn PartExec<P> + Send + Sync>;
 
-/// One branch of a layer: the norm of the residual, the part over the normed rows, whether the
-/// part's output rows are a rank's partial, and which of a sequence's region lists is the
-/// part's.
-pub struct PlanBranch<P: PartHost, N> {
-    /// The norm's weights, as the host holds them.
-    pub norm: N,
+/// One branch of a layer: the host's frame around it, the part, whether the part's output rows
+/// are a rank's partial, and which of a sequence's region lists is the part's.
+pub struct PlanBranch<P: PartHost, F> {
+    /// The host's entry and exit around the part: a norm's weights for a plain residual, a
+    /// stream mixer's as well for a widened one, nothing for a part that lands elsewhere.
+    pub frame: F,
     /// The part.
     pub part: PlanPart<P>,
     /// Whether the part's output rows are a rank's partial ([`crate::RankSplit::Summed`]): the
-    /// host's combine sums them before the residual add.
+    /// host's exit sums them over the group before they land.
     pub summed: bool,
     /// Which of a sequence's region lists is this part's, in walk order.
     pub slot: usize,
@@ -86,6 +88,20 @@ pub trait PlanLane {
 
     /// Whether the lane can hold `positions` more positions (from zero when `reset`).
     fn room(&self, positions: usize, reset: bool) -> bool;
+
+    /// A new request on the lane (the runtime sets its sampling once a request): what the lane
+    /// counts a request, such as a drafter's speculation counters or its queued answers, starts
+    /// over. A lane that counts nothing does nothing.
+    fn requested(&mut self) {}
+}
+
+/// What a pass is, as a planned walk's host sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanPass {
+    /// What the pass is for.
+    pub kind: PassKind,
+    /// The rows of the prompt still to come after a prompt chunk ([`Pass::prompt_end`]).
+    pub prompt_end: Option<usize>,
 }
 
 /// One sequence of a planned walk: the host's lane, the ids its state holds and its sampler.
@@ -157,16 +173,18 @@ pub type PlanRows<'a, 'b, L> = [(&'a mut PlanSeq<L>, &'b [u32])];
 /// The device a [`PlanWalk`] drives. Every method is required.
 ///
 /// The host's buffers are its own ([`Self::Scratch`]): the walk names rows by count, and every
-/// method reads and writes the buffers the host laid out. The residual is one buffer of
-/// `[rows][hidden]`; [`Self::norm`] reads it into the parts' input, a part writes its output,
-/// [`Self::combine`] sums that output over the group and [`Self::add`] adds it to the residual.
+/// method reads and writes the buffers the host laid out. [`Self::enter`] reads the residual
+/// into the parts' input, a part writes its output, and [`Self::leave`] lands that output: over
+/// the group where it is a partial, then into the residual (or wherever the frame says).
 pub trait PlanHost: Send + Sync + Sized + 'static {
     /// The parts' host: the pass and open contexts the parts are written for.
     type Parts: PartHost;
-    /// A norm's weights.
-    type Norm: Send + Sync;
+    /// A branch's frame: what [`Self::enter`] and [`Self::leave`] read.
+    type Frame: Send + Sync;
     /// A sequence's device state.
     type Lane: PlanLane + Send;
+    /// The draft head: [`Absent`] for an arm without one.
+    type Drafter: Drafter<PlanWalk<Self>>;
     /// One walk's buffers.
     type Scratch: Send;
     /// What a pass hands its parts besides the rows: the host's kernel choice for a pass shape.
@@ -176,14 +194,15 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
     const DEVICE: &'static str;
     /// The arm's capabilities, word for word its ledger row.
     const CAPABILITIES: WalkCapabilities;
-    /// Why the arm has no draft head.
-    const NO_DRAFTER: &'static str;
+    /// The roles beyond the token mixer and the feed-forward this host frames
+    /// ([`plan_layer`]'s `hosted`); every other role is refused by name.
+    const ROLES: &'static [StepRole] = &[];
 
     /// The number of layers.
     fn layers(&self) -> usize;
 
     /// The branches of `layer`, in forward order.
-    fn branches(&self, layer: usize) -> &[PlanBranch<Self::Parts, Self::Norm>];
+    fn branches(&self, layer: usize) -> &[PlanBranch<Self::Parts, Self::Frame>];
 
     /// The checkpoint's vocabulary.
     fn vocab(&self) -> usize;
@@ -206,8 +225,68 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
     /// No lane free, or a device failure.
     fn lane(this: &Arc<Self>) -> Result<Self::Lane, BackendError>;
 
-    /// The mode a pass of `kind` takes.
-    fn mode(&self, kind: PassKind) -> Self::Mode;
+    /// The draft head over this host.
+    ///
+    /// # Errors
+    /// A draft head the host cannot build.
+    fn drafter(this: &Arc<Self>) -> Result<Self::Drafter, BackendError>;
+
+    /// The mode a window of `rows` rows of `pass` takes.
+    fn mode(&self, pass: PlanPass, rows: usize) -> Self::Mode;
+
+    /// How `pass` over `segments` splits into windows the walk runs one after another, as row
+    /// counts in row order (each above zero, at most [`Self::pass_rows`], summing to the pass's
+    /// rows). A window may end inside a segment: its sequence's later rows go in the next. One
+    /// window by default.
+    ///
+    /// # Errors
+    /// A host that cannot split the pass.
+    fn windows(
+        &self,
+        pass: PlanPass,
+        segments: &PlanRows<'_, '_, Self::Lane>,
+    ) -> Result<Vec<usize>, BackendError> {
+        let _ = pass;
+        Ok(vec![segments.iter().map(|(_, ids)| ids.len()).sum()])
+    }
+
+    /// The host's tail after a window's layers, over the window's segments (their histories do
+    /// not hold the window's ids yet): a head the host runs eagerly, a draft head's caches, what
+    /// a prompt's end commits. `last` is the pass's last window. Nothing by default.
+    ///
+    /// # Errors
+    /// A device failure.
+    fn finish(
+        &self,
+        scratch: &Self::Scratch,
+        segments: &mut PlanRows<'_, '_, Self::Lane>,
+        pass: PlanPass,
+        last: bool,
+    ) -> Result<(), BackendError> {
+        let _ = (scratch, segments, pass, last);
+        Ok(())
+    }
+
+    /// The answer `lane` already holds for its head row, once the row's input is recorded (`fed`:
+    /// the token the row consumed, `None` for a prompt's end), such as a verified draft's queued
+    /// answer. `None` by default: the head chooses.
+    ///
+    /// # Errors
+    /// A lane whose held answers are out of order.
+    fn answered(
+        &self,
+        lane: &mut Self::Lane,
+        fed: Option<u32>,
+    ) -> Result<Option<StepOutput>, BackendError> {
+        let _ = (lane, fed);
+        Ok(None)
+    }
+
+    /// Whether `token` ends the reply: the head answers `None` for it. No token by default.
+    fn ends(&self, token: u32) -> bool {
+        let _ = token;
+        false
+    }
 
     /// Backs the lane's positional regions up to `reach` positions.
     ///
@@ -221,14 +300,15 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
     /// A device failure.
     fn embed(&self, scratch: &Self::Scratch, ids: &[u32]) -> Result<(), BackendError>;
 
-    /// The parts' input: `norm` of the residual's `rows` rows.
+    /// The parts' input from the residual's `rows` rows, through `frame`: the norm for a plain
+    /// residual, the streams' mix in then the norm for a widened one.
     ///
     /// # Errors
     /// A device failure.
-    fn norm(
+    fn enter(
         &self,
         scratch: &Self::Scratch,
-        norm: &Self::Norm,
+        frame: &Self::Frame,
         rows: usize,
     ) -> Result<(), BackendError>;
 
@@ -244,17 +324,23 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
         mode: Self::Mode,
     ) -> <Self::Parts as PartHost>::Pass<'a>;
 
-    /// Sums a part's partial output rows over the group, in rank order. Nothing at one rank.
+    /// Lands a part's `rows` output rows through `frame`: summed over the group first, in rank
+    /// order, when `summed` (nothing to sum at one rank), then added to the residual, or mixed
+    /// out into its streams for a widened one. `next` is the frame the walk enters next (`None`
+    /// after the last layer's last branch), so an exit that fuses the next entry's first stage
+    /// (a stream mixer's projection of the streams it just wrote) can; [`Self::enter`] then
+    /// finds it done.
     ///
     /// # Errors
     /// A device or collective failure.
-    fn combine(&self, scratch: &Self::Scratch, rows: usize) -> Result<(), BackendError>;
-
-    /// Adds a part's output rows to the residual.
-    ///
-    /// # Errors
-    /// A device failure.
-    fn add(&self, scratch: &Self::Scratch, rows: usize) -> Result<(), BackendError>;
+    fn leave(
+        &self,
+        scratch: &Self::Scratch,
+        frame: &Self::Frame,
+        next: Option<&Self::Frame>,
+        summed: bool,
+        rows: usize,
+    ) -> Result<(), BackendError>;
 
     /// The residual's `rows` rows, copied back: a layer trace.
     ///
@@ -287,36 +373,77 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
     ) -> Result<Vec<u32>, BackendError>;
 }
 
-/// The branches a layer's step runs in a planned walk, in forward order, or the role the walk has
-/// no place for.
+/// A layer as a planned walk runs it: its branches in run order, and the widened residual
+/// that frames them, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanLayer {
+    /// The residual's mixer ([`StepRole::Residual`]): it names no branch; the host's frames
+    /// around the token mixer and the feed-forward run it. `None` for a plain residual.
+    pub residual: Option<PartKind>,
+    /// The branches, in run order: the side lookups on the layer input first, then the
+    /// attention's compression and indexer (their output is what the token mixer reads, so they
+    /// run before it), the token mixer, the feed-forward.
+    pub branches: Vec<(StepRole, PartKind)>,
+}
+
+/// The layer a step runs as in a planned walk whose host frames `hosted` beyond the token mixer
+/// and the feed-forward, or the first role it has no place for.
 ///
-/// A planned layer is a token mixer and a feed-forward, each a branch. The other roles a step can
-/// hold are refused by name, each listed (no wildcard, so a new role leads the compiler here):
-/// a compressed cache and a sparse indexer feed an attention's reads rather than the residual, a
-/// widened residual replaces the add itself, and a side table adds a lookup beside the branch.
-/// No catalogue part executes one of them as a branch yet.
+/// Every role is listed (no wildcard, so a new role leads the compiler here). A host that runs
+/// none of the others passes `&[]` and is refused by name for a compressed cache, a sparse
+/// indexer, a widened residual or a side table.
 ///
 /// # Errors
-/// The first role the walk does not run.
-pub fn plan_roles(step: &LayerStep) -> Result<Vec<(StepRole, PartKind)>, String> {
-    step.roles()
-        .into_iter()
-        .map(|(role, part)| match role {
-            StepRole::Attention | StepRole::Ffn => Ok((role, part)),
+/// The first role neither the walk nor the host runs.
+pub fn plan_layer(step: &LayerStep, hosted: &[StepRole]) -> Result<PlanLayer, String> {
+    let mut layer = PlanLayer {
+        residual: None,
+        branches: Vec::new(),
+    };
+    let mut before = Vec::new();
+    for (role, part) in step.roles() {
+        let framed = match role {
+            StepRole::Attention | StepRole::Ffn => true,
             StepRole::Compression | StepRole::Indexer | StepRole::Residual | StepRole::Side => {
-                Err(format!(
-                    "layer {}'s part {} is a {role:?} step, and a planned walk runs a layer's \
-                     token mixer and its feed-forward",
-                    step.index,
-                    part.name()
-                ))
+                hosted.contains(&role)
             }
-        })
-        .collect()
+        };
+        if !framed {
+            return Err(format!(
+                "layer {}'s part {} is a {role:?} step, and this planned walk's host runs a \
+                 layer's token mixer and its feed-forward{}",
+                step.index,
+                part.name(),
+                if hosted.is_empty() {
+                    String::new()
+                } else {
+                    format!(" and its {hosted:?} steps")
+                }
+            ));
+        }
+        match role {
+            StepRole::Residual => layer.residual = Some(part),
+            StepRole::Compression | StepRole::Indexer => before.push((role, part)),
+            StepRole::Side | StepRole::Attention | StepRole::Ffn => {
+                layer.branches.push((role, part));
+            }
+        }
+    }
+    // The attention's own sublayers follow it in forward order but feed its reads: they run
+    // ahead of it.
+    if !before.is_empty() {
+        let at = layer
+            .branches
+            .iter()
+            .position(|(role, _)| *role == StepRole::Attention)
+            .unwrap_or(layer.branches.len());
+        layer.branches.splice(at..at, before);
+    }
+    Ok(layer)
 }
 
 /// The branches of every layer of `host`, in walk order: the order of [`PlanBranch::slot`].
-pub fn branches<H: PlanHost>(host: &H) -> impl Iterator<Item = &PlanBranch<H::Parts, H::Norm>> {
+pub fn branches<H: PlanHost>(host: &H) -> impl Iterator<Item = &PlanBranch<H::Parts, H::Frame>> {
     (0..host.layers()).flat_map(|layer| host.branches(layer))
 }
 
@@ -328,20 +455,24 @@ pub fn plan_state<H: PlanHost>(host: &H) -> Vec<Region> {
 }
 
 /// One walk over `segments`' rows, laid one after another: each sequence's ids at its own
-/// position. Every layer runs its branches in forward order: the norm, the part's `body`, the
-/// group's combine where the part leaves a partial, and the residual add. The residual of every
-/// row is left in the host's buffer; each sequence's history takes its ids. With `trace`, each
+/// position, in the host's windows ([`PlanHost::windows`]) one after another. Every window
+/// embeds its ids and runs every layer's branches in run order: the host's entry, the part's
+/// `body`, the host's exit (the group's combine where the part leaves a partial, then the
+/// landing); then the host's tail ([`PlanHost::finish`]), and each sequence's history takes the
+/// window's ids. The residual of the last window's rows is left in the host's buffer. Each
+/// window takes `mode`, or the host's [`PlanHost::mode`] for it when `None`. With `trace`, each
 /// layer's residual rows are appended to the layer's entry.
 ///
 /// # Errors
 /// No rows or more than the host's pass, an empty segment, an id outside the vocabulary, a
-/// sequence past the context, or the host's failure.
+/// sequence past the context, windows that do not split the pass, or the host's failure.
 pub fn walk_rows<H: PlanHost>(
     host: &H,
     scratch: &H::Scratch,
     segments: &mut PlanRows<'_, '_, H::Lane>,
     body: PartBody,
-    mode: H::Mode,
+    pass: PlanPass,
+    mode: Option<H::Mode>,
     mut trace: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<(), BackendError> {
     let refuse = |message: String| Err(BackendError::new(H::DEVICE, message));
@@ -351,7 +482,6 @@ pub fn walk_rows<H: PlanHost>(
         return refuse(format!("a walk takes 1..={most} rows, not {rows}"));
     }
     let (vocab, context) = (host.vocab(), host.limits().context);
-    let mut ids = Vec::with_capacity(rows);
     for (sequence, tokens) in segments.iter_mut() {
         if tokens.is_empty() {
             return refuse("a segment has no tokens".to_owned());
@@ -366,28 +496,69 @@ pub fn walk_rows<H: PlanHost>(
             return refuse(format!("the sequence is past the served context {context}"));
         }
         host.back(&mut sequence.lane, reach)?;
-        ids.extend_from_slice(tokens);
     }
-    host.embed(scratch, &ids)?;
-    for index in 0..host.layers() {
-        for branch in host.branches(index) {
-            host.norm(scratch, &branch.norm, rows)?;
-            let mut pass = host.pass(scratch, &*segments, index, branch.slot, rows, mode);
-            // One dynamic call a part a pass.
-            body.run::<H::Parts, _>(&*branch.part, &mut pass)?;
-            drop(pass);
-            if branch.summed {
-                host.combine(scratch, rows)?;
+    let windows = host.windows(pass, segments)?;
+    if windows.iter().any(|&count| count == 0 || count > most)
+        || windows.iter().sum::<usize>() != rows
+    {
+        return refuse(format!(
+            "the host split {rows} rows into windows {windows:?}, which do not cover them"
+        ));
+    }
+    let layers = host.layers();
+    // The frame the walk enters after branch `at` of `index`: the layer's next branch, else the
+    // first branch of the next layer that has one.
+    let next = |index: usize, at: usize| {
+        host.branches(index)
+            .get(at + 1)
+            .or_else(|| (index + 1..layers).find_map(|later| host.branches(later).first()))
+            .map(|branch| &branch.frame)
+    };
+    let mut start = 0;
+    for (number, &count) in windows.iter().enumerate() {
+        let end = start + count;
+        // The window's slice of each segment it reaches, in row order.
+        let mut window: Vec<(&mut PlanSeq<H::Lane>, &[u32])> = Vec::new();
+        let mut at = 0;
+        for (sequence, tokens) in segments.iter_mut() {
+            let (low, high) = (at, at + tokens.len());
+            at = high;
+            let (from, to) = (low.max(start), high.min(end));
+            if from < to {
+                window.push((&mut **sequence, &tokens[from - low..to - low]));
             }
-            host.add(scratch, rows)?;
         }
-        if let Some(trace) = trace.as_deref_mut() {
-            let residual = host.residual(scratch, rows)?;
-            trace[index].extend(residual);
+        let ids: Vec<u32> = window
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        let mode = mode.unwrap_or_else(|| host.mode(pass, count));
+        host.embed(scratch, &ids)?;
+        for index in 0..layers {
+            for (at, branch) in host.branches(index).iter().enumerate() {
+                host.enter(scratch, &branch.frame, count)?;
+                let mut part = host.pass(scratch, &window, index, branch.slot, count, mode);
+                // One dynamic call a part a pass.
+                body.run::<H::Parts, _>(&*branch.part, &mut part)?;
+                drop(part);
+                host.leave(
+                    scratch,
+                    &branch.frame,
+                    next(index, at),
+                    branch.summed,
+                    count,
+                )?;
+            }
+            if let Some(trace) = trace.as_deref_mut() {
+                let residual = host.residual(scratch, count)?;
+                trace[index].extend(residual);
+            }
         }
-    }
-    for (sequence, tokens) in segments.iter_mut() {
-        sequence.history.extend_from_slice(tokens);
+        host.finish(scratch, &mut window, pass, number + 1 == windows.len())?;
+        for (sequence, tokens) in &mut window {
+            sequence.history.extend_from_slice(tokens);
+        }
+        start = end;
     }
     Ok(())
 }
@@ -398,7 +569,7 @@ pub struct PlanWalk<H: PlanHost> {
     layout: StateLayout,
     limits: Limits,
     scratch: Mutex<H::Scratch>,
-    drafter: Absent<&'static str>,
+    drafter: H::Drafter,
 }
 
 impl<H: PlanHost> PlanWalk<H> {
@@ -411,12 +582,13 @@ impl<H: PlanHost> PlanWalk<H> {
         let scratch = H::scratch(&host, rows)?;
         let layout = StateLayout::new(plan_state(&*host));
         let limits = host.limits();
+        let drafter = H::drafter(&host)?;
         Ok(Self {
             host,
             layout,
             limits,
             scratch: Mutex::new(scratch),
-            drafter: Absent(H::NO_DRAFTER),
+            drafter,
         })
     }
 
@@ -424,6 +596,16 @@ impl<H: PlanHost> PlanWalk<H> {
     #[must_use]
     pub fn host(&self) -> &Arc<H> {
         &self.host
+    }
+
+    /// The logits of `count` rows of the last walk from row `first`, row after row: what a
+    /// drafter's verify reads after it walks a verify pass.
+    ///
+    /// # Errors
+    /// As [`PlanHost::logits`].
+    pub fn logits(&self, first: usize, count: usize) -> Result<Vec<f32>, BackendError> {
+        let scratch = self.scratch()?;
+        self.host.logits(&scratch, first, count)
     }
 
     fn scratch(&self) -> Result<MutexGuard<'_, H::Scratch>, BackendError> {
@@ -434,8 +616,9 @@ impl<H: PlanHost> PlanWalk<H> {
 }
 
 /// The head of `rows`, from the residual rows the last walk left: each row's input recorded in
-/// its sampler first, then one device pick a row when every row takes its argmax, else the
-/// logits and the host sampler.
+/// its sampler first and a lane's held answer taken as it stands ([`PlanHost::answered`]); then
+/// one device pick a row when every other row takes its argmax, else the logits and the host
+/// sampler. A token the host ends the reply on ([`PlanHost::ends`]) answers `None`.
 ///
 /// # Errors
 /// The host's failure, or a host that answers another number of rows.
@@ -444,7 +627,6 @@ pub fn plan_head<H: PlanHost>(
     scratch: &H::Scratch,
     rows: &mut [HeadRow<'_, PlanSeq<H::Lane>>],
 ) -> Result<Vec<StepOutput>, BackendError> {
-    let contiguous = rows.iter().enumerate().all(|(index, row)| row.row == index);
     let asked = rows.len();
     let answered = |made: usize| {
         BackendError::new(
@@ -454,73 +636,79 @@ pub fn plan_head<H: PlanHost>(
     };
     // Record each row's token before asking whether its sampler is greedy: a prompt's record
     // resets and fills the history the penalty check reads.
+    let mut steps: Vec<Option<StepOutput>> = Vec::with_capacity(asked);
     for row in rows.iter_mut() {
-        row.input.record(&mut row.seq.sampler);
+        let fed = row.input.record(&mut row.seq.sampler);
+        steps.push(host.answered(&mut row.seq.lane, fed)?);
     }
+    let open: Vec<usize> = (0..asked).filter(|&at| steps[at].is_none()).collect();
+    let contiguous = open.len() == asked && rows.iter().enumerate().all(|(at, row)| row.row == at);
+    let ends = |token: u32| (!host.ends(token)).then_some(token);
     // A greedy sampler whose penalties change nothing takes the row's argmax as it stands.
     // Choose it on the device and copy one u32 a row, not the vocabulary.
-    if rows
+    if open
         .iter()
-        .all(|row| row.seq.sampler.takes_argmax(&row.seq.sampling))
+        .all(|&at| rows[at].seq.sampler.takes_argmax(&rows[at].seq.sampling))
     {
         let picks: Vec<u32> = if contiguous {
-            host.choices(scratch, 0, rows.len())?
+            host.choices(scratch, 0, asked)?
         } else {
-            let mut picks = Vec::with_capacity(rows.len());
-            for row in rows.iter() {
-                picks.extend(host.choices(scratch, row.row, 1)?);
+            let mut picks = Vec::with_capacity(open.len());
+            for &at in &open {
+                picks.extend(host.choices(scratch, rows[at].row, 1)?);
             }
             picks
         };
-        if picks.len() != rows.len() {
-            return Err(answered(picks.len()));
+        if picks.len() != open.len() {
+            return Err(answered(picks.len() + asked - open.len()));
         }
-        return Ok(picks
-            .into_iter()
-            .map(|pick| StepOutput {
+        for (&at, pick) in open.iter().zip(picks) {
+            steps[at] = Some(StepOutput {
                 logits: Vec::new(),
-                next_token: Some(pick),
+                next_token: ends(pick),
                 draft: Vec::new(),
-            })
-            .collect());
-    }
-    // A sampling request needs the row: temperature, top-k, top-p, penalties and the draw stay
-    // on the host over the logits the step copies back.
-    let vocab = host.vocab();
-    let logits: Vec<Vec<f32>> = if contiguous {
-        host.logits(scratch, 0, rows.len())?
-            .chunks(vocab)
-            .map(<[f32]>::to_vec)
-            .collect()
+            });
+        }
     } else {
-        rows.iter()
-            .map(|row| host.logits(scratch, row.row, 1))
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    if logits.len() != rows.len() {
-        return Err(answered(logits.len()));
-    }
-    Ok(rows
-        .iter_mut()
-        .zip(logits)
-        .map(|(row, logits)| {
+        // A sampling request needs the row: temperature, top-k, top-p, penalties and the draw
+        // stay on the host over the logits the step copies back.
+        let vocab = host.vocab();
+        let logits: Vec<Vec<f32>> = if contiguous {
+            host.logits(scratch, 0, asked)?
+                .chunks(vocab)
+                .map(<[f32]>::to_vec)
+                .collect()
+        } else {
+            open.iter()
+                .map(|&at| host.logits(scratch, rows[at].row, 1))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if logits.len() != open.len() {
+            return Err(answered(logits.len() + asked - open.len()));
+        }
+        for (&at, logits) in open.iter().zip(logits) {
+            let seq = &mut *rows[at].seq;
             // The row's token is already recorded above, once: a second record here would count
             // every sampled token twice in the penalties and leave the history a token a step
             // ahead of the position a rewind truncates it to.
-            let chosen = row.seq.sampler.choose(&logits, &row.seq.sampling);
-            StepOutput {
+            let chosen = seq.sampler.choose(&logits, &seq.sampling);
+            steps[at] = Some(StepOutput {
                 logits,
-                next_token: Some(chosen),
+                next_token: ends(chosen),
                 draft: Vec::new(),
-            }
-        })
-        .collect())
+            });
+        }
+    }
+    steps
+        .into_iter()
+        .map(|step| step.ok_or_else(|| answered(0)))
+        .collect()
 }
 
 impl<H: PlanHost> Walk for PlanWalk<H> {
     type Seq = PlanSeq<H::Lane>;
     type Hidden = Hidden;
-    type Drafter = Absent<&'static str>;
+    type Drafter = H::Drafter;
     type Vision = NoVision;
 
     const CAPABILITIES: WalkCapabilities = H::CAPABILITIES;
@@ -544,6 +732,7 @@ impl<H: PlanHost> Walk for PlanWalk<H> {
     fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
         seq.sampling = sampling;
         seq.sampler.reset();
+        seq.lane.requested();
     }
 
     fn walk(
@@ -554,12 +743,12 @@ impl<H: PlanHost> Walk for PlanWalk<H> {
         let Pass {
             kind,
             constraint: _,
-            prompt_end: _,
+            prompt_end,
             hook,
         } = pass;
         let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
         let scratch = self.scratch()?;
-        let mode = self.host.mode(kind);
+        let plan = PlanPass { kind, prompt_end };
         let mut pairs: Vec<(&mut Self::Seq, &[u32])> = segments
             .iter_mut()
             .map(|segment| (&mut *segment.seq, segment.rows))
@@ -569,7 +758,8 @@ impl<H: PlanHost> Walk for PlanWalk<H> {
             &scratch,
             &mut pairs,
             PartBody::of(kind),
-            mode,
+            plan,
+            None,
             None,
         )?;
         drop(pairs);
@@ -590,5 +780,69 @@ impl<H: PlanHost> Walk for PlanWalk<H> {
         }
         let scratch = self.scratch()?;
         plan_head(&*self.host, &scratch, rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hyper_step() -> LayerStep {
+        LayerStep {
+            index: 3,
+            attention: PartKind::MlaAttention,
+            compression: None,
+            indexer: Some(PartKind::SparseIndexer),
+            ffn: PartKind::Moe,
+            residual: Some(PartKind::HyperConnection),
+            sides: vec![PartKind::Engram],
+        }
+    }
+
+    #[test]
+    fn a_host_that_frames_nothing_more_is_refused_by_role() {
+        let error = plan_layer(&hyper_step(), &[]).unwrap_err();
+        assert!(error.contains("layer 3's part"), "{error}");
+        assert!(error.contains("Side"), "{error}");
+    }
+
+    #[test]
+    fn a_widened_residual_frames_and_the_indexer_runs_ahead_of_its_mixer() {
+        let hosted = [StepRole::Side, StepRole::Residual, StepRole::Indexer];
+        let layer = plan_layer(&hyper_step(), &hosted).unwrap();
+        assert_eq!(layer.residual, Some(PartKind::HyperConnection));
+        assert_eq!(
+            layer.branches,
+            vec![
+                (StepRole::Side, PartKind::Engram),
+                (StepRole::Indexer, PartKind::SparseIndexer),
+                (StepRole::Attention, PartKind::MlaAttention),
+                (StepRole::Ffn, PartKind::Moe),
+            ]
+        );
+        let partial = plan_layer(&hyper_step(), &[StepRole::Side, StepRole::Residual]);
+        assert!(partial.unwrap_err().contains("Indexer"));
+    }
+
+    #[test]
+    fn a_plain_layer_is_its_mixer_then_its_feed_forward() {
+        let step = LayerStep {
+            index: 0,
+            attention: PartKind::GqaAttention,
+            compression: None,
+            indexer: None,
+            ffn: PartKind::DenseMlp,
+            residual: None,
+            sides: Vec::new(),
+        };
+        let layer = plan_layer(&step, &[]).unwrap();
+        assert_eq!(layer.residual, None);
+        assert_eq!(
+            layer.branches,
+            vec![
+                (StepRole::Attention, PartKind::GqaAttention),
+                (StepRole::Ffn, PartKind::DenseMlp),
+            ]
+        );
     }
 }

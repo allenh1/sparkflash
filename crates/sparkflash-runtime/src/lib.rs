@@ -71,8 +71,8 @@ pub use layout::{
 pub use ledger::{Ledger, Mode, Strategy};
 pub use part::{PartBody, PartExec, PartHost, PartMaker, PartRegistry, RankSplit};
 pub use plan::{
-    PlanBranch, PlanHost, PlanLane, PlanPart, PlanRows, PlanSeq, PlanWalk, plan_head, plan_roles,
-    plan_state, walk_rows,
+    PlanBranch, PlanHost, PlanLane, PlanLayer, PlanPart, PlanPass, PlanRows, PlanSeq, PlanWalk,
+    plan_head, plan_layer, plan_state, walk_rows,
 };
 pub use pool::{LaneMemory, LanePool};
 pub use resume::{

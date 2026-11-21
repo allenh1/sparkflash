@@ -80,7 +80,7 @@ named: `sparse_indexer`, `hyper_connection` and `engram`.
 | left | whose | why |
 | --- | --- | --- |
 | the MLA part's bodies (latent projections, rotary, gated output, sinks, the sliding layers) | the family crate | the arithmetic only this release has; the catalogue's MLA kernels are DeepSeek's and GLM's shapes |
-| the indexer role (fine and compressed) | the shared walk | `plan_roles` refuses an indexer step; DeepSeek and GLM run theirs inside their own walks |
+| the indexer role (fine and compressed) | the shared walk | `plan_layer` refuses an indexer step for a host that does not frame one; DeepSeek and GLM run theirs inside their own walks |
 | the residual role (four hyper-connection streams, iHC) | the shared walk | the walk's residual is one stream; GLM's mHC, Qwen's hyper streams and Inkling's block residual need the same widening |
 | the side role (Engram) | the shared walk | DeepSeek's and Qwen's lookups land on the layer input inside their own walks |
 | the image tower and the draft head | the shared walk | the walk takes no images and has no drafter hook |

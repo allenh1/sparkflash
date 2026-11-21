@@ -23,7 +23,7 @@
 //!   [sparkflash_runtime::PartExec] over the dense host; [emit] writes a stub whose bodies refuse
 //!   by name;
 //! * a residual mixer, a side lookup, a sparse indexer or a compression step is a step
-//!   [sparkflash_runtime::PlanWalk] does not run yet ([sparkflash_runtime::plan_roles] refuses
+//!   [sparkflash_runtime::PlanWalk] does not run yet ([sparkflash_runtime::plan_layer] refuses
 //!   it), and a draft head or an image tower is a capability the walk does not host yet. Both are
 //!   named, not stubbed: no part a family writes today can carry them.
 //!

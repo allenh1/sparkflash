@@ -17,9 +17,9 @@
 //! The runtime drives it: the arm's serving entry opens a [`sparkflash_runtime::Runtime`] over
 //! [`DenseWalk`], the runtime's [`PlanWalk`] over this host, and the runtime owns the prompt
 //! parts, history, reuse, rewind, lane pool, ledger, the layer loop and the head's
-//! record-then-choose. This file supplies only what needs the device: the embed, the norm before
-//! each part, the group's sum of a part's partial, the residual add, the head's logits and its
-//! device pick, and a sequence's lane memory.
+//! record-then-choose. This file supplies only what needs the device: the embed, each branch's
+//! frame (the norm before the part; the group's sum of its partial and the residual add after),
+//! the head's logits and its device pick, and a sequence's lane memory.
 //!
 //! Every pass takes the arm's [`WidePolicy::DENSE`]: a prompt chunk takes the wide tile, and a
 //! token step takes the tile once it batches more than the row GEMV's eight rows (below that the
@@ -37,8 +37,8 @@ use sparkflash_model::ledger::State;
 use sparkflash_ops::calls::{self, RmsNorm};
 use sparkflash_ops::projection::WidePolicy;
 use sparkflash_runtime::{
-    ComputeDeclaration, Limits, PassKind, PassMask, PlanBranch, PlanHost, PlanLane, PlanSeq,
-    PlanWalk, Segments, StateKind, WalkCapabilities,
+    Absent, ComputeDeclaration, Limits, PassKind, PassMask, PlanBranch, PlanHost, PlanLane,
+    PlanPass, PlanSeq, PlanWalk, Segments, StateKind, WalkCapabilities,
 };
 
 use super::{
@@ -101,13 +101,13 @@ impl PlanLane for DenseLane {
 
 impl PlanHost for Shared {
     type Parts = Dense;
-    type Norm = Deviceptr;
+    type Frame = Deviceptr;
     type Lane = DenseLane;
     type Scratch = Scratch;
     type Mode = Option<WidePolicy>;
+    type Drafter = Absent<&'static str>;
 
     const DEVICE: &'static str = DEVICE;
-    const NO_DRAFTER: &'static str = "dense has no draft head";
     const CAPABILITIES: WalkCapabilities = WalkCapabilities {
         passes: PassMask::ALL,
         segments: Segments::Many,
@@ -151,8 +151,12 @@ impl PlanHost for Shared {
         DenseLane::open(Arc::clone(this)).map_err(|error| BackendError::new(DEVICE, error))
     }
 
-    fn mode(&self, kind: PassKind) -> Option<WidePolicy> {
-        policy_for_kind(kind, self.policy)
+    fn drafter(_: &Arc<Self>) -> Result<Self::Drafter, BackendError> {
+        Ok(Absent("dense has no draft head"))
+    }
+
+    fn mode(&self, pass: PlanPass, _rows: usize) -> Option<WidePolicy> {
+        policy_for_kind(pass.kind, self.policy)
     }
 
     fn back(&self, lane: &mut DenseLane, reach: usize) -> Result<(), BackendError> {
@@ -179,7 +183,7 @@ impl PlanHost for Shared {
         )
     }
 
-    fn norm(&self, scratch: &Scratch, norm: &Deviceptr, rows: usize) -> Result<(), BackendError> {
+    fn enter(&self, scratch: &Scratch, norm: &Deviceptr, rows: usize) -> Result<(), BackendError> {
         let b = &scratch.buffers;
         self.norm(
             RmsNorm::new(b.x.0, norm.0, b.normed.0, self.hidden, self.eps),
@@ -207,12 +211,18 @@ impl PlanHost for Shared {
         }
     }
 
-    fn combine(&self, scratch: &Scratch, rows: usize) -> Result<(), BackendError> {
-        self.sum(scratch.buffers.projected, rows)
-    }
-
-    fn add(&self, scratch: &Scratch, rows: usize) -> Result<(), BackendError> {
+    fn leave(
+        &self,
+        scratch: &Scratch,
+        _norm: &Deviceptr,
+        _next: Option<&Deviceptr>,
+        summed: bool,
+        rows: usize,
+    ) -> Result<(), BackendError> {
         let b = &scratch.buffers;
+        if summed {
+            self.sum(b.projected, rows)?;
+        }
         self.call(
             self.kernels.add,
             calls::add(b.x.0, b.projected.0, rows * self.hidden),
