@@ -2282,12 +2282,12 @@ and the served gate, and neither has run. The TP checks of every arm are skipped
 |---|---|---|
 | DeepSeek V4.1 | `Batch` (its own; shares the decisions and the prompt half) | no |
 | Qwen (three selectors), GLM | `TickEngine` through `TickServe`, alone and in a group | yes |
-| Inkling | `TickEngine` in a group; the older `FusedEngine` when the group serves images; an f32 host path with no walk when it runs alone | group only |
-| dense (any catalogue-only model) | `TickEngine` alone; `Fusion::group` (the older engine) in a TP group | yes |
+| Inkling | `TickEngine` alone and in a group, images included; a lone rank still has an f32 host path with no walk | group only |
+| dense (any catalogue-only model) | `TickEngine` alone and in a TP group | yes |
 | Dory | its own two `ModelSession`s (device, recurrence ring): own lanes, chunking, history, rewind and ledger | no |
 
-So the runtime itself still carries two schedulers (`engine.rs` 2,242 lines, `fused.rs` 2,290),
-and two models are outside it.
+So the runtime carries one scheduler (`engine.rs`, with the decisions in `tick.rs`), and two
+models are outside it. The fused engine (`fused.rs`, 2,290 lines) is gone.
 
 ### What a new family costs today
 
@@ -2382,8 +2382,8 @@ Three findings, each with the change it implies.
    and the CLI's codec, response engine, group defaults, converter dispatch and the console's
    deployment rows read it. The CLI line gate records the gain. Left: Inkling's single-process
    f32 host path still boots in `dynamic.rs` (routing it through `serve_arm_identity` would add
-   the kernel catalogue's boot gate, which that path deliberately bypasses), and the dense and
-   Inkling group halves stay on the fused engine through the same entry. The group halves of the
+   the kernel catalogue's boot gate, which that path deliberately bypasses). The dense and
+   Inkling group halves moved onto the tick group in item 4. The group halves of the
    pack drivers (`serve_group`, `serve_group_lanes`) and `WalkArm`'s own `serve_group` and
    `mirror` compile on the new split and owe one multi-rank run.
 2. **The scaffolding.** One parametrised CPU shape walk in the runtime replaces the three copies:
@@ -2414,8 +2414,16 @@ Three findings, each with the change it implies.
    * `DraftBudget` (`AnchorsAndDrafts`, `OnePass(rows)`) is the budget rule of Qwen, GLM and
      Inkling, and `ExpertUnionWall::with_experts` builds each arm's wall from its fitted
      constant and the checkpoint's expert counts.
-4. **Retire `FusedEngine`.** Two users remain: dense in a TP group (its lane frames cannot carry
-   a chunk's rows yet) and Inkling's group with images. Both need a group.
+4. **Retire `FusedEngine`.** Done. The tick group's wire already carried a prompt chunk's rows
+   (`LaneRows`, run on the worker by `run_part_rows`), so dense's group needed nothing new. A
+   prompt whose start encodes images (Inkling's tower) sends its request frame first and the
+   start after it (`TickGroup::begin`, `TickGroup::started`, `LaneStart`), so every rank joins
+   the encode from the frame instead of waiting for rank 0's start. Dense's group and Inkling's
+   image group run on the tick group; `FusedEngine`, `FusedSession`, `FusedArm`, `GroupLanes`,
+   `Fusion`, `GroupEngine` and the arms' `group_engine` are deleted. A chunk boundary is the
+   arm's `ChunkPolicy` chunk on either engine, so no bits move. Verified on the CPU (the
+   runtime's tests, including the image-order and start-check gates) and on one GB10 (the arms'
+   library tests and the generated checks); the group halves themselves owe one multi-rank run.
 5. **Dory onto `Walk`.** It is the only served model with no reuse at TP 1 and the only one whose
    ledger is written by hand. Done for the single-process device arm: `DoryWalk` (in
    `crates/sparkflash-model-dory/src/device/walk.rs`) serves on the tick engine, so its lanes

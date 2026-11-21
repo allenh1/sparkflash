@@ -60,9 +60,9 @@ use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculatio
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
 use crate::chunk::ChunkPolicy;
-use crate::fused::Part;
 use crate::group::{GroupWire, TickGroup, watched_hub};
 use crate::ledger::{Ledger, Mode, Strategy};
+use crate::runtime::Part;
 use crate::runtime::{Runtime, RuntimeSlot, StepMode};
 use crate::tick::{
     Clock, Decision, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, QUEUE,
@@ -414,6 +414,40 @@ fn release_lane<W: Walk>(
     }
 }
 
+/// The fused engine's prompt-schedule switch. It is no longer read by any engine: the tick
+/// engine always runs a prompt in chunks between the decoders' steps. A value that asks for
+/// something else is refused rather than ignored.
+pub const PROMPT_PARTS_ENV: &str = "SPARKFLASH_PROMPT_PARTS";
+
+/// [PROMPT_PARTS_ENV] as set.
+///
+/// # Errors
+/// A value that asks for a schedule this engine does not run, or a variable that is not UTF-8.
+fn prompt_parts() -> Result<(), String> {
+    match std::env::var(PROMPT_PARTS_ENV) {
+        Err(std::env::VarError::NotPresent) => prompt_parts_request(None),
+        Ok(value) => prompt_parts_request(Some(&value)),
+        Err(error) => Err(format!("{PROMPT_PARTS_ENV}: {error}")),
+    }
+}
+
+/// What a [PROMPT_PARTS_ENV] of `value` asks for. `on` (and unset) is the schedule the tick
+/// engine runs, so it is accepted; `off` asked the fused engine to run every prompt whole as
+/// it arrived, which this engine does not do, and is refused by name.
+///
+/// # Errors
+/// `off`, or a value that is neither `on` nor `off`.
+fn prompt_parts_request(value: Option<&str>) -> Result<(), String> {
+    match value.map(str::trim) {
+        None | Some("" | "on") => Ok(()),
+        Some("off") => Err(format!(
+            "{PROMPT_PARTS_ENV}=off ran every prompt whole in the fused engine, which is retired: \
+             the tick engine chunks every prompt, so unset it"
+        )),
+        Some(other) => Err(format!("{PROMPT_PARTS_ENV}={other} is neither on nor off")),
+    }
+}
+
 /// DeepSeek's tick over one Walk.
 pub struct TickEngine<W: Walk> {
     runtime: Runtime<W>,
@@ -543,6 +577,7 @@ impl<W: Walk> TickEngine<W> {
     /// # Errors
     /// A runtime that refuses the walk, or a lane the arm cannot open.
     pub fn new(walk: W, capacity: usize) -> Result<Self, BackendError> {
+        prompt_parts().map_err(|error| BackendError::new("tick", error))?;
         if capacity == 0 {
             return Err(BackendError::new(
                 "tick",
@@ -883,7 +918,7 @@ impl<W: Walk> TickEngine<W> {
             return Ok(());
         };
         // Rank 0's own half first: an arm that refuses the give-back refuses on every rank, so
-        // a refusal must not leave the workers past rank 0 (as GroupLanes' does).
+        // a refusal must not leave the workers past rank 0 (as a lane mirror's does).
         self.runtime.give_back_slot(slot, count)?;
         if let Some(group) = self.group.as_ref()
             && let Err(error) = group.give_back(lane, count)
@@ -1116,9 +1151,24 @@ impl<W: Walk> TickEngine<W> {
             self.requests[index].lane = Some(lane);
             let sampling = self.requests[index].sampling;
             self.runtime.walk().set_sampling(slot.seq_mut(), sampling);
+            // A prompt whose start runs a collective (an image encode on every rank) has its
+            // request frame in front of that start: the workers join the collective from the
+            // frame, so rank 0 cannot wait for its own start first. The start frame follows
+            // ([TickGroup::started]).
+            let early = self.group.is_some() && !new_images.is_empty();
+            if early {
+                let group = self.group.as_ref().expect("a group");
+                if let Err(error) = group.begin(lane, &wanted, &new_images, &sampling) {
+                    group.out_of_step(&error.to_string());
+                }
+            }
             let start = match self.runtime.start_prompt_slot(slot, &wanted, &new_images) {
                 Ok(start) => start,
                 Err(error) => {
+                    if early {
+                        let group = self.group.as_ref().expect("a group");
+                        group.out_of_step(&error.to_string());
+                    }
                     self.fail(index, error, events);
                     continue;
                 }
@@ -1138,11 +1188,17 @@ impl<W: Walk> TickEngine<W> {
             }
             // The request frame carries the start rank 0 chose, so it follows rank 0's own
             // start_prompt_slot and precedes every row frame; the worker's own start is checked
-            // against it there. Nothing has run a row yet.
-            if let Some(group) = self.group.as_ref()
-                && let Err(error) = group.place(lane, &wanted, &new_images, start, &sampling)
-            {
-                group.out_of_step(&error.to_string());
+            // against it there. A prompt that carried images already sent its request frame, so
+            // its start travels alone. Nothing has run a row yet.
+            if let Some(group) = self.group.as_ref() {
+                let sent = if early {
+                    group.started(lane, start)
+                } else {
+                    group.place(lane, &wanted, &new_images, start, &sampling)
+                };
+                if let Err(error) = sent {
+                    group.out_of_step(&error.to_string());
+                }
             }
             let bulk = bulk_from(
                 target,
@@ -2239,4 +2295,23 @@ fn trace_path() -> Option<PathBuf> {
     let value = std::env::var_os("SPARKFLASH_TICK_TRACE")?;
     let path = PathBuf::from(value);
     (!path.as_os_str().is_empty()).then_some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fused engine's switch went with the engine. What it asked for that the tick engine
+    /// runs is accepted; the rest is refused by name rather than ignored.
+    #[test]
+    fn the_retired_prompt_parts_switch_accepts_what_the_engine_runs_and_refuses_the_rest() {
+        for on in [None, Some(""), Some("on")] {
+            assert_eq!(prompt_parts_request(on), Ok(()), "{on:?}");
+        }
+        let off = prompt_parts_request(Some("off")).expect_err("off asked for whole prompts");
+        assert!(off.contains(PROMPT_PARTS_ENV), "{off}");
+        assert!(off.contains("retired"), "{off}");
+        let other = prompt_parts_request(Some("0")).expect_err("not a switch value");
+        assert!(other.contains(PROMPT_PARTS_ENV), "{other}");
+    }
 }

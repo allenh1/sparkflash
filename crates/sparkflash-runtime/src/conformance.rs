@@ -229,8 +229,8 @@ pub trait WalkFixture: Walk {
     /// ([`crate::TickEngine`]) instead of the runtime's own prompt loop.
     ///
     /// An arm that serves on the tick engine says so here, so its generated checks drive the
-    /// path it serves on. An arm still on [`crate::FusedEngine`] leaves the default and its
-    /// checks are unchanged.
+    /// path it serves on. The checks that drive the runtime's own prompt loop instead leave the
+    /// default.
     fn tick_engine() -> bool {
         false
     }

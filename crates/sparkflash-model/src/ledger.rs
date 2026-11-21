@@ -29,7 +29,7 @@ use std::fmt;
 /// One strategy the runtime offers an arm, in the order the ledger prints it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Strategy {
-    /// Several requests' rows in one walk ([sparkflash_runtime::FusedEngine]).
+    /// Several requests' rows in one walk ([sparkflash_runtime::TickEngine]).
     Lanes,
     /// A long prompt a chunk at a time between the decoders' steps.
     PromptParts,

@@ -334,7 +334,7 @@ impl Walk for DenseWalk {
 #[cfg(test)]
 mod tests {
     use sparkflash_runtime::testing::format_rule;
-    use sparkflash_runtime::{Fixture, FusedArm, Runtime, WalkFixture};
+    use sparkflash_runtime::{Fixture, Runtime, WalkFixture};
 
     use super::*;
 
@@ -765,7 +765,7 @@ mod tests {
     fn prompt_passes_in(runtime: &Runtime<RecordingWalk>, len: usize) -> Vec<Recorded> {
         let mut slot = runtime.open_slot().expect("a slot");
         runtime
-            .prefill(&mut slot, &vec![7u32; len])
+            .prefill_slot(&mut slot, &vec![7u32; len])
             .expect("the prefill");
         runtime
             .walk()

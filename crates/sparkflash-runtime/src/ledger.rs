@@ -22,7 +22,7 @@
 //! lanes?" without reading its code, and a strategy that silently fell back would show as one.
 //!
 //! The engine fills what it decides itself (how many lanes, whether prompts run in parts at all);
-//! the arm fills what only it knows ([crate::FusedArm::ledger]): whether it splits its prompts,
+//! the runtime fills what it decides ([crate::Runtime::ledger]): whether it splits its prompts,
 //! drafts, verifies its lanes' rounds in one walk, hands back multi-token runs or keeps prefixes.
 //!
 //! [docs/engine/03-runtime.md]: ../../../docs/engine/03-runtime.md

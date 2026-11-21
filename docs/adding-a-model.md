@@ -165,14 +165,15 @@ describes.
 An arm does not write a serving loop. It supplies a schedule (how its walk steps rows) and the
 kernels only it has; everything else is shared and named here.
 
-**The schedule** is `sparkflash_runtime::FusedArm` ([engine/03-runtime.md](engine/03-runtime.md)):
-open a slot, step a set of slots one row each, run a prompt (`begin_prompt`, `next_part` for a
-prompt split into chunks), hand back a multi-token run (`ready`, `give_back`), and say what a slot
-holds for prefix reuse (`history`). A drafting arm adds `RoundArm` (draft every chain, one verify
-walk, accept per sequence) and the runtime decides the rows each round gets (`share_rows`). A
-tensor-parallel group adds only its wire (`GroupWire`: admission, sampler and image frames);
-`GroupLanes` runs rank 0's decisions on every rank. The engine (`FusedEngine`) owns slots, the
-engine thread, admission, the prompt scheduler and reclaim.
+**The schedule** is `sparkflash_runtime::Walk` ([engine/03-runtime.md](engine/03-runtime.md)):
+one walk over some rows of some sequences (`Pass` says which shape), a sequence that grows,
+gives back and rewinds, a head over the last row, and the layout its state uses. A drafting arm
+adds `Drafter` (draft every chain, one verify walk, accept per sequence) and the runtime decides
+the rows each round gets (`share_rows`). A tensor-parallel group adds only its wire
+(`GroupWire`: admission, sampler and image frames); the tick group (`TickGroup`) runs rank 0's
+decisions on every rank. The engine (`TickEngine`, served through `sparkflash_runtime::serve`,
+`serve_group` and `mirror`) owns slots, the engine thread, admission, the prompt scheduler and
+reclaim.
 
 **What a new arm inherits.** Each strategy below is built once; the arm supplies the hook in the
 middle column and gets the rest. The default is what an arm that writes nothing gets, and the
@@ -205,10 +206,11 @@ the history (Dory's guessed rows) and takes the lane out of the counts that sche
 lanes. The host's kept pool does the rest. Such an arm builds its own `Ledger` and prints it at
 open, so its line reads as every other arm's.
 
-**The ledger** is how an arm says what it does with that schedule. `FusedArm::ledger` returns a
-`sparkflash_runtime::Ledger` stating each strategy it runs natively, looped or off, with the
-reason; the engine adds what it decides and prints the line at boot. A strategy the arm leaves
-unstated prints as off, so an arm cannot appear to support what it does not.
+**The ledger** is how an arm says what it does with that schedule. `WalkCapabilities` states the
+shapes the walk takes and what its own kernels decide; `Runtime::ledger` turns that into a
+`sparkflash_runtime::Ledger` stating each strategy natively, looped or off, with the reason; the
+engine adds what it decides and prints the line at boot. A strategy the arm leaves unstated prints
+as off, so an arm cannot appear to support what it does not.
 
 **Shared launch rules.** A BF16 projection's kernel comes from `sparkflash_ops::projection`:
 `route_bf16` with the arm's `WidePolicy` chooses the row GEMV, the wide tensor-core tile, the
@@ -376,7 +378,7 @@ the mechanism there; never copy it into the arm.
 | the descriptor a pack reports (window and vocabulary from the checkpoint) | `sparkflash_model::arm::PackIdentity` |
 | a session's KV claim and the `--concurrency`/`--kv-budget-gib` admission | `sparkflash_model::arm::KvPlan`, printed and refused by `pack::admit` |
 | which drafts a verify keeps, the tokens it queues, the depth, the counters | `sparkflash_model::spec::{verdict, Queue, Speculator}` |
-| sessions stepped together as one pass over the weights (`--fuse-batch`), lanes and multi-token runs | `sparkflash_runtime::{FusedArm, FusedEngine}` ([engine/03-runtime.md](engine/03-runtime.md)) |
+| sessions stepped together as one pass over the weights (`--fuse-batch`), lanes and multi-token runs | `sparkflash_runtime::{Walk, TickEngine}` ([engine/03-runtime.md](engine/03-runtime.md)) |
 | several sequences' drafts verified in one walk, and the rows each is given | `sparkflash_runtime::{RoundArm, run_round, share_rows, StepWall}` |
 | a walk's CPU profile tests (compute rows, tick config, prompt chunks, joint and speculative rounds) | `sparkflash_runtime::profile_checks!` over the arm's `testing::ShapeWalk` |
 | a fixture's stored-format names and token-pass bytes | `sparkflash_runtime::testing::{format_rule, token_bytes}` |
@@ -539,9 +541,9 @@ web's fit read that one plan, and:
   catalogue, whose rows pin the released presets' shapes. Its check is a per-layer parity report
   against the host reference (`cli/src/serve/dense_parity.rs`), not a recorded digest: it keeps
   BF16 keys and values where the reference keeps f32. It serves at TP1 on the serving contract
-  (runtime step 20): `DenseLanes` is a `FusedArm`, so the shared `FusedEngine` steps its lanes
+  (runtime step 20): `DenseLanes` is the runtime's, so the shared `TickEngine` steps its lanes
   together (four by default; `--concurrency` or the profile's `runtime.concurrency` sets them,
-  and a mismatch is refused), feeds long prompts in 256-row parts between other lanes' steps,
+  and a mismatch is refused), feeds long prompts in 256-row chunks between other lanes' steps,
   keeps each conversation for its next turn, and goes back to the prompt when a turn parts from
   the reply (`SPARKFLASH_REWIND=0` keeps only extensions). Each lane's keys and values grow in
   `SequenceLanes` memory, and the boot prints the arm's ledger. A member of a fused step gets the
@@ -555,7 +557,7 @@ web's fit read that one plan, and:
   head counts, every MLP and expert width; FP8 shares on whole scale tiles), every branch's
   partial rows are summed in rank order through `sparkflash_ops::tp::RowSums` (the host seam, or
   NCCL's one-shot and two-shot device legs, which give the same bits), and rank 0's lanes run on
-  every rank through `GroupLanes` (`enable_group_fusion`, `mirror_group`). A worker never
+  every rank through the tick group (`enable_group_fusion`, `mirror_group`). A worker never
   detokenizes; the host reference runs alone, so a checkpoint the arm refuses is refused at a
   world above one;
 - any other novel family is served by the CPU reference backend in

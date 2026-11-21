@@ -1024,11 +1024,13 @@ the teacher-forced logits of the 6,000-token text are identical.
 ### Concurrency: fused lanes
 
 `LANES=N` (`--concurrency N --fuse-batch`) serves N requests at once through the workspace's
-`FusedEngine`, the engine Qwen and GLM use (Dory's recurrence group has its own scheduler).
+tick engine (`TickEngine`), the engine every arm uses (Dory's recurrence group has its own
+scheduler).
 Requests are admitted within a 300 µs window. A prefill
 runs alone, and the decodes due together run as one multi-row step that reads each weight once for
-every lane. Rank 0 broadcasts each lane's prompt (`LaneRequest`) and each fused step's members in
-its own order (`LaneStep`), so every rank steps the same rows in the same order. A lane decodes the
+every lane. Rank 0 broadcasts each lane's prompt (`LaneRequest`), each chunk's rows (`LaneRows`)
+and each step's members and shape (`LaneStepMode`), so every rank steps the same rows in the
+same order. A lane decodes the
 bits it would decode alone: every request at widths 2 and 4 returns its width-1 text.
 
 | width | aggregate | per request | time to first token |

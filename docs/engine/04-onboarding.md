@@ -447,8 +447,10 @@ In order:
    crate behind `Walk`. Its constants (4096-row idle chunk, 2048 busy, 64 rows a step, the band
    wall, the queue) become the `Defaults` table of mechanism 5.
 5. **The other arms move onto it**, one at a time, dense first. `FusedEngine` and `GroupLanes`
-   are deleted when the last arm has left. An arm that measures slower on the tick engine stays
-   where it is, and the plan records why.
+   are deleted when the last arm has left: done for the single-process and group engines, every
+   `Walk` arm's group now being the tick group, with `fused.rs` deleted; DeepSeek's `Batch`
+   still has not moved. An arm that measures slower on the tick engine stays where it is, and the
+   plan records why.
 6. **The CLI path folds** into the common entry.
 
 What `Walk` needs for this, beyond the first sketch:
@@ -545,7 +547,7 @@ when a row changes.
 | DeepSeek | captured | native (32 lanes in a 64-deep queue, rows gathered on the device) | native (bulk chunks, 4096 rows a tick when idle and 2048 busy) | native (bulk chunks on the FP8 x FP4/FP8 MMAs) | native (one-to-eight-row steps on the MMA (opt_gemv_mma)) | native (DSpark block drafter) | native (up to 32 lanes share one speculative step) | native (an accepted run reaches the request at once) | native (a lane keeps its sequence and resumes from the longest shared prefix) | native (positional state: a changed turn moves its counters back) | native (FP8 projections, FP4 and MXFP8 experts in their stored formats) | native (a tensor-parallel group: rank 0 decides each tick and broadcasts) |
 | Qwen | captured | native (four fused lanes) | native (the prefill plan's chunks) | native (prompt chunks on the wide tile and the grouped expert MMAs) | native (few-row twins of the tile at every row count) | native (DFlash 2 or MTP) | native (lanes' rounds share one verify) | native (an accepted run reaches the request at once) | native (a prompt that extends a lane's sequence) | native (a prompt that goes back to the last prompt's end) | native (NVFP4 weights with BF16 activation pairs) | native (a tensor-parallel group on the tick engine: rank 0 decides each tick and the workers replay its rows) |
 | GLM | captured | native (four fused lanes) | native (bulk prefill chunks of 4096 rows) | native (bulk GEMMs on the FP8 E4M3 MMAs; BF16 as head and remainder) | native (the FP8 parts on the tile's few-row body, the BF16 parts on the tiled GEMV) | native (MTP or DFlash 2) | native (lanes' rounds share one verify) | native (an accepted run reaches the request at once) | native (a prompt that extends a lane's sequence) | native (a prompt that goes back to the last prompt's end) | native (FP8 E4M3 projections and experts run E4M3 x E4M3; BF16 stays BF16) | native (a four-rank group over the shared RDMA exchange) |
-| Inkling | none (registered, uncaptured) | native (four fused lanes) | native (bulk chunks of up to 8,192 tokens) | native (dense projections and NVFP4/MXFP8 experts on the grouped MMAs) | off (row token GEMV; decode.tensor_cores=true is refused) | native (prompt lookup or the DSpark stage) | native (lanes' rounds share one verify) | native (an accepted run reaches the request at once) | native (a prompt that extends a lane's sequence) | native (a prompt that goes back to the last prompt's end) | native (NVFP4 and MXFP8 experts, BF16 dense, in their stored formats) | native (a four-rank group on the tick engine: rank 0 decides each tick and the workers replay its rows; a rank 0 that holds the vision tower keeps the fused group) |
+| Inkling | none (registered, uncaptured) | native (four fused lanes) | native (bulk chunks of up to 8,192 tokens) | native (dense projections and NVFP4/MXFP8 experts on the grouped MMAs) | off (row token GEMV; decode.tensor_cores=true is refused) | native (prompt lookup or the DSpark stage) | native (lanes' rounds share one verify) | native (an accepted run reaches the request at once) | native (a prompt that extends a lane's sequence) | native (a prompt that goes back to the last prompt's end) | native (NVFP4 and MXFP8 experts, BF16 dense, in their stored formats) | native (a four-rank group on the tick engine: rank 0 decides each tick and the workers replay its rows; a rank 0 that holds the vision tower sends the request frame before its image encode) |
 | Dory | none (registered, uncaptured) | native (eight lanes, up to 32 rows a pass, a batch on every rank) | native (chunks of up to 4096 rows between the other lanes' steps) | native (prompt projections over eight rows on dory_mma_wide; attention on the MMA instances) | off (warp-dot row kernels; decode.tensor_cores=true is refused) | native (loop-1 exit on the drafter rank while at most its lanes run) | native (one verify walk over the ring's lanes) | off (the ring hands back one token a lane) | native (a prompt that extends a lane's sequence) | native (a prompt that goes back to the last prompt's end) | native (BF16 weights and a BF16 KV cache throughout) | native (a rank ring: each rank runs its loops, rank 0 schedules) |
 | dense | none (no entry) | native (four fused lanes) | native (256-row chunks) | native (prompt projections on the shared wide tile) | off (row GEMV; decode.tensor_cores=true is refused) | off (no drafter) | off (no drafter configured) | off (the arm holds no answers past a step) | native (a prompt that extends a lane's sequence) | native (a prompt that goes back to the last prompt's end) | native (BF16, FP8 E4M3 and NVFP4 parts run in their stored formats) | native (a tensor-parallel group over the shared RDMA exchange) |
 
@@ -757,6 +759,16 @@ measurements, the inventory and the window gate are in
 [04-onboarding-review.md](04-onboarding-review.md#phase-6-step-6-first-slice-the-rank-openers-leave-serverrs).
 DeepSeek's 14,545-line serving path (`device_chain.rs`, `tp4_host.rs`, `tp4_chain.rs`,
 `tp4_device_runner.rs`, `serve/device.rs`) is untouched and is the rest of step 6.
+
+#### Phase 6: the fused engine retired
+
+The last two users of the fused engine left it. The tick group's wire already carried a prompt
+chunk's rows (`LaneRows`), so the dense arm's group needed nothing new. A prompt whose start
+encodes images (Inkling's tower) now sends its request frame before rank 0's start and the start
+after it (`TickGroup::begin`, `TickGroup::started`, `LaneStart`), so every rank joins the
+encode from the frame. Both serve on the tick group, and `fused.rs`, `FusedArm`, `FusedEngine`,
+`FusedSession`, `GroupLanes`, `Fusion` and `GroupEngine` are deleted. This removes the second
+scheduler phase 6 step 5 waited on; it is not DeepSeek's move, which still owes its A/B.
 
 #### Phase 6: what the tick trace emits now
 

@@ -38,6 +38,14 @@
 
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
+/// Steps of the decoding members between two parts of a prompt (`--prefill-decode-interval 2`,
+/// spec 5.6.2). DeepSeek's scheduler reads it from here.
+pub const PREFILL_DECODE_INTERVAL: usize = 2;
+
+/// A prompt of at most this many tokens runs whole as it arrives, between two parts of a longer
+/// one (`DSV41_PREFILL_BYPASS = 256`, spec 5.6.2). DeepSeek's scheduler reads it from here.
+pub const PREFILL_BYPASS_MAX_TOKENS: usize = 256;
+
 /// Sequences that may wait for a lane, past the lanes themselves.
 pub const QUEUE: usize = 64;
 /// The fewest positions a sequence takes from another lane ([crate::tick::common_prefix]'s

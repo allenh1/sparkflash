@@ -2588,10 +2588,6 @@ impl sparkflash_runtime::WalkArm for Qwen4ExpDeviceBackend {
             _ => Ok(()),
         }
     }
-
-    fn group_engine(&self) -> sparkflash_runtime::GroupEngine {
-        sparkflash_runtime::GroupEngine::Tick
-    }
 }
 
 impl std::fmt::Debug for Qwen4ExpDeviceBackend {

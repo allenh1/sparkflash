@@ -190,8 +190,6 @@ fn the_device_arm_refuses_a_context_past_the_window() {
 /// steps drop the lanes to one and check that path too.
 #[test]
 fn fused_lanes_step_as_each_lane_decodes_alone() {
-    use sparkflash_runtime::FusedArm;
-
     if !backend_available() {
         return;
     }
@@ -233,7 +231,9 @@ fn fused_lanes_step_as_each_lane_decodes_alone() {
     for (index, prompt) in prompts.iter().enumerate() {
         let mut slot = lanes.open_slot().expect("a lane");
         lanes.set_sampling(&mut slot, greedy());
-        let first = lanes.prefill(&mut slot, prompt).expect("the lane's prompt");
+        let first = lanes
+            .prefill_slot(&mut slot, prompt)
+            .expect("the lane's prompt");
         assert_eq!(
             first.logits, solo[index][0],
             "lane {index}: the prompt's answer"
@@ -248,7 +248,7 @@ fn fused_lanes_step_as_each_lane_decodes_alone() {
             .enumerate()
             .map(|(index, slot)| (slot, fed[index][step]))
             .collect();
-        let outputs = lanes.step(&mut members).expect("the fused step");
+        let outputs = lanes.step_slots(&mut members).expect("the fused step");
         assert_eq!(outputs.len(), width);
         for (index, output) in outputs.iter().enumerate() {
             let expected = &solo[index][step + 1];
@@ -273,7 +273,7 @@ fn fused_lanes_step_as_each_lane_decodes_alone() {
     lanes.renew(&mut slot).expect("the lane renews");
     lanes.set_sampling(&mut slot, greedy());
     let again = lanes
-        .prefill(&mut slot, prompts[1])
+        .prefill_slot(&mut slot, prompts[1])
         .expect("the renewed prompt");
     assert_eq!(
         again.logits, solo[1][0],

@@ -24,10 +24,8 @@
 //! * [mirror]: a worker of that group, replaying rank 0 until the group ends;
 //! * [lane_limit]: the lanes a group opens when its operator named none.
 //!
-//! A group is the tick group unless the arm says its group still needs the older fused engine
-//! ([GroupEngine::Fused]): the dense arm's lane frames cannot carry a chunk's rows yet, and
-//! Inkling's group keeps it while its rank 0 encodes images. Both stay reachable here, unchanged,
-//! until that engine is retired.
+//! A group is the tick group for every arm: rank 0's decisions travel as frames, and a worker
+//! runs the same rows and the same step shape.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -36,11 +34,7 @@ use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
 use sparkflash_model::backend::{BackendError, ModelSession};
 
 use crate::engine::TickServe;
-use crate::fused::{FusedArm, FusedEngine};
-use crate::group::{
-    GroupLanes, GroupWire, mirror_ticks_until_the_group_ends, mirror_until_the_group_ends,
-    watched_hub,
-};
+use crate::group::{GroupWire, mirror_ticks_until_the_group_ends};
 use crate::runtime::Runtime;
 use crate::walk::Walk;
 
@@ -51,16 +45,6 @@ pub enum Place {
     Alone,
     /// As one rank of a tensor-parallel group ([serve_group], [mirror]).
     Group,
-}
-
-/// The engine a group's ranks agree on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupEngine {
-    /// The tick group: rank 0 decides the tick, the frames carry its rows and step shape.
-    Tick,
-    /// The older fused engine over [GroupLanes], for a group whose frames the tick group cannot
-    /// carry yet. Every rank must give the same answer.
-    Fused,
 }
 
 /// What a walk arm's backend states so the runtime can serve it.
@@ -87,9 +71,6 @@ pub trait WalkArm {
     /// # Errors
     /// The refusal, in the arm's words.
     fn admit(&self, place: Place) -> Result<(), BackendError>;
-
-    /// The engine this arm's group runs on.
-    fn group_engine(&self) -> GroupEngine;
 }
 
 /// The engine a served backend's sessions are handles on.
@@ -129,12 +110,6 @@ where
     }
 }
 
-impl<A: FusedArm> Sessions for Arc<FusedEngine<A>> {
-    fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        Ok(Box::new(FusedEngine::open(self)?))
-    }
-}
-
 /// Serves `arm` in this process alone: `capacity` lanes on the tick engine over its walk.
 ///
 /// # Errors
@@ -163,23 +138,17 @@ pub fn serve_group(
 ) -> Result<Serving, BackendError> {
     arm.admit(Place::Group)?;
     let walk = arm.walk(capacity)?;
-    Ok(match arm.group_engine() {
-        GroupEngine::Tick => Serving(Box::new(TickServe::start_group(
-            walk,
-            capacity,
-            hub,
-            arm.wire(),
-        )?)),
-        GroupEngine::Fused => {
-            let lanes = GroupLanes::new(Runtime::new(walk, 0)?, watched_hub(hub)?, arm.wire());
-            Serving(Box::new(FusedEngine::start(Arc::new(lanes), capacity)?))
-        }
-    })
+    Ok(Serving(Box::new(TickServe::start_group(
+        walk,
+        capacity,
+        hub,
+        arm.wire(),
+    )?)))
 }
 
 /// A worker of a group: replays rank 0's frames over `capacity` lanes of this rank's own until
-/// the group can no longer serve, then ends the process ([mirror_ticks_until_the_group_ends], or
-/// [mirror_until_the_group_ends] on the fused engine).
+/// the group can no longer serve, then ends the process
+/// ([mirror_ticks_until_the_group_ends]).
 ///
 /// # Errors
 /// A backend that is no group's rank, or a walk or runtime the arm cannot build, before any
@@ -195,10 +164,7 @@ pub fn mirror(
         .and_then(|walk| Runtime::new(walk, 0))
         .map_err(|error| error.to_string())?;
     let wire = arm.wire();
-    match arm.group_engine() {
-        GroupEngine::Tick => mirror_ticks_until_the_group_ends(control, &runtime, &wire, capacity),
-        GroupEngine::Fused => mirror_until_the_group_ends(control, &runtime, &wire, capacity),
-    }
+    mirror_ticks_until_the_group_ends(control, &runtime, &wire, capacity)
 }
 
 /// The most lanes `arm`'s batch takes: the member width its walk's [crate::Limits] states.
@@ -251,10 +217,6 @@ mod tests {
                 (false, Place::Group) => Err(BackendError::new("shape", "no group's rank")),
                 _ => Ok(()),
             }
-        }
-
-        fn group_engine(&self) -> GroupEngine {
-            GroupEngine::Tick
         }
     }
 
