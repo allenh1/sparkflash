@@ -49,10 +49,10 @@ use sparkflash_model::ledger::State;
 use sparkflash_model::parts::Part;
 use sparkflash_model::{DepthPolicy, Queue, Speculator, TpPlan, argmax, kept_to_end, verdict};
 use sparkflash_runtime::{
-    ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, Limits, OutputConstraint,
-    PartExec, PartHost, Pass, PassKind, PassMask, PlanBranch, PlanHost, PlanLane, PlanPart,
-    PlanPass, PlanRows, PlanSeq, PlanWalk, PlanWindow, RankSplit, Region, Segment, Segments,
-    StateKind, StepWall, Walk, WalkCapabilities, plan_layer,
+    ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, Limits, NoVision,
+    OutputConstraint, PartExec, PartHost, Pass, PassKind, PassMask, PlanBranch, PlanHost, PlanLane,
+    PlanPart, PlanPass, PlanRows, PlanSeq, PlanWalk, PlanWindow, RankSplit, Region, Segment,
+    Segments, StateKind, StepWall, Walk, WalkCapabilities, plan_layer,
 };
 use sparkflash_weights::tp::{BitGatherHandle, TpRuntime};
 
@@ -495,6 +495,8 @@ impl PlanHost for Shared {
     type Lane = GlmLane;
     /// The checkpoint's MTP layer or the loaded DFlash 2 block drafter, as the runtime's round.
     type Drafter = GlmDrafter;
+    /// The arm reads text alone.
+    type Vision = NoVision;
     type Scratch = Scratch;
     /// The rank picks its kernels from the window it is in.
     type Mode = ();

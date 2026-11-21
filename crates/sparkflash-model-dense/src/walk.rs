@@ -37,8 +37,8 @@ use sparkflash_model::ledger::State;
 use sparkflash_ops::calls::{self, RmsNorm};
 use sparkflash_ops::projection::WidePolicy;
 use sparkflash_runtime::{
-    Absent, ComputeDeclaration, Limits, PassKind, PassMask, PlanBranch, PlanHost, PlanLane,
-    PlanPass, PlanSeq, PlanWalk, Segments, StateKind, WalkCapabilities,
+    Absent, ComputeDeclaration, Limits, NoVision, PassKind, PassMask, PlanBranch, PlanHost,
+    PlanLane, PlanPass, PlanSeq, PlanWalk, Segments, StateKind, WalkCapabilities,
 };
 
 use super::{
@@ -106,6 +106,7 @@ impl PlanHost for Shared {
     type Scratch = Scratch;
     type Mode = Option<WidePolicy>;
     type Drafter = Absent<&'static str>;
+    type Vision = NoVision;
 
     const DEVICE: &'static str = DEVICE;
     const CAPABILITIES: WalkCapabilities = WalkCapabilities {

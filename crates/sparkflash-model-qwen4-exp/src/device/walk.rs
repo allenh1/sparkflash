@@ -42,9 +42,9 @@ use sparkflash_model::backend::{BackendError, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
     ChunkPolicy, ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, Limits,
-    OutputConstraint, PartExec, PartHost, Pass, PassKind, PassMask, PlanBranch, PlanHost, PlanLane,
-    PlanPart, PlanPass, PlanRows, PlanSeq, PlanWalk, PlanWindow, RankSplit, Region, Segment,
-    Segments, StateKind, StepWall, Walk, WalkCapabilities, check_rewind,
+    NoVision, OutputConstraint, PartExec, PartHost, Pass, PassKind, PassMask, PlanBranch, PlanHost,
+    PlanLane, PlanPart, PlanPass, PlanRows, PlanSeq, PlanWalk, PlanWindow, RankSplit, Region,
+    Segment, Segments, StateKind, StepWall, Walk, WalkCapabilities, check_rewind,
 };
 
 /// The verify budget: every member's anchor and its whole depth. The batch buffers hold that
@@ -947,6 +947,8 @@ impl PlanHost for QwenHost {
     type Frame = QwenFrame;
     type Lane = QwenLane;
     type Drafter = QwenDrafter;
+    /// The arm reads text alone.
+    type Vision = NoVision;
     type Scratch = QwenScratch;
     type Mode = ();
 

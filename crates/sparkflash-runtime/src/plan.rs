@@ -39,7 +39,7 @@ use sparkflash_model::parts::Part as PartKind;
 use crate::layout::{LaneState, Limits, Region, StateLayout, check_checkpoint, check_rewind};
 use crate::part::{PartBody, PartExec, PartHost};
 use crate::walk::{
-    Drafter, HeadRow, Hidden, NoVision, Pass, PassKind, Segment, Walk, WalkCapabilities,
+    Drafter, HeadRow, Hidden, Pass, PassKind, Segment, Vision, Walk, WalkCapabilities,
 };
 
 /// A built part as a planned walk holds it: shared between the serving thread and its sessions.
@@ -218,6 +218,10 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
     type Lane: PlanLane + Send;
     /// The draft head: [`Absent`] for an arm without one.
     type Drafter: Drafter<PlanWalk<Self>>;
+    /// The image path: [`crate::NoVision`] for an arm without one. Its encode leaves the rows
+    /// with the sequence's lane, and the host's window reads them there: the walk hands the
+    /// host no images of its own.
+    type Vision: Vision<PlanWalk<Self>>;
     /// One walk's buffers.
     type Scratch: Send;
     /// What a pass hands its parts besides the rows: the host's kernel choice for a pass shape.
@@ -362,6 +366,13 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
     fn ends(&self, token: u32) -> bool {
         let _ = token;
         false
+    }
+
+    /// How many positions past the rewind point a sequence's state can still go back from
+    /// ([`Walk::rewind_slack`]): every position by default; a host whose cache slides states
+    /// its reach.
+    fn rewind_slack(&self) -> usize {
+        usize::MAX
     }
 
     /// Backs the lane's positional regions up to `reach` positions.
@@ -807,7 +818,7 @@ impl<H: PlanHost> Walk for PlanWalk<H> {
     type Seq = PlanSeq<H::Lane>;
     type Hidden = Hidden;
     type Drafter = H::Drafter;
-    type Vision = NoVision;
+    type Vision = H::Vision;
 
     const CAPABILITIES: WalkCapabilities = H::CAPABILITIES;
 
@@ -825,6 +836,10 @@ impl<H: PlanHost> Walk for PlanWalk<H> {
 
     fn drafter(&self) -> &Self::Drafter {
         &self.drafter
+    }
+
+    fn rewind_slack(&self) -> usize {
+        self.host.rewind_slack()
     }
 
     fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
