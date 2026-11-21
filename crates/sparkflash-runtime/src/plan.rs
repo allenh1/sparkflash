@@ -312,6 +312,15 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
         plan_state(self)
     }
 
+    /// How many of the layers, from the first, the walk runs in the window just begun
+    /// ([`Self::begin_window`]): the host's [`Self::finish`] runs the rest itself, such as
+    /// layers whose rows it splits in halves that overlap their collectives. The last walked
+    /// branch's exit still names the next layer's first frame. Every layer by default.
+    fn walked_layers(&self, scratch: &Self::Scratch) -> usize {
+        let _ = scratch;
+        self.layers()
+    }
+
     /// The host's tail after a window's layers, over the window's segments (their histories do
     /// not hold the window's ids yet): a head the host runs eagerly, a draft head's caches, what
     /// a prompt's end commits. `last` is the pass's last window. Nothing by default.
@@ -611,7 +620,7 @@ pub fn walk_rows<H: PlanHost>(
         host.begin_window(scratch, &mut window, &planned)?;
         let mut run = || {
             host.embed(scratch, &ids)?;
-            for index in 0..layers {
+            for index in 0..host.walked_layers(scratch).min(layers) {
                 for (at, branch) in host.branches(index).iter().enumerate() {
                     host.enter(scratch, &branch.frame, count)?;
                     let mut part = host.pass(scratch, &window, index, branch.slot, count, mode);
