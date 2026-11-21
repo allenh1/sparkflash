@@ -513,4 +513,49 @@ mod tests {
         assert!(again.contains("exists"), "{again}");
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
+
+    /// A checkpoint shaped like tencent/Hy4-flash-FP8 (a small config of the same structure:
+    /// latent attention with a sparse indexer, a sliding layer, four hyper-connection streams,
+    /// hashed Engram tables a head, routed experts): its MLA is the family's part, which the
+    /// dense host now takes, and what is left is the three roles the shared walk does not run.
+    #[test]
+    fn a_hyper_connected_engram_checkpoint_names_the_roles_left() {
+        let text = r#"{
+            "model_type": "acme_hyper", "hidden_size": 256, "intermediate_size": 512,
+            "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 4,
+            "head_dim": 64, "kv_lora_rank": 64, "q_lora_rank": 128, "qk_nope_head_dim": 32,
+            "qk_rope_head_dim": 32, "v_head_dim": 64,
+            "layer_types": ["deepseek_sparse_attention", "sliding_attention"],
+            "sliding_window": 128, "indexer_types": ["full", "full"], "index_n_heads": 4,
+            "index_head_dim": 32, "index_topk": 64, "mlp_layer_types": ["dense", "sparse"],
+            "first_k_dense_replace": 1, "n_routed_experts": 8, "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64, "n_shared_experts": 1, "hc_mult": 4,
+            "engram_layer_ids": [1], "engram_vocab_size": [1000, 1000],
+            "engram_layer_head_vocab_sizes": {"1": [[11, 13], [17, 19]]},
+            "engram_max_ngram_size": 3, "engram_n_embed_per_ngram": 64,
+            "engram_n_head_per_ngram": 2, "engram_pad_id": 0, "vocab_size": 512,
+            "max_position_embeddings": 512, "rms_norm_eps": 1e-6, "hidden_act": "silu",
+            "torch_dtype": "bfloat16"
+        }"#;
+        let (_, survey) = surveyed(text);
+        assert_eq!(
+            survey.own,
+            BTreeSet::from([Part::MlaAttention]),
+            "{survey:?}"
+        );
+        let left: BTreeSet<StepRole> = survey.unhosted.iter().map(|(role, _)| *role).collect();
+        assert_eq!(
+            left,
+            BTreeSet::from([StepRole::Indexer, StepRole::Residual, StepRole::Side]),
+            "{survey:?}"
+        );
+        let refusal = survey
+            .refusal
+            .as_deref()
+            .expect("the roles left are refused");
+        for part in ["sparse_indexer", "hyper_connection", "engram"] {
+            assert!(refusal.contains(part), "{refusal}");
+        }
+        assert!(!refusal.contains("mla_attention"), "{refusal}");
+    }
 }

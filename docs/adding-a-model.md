@@ -33,7 +33,7 @@ Before any code is written it prints:
 
 - the parts `Architecture::parts()` reads from the config, and which ones the kernel catalogue
   (`sparkflash_ops::parts::CATALOGUE`) already has;
-- the parts that need a `PartExec` (no tensor-core body in a pass and no `WAIVERS` line);
+- the parts with no tensor-core body in a pass and no `WAIVERS` line;
 - the stored format of each weight class, read from `quantization_config` at the top level or
   under `text_config`;
 - the config switches the parser does not model yet (`Architecture::unmodelled_features`), which

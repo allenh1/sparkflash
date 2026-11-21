@@ -416,7 +416,7 @@ fn render_parts(out: &mut String, architecture: &Architecture) {
             let _ = writeln!(out, "  waived {line}");
         }
     }
-    let _ = writeln!(out, "parts needing a PartExec:");
+    let _ = writeln!(out, "parts with no tensor-core body or waiver:");
     if needing.is_empty() {
         let _ = writeln!(out, "  none");
     } else {
@@ -535,7 +535,7 @@ mod tests {
         );
         assert!(text.contains("dense_mlp"), "no dense_mlp in:\n{text}");
         assert!(text.contains("lm_head"), "no lm_head in:\n{text}");
-        assert!(text.contains("parts needing a PartExec:"));
+        assert!(text.contains("parts with no tensor-core body or waiver:"));
         assert!(text.contains("parts with tensor-core gaps:"));
         assert!(
             text.contains("waived lm_head bf16 decode"),
