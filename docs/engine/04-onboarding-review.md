@@ -2446,6 +2446,96 @@ Three findings, each with the change it implies.
 7. **Phase 6, continued as shared halves**: the bulk chunk loop, then `decode`'s plan, each with
    the tick-trace A/B on the cluster.
 
+## The 2026-11-21 sprint: one walk for the catalogue arms, and a command that writes a family
+
+No cluster was used. Device runs are on one GB10 host, CPU runs on a development machine. The
+commits are the ones after `d7704d02` on `onboard/sprint2`; nothing is pushed or deployed. No output bits of
+a released arm move: DeepSeek, GLM, Qwen, Inkling and Dory keep their walks, and the dense arm's
+move onto the shared walk is checked bit-equal by its generated checks and `part_plugin`.
+
+### W1: the served groups on one host
+
+`scripts/one-host-group.sh` starts a dense, GLM, Qwen, Inkling or Dory group on one host (dry run
+by default) and runs the served gate against it; `scripts/owed-cluster-window.sh` lists what a
+one-GPU host cannot run. On the GB10:
+
+| group | lanes | lanes sampled | interleave | turns |
+| --- | --- | --- | --- | --- |
+| dense TP 4 (one host) | PASS | PASS | PASS | FAIL |
+| Qwen3.6 TP 2 | PASS | PASS | | FAIL |
+| Dory | refused at 4 ranks (2 loops: world equals loops); at 2 ranks rank 1 exits before the group is ready (no NCCL ring on one GPU) | | | |
+| GLM, Inkling | owed to the cluster (weights and world) | | | |
+
+The kept-lane `turns` failure is in shared serving, not an arm: the 2026-11-17 binary passes it,
+the reconciled tip and `d7704d02` fail it. It is not chased here.
+
+### W2: the dense arm on `PlanWalk`
+
+`sparkflash_runtime::plan` holds the walk the dense arm wrote for itself (layer loop, sequence,
+record-then-choose head); the arm is its host. Dense `walk.rs` goes from 333 to 248 non-test
+lines. `tests/onboard_example.rs` is a whole family with one part of its own in 325 lines and no
+walk. The generated checks (TP 1 = 2 = 4), `part_plugin` (bit-equal logits) and
+`onboard_example` pass.
+
+### W2.5: what each released arm needs before it can be a `PlanWalk` host
+
+Read from the arms at the tip; sizes are estimates, not measurements.
+
+| arm | layer loop today | what the shared walk lacks | runtime growth | touched |
+| --- | --- | --- | --- | --- |
+| GLM | `DeviceRank::step`, 8-row steps, prompts under 16 rows on the token path | a residual role (mHC `mix_in`/`mix_out`, which needs the next branch's hyper weights and fuses the rank sum), an indexer role, host-split passes, a drafter hook (MTP and DFlash2), a head that maps EOS to none from host logits | ~300 lines | 1.1-1.3k |
+| Qwen | the prefill plan's forwards and the batch's token/verify walk | a widened residual (hyper streams: fold and inject), the side role (PLE), QSA's indexer, the verify/drafter hooks, a prompt head that records through the sampler; its BF16 projections, router and prompt experts are other kernels than dense's, so dense's parts do not give its bits | ~600 | 1.5-2k |
+| Inkling | two executors (`chunk.rs` rows, `device.rs` step) | a branch input that is not `norm(x)` (the block residual's carried chain), a post-combine stage (short convs), a summary push, layer-start and final-row taps (DSpark), a host chooser (Gumbel), the vision and drafter hooks, its exchange | 400-600 | 3-3.5k |
+
+Every row needs the same three shared pieces first: a residual role the host executes in place of
+the add, a side role landing on the layer input, and an indexer role whose selection a later
+layer may read. `plan_roles` refuses all three by name today. Bits hold only where the host keeps
+each arm's row splits and fused sums; that is the check each migration owes, and GLM's and
+Inkling's served checks are owed to the cluster.
+
+### W3: one registration, and `onboard --emit`
+
+The recount is of the edits outside its own crate that a new family makes. The earlier count
+above, about 25 edits in about 15 files, is for a family with an arm of its own. A family with
+one part of its own on the dense host now makes 4 edits (workspace member, the CI files, the CLI
+dependency and its `DENSE_FAMILIES` row), plus `MODELS` and `ARMS` only to serve under a
+registry id. Each is held by cargo or a test except the last:
+
+| edit outside the crate | before this sprint | now |
+| --- | --- | --- |
+| workspace member | hand edit | hand edit; cargo refuses a non-member |
+| the two CI files | hand edit | hand edit; `every_model_crate_is_named_in_both_ci_files` |
+| `MODELS` descriptor and `ARMS` entry (only to serve under a registry id) | two hand edits | two hand edits; `every_registered_model_has_an_arm`, `every_model_crate_is_an_arms_crate` |
+| the ledger's weights list | hand edit (`weights_ids`) | derived: `ArmLedger::weights` reads `ARMS` |
+| the CLI's route for the arm | inferred from the default weights id and `TYPED_PACKS` | `Source::route`; `every_pack_route_arm_has_a_typed_pack_row` holds both directions |
+| the CLI's crate table (`--crate`) | hand edit | derived: `sparkflash_model::crate_for` |
+| numerics status by weights | CLI copy | `sparkflash_model::weights_numerics_status` |
+| the dense structure gate, layer shapes and tensor names, for a new mixer kind | three edits (`dense_device_refusal`, `Shape::of`, `naming::names`) | none: a registered part's mixer is the family's (`dense_device_refusal_hosting`, `AttentionNames::Own`) |
+| reaching the family's parts from `sparkflash serve` | no registration point; the open calls themselves | one `DENSE_FAMILIES` row and the CLI dependency (no test holds it yet) |
+
+`sparkflash onboard <id> --emit DIR` writes the crate (config, `architecture()`, `parts()` with
+one stub per own part, a conformance test whose fixture refuses by name) and prints these edits.
+On the worked example's family and on an MLA-shaped config the emitted crate compiles
+clippy-clean and its generated checks refuse by name. `docs/adding-a-model.md` is 128 lines (was
+619); its reference material is `docs/arm-reference.md`, and its section 4 names the check
+holding each old checklist item.
+
+Two policy changes to confirm: `one_stack`'s model-to-model rule now exempts
+`sparkflash-model-dense`, since it is the host an emitted crate builds on; and the CLI source
+gate stands at 35,858 of 35,865.
+
+Not done from W3.2: the launch scripts' environment pattern still repeats `Arm` fields (the web
+console's world sizes already read `Arm::deployment`).
+
+### The proof of concept: tencent/Hy4-flash-FP8
+
+[models/hy4-flash-onboarding.md](../models/hy4-flash-onboarding.md) records the run. Three
+general parser changes read the release (per-head hashed Engram tables, a nested
+`quantization_config`, eight named unmodelled switches); `onboard --emit` wrote a 175-line crate
+whose one part is its MLA, and the dense host takes that mixer once registered. It is not
+registered or served: the shared walk does not run its indexer, hyper-connection or Engram
+roles, the same three pieces W2.5 names, and it is refused by those names.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
