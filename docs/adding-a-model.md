@@ -381,7 +381,7 @@ the mechanism there; never copy it into the arm.
 | sessions stepped together as one pass over the weights (`--fuse-batch`), lanes and multi-token runs | `sparkflash_runtime::{Walk, TickEngine}` ([engine/03-runtime.md](engine/03-runtime.md)) |
 | several sequences' drafts verified in one walk, and the rows each is given | `sparkflash_runtime::{RoundArm, run_round, share_rows, StepWall}` |
 | a walk's CPU profile tests (compute rows, tick config, prompt chunks, joint and speculative rounds) | `sparkflash_runtime::conformance!(Arm, profile: stated())` over one `testing::ArmProfile`; add `rounds` for a drafting walk |
-| a fixture's stored-format names and token-pass bytes | `sparkflash_runtime::testing::{format_rule, token_bytes}` |
+| a fixture's stored-format names and token-pass bytes | `sparkflash_runtime::FormatRule::classes` and `sparkflash_runtime::testing::token_bytes` |
 | splitting a streamed answer into text and `<tool_call>` bodies | `sparkflash_api::tool_block::BlockSplitter` (the family parses the body) |
 | deterministic fixture weights and hash-table sizes | `sparkflash_weights::rng::{splitmix64, is_prime}` |
 
