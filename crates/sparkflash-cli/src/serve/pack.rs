@@ -32,7 +32,7 @@ use std::sync::Arc;
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
 use sparkflash_kernels::images::CUDA_ARCH;
 use sparkflash_model::numerics::ConfigKey;
-use sparkflash_model::{ModelBackend, ModelDescriptor, ModelProfile, PromptCodec, Target};
+use sparkflash_model::{Dialect, ModelBackend, ModelDescriptor, ModelProfile, PromptCodec, Target};
 use sparkflash_model_glm5_next::Glm5NextConfig;
 use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
 use sparkflash_ops::EngineBuilder;
@@ -147,14 +147,13 @@ pub(super) trait PackArm {
     fn fuse(backend: &mut Self::Backend, concurrency: usize) -> Result<(), String>;
 }
 
-/// A release's response dialect over the raw driver: its reasoning and tool channels, by the
-/// dialect its registration declares ([sparkflash_model::Tokenizer::dialect]).
-fn respond<R: Release>(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine> {
-    let dialect = R::ARM
+/// The dialect a release's replies are read in: the one its registration declares
+/// ([sparkflash_model::Tokenizer::dialect]).
+fn dialect<R: Release>() -> Dialect {
+    R::ARM
         .tokenizer()
         .dialect
-        .expect("a typed pack's registration declares its dialect");
-    super::dynamic::respond(dialect, driver)
+        .expect("a typed pack's registration declares its dialect")
 }
 
 /// The typed configuration of a release's arm.
@@ -1175,40 +1174,40 @@ fn serve_host<R: Release>(options: &ServeOptions) -> Result<ExitCode, String> {
     );
     // The byte codec's output is arbitrary text, not the released template's channels, so the
     // fixture stays on the raw driver.
-    let respond = (!options.synthetic).then_some(respond::<R> as Respond);
+    let dialect = (!options.synthetic).then(dialect::<R>);
     serve_backend(
         options,
         Box::new(backend),
+        descriptor,
         seam,
         options.max_tokens.min(R::max_output_tokens()),
         1,
-        respond,
+        dialect,
         &banner,
         options.concurrency,
     )
 }
 
-/// An arm's response dialect over the raw driver ([respond]).
-type Respond = fn(Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine>;
-
 /// Serves `backend` behind the generic host driver ([`sparkflash_serve::HostDriver`]): one
-/// session a concurrent request, `respond`'s dialect over it when given, and the numerics key of
-/// a group of `world` ranks. Every arm that serves a [`ModelBackend`] serves it here, on one
-/// node or as rank 0 of a group's fused lanes; `banner` announces what is served.
+/// session a concurrent request, `dialect`'s response engine over it when given
+/// ([super::dynamic::respond]), and the numerics key of a group of `world` ranks. Every route
+/// that serves a [`ModelBackend`] serves it here, typed or dynamic, on one node or as rank 0 of a
+/// group's fused lanes; `banner` announces what is served and `descriptor` is what `/v1/models`
+/// names.
 // One argument a piece of the boot line and its driver: keep the call sites shaped like the
 // serving surface rather than packing them into a struct no caller reuses.
 #[allow(clippy::too_many_arguments)]
-fn serve_backend(
+pub(super) fn serve_backend(
     options: &ServeOptions,
     backend: Box<dyn ModelBackend>,
+    descriptor: ModelDescriptor,
     seam: Arc<dyn PromptCodec>,
     max_tokens: usize,
     world: usize,
-    respond: Option<Respond>,
+    dialect: Option<Dialect>,
     banner: &str,
     concurrency: usize,
 ) -> Result<ExitCode, String> {
-    let descriptor = backend.descriptor().clone();
     let driver = sparkflash_serve::HostDriver::start(
         backend,
         Arc::clone(&seam),
@@ -1222,8 +1221,8 @@ fn serve_backend(
     let metrics = driver.metrics();
     println!("{banner}");
     let driver: Arc<dyn ApiInferenceEngine> = Arc::new(driver);
-    let engine = match respond {
-        Some(respond) => respond(driver),
+    let engine = match dialect {
+        Some(dialect) => super::dynamic::respond(dialect, driver),
         None => driver,
     };
     let numerics = ConfigKey::tp(descriptor.id.clone(), world, options.numerics, CUDA_ARCH);
@@ -1262,7 +1261,7 @@ impl<B: ModelBackend> ModelBackend for DescriptorBackend<B> {
 ///
 /// This is the dynamic path for a cached fine-tune whose `model_type` is a released family: the
 /// arm's arithmetic and profile are used, while the descriptor, context and tokenizer are the
-/// checkpoint's, and the response dialect is the arm's ([respond]).
+/// checkpoint's, and the response dialect is the arm's ([dialect]).
 pub(super) fn serve_arm_identity<R: Release>(
     options: &ServeOptions,
     directory: PathBuf,
@@ -1302,15 +1301,16 @@ pub(super) fn serve_arm_identity<R: Release>(
     );
     let backend = DescriptorBackend {
         inner: backend,
-        descriptor,
+        descriptor: descriptor.clone(),
     };
     serve_backend(
         options,
         Box::new(backend),
+        descriptor,
         seam,
         options.max_tokens.min(R::max_output_tokens()),
         1,
-        Some(respond::<R>),
+        Some(dialect::<R>()),
         &banner,
         options.concurrency,
     )
@@ -1425,7 +1425,7 @@ fn serve_group<R: Release>(
         tp4.control_port
     );
     let metrics = driver.metrics();
-    let engine = respond::<R>(Arc::new(driver));
+    let engine = super::dynamic::respond(dialect::<R>(), Arc::new(driver));
     let numerics = ConfigKey::tp(
         descriptor.id.clone(),
         tp4.world_size,
@@ -1472,13 +1472,15 @@ fn serve_group_lanes<R: Release>(
         tp4.control_port,
         lanes
     );
+    let descriptor = backend.descriptor().clone();
     serve_backend(
         options,
         backend,
+        descriptor,
         seam,
         options.max_tokens.min(R::max_output_tokens()),
         tp4.world_size,
-        Some(respond::<R>),
+        Some(dialect::<R>()),
         &banner,
         lanes,
     )

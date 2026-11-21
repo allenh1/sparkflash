@@ -38,8 +38,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
-use sparkflash_kernels::images::CUDA_ARCH;
-use sparkflash_model::numerics::ConfigKey;
 use sparkflash_model::prompt::PromptError;
 use sparkflash_model::{
     Architecture, Arm as _, Capabilities, ModelBackend, ModelDescriptor, ModelProfile, PromptCodec,
@@ -50,7 +48,7 @@ use sparkflash_ops::plan::KernelPhase;
 use sparkflash_ops::resolver::{Availability, KernelResolver};
 
 use super::dynamic_host::DynamicHostBackend;
-use super::{ServeOptions, pack, serve_with_seam};
+use super::{ServeOptions, pack};
 
 /// A checkpoint resolved from `--model` or `--checkpoint`, with its execution plan.
 pub(crate) struct DynamicCheckpoint {
@@ -968,7 +966,8 @@ pub(crate) fn serve_backend(
 ///
 /// The single-process path is [serve_backend] with `world = 1`; a four-rank device arm names its
 /// own world so the boot line's numerics identity is the configuration that actually answered.
-#[allow(clippy::too_many_arguments)]
+/// The driver is the typed route's ([pack::serve_backend]), with the operator's own output cap
+/// and concurrency.
 pub(crate) fn serve_backend_world(
     backend: Box<dyn ModelBackend>,
     descriptor: ModelDescriptor,
@@ -978,23 +977,17 @@ pub(crate) fn serve_backend_world(
     banner: &str,
     world: usize,
 ) -> Result<ExitCode, String> {
-    let driver = sparkflash_serve::HostDriver::start(
+    pack::serve_backend(
+        options,
         backend,
-        Arc::clone(&seam),
-        sparkflash_serve::HostOptions {
-            max_tokens: options.max_tokens,
-            concurrency: options.concurrency,
-            ..sparkflash_serve::HostOptions::default()
-        }
-        .with_env()?,
-    )?;
-    let metrics = driver.metrics();
-    let engine = respond(dialect, Arc::new(driver));
-    println!("sparkflash serve: {banner}");
-    let numerics = ConfigKey::tp(descriptor.id.clone(), world, options.numerics, CUDA_ARCH);
-    Ok(serve_with_seam(
-        engine, metrics, seam, None, options, descriptor, numerics,
-    ))
+        descriptor,
+        seam,
+        options.max_tokens,
+        world,
+        Some(dialect),
+        &format!("sparkflash serve: {banner}"),
+        options.concurrency,
+    )
 }
 
 /// Serves a Dory checkpoint through its device arm, or the host reference when this build has
