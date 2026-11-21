@@ -315,7 +315,13 @@ pub fn read_hub(repo: &str, revision: &str) -> Result<TensorIndex, IndexError> {
         }
         Err(error) if error.status == Some(404) => match hub_safetensors(&agent, repo, revision) {
             Ok(files) if !files.is_empty() => files,
-            _ => vec![SINGLE_FILE_NAME.to_owned()],
+            Ok(_) => vec![SINGLE_FILE_NAME.to_owned()],
+            Err(error) => {
+                return Err(IndexError::Hub {
+                    subject: source,
+                    detail: error.detail,
+                });
+            }
         },
         Err(error) => {
             return Err(IndexError::Hub {
@@ -720,6 +726,29 @@ mod tests {
                 dtype: "I9".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn a_revision_and_a_shard_name_stay_one_path_component() {
+        for revision in ["main", "a..b", "", ".", "..", "a/b", "a\\b"] {
+            assert_eq!(is_revision(revision), revision == "main", "{revision:?}");
+        }
+        for name in [
+            "model.safetensors",
+            "../model.safetensors",
+            "a/model.safetensors",
+            "model.bin",
+            "",
+        ] {
+            assert_eq!(is_shard_name(name), name == "model.safetensors", "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_content_range_total_is_read_after_the_slash() {
+        assert_eq!(total_of_content_range("bytes 0-7/1234"), Some(1234));
+        assert_eq!(total_of_content_range("bytes 0-7/*"), None);
+        assert_eq!(total_of_content_range("not a range"), None);
     }
 
     #[test]
