@@ -142,6 +142,26 @@ pub fn nccl_requested(world: usize) -> Result<bool, String> {
     }
 }
 
+/// The shared two-shot sum ([sparkflash_ops::tp::reduce_two_shot]) moves its words on an
+/// exchange's device leg.
+impl sparkflash_ops::tp::DeviceLeg for dyn Exchange {
+    fn rank(&self) -> usize {
+        Exchange::rank(self)
+    }
+
+    fn world(&self) -> usize {
+        Exchange::world(self)
+    }
+
+    fn scatter(&self, stream: u64, send: u64, slots: u64, bytes: usize) -> Result<(), String> {
+        self.scatter_on_device(stream, send, slots, bytes)
+    }
+
+    fn exchange(&self, stream: u64, send: u64, slots: u64, bytes: usize) -> Result<(), String> {
+        self.exchange_on_device(stream, send, slots, bytes)
+    }
+}
+
 /// A world of one: both exchanges are the identity, and no socket is opened.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Solo;

@@ -310,6 +310,51 @@ pub fn splits_two_shot(count: usize, world: usize) -> bool {
     world > 1 && count.is_multiple_of(4 * world)
 }
 
+/// The device leg a two-shot sum moves its words on: [TpRuntime], or an arm's own exchange.
+/// Both calls are collective and move words unchanged, under [TpRuntime::scatter_on_device]'s
+/// and [TpRuntime::exchange_on_device]'s contracts.
+pub trait DeviceLeg {
+    /// This rank.
+    fn rank(&self) -> usize;
+
+    /// The ranks.
+    fn world(&self) -> usize;
+
+    /// Chunk `peer` of the `world` chunks of the `bytes` at `send` to `peer`, and every peer's
+    /// chunk `rank` to `slots + peer * bytes / world`, enqueued on `stream`.
+    ///
+    /// # Errors
+    /// A leg that cannot enqueue it.
+    fn scatter(&self, stream: u64, send: u64, slots: u64, bytes: usize) -> Result<(), String>;
+
+    /// This rank's `bytes` at `send` into every peer's `slots + rank * bytes`, enqueued on
+    /// `stream`.
+    ///
+    /// # Errors
+    /// A leg that cannot enqueue it.
+    fn exchange(&self, stream: u64, send: u64, slots: u64, bytes: usize) -> Result<(), String>;
+}
+
+impl DeviceLeg for TpRuntime {
+    fn rank(&self) -> usize {
+        Self::rank(self)
+    }
+
+    fn world(&self) -> usize {
+        Self::world(self)
+    }
+
+    fn scatter(&self, stream: u64, send: u64, slots: u64, bytes: usize) -> Result<(), String> {
+        self.scatter_on_device(stream, send, slots, bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn exchange(&self, stream: u64, send: u64, slots: u64, bytes: usize) -> Result<(), String> {
+        self.exchange_on_device(stream, send, slots, bytes)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// The two-shot device all-reduce of count floats at partial, in place.
 ///
 /// Every rank's chunk of each peer's partial lands in slots, sum adds them into this rank's own
@@ -317,8 +362,8 @@ pub fn splits_two_shot(count: usize, world: usize) -> bool {
 ///
 /// # Errors
 /// A collective failure, or whatever sum reports.
-pub fn reduce_two_shot(
-    tp: &TpRuntime,
+pub fn reduce_two_shot<L: DeviceLeg + ?Sized>(
+    tp: &L,
     stream: u64,
     partial: Deviceptr,
     slots: Deviceptr,
@@ -334,8 +379,8 @@ pub fn reduce_two_shot(
 ///
 /// # Errors
 /// A collective failure, or whatever sum reports.
-pub fn reduce_scatter(
-    tp: &TpRuntime,
+pub fn reduce_scatter<L: DeviceLeg + ?Sized>(
+    tp: &L,
     stream: u64,
     partial: Deviceptr,
     slots: Deviceptr,
@@ -344,7 +389,7 @@ pub fn reduce_scatter(
 ) -> Result<Deviceptr, BackendError> {
     let chunk = count / tp.world();
     let mine = partial.offset(tp.rank() * chunk * 4);
-    tp.scatter_on_device(stream, partial.0, slots.0, count * 4)
+    tp.scatter(stream, partial.0, slots.0, count * 4)
         .map_err(collective_error)?;
     sum(mine, chunk)?;
     Ok(mine)
@@ -355,15 +400,15 @@ pub fn reduce_scatter(
 ///
 /// # Errors
 /// A collective failure.
-pub fn gather_in_place(
-    tp: &TpRuntime,
+pub fn gather_in_place<L: DeviceLeg + ?Sized>(
+    tp: &L,
     stream: u64,
     base: Deviceptr,
     mine: Deviceptr,
     bytes: usize,
 ) -> Result<(), BackendError> {
     debug_assert_eq!(mine, base.offset(tp.rank() * bytes));
-    tp.exchange_on_device(stream, mine.0, base.0, bytes)
+    tp.exchange(stream, mine.0, base.0, bytes)
         .map_err(collective_error)
 }
 

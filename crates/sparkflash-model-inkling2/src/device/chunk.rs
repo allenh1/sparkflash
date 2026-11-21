@@ -40,6 +40,7 @@
 use sparkflash_model::backend::BackendError;
 use sparkflash_ops::moe::{MoePlanCall, grouped};
 use sparkflash_ops::projection::{Route, WidePolicy, route_bf16};
+use sparkflash_ops::tp::reduce_two_shot;
 
 use crate::device_plan::{BandOp, Collective, ConvSlot, ExpertBody, LayerSchedule, Step, TauRule};
 
@@ -98,14 +99,14 @@ pub(super) fn exchange_sum(
     Ok(())
 }
 
-/// Whether [exchange_sum] of `elements` takes two shots ([two_shots]) rather than one.
+/// Whether [exchange_sum] of `elements` takes two shots ([two_shots]) rather than one: the
+/// arm's byte threshold, over whole float4 chunks a rank.
 fn takes_two_shots(elements: usize, world: usize) -> bool {
     elements * std::mem::size_of::<f32>() >= TWO_SHOT_FROM && elements.is_multiple_of(4 * world)
 }
 
-/// [exchange_sum]'s two shots of `elements` at `pointer`, on the run's stream or, under `side`,
-/// on that stream behind everything queued on the run's so far: this rank sums chunk `rank`
-/// (every peer's piece of it lands in the slots), then the summed chunks are shared in place. Each
+/// [exchange_sum]'s two shots of `elements` at `pointer` ([reduce_two_shot]), on the run's
+/// stream or, under `side`, on that stream behind everything queued on the run's so far. Each
 /// element is the same fold in the same order, so the bits are the one-shot's at half the bytes a
 /// rank.
 fn two_shots(
@@ -115,23 +116,18 @@ fn two_shots(
     slots: Deviceptr,
     elements: usize,
 ) -> Result<(), BackendError> {
-    let (rank, world) = (shared.exchange.rank(), shared.exchange.world());
-    let float = std::mem::size_of::<f32>();
-    let chunk = elements / world;
-    let mine = pointer.0 + (rank * chunk * float) as u64;
     if let Some(side) = side {
         shared.cuda.side_follow_run(side).map_err(device_error)?;
     }
     let stream = side.map_or(0, SideStream::raw);
-    shared
-        .exchange
-        .scatter_on_device(stream, pointer.0, slots.0, elements * float)
-        .map_err(device_error)?;
-    sum_slots(shared, side, mine, slots, chunk)?;
-    shared
-        .exchange
-        .exchange_on_device(stream, mine, pointer.0, chunk * float)
-        .map_err(device_error)
+    reduce_two_shot(
+        &*shared.exchange,
+        stream,
+        pointer,
+        slots,
+        elements,
+        |mine, chunk| sum_slots(shared, side, mine.0, slots, chunk),
+    )
 }
 
 /// q4e_sum_slots over `count` values at `own`: the slots' pieces and its own, in ascending rank
@@ -143,28 +139,21 @@ fn sum_slots(
     slots: Deviceptr,
     count: usize,
 ) -> Result<(), BackendError> {
-    let grid = ((count / 4).div_ceil(SUM_BLOCK as usize) as u32, 1, 1);
-    let args = [
-        own,
-        slots.0,
-        count as u64,
-        shared.exchange.rank() as u64,
-        shared.exchange.world() as u64,
-    ];
+    let (rank, world) = (shared.exchange.rank(), shared.exchange.world());
+    let call = calls::sum_slots(own, slots.0, count, rank, world);
     let entry = shared.kernels.sum_slots;
     match side {
-        None => shared.launch(entry, grid, (SUM_BLOCK, 1, 1), &args),
+        None => shared.call(entry, call),
         // The side stream already follows the run's (two_shots), and outside a graph segment
         // side_launch always launches.
-        Some(side) => shared
-            .cuda
-            .side_launch(side, entry.kernel(), grid, (SUM_BLOCK, 1, 1), &args),
+        Some(side) => {
+            shared
+                .cuda
+                .side_launch(side, entry.kernel(), call.grid, call.block, &call.args)
+        }
     }
     .map_err(device_error)
 }
-
-/// The block q4e_sum_slots is written for (the token image's Q4E_BLOCK).
-const SUM_BLOCK: u32 = 256;
 
 /// The narrowest sum that takes two shots rather than one: about 57 rows of the residual. Below
 /// it the second shot's launch costs more than the bytes it saves, and the decode step's sums
