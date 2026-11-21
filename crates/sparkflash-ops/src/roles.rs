@@ -862,6 +862,283 @@ impl Combine {
     }
 }
 
+/// A router's rule: the kernel it names and the arguments that kernel takes. Each router keeps
+/// its own scoring, its own pick order and its own weights; a rule runs only on its own kernel, so
+/// no arm's routing takes another's arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RouterRule {
+    /// `q4e_route` (the dense arm): the score [crate::moe::router_score] names, the bias where the
+    /// layer has one, the picked weights renormalised when `renormalise` and times `scaling`;
+    /// `top_k` weights a row. A 256-thread block a row.
+    Route {
+        /// The score's code.
+        score: u64,
+        /// The selection bias.
+        bias: Option<Deviceptr>,
+        /// The picked weights sum to one.
+        renormalise: bool,
+        /// The routed scaling factor.
+        scaling: f32,
+    },
+    /// `q4e_router` (Qwen): a row's probabilities over every expert into the weights (which may
+    /// be the logits), and its top-k indices. A 256-thread block a row.
+    Softmax,
+    /// `q4e_noaux_router` (GLM): the biased choice, its weights renormalised when `renormalise`
+    /// and times `scaling`. A warp a row.
+    NoauxAscending {
+        /// The selection bias.
+        bias: Deviceptr,
+        /// The picked weights sum to one.
+        renormalise: bool,
+        /// The routed scaling factor.
+        scaling: f32,
+    },
+    /// `inkling_router_topk` (Inkling): the sigmoid router, its shares times `scale`. A
+    /// 128-thread block a row shares the walk over the experts and keeps the sequential scan's
+    /// choice.
+    InklingTopk {
+        /// The selection bias.
+        bias: Deviceptr,
+        /// The route scale.
+        scale: f32,
+    },
+}
+
+impl RouterRule {
+    /// The kernel the rule runs on.
+    #[must_use]
+    pub const fn symbol(&self) -> &'static str {
+        match self {
+            Self::Route { .. } => "q4e_route",
+            Self::Softmax => "q4e_router",
+            Self::NoauxAscending { .. } => "q4e_noaux_router",
+            Self::InklingTopk { .. } => "inkling_router_topk",
+        }
+    }
+}
+
+/// The rows a router reads and writes: the logits, the picked experts' indices and their weights.
+#[derive(Clone, Copy, Debug)]
+pub struct RouterRows {
+    /// The router logits, `[rows][experts]` f32.
+    pub logits: Deviceptr,
+    /// The picked experts, `[rows][top_k]`.
+    pub indices: Deviceptr,
+    /// The routing weights (a rule's own stride).
+    pub weights: Deviceptr,
+}
+
+/// A loaded router, one of the [RouterRule]s' kernels.
+#[derive(Clone, Copy, Debug)]
+pub struct Router {
+    kernel: Bound,
+}
+
+impl Router {
+    /// The routers a rule names.
+    pub const SYMBOLS: [&'static str; 4] = [
+        "q4e_route",
+        "q4e_router",
+        "q4e_noaux_router",
+        "inkling_router_topk",
+    ];
+
+    /// `kernel`, one of [Self::SYMBOLS].
+    ///
+    /// # Errors
+    /// Another kernel, by name.
+    pub fn new(kernel: Bound) -> Result<Self, String> {
+        let name = kernel.kernel().name();
+        if Self::SYMBOLS.contains(&name) {
+            Ok(Self { kernel })
+        } else {
+            Err(format!(
+                "a router runs one of {:?}, not {name}",
+                Self::SYMBOLS
+            ))
+        }
+    }
+
+    /// `rows` rows of `experts` logits routed to `top_k` experts under `rule`.
+    ///
+    /// # Errors
+    /// A rule for another router, by name, or the driver's refusal.
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        rule: RouterRule,
+        rows_in: &RouterRows,
+        (experts, top_k): (usize, usize),
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        let name = self.kernel.kernel().name();
+        if name != rule.symbol() {
+            return Err(BackendError::new(
+                ROLE,
+                format!("{name} takes its own routing rule, not {}'s", rule.symbol()),
+            ));
+        }
+        let RouterRows {
+            logits,
+            indices,
+            weights,
+        } = *rows_in;
+        let grid = (rows as u32, 1, 1);
+        let (experts, top_k) = (experts as u64, top_k as u64);
+        match rule {
+            RouterRule::Route {
+                score,
+                bias,
+                renormalise,
+                scaling,
+            } => cx.launch(
+                self.kernel,
+                (grid, (256, 1, 1)),
+                &[
+                    logits.0,
+                    bias.map_or(0, |bias| bias.0),
+                    indices.0,
+                    weights.0,
+                    experts,
+                    top_k,
+                    score,
+                    u64::from(renormalise),
+                    u64::from(scaling.to_bits()),
+                ],
+            ),
+            RouterRule::Softmax => cx.launch(
+                self.kernel,
+                (grid, (256, 1, 1)),
+                &[logits.0, weights.0, indices.0, experts, top_k],
+            ),
+            RouterRule::NoauxAscending {
+                bias,
+                renormalise,
+                scaling,
+            } => cx.launch(
+                self.kernel,
+                (grid, (32, 1, 1)),
+                &[
+                    logits.0,
+                    bias.0,
+                    indices.0,
+                    weights.0,
+                    experts,
+                    top_k,
+                    u64::from(renormalise),
+                    u64::from(scaling.to_bits()),
+                ],
+            ),
+            RouterRule::InklingTopk { bias, scale } => cx.launch(
+                self.kernel,
+                (grid, (128, 1, 1)),
+                &[
+                    logits.0,
+                    bias.0,
+                    indices.0,
+                    weights.0,
+                    experts,
+                    top_k,
+                    u64::from(scale.to_bits()),
+                ],
+            ),
+        }
+    }
+}
+
+/// SwiGLU over split gate and up rows: `q4e_swiglu`, and under a release's `swiglu_limit`
+/// `q4e_swiglu_clamped` ([calls::swiglu_clamped]) where the arm loads it. A limit on an arm
+/// without the clamped body is refused by name.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitSwiGlu {
+    plain: Bound,
+    clamped: Option<Bound>,
+}
+
+impl SplitSwiGlu {
+    /// The plain body and the clamped one.
+    pub const SYMBOLS: [&'static str; 2] = ["q4e_swiglu", "q4e_swiglu_clamped"];
+
+    /// The loaded [Self::SYMBOLS], the clamped one where the arm takes a limit.
+    ///
+    /// # Errors
+    /// Another kernel in a place, by name.
+    pub fn new(plain: Bound, clamped: Option<Bound>) -> Result<Self, String> {
+        let [plain_symbol, clamped_symbol] = Self::SYMBOLS;
+        runs(plain, plain_symbol, "the SwiGLU").map_err(|error| error.to_string())?;
+        if let Some(clamped) = clamped {
+            runs(clamped, clamped_symbol, "the clamped SwiGLU")
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(Self { plain, clamped })
+    }
+
+    /// `out = silu(gate) * up` over `count` floats, the gate and up clamped to `limit` first when
+    /// given.
+    ///
+    /// # Errors
+    /// A limit without the clamped body, by name, or the driver's refusal.
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        (gate, up, out): (Deviceptr, Deviceptr, Deviceptr),
+        count: usize,
+        limit: Option<f32>,
+    ) -> Result<(), BackendError> {
+        match (limit, self.clamped) {
+            (None, _) => cx.call(self.plain, calls::swiglu(gate.0, up.0, out.0, count)),
+            (Some(limit), Some(clamped)) => cx.call(
+                clamped,
+                calls::swiglu_clamped(gate.0, up.0, out.0, count, limit),
+            ),
+            (Some(_), None) => Err(BackendError::new(
+                ROLE,
+                "a swiglu_limit needs q4e_swiglu_clamped, which this arm does not load",
+            )),
+        }
+    }
+}
+
+/// SwiGLU over fused gate-up rows under a limit, `q4e_swiglu_limited` (GLM's MLPs and experts):
+/// each `[2 * width]` row's halves into a `[width]` row, a block a 256-float slice of a row.
+#[derive(Clone, Copy, Debug)]
+pub struct FusedSwiGlu {
+    kernel: Bound,
+}
+
+impl FusedSwiGlu {
+    /// The kernel.
+    pub const SYMBOL: &'static str = "q4e_swiglu_limited";
+
+    /// The loaded [Self::SYMBOL].
+    ///
+    /// # Errors
+    /// Another kernel, by name.
+    pub fn new(kernel: Bound) -> Result<Self, String> {
+        runs(kernel, Self::SYMBOL, "the fused SwiGLU").map_err(|error| error.to_string())?;
+        Ok(Self { kernel })
+    }
+
+    /// `rows` fused rows of `gate_up` into `out`, `width` wide, under `limit`.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        (gate_up, out): (Deviceptr, Deviceptr),
+        width: usize,
+        limit: f32,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        cx.launch(
+            self.kernel,
+            ((calls::flat_blocks(width), rows as u32, 1), (BLOCK, 1, 1)),
+            &[gate_up.0, out.0, width as u64, u64::from(limit.to_bits())],
+        )
+    }
+}
+
 /// A grouped-query attention layer's shape on this rank: its query and key/value heads, a head's
 /// floats, whether the query projection interleaves a sigmoid output gate with each head, and the
 /// rotary's rotated floats and base.

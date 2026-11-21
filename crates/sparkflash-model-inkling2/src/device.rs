@@ -92,7 +92,7 @@ use packed::pack_dense;
 use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{Form as DenseForm, Layout, Packed, PackedSet, Tiled};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::{Bound, Embed, Launcher, Norm};
+use sparkflash_ops::roles::{Bound, Embed, Launcher, Norm, Router, RouterRows, RouterRule};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 pub use tower::InklingVisionTower;
 
@@ -186,9 +186,6 @@ const SCORE_BUDGET: usize = 1 << 21;
 /// chunk covers ~43k keys a pass, a 4,096-row one 1,344 and an 8,192-row one 672. The pass
 /// count does not move the bits (the recurrence carries its state across passes exactly).
 const CHUNK_SCORE_BUDGET: usize = 1 << 26;
-/// The threads the router runs: the block shares the walk over the experts and keeps the
-/// sequential scan's choice (inkling_router_topk).
-const ROUTER_BLOCK: u32 = 128;
 /// The threads one band-share launch runs: one a slot, past the released top-8.
 const SHARES_BLOCK: u32 = 64;
 /// The rows one block of a decode band projection computes (INKLING_GROUP_ROWS: a row a
@@ -821,7 +818,7 @@ struct Kernels {
     short_conv: Bound,
     short_conv_dynamic: Bound,
     kv_store: Bound,
-    router: Bound,
+    router: Router,
     expert_nvfp4: Bound,
     expert_mxfp8: Bound,
     /// A chunk's projections of one expert over every pair that chose it, a weight run decoded
@@ -1100,12 +1097,12 @@ impl Kernels {
                 Precision::Bf16,
             )?,
             kv_store: load(Image::Inkling, inkling, "inkling_kv_store", Precision::Bf16)?,
-            router: load(
+            router: Router::new(load(
                 Image::Inkling,
                 inkling,
                 "inkling_router_topk",
                 Precision::F32,
-            )?,
+            )?)?,
             expert_nvfp4: load(
                 Image::Inkling,
                 inkling,
@@ -2898,20 +2895,26 @@ impl Shared {
         shares: Deviceptr,
         rows: usize,
     ) -> Result<(), String> {
-        self.launch(
-            self.kernels.router,
-            (rows as u32, 1, 1),
-            (ROUTER_BLOCK, 1, 1),
-            &[
-                logits.0,
-                bias.0,
-                indices.0,
-                shares.0,
-                self.config.n_routed_experts as u64,
-                self.config.num_experts_per_tok as u64,
-                bits(self.config.route_scale as f32),
-            ],
-        )
+        self.kernels
+            .router
+            .run(
+                self,
+                RouterRule::InklingTopk {
+                    bias,
+                    scale: self.config.route_scale as f32,
+                },
+                &RouterRows {
+                    logits,
+                    indices,
+                    weights: shares,
+                },
+                (
+                    self.config.n_routed_experts,
+                    self.config.num_experts_per_tok,
+                ),
+                rows,
+            )
+            .map_err(|error| error.to_string())
     }
 
     /// Append a chunk's rows to their own summary stacks.
@@ -6141,19 +6144,12 @@ impl RowRun {
                             config.n_routed_experts,
                         )?;
                     }
-                    run(shared.launch(
-                        shared.kernels.router,
-                        (1, 1, 1),
-                        (ROUTER_BLOCK, 1, 1),
-                        &[
-                            self.state.scratch.router_logits.0,
-                            bias.0,
-                            self.state.scratch.indices.0,
-                            self.state.scratch.shares.0,
-                            config.n_routed_experts as u64,
-                            config.num_experts_per_tok as u64,
-                            bits(config.route_scale as f32),
-                        ],
+                    run(shared.router_rows(
+                        self.state.scratch.router_logits,
+                        bias,
+                        self.state.scratch.indices,
+                        self.state.scratch.shares,
+                        1,
                     ))?;
                 }
                 (Op::ExpertGateUp, Target::Band(BandOp::GateUp)) => {

@@ -34,7 +34,9 @@ use sparkflash_ops::attention::GqaBody;
 use sparkflash_ops::calls::{self, RmsNorm, Rope};
 use sparkflash_ops::gdn::ConvRows;
 use sparkflash_ops::indexer::IndexerPass;
-use sparkflash_ops::roles::{ExpertRows, ExpertShape, GqaRows, GqaShape, Injection, Launcher};
+use sparkflash_ops::roles::{
+    ExpertRows, ExpertShape, GqaRows, GqaShape, Injection, Launcher, RouterRows, RouterRule,
+};
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
@@ -663,17 +665,16 @@ impl DeviceSequence {
             self.probabilities,
             batch * config.num_experts,
         )?;
-        self.launch(
-            kernels.router,
-            (batch as u32, 1, 1),
-            (256, 1, 1),
-            &[
-                self.probabilities.0,
-                self.probabilities.0,
-                self.expert_indices.0,
-                config.num_experts as u64,
-                config.num_experts_per_tok as u64,
-            ],
+        kernels.router.run(
+            self,
+            RouterRule::Softmax,
+            &RouterRows {
+                logits: self.probabilities,
+                indices: self.expert_indices,
+                weights: self.probabilities,
+            },
+            (config.num_experts, config.num_experts_per_tok),
+            batch,
         )?;
         self.prof_mark("router")?;
         // One hit a chosen expert, into the input this forward opened (docs/NUMERICS.md §5);
@@ -810,14 +811,11 @@ impl DeviceSequence {
             // The same argument as the hyper passes: one weight pass per chunk instead of one per
             // group of eight tokens. A decode step on the chunk path comes here too, so its row
             // gets a chunk row's bits.
-            self.call(
-                kernels.swiglu,
-                calls::swiglu(
-                    self.shared_hidden.0,
-                    self.shared_up.0,
-                    self.shared_up.0,
-                    batch * intermediate,
-                ),
+            kernels.swiglu.run(
+                self,
+                (self.shared_hidden, self.shared_up, self.shared_up),
+                batch * intermediate,
+                None,
             )?;
         } else {
             // Same register-accumulator bound as the hyper passes: one launch per group of

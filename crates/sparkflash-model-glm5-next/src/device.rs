@@ -121,7 +121,9 @@ use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
 use sparkflash_ops::roles;
-use sparkflash_ops::roles::{Bound, Embed, Launcher, LayerNorm, Norm};
+use sparkflash_ops::roles::{
+    Bound, Embed, FusedSwiGlu, Launcher, LayerNorm, Norm, Router, RouterRows, RouterRule,
+};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{host_sum, reduce_scatter, reduce_two_shot, takes_two_shots};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -536,8 +538,8 @@ struct Kernels {
     mla_softmax: Bound,
     mla_mix: Bound,
     mla_project: Bound,
-    swiglu: Bound,
-    router: Bound,
+    swiglu: FusedSwiGlu,
+    router: Router,
     combine: Bound,
     fold: Bound,
     prefetch_l2: Bound,
@@ -757,8 +759,8 @@ impl Kernels {
             mla_softmax: decode("q4e_glm_mla_softmax", Precision::Bf16)?,
             mla_mix: decode("q4e_glm_mla_mix", Precision::Bf16)?,
             mla_project: decode("q4e_glm_mla_project", Precision::Bf16)?,
-            swiglu: decode("q4e_swiglu_limited", Precision::Bf16)?,
-            router: decode("q4e_noaux_router", Precision::Bf16)?,
+            swiglu: FusedSwiGlu::new(decode("q4e_swiglu_limited", Precision::Bf16)?)?,
+            router: Router::new(decode("q4e_noaux_router", Precision::Bf16)?)?,
             combine: moe("q4e_moe_combine", Precision::Bf16)?,
             prefetch_l2: decode("q4e_prefetch_l2", Precision::F32)?,
             fold: token("q4e_fold_streams", Precision::F32)?,
@@ -5374,16 +5376,12 @@ impl DeviceRank {
         let s = &self.scratch;
         let width = mlp.gate_up.rows / 2;
         self.gemv(&mlp.gate_up, s.collapsed, s.gate_up, rows)?;
-        self.launch(
-            self.kernels.swiglu.kernel(),
-            (blocks(width), rows as u32, 1),
-            BLOCK,
-            &[
-                s.gate_up.0,
-                s.activated.0,
-                width as u64,
-                float(self.config.swiglu_limit as f32),
-            ],
+        self.kernels.swiglu.run(
+            self,
+            (s.gate_up, s.activated),
+            width,
+            self.config.swiglu_limit as f32,
+            rows,
         )?;
         self.gemv(&mlp.down, s.activated, output, rows)
     }
@@ -5408,21 +5406,21 @@ impl DeviceRank {
             rows,
             self.exact_prefill,
         )?;
-        self.launch(
-            self.kernels.router.kernel(),
-            (rows as u32, 1, 1),
-            // One warp a row picks.
-            32,
-            &[
-                s.router_logits.0,
-                moe.bias.0,
-                s.expert_indices.0,
-                s.expert_weights.0,
-                config.n_routed_experts as u64,
-                topk as u64,
-                u64::from(config.norm_topk_prob),
-                float(config.routed_scaling_factor as f32),
-            ],
+        // One warp a row picks.
+        self.kernels.router.run(
+            self,
+            RouterRule::NoauxAscending {
+                bias: moe.bias,
+                renormalise: config.norm_topk_prob,
+                scaling: config.routed_scaling_factor as f32,
+            },
+            &RouterRows {
+                logits: s.router_logits,
+                indices: s.expert_indices,
+                weights: s.expert_weights,
+            },
+            (config.n_routed_experts, topk),
+            rows,
         )?;
         self.prof_mark("moe_router");
         if rows > MAX_ROWS {
@@ -5439,16 +5437,12 @@ impl DeviceRank {
             rows,
         )?;
         self.prof_mark("moe_up");
-        self.launch(
-            self.kernels.swiglu.kernel(),
-            (blocks(width), (rows * topk) as u32, 1),
-            BLOCK,
-            &[
-                s.expert_gate_up.0,
-                s.expert_activated.0,
-                width as u64,
-                float(config.swiglu_limit as f32),
-            ],
+        self.kernels.swiglu.run(
+            self,
+            (s.expert_gate_up, s.expert_activated),
+            width,
+            config.swiglu_limit as f32,
+            rows * topk,
         )?;
         self.expert_gemv(
             moe.down,

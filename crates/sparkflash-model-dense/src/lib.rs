@@ -101,7 +101,7 @@ use sparkflash_ops::projection::{
 };
 use sparkflash_ops::roles::{
     Bound, Combine, ExpertRows, ExpertShape, GqaAttention, GqaRows, GqaShape, Injection, Launcher,
-    ManifoldMixer, Norm, TokenExperts,
+    ManifoldMixer, Norm, Router, RouterRows, RouterRule, SplitSwiGlu, TokenExperts,
 };
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
@@ -617,7 +617,7 @@ struct RoutedExperts {
 /// The routed layers' kernels, loaded when a layer routes.
 #[derive(Clone, Copy)]
 struct MoeKernels {
-    route: Bound,
+    route: Router,
     /// The plan and the token passes in the checkpoint's expert format (the NVFP4 body has no
     /// clamped form for a `swiglu_limit`).
     experts: TokenExperts,
@@ -658,8 +658,7 @@ struct Kernels {
     norm: Norm,
     /// The grouped-query attention after its projections, a segment's rows a launch.
     gqa: GqaAttention,
-    swiglu: Bound,
-    swiglu_clamped: Bound,
+    swiglu: SplitSwiGlu,
     wide: Bound,
     /// The vocabulary-wide argmax the greedy head chooses with (`q4e_argmax_slices`).
     argmax: Bound,
@@ -752,13 +751,13 @@ impl Kernels {
         };
         let moe = match stage {
             Some(bytes) => Some(MoeKernels {
-                route: Bound::new(
+                route: Router::new(Bound::new(
                     cuda,
                     Image::Qwen4Moe,
                     qwen4_moe_cubin(),
                     "q4e_route",
                     Precision::Bf16,
-                )?,
+                )?)?,
                 experts: TokenExperts::new(
                     Bound::new(
                         cuda,
@@ -860,8 +859,10 @@ impl Kernels {
                 ],
                 None,
             )?,
-            swiglu: token("q4e_swiglu", Precision::Bf16)?,
-            swiglu_clamped: token("q4e_swiglu_clamped", Precision::Bf16)?,
+            swiglu: SplitSwiGlu::new(
+                token("q4e_swiglu", Precision::Bf16)?,
+                Some(token("q4e_swiglu_clamped", Precision::Bf16)?),
+            )?,
             argmax: token("q4e_argmax_slices", Precision::Bf16)?,
             wide: Bound::shared(
                 cuda,
@@ -2885,16 +2886,9 @@ impl Shared {
         self.project(&mlp.gate, b, b.normed.0, b.ffn_gate.0, rows, policy)?;
         self.project(&mlp.up, b, b.normed.0, b.ffn_up.0, rows, policy)?;
         let count = rows * mlp.gate.rows();
-        match clamp {
-            None => self.call(
-                self.kernels.swiglu,
-                calls::swiglu(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, count),
-            )?,
-            Some(limit) => self.call(
-                self.kernels.swiglu_clamped,
-                calls::swiglu_clamped(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, count, limit),
-            )?,
-        }
+        self.kernels
+            .swiglu
+            .run(self, (b.ffn_gate, b.ffn_up, b.ffn_up), count, clamp)?;
         self.project(&mlp.down, b, b.ffn_up.0, output.0, rows, policy)
     }
 
@@ -2927,20 +2921,21 @@ impl Shared {
         let hidden = self.hidden;
         let (experts, top_k, intermediate) = (routed.experts, routed.top_k, routed.intermediate);
         self.project(router, b, b.normed.0, b.router.0, rows, None)?;
-        self.launch(
-            kernels.route,
-            ((rows as u32, 1, 1), (256, 1, 1)),
-            &[
-                b.router.0,
-                bias.map_or(0, |bias| bias.0),
-                b.indices.0,
-                b.weights.0,
-                experts as u64,
-                top_k as u64,
-                routed.score,
-                u64::from(routed.renormalise),
-                u64::from(routed.scaling.to_bits()),
-            ],
+        kernels.route.run(
+            self,
+            RouterRule::Route {
+                score: routed.score,
+                bias: *bias,
+                renormalise: routed.renormalise,
+                scaling: routed.scaling,
+            },
+            &RouterRows {
+                logits: b.router,
+                indices: b.indices,
+                weights: b.weights,
+            },
+            (experts, top_k),
+            rows,
         )?;
         // The NVFP4 body reads the per-tensor scale table as its second argument; the BF16 and
         // FP8 bodies read the same six-address table with no second table. The route writes

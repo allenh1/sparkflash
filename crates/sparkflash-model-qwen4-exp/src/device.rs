@@ -113,7 +113,9 @@ use sparkflash_ops::gemv::gemv_e4m3_tile;
 use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{Form, PackedSet, Placement, Tiled};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::{Bound, Combine, Embed, GqaAttention, Launcher, Norm, TokenExperts};
+use sparkflash_ops::roles::{
+    Bound, Combine, Embed, GqaAttention, Launcher, Norm, Router, SplitSwiGlu, TokenExperts,
+};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -612,8 +614,8 @@ struct Kernels {
     inject: Bound,
     /// The row sums' in-place sum of this rank's chunk ([sparkflash_ops::tp::RowSums]).
     sum_slots: Bound,
-    swiglu: Bound,
-    router: Bound,
+    swiglu: SplitSwiGlu,
+    router: Router,
     /// The shared routed-expert plan (kernels/moe_plan_sm121.cu): the run order its expert
     /// kernels read and the run bounds that tell each block where its run starts.
     moe_plan: Bound,
@@ -764,8 +766,8 @@ impl Kernels {
             hyper_inject: token("q4e_hyper_inject", Precision::Bf16)?,
             inject: token("q4e_inject", Precision::F32)?,
             sum_slots: token("q4e_sum_slots", Precision::Bf16)?,
-            swiglu: token("q4e_swiglu", Precision::Bf16)?,
-            router: moe("q4e_router", Precision::Bf16)?,
+            swiglu: SplitSwiGlu::new(token("q4e_swiglu", Precision::Bf16)?, None)?,
+            router: Router::new(moe("q4e_router", Precision::Bf16)?)?,
             moe_plan,
             experts_nvfp4: TokenExperts::new(
                 moe_plan,
