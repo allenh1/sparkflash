@@ -17,7 +17,7 @@
 
     scripts/sync-nodes.py --host user@198.51.100.12,spark-1 [--host ...] --path /abs/dir [--path ...]
                           [--exclude '*.incomplete'] [--ensure-dir /abs/dir] [--ssh-arg=-oX=Y]
-                          [--streams 4]
+                          [--streams 4] [--prune]
 
 The web control plane runs this to install the server binary, kernels and NCCL library on the other
 Sparks, and to copy the model there. Each `--host` is `destination,ssh-name`: the destination may
@@ -30,6 +30,11 @@ parallel are what fill it, and every host reads the same files in the same order
 page cache serves the second and third copy. rsync writes each file under a temporary name and
 renames it when complete, so an interrupted copy never leaves a short file under its real name; a
 rerun skips the files that already match in size and time.
+
+With `--prune`, a `--path` that is a directory is mirrored: files and directories that no longer
+exist on the lead are deleted on every host. An excluded name is never deleted, so an in-progress
+download stays in place. A `--path` that is a file copies only that file and never deletes its
+siblings.
 
 Progress goes to stdout as `@progress {"done": N, "total": N, "detail": "..."}` lines.
 """
@@ -76,6 +81,36 @@ def collect(paths: list[str], excludes: list[str]) -> list[tuple[str, int]]:
                     path = os.path.join(directory, name)
                     size = 0 if os.path.islink(path) else os.lstat(path).st_size
                     entries.append((path, size))
+    return entries
+
+
+def is_directory(path: str) -> bool:
+    """Whether `path` is a real directory; a symlink to one is copied as the link itself."""
+    return not os.path.islink(path) and os.path.isdir(path)
+
+
+def collect_mirror(root: str, excludes: list[str]) -> list[str]:
+    """Every directory (with a trailing slash) and file under `root`, for a pruning pass.
+
+    rsync deletes only inside a directory that appears in its file list, so the root and every
+    subdirectory are listed. A symlinked directory is listed as a file, as `collect` copies it.
+    """
+
+    def wanted(name: str) -> bool:
+        return not any(fnmatch.fnmatch(name, pattern) for pattern in excludes)
+
+    root = os.path.abspath(root)
+    entries = [root.rstrip("/") + "/"]
+    for directory, dirs, files in os.walk(root):
+        # A symlink to a directory is copied as the link, not followed.
+        for name in [name for name in dirs if os.path.islink(os.path.join(directory, name))]:
+            dirs.remove(name)
+            files.append(name)
+        dirs[:] = [name for name in dirs if wanted(name)]
+        entries.extend(os.path.join(directory, name) + "/" for name in sorted(dirs))
+        entries.extend(
+            os.path.join(directory, name) for name in sorted(files) if wanted(name)
+        )
     return entries
 
 
@@ -152,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="absolute directory to create on every host")
     parser.add_argument("--ssh-arg", action="append", default=[], help="one ssh argument")
     parser.add_argument("--streams", type=int, default=4, help="rsync processes per host")
+    parser.add_argument("--prune", action="store_true",
+                        help="delete destination entries that no longer exist under a directory --path")
     parser.add_argument("--ssh", default="ssh", help=argparse.SUPPRESS)
     parser.add_argument("--dest-root", default="/", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -187,6 +224,32 @@ def main(argv: list[str] | None = None) -> int:
                 handle.write(name.lstrip("/").encode() + b"\0")
         lists.append((path, sum(size for _, size in bucket)))
 
+    # One complete list per directory that has to mirror its source. It is deliberately not
+    # split: a pruning stream sees only its own file list, so splitting would let it delete a
+    # file that another stream has not copied yet.
+    mirrors = []
+    if args.prune:
+        for index, root in enumerate(args.path):
+            if not is_directory(root):
+                continue
+            path = os.path.join(workdir, f"mirror-{index}")
+            with open(path, "wb") as handle:
+                for name in collect_mirror(root, args.exclude):
+                    handle.write(name.lstrip("/").encode() + b"\0")
+            mirrors.append(path)
+
+    def cleanup() -> None:
+        for path, _ in lists:
+            os.remove(path)
+        for path in mirrors:
+            os.remove(path)
+        os.rmdir(workdir)
+
+    def remote_shell(alias: str) -> str:
+        return shlex.join(
+            [*shlex.split(args.ssh), *args.ssh_arg, "-o", f"HostKeyAlias={alias}"]
+        )
+
     # Every host first: rsync must be there, and the directories the launcher needs must exist.
     for destination, alias in hosts:
         ssh = [*shlex.split(args.ssh), *args.ssh_arg, "-o", f"HostKeyAlias={alias}"]
@@ -202,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
 
     transfers = []
     for destination, alias in hosts:
-        rsh = shlex.join([*shlex.split(args.ssh), *args.ssh_arg, "-o", f"HostKeyAlias={alias}"])
+        rsh = remote_shell(alias)
         for path, size in lists:
             transfers.append(Transfer(alias, size, [
                 # Copying from "/" makes the implied parent directories (/home, /home/user)
@@ -238,11 +301,35 @@ def main(argv: list[str] | None = None) -> int:
         else:
             failed.append(f"{transfer.alias} (rsync exit {code})")
     report()
-    for path, _ in lists:
-        os.remove(path)
-    os.rmdir(workdir)
     if failed:
+        cleanup()
         raise SystemExit("The copy failed for " + ", ".join(sorted(set(failed))))
+
+    if mirrors:
+        # A metadata-only second pass deletes what the lead no longer has. Every copy finished
+        # first, and each directory has one full list, so this cannot race the copy streams.
+        # --exclude protects an excluded name from --delete too, leaving a partial download.
+        prunes = []
+        for destination, alias in hosts:
+            rsh = remote_shell(alias)
+            for path in mirrors:
+                prunes.append(Transfer(alias, 0, [
+                    "rsync", "-a", "--whole-file", "--omit-dir-times", "--from0",
+                    f"--files-from={path}", "--delete",
+                    *(f"--exclude={pattern}" for pattern in args.exclude),
+                    "-e", rsh, "/", f"{destination}:{dest_root}/",
+                ]))
+        for transfer in prunes:
+            transfer.start()
+        for transfer in prunes:
+            code = transfer.process.wait()
+            if code != 0:
+                failed.append(f"{transfer.alias} (rsync exit {code})")
+        if failed:
+            cleanup()
+            raise SystemExit("The copy failed for " + ", ".join(sorted(set(failed))))
+
+    cleanup()
     print(f"Copied {human(total)} to {len(hosts)} Sparks", flush=True)
     return 0
 
