@@ -1012,15 +1012,25 @@ fn serve_dory_host(
             )
         })?;
     let device = sparkflash_model_dory::DoryDeviceBackend::available();
+    // The single-process device arm serves on the shared tick engine, so its seams are the
+    // engine's: the lanes below are the device's, and the host's reference keeps its own.
+    let mut options = options.clone();
     let backend: Box<dyn ModelBackend> = if device {
-        Box::new(
-            sparkflash_model_dory::DoryDeviceBackend::open_with_descriptor(
-                &checkpoint.directory,
-                descriptor.clone(),
-                context,
-            )
-            .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?,
+        let mut backend = sparkflash_model_dory::DoryDeviceBackend::open_with_descriptor(
+            &checkpoint.directory,
+            descriptor.clone(),
+            context,
         )
+        .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+        let lanes = dense_lanes(
+            options.concurrency_set.then_some(options.concurrency),
+            sparkflash_model::active_profile().runtime.concurrency,
+        )?;
+        backend
+            .enable_fusion(lanes)
+            .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+        options.concurrency = lanes;
+        Box::new(backend)
     } else {
         let source = sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
             .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?;
@@ -1034,14 +1044,18 @@ fn serve_dory_host(
             .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?,
         )
     };
+    let reference = if device {
+        format!("device arm on {} lanes", options.concurrency)
+    } else {
+        "host reference".to_owned()
+    };
     let banner = format!(
-        "{} ({}) at TP=1 on {}, context {context}, Dory {} reference",
+        "{} ({}) at TP=1 on {}, context {context}, Dory {reference}",
         descriptor.id,
         descriptor.weights_id,
         checkpoint.directory.display(),
-        if device { "device" } else { "host" }
     );
-    serve_backend(backend, descriptor, seam, dialect, options, &banner)
+    serve_backend(backend, descriptor, seam, dialect, &options, &banner)
 }
 
 /// Whether a non-registry `--model` names a DeepSeek checkpoint, which the existing reference
