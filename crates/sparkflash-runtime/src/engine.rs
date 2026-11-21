@@ -60,9 +60,9 @@ use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculatio
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
 use crate::chunk::ChunkPolicy;
-use crate::fused::Part;
 use crate::group::{GroupWire, TickGroup, watched_hub};
 use crate::ledger::{Ledger, Mode, Strategy};
+use crate::runtime::Part;
 use crate::runtime::{Runtime, RuntimeSlot, StepMode};
 use crate::tick::{
     Clock, Decision, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, QUEUE,
@@ -883,7 +883,7 @@ impl<W: Walk> TickEngine<W> {
             return Ok(());
         };
         // Rank 0's own half first: an arm that refuses the give-back refuses on every rank, so
-        // a refusal must not leave the workers past rank 0 (as GroupLanes' does).
+        // a refusal must not leave the workers past rank 0 (as a lane mirror's does).
         self.runtime.give_back_slot(slot, count)?;
         if let Some(group) = self.group.as_ref()
             && let Err(error) = group.give_back(lane, count)
@@ -1116,9 +1116,24 @@ impl<W: Walk> TickEngine<W> {
             self.requests[index].lane = Some(lane);
             let sampling = self.requests[index].sampling;
             self.runtime.walk().set_sampling(slot.seq_mut(), sampling);
+            // A prompt whose start runs a collective (an image encode on every rank) has its
+            // request frame in front of that start: the workers join the collective from the
+            // frame, so rank 0 cannot wait for its own start first. The start frame follows
+            // ([TickGroup::started]).
+            let early = self.group.is_some() && !new_images.is_empty();
+            if early {
+                let group = self.group.as_ref().expect("a group");
+                if let Err(error) = group.begin(lane, &wanted, &new_images, &sampling) {
+                    group.out_of_step(&error.to_string());
+                }
+            }
             let start = match self.runtime.start_prompt_slot(slot, &wanted, &new_images) {
                 Ok(start) => start,
                 Err(error) => {
+                    if early {
+                        let group = self.group.as_ref().expect("a group");
+                        group.out_of_step(&error.to_string());
+                    }
                     self.fail(index, error, events);
                     continue;
                 }
@@ -1138,11 +1153,17 @@ impl<W: Walk> TickEngine<W> {
             }
             // The request frame carries the start rank 0 chose, so it follows rank 0's own
             // start_prompt_slot and precedes every row frame; the worker's own start is checked
-            // against it there. Nothing has run a row yet.
-            if let Some(group) = self.group.as_ref()
-                && let Err(error) = group.place(lane, &wanted, &new_images, start, &sampling)
-            {
-                group.out_of_step(&error.to_string());
+            // against it there. A prompt that carried images already sent its request frame, so
+            // its start travels alone. Nothing has run a row yet.
+            if let Some(group) = self.group.as_ref() {
+                let sent = if early {
+                    group.started(lane, start)
+                } else {
+                    group.place(lane, &wanted, &new_images, start, &sampling)
+                };
+                if let Err(error) = sent {
+                    group.out_of_step(&error.to_string());
+                }
             }
             let bulk = bulk_from(
                 target,

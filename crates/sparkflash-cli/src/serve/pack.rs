@@ -101,7 +101,7 @@ pub(super) trait PackArm {
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String>;
     /// Opens this process's rank of the group's fused lanes under `--fuse-batch`
-    /// (sparkflash_runtime::GroupLanes): the operator's lane count, or the count the arm's
+    /// (sparkflash_runtime::serve_group): the operator's lane count, or the count the arm's
     /// [sparkflash_runtime::Limits] states when the operator gave none. Every pack arm opens
     /// lanes, so this has no default: a group either steps its arm's walk or says which world
     /// it cannot serve.

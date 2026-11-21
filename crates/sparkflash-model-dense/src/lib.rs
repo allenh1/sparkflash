@@ -50,7 +50,7 @@
 //! row agrees to a tolerance rather than to the bit.
 //!
 //! It serves on the shared runtime's contract ([DenseLanes], a [sparkflash_runtime::Runtime]
-//! over [DenseWalk]): the runtime owns the fused lanes, the prompt parts, kept conversations,
+//! over [DenseWalk]): the runtime owns the lanes, the prompt parts, kept conversations,
 //! the rewind point and the ledger, and the arm supplies only the walk and its head. Its caches
 //! stay on the shared lane memory ([SequenceLanes]).
 //!
@@ -62,7 +62,7 @@
 //! head. Each branch therefore leaves a partial of its hidden rows, which the ranks sum in rank
 //! order ([RowSums]) before the residual takes it, so the residual is the same bits on every rank
 //! and so is every replicated decision (the router's picks, the token). Rank 0 serves the group's
-//! fused lanes and every other rank replays them ([DenseDeviceBackend::enable_group_fusion],
+//! lanes and every other rank replays them ([DenseDeviceBackend::enable_group_fusion],
 //! [DenseDeviceBackend::mirror_group]).
 
 use std::sync::Arc;
@@ -104,8 +104,8 @@ use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 use sparkflash_runtime::{
-    ChunkPolicy, GroupEngine, GroupWire, Limits, PartBody, Place, RankSplit, Region, Serving,
-    TextWire, Walk, WalkArm,
+    ChunkPolicy, GroupWire, Limits, PartBody, Place, RankSplit, Region, Serving, TextWire, Walk,
+    WalkArm,
 };
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, TensorSpec, WeightSource};
@@ -1015,12 +1015,6 @@ impl WalkArm for DenseDeviceBackend {
             _ => Ok(()),
         }
     }
-
-    /// Alone the arm serves on the tick engine. Its group still serves through the fused engine,
-    /// until its lane frames can carry a chunk's rows.
-    fn group_engine(&self) -> GroupEngine {
-        GroupEngine::Fused
-    }
 }
 
 impl DenseDeviceBackend {
@@ -1372,10 +1366,10 @@ impl DenseDeviceBackend {
     }
 
     /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group
-    /// ([sparkflash_runtime::serve_group], on the fused engine): every lane's prompt, step,
-    /// give-back and release is broadcast through `hub` before it runs here, and each worker
-    /// replays them ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same
-    /// sequence on every rank and the sums inside a walk line up.
+    /// ([sparkflash_runtime::serve_group], on the tick group): every lane's prompt, its chunks,
+    /// each step's shape, a give-back and a release is broadcast through `hub` before it runs
+    /// here, and each worker replays them ([Self::mirror_group]) over its own `capacity` lanes,
+    /// so lane `n` is the same sequence on every rank and the sums inside a walk line up.
     ///
     /// # Errors
     /// A backend that is not a group's rank, then as [Self::enable_fusion], or a watch that
@@ -3751,8 +3745,8 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// One sequence with its own scratch, outside the fused engine: the parity gate's session, which
-/// records each layer's residual.
+/// One sequence with its own scratch, outside the serving engine: the parity gate's session,
+/// which records each layer's residual.
 pub struct DenseDeviceSession {
     sequence: Sequence,
     scratch: Scratch,

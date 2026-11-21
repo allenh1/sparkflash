@@ -129,9 +129,9 @@ pub enum Tp4ControlFrame {
         /// The canvas bytes after the frame.
         bytes: u64,
     },
-    /// Rank 0 -> every worker of a fused or tick group: lane `lane` takes a request's prompt. A
-    /// lane that still holds an earlier request forgets it first, on every rank alike, unless
-    /// `keep` says rank 0's lane kept it to continue.
+    /// Rank 0 -> every worker of a lane group: lane `lane` takes a request's prompt. A lane
+    /// that still holds an earlier request forgets it first, on every rank alike, unless `keep`
+    /// says rank 0's lane kept it to continue.
     LaneRequest {
         /// The lane, `0..lanes`, in the order rank 0's pool opened them.
         lane: u32,
@@ -148,39 +148,40 @@ pub enum Tp4ControlFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sampler: Option<Tp4FrameSampler>,
         /// The position rank 0's `start_prompt_slot` chose: where the prompt resumes from its
-        /// lane's history, or zero. A tick group's worker starts its own prompt the same way and
-        /// refuses a start that differs, because every row frame after this one is a position
-        /// from this start. A fused group's worker runs the arm's own prompt path, so its frames
-        /// leave this absent; a frame from a rank 0 that predates the field is the same.
+        /// lane's history, or zero. The worker starts its own prompt the same way and refuses a
+        /// start that differs, because every row frame after this one is a position from this
+        /// start. A prompt whose start runs a collective (an image encode) sends this frame
+        /// before rank 0's own start and leaves this absent; [Tp4ControlFrame::LaneStart] then
+        /// names it and the worker checks it. A frame from a rank 0 that predates the field is
+        /// the same.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start: Option<u32>,
     },
-    /// Rank 0 -> every worker of a fused group: lane `lane` is idle and gives up what it holds,
+    /// Rank 0 -> every worker of a tick group: the start rank 0's own `start_prompt_slot`
+    /// chose for the prompt its [Tp4ControlFrame::LaneRequest] opened. The request carried no
+    /// start because rank 0 had to broadcast it before its own start, which runs a collective
+    /// (an image encode) every rank joins. The worker runs the prompt on the request frame and
+    /// checks the start it reached against this one.
+    LaneStart {
+        /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
+        lane: u32,
+        /// The position rank 0's start reached.
+        start: u32,
+    },
+    /// Rank 0 -> every worker of a lane group: lane `lane` is idle and gives up what it holds,
     /// so another lane can grow; its next request starts over.
     LaneRelease {
         /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
         lane: u32,
     },
-    /// Rank 0 -> every worker of a fused group: one step of these lanes, each consuming the token
-    /// rank 0 sampled for it, in this order - the order is the step's row order on every rank.
-    LaneStep {
-        /// `(lane, token)` a member.
-        members: Vec<(u32, u32)>,
-    },
-    /// Rank 0 -> every worker of a fused group: lane `lane`'s caller never used the last `count`
-    /// answers of its run, so the lane rolls them back within its round (the shared engine's
+    /// Rank 0 -> every worker of a lane group: lane `lane`'s caller never used the last `count`
+    /// answers of its run, so the lane rolls them back within its round (the runtime's
     /// give-back), before the frame that follows.
     LaneGiveBack {
         /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
         lane: u32,
         /// The answers to roll back.
         count: u32,
-    },
-    /// Rank 0 -> every worker of a fused group: lane `lane` runs the next part of the prompt its
-    /// `LaneRequest` began, between the steps the frames around it name.
-    LanePart {
-        /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
-        lane: u32,
     },
     /// Rank 0 -> every worker of a tick group: lane `lane` runs exactly `rows` rows of the prompt
     /// its `LaneRequest` began. The count is rank 0's scheduler decision (the tick engine's
@@ -225,9 +226,8 @@ impl Tp4ControlFrame {
             Self::DevicePixels { .. } => "DevicePixels",
             Self::LaneRequest { .. } => "LaneRequest",
             Self::LaneRelease { .. } => "LaneRelease",
-            Self::LaneStep { .. } => "LaneStep",
+            Self::LaneStart { .. } => "LaneStart",
             Self::LaneGiveBack { .. } => "LaneGiveBack",
-            Self::LanePart { .. } => "LanePart",
             Self::LaneRows { .. } => "LaneRows",
             Self::LaneStepMode { .. } => "LaneStepMode",
             Self::End => "End",

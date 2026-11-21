@@ -17,7 +17,7 @@
 //! `--list` reads `sparkflash_model::ARMS`, the one model table: the console id, the registry
 //! weight selectors, the default context, the tokenizer and chat template, the conversion
 //! defaults and the ledger pointer. `--ledger` reads `sparkflash_model::ARM_LEDGERS`, the same
-//! declaration an arm's `FusedArm::ledger` returns at boot, so the gap table is a preview of the
+//! declaration an arm's ledger returns at boot, so the gap table is a preview of the
 //! boot line and not a second hand-kept list. No device is opened: an arm with no checkpoint and
 //! no cubin still prints.
 

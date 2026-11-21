@@ -18,13 +18,14 @@
 //! drafter, and what a walk costs. Everything that decides *which rows run together* lives here,
 //! so a strategy built once serves every arm that can take its walk:
 //!
-//! * [fused]: slots on one engine thread, the prefix claim, park and reclaim, and multi-token
-//!   runs (a member drains its round in one step);
+//! * [engine]: the tick engine, its scheduler thread and the sessions that post to it;
+//! * [tick]: the scheduler's decisions, each one a function: the lane choice, the prompt chunks,
+//!   the step's shape, and the trace that pins them;
 //! * [share]: the step wall models and the row share, which gives each verify row to the draft
 //!   likeliest accepted while it pays;
 //! * [rounds]: one speculative round over several sequences - every chain drafted, rows shared,
 //!   one walk, each sequence accepting its own;
-//! * [group]: fused lanes across a tensor-parallel group - rank 0 decides and broadcasts, every
+//! * [group]: lanes across a tensor-parallel group - rank 0 decides and broadcasts, every
 //!   other rank replays;
 //! * [ledger]: which of these an arm runs natively, looped or not at all, printed when its engine
 //!   starts;
@@ -36,7 +37,6 @@
 pub mod chunk;
 pub mod conformance;
 pub mod engine;
-pub mod fused;
 pub mod group;
 pub mod layout;
 pub mod ledger;
@@ -59,15 +59,9 @@ pub use conformance::{
 pub use engine::{
     Kept as TickKept, RequestId, TickConfig, TickEngine, TickEvent, TickServe, TickSession,
 };
-pub use fused::{
-    FusedArm, FusedEngine, FusedSession, PREFILL_BYPASS_MAX_TOKENS, PREFILL_DECODE_INTERVAL,
-    PROMPT_PARTS_ENV, Part, REWIND_ENV, Resume, extends, prompt_parts, resume, rewind,
-    rewind_request,
-};
 pub use group::{
-    Fusion, GroupLane, GroupLanes, GroupWire, Split, TextWire, TickGroup, end_group, mirror_lanes,
-    mirror_tick_lanes, mirror_tick_lanes_seen, mirror_ticks_until_the_group_ends,
-    mirror_until_the_group_ends, watched_hub,
+    GroupWire, Split, TextWire, TickGroup, end_group, mirror_tick_lanes, mirror_tick_lanes_seen,
+    mirror_ticks_until_the_group_ends, watched_hub,
 };
 pub use layout::{
     LaneState, Limits, Region, StateKind, StateLayout, check_checkpoint, check_rewind,
@@ -75,11 +69,15 @@ pub use layout::{
 pub use ledger::{Ledger, Mode, Strategy};
 pub use part::{PartBody, PartExec, PartHost, PartMaker, PartRegistry, RankSplit};
 pub use pool::{LaneMemory, LanePool};
-pub use resume::{Restore, Rewind, checkpoint_after, rewind_plan};
+pub use resume::{
+    REWIND_ENV, Restore, Resume, Rewind, checkpoint_after, extends, resume, rewind, rewind_plan,
+    rewind_request,
+};
 pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
-pub use runtime::{Runtime, RuntimeSession, RuntimeSlot, StepMode, ledger_for};
-pub use serve::{GroupEngine, Place, Serving, WalkArm, lane_limit, mirror, serve, serve_group};
+pub use runtime::{Part, Runtime, RuntimeSession, RuntimeSlot, StepMode, ledger_for};
+pub use serve::{Place, Serving, WalkArm, lane_limit, mirror, serve, serve_group};
 pub use share::{BandWall, DraftBudget, ExpertUnionWall, StepWall, share_rows};
+pub use tick::{PREFILL_BYPASS_MAX_TOKENS, PREFILL_DECODE_INTERVAL};
 pub use walk::{
     Absent, ComputeDeclaration, Draft, Drafter, HeadInput, HeadRow, Hidden, NoVision,
     OutputConstraint, Pass, PassKind, PassMask, Residual, Segment, Segments, Vision, Walk,

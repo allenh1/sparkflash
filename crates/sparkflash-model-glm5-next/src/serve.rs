@@ -40,7 +40,7 @@ use sparkflash_model::{
     PackIdentity,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
-use sparkflash_runtime::{GroupEngine, GroupWire, Place, Serving, TextWire, Walk, WalkArm};
+use sparkflash_runtime::{GroupWire, Place, Serving, TextWire, Walk, WalkArm};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
@@ -77,10 +77,6 @@ impl WalkArm for Glm5NextDeviceBackend {
     /// The backend holds a collective alone and in a group, so it refuses neither place.
     fn admit(&self, _place: Place) -> Result<(), BackendError> {
         Ok(())
-    }
-
-    fn group_engine(&self) -> GroupEngine {
-        GroupEngine::Tick
     }
 }
 

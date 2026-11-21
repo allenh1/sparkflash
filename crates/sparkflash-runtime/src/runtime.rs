@@ -12,17 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The runtime's only `FusedArm`: every strategy over one [`Walk`].
+//! The runtime's strategies over one [`Walk`].
 //!
 //! [`Runtime`] owns what no arm should write again: history, resume and the prefix match; the
 //! prompt-part state machine, sized by [`ChunkPolicy`]; checkpoint and rewind, driven by
-//! [`StateLayout`]; lane reservations from [`LanePool`]; give-back; the ledger; and, by
-//! implementing [`FusedArm`], group mirroring and the fused engine's lanes. A model supplies
-//! only the walk and the head.
-//!
-//! The engine itself is not replaced here: `FusedEngine` still schedules the lanes, and this
-//! type is the one `FusedArm` a walk needs. The dense arm serves through it; the other arms
-//! move onto it in the same phase, first dense as the proof.
+//! [`StateLayout`]; lane reservations from [`LanePool`]; give-back; and the ledger. A model
+//! supplies only the walk and the head. The tick engine schedules the lanes over it
+//! ([`crate::TickEngine`]); its group is [`crate::TickGroup`].
 
 use std::sync::Mutex;
 
@@ -30,13 +26,21 @@ use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculatio
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
 use crate::chunk::ChunkPolicy;
-use crate::fused::{FusedArm, Part, Resume, resume};
 use crate::layout::{LaneState, Limits, StateKind, StateLayout};
 use crate::ledger::{Ledger, Mode, Strategy};
 use crate::pool::{LaneMemory, LanePool};
-use crate::resume::{Restore, checkpoint_after, rewind_plan};
+use crate::resume::{Restore, Resume, checkpoint_after, extends, resume, rewind_plan};
 use crate::share::share_rows;
 use crate::walk::{Draft, Drafter, HeadRow, Pass, PassMask, Residual, Segment, Vision, Walk};
+
+/// What one part of a prompt left: the prompt is consumed, or it has parts left.
+#[derive(Debug, Clone)]
+pub enum Part {
+    /// The prompt is consumed: this is its first step.
+    Done(StepOutput),
+    /// The prompt has parts left; [Runtime::next_part_slot] runs the next.
+    More,
+}
 
 /// A prompt the runtime is feeding a chunk at a time.
 #[derive(Debug)]
@@ -183,7 +187,8 @@ impl<W: Walk> Runtime<W> {
         let limits = walk.limits();
         let chunk = ChunkPolicy::new(limits, free_bytes, layout.bytes_per_row());
         let lane_bytes = layout.bytes_at(limits.context);
-        let rewind = crate::fused::rewind().map_err(|error| BackendError::new("runtime", error))?;
+        let rewind =
+            crate::resume::rewind().map_err(|error| BackendError::new("runtime", error))?;
         Ok(Self {
             walk,
             layout,
@@ -634,7 +639,7 @@ impl<W: Walk> Runtime<W> {
         Ok((steps, walked))
     }
 
-    /// A fresh slot, with no `Send` bound: [`FusedArm::open_slot`] delegates here, and so
+    /// A fresh slot, with no `Send` bound: the engine opens its lanes through it, and so
     /// does a check's CPU walk.
     ///
     /// # Errors
@@ -654,7 +659,7 @@ impl<W: Walk> Runtime<W> {
         })
     }
 
-    /// A prompt through the runtime, with no `Send` bound: the engine's [`FusedArm::prefill`]
+    /// A prompt through the runtime, with no `Send` bound: the engine's own prompt entry
     /// delegates here, and so does a checks' CPU walk.
     ///
     /// # Errors
@@ -673,7 +678,8 @@ impl<W: Walk> Runtime<W> {
         }
     }
 
-    /// The first part of a prompt ([FusedArm::begin_prompt], without the join bounds).
+    /// The first part of a prompt ([Self::start_prompt_slot] plus one chunk, without the join
+    /// bounds).
     ///
     /// # Errors
     /// An empty prompt, an image the arm does not take, or a backend failure.
@@ -785,7 +791,7 @@ impl<W: Walk> Runtime<W> {
         Ok(start)
     }
 
-    /// The next part of a prompt ([FusedArm::next_part], without the join bounds).
+    /// The next part of a prompt (one chunk, without the join bounds).
     ///
     /// # Errors
     /// A backend failure, or no prompt in parts.
@@ -793,7 +799,7 @@ impl<W: Walk> Runtime<W> {
         self.run_part(slot)
     }
 
-    /// One step over the members ([FusedArm::step], without the join bounds): the round path
+    /// One step over the members (without the join bounds): the round path
     /// when the drafter is present, a plain token row otherwise.
     ///
     /// # Errors
@@ -878,7 +884,7 @@ impl<W: Walk> Runtime<W> {
         Ok(steps)
     }
 
-    /// Clears `slot` for another request, keeping the request's sampler ([FusedArm::release]).
+    /// Clears `slot` for another request, keeping the request's sampler.
     ///
     /// # Errors
     /// An exhausted lane pool, or a sequence the arm cannot open.
@@ -893,7 +899,7 @@ impl<W: Walk> Runtime<W> {
     }
 
     /// Whether `slot` can take a prompt (or, for `None`, its next step) with the memory the arm
-    /// has spare now ([FusedArm::room]).
+    /// has spare now.
     #[must_use]
     pub fn room_slot(&self, slot: &RuntimeSlot<W>, prompt: Option<&[u32]>) -> bool {
         // A prompt's final position is its own length: it either extends the history or rewinds
@@ -919,15 +925,15 @@ impl<W: Walk> Runtime<W> {
                     .point
                     .filter(|point| *point <= slot.history.len())
                     .map(|point| &slot.history[..point]);
-                let continues = crate::fused::extends(&slot.history, prompt)
-                    || point.is_some_and(|point| crate::fused::extends(point, prompt));
+                let continues = extends(&slot.history, prompt)
+                    || point.is_some_and(|point| extends(point, prompt));
                 slot.seq.room(prompt.len(), !continues)
             }
             None => slot.seq.room(positions, false),
         }
     }
 
-    /// Rolls back `count` answers the caller never used ([FusedArm::give_back]).
+    /// Rolls back `count` answers the caller never used.
     ///
     /// # Errors
     /// A count past the history, or an arm that cannot give the rows back.
@@ -956,13 +962,13 @@ impl<W: Walk> Runtime<W> {
         Ok(())
     }
 
-    /// Whether `slot` already holds the answer to a step fed `token` ([FusedArm::ready]).
+    /// Whether `slot` already holds the answer to a step fed `token`.
     #[must_use]
     pub fn ready_slot(&self, slot: &RuntimeSlot<W>, token: u32) -> bool {
         self.walk.drafter().ready(&slot.seq, token)
     }
 
-    /// A slot's speculative counters for the request it serves ([FusedArm::speculation]).
+    /// A slot's speculative counters for the request it serves.
     #[must_use]
     pub fn speculation_slot(&self, slot: &RuntimeSlot<W>) -> Speculation {
         self.walk.drafter().speculation(&slot.seq)
@@ -1008,7 +1014,7 @@ where
 {
     fn set_sampling(&mut self, sampling: Sampling) {
         let slot = self.slot.as_mut().expect("the session has its slot");
-        FusedArm::set_sampling(&self.runtime, slot, sampling);
+        self.runtime.set_sampling(slot, sampling);
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
@@ -1062,29 +1068,25 @@ where
 
     fn speculation(&self) -> Speculation {
         let slot = self.slot.as_ref().expect("the session has its slot");
-        FusedArm::speculation(&self.runtime, slot)
+        self.runtime.speculation_slot(slot)
     }
 
     fn reusable_prefix(&self) -> Option<&[u32]> {
         let slot = self.slot.as_ref()?;
-        FusedArm::history(&self.runtime, slot)
+        Some(&slot.history)
     }
 
     fn rewind_prefix(&self) -> Option<&[u32]> {
         let slot = self.slot.as_ref()?;
-        FusedArm::rewind_prefix(&self.runtime, slot)
+        self.runtime.rewind_prefix(slot)
     }
 
     fn held_images(&self) -> &[ImageSpan] {
-        self.slot
-            .as_ref()
-            .map_or(&[], |slot| FusedArm::held_images(&self.runtime, slot))
+        self.slot.as_ref().map_or(&[], |slot| &slot.held_images)
     }
 
     fn cached_tokens(&self) -> usize {
-        self.slot
-            .as_ref()
-            .map_or(0, |slot| FusedArm::cached_tokens(&self.runtime, slot))
+        self.slot.as_ref().map_or(0, |slot| slot.cached)
     }
 }
 
@@ -1168,66 +1170,36 @@ fn runtime_ledger<W: Walk>(
     ledger
 }
 
-impl<W> crate::fused::sealed::Sealed for Runtime<W> where W: Walk {}
-
-impl<W> FusedArm for Runtime<W>
+impl<W> Runtime<W>
 where
     W: Walk + Send + Sync,
     W::Seq: Send,
 {
-    type Slot = RuntimeSlot<W>;
-
-    fn open_slot(&self) -> Result<Self::Slot, BackendError> {
-        Runtime::open_slot(self)
-    }
-
-    fn holds_request(&self, slot: &Self::Slot) -> bool {
+    /// Whether `slot` holds a request: a prompt in parts, or a history.
+    #[must_use]
+    pub fn holds_request(&self, slot: &RuntimeSlot<W>) -> bool {
         !slot.history.is_empty() || slot.prompt.is_some()
     }
 
-    fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
+    /// Clears `slot` for another request, keeping the request's sampler
+    /// ([Self::release_slot]).
+    ///
+    /// # Errors
+    /// An exhausted lane pool, or a sequence the arm cannot open.
+    pub fn renew(&self, slot: &mut RuntimeSlot<W>) -> Result<(), BackendError> {
         self.release_slot(slot)
     }
 
-    fn set_sampling(&self, slot: &mut Self::Slot, sampling: Sampling) {
+    /// Sets the sampler `slot` serves with, on the arm's sequence as well as the slot.
+    pub fn set_sampling(&self, slot: &mut RuntimeSlot<W>, sampling: Sampling) {
         slot.sampling = sampling;
         self.walk.set_sampling(&mut slot.seq, sampling);
     }
 
-    fn prefill(&self, slot: &mut Self::Slot, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        self.prefill_slot(slot, tokens)
-    }
-
-    fn begin_prompt(
-        &self,
-        slot: &mut Self::Slot,
-        tokens: &[u32],
-        images: &[VisionImage],
-    ) -> Result<Part, BackendError> {
-        self.begin_prompt_slot(slot, tokens, images)
-    }
-
-    fn next_part(&self, slot: &mut Self::Slot) -> Result<Part, BackendError> {
-        self.next_part_slot(slot)
-    }
-
-    fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
-        self.step_slots(members)
-    }
-
-    fn ready(&self, slot: &Self::Slot, token: u32) -> bool {
-        self.ready_slot(slot, token)
-    }
-
-    fn speculation(&self, slot: &Self::Slot) -> Speculation {
-        self.speculation_slot(slot)
-    }
-
-    fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
-        Some(&slot.history)
-    }
-
-    fn rewind_prefix<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+    /// The prefix a later prompt may take up as the sequence stands: its last prompt's end,
+    /// when the arm keeps a rewind point there and the sequence can still reach it.
+    #[must_use]
+    pub fn rewind_prefix<'s>(&self, slot: &'s RuntimeSlot<W>) -> Option<&'s [u32]> {
         slot.point
             .filter(|point| {
                 *point <= slot.history.len()
@@ -1236,27 +1208,10 @@ where
             .map(|point| &slot.history[..point])
     }
 
-    fn held_images<'s>(&self, slot: &'s Self::Slot) -> &'s [ImageSpan] {
-        &slot.held_images
-    }
-
-    fn cached_tokens(&self, slot: &Self::Slot) -> usize {
-        slot.cached
-    }
-
-    fn room(&self, slot: &Self::Slot, prompt: Option<&[u32]>) -> bool {
-        self.room_slot(slot, prompt)
-    }
-
-    fn release(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
-        self.release_slot(slot)
-    }
-
-    fn give_back(&self, slot: &mut Self::Slot, count: usize) -> Result<(), BackendError> {
-        self.give_back_slot(slot, count)
-    }
-
-    fn max_batch(&self) -> usize {
+    /// The most members one step of this runtime's walk takes: a drafting walk's verify width,
+    /// or a non-drafting walk's segment cap within its prompt chunk.
+    #[must_use]
+    pub fn max_batch(&self) -> usize {
         if W::Drafter::PRESENT && self.walk.drafter().drafts() {
             // A verify refuses more rows than the rank's verify batch: a drafting walk's member
             // cap is the arm's verify width, not its prompt chunk.
@@ -1266,7 +1221,10 @@ where
         }
     }
 
-    fn ledger(&self) -> Ledger {
+    /// The ledger this runtime runs: what its walk states, with the runtime's own chunk, rewind
+    /// and round decisions filled in.
+    #[must_use]
+    pub fn ledger(&self) -> Ledger {
         let drafter = W::Drafter::PRESENT.then(|| self.walk.drafter().describe());
         runtime_ledger::<W>(
             Some(self.chunk.rows()),
@@ -2041,7 +1999,9 @@ mod tests {
 
     fn prompt_of(runtime: &Runtime<ToyWalk>, tokens: &[u32]) -> Vec<u32> {
         let mut slot = runtime.open_slot().expect("a slot");
-        runtime.prefill(&mut slot, tokens).expect("the prefill");
+        runtime
+            .prefill_slot(&mut slot, tokens)
+            .expect("the prefill");
         slot.history.clone()
     }
 
@@ -2076,11 +2036,11 @@ mod tests {
         let runtime = runtime(256);
         let mut slot = runtime.open_slot().expect("a slot");
         runtime
-            .prefill(&mut slot, &[1, 2, 3])
+            .prefill_slot(&mut slot, &[1, 2, 3])
             .expect("the first prompt");
         let before = slot.seq().rows.len();
         runtime
-            .prefill(&mut slot, &[1, 2, 3, 4])
+            .prefill_slot(&mut slot, &[1, 2, 3, 4])
             .expect("the continued prompt");
         assert_eq!(slot.seq().rows, vec![1, 2, 3, 4]);
         assert_eq!(
@@ -2099,13 +2059,13 @@ mod tests {
             Runtime::new(ToyWalk::new(256, 4_096).keeping(2), 0).expect("the runtime starts");
         let mut slot = runtime.open_slot().expect("a slot");
         runtime
-            .prefill(&mut slot, &[1, 2, 3])
+            .prefill_slot(&mut slot, &[1, 2, 3])
             .expect("the first prompt");
         // The walk kept two rows the caller was never given a token for.
         assert_eq!(slot.seq().rows, vec![1, 2, 3, u32::MAX, u32::MAX]);
         assert_eq!(slot.history(), &[1, 2, 3]);
         runtime
-            .prefill(&mut slot, &[1, 2, 3, 9])
+            .prefill_slot(&mut slot, &[1, 2, 3, 9])
             .expect("the continuation");
         assert_eq!(
             slot.seq().rows,
@@ -2121,12 +2081,14 @@ mod tests {
     fn the_drafter_reports_a_sequence_s_speculation() {
         let runtime = Runtime::new(DraftWalk::new(3, None), 0).expect("the runtime starts");
         let mut slot = runtime.open_slot().expect("a slot");
-        runtime.prefill(&mut slot, &[1]).expect("the prompt");
-        assert_eq!(runtime.speculation(&slot), Speculation::default());
-        runtime.step(&mut [(slot, 2)]).expect("the drafting step");
+        runtime.prefill_slot(&mut slot, &[1]).expect("the prompt");
+        assert_eq!(runtime.speculation_slot(&slot), Speculation::default());
+        runtime
+            .step_slots(&mut [(slot, 2)])
+            .expect("the drafting step");
         let slot = runtime.open_slot().expect("a slot");
         assert_eq!(
-            runtime.speculation(&slot),
+            runtime.speculation_slot(&slot),
             Speculation {
                 verify_steps: 1,
                 drafts_proposed: 3,
@@ -2141,37 +2103,39 @@ mod tests {
     fn the_drafter_answers_a_run_and_a_give_back() {
         let runtime = Runtime::new(DraftWalk::new(3, None), 0).expect("the runtime starts");
         let mut slot = runtime.open_slot().expect("a slot");
-        runtime.prefill(&mut slot, &[1]).expect("the prompt");
+        runtime.prefill_slot(&mut slot, &[1]).expect("the prompt");
         let mut member = [(slot, 2u32)];
-        let steps = runtime.step(&mut member).expect("the drafting step");
+        let steps = runtime.step_slots(&mut member).expect("the drafting step");
         let next = steps[0].next_token.expect("a token");
         assert!(
-            runtime.ready(&member[0].0, next),
+            runtime.ready_slot(&member[0].0, next),
             "the verify holds the run"
         );
-        assert!(!runtime.ready(&member[0].0, next.wrapping_add(100)));
+        assert!(!runtime.ready_slot(&member[0].0, next.wrapping_add(100)));
         runtime
-            .give_back(&mut member[0].0, 1)
+            .give_back_slot(&mut member[0].0, 1)
             .expect("the drafter takes the give-back");
         assert_eq!(member[0].0.history(), &[1]);
         assert_eq!(member[0].0.seq().rows, vec![1]);
-        assert!(!runtime.ready(&member[0].0, next));
+        assert!(!runtime.ready_slot(&member[0].0, next));
     }
 
     #[test]
     fn a_rewound_prompt_equals_a_cold_one() {
         let runtime = runtime(256);
         let mut warm = runtime.open_slot().expect("a slot");
-        runtime.prefill(&mut warm, &[1, 2, 3]).expect("the prompt");
         runtime
-            .prefill(&mut warm, &[1, 2, 3, 4, 5])
+            .prefill_slot(&mut warm, &[1, 2, 3])
+            .expect("the prompt");
+        runtime
+            .prefill_slot(&mut warm, &[1, 2, 3, 4, 5])
             .expect("the reply");
         runtime
-            .prefill(&mut warm, &[1, 2, 9, 9])
+            .prefill_slot(&mut warm, &[1, 2, 9, 9])
             .expect("the changed prompt");
         let mut cold = runtime.open_slot().expect("a slot");
         runtime
-            .prefill(&mut cold, &[1, 2, 9, 9])
+            .prefill_slot(&mut cold, &[1, 2, 9, 9])
             .expect("the cold prompt");
         assert_eq!(warm.seq().rows, cold.seq().rows);
         assert_eq!(warm.history(), cold.history());
@@ -2234,7 +2198,7 @@ mod tests {
             runtime.open_slot().expect("a slot"),
         ];
         for slot in &mut slots {
-            runtime.prefill(slot, &[1]).expect("the prompt");
+            runtime.prefill_slot(slot, &[1]).expect("the prompt");
         }
         let mut members: Vec<(RuntimeSlot<ToyWalk>, u32)> = slots
             .into_iter()
@@ -2243,7 +2207,7 @@ mod tests {
                 (slot, token)
             })
             .collect();
-        let steps = runtime.step(&mut members).expect("one walk");
+        let steps = runtime.step_slots(&mut members).expect("one walk");
         assert_eq!(steps.len(), 4);
         let walks = runtime.walk().walks.lock().expect("the toy walk record");
         let last = walks.last().expect("the step walked");
@@ -2259,7 +2223,7 @@ mod tests {
     fn a_real_verify_stops_at_the_first_mismatch_and_appends_only_the_kept_rows() {
         let runtime = Runtime::new(DraftWalk::passing(), 0).expect("the runtime starts");
         let mut slot = runtime.open_slot().expect("a slot");
-        runtime.prefill(&mut slot, &[1]).expect("the prompt");
+        runtime.prefill_slot(&mut slot, &[1]).expect("the prompt");
         let mut members = [(slot, 11u32, &[12u32, 200, 201][..])];
         let constraint = OutputConstraint::new(&[], 8);
         let steps = runtime
@@ -2301,8 +2265,8 @@ mod tests {
             "the joint budget is narrow"
         );
         let mut slot = runtime.open_slot().expect("a slot");
-        runtime.prefill(&mut slot, &[10]).expect("the prompt");
-        runtime.step(&mut [(slot, 11)]).expect("the round");
+        runtime.prefill_slot(&mut slot, &[10]).expect("the prompt");
+        runtime.step_slots(&mut [(slot, 11)]).expect("the round");
         let walks = runtime
             .walk()
             .shared
@@ -2329,7 +2293,7 @@ mod tests {
         ];
         for (index, slot) in slots.iter_mut().enumerate() {
             runtime
-                .prefill(slot, &[index as u32 + 1])
+                .prefill_slot(slot, &[index as u32 + 1])
                 .expect("the prompt");
         }
         let mut members: Vec<(RuntimeSlot<DraftWalk>, u32)> = slots
@@ -2337,7 +2301,7 @@ mod tests {
             .enumerate()
             .map(|(index, slot)| (slot, index as u32 + 11))
             .collect();
-        runtime.step(&mut members).expect("one joint round");
+        runtime.step_slots(&mut members).expect("one joint round");
         let walks = runtime
             .walk()
             .shared
@@ -2364,7 +2328,7 @@ mod tests {
         ];
         for (index, slot) in slots.iter_mut().enumerate() {
             runtime
-                .prefill(slot, &[index as u32 + 1])
+                .prefill_slot(slot, &[index as u32 + 1])
                 .expect("the prompt");
         }
         let mut members: Vec<(RuntimeSlot<DraftWalk>, u32)> = slots
@@ -2372,7 +2336,7 @@ mod tests {
             .enumerate()
             .map(|(index, slot)| (slot, index as u32 + 11))
             .collect();
-        runtime.step(&mut members).expect("two lone rounds");
+        runtime.step_slots(&mut members).expect("two lone rounds");
         let walks = runtime
             .walk()
             .shared
@@ -2394,7 +2358,7 @@ mod tests {
     fn a_step_reserves_the_verify_rows() {
         let runtime = Runtime::new(DraftWalk::passing(), 0).expect("the runtime starts");
         let slot = runtime.open_slot().expect("a slot");
-        assert!(runtime.room(&slot, None));
+        assert!(runtime.room_slot(&slot, None));
         assert_eq!(
             *slot
                 .seq()
@@ -2414,9 +2378,9 @@ mod tests {
     fn a_rejected_draft_gives_back_correctly() {
         let runtime = Runtime::new(DraftWalk::rejecting(), 0).expect("the runtime starts");
         let mut slot = runtime.open_slot().expect("a slot");
-        runtime.prefill(&mut slot, &[1]).expect("the prompt");
+        runtime.prefill_slot(&mut slot, &[1]).expect("the prompt");
         let mut member = [(slot, 2u32)];
-        let steps = runtime.step(&mut member).expect("the round");
+        let steps = runtime.step_slots(&mut member).expect("the round");
         assert_eq!(steps[0].next_token, Some(3));
         assert_eq!(
             member[0].0.seq().rows,
@@ -2437,7 +2401,7 @@ mod tests {
         drop(walks);
         // The accepted draft's answer is held, so feeding it costs no verify.
         member[0].1 = 3;
-        let steps = runtime.step(&mut member).expect("the held step");
+        let steps = runtime.step_slots(&mut member).expect("the held step");
         assert_eq!(steps[0].next_token, Some(4));
         assert_eq!(member[0].0.history(), &[1, 2, 3]);
         let walks = runtime
@@ -2608,10 +2572,10 @@ mod tests {
         while matches!(part, Part::More) {
             part = runtime.next_part_slot(&mut slot).expect("the next part");
         }
-        assert_eq!(runtime.held_images(&slot), &[span]);
+        assert_eq!(slot.held_image_spans(), &[span]);
         assert_eq!(*encoded.lock().expect("the encode record"), vec![(1, 1)]);
         assert_eq!(*carried.lock().expect("the carry record"), vec![1]);
-        assert_eq!(runtime.cached_tokens(&slot), 0);
+        assert_eq!(slot.cached(), 0);
 
         let mut longer = prompt.to_vec();
         longer.extend_from_slice(&[40, 41]);
@@ -2622,7 +2586,7 @@ mod tests {
             part = runtime.next_part_slot(&mut slot).expect("the next part");
         }
         assert_eq!(
-            runtime.cached_tokens(&slot),
+            slot.cached(),
             prompt.len(),
             "the same image rides the prefix"
         );
@@ -2647,16 +2611,12 @@ mod tests {
         while matches!(part, Part::More) {
             part = runtime.next_part_slot(&mut slot).expect("the next part");
         }
-        assert_eq!(
-            runtime.cached_tokens(&slot),
-            0,
-            "a changed image starts over"
-        );
+        assert_eq!(slot.cached(), 0, "a changed image starts over");
         assert_eq!(
             *encoded.lock().expect("the encode record"),
             vec![(1, 1), (1, 0), (1, 1)]
         );
-        assert_eq!(runtime.held_images(&slot), &[changed.span]);
+        assert_eq!(slot.held_image_spans(), &[changed.span]);
     }
 
     /// A drafter compiled in but configured off runs one plain token pass over every member,
@@ -2689,57 +2649,6 @@ mod tests {
             vec![(PassKind::TokenRows, vec![1, 1, 1])],
             "the three members share one token pass"
         );
-    }
-
-    #[test]
-    fn a_group_of_a_runtimes_lanes_takes_its_width_from_limits() {
-        use std::net::TcpListener;
-        use std::time::Duration;
-
-        use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
-
-        use crate::FusedEngine;
-        use crate::group::{GroupLanes, TextWire, mirror_lanes};
-
-        // A world of two, as the group's control hub sees it; the lanes themselves are one
-        // runtime's, which is the only group width the compiler allows. Rank 1 mirrors rank 0's
-        // decisions on its own runtime, so the broadcast path is the real one.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let address = listener.local_addr().expect("the bound address");
-        let _worker = std::thread::spawn(move || {
-            let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
-                .expect("a control connection");
-            control.handshake().expect("the handshake");
-            let runtime = Runtime::new(ToyWalk::new(4, 64), 0).expect("the worker's runtime");
-            let _ = mirror_lanes(
-                &mut control,
-                &runtime,
-                &TextWire::new("toy", "the toy", 64),
-                4,
-            );
-        });
-        let hub = Tp4ControlHub::start_with_listener(listener, 2, Duration::from_secs(5))
-            .expect("the control hub");
-        let runtime = Runtime::new(ToyWalk::new(4, 64), 0).expect("the toy runtime");
-        let lanes = runtime.limits().members;
-        assert_eq!(lanes, 4, "the arm's Limits name the lane width");
-        let group = GroupLanes::new(
-            runtime,
-            Arc::new(Mutex::new(hub)),
-            TextWire::new("toy", "the toy", 64),
-        );
-        let engine = FusedEngine::start(Arc::new(group), lanes).expect("the group's engine");
-        let mut session = engine.open().expect("a lane");
-        let first = session.prefill(&[1, 2, 3]).expect("the prompt");
-        assert_eq!(first.next_token, Some(4));
-        assert_eq!(
-            session.decode(4).expect("the step").next_token,
-            Some(5),
-            "a lane of the group steps its runtime's walk"
-        );
-        session.park();
-        drop(session);
-        drop(engine);
     }
 
     /// The toy walk's fixture: the runtime's CPU walk, with no group on this host.

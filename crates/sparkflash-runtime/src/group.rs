@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Fused lanes across a tensor-parallel group: rank 0 decides, every other rank replays.
+//! Lanes across a tensor-parallel group: rank 0 decides, every other rank replays.
 //!
 //! Every rank holds its share of the weights and runs the same walks, because the collectives
-//! inside a walk block until every rank joins. Rank 0 alone runs the [crate::FusedEngine]: it picks
-//! which lanes step together, and [GroupLanes] broadcasts each decision (a lane's prompt and each
-//! later part of it, a step's members in their row order, a give-back, a release) *before* running
-//! it on its own rank. A
-//! worker runs [mirror_lanes] over its own lane arm and replays the frames in the order they came,
-//! so lane `n` is the same sequence on every rank and the collectives line up.
+//! inside a walk block until every rank joins. Rank 0 alone runs the [crate::TickEngine]: it picks
+//! which lanes step together, which rows a prompt chunk runs and the shape of a step, and
+//! [TickGroup] broadcasts each decision (a lane's prompt, each chunk of it, a step's members in
+//! their row order, a give-back, a release) *before* running it on its own rank. A worker runs
+//! [mirror_tick_lanes] over its own lanes and replays the frames in the order they came, so lane
+//! `n` is the same sequence on every rank and the collectives line up.
 //!
 //! This came from Inkling's group (`sparkflash-model-inkling2/src/group.rs`); what stays with an
 //! arm is its [GroupWire]: what rank 0 refuses before it broadcasts, how a request's sampler
@@ -31,21 +31,19 @@
 //! out, a failure on rank 0's own half leaves the workers past it, inside collectives rank 0
 //! will not join. Rank 0 then broadcasts [Tp4ControlFrame::Error] and ends its process
 //! ([end_group]). A worker ends its own when its mirror fails or when rank 0's control socket
-//! closes, even while it waits in a collective ([mirror_until_the_group_ends]). Rank 0 ends when
+//! closes, even while it waits in a collective ([mirror_ticks_until_the_group_ends]). Rank 0 ends
+//! when
 //! a worker's socket closes ([watched_hub]).
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sparkflash_comm::control::{
     Tp4ControlFrame, Tp4ControlHub, Tp4ControlWorker, Tp4DeviceImage, Tp4FrameSampler,
     Tp4FrameStepMode, control_read_is_idle, exit_now, watch_leader, watch_workers,
 };
-use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
-use sparkflash_model::vision::{ImageSpan, VisionImage};
+use sparkflash_model::backend::{BackendError, Sampling};
+use sparkflash_model::vision::VisionImage;
 
-use crate::fused::{FusedArm, FusedEngine, Part};
-use crate::ledger::{Ledger, Mode, Strategy};
 use crate::runtime::{Runtime, RuntimeSlot, StepMode};
 use crate::walk::Walk;
 
@@ -256,28 +254,6 @@ pub fn watched_hub(hub: Tp4ControlHub) -> Result<Arc<Mutex<Tp4ControlHub>>, Back
 /// Set never: the lanes' rank 0 says no End, so any close of its socket ends a worker.
 static NO_END: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Runs a worker's [mirror_lanes] and then ends its process: a mirror only ever stops when the
-/// group can no longer serve. A watch on rank 0's control socket ends the process too while it
-/// waits in a collective rank 0 will never join.
-pub fn mirror_until_the_group_ends<A: FusedArm, W: GroupWire>(
-    control: &mut Tp4ControlWorker,
-    arm: &A,
-    wire: &W,
-    lanes: usize,
-) -> ! {
-    let rank = control.rank;
-    if let Err(error) = watch_leader(&control.stream, rank as usize, &NO_END, || {}) {
-        eprintln!("sparkflash serve: rank {rank}: {error}");
-        exit_now(1);
-    }
-    let error = match mirror_lanes(control, arm, wire, lanes) {
-        Ok(()) => "the control channel ended".to_owned(),
-        Err(error) => error,
-    };
-    eprintln!("sparkflash serve: rank {rank}: the group cannot serve, exiting: {error}");
-    exit_now(1)
-}
-
 /// Broadcasts one frame to the group.
 ///
 /// # Errors
@@ -291,145 +267,17 @@ pub fn broadcast(hub: &Mutex<Tp4ControlHub>, frame: &Tp4ControlFrame) -> Result<
         .map_err(|error| BackendError::new("group", format!("{kind}: {error}")))
 }
 
-/// Mirrors rank 0's lane frames onto this rank's own pool of `lanes` fused lanes, until the
-/// control channel ends.
-///
-/// The pool is opened up front, as rank 0's engine opens its own, so lane `n` is the same slot on
-/// every rank. A `LaneRequest` forgets what the lane held, unless rank 0 kept its own, and
-/// prefills it with rank 0's sampler; a `LaneStep` steps its members in the frame's order, which
-/// is the step's row order on every rank and so the order the collectives inside it line up in.
-///
-/// # Errors
-/// A frame for a lane outside the pool (the ranks are out of step), an arm failure, or the
-/// channel's end.
-pub fn mirror_lanes<A: FusedArm, W: GroupWire>(
-    control: &mut Tp4ControlWorker,
-    arm: &A,
-    wire: &W,
-    lanes: usize,
-) -> Result<(), String> {
-    let mut pool: Vec<Option<A::Slot>> = Vec::with_capacity(lanes);
-    for _ in 0..lanes {
-        pool.push(Some(
-            arm.open_slot()
-                .map_err(|error| format!("open a lane: {error}"))?,
-        ));
-    }
-    let name = wire.name();
-    let out_of_step = |lane: u32| {
-        format!(
-            "lane {lane} is outside this rank's {lanes} lanes or already stepping: the ranks are out \
-             of step (every rank must be given the same --concurrency)"
-        )
-    };
-    loop {
-        let frame = match control.next_frame() {
-            Ok(frame) => frame,
-            Err(error) if control_read_is_idle(&error) => continue,
-            Err(error) => return Err(error.to_string()),
-        };
-        match frame {
-            Tp4ControlFrame::LaneRequest {
-                lane,
-                prompt_ids,
-                images,
-                keep,
-                sampler,
-                start: _,
-            } => {
-                let images = wire
-                    .images(images)
-                    .map_err(|error| format!("lane {lane}: {error}"))?;
-                let slot = pool
-                    .get_mut(lane as usize)
-                    .and_then(Option::as_mut)
-                    .ok_or_else(|| out_of_step(lane))?;
-                if !keep && arm.holds_request(slot) {
-                    arm.renew(slot)
-                        .map_err(|error| format!("lane {lane}: renew: {error}"))?;
-                }
-                arm.set_sampling(slot, wire.sampling(sampler));
-                if wire.trace() {
-                    eprintln!("[{name}] serve worker lane {lane} prefill {prompt_ids:?}");
-                }
-                arm.begin_prompt(slot, &prompt_ids, &images)
-                    .map_err(|error| format!("lane {lane}: prefill: {error}"))?;
-            }
-            Tp4ControlFrame::LanePart { lane } => {
-                let slot = pool
-                    .get_mut(lane as usize)
-                    .and_then(Option::as_mut)
-                    .ok_or_else(|| out_of_step(lane))?;
-                if wire.trace() {
-                    eprintln!("[{name}] serve worker lane {lane} next part");
-                }
-                arm.next_part(slot)
-                    .map_err(|error| format!("lane {lane}: prefill part: {error}"))?;
-            }
-            Tp4ControlFrame::LaneRelease { lane } => {
-                let slot = pool
-                    .get_mut(lane as usize)
-                    .and_then(Option::as_mut)
-                    .ok_or_else(|| out_of_step(lane))?;
-                if wire.trace() {
-                    eprintln!("[{name}] serve worker lane {lane} release");
-                }
-                arm.release(slot)
-                    .map_err(|error| format!("lane {lane}: release: {error}"))?;
-            }
-            Tp4ControlFrame::LaneStep { members } => {
-                let mut stepping = Vec::with_capacity(members.len());
-                for &(lane, token) in &members {
-                    let slot = pool
-                        .get_mut(lane as usize)
-                        .and_then(Option::take)
-                        .ok_or_else(|| out_of_step(lane))?;
-                    stepping.push((slot, token));
-                }
-                if wire.trace() {
-                    eprintln!("[{name}] serve worker step {members:?}");
-                }
-                let answer = arm.step(&mut stepping);
-                for ((slot, _), &(lane, _)) in stepping.into_iter().zip(&members) {
-                    pool[lane as usize] = Some(slot);
-                }
-                answer.map_err(|error| format!("step {members:?}: {error}"))?;
-            }
-            Tp4ControlFrame::LaneGiveBack { lane, count } => {
-                let slot = pool
-                    .get_mut(lane as usize)
-                    .and_then(Option::as_mut)
-                    .ok_or_else(|| out_of_step(lane))?;
-                if wire.trace() {
-                    eprintln!("[{name}] serve worker lane {lane} gives back {count}");
-                }
-                arm.give_back(slot, count as usize)
-                    .map_err(|error| format!("lane {lane}: give back {count}: {error}"))?;
-            }
-            Tp4ControlFrame::Error { code, message } => {
-                return Err(format!("rank 0 ended the group ({code}): {message}"));
-            }
-            other => {
-                return Err(format!(
-                    "the fused worker expected LaneRequest, LanePart, LaneRelease, LaneStep, \
-                     LaneGiveBack or Error, not {}",
-                    other.kind()
-                ));
-            }
-        }
-    }
-}
-
 /// Rank 0's side of a tick group: the frames a [crate::TickEngine]'s decisions produce, each
 /// broadcast before the runtime call it names.
 ///
 /// The engine keeps every decision (which lane, which rows, which step shape, when to give back
-/// or release) and calls this once per decision. The frames are the same lane frames a fused
-/// group uses, plus the two a tick decides: [Tp4ControlFrame::LaneRows] carries the rows
+/// or release) and calls this once per decision. [Tp4ControlFrame::LaneRows] carries the rows
 /// [crate::Runtime::run_part_rows] must run, and [Tp4ControlFrame::LaneStepMode] carries the
 /// shape [crate::Runtime::step_mode_slots] must run, with the members in rank 0's row order.
 /// [Tp4ControlFrame::LaneRequest] carries the start rank 0's `start_prompt_slot` chose, so its
-/// rows are a position from a start both ranks agree on.
+/// rows are a position from a start both ranks agree on. A prompt whose start runs a collective
+/// (an image encode) cannot wait for that start: its request goes first ([Self::begin]) and
+/// [Tp4ControlFrame::LaneStart] names the start after it ([Self::started]).
 ///
 /// A worker replays it with [mirror_tick_lanes]. A failure of rank 0's own half after a frame
 /// has gone out leaves the workers past rank 0, so [Self::out_of_step] tells them why and ends
@@ -488,6 +336,36 @@ impl TickGroup {
         start: usize,
         sampling: &Sampling,
     ) -> Result<(), BackendError> {
+        let start = u32::try_from(start).map_err(|_| {
+            BackendError::new("group", format!("a start of {start} does not fit a frame"))
+        })?;
+        self.request(lane, tokens, images, Some(start), sampling)
+    }
+
+    /// Broadcast: lane `lane` begins this prompt before rank 0's own start, with rank 0's
+    /// sampler. A prompt whose start runs a collective (an image encode every rank joins) has to
+    /// have its request frame in front of that start, because the workers join the collective
+    /// from the frame; [Self::started] names the start that follows.
+    ///
+    /// # Errors
+    /// A count the frame cannot carry, or a frame that could not be sent (the group is split).
+    pub fn begin(
+        &self,
+        lane: usize,
+        tokens: &[u32],
+        images: &[VisionImage],
+        sampling: &Sampling,
+    ) -> Result<(), BackendError> {
+        self.request(lane, tokens, images, None, sampling)
+    }
+
+    /// Broadcast: the start rank 0's own `start_prompt_slot` chose for the prompt
+    /// [Self::begin] opened. The worker refuses a start that differs, because every row frame
+    /// after it is a position from this start.
+    ///
+    /// # Errors
+    /// A start the frame cannot carry, or a frame that could not be sent (the group is split).
+    pub fn started(&self, lane: usize, start: usize) -> Result<(), BackendError> {
         let lane = u32::try_from(lane)
             .map_err(|_| BackendError::new("group", format!("lane {lane} does not fit a frame")))?;
         let start = u32::try_from(start).map_err(|_| {
@@ -495,10 +373,38 @@ impl TickGroup {
         })?;
         if self.wire.trace() {
             eprintln!(
-                "[{}] serve rank 0 lane {lane} prefill {} rows at {start}",
-                self.wire.name(),
-                tokens.len()
+                "[{}] serve rank 0 lane {lane} starts at {start}",
+                self.wire.name()
             );
+        }
+        self.in_step(self.send(&Tp4ControlFrame::LaneStart { lane, start }))
+    }
+
+    /// The request frame both [Self::place] and [Self::begin] send: the lane, the prompt, its
+    /// image spans and the sampler, with the start when rank 0 already knows it.
+    fn request(
+        &self,
+        lane: usize,
+        tokens: &[u32],
+        images: &[VisionImage],
+        start: Option<u32>,
+        sampling: &Sampling,
+    ) -> Result<(), BackendError> {
+        let lane = u32::try_from(lane)
+            .map_err(|_| BackendError::new("group", format!("lane {lane} does not fit a frame")))?;
+        if self.wire.trace() {
+            match start {
+                Some(start) => eprintln!(
+                    "[{}] serve rank 0 lane {lane} prefill {} rows at {start}",
+                    self.wire.name(),
+                    tokens.len()
+                ),
+                None => eprintln!(
+                    "[{}] serve rank 0 lane {lane} begins {} rows",
+                    self.wire.name(),
+                    tokens.len()
+                ),
+            }
         }
         self.in_step(self.send(&Tp4ControlFrame::LaneRequest {
             lane,
@@ -509,7 +415,7 @@ impl TickGroup {
             // frame that disagrees is refused rather than obeyed.
             keep: true,
             sampler: self.wire.sampler(sampling),
-            start: Some(start),
+            start,
         }))
     }
 
@@ -632,12 +538,23 @@ impl TickGroup {
     }
 }
 
+/// The refusal of a start that differs from the one this rank reached: every row frame after it
+/// is a position from rank 0's start, so the ranks cannot serve on.
+fn start_differs(lane: u32, start: usize, at: usize) -> String {
+    format!(
+        "lane {lane}: rank 0 starts the prompt at {start}, this rank starts it at {at}: the ranks \
+         are out of step"
+    )
+}
+
 /// Mirrors rank 0's tick frames onto this rank's own pool of runtime slots, until the control
 /// channel ends.
 ///
 /// The pool is opened up front, as rank 0's engine opens its own, so lane `n` is the same slot
 /// on every rank. A request frame starts the lane's prompt on this rank and refuses a start that
-/// differs from rank 0's; a rows frame runs exactly the rows it names through
+/// differs from rank 0's; when it carries no start (a prompt with images, whose start rank 0
+/// had to broadcast the frame before) the lane's own start waits for the [Tp4ControlFrame::LaneStart]
+/// that follows it; a rows frame runs exactly the rows it names through
 /// [crate::Runtime::run_part_rows]; a step frame takes its member lanes in the frame's order and
 /// runs [crate::Runtime::step_mode_slots] with the frame's shape, then drains the answers the
 /// arm already holds exactly as rank 0's engine does (those rows run no device work, so they
@@ -668,6 +585,8 @@ pub fn mirror_tick_lanes_seen<W: Walk>(
     seen: &mut dyn FnMut(&Tp4ControlFrame),
 ) -> Result<(), String> {
     let mut pool: Vec<Option<RuntimeSlot<W>>> = Vec::with_capacity(lanes);
+    // The starts a request frame that carried none reached, waiting for rank 0's start frame.
+    let mut begun: Vec<Option<usize>> = vec![None; lanes];
     for _ in 0..lanes {
         pool.push(Some(
             runtime
@@ -720,14 +639,33 @@ pub fn mirror_tick_lanes_seen<W: Walk>(
                 let at = runtime
                     .start_prompt_slot(slot, &prompt_ids, &images)
                     .map_err(|error| format!("lane {lane}: start: {error}"))?;
+                begun[lane as usize] = None;
                 if let Some(start) = start {
                     let start = start as usize;
                     if at != start {
-                        return Err(format!(
-                            "lane {lane}: rank 0 starts the prompt at {start}, this rank starts it \
-                             at {at}: the ranks are out of step"
-                        ));
+                        return Err(start_differs(lane, start, at));
                     }
+                } else {
+                    // Rank 0's start runs a collective on this prompt (an image encode), so its
+                    // frame had to come first: the start is checked against the next frame.
+                    begun[lane as usize] = Some(at);
+                }
+            }
+            Tp4ControlFrame::LaneStart { lane, start } => {
+                if wire.trace() {
+                    eprintln!("[{name}] serve worker lane {lane} starts at {start}");
+                }
+                let reached = begun
+                    .get_mut(lane as usize)
+                    .and_then(Option::take)
+                    .ok_or_else(|| {
+                        format!(
+                            "lane {lane} starts at {start} with no request frame before it: the \
+                             ranks are out of step"
+                        )
+                    })?;
+                if reached != start as usize {
+                    return Err(start_differs(lane, start as usize, reached));
                 }
             }
             Tp4ControlFrame::LaneRows { lane, rows } => {
@@ -822,8 +760,8 @@ pub fn mirror_tick_lanes_seen<W: Walk>(
             }
             other => {
                 return Err(format!(
-                    "the tick worker expected LaneRequest, LaneRows, LaneStepMode, LaneGiveBack, \
-                     LaneRelease or Error, not {}",
+                    "the tick worker expected LaneRequest, LaneStart, LaneRows, LaneStepMode, \
+                     LaneGiveBack, LaneRelease or Error, not {}",
                     other.kind()
                 ));
             }
@@ -853,547 +791,9 @@ pub fn mirror_ticks_until_the_group_ends<W: Walk>(
     exit_now(1)
 }
 
-/// The engine a fused backend's sessions are handles on: its own lanes, or rank 0 of a group's,
-/// every lane's prompt and step broadcast before it runs ([GroupLanes]). Every arm that fuses keeps
-/// one of these, so starting either form and opening a session on it is written once.
-pub enum Fusion<A: FusedArm> {
-    /// This process alone.
-    Local(Arc<FusedEngine<A>>),
-    /// Rank 0 of a group.
-    Group(Arc<FusedEngine<GroupLanes<A, TextWire>>>),
-}
-
-impl<A: FusedArm> Fusion<A> {
-    /// `capacity` lanes of `arm` on this process.
-    ///
-    /// # Errors
-    /// As [FusedEngine::start].
-    pub fn local(arm: A, capacity: usize) -> Result<Self, BackendError> {
-        Ok(Self::Local(FusedEngine::start(Arc::new(arm), capacity)?))
-    }
-
-    /// Rank 0 of a group: `arm`'s `capacity` lanes, every frame broadcast through `hub` first
-    /// (watched, [watched_hub]) and refused first as `wire` refuses it; each worker replays them
-    /// ([mirror_until_the_group_ends]) over lanes of its own.
-    ///
-    /// # Errors
-    /// A watch that cannot start, then as [FusedEngine::start].
-    pub fn group(
-        arm: A,
-        hub: Tp4ControlHub,
-        wire: TextWire,
-        capacity: usize,
-    ) -> Result<Self, BackendError> {
-        let arm = GroupLanes::new(arm, watched_hub(hub)?, wire);
-        Ok(Self::Group(FusedEngine::start(Arc::new(arm), capacity)?))
-    }
-
-    /// A session on the engine: one pooled lane for one request.
-    ///
-    /// # Errors
-    /// As [FusedEngine::open].
-    pub fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        Ok(match self {
-            Self::Local(engine) => Box::new(engine.open()?),
-            Self::Group(engine) => Box::new(engine.open()?),
-        })
-    }
-}
-
-/// Rank 0's fused lanes: a lane arm whose every prompt, step, give-back and release is broadcast
-/// before it runs.
-///
-/// The engine thread is the only caller, so the frames leave in the order the steps run, and a
-/// worker that mirrors them in that order runs the same walks with the same rows. Each slot
-/// carries the lane number the workers know it by.
-pub struct GroupLanes<A: FusedArm, W: GroupWire> {
-    arm: A,
-    hub: Arc<Mutex<Tp4ControlHub>>,
-    wire: W,
-    /// The next lane number [FusedArm::open_slot] hands out.
-    next: AtomicU32,
-    /// What a failure after a broadcast does ([end_group] unless [Self::with_split]).
-    split: Split,
-}
-
-/// One lane of [GroupLanes]: the inner arm's slot and the number the workers know it by. The
-/// slot is lent to the inner arm for a step and back between steps.
-pub struct GroupLane<S> {
-    lane: u32,
-    slot: Option<S>,
-    /// Whether the engine renewed the slot since its last prompt: the workers renew theirs only
-    /// then, so a kept lane continues on every rank alike.
-    renewed: bool,
-    /// The request's sampler for the workers ([GroupWire::sampler]).
-    sampler: Option<Tp4FrameSampler>,
-}
-
-impl<A: FusedArm, W: GroupWire> GroupLanes<A, W> {
-    /// Wraps `arm` to broadcast through `hub`, refusing first what `wire` refuses.
-    pub fn new(arm: A, hub: Arc<Mutex<Tp4ControlHub>>, wire: W) -> Self {
-        Self {
-            arm,
-            hub,
-            wire,
-            next: AtomicU32::new(0),
-            split: end_group,
-        }
-    }
-
-    /// Splits the group with `split` instead of ending the process, for a test.
-    #[must_use]
-    pub fn with_split(mut self, split: Split) -> Self {
-        self.split = split;
-        self
-    }
-
-    /// The wrapped arm.
-    pub fn arm(&self) -> &A {
-        &self.arm
-    }
-
-    fn send(&self, frame: &Tp4ControlFrame) -> Result<(), BackendError> {
-        broadcast(&self.hub, frame)
-    }
-
-    /// `result` of a frame that may have reached the workers: a failure leaves them past rank 0,
-    /// so the group ends ([Split]) once it has been told why.
-    fn in_step<T>(&self, result: Result<T, BackendError>) -> Result<T, BackendError> {
-        match result {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                let message = error.to_string();
-                let _ = self.send(&Tp4ControlFrame::Error {
-                    code: "group_out_of_step".to_owned(),
-                    message: message.clone(),
-                });
-                (self.split)(&message)
-            }
-        }
-    }
-
-    fn slot(lane: &mut GroupLane<A::Slot>) -> Result<&mut A::Slot, BackendError> {
-        lane.slot
-            .as_mut()
-            .ok_or_else(|| BackendError::new("group", "a lane's slot is already stepping"))
-    }
-}
-
-impl<A: FusedArm, W: GroupWire> crate::fused::sealed::Sealed for GroupLanes<A, W> {}
-
-impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
-    type Slot = GroupLane<A::Slot>;
-
-    fn open_slot(&self) -> Result<Self::Slot, BackendError> {
-        let lane = self.next.fetch_add(1, Ordering::Relaxed);
-        Ok(GroupLane {
-            lane,
-            slot: Some(self.arm.open_slot()?),
-            renewed: false,
-            sampler: None,
-        })
-    }
-
-    fn holds_request(&self, slot: &Self::Slot) -> bool {
-        slot.slot
-            .as_ref()
-            .is_some_and(|inner| self.arm.holds_request(inner))
-    }
-
-    /// Local: a worker renews its own lane when the next `LaneRequest` says this one was.
-    fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
-        self.arm.renew(Self::slot(slot)?)?;
-        slot.renewed = true;
-        Ok(())
-    }
-
-    fn set_sampling(&self, slot: &mut Self::Slot, sampling: Sampling) {
-        slot.sampler = self.wire.sampler(&sampling);
-        if let Some(inner) = slot.slot.as_mut() {
-            self.arm.set_sampling(inner, sampling);
-        }
-    }
-
-    fn prefill(&self, slot: &mut Self::Slot, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        self.prefill_images(slot, tokens, &[])
-    }
-
-    /// Every part through the frames, as the engine would run them back to back: a worker's
-    /// `LaneRequest` runs only the first part.
-    fn prefill_images(
-        &self,
-        slot: &mut Self::Slot,
-        tokens: &[u32],
-        images: &[VisionImage],
-    ) -> Result<StepOutput, BackendError> {
-        let mut part = self.begin_prompt(slot, tokens, images)?;
-        loop {
-            match part {
-                Part::Done(step) => return Ok(step),
-                Part::More => part = self.next_part(slot)?,
-            }
-        }
-    }
-
-    /// Broadcast: every rank begins the same lane's prompt and runs its first part.
-    fn begin_prompt(
-        &self,
-        slot: &mut Self::Slot,
-        tokens: &[u32],
-        images: &[VisionImage],
-    ) -> Result<Part, BackendError> {
-        // Refuse before the broadcast, as the serial session does.
-        self.wire.admit(tokens, images)?;
-        if !self.arm.room(Self::slot(slot)?, Some(tokens)) {
-            return Err(no_room(tokens.len()));
-        }
-        if self.wire.trace() {
-            eprintln!(
-                "[{}] serve rank 0 lane {} prefill {tokens:?}",
-                self.wire.name(),
-                slot.lane
-            );
-        }
-        let lane = slot.lane;
-        let keep = !std::mem::take(&mut slot.renewed);
-        let sampler = slot.sampler;
-        let inner = Self::slot(slot)?;
-        self.in_step(
-            self.send(&Tp4ControlFrame::LaneRequest {
-                lane,
-                prompt_ids: tokens.to_vec(),
-                images: image_frames(images),
-                keep,
-                sampler,
-                // The fused arm's prompt path decides its own start on the worker; only a tick
-                // group's request frame carries one for the worker to check.
-                start: None,
-            })
-            .and_then(|()| self.arm.begin_prompt(inner, tokens, images)),
-        )
-    }
-
-    /// Broadcast: every rank runs the same lane's next part, between the same steps.
-    fn next_part(&self, slot: &mut Self::Slot) -> Result<Part, BackendError> {
-        if self.wire.trace() {
-            eprintln!(
-                "[{}] serve rank 0 lane {} next part",
-                self.wire.name(),
-                slot.lane
-            );
-        }
-        let lane = slot.lane;
-        let inner = Self::slot(slot)?;
-        self.in_step(
-            self.send(&Tp4ControlFrame::LanePart { lane })
-                .and_then(|()| self.arm.next_part(inner)),
-        )
-    }
-
-    fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
-        let lanes: Vec<(u32, u32)> = members
-            .iter()
-            .map(|(lane, token)| (lane.lane, *token))
-            .collect();
-        let mut stepping = Vec::with_capacity(members.len());
-        for (lane, token) in members.iter_mut() {
-            let inner = lane
-                .slot
-                .take()
-                .ok_or_else(|| BackendError::new("group", "a lane's slot is already stepping"));
-            match inner {
-                Ok(inner) => stepping.push((inner, *token)),
-                Err(error) => {
-                    // Give back what was taken: the engine keeps the slots across a failed step.
-                    for ((lane, _), (inner, _)) in members.iter_mut().zip(stepping) {
-                        lane.slot = Some(inner);
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        // Every rank grows the same lanes the same way, so a step without room fails here, before
-        // the broadcast, and not on the workers. A member whose answer is already held grows
-        // nothing.
-        if stepping
-            .iter()
-            .any(|(inner, token)| !self.arm.ready(inner, *token) && !self.arm.room(inner, None))
-        {
-            for ((lane, _), (inner, _)) in members.iter_mut().zip(stepping) {
-                lane.slot = Some(inner);
-            }
-            return Err(no_room(1));
-        }
-        if self.wire.trace() {
-            eprintln!("[{}] serve rank 0 step {lanes:?}", self.wire.name());
-        }
-        let answer = self
-            .send(&Tp4ControlFrame::LaneStep { members: lanes })
-            .and_then(|()| self.arm.step(&mut stepping));
-        for ((lane, _), (inner, _)) in members.iter_mut().zip(stepping) {
-            lane.slot = Some(inner);
-        }
-        self.in_step(answer)
-    }
-
-    /// Local: rank 0's lane holds what every rank's does.
-    fn ready(&self, slot: &Self::Slot, token: u32) -> bool {
-        slot.slot
-            .as_ref()
-            .is_some_and(|inner| self.arm.ready(inner, token))
-    }
-
-    /// Broadcast: every rank rolls the same lane back by the same count.
-    ///
-    /// Unlike a prompt or a step, rank 0 runs it before it is sent. A give-back is the lane's own
-    /// bookkeeping, with no collective for the workers to meet, so the order is free. An arm that
-    /// refuses it (GLM's holds no answers to give back) refuses on every rank alike, and the
-    /// engine renews the slot instead. Sending first would end every worker on that refusal,
-    /// while rank 0 renewed and stepped on into a collective no worker would join.
-    fn give_back(&self, slot: &mut Self::Slot, count: usize) -> Result<(), BackendError> {
-        if count == 0 {
-            return Ok(());
-        }
-        let frame_count = u32::try_from(count)
-            .map_err(|_| BackendError::new("group", format!("{count} answers to give back")))?;
-        self.arm.give_back(Self::slot(slot)?, count)?;
-        if self.wire.trace() {
-            eprintln!(
-                "[{}] serve rank 0 lane {} gives back {count}",
-                self.wire.name(),
-                slot.lane
-            );
-        }
-        // Rank 0's lane has given back: a worker that never hears of it is past rank 0.
-        self.in_step(self.send(&Tp4ControlFrame::LaneGiveBack {
-            lane: slot.lane,
-            count: frame_count,
-        }))
-    }
-
-    fn speculation(&self, slot: &Self::Slot) -> Speculation {
-        slot.slot
-            .as_ref()
-            .map(|inner| self.arm.speculation(inner))
-            .unwrap_or_default()
-    }
-
-    fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
-        self.arm.history(slot.slot.as_ref()?)
-    }
-
-    /// Rank 0's answer: a slot it renews is renewed on every worker by the next `LaneRequest`.
-    fn continues(&self, slot: &Self::Slot, prompt: &[u32]) -> bool {
-        slot.slot
-            .as_ref()
-            .is_some_and(|inner| self.arm.continues(inner, prompt))
-    }
-
-    fn room(&self, slot: &Self::Slot, prompt: Option<&[u32]>) -> bool {
-        slot.slot
-            .as_ref()
-            .is_some_and(|inner| self.arm.room(inner, prompt))
-    }
-
-    /// Broadcast: every rank gives up the same lane's memory, so their pools stay alike.
-    fn release(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
-        if self.wire.trace() {
-            eprintln!(
-                "[{}] serve rank 0 lane {} release",
-                self.wire.name(),
-                slot.lane
-            );
-        }
-        let lane = slot.lane;
-        let inner = Self::slot(slot)?;
-        self.in_step(
-            self.send(&Tp4ControlFrame::LaneRelease { lane })
-                .and_then(|()| self.arm.release(inner)),
-        )?;
-        slot.renewed = true;
-        Ok(())
-    }
-
-    fn rewind_prefix<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
-        self.arm.rewind_prefix(slot.slot.as_ref()?)
-    }
-
-    fn held_images<'s>(&self, slot: &'s Self::Slot) -> &'s [ImageSpan] {
-        slot.slot
-            .as_ref()
-            .map_or(&[], |inner| self.arm.held_images(inner))
-    }
-
-    fn cached_tokens(&self, slot: &Self::Slot) -> usize {
-        slot.slot
-            .as_ref()
-            .map_or(0, |inner| self.arm.cached_tokens(inner))
-    }
-
-    fn ledger(&self) -> Ledger {
-        self.arm.ledger().with(
-            Strategy::Group,
-            Mode::native(format!(
-                "{}: rank 0 decides and broadcasts, the workers replay",
-                self.wire.name()
-            )),
-        )
-    }
-
-    fn max_batch(&self) -> usize {
-        self.arm.max_batch()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    /// A toy arm's complete ledger: every strategy stated, none claimed.
-    fn stated(arm: &'static str) -> Ledger {
-        let mut ledger = Ledger::new(arm);
-        for strategy in Strategy::ALL {
-            ledger.set(strategy, Mode::off("the toy arm does not state it"));
-        }
-        ledger
-    }
-
-    /// Waits for the mirror to reach a state; the control channel is one-way for rank 0, so a
-    /// test observes the worker rather than reading an acknowledgement.
-    fn wait_for(mut ready: impl FnMut() -> bool, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if ready() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        panic!("the mirror did not {what} within five seconds");
-    }
-
-    /// A wire that refuses prompts over `context` tokens and carries no sampler.
-    struct Wire {
-        context: usize,
-    }
-
-    impl GroupWire for Wire {
-        fn name(&self) -> &'static str {
-            "toy"
-        }
-
-        fn admit(&self, tokens: &[u32], _images: &[VisionImage]) -> Result<(), BackendError> {
-            if tokens.len() > self.context {
-                return Err(BackendError::new("context", "too long"));
-            }
-            Ok(())
-        }
-
-        fn sampler(&self, _sampling: &Sampling) -> Option<Tp4FrameSampler> {
-            None
-        }
-
-        fn sampling(&self, _sampler: Option<Tp4FrameSampler>) -> Sampling {
-            Sampling::default()
-        }
-
-        fn images(&self, frames: Vec<Tp4DeviceImage>) -> Result<Vec<VisionImage>, String> {
-            if frames.is_empty() {
-                Ok(Vec::new())
-            } else {
-                Err("no images here".to_owned())
-            }
-        }
-    }
-
-    /// A toy lane arm: a slot is the tokens its lane has consumed, and the record is every
-    /// prompt, step and give-back in the order the arm ran them. `refuses` makes it refuse every
-    /// give-back, as GLM's arm does; `fails` fails every step, as a driver error on one rank does.
-    #[derive(Default)]
-    struct ToyLanes {
-        record: Mutex<Vec<String>>,
-        refuses: bool,
-        fails: bool,
-    }
-
-    impl crate::fused::sealed::Sealed for ToyLanes {}
-
-    impl FusedArm for ToyLanes {
-        fn ledger(&self) -> Ledger {
-            stated("toy lanes")
-        }
-
-        type Slot = Vec<u32>;
-
-        fn open_slot(&self) -> Result<Self::Slot, BackendError> {
-            Ok(Vec::new())
-        }
-
-        fn holds_request(&self, slot: &Self::Slot) -> bool {
-            !slot.is_empty()
-        }
-
-        fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
-            slot.clear();
-            Ok(())
-        }
-
-        fn set_sampling(&self, _slot: &mut Self::Slot, _sampling: Sampling) {}
-
-        fn prefill(
-            &self,
-            slot: &mut Self::Slot,
-            tokens: &[u32],
-        ) -> Result<StepOutput, BackendError> {
-            slot.extend_from_slice(tokens);
-            self.record
-                .lock()
-                .expect("the record")
-                .push(format!("prefill {tokens:?}"));
-            Ok(StepOutput {
-                logits: vec![0.0; 2],
-                next_token: Some(1),
-                draft: Vec::new(),
-            })
-        }
-
-        fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
-            if self.fails {
-                return Err(BackendError::new("toy", "the device failed"));
-            }
-            let mut rows = Vec::new();
-            for (slot, token) in members.iter_mut() {
-                slot.push(*token);
-                rows.push(slot.clone());
-            }
-            self.record
-                .lock()
-                .expect("the record")
-                .push(format!("step {rows:?}"));
-            Ok(members.iter().map(|_| StepOutput::default()).collect())
-        }
-
-        fn give_back(&self, slot: &mut Self::Slot, count: usize) -> Result<(), BackendError> {
-            if self.refuses {
-                return Err(BackendError::new(
-                    "toy",
-                    "this arm holds no answers to give back",
-                ));
-            }
-            slot.truncate(slot.len().saturating_sub(count));
-            self.record
-                .lock()
-                .expect("the record")
-                .push(format!("give back {count}"));
-            Ok(())
-        }
-
-        fn speculation(&self, _slot: &Self::Slot) -> Speculation {
-            Speculation::default()
-        }
-    }
 
     #[test]
     fn a_whole_sampler_crosses_the_frame_and_greedy_sends_none() {
@@ -1422,185 +822,5 @@ mod tests {
             ..Sampling::default()
         };
         assert_eq!(frame_sampling(sampler_frame(&penalized)), penalized);
-    }
-
-    #[test]
-    fn the_lane_mirror_runs_rank_zeros_prompts_steps_and_give_backs_in_order() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let address = listener.local_addr().expect("the bound address");
-        let mirrored = Arc::new(ToyLanes::default());
-        let worker = {
-            let mirrored = Arc::clone(&mirrored);
-            thread::spawn(move || {
-                let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
-                    .expect("a control connection");
-                control.handshake().expect("the handshake");
-                mirror_lanes(&mut control, mirrored.as_ref(), &Wire { context: 64 }, 2)
-            })
-        };
-        let hub = Arc::new(Mutex::new(
-            Tp4ControlHub::start_with_listener(listener, 2, Duration::from_secs(5))
-                .expect("the hub"),
-        ));
-        let lanes = GroupLanes::new(ToyLanes::default(), Arc::clone(&hub), Wire { context: 64 });
-        let mut first = lanes.open_slot().expect("lane 0");
-        let mut second = lanes.open_slot().expect("lane 1");
-        lanes.prefill(&mut first, &[1, 2]).expect("lane 0's prompt");
-        lanes.prefill(&mut second, &[7]).expect("lane 1's prompt");
-        // A prompt the wire refuses is never broadcast.
-        lanes
-            .prefill(&mut second, &[0; 65])
-            .expect_err("an over-long prompt is refused");
-        // Rank 1 steps the members in rank 0's order, second lane first.
-        let mut members = vec![(second, 8u32), (first, 3u32)];
-        lanes.step(&mut members).expect("the fused step");
-        let (mut first, _) = members.pop().expect("lane 0");
-        lanes.give_back(&mut first, 1).expect("the give-back");
-        // A lane that held a request forgets it on its next prompt, on rank 1 as on rank 0.
-        assert!(lanes.holds_request(&first));
-        lanes.renew(&mut first).expect("the lane renews");
-        lanes
-            .prefill(&mut first, &[5])
-            .expect("lane 0's next prompt");
-        let expected = vec![
-            "prefill [1, 2]".to_owned(),
-            "prefill [7]".to_owned(),
-            "step [[7, 8], [1, 2, 3]]".to_owned(),
-            "give back 1".to_owned(),
-            "prefill [5]".to_owned(),
-        ];
-        wait_for(
-            || *mirrored.record.lock().expect("the record") == expected,
-            "mirror both prompts, the step, the give-back and the renewed prompt",
-        );
-        assert_eq!(
-            *lanes.arm().record.lock().expect("rank 0's record"),
-            expected
-        );
-        // An unknown lane is the ranks out of step, and ends the worker.
-        hub.lock()
-            .expect("the hub")
-            .broadcast(&Tp4ControlFrame::LaneStep {
-                members: vec![(5, 1)],
-            })
-            .expect("the frame is written");
-        let error = worker
-            .join()
-            .expect("the worker finishes")
-            .expect_err("a lane outside the pool is refused");
-        assert!(error.contains("out of step"), "{error}");
-    }
-
-    #[test]
-    fn a_give_back_the_arm_refuses_never_reaches_the_workers() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let address = listener.local_addr().expect("the bound address");
-        let refusing = || ToyLanes {
-            refuses: true,
-            ..ToyLanes::default()
-        };
-        let mirrored = Arc::new(refusing());
-        let worker = {
-            let mirrored = Arc::clone(&mirrored);
-            thread::spawn(move || {
-                let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
-                    .expect("a control connection");
-                control.handshake().expect("the handshake");
-                mirror_lanes(&mut control, mirrored.as_ref(), &Wire { context: 64 }, 1)
-            })
-        };
-        let hub = Arc::new(Mutex::new(
-            Tp4ControlHub::start_with_listener(listener, 2, Duration::from_secs(5))
-                .expect("the hub"),
-        ));
-        let lanes = GroupLanes::new(refusing(), Arc::clone(&hub), Wire { context: 64 });
-        let mut lane = lanes.open_slot().expect("lane 0");
-        lanes.prefill(&mut lane, &[1, 2]).expect("the prompt");
-        let mut members = vec![(lane, 3u32)];
-        lanes.step(&mut members).expect("the step");
-        let (mut lane, _) = members.pop().expect("lane 0");
-        // The engine renews a slot whose give-back is refused, and steps on.
-        lanes
-            .give_back(&mut lane, 2)
-            .expect_err("the arm refuses the give-back");
-        lanes.renew(&mut lane).expect("the lane renews");
-        lanes.prefill(&mut lane, &[5]).expect("the renewed prompt");
-        let mut members = vec![(lane, 6u32)];
-        lanes
-            .step(&mut members)
-            .expect("the step after the renewal");
-        let expected = vec![
-            "prefill [1, 2]".to_owned(),
-            "step [[1, 2, 3]]".to_owned(),
-            "prefill [5]".to_owned(),
-            "step [[5, 6]]".to_owned(),
-        ];
-        wait_for(
-            || *mirrored.record.lock().expect("the record") == expected,
-            "mirror the renewed lane's prompt and step, with no give-back",
-        );
-        assert!(
-            !worker.is_finished(),
-            "the refused give-back ended the worker"
-        );
-        hub.lock()
-            .expect("the hub")
-            .broadcast(&Tp4ControlFrame::LaneRelease { lane: 9 })
-            .expect("the frame is written");
-        let error = worker
-            .join()
-            .expect("the worker finishes")
-            .expect_err("a lane outside the pool is refused");
-        assert!(error.contains("out of step"), "{error}");
-    }
-
-    fn splits(why: &str) -> ! {
-        panic!("the group split: {why}")
-    }
-
-    #[test]
-    fn a_step_that_fails_on_rank_zero_alone_tells_the_workers_and_ends_the_group() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let address = listener.local_addr().expect("the bound address");
-        let mirrored = Arc::new(ToyLanes::default());
-        let worker = {
-            let mirrored = Arc::clone(&mirrored);
-            thread::spawn(move || {
-                let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
-                    .expect("a control connection");
-                control.handshake().expect("the handshake");
-                mirror_lanes(&mut control, mirrored.as_ref(), &Wire { context: 64 }, 1)
-            })
-        };
-        let hub = Arc::new(Mutex::new(
-            Tp4ControlHub::start_with_listener(listener, 2, Duration::from_secs(5))
-                .expect("the hub"),
-        ));
-        let failing = ToyLanes {
-            fails: true,
-            ..ToyLanes::default()
-        };
-        let lanes =
-            GroupLanes::new(failing, Arc::clone(&hub), Wire { context: 64 }).with_split(splits);
-        let mut lane = lanes.open_slot().expect("lane 0");
-        lanes.prefill(&mut lane, &[1, 2]).expect("the prompt");
-        let mut members = vec![(lane, 3u32)];
-        // The worker has stepped past rank 0, so rank 0 does not hand the error back to serve on.
-        let split = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = lanes.step(&mut members);
-        }))
-        .expect_err("the failed step splits the group");
-        let why = split.downcast_ref::<String>().expect("the split's message");
-        assert!(why.contains("the device failed"), "{why}");
-        let error = worker
-            .join()
-            .expect("the worker finishes")
-            .expect_err("rank 0's error ends the worker");
-        assert!(error.contains("group_out_of_step"), "{error}");
-        assert!(error.contains("the device failed"), "{error}");
-        assert_eq!(
-            *mirrored.record.lock().expect("the record"),
-            vec!["prefill [1, 2]".to_owned(), "step [[1, 2, 3]]".to_owned()]
-        );
     }
 }

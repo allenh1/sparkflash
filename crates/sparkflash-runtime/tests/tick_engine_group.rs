@@ -26,13 +26,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sparkflash_comm::control::{Tp4ControlFrame, Tp4ControlHub, Tp4ControlWorker};
+use sparkflash_comm::control::{
+    Tp4ControlFrame, Tp4ControlHub, Tp4ControlWorker, Tp4DeviceImage, Tp4FrameSampler,
+};
 use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
 use sparkflash_model::verdict;
+use sparkflash_model::vision::{ImageGrid, ImageSpan, VisionImage};
 use sparkflash_runtime::{
-    Draft, Drafter, HeadInput, HeadRow, Hidden, LaneState, Limits, NoVision, OutputConstraint,
+    Draft, Drafter, GroupWire, HeadInput, HeadRow, Hidden, LaneState, Limits, OutputConstraint,
     Pass, PassKind, Region, Runtime, Segment, StateLayout, StepWall, TickEngine, TickEvent,
-    TickGroup, Walk, WalkCapabilities, check_rewind, mirror_tick_lanes, mirror_tick_lanes_seen,
+    TickGroup, Vision, Walk, WalkCapabilities, check_rewind, mirror_tick_lanes,
+    mirror_tick_lanes_seen,
 };
 
 /// The model's own pick after `token`: the plain path's next token.
@@ -97,10 +101,17 @@ struct GroupWalk {
     drafter: GroupDrafter,
     /// Every pass the walk was handed, in order.
     shapes: Arc<Mutex<Vec<Shape>>>,
+    /// The images it encoded, a prompt.
+    encodes: Arc<Mutex<Vec<usize>>>,
 }
 
 impl GroupWalk {
     fn new(shapes: Arc<Mutex<Vec<Shape>>>) -> Self {
+        Self::sharing(shapes, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// A walk whose images-encoded record the caller keeps, for a worker's side of the gate.
+    fn sharing(shapes: Arc<Mutex<Vec<Shape>>>, encodes: Arc<Mutex<Vec<usize>>>) -> Self {
         Self {
             layout: StateLayout::new(vec![Region::Positional {
                 name: "toy",
@@ -109,12 +120,42 @@ impl GroupWalk {
             limits: Limits::new(2, 1_024).with_members(4),
             drafter: GroupDrafter,
             shapes,
+            encodes,
         }
     }
 
     fn shapes(&self) -> Vec<Shape> {
         self.shapes.lock().expect("the pass record").clone()
     }
+
+    fn encodes(&self) -> Vec<usize> {
+        self.encodes.lock().expect("the encode record").clone()
+    }
+}
+
+/// The walk's image path: rank 0 encodes, a worker receives the rows through its group's sum.
+/// On the CPU gate it records that the encode ran, a prompt.
+struct GroupVision;
+
+impl Vision<GroupWalk> for GroupVision {
+    const PRESENT: bool = true;
+
+    fn encode(
+        walk: &GroupWalk,
+        _seq: &mut Seq,
+        _tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<(), BackendError> {
+        if !images.is_empty() {
+            walk.encodes
+                .lock()
+                .expect("the encode record")
+                .push(images.len());
+        }
+        Ok(())
+    }
+
+    fn clear(_walk: &GroupWalk, _seq: &mut Seq) {}
 }
 
 struct GroupDrafter;
@@ -123,7 +164,7 @@ impl Walk for GroupWalk {
     type Seq = Seq;
     type Hidden = Hidden;
     type Drafter = GroupDrafter;
-    type Vision = NoVision;
+    type Vision = GroupVision;
 
     const CAPABILITIES: WalkCapabilities =
         WalkCapabilities::all(sparkflash_runtime::StateKind::Positional);
@@ -289,6 +330,75 @@ fn splits(why: &str) -> ! {
     panic!("the group split: {why}")
 }
 
+/// The group walk's wire with its image spans: a prompt's spans cross, its canvas does not
+/// (rank 0 encodes, and a worker's rows arrive through the group's sum).
+struct ImageWire;
+
+impl GroupWire for ImageWire {
+    fn name(&self) -> &'static str {
+        "toy"
+    }
+
+    fn admit(&self, tokens: &[u32], _images: &[VisionImage]) -> Result<(), BackendError> {
+        if tokens.len() > 1_024 {
+            return Err(BackendError::new("context", "too long"));
+        }
+        Ok(())
+    }
+
+    fn sampler(&self, _sampling: &Sampling) -> Option<Tp4FrameSampler> {
+        None
+    }
+
+    fn sampling(&self, _sampler: Option<Tp4FrameSampler>) -> Sampling {
+        Sampling::default()
+    }
+
+    fn images(&self, frames: Vec<Tp4DeviceImage>) -> Result<Vec<VisionImage>, String> {
+        frames
+            .into_iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let key = frame
+                    .key_bytes()
+                    .map_err(|error| format!("image {}: {error}", index + 1))?;
+                Ok(VisionImage {
+                    span: ImageSpan {
+                        start: frame.start as usize,
+                        grid: ImageGrid {
+                            n_llm_h: frame.n_llm_h as usize,
+                            n_llm_w: frame.n_llm_w as usize,
+                            best_height: frame.best_height as usize,
+                            best_width: frame.best_width as usize,
+                            line_stride: frame.n_llm_w as usize,
+                        },
+                        key,
+                    },
+                    pixels: Arc::from(Vec::<u8>::new()),
+                })
+            })
+            .collect()
+    }
+}
+
+/// A prompt's image span at `start`: three positions, one token row.
+fn image_at(start: usize) -> VisionImage {
+    VisionImage {
+        span: ImageSpan {
+            start,
+            grid: ImageGrid {
+                n_llm_h: 1,
+                n_llm_w: 1,
+                best_height: 1,
+                best_width: 1,
+                line_stride: 1,
+            },
+            key: [3; 32],
+        },
+        pixels: Arc::from(Vec::<u8>::new()),
+    }
+}
+
 /// Waits for the worker to record a frame count; the control channel is one-way for rank 0, so a
 /// test observes the worker rather than reading an acknowledgement.
 fn wait_for(mut ready: impl FnMut() -> bool, what: &str) {
@@ -314,6 +424,7 @@ fn describe(frame: &Tp4ControlFrame) -> String {
             "request {lane} {prompt_ids:?} start={}",
             start.map_or_else(|| "none".to_owned(), |start| start.to_string())
         ),
+        Tp4ControlFrame::LaneStart { lane, start } => format!("start {lane} {start}"),
         Tp4ControlFrame::LaneRows { lane, rows } => format!("rows {lane} {rows}"),
         Tp4ControlFrame::LaneStepMode { members, mode } => format!("step {members:?} {mode:?}"),
         Tp4ControlFrame::LaneGiveBack { lane, count } => format!("give back {lane} {count}"),
@@ -454,6 +565,95 @@ fn a_worker_runs_rank_zeros_rows_and_step_shape_in_the_order_it_broadcasts_them(
 }
 
 #[test]
+fn an_image_prompt_begins_before_rank_zeros_start_and_names_it_after() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let address = listener.local_addr().expect("the bound address");
+    let worker_shapes = Arc::new(Mutex::new(Vec::new()));
+    let worker_encodes = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let worker = {
+        let shapes = Arc::clone(&worker_shapes);
+        let encodes = Arc::clone(&worker_encodes);
+        let seen = Arc::clone(&seen);
+        thread::spawn(move || {
+            let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
+                .expect("a control connection");
+            control.handshake().expect("the handshake");
+            let runtime =
+                Runtime::new(GroupWalk::sharing(shapes, encodes), 0).expect("the worker's runtime");
+            let mut record = |frame: &Tp4ControlFrame| {
+                seen.lock().expect("the frames").push(describe(frame));
+            };
+            mirror_tick_lanes_seen(&mut control, &runtime, &ImageWire, 1, &mut record)
+        })
+    };
+    let hub = Arc::new(Mutex::new(
+        Tp4ControlHub::start_with_listener(listener, 2, Duration::from_secs(5)).expect("the hub"),
+    ));
+    let shapes = Arc::new(Mutex::new(Vec::new()));
+    let mut engine = TickEngine::new(GroupWalk::new(Arc::clone(&shapes)), 1)
+        .expect("the engine starts")
+        .with_group(TickGroup::new(Arc::clone(&hub), Box::new(ImageWire)).with_split(splits));
+    // One image at position 1, three positions long: the prompt resumes at zero and runs all
+    // four rows, in the walk's two-row chunks.
+    let image = image_at(1);
+    let id = engine
+        .admit(
+            &[10, 11, 12, 13],
+            std::slice::from_ref(&image),
+            Sampling::default(),
+        )
+        .expect("the image prompt");
+    let mut anchor = None;
+    while anchor.is_none() {
+        for event in engine.tick().expect("the tick") {
+            if let TickEvent::Prompt { id: at, step } = event
+                && at == id
+            {
+                anchor = step.next_token;
+            }
+        }
+    }
+    let expected = vec![
+        "request 0 [10, 11, 12, 13] start=none".to_owned(),
+        "start 0 0".to_owned(),
+        "rows 0 2".to_owned(),
+        "rows 0 2".to_owned(),
+    ];
+    wait_for(
+        || seen.lock().expect("the frames").len() >= expected.len(),
+        "record every frame",
+    );
+    assert_eq!(
+        *seen.lock().expect("the frames"),
+        expected,
+        "the request frame is ordered before rank 0's start, and the start frame after it"
+    );
+    assert_eq!(
+        engine.walk().encodes(),
+        vec![1],
+        "rank 0 encoded the image once, in its start"
+    );
+    assert_eq!(
+        *worker_encodes.lock().expect("the worker's encodes"),
+        vec![1],
+        "the worker joined rank 0's encode from the request frame"
+    );
+    assert_eq!(
+        *worker_shapes.lock().expect("the worker's passes"),
+        engine.walk().shapes(),
+        "the worker ran rank 0's chunks"
+    );
+    drop(engine);
+    drop(hub);
+    let error = worker
+        .join()
+        .expect("the worker finishes")
+        .expect_err("a closed control channel ends the mirror");
+    assert!(!error.is_empty(), "the mirror says why it stopped");
+}
+
+#[test]
 fn a_start_that_differs_from_rank_zeros_is_refused_naming_both_positions() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
     let address = listener.local_addr().expect("the bound address");
@@ -500,6 +700,49 @@ fn a_start_that_differs_from_rank_zeros_is_refused_naming_both_positions() {
     );
     assert!(
         error.contains("this rank starts it at 3"),
+        "the message names the worker's start: {error}"
+    );
+    assert!(error.contains("out of step"), "{error}");
+}
+
+#[test]
+fn a_start_frame_that_differs_from_the_workers_is_refused_naming_both_positions() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let address = listener.local_addr().expect("the bound address");
+    let worker = thread::spawn(move || {
+        let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
+            .expect("a control connection");
+        control.handshake().expect("the handshake");
+        let runtime = Runtime::new(GroupWalk::new(Arc::new(Mutex::new(Vec::new()))), 0)
+            .expect("the worker's runtime");
+        let wire = sparkflash_runtime::TextWire::new("toy", "toy", 1_024);
+        mirror_tick_lanes(&mut control, &runtime, &wire, 1)
+    });
+    let mut hub =
+        Tp4ControlHub::start_with_listener(listener, 2, Duration::from_secs(5)).expect("the hub");
+    // A request with no start: rank 0's own start follows it, because that start runs a
+    // collective. The worker reaches zero; rank 0's start frame says two.
+    hub.broadcast(&Tp4ControlFrame::LaneRequest {
+        lane: 0,
+        prompt_ids: vec![1, 2, 3],
+        images: Vec::new(),
+        keep: true,
+        sampler: None,
+        start: None,
+    })
+    .expect("the request");
+    hub.broadcast(&Tp4ControlFrame::LaneStart { lane: 0, start: 2 })
+        .expect("the mismatched start");
+    let error = worker
+        .join()
+        .expect("the worker finishes")
+        .expect_err("the worker refuses a start it did not reach");
+    assert!(
+        error.contains("rank 0 starts the prompt at 2"),
+        "the message names rank 0's start: {error}"
+    );
+    assert!(
+        error.contains("this rank starts it at 0"),
         "the message names the worker's start: {error}"
     );
     assert!(error.contains("out of step"), "{error}");
