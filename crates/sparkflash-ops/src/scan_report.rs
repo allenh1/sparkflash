@@ -21,10 +21,12 @@
 //! pass that refused it. Every row is resolved at exactly the plan's precision, the same request
 //! the load path makes; there is no fallback to another precision.
 //!
-//! Step 0 lands the kernel rows and the vocabulary of the two coverage checks. The tensor-claim
-//! and config-key passes themselves are not wired yet, so [ScanReport::coverage] records them as
-//! [CoverageState::NotChecked] and [ScanReport::is_clean] stays `false` even when every row
-//! resolved. A supplied tensor index is counted and printed, never treated as checked.
+//! The kernel rows are step 0's. The tensor-claim pass is wired: when [ScanInputs::tensors]
+//! supplies an index, the scan compares it in both directions with [TensorClaims], the
+//! description's claim set, and pushes one row per unclaimed group and one per planned tensor the
+//! index does not match. The config-key pass is not wired yet, so [Coverage::config_keys] stays
+//! [CoverageState::NotChecked] and [ScanReport::is_clean] stays `false` even when tensors and
+//! kernels are clean.
 //!
 //! The scan resolves against the catalogue, not against this build's images:
 //! [ScanReport::availability] is [Availability::Catalogue] and the report prints it. A caller
@@ -35,16 +37,21 @@
 //! config states one, the pass and the target, and carries what would fix it. The statuses are the
 //! seven of the plan's section 4, no more.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Write as _;
 
 use sparkflash_model::architecture::{Architecture, WeightFormat};
 use sparkflash_model::stack::{Shape, StackKind};
-use sparkflash_model::{Part, Target};
+use sparkflash_model::{Part, Target, TpPlan};
 
 use crate::engine_plan::{EnginePlan, PartRequirement, precision_of};
 use crate::plan::{KernelPhase, PartGeometry};
 use crate::resolver::{Availability, KernelResolver, ResolveCause, ResolveError};
+use crate::tensor_plan::{
+    TensorClaims, TensorDisagreement, TensorGroup, compare_tensor_claims, group_unclaimed,
+    is_tower_tensor, shape_text,
+};
 
 /// One tensor from a checkpoint's index: its name, stored shape and dtype.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +74,19 @@ impl TensorEntry {
             dtype: dtype.into(),
         }
     }
+
+    /// The logical spec of this stored descriptor, for comparison with a planned tensor.
+    ///
+    /// The one transformation is safetensors' packed FP4 convention, which stores an E2M1
+    /// weight as `I8` with the last dimension halved.
+    ///
+    /// # Errors
+    /// A dtype word this reader does not map, named with the tensor.
+    pub fn logical_spec(
+        &self,
+    ) -> Result<sparkflash_weights::TensorSpec, sparkflash_weights::tensor_index::IndexError> {
+        sparkflash_weights::tensor_index::logical_spec(&self.name, &self.dtype, &self.shape)
+    }
 }
 
 /// A checkpoint's tensor index, when the caller has read one.
@@ -82,13 +102,31 @@ impl TensorIndex {
     pub fn new(tensors: Vec<TensorEntry>) -> Self {
         Self { tensors }
     }
+
+    /// An index from a reader's stored descriptors, preserving the dtype words the headers spell.
+    #[must_use]
+    pub fn from_reader(index: &sparkflash_weights::tensor_index::TensorIndex) -> Self {
+        Self::new(
+            index
+                .tensors
+                .iter()
+                .map(|tensor| {
+                    TensorEntry::new(
+                        tensor.name.clone(),
+                        tensor.shape.clone(),
+                        tensor.dtype.clone(),
+                    )
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Whether one of the two coverage checks of the plan's section 4 has run.
 ///
-/// Step 0 defines the states and leaves both checks [Self::NotChecked]; the tensor-claim and
-/// config-key passes land on the same report later. A check that has not run is never reported
-/// as clean.
+/// The tensor-claim check runs whenever [ScanInputs::tensors] supplies an index. The config-key
+/// check stays [Self::NotChecked] until the layout reader consumes the document. A check that
+/// has not run is never reported as clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverageState {
     /// The check ran and every item was claimed or consumed.
@@ -157,11 +195,12 @@ impl Coverage {
 pub struct ScanInputs<'a> {
     /// The checkpoint's `config.json` text.
     pub config: &'a str,
-    /// The tensor index, when the caller has read the checkpoint's index files.
+    /// The tensor index, when the caller has read the checkpoint's safetensors headers.
     ///
-    /// Step 0 records how many tensors it holds and prints that count; the claim check that
-    /// consumes it lands with the layout reader. Passing an index therefore never turns an
-    /// unclaimed tensor into a clean report.
+    /// The scan compares it in both directions with [TensorClaims]: a planned tensor missing from
+    /// the index or stored at another shape or dtype is one row naming it, and an indexed tensor
+    /// no part claims is one row per prefix group. Passing no index leaves the check
+    /// [CoverageState::NotChecked], never clean.
     pub tensors: Option<&'a TensorIndex>,
     /// The GPU target the scan resolves against.
     pub target: Target,
@@ -338,8 +377,8 @@ impl ScanReport {
 
     /// Whether the checkpoint is clean: every part resolved and both coverage checks are clean.
     ///
-    /// Step 0 never returns true because the coverage checks are not wired in yet. A caller must
-    /// not gate a load on [Self::is_resolved] alone.
+    /// The config-key check is not wired in yet, so this stays false even when the kernel rows and
+    /// the tensor claims are clean. A caller must not gate a load on [Self::is_resolved] alone.
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.is_resolved() && self.coverage.is_complete()
@@ -404,10 +443,8 @@ impl ScanReport {
             self.rows.len() - resolved
         );
         let tensors = match (self.coverage.tensors, self.coverage.indexed_tensors) {
-            (CoverageState::NotChecked, Some(count)) => {
-                format!("{} ({count} indexed)", CoverageState::NotChecked.name())
-            }
-            (state, _) => state.name().to_owned(),
+            (state, Some(count)) => format!("{} ({count} indexed)", state.name()),
+            (state, None) => state.name().to_owned(),
         };
         let _ = writeln!(
             out,
@@ -447,9 +484,6 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             return report;
         }
     };
-    // Step 0 records the index's size; the claim check that consumes its names is the coverage
-    // pass that lands on top of this report. Ignoring the index would let a checkpoint with an
-    // unclaimed tower print a clean scan, so the report states that the check did not run.
     let resolver = KernelResolver::new(inputs.target, report.availability);
     let architecture = plan.architecture();
     for requirement in plan.globals() {
@@ -474,7 +508,226 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             );
         }
     }
+    if let Some(index) = inputs.tensors {
+        apply_tensor_coverage(&mut report, architecture, inputs.world, index);
+    }
     report
+}
+
+/// The tensor-claim pass: compare the description's claim set with the supplied index.
+fn apply_tensor_coverage(
+    report: &mut ScanReport,
+    architecture: &Architecture,
+    world: usize,
+    index: &TensorIndex,
+) {
+    report.coverage.indexed_tensors = Some(index.tensors.len());
+    let tp = match TpPlan::for_architecture(architecture, world, 0) {
+        Ok(tp) => tp,
+        Err(error) => {
+            report_tensor_plan_failure(
+                report,
+                index,
+                format!("the tensor-parallel plan could not be built: {error}"),
+            );
+            return;
+        }
+    };
+    let claims = match TensorClaims::from_checkpoint(architecture, tp) {
+        Ok(claims) if !claims.is_empty() => claims,
+        Ok(_) => {
+            report_tensor_plan_failure(
+                report,
+                index,
+                "the shared checkpoint plan claims no tensor".to_owned(),
+            );
+            return;
+        }
+        Err(error) => {
+            report_tensor_plan_failure(
+                report,
+                index,
+                format!("the shared checkpoint plan could not be built: {error}"),
+            );
+            return;
+        }
+    };
+    // A plan whose names are not this checkpoint's spelling cannot be compared tensor by
+    // tensor: every name would be a disagreement and every index tensor unclaimed. That is one
+    // missing layout, not a hundred thousand findings, so it is one row naming the plan.
+    let present = {
+        let names: BTreeSet<&str> = index
+            .tensors
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        claims
+            .specs()
+            .iter()
+            .filter(|spec| names.contains(spec.name.as_str()))
+            .count()
+    };
+    if present.saturating_mul(20) < claims.len() {
+        report_tensor_plan_failure(
+            report,
+            index,
+            format!(
+                "the shared checkpoint plan names {} tensors, but only {present} of them are in \
+                 the index; the checkpoint uses a spelling the shared plan does not describe",
+                claims.len()
+            ),
+        );
+        return;
+    }
+    let coverage = compare_tensor_claims(&claims, index);
+    report.coverage.tensors = if coverage.is_clean() {
+        CoverageState::Clean
+    } else {
+        CoverageState::Dirty
+    };
+    for disagreement in &coverage.disagreements {
+        push_disagreement(report, disagreement);
+    }
+    for group in &coverage.unclaimed {
+        push_unclaimed(report, group);
+    }
+}
+
+/// A checkpoint whose claim set cannot be built: the tower tensors it does describe are still
+/// unclaimed, and the plan failure is one row rather than one row per language tensor.
+fn report_tensor_plan_failure(report: &mut ScanReport, index: &TensorIndex, detail: String) {
+    report.coverage.tensors = CoverageState::Dirty;
+    report.rows.push(ScanRow {
+        stack: StackKind::Language,
+        block: None,
+        part: Part::Embedding,
+        shape: Shape::unknown(),
+        format: None,
+        pass: KernelPhase::Both,
+        target: report.target,
+        status: ScanStatus::UnknownLayout {
+            detail,
+            fix: "add the checkpoint's stack or layout entries to the shared description so its \
+                  tensors can be planned and claimed"
+                .to_owned(),
+        },
+    });
+    let tower: Vec<TensorEntry> = index
+        .tensors
+        .iter()
+        .filter(|entry| is_tower_tensor(&entry.name))
+        .cloned()
+        .collect();
+    for group in group_unclaimed(&tower) {
+        push_unclaimed(report, &group);
+    }
+}
+
+/// One planned tensor the checkpoint does not match.
+fn push_disagreement(report: &mut ScanReport, disagreement: &TensorDisagreement) {
+    let found = match (&disagreement.found_dtype, &disagreement.found_shape) {
+        (Some(dtype), Some(shape)) => format!("{} {}", dtype, shape_text(shape)),
+        _ => "absent from the index".to_owned(),
+    };
+    let expected = format!(
+        "{} {}",
+        disagreement.expected_dtype,
+        shape_text(&disagreement.expected_shape)
+    );
+    let detail = format!(
+        "planned tensor {} is {found}; the plan expects {expected} ({})",
+        disagreement.tensor, disagreement.reason
+    );
+    let fix = format!(
+        "fix the checkpoint or the shared tensor plan so {} is {expected}",
+        disagreement.tensor
+    );
+    let stack = stack_of_name(&disagreement.tensor);
+    report.rows.push(ScanRow {
+        stack,
+        block: block_of_name(&disagreement.tensor),
+        part: part_of_stack(stack),
+        shape: if disagreement.expected_shape.is_empty() {
+            Shape::unknown()
+        } else {
+            Shape::new(disagreement.expected_shape.clone())
+        },
+        format: None,
+        pass: KernelPhase::Both,
+        target: report.target,
+        status: ScanStatus::UnknownLayout { detail, fix },
+    });
+}
+
+/// One unclaimed prefix group.
+fn push_unclaimed(report: &mut ScanReport, group: &TensorGroup) {
+    let stack = stack_of_name(&group.prefix);
+    let fix = if group.count() == 1 {
+        format!(
+            "the checkpoint tensor {} is not claimed by any planned part; add the stack or layout \
+             entry that takes it",
+            group.prefix
+        )
+    } else {
+        format!(
+            "add the stack or layout entry that takes {} ({} checkpoint tensors)",
+            group.prefix,
+            group.count()
+        )
+    };
+    report.rows.push(ScanRow {
+        stack,
+        block: block_of_name(&group.prefix),
+        part: part_of_stack(stack),
+        shape: Shape::unknown(),
+        format: None,
+        pass: KernelPhase::Both,
+        target: report.target,
+        status: ScanStatus::UnclaimedTensor {
+            tensor: group.label(),
+            fix,
+        },
+    });
+}
+
+/// The stack a checkpoint tensor's name belongs to, from the name's own path segments.
+fn stack_of_name(name: &str) -> StackKind {
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts
+        .iter()
+        .any(|part| matches!(*part, "vision" | "visual" | "aligner"))
+    {
+        StackKind::Vision
+    } else if parts.iter().any(|part| *part == "audio") {
+        StackKind::Audio
+    } else if parts.iter().any(|part| *part == "mtp") {
+        StackKind::Draft
+    } else {
+        StackKind::Language
+    }
+}
+
+/// The representative part of a coverage row: the tower's own part, the draft stage's, or the
+/// embedding for a language tensor no part took.
+fn part_of_stack(stack: StackKind) -> Part {
+    match stack {
+        StackKind::Vision | StackKind::Audio => Part::Vision,
+        StackKind::Draft => Part::Mtp,
+        StackKind::Language => Part::Embedding,
+    }
+}
+
+/// The first block index a tensor name spells, when it spells one.
+fn block_of_name(name: &str) -> Option<usize> {
+    let parts: Vec<&str> = name.split('.').collect();
+    for pair in parts.windows(2) {
+        if matches!(pair[0], "layers" | "blocks") {
+            if let Ok(index) = pair[1].parse() {
+                return Some(index);
+            }
+        }
+    }
+    None
 }
 
 fn push_row(
@@ -653,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn a_supplied_tensor_index_is_counted_and_never_turns_the_scan_clean() {
+    fn a_supplied_tensor_index_is_checked_and_never_turns_the_scan_clean() {
         let index = TensorIndex::new(vec![TensorEntry::new(
             "model.visual.nothing_claims_this",
             vec![16, 16],
@@ -664,12 +917,37 @@ mod tests {
             ..inputs(Target::Sm121)
         });
         assert!(report.error.is_none(), "{report:?}");
-        assert!(report.is_resolved());
         assert!(!report.is_clean());
         assert_eq!(report.coverage.indexed_tensors, Some(1));
-        assert_eq!(report.coverage.tensors, CoverageState::NotChecked);
+        assert_eq!(report.coverage.tensors, CoverageState::Dirty);
+        // The one indexed tensor is unclaimed, and the plan that shares no name with the index is
+        // one layout row rather than one row per planned tensor.
+        let unclaimed: Vec<&ScanRow> = report
+            .rows
+            .iter()
+            .filter(|row| matches!(row.status, ScanStatus::UnclaimedTensor { .. }))
+            .collect();
+        assert_eq!(unclaimed.len(), 1, "{}", report.render());
+        assert_eq!(
+            unclaimed[0].status.subject(),
+            Some("model.visual.nothing_claims_this")
+        );
+        let layout: Vec<&ScanRow> = report
+            .rows
+            .iter()
+            .filter(|row| matches!(row.status, ScanStatus::UnknownLayout { .. }))
+            .collect();
+        assert_eq!(layout.len(), 1, "{}", report.render());
+        assert!(
+            layout[0]
+                .status
+                .subject()
+                .is_some_and(|detail| detail.contains("only 0 of them are in the index")),
+            "{}",
+            report.render()
+        );
         let text = report.render();
-        assert!(text.contains("tensors not checked (1 indexed)"), "{text}");
+        assert!(text.contains("tensors dirty (1 indexed)"), "{text}");
         assert!(text.contains("clean: no"), "{text}");
     }
 
@@ -914,6 +1192,135 @@ mod tests {
             "clean: no\n",
         );
         assert_eq!(report.render(), expected);
+    }
+
+    fn planned_entries(config: &str, world: usize) -> Vec<TensorEntry> {
+        let architecture = Architecture::from_json(config).expect("the config parses");
+        let tp = TpPlan::for_architecture(&architecture, world, 0).expect("the tp plan");
+        let plan = crate::tensor_plan::ArchitectureTensorPlan::checkpoint(&architecture, tp)
+            .expect("the checkpoint plan");
+        plan.specs()
+            .iter()
+            .map(|spec| TensorEntry::new(spec.name.clone(), spec.shape.clone(), spec.dtype.name()))
+            .collect()
+    }
+
+    #[test]
+    fn a_missing_tensor_a_mismatched_shape_and_an_extra_tensor_are_all_named() {
+        let mut entries = planned_entries(CONFIG, 1);
+        entries.retain(|entry| entry.name != "model.embed_tokens.weight");
+        for entry in &mut entries {
+            if entry.name == "lm_head.weight" {
+                entry.shape = vec![1, 1];
+            }
+        }
+        entries.push(TensorEntry::new(
+            "model.visual.blocks.0.patch.weight",
+            vec![16, 16],
+            "BF16",
+        ));
+        let index = TensorIndex::new(entries);
+        let report = scan(ScanInputs {
+            tensors: Some(&index),
+            ..inputs(Target::Sm121)
+        });
+        assert!(report.error.is_none(), "{report:?}");
+        assert_eq!(report.coverage.tensors, CoverageState::Dirty);
+
+        let missing = report
+            .rows
+            .iter()
+            .find(|row| {
+                row.status
+                    .subject()
+                    .is_some_and(|subject| subject.contains("model.embed_tokens.weight"))
+            })
+            .expect("the missing tensor is named");
+        let ScanStatus::UnknownLayout { detail, fix } = &missing.status else {
+            panic!(
+                "a missing tensor is a layout refusal, got {:?}",
+                missing.status
+            );
+        };
+        assert!(detail.contains("is absent from the index"), "{detail}");
+        assert!(fix.contains("model.embed_tokens.weight"), "{fix}");
+
+        let mismatch = report
+            .rows
+            .iter()
+            .find(|row| {
+                row.status
+                    .subject()
+                    .is_some_and(|subject| subject.contains("lm_head.weight"))
+            })
+            .expect("the shape mismatch is named");
+        let ScanStatus::UnknownLayout { detail, .. } = &mismatch.status else {
+            panic!(
+                "a shape mismatch is a layout refusal, got {:?}",
+                mismatch.status
+            );
+        };
+        assert!(detail.contains("BF16 1x1"), "{detail}");
+        assert!(detail.contains("expects BF16 128x5120"), "{detail}");
+
+        let unclaimed = report
+            .rows
+            .iter()
+            .filter(|row| matches!(row.status, ScanStatus::UnclaimedTensor { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(unclaimed.len(), 1, "{}", report.render());
+        assert_eq!(
+            unclaimed[0].status.subject(),
+            Some("model.visual.blocks.0.patch.weight")
+        );
+        assert_eq!(unclaimed[0].stack, StackKind::Vision);
+        let text = report.render();
+        assert!(
+            text.contains("unclaimed tensor: model.visual.blocks.0.patch.weight"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_large_unclaimed_tower_is_one_prefix_row_with_its_count() {
+        let mut entries = planned_entries(CONFIG, 1);
+        for index in 0..346 {
+            entries.push(TensorEntry::new(
+                format!("model.visual.blocks.{index}.attn.qkv.weight"),
+                vec![3, 16, 16],
+                "BF16",
+            ));
+        }
+        // A different branch under the same tower: the exact common prefix is `model.visual`.
+        entries.push(TensorEntry::new(
+            "model.visual.merger.proj.weight",
+            vec![16, 16],
+            "BF16",
+        ));
+        let index = TensorIndex::new(entries);
+        let report = scan(ScanInputs {
+            tensors: Some(&index),
+            ..inputs(Target::Sm121)
+        });
+        assert_eq!(report.coverage.tensors, CoverageState::Dirty);
+        let unclaimed = report
+            .rows
+            .iter()
+            .filter(|row| matches!(row.status, ScanStatus::UnclaimedTensor { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(unclaimed.len(), 1, "{}", report.render());
+        assert_eq!(
+            unclaimed[0].status.subject(),
+            Some("model.visual.* (347 tensors)")
+        );
+        assert_eq!(unclaimed[0].stack, StackKind::Vision);
+        assert!(
+            report
+                .render()
+                .contains("unclaimed tensor: model.visual.* (347 tensors)"),
+            "{}",
+            report.render()
+        );
     }
 
     #[test]
