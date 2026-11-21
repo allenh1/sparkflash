@@ -239,9 +239,9 @@ fn render(input: &Input) -> String {
                 },
                 arm.default_context(),
                 arm.tokenizer().tokenizer_id,
-                arm.tokenizer().chat_template,
+                arm.tokenizer().chat_template(),
                 conversion.world_size,
-                if conversion.released {
+                if conversion.released() {
                     "released"
                 } else {
                     "dynamic"

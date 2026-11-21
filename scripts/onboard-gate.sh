@@ -107,7 +107,10 @@ if [ -z "$ARM" ]; then
 fi
 
 # The arm's conformance crate. A new arm names its crate with --crate; the four landed arms are
-# derived from their names so the gate cannot run another crate's checks by accident.
+# derived from their names so the gate cannot run another crate's checks by accident. The crates
+# are the ones the registrations state (sparkflash_model::ARMS, Source::crate_name): a test in
+# crates/sparkflash-model/tests/arms.rs fails when an arm crate declares the checks and this case
+# does not name it.
 if [ -z "$CRATE" ]; then
     lower="$(printf '%s' "$ARM" | tr '[:upper:]' '[:lower:]')"
     case "$lower" in

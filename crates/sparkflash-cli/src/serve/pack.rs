@@ -145,20 +145,16 @@ pub(super) trait PackArm {
     ) -> Result<Self::Backend, String>;
     /// Pools `concurrency` sessions into one fused batch.
     fn fuse(backend: &mut Self::Backend, concurrency: usize) -> Result<(), String>;
-    /// The pack's response dialect over the driver: its reasoning and tool channels.
-    fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine>;
+}
 
-    /// Refuses a typed profile field this arm reads but cannot honour.
-    ///
-    /// The check runs wherever the profile is read, so the single-node arm and the group agree:
-    /// an unhonoured field is a boot refusal naming the switch, never a setting accepted and
-    /// dropped. The default honours every field.
-    ///
-    /// # Errors
-    /// A field this arm cannot serve.
-    fn check_profile(_profile: &ModelProfile) -> Result<(), String> {
-        Ok(())
-    }
+/// A release's response dialect over the raw driver: its reasoning and tool channels, by the
+/// dialect its registration declares ([sparkflash_model::Tokenizer::dialect]).
+fn respond<R: Release>(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine> {
+    let dialect = R::ARM
+        .tokenizer()
+        .dialect
+        .expect("a typed pack's registration declares its dialect");
+    super::dynamic::respond(dialect, driver)
 }
 
 /// The typed configuration of a release's arm.
@@ -223,7 +219,9 @@ pub(super) trait Release {
         profile
             .apply_env(lookup)
             .map_err(|error| named(error.to_string()))?;
-        Self::Arm::check_profile(&profile).map_err(named)?;
+        // A field the arm reads but cannot honour is a boot refusal naming the switch wherever
+        // the profile is read, so the single-node arm and the group agree.
+        sparkflash_model::arms::check_profile(Self::ARM, &profile).map_err(named)?;
         Ok(profile)
     }
 
@@ -355,10 +353,6 @@ impl PackArm for QwenArm {
             .enable_fusion(concurrency)
             .map_err(|error| error.to_string())
     }
-
-    fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine> {
-        sparkflash_api::qwen::QwenResponseEngine::layer(driver)
-    }
 }
 
 impl Release for sparkflash_model::Qwen {
@@ -430,15 +424,6 @@ impl PackArm for GlmArm {
         lanes: Option<usize>,
     ) -> Result<(Option<Box<dyn ModelBackend>>, usize), String> {
         open_glm_lanes(config, lanes)
-    }
-
-    fn check_profile(profile: &ModelProfile) -> Result<(), String> {
-        sparkflash_model::profile::refuse_tensor_core_decode(
-            "GLM",
-            sparkflash_model::descriptor::GLM53_FLASH_ID,
-            "docs/numerics/glm53/v3-gemv.md",
-            profile,
-        )
     }
 
     fn write_fixture(directory: &Path, config: &Self::Config) -> Result<(), String> {
@@ -558,12 +543,6 @@ impl PackArm for GlmArm {
             .enable_fusion(concurrency)
             .map_err(|error| error.to_string())
     }
-
-    fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine> {
-        // The dialect splits the model reasoning block into reasoning_content and lifts its
-        // <tool_call> XML into native tool calls (sparkflash_api::glm).
-        sparkflash_api::glm::GlmResponseEngine::layer(driver)
-    }
 }
 
 impl Release for sparkflash_model::Glm {
@@ -576,14 +555,6 @@ impl Release for sparkflash_model::Glm {
         Glm5NextConfig::tiny()
     }
 }
-
-/// The lane count the options record before an arm answers, and the dynamic dense arm's own
-/// default: four.
-///
-/// A pack group's real width is its arm's [sparkflash_runtime::Limits], read when the rank
-/// opens ([PackArm::open_lanes]); this is what `ServeOptions` holds when the operator gave no
-/// `--concurrency`, so flag validation has a number before any device is opened.
-pub(super) const GROUP_LANES: usize = 4;
 
 /// Serves a resolved checkpoint of a pack's family under the checkpoint's own identity
 /// ([serve_arm_identity]).
@@ -707,7 +678,6 @@ impl Pack {
     }
 
     /// The [sparkflash_model::Arm] entry that answers for this pack's weights.
-    #[cfg(test)]
     pub(super) fn arm(self) -> &'static dyn sparkflash_model::Arm {
         sparkflash_model::arm_for_weights(&self.descriptor.weights_id)
             .expect("a pack's weights name an ARMS entry")
@@ -1205,7 +1175,7 @@ fn serve_host<R: Release>(options: &ServeOptions) -> Result<ExitCode, String> {
     );
     // The byte codec's output is arbitrary text, not the released template's channels, so the
     // fixture stays on the raw driver.
-    let respond = (!options.synthetic).then_some(R::Arm::respond as Respond);
+    let respond = (!options.synthetic).then_some(respond::<R> as Respond);
     serve_backend(
         options,
         Box::new(backend),
@@ -1218,7 +1188,7 @@ fn serve_host<R: Release>(options: &ServeOptions) -> Result<ExitCode, String> {
     )
 }
 
-/// An arm's response dialect over the raw driver ([`PackArm::respond`]).
+/// An arm's response dialect over the raw driver ([respond]).
 type Respond = fn(Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine>;
 
 /// Serves `backend` behind the generic host driver ([`sparkflash_serve::HostDriver`]): one
@@ -1292,7 +1262,7 @@ impl<B: ModelBackend> ModelBackend for DescriptorBackend<B> {
 ///
 /// This is the dynamic path for a cached fine-tune whose `model_type` is a released family: the
 /// arm's arithmetic and profile are used, while the descriptor, context and tokenizer are the
-/// checkpoint's, and the response dialect is the arm's ([PackArm::respond]).
+/// checkpoint's, and the response dialect is the arm's ([respond]).
 pub(super) fn serve_arm_identity<R: Release>(
     options: &ServeOptions,
     directory: PathBuf,
@@ -1340,7 +1310,7 @@ pub(super) fn serve_arm_identity<R: Release>(
         seam,
         options.max_tokens.min(R::max_output_tokens()),
         1,
-        Some(R::Arm::respond),
+        Some(respond::<R>),
         &banner,
         options.concurrency,
     )
@@ -1455,7 +1425,7 @@ fn serve_group<R: Release>(
         tp4.control_port
     );
     let metrics = driver.metrics();
-    let engine = R::Arm::respond(Arc::new(driver));
+    let engine = respond::<R>(Arc::new(driver));
     let numerics = ConfigKey::tp(
         descriptor.id.clone(),
         tp4.world_size,
@@ -1508,7 +1478,7 @@ fn serve_group_lanes<R: Release>(
         seam,
         options.max_tokens.min(R::max_output_tokens()),
         tp4.world_size,
-        Some(R::Arm::respond),
+        Some(respond::<R>),
         &banner,
         lanes,
     )

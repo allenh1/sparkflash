@@ -865,17 +865,19 @@ impl ServeOptions {
         // A registry model name selects a pack; the default DeepSeek arm is a pack identity but
         // not a PackArm, so the packed-model flag checks below are keyed on `is_arm`.
         let pack = cli.model.as_deref().and_then(pack::Pack::named);
-        // A `--tp4-rank` group whose arm opens its ranks as lanes steps [pack::GROUP_LANES] fused
-        // lanes unless the operator gives --concurrency (1 serves one request at a time).
+        // A `--tp4-rank` group whose arm opens its ranks as lanes steps the lanes its registration
+        // states ([sparkflash_model::GroupDefaults::lanes]) unless the operator gives
+        // --concurrency (1 serves one request at a time). A pack group's real width is its arm's
+        // [sparkflash_runtime::Limits], read when the rank opens; this is what the options hold
+        // so flag validation has a number before any device is opened.
         #[cfg(feature = "tp4-serve")]
         let group_lanes = cli.tp4_rank.is_some() && pack.is_some_and(pack::Pack::opens_group_lanes);
         #[cfg(not(feature = "tp4-serve"))]
         let group_lanes = false;
         let fuse_batch = cli.fuse_batch || (group_lanes && cli.concurrency.is_none());
-        let concurrency = cli.concurrency.unwrap_or(if group_lanes && fuse_batch {
-            pack::GROUP_LANES
-        } else {
-            1
+        let concurrency = cli.concurrency.unwrap_or(match pack {
+            Some(pack) if group_lanes && fuse_batch => pack.arm().group().lanes,
+            _ => 1,
         });
         let packed = pack.is_some_and(pack::Pack::has_pack_arm);
         // A model no pack names resolves through the dynamic path, whose shared dense device arm

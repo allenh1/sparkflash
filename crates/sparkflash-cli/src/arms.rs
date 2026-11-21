@@ -39,7 +39,7 @@ pub fn render_arms() -> String {
             arm.weights().join(", ")
         };
         let conversion = arm.conversion();
-        let released = if conversion.released {
+        let released = if conversion.released() {
             "released"
         } else {
             "dynamic"
@@ -55,7 +55,7 @@ pub fn render_arms() -> String {
                 arm.default_context().to_string()
             },
             arm.tokenizer().tokenizer_id,
-            arm.tokenizer().chat_template,
+            arm.tokenizer().chat_template(),
             conversion.world_size,
             released,
             arm.ledger().arm,
@@ -157,7 +157,7 @@ mod tests {
             assert!(text.contains(arm.id()), "missing {}", arm.id());
             assert!(text.contains(arm.model_id()), "missing {}", arm.model_id());
             assert!(
-                text.contains(arm.tokenizer().chat_template),
+                text.contains(arm.tokenizer().chat_template()),
                 "missing {}'s chat template",
                 arm.id()
             );

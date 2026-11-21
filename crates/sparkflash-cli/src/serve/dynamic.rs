@@ -42,7 +42,8 @@ use sparkflash_kernels::images::CUDA_ARCH;
 use sparkflash_model::numerics::ConfigKey;
 use sparkflash_model::prompt::PromptError;
 use sparkflash_model::{
-    Architecture, Capabilities, ModelBackend, ModelDescriptor, ModelProfile, PromptCodec, Target,
+    Architecture, Arm as _, Capabilities, ModelBackend, ModelDescriptor, ModelProfile, PromptCodec,
+    Target,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::plan::KernelPhase;
@@ -63,24 +64,9 @@ pub(crate) struct DynamicCheckpoint {
     pub plan: EnginePlan,
 }
 
-/// The context a device-arm group admits when the operator does not name one.
-///
-/// The Inkling release's window is 1M tokens; 256K is the arm's documented serving default, and
-/// the difference is 6 GiB of KV a rank.
-const INKLING_GROUP_DEFAULT_CONTEXT: usize = 262_144;
-
-/// The prompt dialect a checkpoint's tokenizer declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Dialect {
-    /// GLM's `[gMASK]<sop>` and `<|user|>` turns.
-    Glm,
-    /// ChatML's `<|im_start|>`/`<|im_end|>` turns.
-    Qwen,
-    /// DeepSeek's own renderer, which its reference path normally serves.
-    Deepseek,
-    /// Inkling-2's typed messages: `<|message_model|><|content_thinking|>...<|end_message|>`.
-    Inkling,
-}
+/// The prompt dialect a checkpoint serves in: its family's registration when that declares one,
+/// else what the tokenizer's own markers say ([codec]).
+pub(crate) use sparkflash_model::Dialect;
 
 /// Resolves `options` into a checkpoint and its plan.
 ///
@@ -269,7 +255,12 @@ impl PromptCodec for DoryCodec {
     }
 }
 
-/// The prompt codec and dialect the checkpoint's tokenizer declares.
+/// The prompt codec and dialect of a checkpoint.
+///
+/// The family's registration ([sparkflash_model::Arm::tokenizer]) declares the dialect of an arm
+/// whose tokenizer carries no marker of its own (Inkling, DeepSeek) and Dory's template over
+/// ChatML's turns; GLM's and ChatML's markers name themselves, which is also how a family with
+/// no registration is read.
 fn codec(
     directory: &Path,
     architecture: &Architecture,
@@ -297,6 +288,8 @@ fn codec(
     }
     let text = std::fs::read_to_string(&tokenizer)
         .map_err(|error| format!("cannot read {}: {error}", tokenizer.display()))?;
+    let declared = sparkflash_model::arm_for_family(&architecture.family)
+        .and_then(|arm| arm.tokenizer().dialect);
     if text.contains(sparkflash_model_glm5_next::codec::GMASK)
         && text.contains(sparkflash_model_glm5_next::codec::SOP)
     {
@@ -306,7 +299,7 @@ fn codec(
         )?;
         return Ok((Arc::new(codec), Dialect::Glm));
     }
-    if architecture.family == "inkling2" {
+    if declared == Some(Dialect::Inkling) {
         let codec = sparkflash_model_inkling2::InklingCodec::from_path(
             &tokenizer,
             architecture.tokens.bos_token_id,
@@ -331,12 +324,12 @@ fn codec(
         // Dory's ChatML tokenizer has no Qwen <|endoftext|> or image delimiters, and its
         // released template is not Qwen's: it opens an empty system turn and never injects a
         // reasoning-effort instruction.
-        if architecture.family == "dory" {
+        if declared == Some(Dialect::Dory) {
             let inner = sparkflash_model_qwen4_exp::QwenCodec::chatml_from_path_with_architecture(
                 &tokenizer,
                 architecture,
             )?;
-            return Ok((Arc::new(DoryCodec { inner }), Dialect::Qwen));
+            return Ok((Arc::new(DoryCodec { inner }), Dialect::Dory));
         }
         let codec = sparkflash_model_qwen4_exp::QwenCodec::from_path_with_architecture(
             &tokenizer,
@@ -344,7 +337,7 @@ fn codec(
         )?;
         return Ok((Arc::new(codec), Dialect::Qwen));
     }
-    if architecture.family == "deepseek_v41" {
+    if declared == Some(Dialect::Deepseek) {
         let seam = sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(&tokenizer)
             .map_err(|error| format!("{}: {error}", tokenizer.display()))?;
         return Ok((Arc::new(seam), Dialect::Deepseek));
@@ -386,13 +379,10 @@ fn profile_with(
     profile
         .apply_env(lookup)
         .map_err(|error| format!("the {} profile: {error}", architecture.family))?;
-    if architecture.family == "inkling2" {
-        sparkflash_model::profile::refuse_tensor_core_decode(
-            "Inkling",
-            sparkflash_model::descriptor::INKLING2_SMALL_ID,
-            "docs/numerics/inkling2/v2-clean-head.md",
-            &profile,
-        )?;
+    // An arm whose decode is the row GEMV refuses the tensor-core switch where its profile is
+    // read, in the one message every such arm gives.
+    if let Some(arm) = sparkflash_model::arm_for_family(&architecture.family) {
+        sparkflash_model::arms::check_profile(arm, &profile)?;
     }
     Ok(profile)
 }
@@ -458,11 +448,14 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     let context = options
         .context
         .unwrap_or(if window == 0 { 4096 } else { window });
-    // Every rank of the device group allocates its KV at the admitted context, and the released
-    // 1M window is not what a first server wants: the arm's documented default is 256K. An
-    // explicit --context still reaches the whole window, and validation below still bounds it.
-    let context = match (options.group.is_some(), options.context) {
-        (true, None) => context.min(INKLING_GROUP_DEFAULT_CONTEXT),
+    // Every rank of the device group allocates its KV at the admitted context, and a released
+    // 1M window is not what a first server wants: the arm states its group's default
+    // ([sparkflash_model::GroupDefaults::context]). An explicit --context still reaches the whole
+    // window, and validation below still bounds it.
+    let group_context = sparkflash_model::arm_for_family(&checkpoint.architecture.family)
+        .and_then(|arm| arm.group().context);
+    let context = match (options.group.is_some(), options.context, group_context) {
+        (true, None, Some(admitted)) => context.min(admitted),
         _ => context,
     };
     if context == 0 || (window != 0 && context > window) {
@@ -803,9 +796,9 @@ fn serve_dense_group(
 }
 
 /// The lanes the shared dense device arm steps: `--concurrency` when given, else the profile's
-/// `runtime.concurrency` (`SPARKFLASH_LANES`), else the lanes every other device arm serves by
-/// default ([super::pack::GROUP_LANES]). `--concurrency 1` keeps one lane, which still keeps its
-/// conversation between requests.
+/// `runtime.concurrency` (`SPARKFLASH_LANES`), else the arm's own default
+/// ([sparkflash_model::GroupDefaults::lanes]). `--concurrency 1` keeps one lane, which still
+/// keeps its conversation between requests.
 ///
 /// # Errors
 /// A flag and a profile that ask for different lanes.
@@ -816,7 +809,7 @@ fn dense_lanes(flag: Option<usize>, profile: Option<usize>) -> Result<usize, Str
              dense device arm for different lanes; give one"
         )),
         (Some(lanes), _) | (None, Some(lanes)) => Ok(lanes),
-        (None, None) => Ok(super::pack::GROUP_LANES),
+        (None, None) => Ok(sparkflash_model::Dense.group().lanes),
     }
 }
 
@@ -942,6 +935,22 @@ fn serve_host(
     )
 }
 
+/// The response engine `dialect` reads replies with, over the raw driver: the one place a
+/// dialect meets its family's reasoning and tool channels.
+pub(crate) fn respond(
+    dialect: Dialect,
+    driver: Arc<dyn ApiInferenceEngine>,
+) -> Arc<dyn ApiInferenceEngine> {
+    match dialect {
+        // Splits the model reasoning block into reasoning_content and lifts its <tool_call> XML
+        // into native tool calls (sparkflash_api::glm).
+        Dialect::Glm => sparkflash_api::glm::GlmResponseEngine::layer(driver),
+        Dialect::Qwen | Dialect::Dory => sparkflash_api::qwen::QwenResponseEngine::layer(driver),
+        Dialect::Deepseek => driver,
+        Dialect::Inkling => sparkflash_api::inkling::InklingResponseEngine::layer(driver),
+    }
+}
+
 /// Serves `backend` behind HTTP through the generic host driver, in `dialect`, under the TP=1
 /// numerics key; `banner` is the boot line's description of what answers.
 pub(crate) fn serve_backend(
@@ -980,12 +989,7 @@ pub(crate) fn serve_backend_world(
         .with_env()?,
     )?;
     let metrics = driver.metrics();
-    let engine: Arc<dyn ApiInferenceEngine> = match dialect {
-        Dialect::Glm => sparkflash_api::glm::GlmResponseEngine::layer(Arc::new(driver)),
-        Dialect::Qwen => sparkflash_api::qwen::QwenResponseEngine::layer(Arc::new(driver)),
-        Dialect::Deepseek => Arc::new(driver),
-        Dialect::Inkling => sparkflash_api::inkling::InklingResponseEngine::layer(Arc::new(driver)),
-    };
+    let engine = respond(dialect, Arc::new(driver));
     println!("sparkflash serve: {banner}");
     let numerics = ConfigKey::tp(descriptor.id.clone(), world, options.numerics, CUDA_ARCH);
     Ok(serve_with_seam(
@@ -1082,7 +1086,7 @@ mod tests {
 
     #[test]
     fn the_dense_arms_lanes_are_the_flag_the_profile_or_four() {
-        assert_eq!(dense_lanes(None, None), Ok(super::super::pack::GROUP_LANES));
+        assert_eq!(dense_lanes(None, None), Ok(sparkflash_model::GROUP_LANES));
         assert_eq!(dense_lanes(Some(1), None), Ok(1));
         assert_eq!(dense_lanes(None, Some(8)), Ok(8));
         assert_eq!(dense_lanes(Some(8), Some(8)), Ok(8));

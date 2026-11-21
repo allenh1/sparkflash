@@ -30,8 +30,9 @@
 //! both. `--inspect` tells the three apart by the model a file's index names.
 //!
 //! `--model ORG/REPO` resolves the snapshot through the hub cache. Dispatch is the checkpoint's
-//! own `Architecture`/`EnginePlan`: a released family keeps its pack converter, DeepSeek keeps
-//! the B12x converter, and any other resolved architecture goes to the generic dynamic writer
+//! own `Architecture` and the converter its family's `sparkflash_model::ARMS` entry names
+//! ([Converter]): a released family keeps its pack converter, DeepSeek keeps the B12x converter,
+//! and any other resolved architecture goes to the generic dynamic writer
 //! (raw tensors in `Architecture` walk order through the same rank-file container). That writer
 //! is the phase-4 placeholder documented in `docs/adding-a-model.md` section 7.
 
@@ -48,9 +49,8 @@ use sparkflash_device::converted::{
 };
 use sparkflash_engine::parallel_tp::TpLayout;
 use sparkflash_engine::safetensors::SafeTensorsSource;
-use sparkflash_model::{Architecture, Target};
+use sparkflash_model::{Architecture, Arm as _, Converter, Target};
 use sparkflash_model_glm5_next::Glm5NextConfig;
-use sparkflash_model_glm5_next::config::MODEL_TYPE as GLM_MODEL_TYPE;
 use sparkflash_model_glm5_next::convert::{WalkSpecs, convert_rank as glm_convert_rank};
 use sparkflash_model_inkling2::config::Inkling2Config;
 use sparkflash_model_inkling2::convert::{
@@ -191,27 +191,27 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
         }
     };
     let out_dir = output_dir.unwrap_or_else(|| default_output_dir(&checkpoint_dir));
-    if let Some((model_type, text)) = checkpoint_config(&checkpoint_dir)? {
+    if let Some(text) = checkpoint_config(&checkpoint_dir)? {
         let unparsed =
             |error: String| format!("{}: {error}", checkpoint_dir.join("config.json").display());
-        // The plan is the dispatch: the checkpoint's own architecture decides which converter
-        // runs, not two hard-coded model_type strings. A document that does not parse is a
+        // The plan is the dispatch: the checkpoint's own architecture names its family, and the
+        // family's registration names the converter. A document that does not parse is a
         // refusal naming the file, never a silent fall-through to DeepSeek's loader.
         let architecture = Architecture::from_checkpoint_dir(&checkpoint_dir)
             .map_err(|error| unparsed(error.to_string()))?;
-        // The family's registration states how its checkpoint converts: the world the release
-        // shards at, and whether this build has a converter for it at all.
-        let conversion =
-            sparkflash_model::arm_for_family(&architecture.family).map(|arm| arm.conversion());
-        let world = world_size.unwrap_or_else(|| conversion.map_or(1, |own| own.world_size));
-        if expert_split.is_some() && architecture.family != "inkling2" {
+        // The registration states how the checkpoint converts: the world the release shards at,
+        // the converter it goes through and what an error calls it. A family with no entry is a
+        // novel one, converted through the shared architecture walk.
+        let conversion = sparkflash_model::arm_for_family(&architecture.family)
+            .map_or(sparkflash_model::Dense.conversion(), |arm| arm.conversion());
+        let world = world_size.unwrap_or(conversion.world_size);
+        if expert_split.is_some() && conversion.converter != Converter::Inkling {
             return Err(format!(
                 "--expert-split is Inkling-2's rank-file layout, and this checkpoint is {:?}",
                 architecture.family
             ));
         }
-        let released = conversion.is_some_and(|own| own.released);
-        if !released && world != 1 {
+        if !conversion.released() && world != 1 {
             return Err(format!(
                 "{} (model_type {:?}) is a dynamic host checkpoint, whose raw walk order is TP1; --tp-world-size {world} would write {world} whole copies, not a shard",
                 checkpoint_dir.display(),
@@ -221,114 +221,93 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
         let config_path = checkpoint_dir.join("config.json");
         let _plan = EnginePlan::from_path(&config_path, Target::Sm121, world, 0)
             .map_err(|error| unparsed(format!("the execution plan: {error}")))?;
-        if matches!(architecture.family.as_str(), "qwen4_exp" | "qwen4_exp_text") {
-            let config =
-                Qwen4ExpConfig::from_json(&text).map_err(|error| unparsed(error.to_string()))?;
-            let slot_pack = SlotPack {
-                name: "Qwen4-Exp",
-                world_size: world_size.unwrap_or(1),
-                ranks: &ranks,
-                pad_moe_640,
-                verify,
-                allows_no_pad: false,
-            };
-            return slot_pack.convert::<Nvfp4Scalars>(&checkpoint_dir, |source, layout, label| {
-                qwen_convert_rank(source, &config, layout, &checkpoint_dir, &out_dir, label)
-            });
-        }
-        if architecture.family == GLM_MODEL_TYPE || model_type == GLM_MODEL_TYPE {
-            let config =
-                Glm5NextConfig::from_json(&text).map_err(|error| unparsed(error.to_string()))?;
-            let slot_pack = SlotPack {
-                name: "GLM-5.3",
-                world_size: world_size.unwrap_or(4),
-                ranks: &ranks,
-                pad_moe_640,
-                verify,
-                allows_no_pad: false,
-            };
-            return slot_pack.convert::<WalkSpecs>(&checkpoint_dir, |source, layout, label| {
-                glm_convert_rank(source, &config, layout, &out_dir, label)
-                    .map_err(|error| error.to_string())
-            });
-        }
-        if architecture.family == "inkling2" {
-            // Inkling-2's plan already names every rank's bytes, so its converter is a walk over
-            // that plan through the shared rank-file container; the pack below only selects the
-            // ranks and prints. Verifying also compares every slot against the checkpoint, which
-            // SlotPack's own read only checks against the header.
-            let mut config = Inkling2Config::from_checkpoint_dir(&checkpoint_dir)
-                .map_err(|error| unparsed(error.to_string()))?;
-            if let Some(split) = expert_split.take() {
-                config.expert_split = split;
+        let slot_pack = SlotPack {
+            name: conversion.name,
+            world_size: world,
+            ranks: &ranks,
+            pad_moe_640,
+            verify,
+            allows_no_pad: conversion.takes_no_pad,
+        };
+        match conversion.converter {
+            // DeepSeek keeps its resident converter and manifest, below.
+            Converter::DeepSeek => {}
+            Converter::Qwen => {
+                let config = Qwen4ExpConfig::from_json(&text)
+                    .map_err(|error| unparsed(error.to_string()))?;
+                return slot_pack.convert::<Nvfp4Scalars>(
+                    &checkpoint_dir,
+                    |source, layout, label| {
+                        qwen_convert_rank(source, &config, layout, &checkpoint_dir, &out_dir, label)
+                    },
+                );
             }
-            let slot_pack = SlotPack {
-                name: "Inkling-2-Small",
-                world_size: world,
-                ranks: &ranks,
-                pad_moe_640,
-                // The closure below verifies the file against the checkpoint, slot digest
-                // included, so the pack's own payload re-read would be a third pass over 97.5 GB
-                // per rank for a weaker check (the header against itself).
-                verify: false,
-                allows_no_pad: true,
-            };
-            return slot_pack.convert::<InklingRecords>(
-                &checkpoint_dir,
-                |source, layout, label| {
-                    let converted = inkling_convert_rank(source, &config, layout, &out_dir, label)?;
-                    if verify {
-                        inkling_verify_rank(&converted.path, source, &config, layout)?;
-                    }
-                    Ok(converted)
-                },
-            );
-        }
-        if architecture.family != "deepseek_v41" {
-            // A novel architecture composed of supported parts: convert it through the shared
-            // architecture walk and the existing walk-ordered rank-file writer. Phase 4's
-            // ArchitectureTensorPlan is merged, but its builder names the released Qwen/GLM
-            // families; a novel family still needs this raw-tensor form: every tensor the
-            // dynamic host path reads, in walk order, in the rank file container. The
-            // limitation is stated in docs/adding-a-model.md section 7.
-            let unsupported = crate::dynamic::unsupported_parts(&architecture);
-            if !unsupported.is_empty() {
-                let names: Vec<String> = unsupported.iter().map(ToString::to_string).collect();
-                return Err(format!(
-                    "{} (model_type {:?}) names parts the dynamic converter does not support: {}",
-                    checkpoint_dir.display(),
-                    architecture.family,
-                    names.join(", ")
-                ));
+            Converter::Glm => {
+                let config = Glm5NextConfig::from_json(&text)
+                    .map_err(|error| unparsed(error.to_string()))?;
+                return slot_pack.convert::<WalkSpecs>(&checkpoint_dir, |source, layout, label| {
+                    glm_convert_rank(source, &config, layout, &out_dir, label)
+                        .map_err(|error| error.to_string())
+                });
             }
-            if world != 1 {
-                return Err(format!(
-                    "{} (model_type {:?}) is a dynamic host checkpoint, whose raw walk order is TP1; --tp-world-size {world} would write {world} whole copies, not a shard",
-                    checkpoint_dir.display(),
-                    architecture.family
-                ));
+            Converter::Inkling => {
+                // Inkling-2's plan already names every rank's bytes, so its converter is a walk
+                // over that plan through the shared rank-file container; the pack only selects
+                // the ranks and prints. The closure verifies the file against the checkpoint,
+                // slot digest included, so the pack's own payload re-read would be a third pass
+                // over 97.5 GB per rank for a weaker check (the header against itself).
+                let mut config = Inkling2Config::from_checkpoint_dir(&checkpoint_dir)
+                    .map_err(|error| unparsed(error.to_string()))?;
+                if let Some(split) = expert_split.take() {
+                    config.expert_split = split;
+                }
+                let slot_pack = SlotPack {
+                    verify: false,
+                    ..slot_pack
+                };
+                return slot_pack.convert::<InklingRecords>(
+                    &checkpoint_dir,
+                    |source, layout, label| {
+                        let converted =
+                            inkling_convert_rank(source, &config, layout, &out_dir, label)?;
+                        if verify {
+                            inkling_verify_rank(&converted.path, source, &config, layout)?;
+                        }
+                        Ok(converted)
+                    },
+                );
             }
-            let slot_pack = SlotPack {
-                name: "dynamic",
-                world_size: 1,
-                ranks: &ranks,
-                pad_moe_640,
-                verify,
-                allows_no_pad: true,
-            };
-            return slot_pack.convert::<DynamicRecords>(
-                &checkpoint_dir,
-                |source, layout, label| {
-                    convert_dynamic_rank(
-                        source,
-                        &architecture,
-                        layout,
-                        &checkpoint_dir,
-                        &out_dir,
-                        label,
-                    )
-                },
-            );
+            Converter::Walk => {
+                // A novel architecture composed of supported parts: convert it through the
+                // shared architecture walk and the existing walk-ordered rank-file writer.
+                // Phase 4's ArchitectureTensorPlan is merged, but its builder names the released
+                // Qwen/GLM families; a novel family still needs this raw-tensor form: every
+                // tensor the dynamic host path reads, in walk order, in the rank file container.
+                // The limitation is stated in docs/adding-a-model.md section 7.
+                let unsupported = crate::dynamic::unsupported_parts(&architecture);
+                if !unsupported.is_empty() {
+                    let names: Vec<String> = unsupported.iter().map(ToString::to_string).collect();
+                    return Err(format!(
+                        "{} (model_type {:?}) names parts the dynamic converter does not support: {}",
+                        checkpoint_dir.display(),
+                        architecture.family,
+                        names.join(", ")
+                    ));
+                }
+                return slot_pack.convert::<DynamicRecords>(
+                    &checkpoint_dir,
+                    |source, layout, label| {
+                        convert_dynamic_rank(
+                            source,
+                            &architecture,
+                            layout,
+                            &checkpoint_dir,
+                            &out_dir,
+                            label,
+                        )
+                    },
+                );
+            }
         }
     }
     if expert_split.is_some() {
@@ -479,23 +458,18 @@ fn convert_dynamic_rank(
     writer.finish()
 }
 
-/// The checkpoint's `config.json` and the model type it names, or `None` when it has none. A
-/// checkpoint with no `config.json`, or a model type no other pack takes, is DeepSeek's.
-fn checkpoint_config(dir: &Path) -> Result<Option<(String, String)>, String> {
+/// The checkpoint's `config.json`, or `None` when it has none. A checkpoint with no
+/// `config.json` is DeepSeek's.
+fn checkpoint_config(dir: &Path) -> Result<Option<String>, String> {
     let path = dir.join("config.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    let root: Value =
+    let _: Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-    let model_type = root
-        .get("model_type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    Ok(Some((model_type, text)))
+    Ok(Some(text))
 }
 
 /// How a convert or inspect line shows what a pack's rank file records beside its slots.
