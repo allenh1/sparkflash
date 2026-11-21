@@ -2904,12 +2904,13 @@ impl Drop for Batch<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DECODER_WARM, DecodeShare, ENCODER_LAYERS, PREFIX_REUSE_MIN_ROWS, R_MAX, bulk_rows,
-        common_prefix, constraint_refusal, decoder_resume, reusable_shared, runs_decoder,
-        share_rows, skip_end_after,
+        DECODER_WARM, DecodeShare, ENCODER_LAYERS, R_MAX, bulk_rows, common_prefix,
+        constraint_refusal, decoder_resume, reusable_shared, runs_decoder, share_rows,
+        skip_end_after,
     };
     use sparkflash_api::constrained::TokenConstraint;
     use sparkflash_api::vocab::TokenBytes;
+    use sparkflash_runtime::tick::PREFIX_REUSE_MIN_ROWS;
 
     #[test]
     fn a_constrained_pick_the_schema_cannot_take_ends_only_its_sequence() {
