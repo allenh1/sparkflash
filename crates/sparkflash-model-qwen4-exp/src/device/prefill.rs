@@ -50,8 +50,9 @@
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_kernels::images::Image;
 use sparkflash_model::BackendError;
+use sparkflash_ops::OpPlan;
+use sparkflash_ops::gdn::{ChunkConv, ConvRows, GatedNorm, GdnChunk};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::{OpPlan, gdn};
 // The routed experts' plan, grouped tile and item count are the shared rule.
 use sparkflash_ops::moe::{MAX_EXPERTS as MOE_MAX_EXPERTS, MoePlanCall, grouped};
 use sparkflash_ops::projection::{Fp8Tile, SPLIT_STAGE, SplitTile, fp8_tile_fits, split_k_slices};
@@ -324,13 +325,11 @@ pub(super) struct PrefillKernels {
     moe_gate_up_fp8: Bound,
     moe_swiglu_fp8: Bound,
     moe_down_fp8: Bound,
-    gdn_conv: Bound,
-    gdn_conv_state: Bound,
-    gdn_prep: Bound,
+    /// The Gated DeltaNet chunk's conv, prep and gated norm; the scan is the plan's.
+    gdn: GdnChunk,
     gdn_scan: Bound,
     gdn_scan_64_64: Bound,
     gdn_scan_128_256: Bound,
-    gdn_gate: Bound,
 }
 
 impl PrefillKernels {
@@ -407,13 +406,17 @@ impl PrefillKernels {
             moe_gate_up_fp8: named("q4p_moe_gate_up_fp8", Precision::Fp8E4M3)?,
             moe_swiglu_fp8: named("q4p_moe_swiglu_fp8", Precision::Fp8E4M3)?,
             moe_down_fp8: named("q4p_moe_down_fp8", Precision::Fp8E4M3)?,
-            gdn_conv: scan("q4p_gdn_conv", Precision::Bf16)?,
-            gdn_conv_state: scan("q4p_gdn_conv_state", Precision::Bf16)?,
-            gdn_prep: scan("q4p_gdn_prep", Precision::Bf16)?,
+            gdn: GdnChunk::new(
+                ChunkConv::new(
+                    scan("q4p_gdn_conv", Precision::Bf16)?,
+                    scan("q4p_gdn_conv_state", Precision::Bf16)?,
+                )?,
+                scan("q4p_gdn_prep", Precision::Bf16)?,
+                GatedNorm::new(scan("q4p_gdn_gate", Precision::Bf16)?)?,
+            )?,
             gdn_scan: scan("q4p_gdn_scan", Precision::Bf16)?,
             gdn_scan_64_64: scan("q4p_gdn_scan_64_64", Precision::Bf16)?,
             gdn_scan_128_256: scan("q4p_gdn_scan_128_256", Precision::Bf16)?,
-            gdn_gate: scan("q4p_gdn_gate", Precision::Bf16)?,
         })
     }
 }
@@ -1223,23 +1226,18 @@ impl DeviceSequence {
         let conv = (geometry.conv_width(), geometry.taps);
         let kernels = &self.backend.kernels.prefill;
         let [conv_out, ..] = inputs;
-        let call = gdn::conv_rows(
-            self.linear_qkv.0,
-            conv_state.0,
-            conv_weight.0,
-            conv_out.0,
-            conv,
-            batch,
-        );
-        self.launch(kernels.gdn_conv, call.grid, call.block, &call.args)?;
-        let call = gdn::conv_history(
-            self.linear_qkv.0,
-            conv_state.0,
+        kernels.gdn.conv.run(
+            self,
+            &ConvRows {
+                raw: self.linear_qkv,
+                history: conv_state,
+                weight: conv_weight,
+                out: conv_out,
+            },
             conv,
             batch,
             (snapshot, snapshot_rows, region_stride),
-        );
-        self.launch(kernels.gdn_conv_state, call.grid, call.block, &call.args)?;
+        )?;
         self.prof_mark("gdn_conv")?;
         self.gdn_recurrence(
             a_log,
@@ -1248,19 +1246,13 @@ impl DeviceSequence {
             (recurrent_state, recurrent_out),
             batch,
         )?;
-        let call = gdn::gated_norm(
-            (
-                self.linear_out.0,
-                self.linear_z.0,
-                norm.0,
-                self.linear_out.0,
-            ),
+        kernels.gdn.gate.run(
+            self,
+            (self.linear_out, self.linear_z, norm, self.linear_out),
             (geometry.heads, geometry.value_dim),
-            config.rms_norm_eps as f32,
-            config.output_gate_is_sigmoid(),
+            (config.rms_norm_eps as f32, config.output_gate_is_sigmoid()),
             batch,
-        );
-        self.launch(kernels.gdn_gate, call.grid, call.block, &call.args)?;
+        )?;
         self.prof_mark("gdn_recur")?;
         Ok(true)
     }
@@ -1284,17 +1276,14 @@ impl DeviceSequence {
         let geometry = self.backend.config.gdn_geometry();
         let kernels = &self.backend.kernels.prefill;
         let scratch = &self.prefill;
-        let call = geometry.prep(
-            conv.0,
-            a.0,
-            b.0,
-            a_log.0,
-            dt_bias.0,
-            scratch.gdn_qk.0,
-            scratch.gdn_decay_beta.0,
+        kernels.gdn.prep(
+            self,
+            &geometry,
+            (conv, a, b),
+            (a_log, dt_bias),
+            (scratch.gdn_qk, scratch.gdn_decay_beta),
             rows,
-        );
-        self.launch(kernels.gdn_prep, call.grid, call.block, &call.args)?;
+        )?;
         // The plan's scan: its kernel for the head widths and its grid ([ScanPlan]).
         let plan = match &self.backend.gdn_scan {
             Ok(Some(plan)) => plan,
@@ -1312,13 +1301,15 @@ impl DeviceSequence {
             .map_err(|error| BackendError::new("qwen4_prefill", error))?;
         // The verify's windows are the conv's snapshot; the recurrent state is replayed rather
         // than saved a row at a time, so the scan writes no snapshot of its own.
-        let args = geometry.scan_args(
-            (scratch.gdn_qk.0, scratch.gdn_decay_beta.0, conv.0),
-            (from.0, to.0),
-            self.linear_out.0,
+        kernels.gdn.scan(
+            self,
+            (scan, (launch.grid, launch.block)),
+            &geometry,
+            (scratch.gdn_qk, scratch.gdn_decay_beta, conv),
+            (from, to),
+            self.linear_out,
             rows,
-        );
-        self.launch(scan, launch.grid, launch.block, &args)?;
+        )?;
         Ok(true)
     }
 }

@@ -32,6 +32,7 @@ use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_model::BackendError;
 use sparkflash_ops::attention::GqaBody;
 use sparkflash_ops::calls::{self, RmsNorm, Rope};
+use sparkflash_ops::gdn::ConvRows;
 use sparkflash_ops::indexer::IndexerPass;
 use sparkflash_ops::roles::{ExpertRows, ExpertShape, GqaRows, GqaShape, Injection, Launcher};
 
@@ -497,22 +498,17 @@ impl DeviceSequence {
                 (conv_snapshot, snapshot_rows, region_stride),
             )?;
         if !chunked {
-            self.launch(
-                kernels.gdn_conv,
-                (config.linear_conv_width().div_ceil(256).max(1) as u32, 1, 1),
-                (256, 1, 1),
-                &[
-                    self.linear_qkv.0,
-                    conv_state.0,
-                    conv.0,
-                    conv_out.0,
-                    config.linear_conv_width() as u64,
-                    config.linear_conv_kernel_dim as u64,
-                    batch as u64,
-                    conv_snapshot,
-                    snapshot_rows as u64,
-                    region_stride,
-                ],
+            kernels.gdn_conv.run(
+                self,
+                &ConvRows {
+                    raw: self.linear_qkv,
+                    history: conv_state,
+                    weight: *conv,
+                    out: conv_out,
+                },
+                (config.linear_conv_width(), config.linear_conv_kernel_dim),
+                batch,
+                (conv_snapshot, snapshot_rows, region_stride),
             )?;
             self.probe_finite(
                 index,

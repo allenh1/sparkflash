@@ -400,7 +400,7 @@ impl Embed {
 }
 
 /// Whether `kernel` is `symbol`, the kernel `role` runs.
-fn runs(kernel: Bound, symbol: &str, role: &str) -> Result<(), BackendError> {
+pub(crate) fn runs(kernel: Bound, symbol: &str, role: &str) -> Result<(), BackendError> {
     let name = kernel.kernel().name();
     if name == symbol {
         Ok(())

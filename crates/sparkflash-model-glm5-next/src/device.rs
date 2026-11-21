@@ -106,7 +106,9 @@ use sparkflash_ops::formats::{
     Bf16, CodePlanes, F32 as F32Format, FormatKind, Fp8E4m3, Mat, Scales, Tensor,
     upload as upload_format,
 };
-use sparkflash_ops::gdn::{self, CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE};
+use sparkflash_ops::gdn::{
+    CONV_HISTORY, ChunkConv, ConvRows, GDN_KEY, GDN_QK_ROW, GDN_VALUE, GatedNorm, TokenConv,
+};
 use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
@@ -507,7 +509,7 @@ struct Kernels {
     mhc_post: Bound,
     sum_slots: Bound,
     norm: Norm,
-    conv: Bound,
+    conv: TokenConv,
     kda_decay: Bound,
     recur: Bound,
     /// A bulk chunk's convolution and recurrence (Qwen's prefill image,
@@ -515,11 +517,10 @@ struct Kernels {
     /// advanced, the token kernel's products in its order; the rows' normed q and k and beta,
     /// the scan with the state in registers, and the gated norm. The token kernels ([Self::conv],
     /// [Self::recur]) stay the decode and verify path, whose bits a replay is defined by.
-    conv_rows: Bound,
-    conv_history: Bound,
+    chunk_conv: ChunkConv,
     kda_prep: Bound,
     kda_scan: Bound,
-    kda_gate: Bound,
+    kda_gate: GatedNorm,
     copy_flat: Bound,
     layer_norm: LayerNorm,
     pool: Bound,
@@ -734,14 +735,16 @@ impl Kernels {
                 token("q4e_rmsnorm", Precision::Bf16)?,
                 Some(token("q4e_rmsnorm_rows", Precision::Bf16)?),
             )?,
-            conv: token("q4e_gdn_conv", Precision::Bf16)?,
+            conv: TokenConv::new(token("q4e_gdn_conv", Precision::Bf16)?)?,
             kda_decay: token("q4e_kda_decay", Precision::Bf16)?,
             recur,
-            conv_rows: scan("q4p_gdn_conv", Precision::Bf16)?,
-            conv_history: scan("q4p_gdn_conv_state", Precision::Bf16)?,
+            chunk_conv: ChunkConv::new(
+                scan("q4p_gdn_conv", Precision::Bf16)?,
+                scan("q4p_gdn_conv_state", Precision::Bf16)?,
+            )?,
             kda_prep: scan("q4p_kda_prep", Precision::Bf16)?,
             kda_scan: scan("q4p_kda_scan", Precision::Bf16)?,
-            kda_gate: scan("q4p_gdn_gate", Precision::Bf16)?,
+            kda_gate: GatedNorm::new(scan("q4p_gdn_gate", Precision::Bf16)?)?,
             copy_flat: token("q4e_copy_flat", Precision::F32)?,
             layer_norm: LayerNorm::new(decode("q4e_layer_norm", Precision::Bf16)?)?,
             pool: decode("q4e_glm_pool", Precision::Bf16)?,
@@ -4596,27 +4599,18 @@ impl DeviceRank {
             let SequenceLayer::Linear { conv, .. } = &run.layers[layer] else {
                 return Err(other_kind());
             };
-            let (raw, mixed) = (
-                own.fused.offset(floats(run.first * mixes)),
-                own.mixed.offset(floats(run.first * mixes)),
-            );
+            let rows_in = ConvRows {
+                raw: own.fused.offset(floats(run.first * mixes)),
+                history: *conv,
+                weight: kda.conv,
+                out: own.mixed.offset(floats(run.first * mixes)),
+            };
+            let width = (mixes, config.linear_conv_kernel_dim);
             if self.bulk(run) {
-                let width = (mixes, config.linear_conv_kernel_dim);
-                let call = gdn::conv_rows(raw.0, conv.0, kda.conv.0, mixed.0, width, run.len);
-                self.launch(
-                    self.kernels.conv_rows.kernel(),
-                    call.grid,
-                    call.block.0,
-                    &call.args,
-                )?;
                 // A chunk never verifies, so it keeps no windows.
-                let call = gdn::conv_history(raw.0, conv.0, width, run.len, (0, 0, 0));
-                self.launch(
-                    self.kernels.conv_history.kernel(),
-                    call.grid,
-                    call.block.0,
-                    &call.args,
-                )?;
+                self.kernels
+                    .chunk_conv
+                    .run(self, &rows_in, width, run.len, (0, 0, 0))?;
                 continue;
             }
             // A verify keeps the windows after each of its rows but the last, for a commit that
@@ -4629,22 +4623,12 @@ impl DeviceRank {
             } else {
                 (0, 0)
             };
-            self.launch(
-                self.kernels.conv.kernel(),
-                (blocks(mixes), 1, 1),
-                BLOCK,
-                &[
-                    raw.0,
-                    conv.0,
-                    kda.conv.0,
-                    mixed.0,
-                    mixes as u64,
-                    config.linear_conv_kernel_dim as u64,
-                    run.len as u64,
-                    windows,
-                    kept as u64,
-                    window as u64,
-                ],
+            self.kernels.conv.run(
+                self,
+                &rows_in,
+                width,
+                run.len,
+                (windows, kept, window as u64),
             )?;
         }
         self.gemv(&kda.f_b, f_a, s.forget, rows)?;
@@ -4810,18 +4794,12 @@ impl DeviceRank {
             ],
         )?;
         // The sigmoid output gate.
-        let call = gdn::gated_norm(
-            (out.0, gate.0, kda.o_norm.0, out.0),
+        self.kernels.kda_gate.run(
+            self,
+            (out, gate, kda.o_norm, out),
             (heads, GDN_VALUE),
-            config.rms_norm_eps as f32,
-            true,
+            (config.rms_norm_eps as f32, true),
             len,
-        );
-        self.launch(
-            self.kernels.kda_gate.kernel(),
-            call.grid,
-            call.block.0,
-            &call.args,
         )
     }
 

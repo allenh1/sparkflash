@@ -107,6 +107,7 @@ use prefill::{PrefillKernels, PrefillScratch, Projection};
 use sparkflash_ops::attention::{GQA_GROUP_KERNELS, gqa_group_shared_bytes};
 use sparkflash_ops::calls::{self, RmsNorm};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
+use sparkflash_ops::gdn::TokenConv;
 pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
 use sparkflash_ops::moe::Launch;
@@ -622,7 +623,8 @@ struct Kernels {
     fold_streams: Bound,
     widen_streams: Bound,
     combine: Combine,
-    gdn_conv: Bound,
+    /// The token path's conv; the recurrence is Qwen's own.
+    gdn_conv: TokenConv,
     gdn_recur: Bound,
     /// The sparse layers' grouped-query attention after their projections, ATTENTION_CHUNK rows a
     /// full attention launch.
@@ -788,7 +790,7 @@ impl Kernels {
             fold_streams: token("q4e_fold_streams", Precision::F32)?,
             widen_streams: token("q4e_widen_streams", Precision::F32)?,
             combine: Combine::new(moe("q4e_moe_combine", Precision::Bf16)?)?,
-            gdn_conv: token("q4e_gdn_conv", Precision::Bf16)?,
+            gdn_conv: TokenConv::new(token("q4e_gdn_conv", Precision::Bf16)?)?,
             gdn_recur: staged("q4e_gdn_recur", Precision::Bf16, gdn_stage_bytes)?,
             // Every causal position, split over the context, and the splits' fold, is the
             // attention of a configuration with no sparse indexer

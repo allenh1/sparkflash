@@ -87,7 +87,7 @@ use sparkflash_ops::formats::{
     Bf16, F32 as F32Format, FormatKind, Fp8E4m3, Mat, NvFp4, PackedBf16, PackedOrder, Scales,
     Tensor, upload as upload_format,
 };
-use sparkflash_ops::gdn::{self, GdnGeometry, gdn_qk_row};
+use sparkflash_ops::gdn::{ChunkConv, ConvRows, GatedNorm, GdnChunk, GdnGeometry, gdn_qk_row};
 use sparkflash_ops::gemv::{
     CudaHandle, E4M3_TILE, GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3Tile, TILED_GEMV_BLOCKS,
     TILED_GEMV_PARTIALS, gemv_e4m3_tile,
@@ -672,13 +672,11 @@ struct Kernels {
 /// ([sparkflash_ops::gdn]) with the scan the [ScanPlan] resolves, and the zero a reset state takes.
 #[derive(Clone, Copy)]
 struct GdnKernels {
-    conv: Bound,
-    history: Bound,
-    prep: Bound,
+    /// The conv, prep and gated norm.
+    chunk: GdnChunk,
     scan: Bound,
     /// The plan's scan grid and block.
     scan_launch: ((u32, u32, u32), (u32, u32, u32)),
-    gate: Bound,
     zero: Bound,
 }
 
@@ -812,12 +810,13 @@ impl Kernels {
                     )
                 };
                 Some(GdnKernels {
-                    conv: scan("q4p_gdn_conv")?,
-                    history: scan("q4p_gdn_conv_state")?,
-                    prep: scan("q4p_gdn_prep")?,
+                    chunk: GdnChunk::new(
+                        ChunkConv::new(scan("q4p_gdn_conv")?, scan("q4p_gdn_conv_state")?)?,
+                        scan("q4p_gdn_prep")?,
+                        GatedNorm::new(scan("q4p_gdn_gate")?)?,
+                    )?,
                     scan: scan(launch.kernel.symbol)?,
                     scan_launch: (launch.grid, launch.block),
-                    gate: scan("q4p_gdn_gate")?,
                     zero: token("q4e_zero", Precision::Bf16)?,
                 })
             }
@@ -2623,6 +2622,7 @@ impl Shared {
         self.project(&gdn.z, b, b.normed.0, b.gdn_z.0, rows, policy)?;
         self.project(&gdn.b, b, b.normed.0, b.gdn_b.0, rows, policy)?;
         self.project(&gdn.a, b, b.normed.0, b.gdn_a.0, rows, policy)?;
+        let chunk = &kernels.chunk;
         let mut first = 0usize;
         for (sequence, tokens) in segments {
             let &[history, _] = sequence.lane.regions[slot].as_slice() else {
@@ -2631,38 +2631,24 @@ impl Shared {
                 ));
             };
             let count = tokens.len();
-            let at = (first * width * 4) as u64;
-            self.call(
-                kernels.conv,
-                gdn::conv_rows(
-                    b.gdn_raw.0 + at,
-                    history.0,
-                    gdn.conv.0,
-                    b.gdn_mixed.0 + at,
-                    conv,
-                    count,
-                ),
-            )?;
-            self.call(
-                kernels.history,
-                gdn::conv_history(b.gdn_raw.0 + at, history.0, conv, count, (0, 0, 0)),
-            )?;
+            let at = first * width * 4;
+            let conv_rows = ConvRows {
+                raw: b.gdn_raw.offset(at),
+                history,
+                weight: gdn.conv,
+                out: b.gdn_mixed.offset(at),
+            };
+            chunk.conv.run(self, &conv_rows, conv, count, (0, 0, 0))?;
             first += count;
         }
-        self.call(
-            kernels.prep,
-            geometry.prep(
-                b.gdn_mixed.0,
-                b.gdn_a.0,
-                b.gdn_b.0,
-                gdn.a_log.0,
-                gdn.dt_bias.0,
-                b.gdn_qk.0,
-                b.gdn_decay.0,
-                rows,
-            ),
+        chunk.prep(
+            self,
+            &geometry,
+            (b.gdn_mixed, b.gdn_a, b.gdn_b),
+            (gdn.a_log, gdn.dt_bias),
+            (b.gdn_qk, b.gdn_decay),
+            rows,
         )?;
-        let (grid, block) = kernels.scan_launch;
         let qk_row = geometry.key_heads * gdn_qk_row(geometry.key_dim) * 4;
         let mut first = 0usize;
         for (sequence, tokens) in segments {
@@ -2672,32 +2658,27 @@ impl Shared {
                 ));
             };
             let count = tokens.len();
-            let args = geometry.scan_args(
+            chunk.scan(
+                self,
+                (kernels.scan, kernels.scan_launch),
+                &geometry,
                 (
-                    b.gdn_qk.0 + (first * qk_row) as u64,
-                    b.gdn_decay.0 + (first * geometry.heads * 8) as u64,
-                    b.gdn_mixed.0 + (first * width * 4) as u64,
+                    b.gdn_qk.offset(first * qk_row),
+                    b.gdn_decay.offset(first * geometry.heads * 8),
+                    b.gdn_mixed.offset(first * width * 4),
                 ),
-                (state.0, state.0),
-                b.attended.0 + (first * geometry.value_width() * 4) as u64,
+                (state, state),
+                b.attended.offset(first * geometry.value_width() * 4),
                 count,
-            );
-            self.cuda
-                .launch_async(kernels.scan.kernel(), grid, block, &args)
-                .map_err(|error| {
-                    BackendError::new(DEVICE, format!("{}: {error}", kernels.scan.kernel().name()))
-                })?;
+            )?;
             first += count;
         }
-        self.call(
-            kernels.gate,
-            gdn::gated_norm(
-                (b.attended.0, b.gdn_z.0, gdn.norm.0, b.attended.0),
-                (geometry.heads, geometry.value_dim),
-                self.eps,
-                linear.sigmoid,
-                rows,
-            ),
+        chunk.gate.run(
+            self,
+            (b.attended, b.gdn_z, gdn.norm, b.attended),
+            (geometry.heads, geometry.value_dim),
+            (self.eps, linear.sigmoid),
+            rows,
         )
     }
 

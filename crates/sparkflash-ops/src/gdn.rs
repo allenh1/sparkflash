@@ -22,7 +22,12 @@
 //! ([gated_norm]). Qwen's, GLM's and the shared dense arm's launches are built here, so each
 //! spells the kernels' argument order once.
 
+use sparkflash_kernels::cuda_driver::Deviceptr;
+use sparkflash_model::backend::BackendError;
+
 use crate::calls::{BLOCK, Call, flat_blocks};
+use crate::moe::Launch;
+use crate::roles::{Bound, Launcher, runs};
 
 /// The key head width the scan is compiled for.
 pub const GDN_KEY: usize = 128;
@@ -281,6 +286,263 @@ pub fn gated_norm(
             u64::from(eps.to_bits()),
             u64::from(sigmoid),
         ],
+    }
+}
+
+/// Four device rows a conv reads and writes: the raw rows, the history before them, the depthwise
+/// weights and the convolved rows.
+#[derive(Clone, Copy, Debug)]
+pub struct ConvRows {
+    /// The raw rows, `[rows][width]` f32.
+    pub raw: Deviceptr,
+    /// The history before them, advanced past them in place.
+    pub history: Deviceptr,
+    /// The depthwise weights, `[width][taps]`.
+    pub weight: Deviceptr,
+    /// The convolved rows (SiLU applied), `[rows][width]` f32.
+    pub out: Deviceptr,
+}
+
+/// The chunk path's causal conv: `q4p_gdn_conv` over the rows from the history ([conv_rows]),
+/// then `q4p_gdn_conv_state` advancing it past them ([conv_history]). Gated DeltaNet's (dense,
+/// Qwen) and Kimi Delta Attention's (GLM) chunks take it.
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkConv {
+    rows: Bound,
+    history: Bound,
+}
+
+impl ChunkConv {
+    /// The kernels in the order [Self::new] takes them.
+    pub const SYMBOLS: [&'static str; 2] = ["q4p_gdn_conv", "q4p_gdn_conv_state"];
+
+    /// The loaded [Self::SYMBOLS].
+    ///
+    /// # Errors
+    /// Another kernel in a place, by name.
+    pub fn new(rows: Bound, history: Bound) -> Result<Self, String> {
+        for (kernel, symbol) in [rows, history].into_iter().zip(Self::SYMBOLS) {
+            runs(kernel, symbol, "the chunk conv").map_err(|error| error.to_string())?;
+        }
+        Ok(Self { rows, history })
+    }
+
+    /// `rows` rows `(width, taps)` wide, then the history past them, a verify's `snapshot` kept
+    /// as [conv_history] keeps it.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        conv: &ConvRows,
+        shape: (usize, usize),
+        rows: usize,
+        snapshot: (u64, usize, u64),
+    ) -> Result<(), BackendError> {
+        let ConvRows {
+            raw,
+            history,
+            weight,
+            out,
+        } = *conv;
+        cx.call(
+            self.rows,
+            conv_rows(raw.0, history.0, weight.0, out.0, shape, rows),
+        )?;
+        cx.call(
+            self.history,
+            conv_history(raw.0, history.0, shape, rows, snapshot),
+        )
+    }
+}
+
+/// The token path's causal conv, `q4e_gdn_conv`: the rows convolved and the history advanced in
+/// one launch, a block a 256-float slice of the width, a verify's windows after each of its first
+/// rows kept. Qwen's Gated DeltaNet steps and GLM's KDA steps take it.
+#[derive(Clone, Copy, Debug)]
+pub struct TokenConv {
+    kernel: Bound,
+}
+
+impl TokenConv {
+    /// The kernel.
+    pub const SYMBOL: &'static str = "q4e_gdn_conv";
+
+    /// The loaded [Self::SYMBOL].
+    ///
+    /// # Errors
+    /// Another kernel, by name.
+    pub fn new(kernel: Bound) -> Result<Self, String> {
+        runs(kernel, Self::SYMBOL, "the token conv").map_err(|error| error.to_string())?;
+        Ok(Self { kernel })
+    }
+
+    /// `rows` rows `(width, taps)` wide; `snapshot` is (windows, rows, window stride): window r
+    /// receives the history after row r for the first `rows` rows, (0, 0, 0) keeps none.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        conv: &ConvRows,
+        (width, taps): (usize, usize),
+        rows: usize,
+        (windows, kept, stride): (u64, usize, u64),
+    ) -> Result<(), BackendError> {
+        cx.launch(
+            self.kernel,
+            ((flat_blocks(width), 1, 1), (BLOCK, 1, 1)),
+            &[
+                conv.raw.0,
+                conv.history.0,
+                conv.weight.0,
+                conv.out.0,
+                width as u64,
+                taps as u64,
+                rows as u64,
+                windows,
+                kept as u64,
+                stride,
+            ],
+        )
+    }
+}
+
+/// The gated RMSNorm after a chunk's scan, `q4p_gdn_gate` ([gated_norm]): Gated DeltaNet's
+/// (sigmoid or SiLU gate) and KDA's (sigmoid).
+#[derive(Clone, Copy, Debug)]
+pub struct GatedNorm {
+    kernel: Bound,
+}
+
+impl GatedNorm {
+    /// The kernel.
+    pub const SYMBOL: &'static str = "q4p_gdn_gate";
+
+    /// The loaded [Self::SYMBOL].
+    ///
+    /// # Errors
+    /// Another kernel, by name.
+    pub fn new(kernel: Bound) -> Result<Self, String> {
+        runs(kernel, Self::SYMBOL, "the gated norm").map_err(|error| error.to_string())?;
+        Ok(Self { kernel })
+    }
+
+    /// [gated_norm] over `rows` rows.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        rows_in: (Deviceptr, Deviceptr, Deviceptr, Deviceptr),
+        (heads, value_dim): (usize, usize),
+        (eps, sigmoid): (f32, bool),
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        let (raw, z, norm, out) = rows_in;
+        cx.call(
+            self.kernel,
+            gated_norm(
+                (raw.0, z.0, norm.0, out.0),
+                (heads, value_dim),
+                eps,
+                sigmoid,
+                rows,
+            ),
+        )
+    }
+}
+
+/// The scan image's Gated DeltaNet scans a [crate::scan::ScanPlan] names, by head widths.
+pub const GDN_SCANS: [&str; 3] = ["q4p_gdn_scan", "q4p_gdn_scan_64_64", "q4p_gdn_scan_128_256"];
+
+/// A Gated DeltaNet layer's chunk path after its projections, in its step order: the conv
+/// ([ChunkConv]); the prep over the convolved rows ([Self::prep]); the scan with the state in
+/// registers on the plan's kernel and grid ([Self::scan]); and the gated norm ([GatedNorm]). Each
+/// arm runs the steps over the rows it holds a sequence at a time where a step reads a state.
+#[derive(Clone, Copy, Debug)]
+pub struct GdnChunk {
+    /// The conv and the history advanced past it.
+    pub conv: ChunkConv,
+    prep: Bound,
+    /// The gated norm after the scan.
+    pub gate: GatedNorm,
+}
+
+impl GdnChunk {
+    /// The prep's kernel.
+    pub const PREP: &'static str = "q4p_gdn_prep";
+
+    /// The steps, `prep` the loaded [Self::PREP].
+    ///
+    /// # Errors
+    /// Another prep kernel, by name.
+    pub fn new(conv: ChunkConv, prep: Bound, gate: GatedNorm) -> Result<Self, String> {
+        runs(prep, Self::PREP, "the Gated DeltaNet prep").map_err(|error| error.to_string())?;
+        Ok(Self { conv, prep, gate })
+    }
+
+    /// [GdnGeometry::prep] over `rows` convolved rows and their `a` and `b` logits.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prep<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        geometry: &GdnGeometry,
+        (mixed, a, b): (Deviceptr, Deviceptr, Deviceptr),
+        (a_log, dt_bias): (Deviceptr, Deviceptr),
+        (qk, decay_beta): (Deviceptr, Deviceptr),
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        cx.call(
+            self.prep,
+            geometry.prep(
+                mixed.0,
+                a.0,
+                b.0,
+                a_log.0,
+                dt_bias.0,
+                qk.0,
+                decay_beta.0,
+                rows,
+            ),
+        )
+    }
+
+    /// The scan over `rows` prepared rows ([GdnGeometry::scan_args]) on `scan`, one of
+    /// [GDN_SCANS], at the plan's `launch`.
+    ///
+    /// # Errors
+    /// Another scan kernel, by name, or the driver's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        (scan, launch): (Bound, Launch),
+        geometry: &GdnGeometry,
+        staged: (Deviceptr, Deviceptr, Deviceptr),
+        (from, to): (Deviceptr, Deviceptr),
+        out: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        let name = scan.kernel().name();
+        if !GDN_SCANS.contains(&name) {
+            return Err(BackendError::new(
+                "role",
+                format!("the Gated DeltaNet scan runs one of {GDN_SCANS:?}, not {name}"),
+            ));
+        }
+        let (qk, decay_beta, mixed) = staged;
+        cx.launch(
+            scan,
+            launch,
+            &geometry.scan_args((qk.0, decay_beta.0, mixed.0), (from.0, to.0), out.0, rows),
+        )
     }
 }
 
