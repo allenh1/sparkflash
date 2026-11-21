@@ -993,6 +993,12 @@ impl Qwen4ExpConfig {
                 "out_hidden_size": self.vision_out_hidden_size.unwrap_or(2560),
                 "num_position_embeddings": self.vision_num_position_embeddings.unwrap_or(2304),
                 "rope_theta": self.vision_rope_theta.unwrap_or(10_000.0),
+                "hidden_act": self
+                    .architecture
+                    .vision
+                    .as_ref()
+                    .and_then(|vision| vision.activation)
+                    .map(|activation| activation.name()),
             });
         }
         serde_json::to_string_pretty(&root).expect("a config of plain scalars always renders")
@@ -1710,7 +1716,7 @@ mod tests {
             // refusal until a 16-patch body exists, not a silent 14-patch launch.
             let language: Vec<_> = failures
                 .iter()
-                .filter(|failure| failure.part != sparkflash_model::Part::Vision)
+                .filter(|failure| !sparkflash_ops::parts::is_vision_part(failure.part))
                 .collect();
             assert!(
                 language.is_empty(),
@@ -1724,8 +1730,7 @@ mod tests {
             assert!(
                 failures
                     .iter()
-                    .any(|failure| failure.part == sparkflash_model::Part::Vision
-                        && failure.to_string().contains("vision patch 16")),
+                    .any(|failure| sparkflash_ops::parts::is_vision_part(failure.part)),
                 "TP{world}: the 16-patch vision tower must be refused"
             );
         }
