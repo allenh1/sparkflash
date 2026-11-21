@@ -2215,6 +2215,7 @@ impl Cuda {
                 name(r)
             ));
         }
+        crate::launch_trace::note_stream(stream as usize as u64);
         let begin: libloading::Symbol<unsafe extern "C" fn(CuStream, u32) -> CuResult> = match self
             .sym(b"cuStreamBeginCapture_v2")
         {
@@ -2530,6 +2531,15 @@ impl Cuda {
             shared_bytes: kernel.shared_bytes,
             args: args.to_vec(),
         };
+        crate::launch_trace::note_launch(
+            kernel.name,
+            grid,
+            block,
+            kernel.shared_bytes,
+            0,
+            programmatic(&kernel),
+            args,
+        );
         match mode {
             GRAPH_RECORD => {
                 control.records.push(record);
@@ -2755,6 +2765,7 @@ impl Cuda {
             }
             *total += bytes;
             note_alloc();
+            crate::launch_trace::note_range(p, bytes);
             Ok(Deviceptr(p))
         }
     }
@@ -2851,6 +2862,7 @@ impl Cuda {
             }
             *total += bytes;
             note_alloc();
+            crate::launch_trace::note_range(p, bytes);
             Ok(Deviceptr(p))
         }
     }
@@ -2904,6 +2916,7 @@ impl Cuda {
             }
             *total += bytes;
             note_alloc();
+            crate::launch_trace::note_range(device, bytes);
             Ok(HostMapped {
                 host,
                 device: Deviceptr(device),
@@ -3001,6 +3014,7 @@ impl Cuda {
             }
             *total += len;
             note_alloc();
+            crate::launch_trace::note_range(device, len);
             Ok(RegisteredMmap {
                 mmap,
                 host,
@@ -3113,6 +3127,7 @@ impl Cuda {
         if r != 0 {
             return Err(format!("cuMemAddressReserve({bytes}) failed: {}", name(r)));
         }
+        crate::launch_trace::note_range(base, bytes);
         Ok(Deviceptr(base))
     }
 
@@ -4229,7 +4244,17 @@ impl Cuda {
         args: &[u64],
     ) -> Result<(), String> {
         let (_storage, mut ptrs) = Cuda::kernel_params(args);
-        let r = if programmatic(&kernel) {
+        let programmatic = programmatic(&kernel);
+        crate::launch_trace::note_launch(
+            kernel.name,
+            grid,
+            block,
+            kernel.shared_bytes,
+            stream as usize as u64,
+            programmatic,
+            args,
+        );
+        let r = if programmatic {
             let launch_ex: libloading::Symbol<LaunchExFn> = self.sym(b"cuLaunchKernelEx")?;
             let mut attribute = CuLaunchAttribute {
                 id: CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
@@ -4300,6 +4325,7 @@ impl Cuda {
         if r != 0 {
             return Err(format!("cuStreamCreate for the run stream failed: {r}"));
         }
+        crate::launch_trace::note_stream(stream as usize as u64);
         Ok(RunStream { stream })
     }
 
@@ -4603,6 +4629,7 @@ impl Cuda {
         if r != 0 {
             return Err(format!("cuStreamCreate for the side stream failed: {r}"));
         }
+        crate::launch_trace::note_stream(stream as usize as u64);
         let r = unsafe { event_create(&mut event, CU_EVENT_DISABLE_TIMING) };
         if r != 0 {
             return Err(format!("cuEventCreate for the side stream failed: {r}"));
@@ -4674,6 +4701,7 @@ impl Cuda {
         if r != 0 {
             return Err(format!("cuStreamCreateWithPriority failed: {r}"));
         }
+        crate::launch_trace::note_stream(stream as usize as u64);
         Ok(stream)
     }
 

@@ -68,6 +68,7 @@ pub mod index_channels;
 pub mod kv_path_launch;
 pub mod kv_path_ref;
 pub mod lane_memory;
+pub mod launch_trace;
 pub mod layer_seams_launch;
 pub mod layer_seams_ref;
 pub mod lm_head_reduce_launch;
