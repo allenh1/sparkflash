@@ -681,7 +681,6 @@ fn every_released_document_boot_checks_or_is_an_explicit_refusal() {
                     errors.len()
                 );
             }
-
         } else {
             result.unwrap_or_else(|errors| panic!("{}: {errors:?}", document.name));
         }
@@ -1056,7 +1055,10 @@ fn the_released_qwen_vision_patch_is_refused() {
         .unwrap_or_else(|| panic!("no vision failure: {failures:?}"));
     let message = failure.to_string();
     assert!(message.contains("vision"), "{message}");
-    assert!(message.contains("hidden 1152 does not equal 1024"), "{message}");
+    assert!(
+        message.contains("hidden 1152 does not equal 1024"),
+        "{message}"
+    );
 }
 
 #[test]

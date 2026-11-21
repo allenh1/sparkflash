@@ -234,9 +234,21 @@ fn the_scan_agrees_with_the_plan_on_every_released_config() {
             path.display(),
             report.error
         );
-        assert_eq!(report.rows.len(), plan.requirements().count());
+        let kernel_rows: Vec<_> = report
+            .rows
+            .iter()
+            .filter(|row| {
+                !matches!(
+                    row.status,
+                    sparkflash_ops::scan::ScanStatus::UnknownKey { .. }
+                        | sparkflash_ops::scan::ScanStatus::UnclaimedTensor { .. }
+                        | sparkflash_ops::scan::ScanStatus::UnknownLayout { .. }
+                )
+            })
+            .collect();
+        assert_eq!(kernel_rows.len(), plan.requirements().count());
         let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
-        for (row, requirement) in report.rows.iter().zip(plan.requirements()) {
+        for (row, requirement) in kernel_rows.into_iter().zip(plan.requirements()) {
             let resolved = resolver
                 .resolve_for(requirement, KernelPhase::Prefill)
                 .is_ok()
@@ -389,9 +401,9 @@ fn the_deepseek_forward_is_out_of_the_cli_and_the_cli_is_below_34k_lines() {
 
 #[test]
 fn each_released_vision_tower_is_a_stack_of_named_components() {
-    use sparkflash_model::{Part, Target};
-    use sparkflash_ops::scan::{scan, ScanInputs};
     use sparkflash_model::stack::StackKind;
+    use sparkflash_model::{Part, Target};
+    use sparkflash_ops::scan::{ScanInputs, scan};
 
     const DEEPSEEK: &str =
         include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
@@ -419,7 +431,13 @@ fn each_released_vision_tower_is_a_stack_of_named_components() {
             .iter()
             .filter(|row| row.stack == StackKind::Vision)
             .collect();
-        assert_eq!(vision.len(), rows, "{name}: {}\n{}", vision.len(), report.render());
+        assert_eq!(
+            vision.len(),
+            rows,
+            "{name}: {}\n{}",
+            vision.len(),
+            report.render()
+        );
         for row in &vision {
             assert!(
                 row.status.is_resolved() || row.status.fix().is_some(),
@@ -429,7 +447,11 @@ fn each_released_vision_tower_is_a_stack_of_named_components() {
             );
         }
         assert_eq!(
-            report.rows.iter().filter(|row| row.stack == StackKind::Vision).all(|row| row.status.is_resolved()),
+            report
+                .rows
+                .iter()
+                .filter(|row| row.stack == StackKind::Vision)
+                .all(|row| row.status.is_resolved()),
             resolved,
             "{name}:\n{}",
             report.render()
@@ -441,8 +463,5 @@ fn each_released_vision_tower_is_a_stack_of_named_components() {
         sparkflash_ops::parts::kernels(Part::Vision, Target::Sm121).count(),
         0
     );
-    assert!(
-        sparkflash_ops::parts::kernels(Part::VisionPatchEmbed, Target::Sm121).count() > 0
-    );
+    assert!(sparkflash_ops::parts::kernels(Part::VisionPatchEmbed, Target::Sm121).count() > 0);
 }
-

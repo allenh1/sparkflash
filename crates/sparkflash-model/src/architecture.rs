@@ -894,8 +894,7 @@ impl Architecture {
         text: &str,
         tensors: Option<&[String]>,
     ) -> Result<Self, ConfigError> {
-        let (parsed, _coverage) =
-            Self::from_json_with_coverage_and_tensor_names(text, tensors)?;
+        let (parsed, _coverage) = Self::from_json_with_coverage_and_tensor_names(text, tensors)?;
         Ok(parsed)
     }
 
@@ -950,8 +949,7 @@ impl Architecture {
         root: &Value,
         tensors: Option<&[String]>,
     ) -> Result<Self, ConfigError> {
-        let (parsed, _coverage) =
-            Self::from_value_with_coverage_and_tensor_names(root, tensors)?;
+        let (parsed, _coverage) = Self::from_value_with_coverage_and_tensor_names(root, tensors)?;
         Ok(parsed)
     }
 
@@ -1005,6 +1003,7 @@ impl Architecture {
         let mtp = mtp(root, text, hidden_size)?;
         let tokens = tokens(root, text)?;
         let inkling = inkling(text, root, vocab_size)?;
+        record_arm_consumed(root);
 
         Ok(Self {
             family,
@@ -3124,9 +3123,7 @@ fn vision(
         .and_then(serde_json::Value::as_u64)
         .is_some_and(|ratio| ratio > 1)
     {
-        Some(VisionDownsample::Unfold(
-            geometry.spatial_merge_size.max(1),
-        ))
+        Some(VisionDownsample::Unfold(geometry.spatial_merge_size.max(1)))
     } else if geometry.spatial_merge_size > 1 {
         // A tower that declares an RMS epsilon and a merger MLP downsamples through a learned
         // merge-cell projection; one that declares a layer norm and a merger width reshapes the
@@ -3173,9 +3170,7 @@ fn vision(
         } else if any(".merger.linear_fc1") || any(".proj_in.") {
             downsample = Some(VisionDownsample::Merge(geometry.spatial_merge_size.max(1)));
         } else if any("aligner.w1") {
-            downsample = Some(VisionDownsample::Unfold(
-                geometry.spatial_merge_size.max(1),
-            ));
+            downsample = Some(VisionDownsample::Unfold(geometry.spatial_merge_size.max(1)));
         }
         merger_final_norm = any("merger.post_projection_norm")
             || any("merger.norm.weight")
@@ -3230,6 +3225,112 @@ fn vision(
     }))
 }
 
+/// Record the keys the arms' typed parsers consume beyond the shared walk.
+///
+/// The shared [Architecture] reader is deliberately smaller than the per-arm readers; a key that
+/// only an arm's typed configuration reads is still consumed by the checkpoint, not ignored. This
+/// list is the reader's acknowledgement of those keys: it is keyed by full structural path, never
+/// by a model name, and a path absent from a document records nothing present.
+fn record_arm_consumed(root: &Value) {
+    const PATHS: &[&str] = &[
+        "language_model_only",
+        "mlp_bias",
+        "mtp_config.head_dim",
+        "mtp_config.hidden_size",
+        "mtp_config.intermediate_size",
+        "mtp_config.local_layer_ids",
+        "mtp_config.markov_head_type",
+        "mtp_config.markov_rank",
+        "mtp_config.max_position_embeddings",
+        "mtp_config.num_attention_heads",
+        "mtp_config.num_key_value_heads",
+        "mtp_config.o_bias",
+        "mtp_config.q_bias",
+        "mtp_config.rms_norm_eps",
+        "mtp_config.rope_theta",
+        "mtp_config.sliding_window_size",
+        "ngpt_alpha_init",
+        "quantization_config.config_groups",
+        "quantization_config.config_groups.group_0",
+        "quantization_config.config_groups.group_0.input_activations",
+        "quantization_config.config_groups.group_0.input_activations.dynamic",
+        "quantization_config.config_groups.group_0.input_activations.group_size",
+        "quantization_config.config_groups.group_0.input_activations.num_bits",
+        "quantization_config.config_groups.group_0.input_activations.type",
+        "quantization_config.config_groups.group_0.targets",
+        "quantization_config.config_groups.group_0.weights",
+        "quantization_config.config_groups.group_0.weights.dynamic",
+        "quantization_config.config_groups.group_0.weights.group_size",
+        "quantization_config.config_groups.group_0.weights.num_bits",
+        "quantization_config.config_groups.group_0.weights.type",
+        "quantization_config.config_groups.group_1",
+        "quantization_config.config_groups.group_1.targets",
+        "quantization_config.config_groups.group_1.weights",
+        "quantization_config.config_groups.group_1.weights.dynamic",
+        "quantization_config.config_groups.group_1.weights.group_size",
+        "quantization_config.config_groups.group_1.weights.num_bits",
+        "quantization_config.config_groups.group_1.weights.type",
+        "quantization_config.group_size",
+        "quantization_config.kv_cache_quant_algo",
+        "quantization_config.modules_to_not_convert",
+        "quantization_config.quantized_layers.model.language_model.layers.1.ple.ple_embedding.ngram_embedding.quant_algo",
+        "rope_parameters.full_attention.rope_type",
+        "rope_parameters.sliding_attention.rope_type",
+        "text_config.dspark_markov_rank",
+        "text_config.dspark_noise_token_id",
+        "text_config.final_norm_pre_affine",
+        "text_config.full_attention_interval",
+        "text_config.indexer_rope_interleave",
+        "text_config.index_kpool_compress",
+        "text_config.index_share_for_mtp_iteration",
+        "text_config.linear_attn_config.full_attn_layers",
+        "text_config.linear_attn_config.kda_layers",
+        "text_config.mamba_ssm_dtype",
+        "text_config.mla_use_nope",
+        "text_config.model_type",
+        "text_config.moe_router_dtype",
+        "text_config.mtp.layer_types",
+        "text_config.mtp_use_dedicated_embeddings",
+        "text_config.mtp.mtp_use_hidden_state_from_layer",
+        "text_config.mtp.rope_theta",
+        "text_config.number_of_conv_states",
+        "text_config.num_key_value_heads",
+        "text_config.o_bias",
+        "text_config.pre_norm_pre_affine",
+        "text_config.q_bias",
+        "text_config.qk_head_dim",
+        "text_config.rope_parameters.mrope_interleaved",
+        "text_config.rope_parameters.rope_type",
+        "text_config.swa_head_dim",
+        "text_config.swa_num_attention_heads",
+        "text_config.swa_num_key_value_heads",
+        "text_config.use_gate_bias",
+        "tie_word_embeddings",
+    ];
+    for path in PATHS {
+        let mut cursor = root;
+        for name in path.split('.') {
+            let Some(child) = read_key(cursor, name) else {
+                break;
+            };
+            cursor = child;
+        }
+    }
+    // ModelOpt keys its quantized modules by their full (dotted) tensor prefix, so one object
+    // key contains the dots of several path segments. Consume that table as data.
+    if let Some(quantization) = read_key(root, "quantization_config")
+        && let Some(layers) = read_key(quantization, "quantized_layers")
+    {
+        record_entries_deep(layers);
+    }
+}
+
+/// Record every key at every depth of a metadata object as consumed.
+fn record_entries_deep(value: &Value) {
+    for (_, child) in crate::coverage::entries(value) {
+        record_entries_deep(child);
+    }
+}
 /// A DFlash 2 drafter checks its target by width, vocabulary and backbone depth.
 impl From<&Architecture> for crate::dflash2::DraftTarget {
     fn from(architecture: &Architecture) -> Self {

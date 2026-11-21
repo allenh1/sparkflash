@@ -45,6 +45,7 @@ pub mod rank_file;
 pub mod rng;
 pub mod safetensors;
 pub mod spec;
+pub mod tensor_index;
 pub mod topk;
 pub mod tp;
 pub mod weights;

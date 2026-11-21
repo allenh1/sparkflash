@@ -306,11 +306,13 @@ impl VisionTowerSpec {
             rope_theta,
             downsample,
             merger_intermediate,
-            merger_activation: vision.merger_activation.unwrap_or(if vision.activation.is_none() {
-                VisionActivation::GeluErf
-            } else {
-                activation
-            }),
+            merger_activation: vision
+                .merger_activation
+                .unwrap_or(if vision.activation.is_none() {
+                    VisionActivation::GeluErf
+                } else {
+                    activation
+                }),
             merger_final_norm: vision.merger_final_norm,
         }
     }
@@ -323,13 +325,23 @@ impl VisionTowerSpec {
     /// never sees.
     #[must_use]
     pub fn patch_features(&self) -> usize {
-        let geometry = &self.geometry;
-        let temporal = if self.merger_intermediate > 0 && self.position.has_grid() {
+        self.geometry.in_channels
+            * self.patch_temporal_size()
+            * self.geometry.patch_size
+            * self.geometry.patch_size
+    }
+
+    /// The frames one patch projection embeds.
+    ///
+    /// A tower whose merger consumes a learned grid takes one frame in its patch kernel even when
+    /// its config names a temporal pair: the second frame is a duplicate the kernel never sees.
+    #[must_use]
+    pub fn patch_temporal_size(&self) -> usize {
+        if self.merger_intermediate > 0 && self.position.has_grid() {
             1
         } else {
-            geometry.temporal_patch_size.max(1)
-        };
-        geometry.in_channels * temporal * geometry.patch_size * geometry.patch_size
+            self.geometry.temporal_patch_size.max(1)
+        }
     }
 
     /// The width a merge cell contributes before the merger.

@@ -236,11 +236,7 @@ impl Architecture {
                 None,
             ),
             PartInstance::new(Part::VisionPosition, position_shape, None),
-            PartInstance::new(
-                Part::VisionNorm,
-                Shape::new([geometry.hidden_size]),
-                None,
-            ),
+            PartInstance::new(Part::VisionNorm, Shape::new([geometry.hidden_size]), None),
             PartInstance::new(
                 Part::VisionAttention,
                 Shape::new([geometry.num_heads, head_dim]),
@@ -257,7 +253,10 @@ impl Architecture {
                 None,
             ),
         ];
-        if !matches!(spec.downsample, VisionDownsample::Merge(_) | VisionDownsample::None) {
+        if !matches!(
+            spec.downsample,
+            VisionDownsample::Merge(_) | VisionDownsample::None
+        ) {
             let merger = parts.pop().expect("the merger is the last component");
             parts.push(PartInstance::new(
                 Part::VisionDownsample,

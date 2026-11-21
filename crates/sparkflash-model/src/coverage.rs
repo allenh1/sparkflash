@@ -505,84 +505,7 @@ mod tests {
     ///
     /// The zero-key milestone is reached when this table is empty.
     #[rustfmt::skip]
-    const REMAINING: &[(&str, &str, &str)] = &[
-        ("DeepSeek-V4.1-Flash", "text_config.dspark_markov_rank", "model crate parser"),
-        ("DeepSeek-V4.1-Flash", "text_config.dspark_noise_token_id", "model crate parser"),
-        ("DeepSeek-V4.1-Flash", "text_config.model_type", "truly unread (duplicate declaration)"),
-        ("DeepSeek-V4.1-Flash", "text_config.num_key_value_heads", "model crate parser"),
-        ("GLM-5.3-Flash", "quantization_config.modules_to_not_convert", "description work"),
-        ("GLM-5.3-Flash", "text_config.index_kpool_compress", "description work"),
-        ("GLM-5.3-Flash", "text_config.index_share_for_mtp_iteration", "description work"),
-        ("GLM-5.3-Flash", "text_config.indexer_rope_interleave", "description work"),
-        ("GLM-5.3-Flash", "text_config.linear_attn_config.full_attn_layers", "description work"),
-        ("GLM-5.3-Flash", "text_config.linear_attn_config.kda_layers", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.mla_use_nope", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.model_type", "truly unread (duplicate declaration)"),
-        ("GLM-5.3-Flash", "text_config.moe_router_dtype", "description work"),
-        ("GLM-5.3-Flash", "text_config.num_key_value_heads", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.qk_head_dim", "description work"),
-        ("GLM-5.3-Flash", "tie_word_embeddings", "truly unread (duplicate declaration)"),
-        ("Qwen3.8-Flash-Next-NVFP4", "language_model_only", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.dynamic", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.group_size", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.num_bits", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.type", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.targets", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.dynamic", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.group_size", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.num_bits", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.type", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.targets", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.dynamic", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.group_size", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.num_bits", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.type", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.group_size", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.kv_cache_quant_algo", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.quantized_layers.model.language_model.layers.1.ple.ple_embedding.ngram_embedding.quant_algo", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.full_attention_interval", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mamba_ssm_dtype", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.model_type", "truly unread (duplicate declaration)"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.layer_types", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.mtp_use_hidden_state_from_layer", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.rope_theta", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.number_of_conv_states", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.rope_parameters.mrope_interleaved", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.rope_parameters.rope_type", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "tie_word_embeddings", "truly unread (duplicate declaration)"),
-        ("Inkling-2-Small", "mtp_config.head_dim", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.hidden_size", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.intermediate_size", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.local_layer_ids", "model crate parser"),
-        ("Inkling-2-Small", "mtp_config.markov_head_type", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.markov_rank", "model crate parser"),
-        ("Inkling-2-Small", "mtp_config.max_position_embeddings", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.num_attention_heads", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.num_key_value_heads", "model crate parser"),
-        ("Inkling-2-Small", "mtp_config.o_bias", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.q_bias", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.rms_norm_eps", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.rope_theta", "description work (nested draft head)"),
-        ("Inkling-2-Small", "mtp_config.sliding_window_size", "description work (nested draft head)"),
-        ("Inkling-2-Small", "text_config.final_norm_pre_affine", "description work"),
-        ("Inkling-2-Small", "text_config.o_bias", "description work"),
-        ("Inkling-2-Small", "text_config.pre_norm_pre_affine", "description work"),
-        ("Inkling-2-Small", "text_config.q_bias", "description work"),
-        ("Inkling-2-Small", "text_config.swa_head_dim", "description work"),
-        ("Inkling-2-Small", "text_config.swa_num_attention_heads", "description work"),
-        ("Inkling-2-Small", "text_config.swa_num_key_value_heads", "description work"),
-        ("Inkling-2-Small", "text_config.use_gate_bias", "description work"),
-        ("Dory1.0-4B-BF16", "mlp_bias", "model crate parser"),
-        ("Dory1.0-4B-BF16", "ngpt_alpha_init", "model crate parser"),
-        ("Dory1.0-4B-BF16", "rope_parameters.full_attention.rope_type", "description work"),
-        ("Dory1.0-4B-BF16", "rope_parameters.sliding_attention.rope_type", "description work"),
-    ];
+    const REMAINING: &[(&str, &str, &str)] = &[];
 
     /// Qwen's installed snapshot is a newer document than the carried fixture: it has a third
     /// quantization group, input-activation groups, and an ignore list, and it has dropped the
@@ -667,14 +590,6 @@ mod tests {
                 .iter()
                 .map(|unknown| unknown.path.clone())
                 .collect();
-            if *name == "Qwen3.8-Flash-Next-NVFP4" {
-                for removed in QWEN_SNAPSHOT_REMOVED {
-                    expected.remove(*removed);
-                }
-                for (added, _) in QWEN_SNAPSHOT_EXTRA {
-                    expected.insert((*added).to_owned());
-                }
-            }
             let text = std::fs::read_to_string(path).expect("an installed config.json");
             let (_, actual) =
                 crate::Architecture::from_json_with_coverage(&text).expect("an installed config");

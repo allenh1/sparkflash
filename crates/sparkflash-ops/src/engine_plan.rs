@@ -508,7 +508,10 @@ fn global_requirements(
     }
     if let Some(vision) = architecture.vision_spec() {
         let geometry = &vision.geometry;
-        let head_dim = geometry.hidden_size.checked_div(geometry.num_heads).unwrap_or(0);
+        let head_dim = geometry
+            .hidden_size
+            .checked_div(geometry.num_heads)
+            .unwrap_or(0);
         let base = PartGeometry {
             hidden: geometry.hidden_size,
             rows: geometry.depth,
@@ -519,7 +522,7 @@ fn global_requirements(
             spatial_merge: vision.downsample.factor(),
             out_hidden: geometry.out_hidden_size,
             in_channels: geometry.in_channels,
-            temporal_patch: geometry.temporal_patch_size,
+            temporal_patch: vision.patch_temporal_size(),
             norm_epsilon_bits: vision.norm_epsilon.to_bits(),
             vision_norm: vision.norm.code(),
             vision_activation: vision.activation.code(),
