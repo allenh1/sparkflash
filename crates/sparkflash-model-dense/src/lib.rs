@@ -78,7 +78,7 @@ use sparkflash_model::architecture::{Activation, AttentionKind, Ffn, WeightForma
 use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
 use sparkflash_model::compose::{LayerStep, StepRole};
 use sparkflash_model::ledger::State;
-use sparkflash_model::{Architecture, Capabilities, ModelDescriptor, Part, TpAxis, TpPlan};
+use sparkflash_model::{Architecture, Capabilities, ModelDescriptor, TpAxis, TpPlan};
 use sparkflash_ops::OpPlan;
 use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
 use sparkflash_ops::dflash::{DraftUploader, Part as Run};
@@ -99,13 +99,12 @@ use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
-use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 use sparkflash_runtime::{
-    ChunkPolicy, GroupWire, Limits, PartBody, Place, RankSplit, Region, Serving, TextWire, Walk,
-    WalkArm,
+    ChunkPolicy, GroupWire, LaneState, Limits, PartBody, Place, PlanBranch, PlanSeq, RankSplit,
+    Region, Serving, TextWire, Walk, WalkArm, walk_rows,
 };
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, TensorSpec, WeightSource};
@@ -274,7 +273,8 @@ impl Shape {
                     }),
                 )
             }
-            _ => {
+            // Every kind is named, no wildcard: a new kind leads the compiler here.
+            AttentionKind::Mla { .. } | AttentionKind::Inkling { .. } | AttentionKind::Kda(_) => {
                 return Err(format!(
                     "layer {index} is neither grouped-query attention nor a Gated DeltaNet"
                 ));
@@ -387,42 +387,16 @@ struct Layer {
 }
 
 /// One branch of a layer: the RMSNorm of the residual, the part over the normed rows, the group's
-/// sum of its output where the part leaves a rank's partial, and the residual add.
-struct Branch {
-    /// The norm's gains.
-    norm: Deviceptr,
-    part: DensePart,
-    /// Whether the part's output rows are a rank's partial ([RankSplit::Summed]).
-    summed: bool,
-    /// Which of a sequence's region lists is this part's ([LaneParts::regions]).
-    slot: usize,
-}
+/// sum of its output where the part leaves a rank's partial, and the residual add
+/// ([sparkflash_runtime::PlanBranch]; its slot is [LaneParts::regions]'s index).
+type Branch = PlanBranch<Dense, Deviceptr>;
 
 /// Every branch of `layers`, in walk order: the order of [Branch::slot].
 fn branches(layers: &[Layer]) -> impl Iterator<Item = &Branch> {
     layers.iter().flat_map(|layer| &layer.branches)
 }
 
-/// The branches a layer's step runs, in forward order, or the part the dense walk has no place
-/// for: it runs a token mixer and a feed-forward a layer.
-fn step_branches(step: &LayerStep) -> Result<Vec<(StepRole, Part)>, String> {
-    step.roles()
-        .into_iter()
-        .map(|(role, part)| match role {
-            StepRole::Attention | StepRole::Ffn => Ok((role, part)),
-            StepRole::Compression | StepRole::Indexer | StepRole::Residual | StepRole::Side => {
-                Err(format!(
-                    "layer {}'s part {} is a {role:?} step, and the dense walk runs a layer's \
-                     token mixer and its feed-forward",
-                    step.index,
-                    part.name()
-                ))
-            }
-        })
-        .collect()
-}
-
-/// Grouped-query attention on the device ([Part::GqaAttention]): its projections, its q/k norms
+/// Grouped-query attention on the device ([sparkflash_model::Part::GqaAttention]): its projections, its q/k norms
 /// and its output projection.
 #[derive(Debug, Clone)]
 struct Gqa {
@@ -438,7 +412,7 @@ struct Gqa {
     state: [Region; 2],
 }
 
-/// A Gated DeltaNet layer on the device ([Part::GdnScan]): its weights and the linear
+/// A Gated DeltaNet layer on the device ([sparkflash_model::Part::GdnScan]): its weights and the linear
 /// attention's `out_proj`.
 #[derive(Debug, Clone)]
 struct Gdn {
@@ -530,7 +504,7 @@ struct Mlp {
     down: Proj,
 }
 
-/// A layer's dense SwiGLU MLP on the device ([Part::DenseMlp]).
+/// A layer's dense SwiGLU MLP on the device ([sparkflash_model::Part::DenseMlp]).
 #[derive(Debug, Clone)]
 struct DenseMlp {
     mlp: Mlp,
@@ -538,7 +512,7 @@ struct DenseMlp {
     clamp: Option<f32>,
 }
 
-/// A layer's routed experts on the device ([Part::Moe]): the router, the experts' table, the
+/// A layer's routed experts on the device ([sparkflash_model::Part::Moe]): the router, the experts' table, the
 /// shared expert and its gate.
 #[derive(Debug, Clone)]
 struct RoutedExperts {
@@ -930,8 +904,9 @@ impl Formats {
     }
 }
 
-/// The weights, kernels and geometry every session reads.
-struct Shared {
+/// The weights, kernels and geometry every session reads: the host the shared walk
+/// ([sparkflash_runtime::PlanWalk]) drives.
+pub struct Shared {
     cuda: CudaHandle,
     kernels: Kernels,
     embed: Mat<Bf16>,
@@ -1128,7 +1103,7 @@ impl DenseDeviceBackend {
         // refused by name, not skipped.
         let steps = architecture.steps();
         for step in &steps {
-            let kinds = step_branches(step)?;
+            let kinds = sparkflash_runtime::plan_roles(step)?;
             parts
                 .require(kinds.into_iter().map(|(_, part)| part))
                 .map_err(|error| {
@@ -1338,14 +1313,14 @@ impl DenseDeviceBackend {
         self.shared.weight_bytes
     }
 
-    /// The same rank as a bare walk, for the generated conformance checks: they open the
-    /// runtime themselves so a check can drive a prompt, a continued turn and a rewind.
+    /// The walk the runtime serves this backend by, for `capacity` lanes: [WalkArm::walk] as its
+    /// concrete type, for the generated conformance checks: they open the runtime themselves so
+    /// a check can drive a prompt, a continued turn and a rewind.
     ///
     /// # Errors
-    /// A scratch allocation the device refuses.
-    #[cfg(test)]
-    pub(crate) fn walk_arm(&self, capacity: usize) -> Result<DenseWalk, BackendError> {
-        DenseWalk::new(Arc::clone(&self.shared), capacity)
+    /// A device allocation the walk's scratch cannot make.
+    pub fn walk_arm(&self, capacity: usize) -> Result<DenseWalk, BackendError> {
+        walk::walk(Arc::clone(&self.shared), capacity)
     }
 
     /// A session of its concrete type, for a caller that reads its per-layer trace.
@@ -2428,7 +2403,7 @@ fn upload<'a>(
         open.whole = Some(Shape::of(architecture, index, Shard::whole())?);
         // The parts first, in forward order, then the norms each reads its input through.
         let mut built = Vec::new();
-        for (role, kind) in step_branches(&steps[index])? {
+        for (role, kind) in sparkflash_runtime::plan_roles(&steps[index])? {
             let part = parts
                 .build(kind, &mut open)
                 .map_err(|error| format!("layer {index}'s part {}: {error}", kind.name()))?;
@@ -2482,13 +2457,6 @@ fn bf16(source: &dyn WeightSource, name: &str, shape: &[usize]) -> Result<(), St
 }
 
 impl Shared {
-    /// The state every part of the walk declares, in walk order: what a sequence's lane holds.
-    pub(crate) fn state(&self) -> Vec<Region> {
-        branches(&self.layers)
-            .flat_map(|branch| branch.part.state().iter().copied())
-            .collect()
-    }
-
     /// A branch's `rows` partial rows at `partial` summed over the group, in place: nothing at one
     /// rank.
     fn sum(&self, partial: Deviceptr, rows: usize) -> Result<(), BackendError> {
@@ -2583,7 +2551,7 @@ impl Shared {
                     self.call(kernels.rope, rope.call())?;
                 }
             }
-            let &[keys, values] = sequence.regions[slot].as_slice() else {
+            let &[keys, values] = sequence.lane.regions[slot].as_slice() else {
                 return Err(BackendError::new(
                     DEVICE,
                     format!("layer {index}'s lane part holds no key/value cache"),
@@ -2655,7 +2623,7 @@ impl Shared {
         self.project(&gdn.a, b, b.normed.0, b.gdn_a.0, rows, policy)?;
         let mut first = 0usize;
         for (sequence, tokens) in segments {
-            let &[history, _] = sequence.regions[slot].as_slice() else {
+            let &[history, _] = sequence.lane.regions[slot].as_slice() else {
                 return refuse(format!(
                     "layer {index}'s lane part holds no recurrent state"
                 ));
@@ -2696,7 +2664,7 @@ impl Shared {
         let qk_row = geometry.key_heads * gdn_qk_row(geometry.key_dim) * 4;
         let mut first = 0usize;
         for (sequence, tokens) in segments {
-            let &[_, state] = sequence.regions[slot].as_slice() else {
+            let &[_, state] = sequence.lane.regions[slot].as_slice() else {
                 return refuse(format!(
                     "layer {index}'s lane part holds no recurrent state"
                 ));
@@ -3275,7 +3243,7 @@ impl Buffers {
 
 /// A walk's scratch on the device, freed with it. Nothing in it outlives a walk but the logits the
 /// walk's caller reads back, so the slots of one engine share one.
-struct Scratch {
+pub struct Scratch {
     shared: Arc<Shared>,
     buffers: Buffers,
 }
@@ -3428,32 +3396,30 @@ impl Scratch {
 /// position. A Gated DeltaNet layer's state is the state after the last row, so its rewind point
 /// is a copy ([Checkpoint]) of every such layer's state at the end of the last prompt, which a
 /// rewind copies back (as the recurrent arms' rewind points do).
-pub struct Sequence {
+pub struct DenseLane {
     shared: Arc<Shared>,
-    lane: SequenceLane<LaneParts>,
+    memory: SequenceLane<LaneParts>,
     /// Each part's regions in the lane, by [Branch::slot], in the order the part declares them.
     regions: Vec<Vec<Deviceptr>>,
     /// The recurrent ones among them, in walk order, as [Shared::linear_sizes] counts them.
     recurrent: Vec<Deviceptr>,
     /// The Gated DeltaNet layers' rewind point, when a layer is one and the sequence keeps one.
     checkpoint: Option<Checkpoint>,
-    /// The ids whose rows the caches hold, in position order: the last prompt and every token
-    /// stepped since. Its length is the sequence's position.
-    history: Vec<u32>,
-    sampler: Sampler,
-    sampling: Sampling,
 }
 
-impl Drop for Sequence {
+/// One sequence of the dense walk: its lane, and the ids and sampler the shared walk keeps.
+pub type Sequence = PlanSeq<DenseLane>;
+
+impl Drop for DenseLane {
     fn drop(&mut self) {
-        self.lane.free(&self.shared.cuda);
+        self.memory.free(&self.shared.cuda);
     }
 }
 
-impl Sequence {
+impl DenseLane {
     fn open(shared: Arc<Shared>) -> Result<Self, String> {
-        let lane = SequenceLane::reserve(&shared.cuda, &shared.lanes)?;
-        let base = lane.base();
+        let memory = SequenceLane::reserve(&shared.cuda, &shared.lanes)?;
+        let base = memory.base();
         let parts = shared.lanes.parts();
         let regions: Vec<Vec<Deviceptr>> = parts
             .regions
@@ -3470,18 +3436,11 @@ impl Sequence {
             .map(|arena| Checkpoint::new(base.offset(arena), shared.linear_sizes.clone()));
         Ok(Self {
             shared,
-            lane,
+            memory,
             regions,
             recurrent,
             checkpoint,
-            history: Vec::new(),
-            sampler: Sampler::new(),
-            sampling: Sampling::default(),
         })
-    }
-
-    fn position(&self) -> usize {
-        self.history.len()
     }
 
     /// The live recurrent regions in walk order, as [Shared::linear_sizes] counts them: each
@@ -3496,7 +3455,7 @@ impl Sequence {
         if let Some(checkpoint) = self.checkpoint.as_mut() {
             checkpoint.forget();
         }
-        if self.recurrent.is_empty() || self.lane.span().backed() == 0 {
+        if self.recurrent.is_empty() || self.memory.span().backed() == 0 {
             return Ok(());
         }
         for (region, bytes) in self.recurrent.iter().zip(&self.shared.linear_sizes) {
@@ -3517,104 +3476,6 @@ impl Sequence {
         }
         Ok(())
     }
-}
-
-/// One walk over the segments' rows, laid out one after another: each sequence's ids at its own
-/// position. The row-wise stages (norms, projections, the MLP, the residual adds, the Gated
-/// DeltaNet prep and gated norm) take every row at once and the per-sequence stages (rotary, the
-/// cache appends, attention, the conv and the scan) each segment's rows, so a row computes as it
-/// would alone wherever the projections take the same kernel: a fused step passes no wide policy,
-/// and a row GEMV row is the same sum at any batch.
-///
-/// Each layer is its branches in forward order ([Layer::branches]): the norm, the part's `body`
-/// (its prompt body or its token body, [PartBody]) from the normed rows in `b.normed` into
-/// `b.projected`, the group's sum where the part leaves a partial, and the residual add.
-///
-/// The residual of every row is left in `b.x`; each sequence's history takes its ids.
-fn walk(
-    shared: &Shared,
-    b: &Buffers,
-    segments: &mut [(&mut Sequence, &[u32])],
-    body: PartBody,
-    policy: Option<WidePolicy>,
-    mut trace: Option<&mut Vec<Vec<f32>>>,
-) -> Result<(), BackendError> {
-    let refuse = |message: String| Err(BackendError::new(DEVICE, message));
-    let lengths: Vec<usize> = segments.iter().map(|(_, tokens)| tokens.len()).collect();
-    let rows = walk::row_plan(&lengths).rows;
-    if rows == 0 || rows > CHUNK_ROWS {
-        return refuse(format!("a walk takes 1..={CHUNK_ROWS} rows, not {rows}"));
-    }
-    let mut ids = Vec::with_capacity(rows * 4);
-    for (sequence, tokens) in segments.iter_mut() {
-        if tokens.is_empty() {
-            return refuse("a segment has no tokens".to_owned());
-        }
-        if let Some(token) = tokens.iter().find(|token| **token as usize >= shared.vocab) {
-            return refuse(format!(
-                "token {token} is outside the checkpoint vocabulary {}",
-                shared.vocab
-            ));
-        }
-        let reach = sequence.position() + tokens.len();
-        if reach > shared.context {
-            return refuse(format!(
-                "the sequence is past the served context {}",
-                shared.context
-            ));
-        }
-        sequence
-            .lane
-            .back(&shared.cuda, reach)
-            .map_err(|error| BackendError::new(DEVICE, format!("the lane memory: {error}")))?;
-        ids.extend(tokens.iter().flat_map(|token| token.to_le_bytes()));
-    }
-    let kernels = shared.kernels;
-    let hidden = shared.hidden;
-    let device = |error: String| BackendError::new(DEVICE, error);
-    shared.cuda.copy_htod(&b.tokens, &ids).map_err(device)?;
-    shared.call(
-        kernels.embed,
-        calls::embed_rows(
-            shared.embed.data().0,
-            b.x.0,
-            b.tokens.0,
-            (hidden, hidden),
-            rows,
-        ),
-    )?;
-    for (index, layer) in shared.layers.iter().enumerate() {
-        for branch in &layer.branches {
-            shared.norm(
-                RmsNorm::new(b.x.0, branch.norm.0, b.normed.0, hidden, shared.eps),
-                rows,
-            )?;
-            let mut pass = PassCx {
-                shared,
-                b,
-                segments: &*segments,
-                index,
-                slot: branch.slot,
-                rows,
-                policy,
-            };
-            // One dynamic call a part a pass, where the walk matched the layer's two enums.
-            body.run::<Dense, _>(&*branch.part, &mut pass)?;
-            if branch.summed {
-                shared.sum(b.projected, rows)?;
-            }
-            shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
-        }
-        if let Some(trace) = trace.as_deref_mut() {
-            let mut bytes = vec![0u8; rows * hidden * 4];
-            shared.cuda.copy_dtoh(&mut bytes, &b.x).map_err(device)?;
-            trace[index].extend(floats(&bytes));
-        }
-    }
-    for (sequence, tokens) in segments.iter_mut() {
-        sequence.history.extend_from_slice(tokens);
-    }
-    Ok(())
 }
 
 /// The final norm and the LM head of `count` residual rows from row `first`, leaving their
@@ -3714,7 +3575,7 @@ fn head_choices(
 /// One fused step: a row a member, each its own token, and each member's next.
 fn step(
     shared: &Shared,
-    b: &Buffers,
+    scratch: &Scratch,
     members: &mut [(&mut Sequence, u32)],
     trace: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<Vec<StepOutput>, BackendError> {
@@ -3724,8 +3585,8 @@ fn step(
         .zip(tokens.chunks(1))
         .map(|((sequence, _), token)| (&mut **sequence, token))
         .collect();
-    walk(shared, b, &mut segments, PartBody::Token, None, trace)?;
-    let logits = head(shared, b, 0, segments.len())?;
+    walk_rows(shared, scratch, &mut segments, PartBody::Token, None, trace)?;
+    let logits = head(shared, &scratch.buffers, 0, segments.len())?;
     Ok(segments
         .iter_mut()
         .zip(logits.chunks(shared.vocab))
@@ -3763,20 +3624,20 @@ impl DenseDeviceSession {
     fn open(shared: Arc<Shared>) -> Result<Self, String> {
         Ok(Self {
             scratch: Scratch::new(Arc::clone(&shared), 1)?,
-            sequence: Sequence::open(shared)?,
+            sequence: PlanSeq::new(DenseLane::open(shared)?),
             trace: None,
         })
     }
 
     /// Starts (or stops) recording each layer's residual after it, every row.
     pub fn trace(&mut self, on: bool) {
-        self.trace = on.then(|| vec![Vec::new(); self.sequence.shared.layers.len()]);
+        self.trace = on.then(|| vec![Vec::new(); self.sequence.lane.shared.layers.len()]);
     }
 
     /// The recorded residuals, a `[positions][hidden]` row-major run a layer, and a fresh record.
     #[must_use]
     pub fn take_trace(&mut self) -> Vec<Vec<f32>> {
-        let layers = self.sequence.shared.layers.len();
+        let layers = self.sequence.lane.shared.layers.len();
         self.trace
             .as_mut()
             .map(|trace| std::mem::replace(trace, vec![Vec::new(); layers]))
@@ -3789,13 +3650,12 @@ impl DenseDeviceSession {
     /// # Errors
     /// A token outside the vocabulary, a sequence past the served context, or a device failure.
     pub fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, BackendError> {
-        let shared = Arc::clone(&self.sequence.shared);
-        let b = &self.scratch.buffers;
+        let shared = Arc::clone(&self.sequence.lane.shared);
         let mut last = 0;
         for chunk in tokens.chunks(shared.chunk) {
-            walk(
-                &shared,
-                b,
+            walk_rows(
+                &*shared,
+                &self.scratch,
                 &mut [(&mut self.sequence, chunk)],
                 PartBody::Rows,
                 shared.policy,
@@ -3806,7 +3666,7 @@ impl DenseDeviceSession {
         if last == 0 {
             return Err(BackendError::new(DEVICE, "the step has no tokens"));
         }
-        head(&shared, b, last - 1, 1)
+        head(&shared, &self.scratch.buffers, last - 1, 1)
     }
 }
 
@@ -3824,10 +3684,9 @@ impl ModelSession for DenseDeviceSession {
         }
         // A session outside the engine starts every prompt over: the caches go back to position
         // zero and the recurrent state to the empty sequence's.
-        self.sequence.history.clear();
-        self.sequence.clear_linear()?;
+        self.sequence.rewind(0)?;
         self.sequence.sampler.reset();
-        let shared = Arc::clone(&self.sequence.shared);
+        let shared = Arc::clone(&self.sequence.lane.shared);
         let Self {
             sequence,
             scratch,
@@ -3835,9 +3694,9 @@ impl ModelSession for DenseDeviceSession {
         } = self;
         let mut last = 0;
         for chunk in tokens.chunks(shared.chunk) {
-            walk(
-                &shared,
-                &scratch.buffers,
+            walk_rows(
+                &*shared,
+                &*scratch,
                 &mut [(&mut *sequence, chunk)],
                 PartBody::Rows,
                 shared.policy,
@@ -3856,10 +3715,10 @@ impl ModelSession for DenseDeviceSession {
     }
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        let shared = Arc::clone(&self.sequence.shared);
+        let shared = Arc::clone(&self.sequence.lane.shared);
         let mut steps = step(
             &shared,
-            &self.scratch.buffers,
+            &self.scratch,
             &mut [(&mut self.sequence, token)],
             self.trace.as_mut(),
         )?;

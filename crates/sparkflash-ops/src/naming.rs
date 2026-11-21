@@ -471,7 +471,10 @@ impl NamingDialect {
                         norm: format!("{a}.norm.weight"),
                     })
                 }
-                other => {
+                // Every kind is named, no wildcard: a new kind leads the compiler here.
+                other @ (AttentionKind::Mla { .. }
+                | AttentionKind::Inkling { .. }
+                | AttentionKind::Kda(_)) => {
                     return Err(format!(
                         "layer {} uses {other:?}, which the shared naming does not spell",
                         layer.index

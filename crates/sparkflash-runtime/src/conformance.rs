@@ -390,6 +390,37 @@ pub trait WalkFixture: Walk {
     }
 }
 
+/// What the generated checks boot: a walk and its fixture.
+///
+/// Every [`WalkFixture`] walk is one. A crate whose walk is a type it does not own (an arm on the
+/// runtime's [`crate::PlanWalk`], or a family on a host it plugs into) states its fixture on a
+/// marker of its own instead, since it cannot implement [`WalkFixture`] for a foreign walk.
+pub trait ArmFixture {
+    /// The walk the checks drive.
+    type Walk: Walk;
+
+    /// As [`WalkFixture::fixture`].
+    ///
+    /// # Errors
+    /// As [`WalkFixture::fixture`].
+    fn fixture(world: usize) -> Result<Fixture<Self::Walk>, BackendError>;
+
+    /// As [`WalkFixture::tick_engine`].
+    fn tick_engine() -> bool;
+}
+
+impl<W: WalkFixture> ArmFixture for W {
+    type Walk = W;
+
+    fn fixture(world: usize) -> Result<Fixture<W>, BackendError> {
+        <W as WalkFixture>::fixture(world)
+    }
+
+    fn tick_engine() -> bool {
+        <W as WalkFixture>::tick_engine()
+    }
+}
+
 /// The answer one generated check gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -407,21 +438,23 @@ pub enum CheckOutcome {
 ///
 /// # Errors
 /// The arm's fixture is missing (code `fixture`), or a check ran and the arm disagreed.
-pub fn run_check<W: WalkFixture>(check: ConformanceCheck) -> Result<CheckOutcome, BackendError> {
-    if check == ConformanceCheck::DraftedEqualsPlain && !W::Drafter::PRESENT {
+pub fn run_check<A: ArmFixture>(check: ConformanceCheck) -> Result<CheckOutcome, BackendError> {
+    if check == ConformanceCheck::DraftedEqualsPlain
+        && !<<A::Walk as Walk>::Drafter as Drafter<A::Walk>>::PRESENT
+    {
         return Ok(CheckOutcome::Skipped(
             "the arm declares no drafter".to_owned(),
         ));
     }
-    check_claims::<W>(&[check]).map_err(|why| BackendError::new("conformance", why))?;
+    check_claims::<A::Walk>(&[check]).map_err(|why| BackendError::new("conformance", why))?;
     match check {
-        ConformanceCheck::WholePromptEqualsChunked => whole_prompt_equals_chunked::<W>(),
-        ConformanceCheck::AloneEqualsFour => alone_equals_four::<W>(),
-        ConformanceCheck::ContinuedEqualsCold => continued_equals_cold::<W>(),
-        ConformanceCheck::RewoundEqualsCold => rewound_equals_cold::<W>(),
-        ConformanceCheck::TpWithinExactness => tp_within_exactness::<W>(),
-        ConformanceCheck::NoUnrecordedWidening => no_unrecorded_widening::<W>(),
-        ConformanceCheck::DraftedEqualsPlain => drafted_equals_plain::<W>(),
+        ConformanceCheck::WholePromptEqualsChunked => whole_prompt_equals_chunked::<A>(),
+        ConformanceCheck::AloneEqualsFour => alone_equals_four::<A>(),
+        ConformanceCheck::ContinuedEqualsCold => continued_equals_cold::<A>(),
+        ConformanceCheck::RewoundEqualsCold => rewound_equals_cold::<A>(),
+        ConformanceCheck::TpWithinExactness => tp_within_exactness::<A>(),
+        ConformanceCheck::NoUnrecordedWidening => no_unrecorded_widening::<A>(),
+        ConformanceCheck::DraftedEqualsPlain => drafted_equals_plain::<A>(),
     }
 }
 
@@ -429,9 +462,9 @@ pub fn run_check<W: WalkFixture>(check: ConformanceCheck) -> Result<CheckOutcome
 ///
 /// The generated tests call this, so `onboard-gate.sh` can report per check pass, fail, skip or
 /// needs-fixture from the test output instead of treating an `#[ignore]`d test as a pass.
-pub fn run_generated<W: WalkFixture>(check: ConformanceCheck) {
+pub fn run_generated<A: ArmFixture>(check: ConformanceCheck) {
     let name = check.name();
-    match run_check::<W>(check) {
+    match run_check::<A>(check) {
         Ok(CheckOutcome::Passed) => {
             println!("conformance: {name}: PASS");
         }
@@ -476,8 +509,8 @@ enum PromptMode {
 }
 
 /// Whole prompt = chunked = token by token, with the same greedy tokens after the prompt.
-fn whole_prompt_equals_chunked<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
-    let fixture = W::fixture(1)?;
+fn whole_prompt_equals_chunked<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
+    let fixture = A::fixture(1)?;
     let whole = direct_run(&fixture.walk, &CONFORMANCE_PROMPT, PromptMode::Whole)?;
     let chunked = direct_run(&fixture.walk, &CONFORMANCE_PROMPT, PromptMode::Chunked)?;
     let token = direct_run(&fixture.walk, &CONFORMANCE_PROMPT, PromptMode::Token)?;
@@ -499,8 +532,8 @@ fn whole_prompt_equals_chunked<W: WalkFixture>() -> Result<CheckOutcome, Backend
     }
     // An arm that serves on the tick engine runs the prompt through it too: the engine's own
     // chunk choices must leave the same tokens the arm's direct chunks do.
-    if W::tick_engine() {
-        let engine = engine_run(W::fixture(1)?.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
+    if A::tick_engine() {
+        let engine = engine_run(A::fixture(1)?.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
         if whole != engine {
             return Err(disagreement(
                 "the tick engine = the whole prompt",
@@ -519,18 +552,18 @@ fn whole_prompt_equals_chunked<W: WalkFixture>() -> Result<CheckOutcome, Backend
 }
 
 /// One request alone and four in one runtime answer the same tokens.
-fn alone_equals_four<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
-    let fixture = W::fixture(1)?;
+fn alone_equals_four<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
+    let fixture = A::fixture(1)?;
     let prompts = [
         CONFORMANCE_PROMPT,
         CONFORMANCE_OTHER,
         CONFORMANCE_THIRD,
         CONFORMANCE_FOURTH,
     ];
-    let (alone, together) = if W::tick_engine() {
+    let (alone, together) = if A::tick_engine() {
         let mut alone = Vec::with_capacity(prompts.len());
         for prompt in &prompts {
-            alone.push(engine_run(W::fixture(1)?.walk, prompt, CONFORMANCE_TOKENS)?);
+            alone.push(engine_run(A::fixture(1)?.walk, prompt, CONFORMANCE_TOKENS)?);
         }
         let together = engine_four(fixture.walk, &prompts, CONFORMANCE_TOKENS)?;
         (alone, together)
@@ -561,11 +594,11 @@ fn alone_equals_four<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
 }
 
 /// A continued turn's tokens equal a cold turn's.
-fn continued_equals_cold<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
-    let fixture = W::fixture(1)?;
-    let (cold, continued) = if W::tick_engine() {
-        let cold = engine_run(W::fixture(1)?.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
-        let mut engine = crate::TickEngine::new(W::fixture(1)?.walk, 1)?;
+fn continued_equals_cold<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
+    let fixture = A::fixture(1)?;
+    let (cold, continued) = if A::tick_engine() {
+        let cold = engine_run(A::fixture(1)?.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
+        let mut engine = crate::TickEngine::new(A::fixture(1)?.walk, 1)?;
         let prefix = CONFORMANCE_PROMPT[..4].to_vec();
         let (id, _) = engine_turn(&mut engine, &prefix)?;
         engine.finish(id);
@@ -617,12 +650,12 @@ fn continued_equals_cold<W: WalkFixture>() -> Result<CheckOutcome, BackendError>
 }
 
 /// A rewound turn's tokens equal a cold turn's.
-fn rewound_equals_cold<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
-    let fixture = W::fixture(1)?;
+fn rewound_equals_cold<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
+    let fixture = A::fixture(1)?;
     let changed = [7, 9, 11, 13, 15, 17, 23];
-    let (cold, rewound) = if W::tick_engine() {
-        let cold = engine_run(W::fixture(1)?.walk, &changed, CONFORMANCE_TOKENS)?;
-        let mut engine = crate::TickEngine::new(W::fixture(1)?.walk, 1)?;
+    let (cold, rewound) = if A::tick_engine() {
+        let cold = engine_run(A::fixture(1)?.walk, &changed, CONFORMANCE_TOKENS)?;
+        let mut engine = crate::TickEngine::new(A::fixture(1)?.walk, 1)?;
         let mut first_turn = CONFORMANCE_PROMPT;
         *first_turn.last_mut().expect("a prompt") = 29;
         let (id, _) = engine_turn(&mut engine, &first_turn)?;
@@ -676,9 +709,9 @@ fn rewound_equals_cold<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
 }
 
 /// TP 1 = TP 2 = TP 4, or a named skip when the host has no group.
-fn tp_within_exactness<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
-    let one = W::fixture(1)?;
-    let baseline = if W::tick_engine() {
+fn tp_within_exactness<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
+    let one = A::fixture(1)?;
+    let baseline = if A::tick_engine() {
         engine_run(one.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
     } else {
         let runtime = Runtime::new(one.walk, 0)?;
@@ -686,7 +719,7 @@ fn tp_within_exactness<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
     };
     let mut compared = vec![1usize];
     for world in [2usize, 4] {
-        let fixture = match W::fixture(world) {
+        let fixture = match A::fixture(world) {
             Ok(fixture) => fixture,
             Err(error) if error.code() == "group" => {
                 let agreed = if compared.len() > 1 {
@@ -704,14 +737,14 @@ fn tp_within_exactness<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
         let Fixture {
             walk, group, keep, ..
         } = fixture;
-        let tokens = if W::tick_engine() {
+        let tokens = if A::tick_engine() {
             group_run(walk, group, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
         } else if group.is_some() {
             return Err(BackendError::new(
                 "conformance",
                 format!(
                     "TP {world}: a group's fixture steps on the tick engine; {} says it does not",
-                    std::any::type_name::<W>()
+                    std::any::type_name::<A::Walk>()
                 ),
             ));
         } else {
@@ -742,15 +775,15 @@ fn tp_within_exactness<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
 }
 
 /// No stored format widened without a record, and the token pass reads at least its floor.
-fn no_unrecorded_widening<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
-    let fixture = W::fixture(1)?;
-    let stored = W::CAPABILITIES.compute.stored;
+fn no_unrecorded_widening<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
+    let fixture = A::fixture(1)?;
+    let stored = <A::Walk as Walk>::CAPABILITIES.compute.stored;
     if !stored.runs() {
         return Err(BackendError::new(
             "conformance",
             format!(
                 "no unrecorded widening: {} declares stored-format arithmetic {stored}",
-                std::any::type_name::<W>()
+                std::any::type_name::<A::Walk>()
             ),
         ));
     }
@@ -760,7 +793,7 @@ fn no_unrecorded_widening<W: WalkFixture>() -> Result<CheckOutcome, BackendError
                 "conformance",
                 format!(
                     "no unrecorded widening: {} runs {} as {} with no record",
-                    std::any::type_name::<W>(),
+                    std::any::type_name::<A::Walk>(),
                     rule.stored,
                     rule.arithmetic
                 ),
@@ -772,7 +805,7 @@ fn no_unrecorded_widening<W: WalkFixture>() -> Result<CheckOutcome, BackendError
             "conformance",
             format!(
                 "no unrecorded widening: {}'s fixture states no bytes-per-token floor",
-                std::any::type_name::<W>()
+                std::any::type_name::<A::Walk>()
             ),
         ));
     }
@@ -800,11 +833,11 @@ fn no_unrecorded_widening<W: WalkFixture>() -> Result<CheckOutcome, BackendError
 /// The drafted side is [`Runtime`]'s step: a prompt, then a fed token a step. The plain side is
 /// a second fixture driven a row at a time through [`Walk::walk`] and [`Walk::head`]. The two
 /// token runs must be equal, which is the property a rejected draft can break.
-fn drafted_equals_plain<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
-    let drafted = W::fixture(1)?;
-    let plain = W::fixture(1)?;
+fn drafted_equals_plain<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
+    let drafted = A::fixture(1)?;
+    let plain = A::fixture(1)?;
     let expected = plain_run(&plain.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
-    let actual = if W::tick_engine() {
+    let actual = if A::tick_engine() {
         engine_run(drafted.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
     } else {
         let runtime = Runtime::new(drafted.walk, 0)?;
@@ -1207,7 +1240,7 @@ macro_rules! conformance {
 
             #[test]
             fn the_declared_compute_rows_are_the_arm_ledger_rows() {
-                $crate::testing::check_compute_rows::<$arm>(&$profile);
+                $crate::testing::check_compute_rows::<<$arm as $crate::ArmFixture>::Walk>(&$profile);
             }
 
             #[test]
@@ -1217,7 +1250,7 @@ macro_rules! conformance {
 
             #[test]
             fn the_runtime_ledger_states_every_row_the_walk_declares() {
-                $crate::testing::check_ledger::<$arm>(&$profile);
+                $crate::testing::check_ledger::<<$arm as $crate::ArmFixture>::Walk>(&$profile);
             }
 
             #[test]
@@ -1288,11 +1321,11 @@ macro_rules! conformance {
             pub const ARM: &str = stringify!($arm);
 
             /// The checks the arm claims; checkable without a device.
-            pub const CHECKS: &[$crate::ConformanceCheck] = $crate::checks_for::<$arm>();
+            pub const CHECKS: &[$crate::ConformanceCheck] = $crate::checks_for::<<$arm as $crate::ArmFixture>::Walk>();
 
             #[test]
             fn the_arm_claims_every_generated_check() {
-                $crate::check_claims::<$arm>(CHECKS).unwrap_or_else(|why| panic!("{}: {why}", ARM));
+                $crate::check_claims::<<$arm as $crate::ArmFixture>::Walk>(CHECKS).unwrap_or_else(|why| panic!("{}: {why}", ARM));
             }
 
             #[test]

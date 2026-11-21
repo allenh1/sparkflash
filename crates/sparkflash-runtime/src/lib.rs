@@ -41,6 +41,7 @@ pub mod group;
 pub mod layout;
 pub mod ledger;
 pub mod part;
+pub mod plan;
 pub mod pool;
 pub mod resume;
 pub mod rounds;
@@ -53,8 +54,8 @@ pub mod walk;
 
 pub use chunk::{CHUNK_SIZES, ChunkPolicy, quantise};
 pub use conformance::{
-    CONFORMANCE_CHECKS, CheckOutcome, ConformanceCheck, Fixture, FormatRule, WalkFixture,
-    check_claims, checks_for, local_group, run_check, run_generated, token_bytes,
+    ArmFixture, CONFORMANCE_CHECKS, CheckOutcome, ConformanceCheck, Fixture, FormatRule,
+    WalkFixture, check_claims, checks_for, local_group, run_check, run_generated, token_bytes,
 };
 pub use engine::{
     Kept as TickKept, PROMPT_PARTS_ENV, RequestId, TickConfig, TickEngine, TickEvent, TickServe,
@@ -69,6 +70,10 @@ pub use layout::{
 };
 pub use ledger::{Ledger, Mode, Strategy};
 pub use part::{PartBody, PartExec, PartHost, PartMaker, PartRegistry, RankSplit};
+pub use plan::{
+    PlanBranch, PlanHost, PlanLane, PlanPart, PlanRows, PlanSeq, PlanWalk, plan_head, plan_roles,
+    plan_state, walk_rows,
+};
 pub use pool::{LaneMemory, LanePool};
 pub use resume::{
     REWIND_ENV, Restore, Resume, Rewind, checkpoint_after, extends, resume, rewind, rewind_plan,

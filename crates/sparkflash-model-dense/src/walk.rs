@@ -12,58 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The dense arm as a Walk.
+//! The dense arm as a host of the shared walk.
 //!
 //! The runtime drives it: the arm's serving entry opens a [`sparkflash_runtime::Runtime`] over
-//! this walk, and the runtime owns the prompt parts, history, reuse, rewind, lane pool and
-//! ledger. This walk
-//! routes every Pass to the same free walk the old serving loop called, with the arm's
-//! [`WidePolicy::DENSE`] for every pass: a prompt chunk takes the wide tile, and a token step
-//! takes the tile once it batches more than the row GEMV's eight rows (below that the policy still
-//! picks the row GEMV, so a one-to-eight-row step is the kernel it always was). Its head turns
-//! the final residual row into the token on the device for a greedy request, and only copies a
-//! logits row when the request samples with temperature or penalties.
+//! [`DenseWalk`], the runtime's [`PlanWalk`] over this host, and the runtime owns the prompt
+//! parts, history, reuse, rewind, lane pool, ledger, the layer loop and the head's
+//! record-then-choose. This file supplies only what needs the device: the embed, the norm before
+//! each part, the group's sum of a part's partial, the residual add, the head's logits and its
+//! device pick, and a sequence's lane memory.
+//!
+//! Every pass takes the arm's [`WidePolicy::DENSE`]: a prompt chunk takes the wide tile, and a
+//! token step takes the tile once it batches more than the row GEMV's eight rows (below that the
+//! policy still picks the row GEMV, so a one-to-eight-row step is the kernel it always was).
 //!
 //! The layout and limits are the arm's: attention layers are positional BF16 key/value caches,
 //! Gated DeltaNet layers are recurrent, the context is the served context, and a pass is the
 //! chunk [super::chunk_rows] takes from [sparkflash_runtime::ChunkPolicy] (256 rows by default).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
+use sparkflash_kernels::cuda_driver::Deviceptr;
+use sparkflash_model::backend::BackendError;
 use sparkflash_model::ledger::State;
+use sparkflash_ops::calls::{self, RmsNorm};
 use sparkflash_ops::projection::WidePolicy;
 use sparkflash_runtime::{
-    Absent, ComputeDeclaration, HeadRow, Hidden, LaneState, Limits, NoVision, Pass, PassKind,
-    PassMask, Region, Segment, Segments, StateKind, StateLayout, Walk, WalkCapabilities,
-    check_checkpoint, check_rewind,
+    ComputeDeclaration, Limits, PassKind, PassMask, PlanBranch, PlanHost, PlanLane, PlanSeq,
+    PlanWalk, Segments, StateKind, WalkCapabilities,
 };
 
 use super::{
-    CHUNK_ROWS, DEVICE, Scratch, Sequence, Shared, TOKEN_DECODE, head as dense_head,
-    head_choices as dense_head_choices, walk as dense_walk,
+    CHUNK_ROWS, DEVICE, Dense, DenseLane, PassCx, Scratch, Shared, TOKEN_DECODE, floats,
+    head as dense_head, head_choices as dense_head_choices,
 };
 
-/// The rows of one walk, as offsets into the pass's residual buffer. The existing walk and this
-/// adapter use this one layout, so a pass has the same rows whichever one runs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RowPlan {
-    /// The total rows.
-    pub rows: usize,
-    /// The first row of each segment.
-    pub offsets: Vec<usize>,
-}
-
-/// The row layout of a pass with one segment of each length.
-pub(crate) fn row_plan(lengths: &[usize]) -> RowPlan {
-    let mut offsets = Vec::with_capacity(lengths.len());
-    let mut rows = 0;
-    for &length in lengths {
-        offsets.push(rows);
-        rows += length;
-    }
-    RowPlan { rows, offsets }
-}
+/// The dense arm, exposed to the shared runtime as a Walk: the runtime's walk over [Shared].
+pub type DenseWalk = PlanWalk<Shared>;
 
 /// The wide policy a pass shape takes: the arm's policy for every pass.
 ///
@@ -75,65 +59,18 @@ pub(crate) fn policy_for_kind(_kind: PassKind, policy: Option<WidePolicy>) -> Op
     policy
 }
 
-/// The dense arm, exposed to the shared runtime as a Walk.
-pub struct DenseWalk {
-    shared: Arc<Shared>,
-    layout: StateLayout,
-    limits: Limits,
-    scratch: Mutex<Scratch>,
-    /// The arm publishes no draft head.
-    drafter: Absent<&'static str>,
-}
-
-impl DenseWalk {
-    /// A walk over shared's weights, with scratch for capacity rows.
-    ///
-    /// # Errors
-    /// A device allocation the scratch cannot make.
-    pub(crate) fn new(shared: Arc<Shared>, capacity: usize) -> Result<Self, BackendError> {
-        let rows = capacity.clamp(1, CHUNK_ROWS);
-        let scratch = Scratch::new(Arc::clone(&shared), rows)
-            .map_err(|error| BackendError::new(DEVICE, error))?;
-        let layout = layout_of(&shared);
-        let limits = Limits::new(shared.chunk, shared.context);
-        Ok(Self {
-            shared,
-            layout,
-            limits,
-            scratch: Mutex::new(scratch),
-            drafter: Absent("dense has no draft head"),
-        })
-    }
-
-    fn scratch(&self) -> Result<std::sync::MutexGuard<'_, Scratch>, BackendError> {
-        self.scratch
-            .lock()
-            .map_err(|_| BackendError::new(DEVICE, "the walk's scratch is poisoned"))
-    }
-}
-
 /// The dense walk for `shared`'s weights and `capacity` lanes, for the tick engine's thread.
 ///
 /// # Errors
 /// A device allocation the walk's scratch cannot make.
 pub(crate) fn walk(shared: Arc<Shared>, capacity: usize) -> Result<DenseWalk, BackendError> {
-    DenseWalk::new(shared, capacity)
+    PlanWalk::new(shared, capacity)
 }
 
-/// The arm's state, as the runtime needs to see it: what each part of the walk declares, in walk
-/// order.
-fn layout_of(shared: &Shared) -> StateLayout {
-    let regions: Vec<Region> = shared.state();
-    StateLayout::new(regions)
-}
+impl PlanLane for DenseLane {
+    const DEVICE: &'static str = DEVICE;
 
-impl LaneState for Sequence {
-    fn position(&self) -> usize {
-        self.history.len()
-    }
-
-    fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
-        check_checkpoint(DEVICE, at, self.history.len())?;
+    fn save(&mut self, at: usize) -> Result<(), BackendError> {
         let live = self.linear_regions();
         if let Some(checkpoint) = self.checkpoint.as_mut() {
             checkpoint
@@ -143,32 +80,34 @@ impl LaneState for Sequence {
         Ok(())
     }
 
-    fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-        check_rewind(DEVICE, to, self.history.len())?;
-        if to == 0 {
-            self.clear_linear()?;
-        } else if let Some(checkpoint) = &self.checkpoint {
+    fn restore(&mut self, to: usize) -> Result<(), BackendError> {
+        if let Some(checkpoint) = &self.checkpoint {
             let live = self.linear_regions();
             checkpoint
                 .restore(&self.shared.cuda, None, &live, to)
                 .map_err(|error| BackendError::new(DEVICE, format!("the rewind point: {error}")))?;
         }
-        self.history.truncate(to);
-        self.sampler.truncate(to);
         Ok(())
     }
 
+    fn clear(&mut self) -> Result<(), BackendError> {
+        self.clear_linear()
+    }
+
     fn room(&self, positions: usize, reset: bool) -> bool {
-        self.lane.room(positions, reset)
+        self.memory.room(positions, reset)
     }
 }
 
-impl Walk for DenseWalk {
-    type Seq = Sequence;
-    type Hidden = Hidden;
-    type Drafter = Absent<&'static str>;
-    type Vision = NoVision;
+impl PlanHost for Shared {
+    type Parts = Dense;
+    type Norm = Deviceptr;
+    type Lane = DenseLane;
+    type Scratch = Scratch;
+    type Mode = Option<WidePolicy>;
 
+    const DEVICE: &'static str = DEVICE;
+    const NO_DRAFTER: &'static str = "dense has no draft head";
     const CAPABILITIES: WalkCapabilities = WalkCapabilities {
         passes: PassMask::ALL,
         segments: Segments::Many,
@@ -184,157 +123,136 @@ impl Walk for DenseWalk {
         },
     };
 
-    fn layout(&self) -> &StateLayout {
-        &self.layout
+    fn layers(&self) -> usize {
+        self.layers.len()
     }
 
-    fn open(&self) -> Result<Self::Seq, BackendError> {
-        Sequence::open(Arc::clone(&self.shared)).map_err(|error| BackendError::new(DEVICE, error))
+    fn branches(&self, layer: usize) -> &[PlanBranch<Dense, Deviceptr>] {
+        &self.layers[layer].branches
+    }
+
+    fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    fn pass_rows(&self) -> usize {
+        CHUNK_ROWS
     }
 
     fn limits(&self) -> Limits {
-        self.limits
+        Limits::new(self.chunk, self.context)
     }
 
-    fn drafter(&self) -> &Self::Drafter {
-        &self.drafter
+    fn scratch(this: &Arc<Self>, rows: usize) -> Result<Scratch, BackendError> {
+        Scratch::new(Arc::clone(this), rows).map_err(|error| BackendError::new(DEVICE, error))
     }
 
-    fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
-        seq.sampling = sampling;
-        seq.sampler.reset();
+    fn lane(this: &Arc<Self>) -> Result<DenseLane, BackendError> {
+        DenseLane::open(Arc::clone(this)).map_err(|error| BackendError::new(DEVICE, error))
     }
 
-    fn walk(
+    fn mode(&self, kind: PassKind) -> Option<WidePolicy> {
+        policy_for_kind(kind, self.policy)
+    }
+
+    fn back(&self, lane: &mut DenseLane, reach: usize) -> Result<(), BackendError> {
+        lane.memory
+            .back(&self.cuda, reach)
+            .map_err(|error| BackendError::new(DEVICE, format!("the lane memory: {error}")))
+    }
+
+    fn embed(&self, scratch: &Scratch, ids: &[u32]) -> Result<(), BackendError> {
+        let b = &scratch.buffers;
+        let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        self.cuda
+            .copy_htod(&b.tokens, &bytes)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        self.call(
+            self.kernels.embed,
+            calls::embed_rows(
+                self.embed.data().0,
+                b.x.0,
+                b.tokens.0,
+                (self.hidden, self.hidden),
+                ids.len(),
+            ),
+        )
+    }
+
+    fn norm(&self, scratch: &Scratch, norm: &Deviceptr, rows: usize) -> Result<(), BackendError> {
+        let b = &scratch.buffers;
+        self.norm(
+            RmsNorm::new(b.x.0, norm.0, b.normed.0, self.hidden, self.eps),
+            rows,
+        )
+    }
+
+    fn pass<'a>(
+        &'a self,
+        scratch: &'a Scratch,
+        segments: &'a [(&'a mut PlanSeq<DenseLane>, &'a [u32])],
+        layer: usize,
+        slot: usize,
+        rows: usize,
+        mode: Option<WidePolicy>,
+    ) -> PassCx<'a> {
+        PassCx {
+            shared: self,
+            b: &scratch.buffers,
+            segments,
+            index: layer,
+            slot,
+            rows,
+            policy: mode,
+        }
+    }
+
+    fn combine(&self, scratch: &Scratch, rows: usize) -> Result<(), BackendError> {
+        self.sum(scratch.buffers.projected, rows)
+    }
+
+    fn add(&self, scratch: &Scratch, rows: usize) -> Result<(), BackendError> {
+        let b = &scratch.buffers;
+        self.call(
+            self.kernels.add,
+            calls::add(b.x.0, b.projected.0, rows * self.hidden),
+        )
+    }
+
+    fn residual(&self, scratch: &Scratch, rows: usize) -> Result<Vec<f32>, BackendError> {
+        let mut bytes = vec![0u8; rows * self.hidden * 4];
+        self.cuda
+            .copy_dtoh(&mut bytes, &scratch.buffers.x)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        Ok(floats(&bytes))
+    }
+
+    fn logits(
         &self,
-        segments: &mut [Segment<'_, Self::Seq>],
-        pass: Pass<'_>,
-    ) -> Result<Hidden, BackendError> {
-        let Pass {
-            kind,
-            constraint: _,
-            prompt_end: _,
-            hook,
-        } = pass;
-        let lengths: Vec<usize> = segments.iter().map(|segment| segment.rows.len()).collect();
-        let plan = row_plan(&lengths);
-        let scratch = self.scratch()?;
-        let policy = policy_for_kind(kind, self.shared.policy);
-        let mut pairs: Vec<(&mut Sequence, &[u32])> = segments
-            .iter_mut()
-            .map(|segment| (&mut *segment.seq, segment.rows))
-            .collect();
-        let body = sparkflash_runtime::PartBody::of(kind);
-        dense_walk(
-            &self.shared,
-            &scratch.buffers,
-            &mut pairs,
-            body,
-            policy,
-            None,
-        )?;
-        drop(pairs);
-        let hidden = Hidden::new(plan.rows);
-        if let Some(hook) = hook {
-            hook.after_layers(&hidden)?;
-        }
-        Ok(hidden)
+        scratch: &Scratch,
+        first: usize,
+        count: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        dense_head(self, &scratch.buffers, first, count)
     }
 
-    fn head(
+    fn choices(
         &self,
-        hidden: &mut Hidden,
-        rows: &mut [HeadRow<'_, Self::Seq>],
-    ) -> Result<Vec<StepOutput>, BackendError> {
-        if hidden.rows == 0 {
-            return Ok(Vec::new());
-        }
-        let scratch = self.scratch()?;
-        let contiguous = rows.iter().enumerate().all(|(index, row)| row.row == index);
-        // Record each row's token before asking whether its sampler is greedy: a prompt's record
-        // resets and fills the history the penalty check reads.
-        for row in rows.iter_mut() {
-            row.input.record(&mut row.seq.sampler);
-        }
-        // A greedy sampler whose penalties change nothing takes the row's argmax as it stands.
-        // Choose it on the device and copy one u32 a row, not the vocabulary.
-        if rows
-            .iter()
-            .all(|row| row.seq.sampler.takes_argmax(&row.seq.sampling))
-        {
-            let picks: Vec<u32> = if contiguous {
-                dense_head_choices(&self.shared, &scratch.buffers, 0, rows.len())?
-            } else {
-                rows.iter()
-                    .map(|row| dense_head_choices(&self.shared, &scratch.buffers, row.row, 1))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect()
-            };
-            if picks.len() != rows.len() {
-                return Err(BackendError::new(
-                    DEVICE,
-                    format!(
-                        "the head was asked for {} rows and made {}",
-                        rows.len(),
-                        picks.len()
-                    ),
-                ));
-            }
-            return Ok(rows
-                .iter()
-                .zip(picks)
-                .map(|(_, pick)| StepOutput {
-                    logits: Vec::new(),
-                    next_token: Some(pick),
-                    draft: Vec::new(),
-                })
-                .collect());
-        }
-        // A sampling request needs the row: temperature, top-k, top-p, penalties and the draw
-        // stay on the host over the logits the step copies back.
-        let logits: Vec<Vec<f32>> = if contiguous {
-            dense_head(&self.shared, &scratch.buffers, 0, rows.len())?
-                .chunks(self.shared.vocab)
-                .map(<[f32]>::to_vec)
-                .collect()
-        } else {
-            rows.iter()
-                .map(|row| dense_head(&self.shared, &scratch.buffers, row.row, 1))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        if logits.len() != rows.len() {
-            return Err(BackendError::new(
-                DEVICE,
-                format!(
-                    "the head was asked for {} rows and made {}",
-                    rows.len(),
-                    logits.len()
-                ),
-            ));
-        }
-        rows.iter_mut()
-            .zip(logits)
-            .map(|(row, logits)| {
-                // The row's token is already recorded above, once: a second record here would
-                // count every sampled token twice in the penalties and leave the history a token
-                // a step ahead of the position a rewind truncates it to.
-                let chosen = row.seq.sampler.choose(&logits, &row.seq.sampling);
-                Ok(StepOutput {
-                    logits,
-                    next_token: Some(chosen),
-                    draft: Vec::new(),
-                })
-            })
-            .collect()
+        scratch: &Scratch,
+        first: usize,
+        count: usize,
+    ) -> Result<Vec<u32>, BackendError> {
+        dense_head_choices(self, &scratch.buffers, first, count)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use sparkflash_runtime::testing::ArmProfile;
-    use sparkflash_runtime::{Fixture, FormatRule, Runtime, WalkFixture};
+    use sparkflash_runtime::{ArmFixture, Fixture, FormatRule, Runtime};
+
+    use sparkflash_model::backend::Sampling;
+    use sparkflash_runtime::{Region, StateLayout, Walk};
 
     use super::*;
 
@@ -500,8 +418,12 @@ mod tests {
     /// directory `scripts/onboard-gate.sh dense` uses and names the path; a named path that is
     /// not a checkpoint is a fixture error that names the exact command which writes one. A
     /// missing fixture is never a skipped check.
-    impl WalkFixture for DenseWalk {
-        fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
+    pub struct DenseFixture;
+
+    impl ArmFixture for DenseFixture {
+        type Walk = DenseWalk;
+
+        fn fixture(world: usize) -> Result<Fixture<DenseWalk>, BackendError> {
             let path = match std::env::var_os("SPARKFLASH_CONFORMANCE_CHECKPOINT") {
                 Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
                 _ => {
@@ -662,23 +584,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_adapter_rows_are_the_existing_walks_rows() {
-        // A token step: one row a member, the shape step builds.
-        let step_rows = row_plan(&[1, 1, 1, 1]);
-        assert_eq!(step_rows.rows, 4);
-        assert_eq!(step_rows.offsets, [0, 1, 2, 3]);
-        // A bulk prompt chunk: CHUNK_ROWS rows, the shape Sequence::part builds.
-        let bulk_rows = row_plan(&[CHUNK_ROWS]);
-        assert_eq!(bulk_rows.rows, CHUNK_ROWS);
-        assert_eq!(bulk_rows.offsets, [0]);
-        // Several prompts' chunks: each segment at its own offset, the shape the runtime asks
-        // for when it pairs prompts.
-        let paired = row_plan(&[CHUNK_ROWS, 1, 17]);
-        assert_eq!(paired.rows, CHUNK_ROWS + 18);
-        assert_eq!(paired.offsets, [0, CHUNK_ROWS, CHUNK_ROWS + 1]);
-    }
-
     /// The walk's Limits come from the arm's chunk rule: the default profile gets 256 rows a
     /// pass, and a profile switch the policy documents gets the smaller pass. The generated
     /// profile tests run a prompt at each.
@@ -700,7 +605,7 @@ mod tests {
     #[test]
     #[ignore = "boots the arm's fixture; run scripts/onboard-gate.sh dense"]
     fn a_sampled_step_records_its_token_once() {
-        let fixture = <DenseWalk as WalkFixture>::fixture(1).expect("the dense fixture");
+        let fixture = DenseFixture::fixture(1).expect("the dense fixture");
         let runtime = Runtime::new(fixture.walk, 0).expect("the runtime starts");
         let mut slot = runtime.open_slot().expect("a slot");
         let sampling = Sampling {
@@ -808,5 +713,5 @@ mod tests {
         .prompt(Limits::new(SWITCHED_CHUNK, 32_768), 150, &[64, 64, 22])
     }
 
-    sparkflash_runtime::conformance!(super::DenseWalk, profile: stated());
+    sparkflash_runtime::conformance!(DenseFixture, profile: stated());
 }

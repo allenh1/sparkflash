@@ -2865,7 +2865,8 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
                 }
                 None
             }
-            _ => {
+            // Every kind is named, no wildcard: a new kind leads the compiler here.
+            AttentionKind::Mla { .. } | AttentionKind::Inkling { .. } | AttentionKind::Kda(_) => {
                 return Some(format!(
                     "layer {index} is neither grouped-query attention nor a Gated DeltaNet, the \
                      attentions the arm runs"
@@ -2896,7 +2897,10 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
         // The output projection's columns: the attended heads, or the linear attention's values.
         let query_width = match &attention.kind {
             AttentionKind::Gdn(gdn) => gdn.value_heads * gdn.value_dim,
-            _ => attention.heads * attention.head_dim,
+            AttentionKind::Gqa { .. }
+            | AttentionKind::Mla { .. }
+            | AttentionKind::Inkling { .. }
+            | AttentionKind::Kda(_) => attention.heads * attention.head_dim,
         };
         let ffn_width = match &layer.ffn {
             Ffn::Dense(dense) => dense.intermediate,

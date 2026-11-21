@@ -36,7 +36,7 @@ use sparkflash_model::ledger::{Strategy, ledger_for_arm};
 use sparkflash_model::verdict;
 
 use crate::chunk::ChunkPolicy;
-use crate::conformance::{ConformanceCheck, WalkFixture, checks_for};
+use crate::conformance::{ArmFixture, ConformanceCheck, checks_for};
 use crate::engine::{RequestId, TickConfig, TickEngine, TickEvent};
 use crate::layout::{LaneState, Limits, StateKind, StateLayout, check_checkpoint, check_rewind};
 use crate::runtime::{Runtime, RuntimeSlot, ledger_for};
@@ -620,14 +620,14 @@ pub fn check_compute_rows<W: Walk>(profile: &ArmProfile) {
 /// # Panics
 /// If the fixture is not on the tick engine, or the walk's drafter, the profile's depth and
 /// the invoked form disagree.
-pub fn check_serving_path<W: WalkFixture>(profile: &ArmProfile, rounds: bool) {
+pub fn check_serving_path<A: ArmFixture>(profile: &ArmProfile, rounds: bool) {
     let arm = profile.ledger;
     assert!(
-        W::tick_engine(),
+        A::tick_engine(),
         "{arm}: a profiled arm serves on the tick engine, and its fixture says it does not"
     );
     assert_eq!(
-        W::Drafter::PRESENT,
+        <<A::Walk as Walk>::Drafter as Drafter<A::Walk>>::PRESENT,
         rounds,
         "{arm}: a walk that declares a drafter invokes `conformance!` with `rounds`, and only \
          that walk does"
@@ -638,7 +638,7 @@ pub fn check_serving_path<W: WalkFixture>(profile: &ArmProfile, rounds: bool) {
         "{arm}: the profile states a draft depth exactly when the walk drafts"
     );
     assert_eq!(
-        checks_for::<W>().contains(&ConformanceCheck::DraftedEqualsPlain),
+        checks_for::<A::Walk>().contains(&ConformanceCheck::DraftedEqualsPlain),
         rounds,
         "{arm}: a drafting arm claims drafted = plain"
     );

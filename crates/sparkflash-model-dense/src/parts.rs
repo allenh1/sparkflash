@@ -30,6 +30,7 @@
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model::backend::BackendError;
 use sparkflash_model::{Architecture, Part, TpPlan};
+use sparkflash_ops::calls::RmsNorm;
 use sparkflash_ops::formats::{Bf16, FormatKind, Mat};
 use sparkflash_ops::naming::{LayerNames, TensorNames};
 use sparkflash_ops::projection::WidePolicy;
@@ -154,7 +155,7 @@ impl PassCx<'_> {
                 first,
                 rows: tokens.len(),
                 position: sequence.position(),
-                regions: &sequence.regions[self.slot],
+                regions: &sequence.lane.regions[self.slot],
             };
             first += tokens.len();
             segment
@@ -179,6 +180,36 @@ impl PassCx<'_> {
                 ),
             )
         })
+    }
+
+    /// The arm's RMSNorm of the pass's rows, f32 `[rows][hidden]`, from `input` into `output`
+    /// under the gains at `weight`, at the arm's epsilon and gain convention: the norm the walk
+    /// runs before every part. `input` and `output` are different buffers.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn norm(
+        &self,
+        input: Deviceptr,
+        weight: Deviceptr,
+        output: Deviceptr,
+    ) -> Result<(), BackendError> {
+        let shared = self.shared;
+        shared.norm(
+            RmsNorm::new(input.0, weight.0, output.0, shared.hidden, shared.eps),
+            self.rows,
+        )
+    }
+
+    /// Copies the pass's rows, f32 `[rows][hidden]`, from `from` to `to` on the walk's stream.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn copy_rows(&self, from: Deviceptr, to: Deviceptr) -> Result<(), BackendError> {
+        self.shared
+            .cuda
+            .copy_dtod_async(&to, &from, self.rows * self.shared.hidden * 4)
+            .map_err(|error| BackendError::new(DEVICE, format!("the rows' copy: {error}")))
     }
 
     /// Launches `kernel` on the walk's stream.
@@ -280,6 +311,15 @@ impl<'a> OpenCx<'a> {
         self.up
             .rows
             .push(LedgerRow::new(name, stored, arithmetic, bytes_per_token));
+    }
+
+    /// Uploads the BF16 vector `name` of `width` values (a norm's gains, a scale), counted with
+    /// the weights and stated in the boot format ledger.
+    ///
+    /// # Errors
+    /// A tensor at another shape or dtype, or an upload the device refuses.
+    pub fn vector(&mut self, name: &str, width: usize) -> Result<Deviceptr, String> {
+        self.up.vector(name, width)
     }
 
     /// Names a BF16 projection the arm's row GEMV reads for a packed copy
