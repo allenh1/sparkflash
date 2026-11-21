@@ -35,6 +35,7 @@ pub mod backend;
 pub mod capabilities;
 pub mod compose;
 pub mod config;
+pub mod coverage;
 pub mod defaults;
 pub mod descriptor;
 pub mod dflash2;
@@ -73,6 +74,7 @@ pub use backend::{BackendError, ModelBackend, ModelSession, Sampling, Speculatio
 pub use capabilities::Capabilities;
 pub use compose::{LayerStep, StepRole};
 pub use config::ConfigError;
+pub use coverage::{ConfigCoverage, IgnoredKey, KeyCoverageState, UnknownKey};
 pub use defaults::{DEFAULTS, DefaultValue, Defaults, check_profile};
 pub use descriptor::{
     DEFAULT_MODEL_ID, DEFAULT_WEIGHTS_ID, DORY1_0_4B_BF16_ID, DORY1_0_4B_BF16_WEIGHTS_ID,

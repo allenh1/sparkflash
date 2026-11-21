@@ -389,7 +389,7 @@ impl VisionGeometry {
         language_hidden: usize,
     ) -> Result<Self, ConfigError> {
         let number = |name: &str| -> Result<Option<usize>, ConfigError> {
-            match config.get(name) {
+            match crate::coverage::read_key(config, name) {
                 None | Some(serde_json::Value::Null) => Ok(None),
                 Some(value) => value
                     .as_u64()
@@ -401,7 +401,7 @@ impl VisionGeometry {
             }
         };
         let float = |name: &str| -> Result<Option<f64>, ConfigError> {
-            match config.get(name) {
+            match crate::coverage::read_key(config, name) {
                 None | Some(serde_json::Value::Null) => Ok(None),
                 Some(value) => value.as_f64().map(Some).ok_or_else(|| {
                     ConfigError::Invalid(format!("vision_config.{name} is not a number"))

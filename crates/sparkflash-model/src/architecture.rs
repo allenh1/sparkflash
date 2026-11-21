@@ -27,6 +27,7 @@
 use serde_json::Value;
 
 use crate::config::{ConfigError, OneOrMany};
+use crate::coverage::{ConfigCoverage, entries, read_key, with_recording};
 use crate::parts::{Part, PartSet, Target, built};
 use crate::vision_geometry::{
     VisionActivation, VisionDownsample, VisionGeometry, VisionNorm, VisionPosition,
@@ -893,9 +894,34 @@ impl Architecture {
         text: &str,
         tensors: Option<&[String]>,
     ) -> Result<Self, ConfigError> {
+        let (parsed, _coverage) =
+            Self::from_json_with_coverage_and_tensor_names(text, tensors)?;
+        Ok(parsed)
+    }
+
+    /// Parse a released Hugging Face `config.json` and report the config-key coverage.
+    ///
+    /// The report says which keys the description reader consumed and which keys the document
+    /// carries that no read consumed. A parse always starts a fresh recorder, so the report is
+    /// about this document only.
+    ///
+    /// # Errors
+    /// As [Self::from_json].
+    pub fn from_json_with_coverage(text: &str) -> Result<(Self, ConfigCoverage), ConfigError> {
+        Self::from_json_with_coverage_and_tensor_names(text, None)
+    }
+
+    /// Parse a released config with both the tensor names and the config-key coverage.
+    ///
+    /// # Errors
+    /// As [Self::from_json].
+    pub fn from_json_with_coverage_and_tensor_names(
+        text: &str,
+        tensors: Option<&[String]>,
+    ) -> Result<(Self, ConfigCoverage), ConfigError> {
         let root: Value =
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
-        Self::from_value_with_tensor_names(&root, tensors)
+        Self::from_value_with_coverage_and_tensor_names(&root, tensors)
     }
 
     /// Read a released Hugging Face `config.json` from a path.
@@ -924,11 +950,43 @@ impl Architecture {
         root: &Value,
         tensors: Option<&[String]>,
     ) -> Result<Self, ConfigError> {
+        let (parsed, _coverage) =
+            Self::from_value_with_coverage_and_tensor_names(root, tensors)?;
+        Ok(parsed)
+    }
+
+    /// Parse an already-decoded `config.json` and report the config-key coverage.
+    ///
+    /// This is [Self::from_value] with the coverage report the scan's config-key check needs.
+    /// The parse is the same one, run with a fresh recorder; the report is discarded on an
+    /// error because an incomplete parse cannot say which keys a successful description
+    /// would have read.
+    ///
+    /// # Errors
+    /// As [Self::from_json].
+    pub fn from_value_with_coverage(root: &Value) -> Result<(Self, ConfigCoverage), ConfigError> {
+        Self::from_value_with_coverage_and_tensor_names(root, None)
+    }
+
+    /// Parse an already-decoded config with both the tensor names and the key coverage.
+    ///
+    /// # Errors
+    /// As [Self::from_json].
+    pub fn from_value_with_coverage_and_tensor_names(
+        root: &Value,
+        tensors: Option<&[String]>,
+    ) -> Result<(Self, ConfigCoverage), ConfigError> {
+        let (parsed, coverage) = with_recording(root, || Self::parse(root, tensors));
+        parsed.map(|architecture| (architecture, coverage))
+    }
+
+    /// The parse every entry point runs, with the active recorder recording its reads.
+    fn parse(root: &Value, tensors: Option<&[String]>) -> Result<Self, ConfigError> {
         let text = object(root, "text_config").unwrap_or(root);
         let family = string(root, "model_type")
             .or_else(|| string(text, "model_type"))
             .ok_or_else(|| invalid("the configuration names no model_type"))?;
-        let architectures = string_list(root.get("architectures"))?;
+        let architectures = string_list(read_key(root, "architectures"))?;
         let hidden_size = required_usize(text, "hidden_size", "text_config")?;
         let vocab_size = required_usize(text, "vocab_size", "text_config")?;
         // Transformers writes the window as max_position_embeddings; some releases (Inkling
@@ -984,9 +1042,8 @@ impl Architecture {
         let text = object(root, "text_config").unwrap_or(root);
         let mut found = Vec::new();
         for field in ["attn_logit_softcapping", "final_logit_softcapping"] {
-            let declared = text
-                .get(field)
-                .or_else(|| root.get(field))
+            let declared = read_key(text, field)
+                .or_else(|| read_key(root, field))
                 .and_then(Value::as_f64);
             if let Some(cap) = declared.filter(|cap| *cap > 0.0) {
                 found.push(format!(
@@ -996,9 +1053,9 @@ impl Architecture {
         }
         let routed_named = ["n_routed_experts", "num_experts"]
             .iter()
-            .any(|field| text.get(*field).is_some_and(|value| !value.is_null()));
+            .any(|field| read_key(text, *field).is_some_and(|value| !value.is_null()));
         if !routed_named
-            && let Some(experts) = text.get("num_local_experts").and_then(Value::as_u64)
+            && let Some(experts) = read_key(text, "num_local_experts").and_then(Value::as_u64)
         {
             found.push(format!(
                 "num_local_experts {experts} (Mixtral-style routed experts are not read; the \
@@ -1054,7 +1111,7 @@ impl Architecture {
                 found.push(format!("{field} ({what})"));
             }
         }
-        if !engram && text.get("engram_layer_head_vocab_sizes").is_some() {
+        if !engram && read_key(text, "engram_layer_head_vocab_sizes").is_some() {
             found.push(
                 "engram_layer_head_vocab_sizes (per-head Engram tables with no Engram layer to \
                  land on)"
@@ -1073,10 +1130,10 @@ impl Architecture {
             );
         }
         if mla && optional_bool(text, "gated_mla").ok().flatten() == Some(true) {
-            let groups = text.get("gate_groups").and_then(Value::as_u64).unwrap_or(1);
-            let low_rank = text
-                .get("gate_lora_rank")
-                .is_some_and(|rank| !rank.is_null());
+            let groups = read_key(text, "gate_groups")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let low_rank = read_key(text, "gate_lora_rank").is_some_and(|rank| !rank.is_null());
             if groups > 1 || low_rank {
                 found.push(format!(
                     "gate_groups {groups} / gate_lora_rank (a grouped or low-rank MLA output gate \
@@ -1084,16 +1141,18 @@ impl Architecture {
                 ));
             }
         }
-        if text.get("d_rel").is_none() && text.get("swa_num_attention_heads").is_some() {
+        if read_key(text, "d_rel").is_none() && read_key(text, "swa_num_attention_heads").is_some()
+        {
             // The sliding layers' head count is typed; head widths or key/value heads of their own
             // are not, and would be read as the full layers' shape.
-            let sliding_layers = string_list(text.get("layer_types"))
+            let sliding_layers = string_list(read_key(text, "layer_types"))
                 .unwrap_or_default()
                 .iter()
                 .any(|kind| kind.contains("sliding"));
             if !sliding_layers
-                && let Some(sliding) = text.get("swa_num_attention_heads").and_then(Value::as_u64)
-                && text.get("num_attention_heads").and_then(Value::as_u64) != Some(sliding)
+                && let Some(sliding) =
+                    read_key(text, "swa_num_attention_heads").and_then(Value::as_u64)
+                && read_key(text, "num_attention_heads").and_then(Value::as_u64) != Some(sliding)
             {
                 found.push(format!(
                     "swa_num_attention_heads {sliding} (a sliding head count with no sliding \
@@ -1107,8 +1166,8 @@ impl Architecture {
                 ("swa_v_head_dim", "v_head_dim"),
                 ("swa_num_key_value_heads", "num_key_value_heads"),
             ] {
-                if let Some(sliding) = text.get(field).and_then(Value::as_u64)
-                    && text.get(full).and_then(Value::as_u64) != Some(sliding)
+                if let Some(sliding) = read_key(text, field).and_then(Value::as_u64)
+                    && read_key(text, full).and_then(Value::as_u64) != Some(sliding)
                 {
                     found.push(format!(
                         "{field} {sliding} (sliding layers with a shape of their own are read as \
@@ -1353,10 +1412,10 @@ impl Architecture {
             // has already read, so that reading stands. Any other document is refused.
             let model = object(&value, "model").unwrap_or(&value);
             let export = object(&value, "quantization")
-                .is_some_and(|quantization| quantization.get("quant_algo").is_some());
+                .is_some_and(|quantization| read_key(quantization, "quant_algo").is_some());
             let read = architecture.quantization.dense_format != WeightFormat::Bf16
                 || architecture.quantization.expert_format != WeightFormat::Bf16;
-            if model.get("parameter_groups").is_some() || !(export && read) {
+            if read_key(model, "parameter_groups").is_some() || !(export && read) {
                 architecture.apply_quant_config(&value)?;
             }
         }
@@ -1370,10 +1429,7 @@ impl Architecture {
             // cannot remove the model's own: the config's order is the served order, and the
             // first id is the one the PLE segment rule resets on. Union generation-only ids
             // after the config's, then dedup.
-            if value
-                .get("eos_token_id")
-                .is_some_and(|field| !field.is_null())
-            {
+            if read_key(&value, "eos_token_id").is_some_and(|field| !field.is_null()) {
                 let mut ids = architecture.tokens.eos_token_ids.clone();
                 ids.extend(eos_ids(&value)?);
                 architecture.tokens.eos_token_ids = dedup(ids);
@@ -1399,7 +1455,7 @@ impl Architecture {
     /// A malformed document, or a group whose arithmetic has no [WeightFormat].
     pub fn apply_quant_config(&mut self, root: &Value) -> Result<(), ConfigError> {
         let model = object(root, "model").unwrap_or(root);
-        let Some(groups) = model.get("parameter_groups").and_then(Value::as_array) else {
+        let Some(groups) = read_key(model, "parameter_groups").and_then(Value::as_array) else {
             return Err(invalid(
                 "hf_quant_config.json has no model.parameter_groups",
             ));
@@ -1414,7 +1470,7 @@ impl Architecture {
             let output = optional_string(group, "output_dtype")
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            let block = usize_list(group.get("weight_block_shape"))?
+            let block = usize_list(read_key(group, "weight_block_shape"))?
                 .last()
                 .copied()
                 .or_else(|| {
@@ -1429,11 +1485,13 @@ impl Architecture {
                 ("mxfp8", _) => WeightFormat::MxFp8 {
                     block: block.unwrap_or(32),
                 },
-                (_, "uint8") if group.get("weight_scale_format").is_some() => WeightFormat::NvFp4 {
-                    group_size: block.unwrap_or(16),
-                },
+                (_, "uint8") if read_key(group, "weight_scale_format").is_some() => {
+                    WeightFormat::NvFp4 {
+                        group_size: block.unwrap_or(16),
+                    }
+                }
                 (_, "float8_e4m3fn")
-                    if group.get("weight_transform").is_some_and(|value| {
+                    if read_key(group, "weight_transform").is_some_and(|value| {
                         value.as_str().is_some_and(|name| name.contains("mxfp8"))
                     }) =>
                 {
@@ -1443,7 +1501,7 @@ impl Architecture {
                 }
                 _ => WeightFormat::Bf16,
             };
-            let tensors = string_list(group.get("tensors"))?;
+            let tensors = string_list(read_key(group, "tensors"))?;
             for name in tensors {
                 if let Some(layer) = name
                     .strip_prefix("model.llm.layers.")
@@ -1836,10 +1894,10 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
         return dory_layers(text);
     }
     let count = required_usize(text, "num_hidden_layers", "text_config")?;
-    let mut layer_types = string_list(text.get("layer_types"))?;
-    let local_layers = usize_list(text.get("local_layer_ids"))?;
-    let ratios = usize_list(text.get("compress_ratios"))?;
-    let indexer_types = string_list(text.get("indexer_types"))?;
+    let mut layer_types = string_list(read_key(text, "layer_types"))?;
+    let local_layers = usize_list(read_key(text, "local_layer_ids"))?;
+    let ratios = usize_list(read_key(text, "compress_ratios"))?;
+    let indexer_types = string_list(read_key(text, "indexer_types"))?;
     if layer_types.is_empty() && !local_layers.is_empty() {
         // Inkling names the sliding-layer set rather than a full_attention_interval. Every
         // unlisted layer is full attention; the local set is the sliding window.
@@ -1894,8 +1952,8 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
             })
             .collect();
     }
-    let kv_sources = usize_list(text.get("kv_source_layer_ids"))?;
-    let index_sources = usize_list(text.get("index_source_layer_ids"))?;
+    let kv_sources = usize_list(read_key(text, "kv_source_layer_ids"))?;
+    let index_sources = usize_list(read_key(text, "index_source_layer_ids"))?;
     let candidate_source = optional_usize(text, "candidate_source_layer_id")?;
     let candidate_blocks = optional_usize(text, "candidate_topk_blocks")?.unwrap_or(0);
     let candidate_block_size = optional_usize(text, "candidate_block_size")?.unwrap_or(0);
@@ -1905,9 +1963,9 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
         block_size: candidate_block_size,
     });
     let first_dense = optional_usize(text, "first_k_dense_replace")?.unwrap_or(0);
-    let mlp_types = string_list(text.get("mlp_layer_types"))?;
-    let engram_layers = usize_list(text.get("engram_layer_ids"))?;
-    let ple_layers = usize_list(text.get("ple_layer_ids"))?;
+    let mlp_types = string_list(read_key(text, "mlp_layer_types"))?;
+    let engram_layers = usize_list(read_key(text, "engram_layer_ids"))?;
+    let ple_layers = usize_list(read_key(text, "ple_layer_ids"))?;
     let engram_geometry = engram_geometry(text)?;
     let ple_geometry = ple_geometry(text)?;
     let post_norm = optional_bool(text, "sandwich_norm")?.unwrap_or(false);
@@ -1946,7 +2004,7 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
             post_norm,
         });
     }
-    if text.get("d_rel").is_none()
+    if read_key(text, "d_rel").is_none()
         && let Some(sliding_heads) = optional_usize(text, "swa_num_attention_heads")?
     {
         // A release with sliding layers of their own head count (Hy4-flash's) names the count
@@ -1970,14 +2028,14 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
             }
         }
     }
-    if text.get("d_rel").is_some() {
+    if read_key(text, "d_rel").is_some() {
         // Inkling's attention is GQA shaped but has no rotary embedding: it carries a learned
         // relative bias instead. Name the variant here, after the shared GQA geometry has been
         // read, so the family-specific arithmetic is not threaded through the generic parser.
         let window = optional_usize(text, "sliding_window_size")?
             .or(optional_usize(text, "sliding_window")?)
             .unwrap_or(0);
-        let block = text.get("n_layers_per_attn_res_block").is_some();
+        let block = read_key(text, "n_layers_per_attn_res_block").is_some();
         for layer in &mut layers {
             let local = local_layers.contains(&layer.index);
             if let AttentionKind::Gqa { kv_heads, .. } = layer.attention.kind {
@@ -2014,7 +2072,7 @@ fn dory_layers(text: &Value) -> Result<Vec<Layer>, ConfigError> {
             "a looped model stores attention and MLP sublayers in pairs, so num_hidden_layers must be even",
         ));
     }
-    let layer_types = string_list(text.get("layer_types"))?;
+    let layer_types = string_list(read_key(text, "layer_types"))?;
     if layer_types.len() != count {
         return Err(invalid(format!(
             "layer_types has {} entries, expected num_hidden_layers = {count}",
@@ -2118,7 +2176,7 @@ fn has_linear_attention(text: &Value) -> bool {
             "linear_value_head_dim",
         ]
         .iter()
-        .any(|field| text.get(*field).is_some())
+        .any(|field| read_key(text, *field).is_some())
 }
 
 /// The per-layer selection lists a released document uses.
@@ -2169,7 +2227,7 @@ fn attention(
     // A looped model keys its rotary config by attention kind; the selected block is the one
     // this layer runs. Every other release keeps the flat fields.
     let selected_rope = rope_parameters
-        .and_then(|parameters| parameters.get(layer_type))
+        .and_then(|parameters| read_key(parameters, layer_type))
         .filter(|value| value.is_object());
     let window = if selected_rope.is_some() && layer_type == "full_attention" {
         None
@@ -2205,7 +2263,7 @@ fn attention(
     let is_mla = optional_usize(text, "kv_lora_rank")?.is_some()
         || optional_usize(text, "qk_nope_head_dim")?.is_some()
         || optional_usize(text, "o_groups")?.is_some()
-        || !usize_list(text.get("compress_ratios"))?.is_empty();
+        || !usize_list(read_key(text, "compress_ratios"))?.is_empty();
 
     let kind = if is_linear {
         if object(text, "linear_attn_config").is_some() {
@@ -2260,13 +2318,13 @@ fn attention(
             "index_kpool",
         ]
         .iter()
-        .any(|field| text.get(field).is_some());
+        .any(|field| read_key(text, field).is_some());
         let output_gate = optional_bool(text, "attn_output_gate")?
             .or(optional_bool(text, "use_output_gate")?)
             .unwrap_or_else(|| {
                 optional_string(text, "output_gate_type").is_some()
                     || declares_indexer
-                    || text.get("attention_output_gate_logit_scale_init").is_some()
+                    || read_key(text, "attention_output_gate_logit_scale_init").is_some()
             });
         AttentionKind::Gqa {
             kv_heads: optional_usize(text, "num_key_value_heads")?.unwrap_or(heads),
@@ -2337,7 +2395,7 @@ fn indexer(
         "index_source_layer_ids",
     ]
     .iter()
-    .any(|field| text.get(field).is_some());
+    .any(|field| read_key(text, field).is_some());
     if !declares_indexer {
         return Ok(None);
     }
@@ -2544,7 +2602,7 @@ fn rope(
         .or_else(|| object(text, "rope_scaling"))
         .or(parameters);
     // DeepSeek's ratio-0 layers run plain RoPE; every other release's scaling is global.
-    let scaling = if ratio == 0 && text.get("compress_ratios").is_some() {
+    let scaling = if ratio == 0 && read_key(text, "compress_ratios").is_some() {
         None
     } else {
         scaling_json
@@ -2578,7 +2636,7 @@ fn rope(
             })
     };
     let mrope_section = parameters
-        .and_then(|value| usize_list(value.get("mrope_section")).ok())
+        .and_then(|value| usize_list(read_key(value, "mrope_section")).ok())
         .and_then(|sections| <[usize; 3]>::try_from(sections.as_slice()).ok());
     Ok(Rope {
         theta,
@@ -2603,11 +2661,11 @@ fn default_rope_theta(text: &Value) -> f64 {
 }
 
 fn engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
-    if text.get("engram_vocab_size").is_some_and(Value::is_array) {
+    if read_key(text, "engram_vocab_size").is_some_and(Value::is_array) {
         return hashed_engram_geometry(text);
     }
     Ok(EngramGeometry {
-        tables: usize_list(text.get("engram_num_embeddings"))?,
+        tables: usize_list(read_key(text, "engram_num_embeddings"))?,
         max_ngram: optional_usize(text, "engram_max_ngram_size")?.unwrap_or(0),
         heads: optional_usize(text, "engram_n_heads")?.unwrap_or(0),
         head_dim: optional_usize(text, "engram_head_dim")?.unwrap_or(0),
@@ -2629,7 +2687,7 @@ fn engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
 /// from the compressed-vocabulary one this build's Engram part runs, and
 /// [Switch::EngramHeadTables] names it for an arm that does not run it.
 fn hashed_engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
-    let orders = usize_list(text.get("engram_vocab_size"))?.len();
+    let orders = usize_list(read_key(text, "engram_vocab_size"))?.len();
     let heads_per_order = optional_usize(text, "engram_n_head_per_ngram")?.unwrap_or(0);
     let width = optional_usize(text, "engram_n_embed_per_ngram")?.unwrap_or(0);
     if heads_per_order == 0 || !width.is_multiple_of(heads_per_order) {
@@ -2641,8 +2699,8 @@ fn hashed_engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
     let per_layer = object(text, "engram_layer_head_vocab_sizes");
     let mut tables = Vec::new();
     let mut head_rows = Vec::new();
-    for layer in usize_list(text.get("engram_layer_ids"))? {
-        let Some(sizes) = per_layer.and_then(|map| map.get(layer.to_string())) else {
+    for layer in usize_list(read_key(text, "engram_layer_ids"))? {
+        let Some(sizes) = per_layer.and_then(|map| read_key(map, &layer.to_string())) else {
             return Err(invalid(format!(
                 "engram_layer_head_vocab_sizes names no tables for Engram layer {layer}"
             )));
@@ -2714,7 +2772,7 @@ fn inkling(text: &Value, root: &Value, vocab_size: usize) -> Result<Option<Inkli
         )));
     }
     let layers = required_usize(text, "num_hidden_layers", "text_config")?;
-    let local = usize_list(text.get("local_layer_ids"))?;
+    let local = usize_list(read_key(text, "local_layer_ids"))?;
     if local.iter().any(|index| *index >= layers) {
         return Err(invalid(
             "local_layer_ids names a layer outside num_hidden_layers",
@@ -2785,7 +2843,7 @@ fn mtp(root: &Value, text: &Value, _hidden: usize) -> Result<Option<Mtp>, Config
                 replicated
             } else {
                 !(optional_bool(nested, "hybrid")?.unwrap_or(false)
-                    && text.get("mtp_use_dedicated_embeddings").is_some())
+                    && read_key(text, "mtp_use_dedicated_embeddings").is_some())
             }
         }
         None => true,
@@ -2797,8 +2855,8 @@ fn mtp(root: &Value, text: &Value, _hidden: usize) -> Result<Option<Mtp>, Config
         }
     };
     let target_layers = match nested_mtp {
-        Some(nested) => usize_list(nested.get("target_layer_ids"))?,
-        None => usize_list(text.get("dspark_target_layer_ids"))?,
+        Some(nested) => usize_list(read_key(nested, "target_layer_ids"))?,
+        None => usize_list(read_key(text, "dspark_target_layer_ids"))?,
     };
     Ok(Some(Mtp {
         stages,
@@ -2868,9 +2926,9 @@ impl DeclaredFormat {
 /// still names the same arithmetic in `config_groups`, as a bit width and a number type over a
 /// group of targets.
 fn modelopt_expert(config: &Value) -> Option<DeclaredFormat> {
-    if let Some(layers) = object(config, "quantized_layers").and_then(Value::as_object) {
+    if let Some(layers) = object(config, "quantized_layers") {
         let mut expert: Option<DeclaredFormat> = None;
-        for (name, spec) in layers {
+        for (name, spec) in entries(layers) {
             if !name.contains(".mlp.experts") || is_mtp_module(name) {
                 continue;
             }
@@ -2895,10 +2953,9 @@ fn modelopt_expert(config: &Value) -> Option<DeclaredFormat> {
             return expert;
         }
     }
-    let groups = object(config, "config_groups")?.as_object()?;
-    for group in groups.values() {
-        let targeted = group
-            .get("targets")
+    let groups = object(config, "config_groups")?;
+    for (_, group) in entries(groups) {
+        let targeted = read_key(group, "targets")
             .and_then(Value::as_array)
             .is_some_and(|targets| {
                 targets.iter().any(|target| {
@@ -2922,7 +2979,7 @@ fn modelopt_expert(config: &Value) -> Option<DeclaredFormat> {
 
 /// The arithmetic a ModelOpt group's `weights` block describes, by width and number type.
 fn group_format(weights: &Value) -> Option<DeclaredFormat> {
-    let bits = weights.get("num_bits").and_then(Value::as_u64)?;
+    let bits = read_key(weights, "num_bits").and_then(Value::as_u64)?;
     let kind = string(weights, "type")?;
     let name = match (bits, kind.to_ascii_lowercase().as_str()) {
         (4, "float") => "NVFP4".to_owned(),
@@ -2937,9 +2994,9 @@ fn group_format(weights: &Value) -> Option<DeclaredFormat> {
 
 /// The MTP stage's routed-expert format as ModelOpt's `quantized_layers` records it.
 fn modelopt_mtp_expert(config: &Value) -> Option<DeclaredFormat> {
-    let layers = object(config, "quantized_layers")?.as_object()?;
+    let layers = object(config, "quantized_layers")?;
     let mut expert: Option<DeclaredFormat> = None;
-    for (name, spec) in layers {
+    for (name, spec) in entries(layers) {
         if !name.contains(".mlp.experts") || !is_mtp_module(name) {
             continue;
         }
@@ -2972,7 +3029,7 @@ fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
     let Some(config) = quantization_config(root) else {
         return Ok(Quantization::default());
     };
-    let block = usize_list(config.get("weight_block_size"))?
+    let block = usize_list(read_key(config, "weight_block_size"))?
         .first()
         .copied();
     // Three releases spell the same facts differently: DeepSeek writes quant_method /
@@ -3034,6 +3091,19 @@ fn vision(
     // language model its own width, not the tower's block width.
     let geometry = VisionGeometry::from_value(config, language_hidden)?;
     geometry.validate()?;
+    // Producer metadata the shared description does not derive a value from. Reading it here
+    // keeps the key-coverage check honest: it is consumed by the vision reader, not left for a
+    // later stack to rediscover.
+    for key in [
+        "model_type",
+        "max_image_tokens",
+        "max_wh_ratio",
+        "image_size",
+        "deepstack_visual_indexes",
+        "projector_bias",
+    ] {
+        let _ = read_key(config, key);
+    }
     let mut norm = if optional_f64(config, "rms_norm_eps")?.is_some() {
         Some(VisionNorm::Rms)
     } else if optional_f64(config, "layer_norm_eps")?.is_some() {
@@ -3045,13 +3115,12 @@ fn vision(
     let mut attention_bias = optional_bool(config, "attention_bias")?;
     let mut position = if geometry.num_position_embeddings > 0 {
         Some(VisionPosition::RotaryAndGrid)
-    } else if config.get("rope_theta").is_some() {
+    } else if read_key(config, "rope_theta").is_some() {
         Some(VisionPosition::Rotary)
     } else {
         None
     };
-    let mut downsample = if config
-        .get("downsample_ratio")
+    let mut downsample = if read_key(config, "downsample_ratio")
         .and_then(serde_json::Value::as_u64)
         .is_some_and(|ratio| ratio > 1)
     {
@@ -3090,7 +3159,7 @@ fn vision(
         }
         if any("pos_embed") || any("position_embedding") {
             position = Some(if geometry.num_position_embeddings > 0 {
-                if config.get("rope_theta").is_some() {
+                if read_key(config, "rope_theta").is_some() {
                     VisionPosition::RotaryAndGrid
                 } else {
                     VisionPosition::LearnedGrid
@@ -3251,7 +3320,7 @@ fn dedup(ids: Vec<u32>) -> Vec<u32> {
 
 /// Every end-of-generation id a document names, one or many.
 fn eos_ids(value: &Value) -> Result<Vec<u32>, ConfigError> {
-    let Some(field) = value.get("eos_token_id") else {
+    let Some(field) = read_key(value, "eos_token_id") else {
         return Ok(Vec::new());
     };
     if field.is_null() {
@@ -3291,12 +3360,11 @@ fn activation(name: &str, field: &str) -> Result<Activation, ConfigError> {
 }
 
 fn object<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
-    value.get(name).filter(|value| value.is_object())
+    read_key(value, name).filter(|value| value.is_object())
 }
 
 fn string(value: &Value, name: &str) -> Option<String> {
-    value
-        .get(name)
+    read_key(value, name)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
@@ -3306,7 +3374,7 @@ fn optional_string(value: &Value, name: &str) -> Option<String> {
 }
 
 fn optional_usize(value: &Value, name: &str) -> Result<Option<usize>, ConfigError> {
-    match value.get(name) {
+    match read_key(value, name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(number)) => number
             .as_u64()
@@ -3322,7 +3390,7 @@ fn required_usize(value: &Value, name: &str, context: &str) -> Result<usize, Con
 }
 
 fn optional_f64(value: &Value, name: &str) -> Result<Option<f64>, ConfigError> {
-    match value.get(name) {
+    match read_key(value, name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(number)) => number
             .as_f64()
@@ -3333,7 +3401,7 @@ fn optional_f64(value: &Value, name: &str) -> Result<Option<f64>, ConfigError> {
 }
 
 fn optional_bool(value: &Value, name: &str) -> Result<Option<bool>, ConfigError> {
-    match value.get(name) {
+    match read_key(value, name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(flag)) => Ok(Some(*flag)),
         Some(other) => Err(invalid(format!("{name} is {other}, not a boolean"))),
