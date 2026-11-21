@@ -146,8 +146,8 @@ pub fn frame_sampling(sampler: Option<Tp4FrameSampler>) -> Sampling {
 
 /// The [GroupWire] of an arm whose group serves text: rank 0 refuses a prompt over the context or
 /// with images (no rank loads a vision tower) before it broadcasts, and a request's whole sampler
-/// crosses ([sampler_frame]) because every rank's picks decide what its verify keeps. GLM's and
-/// Qwen's `--tp4-rank` groups use it.
+/// crosses ([sampler_frame]) because every rank's picks decide what its verify keeps. GLM's,
+/// Qwen's and the dense arm's `--tp4-rank` groups use it.
 pub struct TextWire {
     /// The arm's name in trace lines.
     name: &'static str,
@@ -624,7 +624,7 @@ pub fn mirror_tick_lanes_seen<W: Walk>(
                     .get_mut(lane as usize)
                     .and_then(Option::as_mut)
                     .ok_or_else(|| out_of_step(lane))?;
-                // The lane's sampler travels whole, as it does for a fused group: every rank's
+                // The lane's sampler travels whole, as it does for every group: every rank's
                 // picks decide what a verify keeps. The request's start does not travel through
                 // it - the arm counts from the prompt it prefills.
                 runtime
