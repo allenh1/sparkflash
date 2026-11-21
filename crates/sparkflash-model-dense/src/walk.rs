@@ -357,6 +357,7 @@ impl Walk for DenseWalk {
 
 #[cfg(test)]
 mod tests {
+    use sparkflash_runtime::testing::format_rule;
     use sparkflash_runtime::{Fixture, FusedArm, WalkFixture};
 
     use super::*;
@@ -547,20 +548,10 @@ mod tests {
             .map_err(|error| BackendError::new("fixture", error))?;
             let walk = backend.walk_arm(64)?;
             let bytes = backend.weight_bytes() as u64;
-            let mut formats = Vec::new();
-            for format in [
-                architecture.quantization.dense_format,
-                architecture.quantization.expert_format,
-            ] {
-                use sparkflash_model::architecture::WeightFormat;
-                let name = match format {
-                    WeightFormat::Bf16 => "BF16",
-                    WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
-                    WeightFormat::MxFp8 { .. } => "MX FP8",
-                    WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
-                };
-                formats.push(sparkflash_runtime::FormatRule::stored(name));
-            }
+            let formats = vec![
+                format_rule(architecture.quantization.dense_format),
+                format_rule(architecture.quantization.expert_format),
+            ];
             Ok(Fixture::new(
                 walk,
                 format!("the dense synthetic checkpoint at {}", path.display()),

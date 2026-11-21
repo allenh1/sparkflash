@@ -27,11 +27,16 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use sparkflash_model::architecture::WeightFormat;
 use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
+use sparkflash_model::ledger::{Strategy, ledger_for_arm};
 use sparkflash_model::verdict;
 
-use crate::engine::{RequestId, TickEngine, TickEvent};
+use crate::chunk::ChunkPolicy;
+use crate::conformance::FormatRule;
+use crate::engine::{RequestId, TickConfig, TickEngine, TickEvent};
 use crate::layout::{LaneState, Limits, StateKind, StateLayout, check_checkpoint, check_rewind};
+use crate::runtime::Runtime;
 use crate::share::{DraftBudget, StepWall};
 use crate::walk::{
     Draft, Drafter, HeadInput, HeadRow, Hidden, NoVision, OutputConstraint, Pass, PassKind,
@@ -143,6 +148,20 @@ impl ShapeWalk {
     pub fn with_right_picks(mut self) -> Self {
         self.drafter.chain = Chain::Picks;
         self
+    }
+
+    /// The same walk whose drafter proposes the model's pick and then a token it never picks: a
+    /// round keeps the first draft and rejects the rest, which is the default.
+    #[must_use]
+    pub fn with_wrong_picks(mut self) -> Self {
+        self.drafter.chain = Chain::PickThenWrong;
+        self
+    }
+
+    /// The drafts the walk's drafter proposes past an anchor, before the budget shares them.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.drafter.depth
     }
 
     /// Every prompt chunk the walk was handed, in order.
@@ -441,6 +460,370 @@ pub fn decode<W: Walk>(engine: &mut TickEngine<W>, id: RequestId, token: u32) ->
             }
         }
     }
+}
+
+/// The stored format name a fixture's class uses.
+#[must_use]
+pub fn format_rule(format: WeightFormat) -> FormatRule {
+    let name = match format {
+        WeightFormat::Bf16 => "BF16",
+        WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
+        WeightFormat::MxFp8 { .. } => "MX FP8",
+        WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
+    };
+    FormatRule::stored(name)
+}
+
+/// The bytes a token pass reads and the floor beneath them, for a fixture whose tensor plan
+/// states `total` stored bytes and `expert` bytes of routed-expert weight: every non-expert
+/// weight is read whatever a token routes, and the experts pay their `top_k` share.
+#[must_use]
+pub fn token_bytes(total: u64, expert: u64, experts: usize, top_k: usize) -> (u64, u64) {
+    let floor = total.saturating_sub(expert);
+    let share = if experts == 0 {
+        0
+    } else {
+        expert.saturating_mul(top_k as u64) / experts as u64
+    };
+    (floor.saturating_add(share), floor)
+}
+
+/// Panics unless `arm`'s four declared compute rows are its arms-table row, so the boot ledger
+/// and **sparkflash arms --ledger** cannot drift.
+pub fn check_compute_rows<W: Walk + ?Sized>(arm: &str) {
+    let declared = ledger_for_arm(arm).unwrap_or_else(|| panic!("{arm}'s declaration"));
+    let capabilities = W::CAPABILITIES.compute;
+    for (strategy, stated) in [
+        (Strategy::TensorCorePrompt, capabilities.prompt),
+        (Strategy::TensorCoreDecode, capabilities.token),
+        (Strategy::StoredArithmetic, capabilities.stored),
+        (Strategy::Rewind, capabilities.rewind),
+    ] {
+        let from_table = declared
+            .rows
+            .iter()
+            .find(|(row, _)| *row == strategy)
+            .map(|(_, state)| *state)
+            .unwrap_or_else(|| panic!("{arm} states no {}", strategy.name()));
+        assert_eq!(stated, from_table, "{} drifted", strategy.name());
+    }
+}
+
+/// Panics unless the tick config the runtime derives from `walk` is the arm's profile: its own
+/// pass and verify widths, its drafter's depth and floor, and the runtime's joint-round
+/// switch, with no decoder-layer skip and no row exchange.
+pub fn check_tick_config<W: Walk>(walk: W, joint: bool) {
+    let limits = walk.limits();
+    let lanes = limits.members.max(1);
+    let chunk = ChunkPolicy::for_limits(limits).rows();
+    let drafting = W::Drafter::PRESENT && walk.drafter().drafts();
+    let config = TickConfig::for_walk(&walk, lanes);
+    assert_eq!(config.lanes, lanes, "the lanes the walk holds");
+    assert_eq!(
+        config.rows_max,
+        limits.rows.max(1),
+        "a prompt chunk is the walk's pass"
+    );
+    assert_eq!(
+        config.chunk_rows,
+        limits.rows.max(1),
+        "the engine's chunk is the walk's pass"
+    );
+    assert_eq!(config.exact_tick_rows, chunk, "the exact tick is the pass");
+    assert_eq!(config.busy_chunk, chunk, "a busy tick is the pass");
+    assert_eq!(config.bulk_cap, Some(chunk), "the bulk cap is the pass");
+    assert_eq!(
+        config.members,
+        limits.members.max(1),
+        "the verify width is the member cap"
+    );
+    assert_eq!(
+        config.k,
+        if drafting {
+            walk.drafter().budget(1)
+        } else {
+            0
+        },
+        "the chain cap is the drafter's own depth"
+    );
+    assert_eq!(
+        config.batch_spec.is_some(),
+        drafting,
+        "only a drafting arm takes the speculative path"
+    );
+    assert_eq!(
+        config.shared_rounds, drafting,
+        "a drafting arm shares one verify"
+    );
+    assert_eq!(
+        config.share_floor,
+        if drafting {
+            walk.drafter().floor()
+        } else {
+            0.2
+        },
+        "the floor is the drafter's"
+    );
+    assert!(!config.decoder_skip, "an arm states no decoder-layer skip");
+    assert!(!config.exchange, "TP=1 has no row exchange");
+    let runtime = Runtime::new(walk, 0)
+        .expect("the runtime starts")
+        .with_joint_rounds(joint);
+    assert_eq!(
+        TickConfig::for_runtime(&runtime, lanes).shared_rounds,
+        drafting && joint,
+        "the shared-round switch is the runtime's"
+    );
+}
+
+/// The chunks `rows` rows split into at `width` rows a pass.
+#[must_use]
+pub fn chunks_at(rows: usize, width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    let mut chunks = vec![width; rows / width];
+    if !rows.is_multiple_of(width) {
+        chunks.push(rows % width);
+    }
+    chunks
+}
+
+/// The prompt chunks the tick engine over `walk` hands a `rows`-row prompt, with the group's
+/// row exchange on when `exchange`.
+#[must_use]
+pub fn prompt_chunks(walk: ShapeWalk, rows: usize, exchange: bool) -> Vec<usize> {
+    let mut config = TickConfig::for_walk(&walk, 1);
+    config.exchange = exchange;
+    let mut engine = TickEngine::new(walk, 1)
+        .expect("the tick engine starts")
+        .with_config(config)
+        .expect("the walk's own config");
+    prompt(&mut engine, &vec![7u32; rows]);
+    engine.walk().chunks()
+}
+
+/// Panics unless the tick engine over `walk` shares one verify across `lanes` members inside the
+/// drafter's budget, or with `joint` off runs plain rows with no verify.
+pub fn check_joint_round(walk: ShapeWalk, lanes: usize, joint: bool) {
+    // The allocation is the property here: a drafter that is always right proposes its whole
+    // depth, so a lone lane's verify is its anchor and the depth its budget allows.
+    let walk = walk.with_right_picks();
+    let mut config = TickConfig::for_walk(&walk, lanes);
+    config.shared_rounds = joint && config.batch_spec.is_some();
+    let mut engine = TickEngine::new(walk, lanes)
+        .expect("the tick engine starts")
+        .with_config(config)
+        .expect("the walk's own config")
+        .with_trace();
+    let mut ids = Vec::with_capacity(lanes);
+    let mut firsts = Vec::with_capacity(lanes);
+    for at in 0..lanes as u32 {
+        let rows: Vec<u32> = (0..7).map(|index| 1 + at * 13 + index).collect();
+        let (id, step) = prompt(&mut engine, &rows);
+        assert_eq!(
+            engine.kept(id).and_then(|kept| kept.history),
+            Some(7),
+            "the prompt's history"
+        );
+        ids.push(id);
+        firsts.push(step.next_token.expect("the prompt's token"));
+    }
+    for (id, token) in ids.iter().zip(&firsts) {
+        engine.feed(*id, *token).expect("the row is fed");
+    }
+    let mut answered = 0;
+    while answered < lanes {
+        for event in engine.tick().expect("the shared tick") {
+            if matches!(event, TickEvent::Decode { .. }) {
+                answered += 1;
+            }
+        }
+    }
+    let trace = engine.trace().expect("the trace").render();
+    let verifies = engine.walk().verifies();
+    if joint {
+        assert!(
+            trace.contains("plan=shared"),
+            "several lanes share one verify: {trace}"
+        );
+        assert_eq!(verifies.len(), 1, "one shared verify, not one a lane");
+        assert_eq!(
+            verifies[0].len(),
+            lanes,
+            "every member's chain is in the pass"
+        );
+        let rows: usize = verifies[0].iter().sum();
+        assert!(
+            verifies[0].iter().all(|rows| *rows >= 1),
+            "every member steps: {verifies:?}"
+        );
+        // The row share gives out the budget or every chain, whichever is fewer, and a right
+        // chain never stops a row: the pass's width is exact.
+        let depth = engine.walk().depth();
+        let budget = engine.walk().drafter().budget(lanes);
+        let want = lanes + (lanes * depth).min(budget);
+        assert_eq!(
+            rows, want,
+            "the shared verify holds the anchors and the drafts the budget allows"
+        );
+    } else {
+        assert!(
+            trace.contains("plan=plain"),
+            "joint rounds off runs plain rows: {trace}"
+        );
+        assert!(
+            verifies.is_empty(),
+            "a plain row takes no verify: {verifies:?}"
+        );
+    }
+}
+
+/// Panics unless a decoding row's speculative round keeps only the rows the model chose: the
+/// accepted draft reaches the request and the rejected one does not.
+pub fn check_speculative_round(walk: ShapeWalk) {
+    let mut engine = TickEngine::new(walk, 1)
+        .expect("the tick engine starts")
+        .with_trace();
+    let (id, first) = prompt(&mut engine, &[10, 11, 12, 13]);
+    let anchor = first.next_token.expect("a token");
+    let steps = decode(&mut engine, id, anchor);
+    assert_eq!(steps.len(), 2, "the anchor and the accepted draft");
+    assert_eq!(steps[0].next_token, Some(pick(anchor)));
+    assert_eq!(steps[1].next_token, Some(pick(pick(anchor))));
+    assert_eq!(
+        engine.history(id).map(<[u32]>::to_vec),
+        Some(vec![10, 11, 12, 13, anchor, pick(anchor)]),
+        "the accepted draft reaches the history"
+    );
+    assert!(
+        !engine
+            .history(id)
+            .expect("the history")
+            .contains(&wrong(anchor)),
+        "the rejected draft never reaches the request"
+    );
+    assert_eq!(
+        engine.walk().verifies(),
+        vec![vec![3]],
+        "the anchor and both drafts verified in one pass"
+    );
+    assert!(
+        engine
+            .trace()
+            .expect("the trace")
+            .render()
+            .contains("plan=spec"),
+        "one row takes the speculative plan"
+    );
+}
+
+/// Emit the profile tests an arm that serves on the tick engine states.
+///
+/// The arm gives its walk's type, its row in the arms table, the depth its drafter proposes,
+/// the prompt chunk widths it serves, and a constructor of the CPU [`ShapeWalk`] at one of
+/// those widths and that depth. The macro emits, in a module named `profile`, a test a
+/// statement:
+///
+/// * `the_declared_compute_rows_are_the_arm_ledger_rows`: the walk's declared compute rows
+///   are the arms table's;
+/// * `the_tick_config_is_the_arms_profile`: the engine's config is derived from the walk's
+///   limits and drafter, and the joint-round switch is the runtime's;
+/// * `the_tick_engine_hands_the_arms_chunks`: a prompt past two passes splits into the pass
+///   width's chunks, on the single process and with a group's row exchange;
+/// * `the_tick_engine_keeps_the_arms_joint_round`: several lanes share one verify, inside the
+///   drafter's budget, and run plain rows with the joint switch off;
+/// * `a_speculative_round_keeps_its_accepted_rows_only`: a rejected draft never reaches the
+///   request;
+/// * `the_generated_checks_drive_the_tick_engine`: the arm's generated checks take the path
+///   it serves on.
+///
+/// ```ignore
+/// sparkflash_runtime::profile_checks!(
+///     MyWalk,
+///     table: "My",
+///     depth: 3,
+///     chunks: [4096, 8192],
+///     shape: |chunk, depth| shape_walk(depth, walk_limits(chunk, 1 << 20))
+/// );
+/// ```
+#[macro_export]
+macro_rules! profile_checks {
+    (
+        $arm:ty,
+        table: $table:literal,
+        depth: $depth:expr,
+        chunks: [$($chunk:expr),* $(,)?],
+        shape: |$chunk_var:ident, $depth_var:ident| $shape:expr $(,)?
+    ) => {
+        /// The profile checks this arm states.
+        pub mod profile {
+            use super::*;
+            use $crate::Walk as _;
+
+            /// The arm's row in the arms table.
+            const TABLE: &str = $table;
+
+            /// The depth the arm's drafter proposes a member.
+            const DEPTH: usize = $depth;
+
+            /// The prompt chunk widths the arm serves.
+            const CHUNKS: &[usize] = &[$($chunk),*];
+
+            /// A shape walk at `chunk` rows a pass, `depth` drafts a member.
+            fn shape($chunk_var: usize, $depth_var: usize) -> $crate::testing::ShapeWalk {
+                $shape
+            }
+
+            /// The widest prompt chunk the arm serves.
+            fn widest() -> usize {
+                *CHUNKS.iter().max().expect("an arm states a chunk width")
+            }
+
+            #[test]
+            fn the_declared_compute_rows_are_the_arm_ledger_rows() {
+                $crate::testing::check_compute_rows::<$arm>(TABLE);
+            }
+
+            #[test]
+            fn the_tick_config_is_the_arms_profile() {
+                $crate::testing::check_tick_config(shape(widest(), DEPTH), true);
+                $crate::testing::check_tick_config(shape(widest(), DEPTH), false);
+            }
+
+            #[test]
+            fn the_tick_engine_hands_the_arms_chunks() {
+                for &width in CHUNKS {
+                    let pass = shape(width, 0).limits().rows.max(1);
+                    let rows = 2 * pass + pass / 3;
+                    assert_eq!(
+                        $crate::testing::prompt_chunks(shape(width, 0), rows, false),
+                        $crate::testing::chunks_at(rows, pass),
+                        "a {rows}-row prompt at {width} rows a pass"
+                    );
+                    assert_eq!(
+                        $crate::testing::prompt_chunks(shape(width, 0), rows, true),
+                        $crate::testing::chunks_at(rows, pass),
+                        "the group's bulk chunks are the single process's chunks"
+                    );
+                }
+            }
+
+            #[test]
+            fn the_tick_engine_keeps_the_arms_joint_round() {
+                $crate::testing::check_joint_round(shape(widest(), DEPTH), 3, true);
+                $crate::testing::check_joint_round(shape(widest(), DEPTH), 3, false);
+            }
+
+            #[test]
+            fn a_speculative_round_keeps_its_accepted_rows_only() {
+                $crate::testing::check_speculative_round(shape(widest(), 2).with_wrong_picks());
+            }
+
+            #[test]
+            fn the_generated_checks_drive_the_tick_engine() {
+                assert!(<$arm as $crate::WalkFixture>::tick_engine());
+            }
+        }
+    };
 }
 
 #[cfg(test)]

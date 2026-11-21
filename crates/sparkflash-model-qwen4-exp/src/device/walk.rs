@@ -816,15 +816,16 @@ fn fresh_hashers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sparkflash_model::ledger::{Strategy as LedgerStrategy, ledger_for_arm};
-    use sparkflash_runtime::testing::{self, ShapeWalk, pick, wrong};
-    use sparkflash_runtime::{ChunkPolicy, Fixture, TickEngine, TickEvent, WalkFixture};
+    use sparkflash_runtime::testing::{self, ShapeWalk, format_rule, token_bytes};
+    use sparkflash_runtime::{ChunkPolicy, Fixture, TickEngine, WalkFixture};
 
     use crate::config::Qwen4ExpConfig;
-    use crate::device::prefill::{DEFAULT_PREFILL_CHUNK, PrefillPlan};
+    use crate::device::MTP_VERIFY_ROWS;
+    use crate::device::batch::MAX_BATCH;
+    use crate::device::prefill::{DEFAULT_PREFILL_CHUNK, PrefillPlan, TOKEN_PREFILL_CHUNK};
 
     /// The stored bytes a token pass must read at this rank, and the floor the plan states.
-    fn token_bytes(
+    fn fixture_token_bytes(
         architecture: &sparkflash_model::Architecture,
         experts: usize,
         top_k: usize,
@@ -837,27 +838,7 @@ mod tests {
         let total = u64::try_from(tensors.rank_bytes()).unwrap_or(u64::MAX);
         let expert = u64::try_from(tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts))
             .unwrap_or(u64::MAX);
-        let floor = total.saturating_sub(expert);
-        let share = if experts == 0 {
-            0
-        } else {
-            expert.saturating_mul(top_k as u64) / experts as u64
-        };
-        Ok((floor.saturating_add(share), floor))
-    }
-
-    /// The stored format names the fixture's classes use.
-    fn format_rule(
-        format: sparkflash_model::architecture::WeightFormat,
-    ) -> sparkflash_runtime::FormatRule {
-        use sparkflash_model::architecture::WeightFormat;
-        let name = match format {
-            WeightFormat::Bf16 => "BF16",
-            WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
-            WeightFormat::MxFp8 { .. } => "MX FP8",
-            WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
-        };
-        sparkflash_runtime::FormatRule::stored(name)
+        Ok(token_bytes(total, expert, experts, top_k))
     }
 
     /// The Qwen fixture: the synthetic tiny checkpoint, opened through the arm's own TP=1
@@ -890,7 +871,7 @@ mod tests {
                 config.max_position_embeddings,
             )?;
             let walk = backend.walk_arm(4)?;
-            let (bytes, floor) = token_bytes(
+            let (bytes, floor) = fixture_token_bytes(
                 &config.architecture,
                 config.num_experts,
                 config.num_experts_per_tok,
@@ -907,28 +888,6 @@ mod tests {
                 formats,
                 Some(Box::new(directory)),
             ))
-        }
-    }
-
-    /// The walk's four declared rows are the arm's static declaration, so the runtime's ledger
-    /// and the `sparkflash arms --ledger` table cannot drift while Qwen moves onto the runtime.
-    #[test]
-    fn the_declared_compute_rows_are_the_arm_ledger_rows() {
-        let declared = ledger_for_arm("Qwen").expect("Qwen's declaration");
-        let capabilities = <QwenWalk as Walk>::CAPABILITIES.compute;
-        for (strategy, stated) in [
-            (LedgerStrategy::TensorCorePrompt, capabilities.prompt),
-            (LedgerStrategy::TensorCoreDecode, capabilities.token),
-            (LedgerStrategy::StoredArithmetic, capabilities.stored),
-            (LedgerStrategy::Rewind, capabilities.rewind),
-        ] {
-            let from_table = declared
-                .rows
-                .iter()
-                .find(|(row, _)| *row == strategy)
-                .map(|(_, state)| *state)
-                .expect("the arm states every strategy");
-            assert_eq!(stated, from_table, "{} drifted", strategy.name());
         }
     }
 
@@ -1017,98 +976,13 @@ mod tests {
         .with_code("qwen4_shape")
     }
 
-    /// The generated checks drive the path Qwen serves TP=1 on, as dense's and GLM's do.
+    /// The prefill plan keeps its forward boundaries: a 4,096-row chunk is one forward and so is
+    /// a short tail, so the runtime's chunk is the plan's own unit.
     #[test]
-    fn the_generated_checks_drive_the_tick_engine() {
-        assert!(<QwenWalk as WalkFixture>::tick_engine());
-    }
-
-    /// The tick engine's config is Qwen's profile: the prefill plan's chunk as the pass width,
-    /// the batch's four members as the verify width, the drafter's own depth, the joint-round
-    /// switch, no decoder-layer skip and no row exchange.
-    #[test]
-    fn the_tick_config_is_the_qwen_profile() {
-        use sparkflash_runtime::TickConfig;
-
-        let walk = shape_walk(
-            DEFAULT_PREFILL_CHUNK,
-            super::super::batch::MAX_BATCH,
-            super::super::MTP_VERIFY_ROWS - 1,
-        );
-        let config = TickConfig::for_walk(&walk, super::super::batch::MAX_BATCH);
-        assert_eq!(config.rows_max, DEFAULT_PREFILL_CHUNK);
-        assert_eq!(config.chunk_rows, DEFAULT_PREFILL_CHUNK);
-        assert_eq!(
-            config.members,
-            super::super::batch::MAX_BATCH,
-            "the verify width is the member cap"
-        );
-        assert_eq!(
-            config.k,
-            super::super::MTP_VERIFY_ROWS,
-            "a member's anchor and the drafter's own drafts"
-        );
-        assert!(config.batch_spec.is_some(), "the arm drafts");
-        assert!(
-            config.shared_rounds,
-            "the arm's joint rounds are on by default"
-        );
-        assert!(!config.decoder_skip, "Qwen has no decoder layers to skip");
-        assert!(!config.exchange, "TP=1 has no row exchange");
-
-        // The engine's shared-round switch is the runtime's, not a second rule.
-        let joint = Runtime::new(shape_walk(DEFAULT_PREFILL_CHUNK, 4, 2), 0)
-            .expect("the runtime")
-            .with_joint_rounds(true);
-        assert!(
-            TickConfig::for_runtime(&joint, 4).shared_rounds,
-            "joint rounds on: the shared verify"
-        );
-        let alone = Runtime::new(shape_walk(DEFAULT_PREFILL_CHUNK, 4, 2), 0)
-            .expect("the runtime")
-            .with_joint_rounds(false);
-        assert!(
-            !TickConfig::for_runtime(&alone, 4).shared_rounds,
-            "joint rounds off: plain rows, as the runtime would plan"
-        );
-    }
-
-    /// Qwen's prompt chunks through the tick engine are the chunks it ran before: the engine's
-    /// pass width is the runtime's `ChunkPolicy` over the same limits, so a 5,000-row
-    /// prompt is 4,096 rows and its tail, both on the single process's exact path and on a
-    /// group's bulk path.
-    #[test]
-    fn the_tick_engine_hands_qwen_the_prefill_plans_chunks() {
-        use sparkflash_runtime::TickConfig;
-
+    fn the_prefill_plan_runs_one_forward_a_chunk() {
         let plan = PrefillPlan::new(DEFAULT_PREFILL_CHUNK, false);
         assert_eq!(plan.forwards(4_096), vec![0..4_096], "one forward a chunk");
         assert_eq!(plan.forwards(904), vec![0..904], "the tail is one forward");
-        let mut engine =
-            TickEngine::new(shape_walk(plan.chunk, 4, 0), 1).expect("the tick engine starts");
-        assert_eq!(engine.config().chunk_rows, plan.chunk);
-        let _ = testing::prompt(&mut engine, &vec![7u32; 5_000]);
-        assert_eq!(
-            engine.walk().chunks(),
-            vec![4_096, 904],
-            "a 5,000-row prompt runs 4,096 then 904, as the old runtime ran it"
-        );
-
-        // A group's row exchange marks the bulk path; the rows are the same split.
-        let walk = shape_walk(plan.chunk, 4, 0);
-        let mut group = TickConfig::for_walk(&walk, 1);
-        group.exchange = true;
-        let mut engine = TickEngine::new(walk, 1)
-            .expect("the tick engine starts")
-            .with_config(group)
-            .expect("the group config");
-        assert!(engine.config().exchange);
-        let _ = testing::prompt(&mut engine, &vec![7u32; 5_000]);
-        assert_eq!(
-            engine.walk().chunks(),
-            vec![4_096, 904],
-            "the group's bulk chunks are the single process's chunks"
-        );
     }
 
     /// The token-kernel plan keeps its 256-row pass and its 128-row forwards: the engine runs the
@@ -1134,92 +1008,13 @@ mod tests {
         );
     }
 
-    /// Several decoding lanes verify in one shared round: the old fused engine's joint round is
-    /// the engine's shared plan, and one verify holds every member's chain.
-    #[test]
-    fn the_tick_engine_keeps_qwens_joint_round() {
-        let mut engine = TickEngine::new(
-            shape_walk(DEFAULT_PREFILL_CHUNK, super::super::batch::MAX_BATCH, 2),
-            3,
-        )
-        .expect("the tick engine starts")
-        .with_trace();
-        let mut ids = Vec::new();
-        let mut firsts = Vec::new();
-        for at in 0..3u32 {
-            let prompt: Vec<u32> = (0..7).map(|index| 1 + at * 13 + index).collect();
-            let (id, step) = testing::prompt(&mut engine, &prompt);
-            assert_eq!(engine.kept(id).and_then(|kept| kept.history), Some(7));
-            ids.push(id);
-            firsts.push(step.next_token.expect("a token"));
-        }
-        for (id, token) in ids.iter().zip(&firsts) {
-            engine.feed(*id, *token).expect("the row is fed");
-        }
-        let mut answered = 0;
-        while answered < ids.len() {
-            for event in engine.tick().expect("the shared tick") {
-                if matches!(event, TickEvent::Decode { .. }) {
-                    answered += 1;
-                }
-            }
-        }
-        let trace = engine.trace().expect("the trace").render();
-        assert!(
-            trace.contains("plan=shared"),
-            "three lanes share one verify: {trace}"
-        );
-        let verifies = engine.walk().verifies();
-        assert_eq!(verifies.len(), 1, "one shared verify, not one a lane");
-        assert_eq!(verifies[0].len(), 3, "every member's chain is in the pass");
-        assert!(
-            verifies[0].iter().sum::<usize>() <= 3 * 3,
-            "the verify holds the batch's rows: {verifies:?}"
-        );
-    }
-
-    /// One decoding row runs one speculative round; the draft it gets wrong is rejected, and only
-    /// the accepted rows reach the request.
-    #[test]
-    fn a_speculative_round_keeps_its_accepted_rows_only() {
-        let mut engine = TickEngine::new(
-            shape_walk(DEFAULT_PREFILL_CHUNK, super::super::batch::MAX_BATCH, 2),
-            1,
-        )
-        .expect("the tick engine starts")
-        .with_trace();
-        let (id, first) = testing::prompt(&mut engine, &[10, 11, 12, 13]);
-        let anchor = first.next_token.expect("a token");
-        let steps = testing::decode(&mut engine, id, anchor);
-        assert_eq!(steps.len(), 2, "the anchor and the accepted draft");
-        assert_eq!(steps[0].next_token, Some(pick(anchor)));
-        assert_eq!(steps[1].next_token, Some(pick(pick(anchor))));
-        assert_eq!(
-            engine.history(id).map(<[u32]>::to_vec),
-            Some(vec![10, 11, 12, 13, anchor, pick(anchor)]),
-            "the accepted draft reaches the history"
-        );
-        assert!(
-            !engine
-                .history(id)
-                .expect("the history")
-                .contains(&wrong(anchor)),
-            "the rejected draft never reaches the request"
-        );
-        assert_eq!(
-            engine.walk().verifies(),
-            vec![vec![3]],
-            "the anchor and both drafts verified in one pass"
-        );
-        assert!(
-            engine
-                .trace()
-                .expect("the trace")
-                .render()
-                .contains("plan=spec"),
-            "one row takes the speculative plan"
-        );
-    }
+    sparkflash_runtime::profile_checks!(
+        QwenWalk,
+        table: "Qwen",
+        depth: MTP_VERIFY_ROWS - 1,
+        chunks: [DEFAULT_PREFILL_CHUNK, TOKEN_PREFILL_CHUNK],
+        shape: |chunk, depth| shape_walk(chunk, MAX_BATCH, depth)
+    );
 
     sparkflash_runtime::conformance!(QwenWalk);
 }
