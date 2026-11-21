@@ -33,8 +33,7 @@ use sparkflash_model::BackendError;
 use sparkflash_ops::attention::GqaBody;
 use sparkflash_ops::calls::{self, RmsNorm, Rope};
 use sparkflash_ops::indexer::IndexerPass;
-use sparkflash_ops::moe::{MoePlanCall, combine_grid, token};
-use sparkflash_ops::roles::Launcher;
+use sparkflash_ops::roles::{ExpertRows, ExpertShape, Injection, Launcher};
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
@@ -764,22 +763,21 @@ impl DeviceSequence {
         // One rank's combination is its share of the sum: it is summed over the world before it
         // is injected, so the combine only writes it ([Self::inject_branch]).
         let sharded = self.backend.tp.is_some();
-        let (grid, block) = combine_grid(config.hidden_size, batch);
-        self.launch(
-            kernels.moe_combine,
-            grid,
-            block,
-            &[
-                self.branch.0,
-                self.expert_accumulator.0,
-                self.shared_out.0,
-                self.expert_gate.0,
-                if sharded { 0 } else { hyper.0 },
-                injection.0,
-                config.num_experts_per_tok as u64,
-                config.hidden_size as u64,
-                config.hc_count as u64,
-            ],
+        kernels.combine.run(
+            self,
+            self.branch,
+            (
+                self.expert_accumulator,
+                self.shared_out,
+                Some(self.expert_gate),
+            ),
+            Injection {
+                hyper: (!sharded).then_some(hyper),
+                weights: injection,
+                streams: config.hc_count,
+            },
+            (config.num_experts_per_tok, config.hidden_size),
+            batch,
         )?;
         self.probe_finite(
             layer,
@@ -806,113 +804,50 @@ impl DeviceSequence {
     ) -> Result<(), BackendError> {
         let config = &self.backend.config;
         let kernels = &*self.backend.kernels;
-        let topk = config.num_experts_per_tok;
-        let hidden = config.hidden_size;
-        let intermediate = config.moe_intermediate_size;
         // The expert dot is latency-bound on its weight rows, so `expert_bench` reads best with
         // rows to spare in flight: two rows per warp and eight warps a block - one sixteen-row
         // panel - beat one row per warp at every sharing level, and beat wider blocks too. The
-        // shared token rule ([token]) holds those counts beside the kernel's.
-        let count = batch;
-        let indices = self.expert_indices;
-        let weights = self.probabilities;
-        let input = mixed;
-        let partials = self.expert_accumulator;
-        // The plan writes both outputs this path reads: `sorted` (the run order, which its
-        // expert kernels take as `perm`) and the run bounds. Qwen passes no item list and no
-        // segments, so its slice of the shared kernel is the token path's.
-        let plan = MoePlanCall::runs(
-            indices.0,
-            self.expert_perm.0,
-            self.expert_run.0,
-            (count * topk, config.num_experts, topk),
-        );
-        let (grid, block) = MoePlanCall::launch();
-        self.launch(kernels.moe_plan, grid, block, &plan.args())?;
-        let (gate_up_grid, block) = token::gate_up_grid(intermediate, topk, count);
-        let (down_grid, _) = token::down_grid(hidden, topk, count);
+        // shared token rule ([sparkflash_ops::moe::token]) holds those counts beside the
+        // kernel's. The plan writes both outputs the passes read: `sorted` (the run order, which
+        // the expert kernels take as `perm`) and the run bounds. Qwen passes no item list and no
+        // segments, so its slice of the shared kernel is the token path's. The router writes a
+        // row's probabilities over every expert, the routing weights' stride.
+        let rows = ExpertRows {
+            indices: self.expert_indices,
+            weights: self.probabilities,
+            input: mixed,
+            sorted: self.expert_perm,
+            runs: self.expert_run,
+            activated: self.expert_activated,
+            partials: self.expert_accumulator,
+        };
+        let shape = ExpertShape {
+            experts: config.num_experts,
+            top_k: config.num_experts_per_tok,
+            hidden: config.hidden_size,
+            intermediate: config.moe_intermediate_size,
+            weight_stride: config.num_experts,
+        };
+        // The FP8 body tiles Q4E_DOWN_ROWS_PER_WARP rows a warp as the NVFP4 one does, so both
+        // take the same down grid.
         match experts {
-            ExpertOperand::NvFp4(experts) => {
-                let (table, scales) = (experts.table, experts.scales);
-                self.launch(
-                    kernels.expert_gate_up,
-                    gate_up_grid,
-                    block,
-                    &[
-                        table.0,
-                        scales.0,
-                        indices.0,
-                        self.expert_perm.0,
-                        self.expert_run.0,
-                        input.0,
-                        self.expert_activated.0,
-                        topk as u64,
-                        hidden as u64,
-                        intermediate as u64,
-                    ],
-                )?;
-                self.launch(
-                    kernels.expert_down,
-                    down_grid,
-                    block,
-                    &[
-                        table.0,
-                        scales.0,
-                        indices.0,
-                        self.expert_perm.0,
-                        self.expert_run.0,
-                        weights.0,
-                        self.expert_activated.0,
-                        partials.0,
-                        topk as u64,
-                        hidden as u64,
-                        intermediate as u64,
-                        config.num_experts as u64,
-                    ],
-                )?;
-            }
-            ExpertOperand::Fp8(experts) => {
-                let table = experts.table;
-                self.launch(
-                    kernels.expert_gate_up_fp8,
-                    gate_up_grid,
-                    block,
-                    &[
-                        table.0,
-                        indices.0,
-                        self.expert_perm.0,
-                        self.expert_run.0,
-                        input.0,
-                        self.expert_activated.0,
-                        topk as u64,
-                        hidden as u64,
-                        intermediate as u64,
-                    ],
-                )?;
-                self.launch(
-                    kernels.expert_down_fp8,
-                    // The shared body tiles Q4E_DOWN_ROWS_PER_WARP rows a warp for both formats,
-                    // so this grid is the NVFP4 one; it used to launch ROWS because the FP8 body
-                    // was its own copy with the narrower tile.
-                    down_grid,
-                    block,
-                    &[
-                        table.0,
-                        indices.0,
-                        self.expert_perm.0,
-                        self.expert_run.0,
-                        weights.0,
-                        self.expert_activated.0,
-                        partials.0,
-                        topk as u64,
-                        hidden as u64,
-                        intermediate as u64,
-                        config.num_experts as u64,
-                    ],
-                )?;
-            }
+            ExpertOperand::NvFp4(experts) => kernels.experts_nvfp4.run(
+                self,
+                (experts.table, experts.scales),
+                &rows,
+                shape,
+                batch,
+                None,
+            ),
+            ExpertOperand::Fp8(experts) => kernels.experts_fp8.run(
+                self,
+                (experts.table, Deviceptr(0)),
+                &rows,
+                shape,
+                batch,
+                None,
+            ),
         }
-        Ok(())
     }
 
     /// The shared expert: SwiGLU of the gate and up projections, its sigmoid gate's logit in

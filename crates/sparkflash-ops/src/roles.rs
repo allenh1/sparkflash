@@ -586,6 +586,282 @@ impl NgptNorm {
     }
 }
 
+/// The device rows the token expert passes read and write.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertRows {
+    /// The chosen experts, `[rows][top_k]` i32.
+    pub indices: Deviceptr,
+    /// The routing weights, `[rows][weight_stride]` f32.
+    pub weights: Deviceptr,
+    /// The rows the experts read, `[rows][hidden]` f32.
+    pub input: Deviceptr,
+    /// The plan's run order, `[rows * top_k]` i32.
+    pub sorted: Deviceptr,
+    /// The plan's run bounds.
+    pub runs: Deviceptr,
+    /// The activations between gate/up and down, `[rows * top_k][intermediate]` f32.
+    pub activated: Deviceptr,
+    /// The weighted down rows, `[rows * top_k][hidden]` f32, which the combine sums.
+    pub partials: Deviceptr,
+}
+
+/// The routed experts' shape the token passes take.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertShape {
+    /// The experts the table holds.
+    pub experts: usize,
+    /// The slots a row routes to.
+    pub top_k: usize,
+    /// A row's floats.
+    pub hidden: usize,
+    /// An expert's intermediate width.
+    pub intermediate: usize,
+    /// The floats between one row's routing weights and the next's.
+    pub weight_stride: usize,
+}
+
+/// The routed experts on the token kernels: the shared plan's runs of one expert's slots
+/// ([crate::moe::MoePlanCall::runs]), then a gate/up and a down pass a run in one table format.
+/// A format is its named bodies; one arm's pairing of another's never runs.
+#[derive(Clone, Copy, Debug)]
+pub struct TokenExperts {
+    plan: Bound,
+    gate_up: Bound,
+    gate_up_clamped: Option<Bound>,
+    down: Bound,
+    scaled: bool,
+}
+
+impl TokenExperts {
+    /// The formats: gate/up, its clamped form under a `swiglu_limit`, down, and whether the
+    /// bodies read the NVFP4 scale table.
+    pub const FORMS: [(&'static str, Option<&'static str>, &'static str, bool); 3] = [
+        ("q4e_expert_gate_up", None, "q4e_expert_down", true),
+        (
+            "q4e_expert_gate_up_fp8",
+            Some("q4e_expert_gate_up_fp8_clamped"),
+            "q4e_expert_down_fp8",
+            false,
+        ),
+        (
+            "q4e_expert_gate_up_bf16",
+            Some("q4e_expert_gate_up_bf16_clamped"),
+            "q4e_expert_down_bf16",
+            false,
+        ),
+    ];
+
+    /// `plan` (the loaded `moe_plan`) and one format's bodies; `gate_up_clamped` is the arm's
+    /// clamped body when it loads one.
+    ///
+    /// # Errors
+    /// A plan that is not `moe_plan`, or bodies of no one format, by name.
+    pub fn new(
+        plan: Bound,
+        gate_up: Bound,
+        gate_up_clamped: Option<Bound>,
+        down: Bound,
+    ) -> Result<Self, String> {
+        runs(plan, "moe_plan", "the expert plan").map_err(|error| error.to_string())?;
+        let name = gate_up.kernel().name();
+        let Some(&(_, clamped, down_symbol, scaled)) =
+            Self::FORMS.iter().find(|(symbol, ..)| *symbol == name)
+        else {
+            return Err(format!(
+                "no token expert format has the gate/up body {name}"
+            ));
+        };
+        runs(down, down_symbol, "this format's down pass").map_err(|error| error.to_string())?;
+        if let Some(kernel) = gate_up_clamped {
+            let Some(symbol) = clamped else {
+                return Err(format!(
+                    "{name} has no clamped form, not {}",
+                    kernel.kernel().name()
+                ));
+            };
+            runs(kernel, symbol, "this format's clamped gate/up")
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(Self {
+            plan,
+            gate_up,
+            gate_up_clamped,
+            down,
+            scaled,
+        })
+    }
+
+    /// Whether the bodies read the NVFP4 scale table.
+    #[must_use]
+    pub const fn scaled(&self) -> bool {
+        self.scaled
+    }
+
+    /// The plan, gate/up and down over `count` rows of `table` (and, for the scaled format,
+    /// `scales`), the gate/up clamped at `limit` when one is given.
+    ///
+    /// # Errors
+    /// A limit on a format with no clamped body, by name, or the driver's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        (table, scales): (Deviceptr, Deviceptr),
+        rows: &ExpertRows,
+        shape: ExpertShape,
+        count: usize,
+        limit: Option<f32>,
+    ) -> Result<(), BackendError> {
+        let ExpertShape {
+            experts,
+            top_k,
+            hidden,
+            intermediate,
+            weight_stride,
+        } = shape;
+        let plan = crate::moe::MoePlanCall::runs(
+            rows.indices.0,
+            rows.sorted.0,
+            rows.runs.0,
+            (count * top_k, experts, top_k),
+        );
+        cx.launch(self.plan, crate::moe::MoePlanCall::launch(), &plan.args())?;
+        let mut gate_up = Vec::with_capacity(11);
+        gate_up.push(table.0);
+        if self.scaled {
+            gate_up.push(scales.0);
+        }
+        gate_up.extend([
+            rows.indices.0,
+            rows.sorted.0,
+            rows.runs.0,
+            rows.input.0,
+            rows.activated.0,
+            top_k as u64,
+            hidden as u64,
+            intermediate as u64,
+        ]);
+        let grid = crate::moe::token::gate_up_grid(intermediate, top_k, count);
+        match limit {
+            None => cx.launch(self.gate_up, grid, &gate_up)?,
+            Some(limit) => {
+                let Some(clamped) = self.gate_up_clamped else {
+                    return Err(BackendError::new(
+                        ROLE,
+                        format!(
+                            "a token expert pass under a swiglu_limit: {} has no clamped form",
+                            self.gate_up.kernel().name()
+                        ),
+                    ));
+                };
+                gate_up.push(u64::from(limit.to_bits()));
+                cx.launch(clamped, grid, &gate_up)?;
+            }
+        }
+        let mut down = Vec::with_capacity(12);
+        down.push(table.0);
+        if self.scaled {
+            down.push(scales.0);
+        }
+        down.extend([
+            rows.indices.0,
+            rows.sorted.0,
+            rows.runs.0,
+            rows.weights.0,
+            rows.activated.0,
+            rows.partials.0,
+            top_k as u64,
+            hidden as u64,
+            intermediate as u64,
+            weight_stride as u64,
+        ]);
+        cx.launch(
+            self.down,
+            crate::moe::token::down_grid(hidden, top_k, count),
+            &down,
+        )
+    }
+}
+
+/// Where a combined MoE row also lands: the widened residual's streams, each by its injection
+/// weight, or nowhere (the combine writes the branch only).
+#[derive(Clone, Copy, Debug)]
+pub struct Injection {
+    /// The widened residual the row is injected into; `None` writes the branch only.
+    pub hyper: Option<Deviceptr>,
+    /// The streams' injection weights.
+    pub weights: Deviceptr,
+    /// The streams.
+    pub streams: usize,
+}
+
+impl Injection {
+    /// No streams: the combine writes the branch only.
+    pub const NONE: Self = Self {
+        hyper: None,
+        weights: Deviceptr(0),
+        streams: 0,
+    };
+}
+
+/// The MoE combine (`q4e_moe_combine`): a row's weighted expert partials plus its shared expert's
+/// row, the latter under its sigmoid gate when the layer has one.
+#[derive(Clone, Copy, Debug)]
+pub struct Combine {
+    kernel: Bound,
+}
+
+impl Combine {
+    /// The combine's kernel.
+    pub const TABLE: KernelTable<1> = KernelTable {
+        image: Image::Qwen4Moe,
+        symbols: [("q4e_moe_combine", Precision::Bf16)],
+    };
+
+    /// `kernel`, the loaded `q4e_moe_combine`.
+    ///
+    /// # Errors
+    /// Another kernel, by name.
+    pub fn new(kernel: Bound) -> Result<Self, String> {
+        let [(symbol, _)] = Self::TABLE.symbols;
+        runs(kernel, symbol, "the MoE combine").map_err(|error| error.to_string())?;
+        Ok(Self { kernel })
+    }
+
+    /// `rows` combined rows into `out` from `partials` (`[rows * top_k][hidden]`) and `shared`
+    /// (`[rows][hidden]`), gated by `shared_gate`'s logits when given, and injected per
+    /// `injection`.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        out: Deviceptr,
+        (partials, shared, shared_gate): (Deviceptr, Deviceptr, Option<Deviceptr>),
+        injection: Injection,
+        (top_k, hidden): (usize, usize),
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        cx.launch(
+            self.kernel,
+            crate::moe::combine_grid(hidden, rows),
+            &[
+                out.0,
+                partials.0,
+                shared.0,
+                shared_gate.map_or(0, |gate| gate.0),
+                injection.hyper.map_or(0, |hyper| hyper.0),
+                injection.weights.0,
+                top_k as u64,
+                hidden as u64,
+                injection.streams as u64,
+            ],
+        )
+    }
+}
+
 /// How a branch's rows reach the streams when the mix leaves the branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SumPath {

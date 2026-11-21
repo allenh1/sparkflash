@@ -112,7 +112,7 @@ use sparkflash_ops::gemv::gemv_e4m3_tile;
 use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{Form, PackedSet, Placement, Tiled};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::{Bound, Embed, Launcher, Norm};
+use sparkflash_ops::roles::{Bound, Combine, Embed, Launcher, Norm, TokenExperts};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -616,13 +616,12 @@ struct Kernels {
     /// The shared routed-expert plan (kernels/moe_plan_sm121.cu): the run order its expert
     /// kernels read and the run bounds that tell each block where its run starts.
     moe_plan: Bound,
-    expert_gate_up: Bound,
-    expert_down: Bound,
-    expert_gate_up_fp8: Bound,
-    expert_down_fp8: Bound,
+    /// The token expert passes in the NVFP4 and the FP8 formats, on [Self::moe_plan].
+    experts_nvfp4: TokenExperts,
+    experts_fp8: TokenExperts,
     fold_streams: Bound,
     widen_streams: Bound,
-    moe_combine: Bound,
+    combine: Combine,
     gdn_conv: Bound,
     gdn_recur: Bound,
     rope: Bound,
@@ -730,6 +729,20 @@ impl Kernels {
                 }
             }
         };
+        if sparkflash_kernels::images::moe_plan_cubin().is_empty() {
+            return Err(
+                "this build has no routed-expert plan cubin: rebuild on a host with nvcc \
+                 (or set SPARKFLASH_NVCC) so build.rs compiles kernels/moe_plan_sm121.cu"
+                    .to_owned(),
+            );
+        }
+        let moe_plan = Bound::new(
+            cuda,
+            Image::MoePlan,
+            sparkflash_kernels::images::moe_plan_cubin(),
+            "moe_plan",
+            Precision::Bf16,
+        )?;
         Ok(Self {
             embed: token("q4e_embed", Precision::Bf16)?,
             gemv_bf16: token("q4e_gemv_bf16", Precision::Bf16)?,
@@ -755,37 +768,30 @@ impl Kernels {
             sum_slots: token("q4e_sum_slots", Precision::Bf16)?,
             swiglu: token("q4e_swiglu", Precision::Bf16)?,
             router: moe("q4e_router", Precision::Bf16)?,
-            moe_plan: {
-                if sparkflash_kernels::images::moe_plan_cubin().is_empty() {
-                    return Err(
-                        "this build has no routed-expert plan cubin: rebuild on a host with nvcc \
-                         (or set SPARKFLASH_NVCC) so build.rs compiles kernels/moe_plan_sm121.cu"
-                            .to_owned(),
-                    );
-                }
-                Bound::new(
-                    cuda,
-                    Image::MoePlan,
-                    sparkflash_kernels::images::moe_plan_cubin(),
-                    "moe_plan",
-                    Precision::Bf16,
-                )?
-            },
-            expert_gate_up: moe_staged("q4e_expert_gate_up", Precision::NvFp4, expert_stage_bytes)?,
-            expert_down: moe_staged("q4e_expert_down", Precision::NvFp4, expert_stage_bytes)?,
-            expert_gate_up_fp8: moe_staged(
-                "q4e_expert_gate_up_fp8",
-                Precision::Fp8E4M3,
-                expert_stage_bytes,
+            moe_plan,
+            experts_nvfp4: TokenExperts::new(
+                moe_plan,
+                moe_staged("q4e_expert_gate_up", Precision::NvFp4, expert_stage_bytes)?,
+                None,
+                moe_staged("q4e_expert_down", Precision::NvFp4, expert_stage_bytes)?,
             )?,
-            expert_down_fp8: moe_staged(
-                "q4e_expert_down_fp8",
-                Precision::Fp8E4M3,
-                expert_stage_bytes,
+            experts_fp8: TokenExperts::new(
+                moe_plan,
+                moe_staged(
+                    "q4e_expert_gate_up_fp8",
+                    Precision::Fp8E4M3,
+                    expert_stage_bytes,
+                )?,
+                None,
+                moe_staged(
+                    "q4e_expert_down_fp8",
+                    Precision::Fp8E4M3,
+                    expert_stage_bytes,
+                )?,
             )?,
             fold_streams: token("q4e_fold_streams", Precision::F32)?,
             widen_streams: token("q4e_widen_streams", Precision::F32)?,
-            moe_combine: moe("q4e_moe_combine", Precision::Bf16)?,
+            combine: Combine::new(moe("q4e_moe_combine", Precision::Bf16)?)?,
             gdn_conv: token("q4e_gdn_conv", Precision::Bf16)?,
             gdn_recur: staged("q4e_gdn_recur", Precision::Bf16, gdn_stage_bytes)?,
             rope: token("q4e_rope", Precision::Bf16)?,

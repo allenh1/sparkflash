@@ -30,9 +30,9 @@
 //! them, as in the host reference, which applies the same tile scales to the same codes.
 //!
 //! A routed layer runs the parts the released arms run: the one router body (`q4e_route`, any
-//! family's score, top-k, renormalisation and scale), the shared expert plan's run walk
-//! ([MoePlanCall::runs]), the token path's expert passes in their BF16 form (one block a run of
-//! an expert's rows, Qwen's NVFP4 and FP8 body) and the combine, with the shared expert and its
+//! family's score, top-k, renormalisation and scale), the shared token expert passes
+//! ([TokenExperts]: the expert plan's run walk, then a gate/up and a down pass a run, in the BF16
+//! form or Qwen's NVFP4 and FP8 one) and the combine ([Combine]), with the shared expert and its
 //! sigmoid gate on the same projections as a dense MLP.
 //!
 //! A Gated DeltaNet layer (a hybrid family's linear attention) runs the scan image's chunk
@@ -92,14 +92,16 @@ use sparkflash_ops::gemv::{
     CudaHandle, E4M3_TILE, GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3Tile, TILED_GEMV_BLOCKS,
     TILED_GEMV_PARTIALS, gemv_e4m3_tile,
 };
-use sparkflash_ops::moe::{Launch, MoePlanCall, combine_grid, router_score, token};
+use sparkflash_ops::moe::{Launch, router_score, token};
 use sparkflash_ops::naming::{AttentionNames, ExpertNames, FfnNames, GdnNames, TensorNames};
 use sparkflash_ops::packed::{self, Form, PackedSet, Placement};
 use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
-use sparkflash_ops::roles::{Bound, Launcher, ManifoldMixer, Norm};
+use sparkflash_ops::roles::{
+    Bound, Combine, ExpertRows, ExpertShape, Injection, Launcher, ManifoldMixer, Norm, TokenExperts,
+};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -603,14 +605,10 @@ struct RoutedExperts {
 #[derive(Clone, Copy)]
 struct MoeKernels {
     route: Bound,
-    plan: Bound,
-    gate_up: Bound,
-    /// The gate/up pass under a `swiglu_limit`; the NVFP4 body has none.
-    gate_up_clamped: Option<Bound>,
-    down: Bound,
-    combine: Bound,
-    /// Whether the expert bodies read the NVFP4 scale table (their arguments carry it).
-    nvfp4: bool,
+    /// The plan and the token passes in the checkpoint's expert format (the NVFP4 body has no
+    /// clamped form for a `swiglu_limit`).
+    experts: TokenExperts,
+    combine: Combine,
 }
 
 /// The packed BF16 form's four bodies ([sparkflash_ops::packed]), resolved through the catalogue
@@ -753,26 +751,27 @@ impl Kernels {
                     "q4e_route",
                     Precision::Bf16,
                 )?,
-                plan: Bound::new(
-                    cuda,
-                    Image::MoePlan,
-                    moe_plan_cubin(),
-                    "moe_plan",
-                    Precision::Bf16,
+                experts: TokenExperts::new(
+                    Bound::new(
+                        cuda,
+                        Image::MoePlan,
+                        moe_plan_cubin(),
+                        "moe_plan",
+                        Precision::Bf16,
+                    )?,
+                    staged(gate_up, expert_precision, bytes)?,
+                    gate_up_clamped
+                        .map(|symbol| staged(symbol, expert_precision, bytes))
+                        .transpose()?,
+                    staged(down, expert_precision, bytes)?,
                 )?,
-                gate_up: staged(gate_up, expert_precision, bytes)?,
-                gate_up_clamped: gate_up_clamped
-                    .map(|symbol| staged(symbol, expert_precision, bytes))
-                    .transpose()?,
-                down: staged(down, expert_precision, bytes)?,
-                nvfp4: formats.expert == ExpertForm::NvFp4,
-                combine: Bound::new(
+                combine: Combine::new(Bound::new(
                     cuda,
                     Image::Qwen4Moe,
                     qwen4_moe_cubin(),
                     "q4e_moe_combine",
                     Precision::Bf16,
-                )?,
+                )?)?,
             }),
             None => None,
         };
@@ -2983,63 +2982,31 @@ impl Shared {
                 u64::from(routed.scaling.to_bits()),
             ],
         )?;
-        let plan = MoePlanCall::runs(
-            b.indices.0,
-            b.sorted.0,
-            b.runs.0,
-            (rows * top_k, experts, top_k),
-        );
-        self.launch(kernels.plan, MoePlanCall::launch(), &plan.args())?;
         // The NVFP4 body reads the per-tensor scale table as its second argument; the BF16 and
-        // FP8 bodies read the same six-address table with no second table.
-        let mut gate_up = Vec::with_capacity(11);
-        gate_up.push(table.0);
-        if kernels.nvfp4 {
-            gate_up.push(scales.unwrap_or(Deviceptr(0)).0);
-        }
-        gate_up.extend([
-            b.indices.0,
-            b.sorted.0,
-            b.runs.0,
-            b.normed.0,
-            b.activated.0,
-            top_k as u64,
-            hidden as u64,
-            intermediate as u64,
-        ]);
-        let grid = token::gate_up_grid(intermediate, top_k, rows);
-        match shape.clamp {
-            None => self.launch(kernels.gate_up, grid, &gate_up)?,
-            Some(limit) => {
-                let Some(clamped_kernel) = kernels.gate_up_clamped else {
-                    return Err(BackendError::new(
-                        DEVICE,
-                        "an NVFP4 expert pass under a swiglu_limit: the body has no clamped form",
-                    ));
-                };
-                let mut clamped = gate_up.clone();
-                clamped.push(u64::from(limit.to_bits()));
-                self.launch(clamped_kernel, grid, &clamped)?;
-            }
-        }
-        let mut down = Vec::with_capacity(12);
-        down.push(table.0);
-        if kernels.nvfp4 {
-            down.push(scales.unwrap_or(Deviceptr(0)).0);
-        }
-        down.extend([
-            b.indices.0,
-            b.sorted.0,
-            b.runs.0,
-            b.weights.0,
-            b.activated.0,
-            b.expert_partials.0,
-            top_k as u64,
-            hidden as u64,
-            intermediate as u64,
-            top_k as u64,
-        ]);
-        self.launch(kernels.down, token::down_grid(hidden, top_k, rows), &down)?;
+        // FP8 bodies read the same six-address table with no second table. The route writes
+        // `top_k` weights a row.
+        kernels.experts.run(
+            self,
+            (*table, scales.unwrap_or(Deviceptr(0))),
+            &ExpertRows {
+                indices: b.indices,
+                weights: b.weights,
+                input: b.normed,
+                sorted: b.sorted,
+                runs: b.runs,
+                activated: b.activated,
+                partials: b.expert_partials,
+            },
+            ExpertShape {
+                experts,
+                top_k,
+                hidden,
+                intermediate,
+                weight_stride: top_k,
+            },
+            rows,
+            shape.clamp,
+        )?;
         match shared {
             Some(mlp) => self.mlp(mlp, shape.clamp, b, b.shared_out, rows, policy)?,
             // The combine always adds a shared row; a layer without one adds zeros.
@@ -3051,24 +3018,17 @@ impl Shared {
         if let Some(gate) = shared_gate {
             self.project(gate, b, b.normed.0, b.shared_logit.0, rows, None)?;
         }
-        self.launch(
-            kernels.combine,
-            combine_grid(hidden, rows),
-            &[
-                b.projected.0,
-                b.expert_partials.0,
-                b.shared_out.0,
-                if shared_gate.is_some() {
-                    b.shared_logit.0
-                } else {
-                    0
-                },
-                0,
-                0,
-                top_k as u64,
-                hidden as u64,
-                0,
-            ],
+        kernels.combine.run(
+            self,
+            b.projected,
+            (
+                b.expert_partials,
+                b.shared_out,
+                shared_gate.as_ref().map(|_| b.shared_logit),
+            ),
+            Injection::NONE,
+            (top_k, hidden),
+            rows,
         )
     }
 }
