@@ -487,9 +487,9 @@ fn scan_gaps(config: &str, architecture: &Architecture, world: usize) -> Result<
     }
     let mut gaps = Vec::new();
     let mut seen = BTreeSet::new();
-    // The pack this gate describes is the language process: Qwen's and GLM's packs do not stage
-    // a vision tower, so its row is reported by the page but is not an engine gap for this gate.
-    // The full plan's vision constraint is still the catalogue's and the page's.
+    // The pack this gate describes is the language process: a pack that does not stage a vision
+    // tower reports its row on the page, but it is not an engine gap for this gate. The full
+    // plan's vision constraint is still the catalogue's and the page's.
     let served = serving_language(Target::Sm121);
     for row in report.unresolved().filter(|row| served.contains(row.part)) {
         let reason = format!(
