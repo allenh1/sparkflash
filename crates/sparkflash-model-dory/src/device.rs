@@ -505,7 +505,7 @@ impl DoryDeviceBackend {
     /// # Errors
     /// A scratch allocation the device refuses.
     pub(crate) fn walk_arm(&self) -> Result<walk::DoryWalk, BackendError> {
-        walk::DoryWalk::new(Arc::clone(&self.shared))
+        walk::walk(Arc::clone(&self.shared))
     }
 
     /// Serves this backend's sessions on `capacity` lanes of the shared tick engine: their token
@@ -1657,6 +1657,14 @@ impl StageCore {
         Ok(())
     }
 
+    /// Moves the sequence `rows` positions on, past the rows a pass wrote outside
+    /// [StageCore::forward]: the planned walk's layers ([walk::DoryHost]).
+    pub(crate) fn advance(&mut self, rows: usize) -> Result<(), BackendError> {
+        self.check_rows(rows)?;
+        self.position += rows;
+        Ok(())
+    }
+
     /// One decode row for each of `lanes`, each at its own position, in one pass; the head, when
     /// asked for, leaves lane `i`'s logits at [StageCore::logits_row] `i`.
     ///
@@ -2447,7 +2455,7 @@ fn edge(
 /// The vocabulary head over the rows `head` of the `rows` hidden rows a walk with the suffix left
 /// in `scratch`, into the logits rows from 0.
 ///
-/// [walk] ends with it when it is asked for a head; [walk::DoryWalk] calls it once the runtime
+/// [walk] ends with it when it is asked for a head; [walk::DoryHost] calls it once the runtime
 /// names the rows it wants, with nothing queued between the suffix and these launches.
 fn head_rows(
     shared: &DeviceShared,
@@ -2512,16 +2520,17 @@ fn logits_rows(
         .cuda
         .copy_dtoh(&mut bytes, &scratch.logits)
         .map_err(|error| BackendError::new(DEVICE, error))?;
-    Ok(bytes
-        .chunks(vocab * 4)
-        .map(|row| {
-            row.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| f32::from_le_bytes(*chunk))
-                .collect()
-        })
-        .collect())
+    Ok(bytes.chunks(vocab * 4).map(floats).collect())
+}
+
+/// The little-endian f32 values of `bytes`, as a device copy leaves them.
+fn floats(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect()
 }
 
 fn copy(
