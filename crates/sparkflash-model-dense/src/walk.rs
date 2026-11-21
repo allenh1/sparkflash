@@ -39,7 +39,7 @@ use sparkflash_runtime::{
 };
 
 use super::{
-    CHUNK_ROWS, DEVICE, Mixer, Scratch, Sequence, Shared, TOKEN_DECODE, head as dense_head,
+    CHUNK_ROWS, DEVICE, Scratch, Sequence, Shared, TOKEN_DECODE, head as dense_head,
     head_choices as dense_head_choices, walk as dense_walk,
 };
 
@@ -133,29 +133,10 @@ pub(crate) fn walk(shared: Arc<Shared>, capacity: usize) -> Result<DenseWalk, Ba
     DenseWalk::new(shared, capacity)
 }
 
-/// The arm's state, as the runtime needs to see it: one positional region a GQA layer, one
-/// recurrent region for every Gated DeltaNet layer together.
+/// The arm's state, as the runtime needs to see it: what each part of the walk declares, in walk
+/// order.
 fn layout_of(shared: &Shared) -> StateLayout {
-    let mut regions = Vec::new();
-    let mut recurrent = 0usize;
-    for layer in &shared.layers {
-        if let Mixer::Gqa { .. } = layer.mixer {
-            regions.push(Region::Positional {
-                name: "kv",
-                // Keys and values, BF16 a value.
-                bytes_per_row: layer.shape.kv_width() * 2 * 2,
-            });
-        }
-    }
-    for size in &shared.linear_sizes {
-        recurrent = recurrent.saturating_add(*size);
-    }
-    if recurrent > 0 {
-        regions.push(Region::Recurrent {
-            name: "gated-deltanet",
-            bytes: recurrent,
-        });
-    }
+    let regions: Vec<Region> = shared.state();
     StateLayout::new(regions)
 }
 
@@ -272,7 +253,15 @@ impl Walk for DenseWalk {
             .iter_mut()
             .map(|segment| (&mut *segment.seq, segment.rows))
             .collect();
-        dense_walk(&self.shared, &scratch.buffers, &mut pairs, policy, None)?;
+        let body = sparkflash_runtime::PartBody::of(kind);
+        dense_walk(
+            &self.shared,
+            &scratch.buffers,
+            &mut pairs,
+            body,
+            policy,
+            None,
+        )?;
         drop(pairs);
         let hidden = Hidden::new(plan.rows);
         if let Some(hook) = hook {
