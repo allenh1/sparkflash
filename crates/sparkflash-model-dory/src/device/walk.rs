@@ -121,10 +121,7 @@ impl DoryWalk {
             shared: Arc::clone(&shared),
         });
         let per_loop = shared.config.recurrent_kv_cache_mode == KvCacheMode::PerLoop;
-        // A per-loop prompt takes a whole chunk a pass; last-loop's overwritten cache makes a
-        // row depend on the tokens after it, so that mode keeps the token-at-a-time order.
-        let rows = if per_loop { PREFILL_BATCH } else { 1 };
-        let limits = Limits::new(rows, shared.context).with_members(LANE_BATCH);
+        let limits = walk_limits(per_loop, shared.context);
         Ok(Self {
             layout: layout_of(&shared),
             shared,
@@ -137,6 +134,15 @@ impl DoryWalk {
             drafter: Absent("the single-process Dory arm has no loop-1 exit"),
         })
     }
+}
+
+/// The limits the walk states at `context`.
+///
+/// A per-loop prompt takes a whole chunk a pass; last-loop's overwritten cache makes a row
+/// depend on the tokens after it, so that mode keeps the token-at-a-time order.
+fn walk_limits(per_loop: bool, context: usize) -> Limits {
+    let rows = if per_loop { PREFILL_BATCH } else { 1 };
+    Limits::new(rows, context).with_members(LANE_BATCH)
 }
 
 /// The arm's state, as the runtime needs to see it: one positional region a block's KV caches.
@@ -412,6 +418,7 @@ impl Walk for DoryWalk {
 
 #[cfg(test)]
 mod tests {
+    use sparkflash_runtime::testing::ArmProfile;
     use sparkflash_runtime::{Fixture, WalkFixture};
 
     use super::*;
@@ -457,29 +464,6 @@ mod tests {
         /// The single-process arm serves on the tick engine, so its generated checks drive it.
         fn tick_engine() -> bool {
             true
-        }
-    }
-
-    /// The four rows the arm's kernels decide are the arm's static declaration, so the walk and
-    /// `ledger_for_arm("Dory")` cannot drift while the arm moves onto the runtime.
-    #[test]
-    fn the_declared_compute_rows_are_the_arm_ledger_rows() {
-        use sparkflash_model::ledger::{Strategy, ledger_for_arm};
-        let declared = ledger_for_arm("Dory").expect("Dory's declaration");
-        let capabilities = <DoryWalk as Walk>::CAPABILITIES.compute;
-        for (strategy, stated) in [
-            (Strategy::TensorCorePrompt, capabilities.prompt),
-            (Strategy::TensorCoreDecode, capabilities.token),
-            (Strategy::StoredArithmetic, capabilities.stored),
-            (Strategy::Rewind, capabilities.rewind),
-        ] {
-            let from_table = declared
-                .rows
-                .iter()
-                .find(|(row, _)| *row == strategy)
-                .map(|(_, state)| *state)
-                .expect("the arm states every strategy");
-            assert_eq!(stated, from_table, "{} drifted", strategy.name());
         }
     }
 
@@ -597,5 +581,21 @@ mod tests {
         assert_eq!(whole16, split_8_8, "16 rows in one pass, then 8 and 8");
     }
 
-    sparkflash_runtime::conformance!(DoryWalk);
+    /// What the arm states for the generated profile tests: its ledger row, one positional
+    /// region, no drafter, and the chunks of each cache mode. A per-loop prompt of 5,000 tokens
+    /// runs in a whole chunk and the rest; a last-loop prompt runs a token a pass.
+    fn stated() -> ArmProfile {
+        let layout = StateLayout::new(vec![Region::Positional {
+            name: "kv",
+            bytes_per_row: 8,
+        }]);
+        let per_loop = walk_limits(true, 8_192);
+        let last_loop = walk_limits(false, 8_192);
+        ArmProfile::new("Dory", layout, per_loop)
+            .with_code(DEVICE)
+            .prompt(per_loop, 5_000, &[PREFILL_BATCH, 5_000 - PREFILL_BATCH])
+            .prompt(last_loop, 3, &[1, 1, 1])
+    }
+
+    sparkflash_runtime::conformance!(DoryWalk, profile: stated());
 }
