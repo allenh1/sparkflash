@@ -158,8 +158,9 @@ pub enum ResolveCause {
     /// precision or pass.
     ///
     /// Under a non-catalogue [Availability] policy an entry this build cannot load also lands
-    /// here: the three causes classify the catalogue, and the policy that refused the image owns
-    /// that remedy.
+    /// here, and so does a [KernelResolver::resolve_symbol] request whose symbol no entry
+    /// exports: the three causes classify the catalogue, and the caller that named the policy or
+    /// the symbol owns that remedy.
     ShapeOrFormatRefused,
     /// The catalogue has entries for the part, but only on other targets.
     OtherTargetOnly {

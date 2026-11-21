@@ -228,9 +228,11 @@ impl Architecture {
                 self.expert_format_is_uniform()
                     .then_some(self.quantization.expert_format)
             }
-            Part::DenseMlp | Part::MlaAttention | Part::GqaAttention => {
-                Some(self.quantization.dense_format)
-            }
+            Part::DenseMlp
+            | Part::MlaAttention
+            | Part::GqaAttention
+            | Part::GdnScan
+            | Part::KdaScan => Some(self.quantization.dense_format),
             _ => None,
         }
     }

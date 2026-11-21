@@ -184,6 +184,90 @@ fn model_families() -> Vec<String> {
 }
 
 #[test]
+fn the_scan_agrees_with_the_plan_on_every_released_config() {
+    use sparkflash_model::Target;
+    use sparkflash_ops::{Availability, EnginePlan, KernelPhase, KernelResolver, ScanInputs, scan};
+
+    let crates = workspace_root().join("crates");
+    let mut configs = Vec::new();
+    for entry in std::fs::read_dir(&crates).expect("the crates directory") {
+        let directory = entry.expect("a crate entry").path();
+        let Some(name) = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        if !name.starts_with("sparkflash-model-") {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(directory.join("config")) else {
+            continue;
+        };
+        for file in files {
+            let path = file.expect("a config entry").path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if file_name.ends_with(".released.json") || file_name.ends_with(".hf.json") {
+                configs.push(path);
+            }
+        }
+    }
+    configs.sort();
+    assert!(configs.len() >= 6, "{configs:?}");
+
+    for path in configs {
+        let config = std::fs::read_to_string(&path).expect("a released config");
+        let plan = EnginePlan::from_json(&config, Target::Sm121, 1, 0)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let report = scan(ScanInputs {
+            config: &config,
+            tensors: None,
+            target: Target::Sm121,
+            world: 1,
+        });
+        assert!(
+            report.error.is_none(),
+            "{}: {:?}",
+            path.display(),
+            report.error
+        );
+        assert_eq!(report.rows.len(), plan.requirements().count());
+        let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
+        for (row, requirement) in report.rows.iter().zip(plan.requirements()) {
+            let resolved = resolver
+                .resolve_for(requirement, KernelPhase::Prefill)
+                .is_ok()
+                && resolver
+                    .resolve_for(requirement, KernelPhase::Decode)
+                    .is_ok();
+            assert_eq!(
+                row.status.is_resolved(),
+                resolved,
+                "{} {:?} block {:?}: scan and the resolver disagree",
+                path.display(),
+                requirement.part,
+                row.block
+            );
+            assert_eq!(row.part, requirement.part);
+            if matches!(
+                requirement.part,
+                sparkflash_model::Part::GdnScan | sparkflash_model::Part::KdaScan
+            ) {
+                assert!(
+                    row.format.is_some(),
+                    "{} {:?} must state the attention format the plan resolves at",
+                    path.display(),
+                    requirement.part
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_tp4_scan_row_states_the_rank_local_shape_the_stack_describes_in_full() {
     use sparkflash_model::stack::Shape;
     use sparkflash_model::{Architecture, Part, Target};

@@ -18,7 +18,8 @@
 //! a checkpoint's config, plans the model with the existing [EnginePlan], and resolves each part
 //! instance for the prefill and decode passes with the existing [KernelResolver]. Each instance
 //! is one row: it resolves only when a kernel is chosen for both passes, and a gap names the
-//! pass that refused it.
+//! pass that refused it. Every row is resolved at exactly the plan's precision, the same request
+//! the load path makes; there is no fallback to another precision.
 //!
 //! Step 0 lands the kernel rows and the vocabulary of the two coverage checks. The tensor-claim
 //! and config-key passes themselves are not wired yet, so [ScanReport::coverage] records them as
@@ -31,8 +32,8 @@
 //! build embeds an image it did not check.
 //!
 //! Every refusal names the part, the rank-local shape the plan states, the stored format when the
-//! config states one, the pass and the target, and carries what would fix it. The statuses are the seven of the plan's section 4,
-//! no more.
+//! config states one, the pass and the target, and carries what would fix it. The statuses are the
+//! seven of the plan's section 4, no more.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -42,7 +43,7 @@ use sparkflash_model::stack::{Shape, StackKind};
 use sparkflash_model::{Part, Target};
 
 use crate::engine_plan::{EnginePlan, PartRequirement, precision_of};
-use crate::plan::{KernelPhase, PartGeometry, Precision};
+use crate::plan::{KernelPhase, PartGeometry};
 use crate::resolver::{Availability, KernelResolver, ResolveCause, ResolveError};
 
 /// One tensor from a checkpoint's index: its name, stored shape and dtype.
@@ -92,6 +93,8 @@ impl TensorIndex {
 pub enum CoverageState {
     /// The check ran and every item was claimed or consumed.
     Clean,
+    /// The check ran and found items to report.
+    Dirty,
     /// The check has not been wired in yet.
     NotChecked,
 }
@@ -102,6 +105,7 @@ impl CoverageState {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Clean => "clean",
+            Self::Dirty => "dirty",
             Self::NotChecked => "not checked",
         }
     }
@@ -482,9 +486,16 @@ fn push_row(
     requirement: &PartRequirement,
 ) {
     let shape = part_shape(requirement.part, &requirement.geometry);
-    let format = architecture.stored_format(requirement.part);
-    let prefill = resolve_pass(resolver, requirement, KernelPhase::Prefill, format);
-    let decode = resolve_pass(resolver, requirement, KernelPhase::Decode, format);
+    // Report a format only when it is the precision this row is actually resolved at. A config
+    // that states a different format, or none, gets "?" rather than a claim the lookup did not
+    // use.
+    let format = architecture
+        .stored_format(requirement.part)
+        .filter(|format| precision_of(*format) == requirement.precision);
+    // Resolve at the plan's precision, exactly as the load path does. Falling back to another
+    // precision would report a part resolved that the plan still refuses.
+    let prefill = resolver.resolve_for(requirement, KernelPhase::Prefill);
+    let decode = resolver.resolve_for(requirement, KernelPhase::Decode);
     let (pass, status) = match (prefill, decode) {
         (Ok(_), Ok(_)) => (KernelPhase::Both, ScanStatus::Resolved),
         (Err(error), Ok(_)) => (KernelPhase::Prefill, refusal_status(&error, &shape, format)),
@@ -503,46 +514,6 @@ fn push_row(
     });
 }
 
-/// Resolve one instance for one pass at the format its row reports.
-///
-/// A stated format is resolved at exactly that precision, so the format column and the kernel
-/// lookup cannot disagree. An unstated format is tried at the plan's precision and then at every
-/// other: the row says a body exists without claiming which stored format it reads.
-fn resolve_pass(
-    resolver: &KernelResolver,
-    requirement: &PartRequirement,
-    phase: KernelPhase,
-    format: Option<WeightFormat>,
-) -> Result<(), ResolveError> {
-    if let Some(format) = format {
-        let requirement = PartRequirement {
-            precision: precision_of(format),
-            ..*requirement
-        };
-        return resolver.resolve_for(&requirement, phase).map(|_| ());
-    }
-    let mut plan_error = None;
-    for precision in [
-        requirement.precision,
-        Precision::Bf16,
-        Precision::F32,
-        Precision::MxFp8,
-        Precision::Fp8E4M3,
-        Precision::NvFp4,
-    ] {
-        let candidate = PartRequirement {
-            precision,
-            ..*requirement
-        };
-        match resolver.resolve_for(&candidate, phase) {
-            Ok(_) => return Ok(()),
-            Err(error) if precision == requirement.precision => plan_error = Some(error),
-            Err(_) => {}
-        }
-    }
-    Err(plan_error.expect("the plan's precision was tried"))
-}
-
 fn refusal_status(error: &ResolveError, shape: &Shape, format: Option<WeightFormat>) -> ScanStatus {
     match &error.cause {
         ResolveCause::NoCatalogueEntry => ScanStatus::NoPartKind {
@@ -558,7 +529,12 @@ fn refusal_status(error: &ResolveError, shape: &Shape, format: Option<WeightForm
                 format!("at {shape}")
             };
             let stored = format.map_or_else(
-                || "whose stored format the config does not state".to_owned(),
+                || {
+                    format!(
+                        "at the {} precision (the stored format is not in the config)",
+                        error.precision.name()
+                    )
+                },
                 |format| format!("stored as {}", format.name()),
             );
             ScanStatus::NotBuilt {
@@ -747,7 +723,10 @@ mod tests {
             vision.status
         );
         let fix = vision.status.fix().expect("a fix");
-        assert!(fix.contains("build-list line"), "{fix}");
+        assert!(
+            fix.contains("at the bf16 precision"),
+            "the refusal must name the precision the plan asked for: {fix}"
+        );
         assert!(!report.is_resolved(), "a 16-patch tower has no body");
     }
 
@@ -803,6 +782,20 @@ mod tests {
             fix,
             "add a build-list line for `mla_attention` at 1x1 stored as BF16 on sm121 and rebuild"
         );
+    }
+
+    #[test]
+    fn a_coverage_check_that_found_items_is_dirty_not_not_checked() {
+        assert_eq!(CoverageState::Clean.name(), "clean");
+        assert_eq!(CoverageState::Dirty.name(), "dirty");
+        assert_eq!(CoverageState::NotChecked.name(), "not checked");
+        assert!(!CoverageState::Dirty.is_clean());
+        let coverage = Coverage {
+            tensors: CoverageState::Dirty,
+            config_keys: CoverageState::Clean,
+            indexed_tensors: None,
+        };
+        assert!(!coverage.is_complete());
     }
 
     #[test]
