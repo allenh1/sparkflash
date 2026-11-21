@@ -80,7 +80,7 @@ use sparkflash_model::compose::{LayerStep, StepRole};
 use sparkflash_model::ledger::State;
 use sparkflash_model::{Architecture, Capabilities, ModelDescriptor, TpAxis, TpPlan};
 use sparkflash_ops::OpPlan;
-use sparkflash_ops::calls::{self, FullAttention, RmsNorm, Rope};
+use sparkflash_ops::calls::{self, FullAttention, RmsNorm};
 use sparkflash_ops::dflash::{DraftUploader, Part as Run};
 use sparkflash_ops::engine_plan::{EnginePlan, PlanError};
 use sparkflash_ops::formats::{
@@ -100,7 +100,8 @@ use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
 use sparkflash_ops::roles::{
-    Bound, Combine, ExpertRows, ExpertShape, Injection, Launcher, ManifoldMixer, Norm, TokenExperts,
+    Bound, Combine, ExpertRows, ExpertShape, GqaAttention, GqaRows, GqaShape, Injection, Launcher,
+    ManifoldMixer, Norm, TokenExperts,
 };
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
@@ -377,6 +378,18 @@ impl Shape {
         self.heads * self.head_dim
     }
 
+    /// The attention's shape on this rank.
+    const fn gqa(&self) -> GqaShape {
+        GqaShape {
+            heads: self.heads,
+            kv_heads: self.kv_heads,
+            head_dim: self.head_dim,
+            gated: self.gated,
+            rotary: self.rotary,
+            theta: self.theta,
+        }
+    }
+
     const fn kv_width(&self) -> usize {
         self.kv_heads * self.head_dim
     }
@@ -639,17 +652,14 @@ struct Kernels {
     add: Bound,
     /// A group's row sum ([RowSums]) on the device legs.
     sum_slots: Bound,
-    deinterleave: Bound,
     embed: Bound,
     gemv: Bound,
     packed: PackedKernels,
     norm: Norm,
-    rope: Bound,
+    /// The grouped-query attention after its projections, a segment's rows a launch.
+    gqa: GqaAttention,
     swiglu: Bound,
     swiglu_clamped: Bound,
-    attention: Bound,
-    combine: Bound,
-    cache: Bound,
     wide: Bound,
     /// The vocabulary-wide argmax the greedy head chooses with (`q4e_argmax_slices`).
     argmax: Bound,
@@ -837,17 +847,22 @@ impl Kernels {
             gdn,
             add: token("q4e_add", Precision::Bf16)?,
             sum_slots: token("q4e_sum_slots", Precision::Bf16)?,
-            deinterleave: token("q4e_deinterleave", Precision::Bf16)?,
             embed: token("q4e_embed", Precision::Bf16)?,
             gemv: token("q4e_gemv_bf16", Precision::Bf16)?,
             packed,
             norm: Norm::new(token("q4e_rmsnorm", Precision::Bf16)?, None)?,
-            rope: token("q4e_rope", Precision::Bf16)?,
+            gqa: GqaAttention::new(
+                [
+                    token("q4e_deinterleave", Precision::Bf16)?,
+                    token("q4e_rope", Precision::Bf16)?,
+                    attention("q4e_cache_bf16", Precision::Bf16)?,
+                    attention("q4e_attn_full", Precision::Bf16)?,
+                    attention("q4e_attn_full_combine", Precision::Bf16)?,
+                ],
+                None,
+            )?,
             swiglu: token("q4e_swiglu", Precision::Bf16)?,
             swiglu_clamped: token("q4e_swiglu_clamped", Precision::Bf16)?,
-            attention: attention("q4e_attn_full", Precision::Bf16)?,
-            combine: attention("q4e_attn_full_combine", Precision::Bf16)?,
-            cache: attention("q4e_cache_bf16", Precision::Bf16)?,
             argmax: token("q4e_argmax_slices", Precision::Bf16)?,
             wide: Bound::shared(
                 cuda,
@@ -2523,94 +2538,58 @@ impl Shared {
             k_norm,
             ..
         } = part;
-        let kernels = self.kernels;
-        let shape = part.shape;
-        let (query_width, kv_width) = (shape.query_width(), shape.kv_width());
+        let gqa = &self.kernels.gqa;
+        let shape = part.shape.gqa();
         let projected_query = if shape.gated { b.interleaved } else { b.query };
         self.project(q, b, b.normed.0, projected_query.0, rows, policy)?;
         self.project(k, b, b.normed.0, b.key.0, rows, policy)?;
         self.project(v, b, b.normed.0, b.value.0, rows, policy)?;
-        if shape.gated {
-            self.call(
-                kernels.deinterleave,
-                calls::deinterleave(
-                    b.interleaved.0,
-                    (b.query.0, b.gate.0),
-                    (shape.heads, shape.head_dim),
-                    rows,
-                ),
-            )?;
-        }
-        for (gains, values, width) in [(*q_norm, b.query, query_width), (*k_norm, b.key, kv_width)]
-        {
-            if let Some(gains) = gains {
-                self.norm(
-                    RmsNorm::new(values.0, gains.0, values.0, width, self.eps)
-                        .groups(shape.head_dim, true),
-                    rows,
-                )?;
-            }
-        }
+        let heads = GqaRows {
+            interleaved: b.interleaved,
+            query: b.query,
+            gate: b.gate,
+            key: b.key,
+            value: b.value,
+            partials: b.partials,
+            attended: b.attended,
+        };
+        gqa.heads(
+            self,
+            &self.kernels.norm,
+            shape,
+            &heads,
+            (*q_norm, *k_norm),
+            (self.eps, self.zero_centred),
+            rows,
+        )?;
         let mut first = 0usize;
         for (sequence, tokens) in segments.iter() {
             let count = tokens.len();
             let position = sequence.position();
-            let row = |base: Deviceptr, width: usize| base.0 + (first * width * 4) as u64;
-            if shape.rotary >= 2 {
-                for (values, heads, width) in [
-                    (b.query, shape.heads, query_width),
-                    (b.key, shape.kv_heads, kv_width),
-                ] {
-                    let rope = Rope {
-                        rows: row(values, width),
-                        heads,
-                        head_dim: shape.head_dim,
-                        rotary: shape.rotary,
-                        position,
-                        theta: shape.theta,
-                        row_stride: width,
-                        tokens: count,
-                    };
-                    self.call(kernels.rope, rope.call())?;
-                }
-            }
             let &[keys, values] = sequence.lane.regions[slot].as_slice() else {
                 return Err(BackendError::new(
                     DEVICE,
                     format!("layer {index}'s lane part holds no key/value cache"),
                 ));
             };
-            let at = (position * kv_width * 2) as u64;
-            self.call(
-                kernels.cache,
-                calls::cache_bf16(keys.0 + at, row(b.key, kv_width), count * kv_width),
-            )?;
-            self.call(
-                kernels.cache,
-                calls::cache_bf16(values.0 + at, row(b.value, kv_width), count * kv_width),
+            gqa.append(
+                self,
+                shape,
+                &heads,
+                (keys, values),
+                position,
+                (first, count),
             )?;
             // The partials are one segment's: the combine reads them before the next segment's
             // attention writes them, both on the one stream.
-            let attention = FullAttention {
-                query: row(b.query, query_width),
-                keys: keys.0,
-                values: values.0,
-                partials: b.partials.0,
+            gqa.attend(
+                self,
+                shape,
+                &heads,
+                (keys, values),
                 position,
-                rows: count,
-                heads: shape.heads,
-                kv_heads: shape.kv_heads,
-                head_dim: shape.head_dim,
-            };
-            self.call(kernels.attention, attention.call())?;
-            let gate = if shape.gated {
-                row(b.gate, query_width)
-            } else {
-                0
-            };
-            self.call(
-                kernels.combine,
-                attention.combine(gate, row(b.attended, query_width)),
+                (first, count),
+                || Ok(()),
             )?;
             first += count;
         }

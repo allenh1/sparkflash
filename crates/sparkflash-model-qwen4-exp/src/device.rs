@@ -112,7 +112,7 @@ use sparkflash_ops::gemv::gemv_e4m3_tile;
 use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{Form, PackedSet, Placement, Tiled};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::{Bound, Combine, Embed, Launcher, Norm, TokenExperts};
+use sparkflash_ops::roles::{Bound, Combine, Embed, GqaAttention, Launcher, Norm, TokenExperts};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -624,7 +624,9 @@ struct Kernels {
     combine: Combine,
     gdn_conv: Bound,
     gdn_recur: Bound,
-    rope: Bound,
+    /// The sparse layers' grouped-query attention after their projections, ATTENTION_CHUNK rows a
+    /// full attention launch.
+    gqa: GqaAttention,
     qsa_pool: Bound,
     qsa_scores: Bound,
     qsa_pick: Bound,
@@ -634,16 +636,10 @@ struct Kernels {
     /// a configuration launches is ops' rule
     /// ([sparkflash_ops::attention::GqaBody::choose]), the one its boot plan names.
     attn_group: [Option<(usize, Bound)>; GQA_GROUP_KERNELS.len()],
-    /// Every causal position, split over the context, and the splits' fold: the attention of a
-    /// configuration with no sparse indexer ([Qwen4ExpConfig::full_attention]).
-    attn_full: Bound,
-    attn_full_combine: Bound,
     ple_gate: Bound,
     ple_conv: Bound,
-    deinterleave: Bound,
     copy_flat: Bound,
-    /// Narrow a f32 projection row into the BF16 KV cache, flat or one row at a time.
-    cache_bf16: Bound,
+    /// Narrow a f32 projection row into the BF16 KV cache one row at a time.
     cache_rows_bf16: Bound,
     /// The tensor-core forms a prefill chunk takes (kernels/qwen4_prefill_sm121.cu).
     prefill: PrefillKernels,
@@ -794,7 +790,19 @@ impl Kernels {
             combine: Combine::new(moe("q4e_moe_combine", Precision::Bf16)?)?,
             gdn_conv: token("q4e_gdn_conv", Precision::Bf16)?,
             gdn_recur: staged("q4e_gdn_recur", Precision::Bf16, gdn_stage_bytes)?,
-            rope: token("q4e_rope", Precision::Bf16)?,
+            // Every causal position, split over the context, and the splits' fold, is the
+            // attention of a configuration with no sparse indexer
+            // ([Qwen4ExpConfig::full_attention]).
+            gqa: GqaAttention::new(
+                [
+                    token("q4e_deinterleave", Precision::Bf16)?,
+                    token("q4e_rope", Precision::Bf16)?,
+                    attn("q4e_cache_bf16", Precision::Bf16)?,
+                    attn("q4e_attn_full", Precision::Bf16)?,
+                    attn("q4e_attn_full_combine", Precision::Bf16)?,
+                ],
+                Some(ATTENTION_CHUNK),
+            )?,
             qsa_pool: attn("q4e_qsa_pool", Precision::Bf16)?,
             qsa_scores: attn("q4e_qsa_scores", Precision::Bf16)?,
             qsa_pick: attn("q4e_qsa_pick", Precision::Bf16)?,
@@ -816,13 +824,9 @@ impl Kernels {
                 .ok()
                 .map(|bound| (heads, bound))
             }),
-            attn_full: attn("q4e_attn_full", Precision::Bf16)?,
-            attn_full_combine: attn("q4e_attn_full_combine", Precision::Bf16)?,
             ple_gate: token("q4e_ple_gate", Precision::Bf16)?,
             ple_conv: token("q4e_ple_conv", Precision::Bf16)?,
-            deinterleave: token("q4e_deinterleave", Precision::Bf16)?,
             copy_flat: token("q4e_copy_flat", Precision::F32)?,
-            cache_bf16: attn("q4e_cache_bf16", Precision::Bf16)?,
             cache_rows_bf16: attn("q4e_cache_rows_bf16", Precision::Bf16)?,
             prefill: PrefillKernels::load(cuda)?,
         })

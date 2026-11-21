@@ -33,13 +33,25 @@ use sparkflash_model::BackendError;
 use sparkflash_ops::attention::GqaBody;
 use sparkflash_ops::calls::{self, RmsNorm, Rope};
 use sparkflash_ops::indexer::IndexerPass;
-use sparkflash_ops::roles::{ExpertRows, ExpertShape, Injection, Launcher};
+use sparkflash_ops::roles::{ExpertRows, ExpertShape, GqaRows, GqaShape, Injection, Launcher};
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
     Dense, DeviceSequence, ExpertOperand, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch, GpuMoe,
-    MAX_SELECTED_TOKENS,
+    MAX_SELECTED_TOKENS, Qwen4ExpConfig,
 };
+
+/// A sparse layer's grouped-query attention shape: every query head interleaves its gate.
+fn gqa_shape(config: &Qwen4ExpConfig) -> GqaShape {
+    GqaShape {
+        heads: config.num_attention_heads,
+        kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        gated: true,
+        rotary: config.rotary_dim(),
+        theta: config.rope_theta as f32,
+    }
+}
 
 impl DeviceSequence {
     /// One sparse-attention block over `batch` rows of `mixed`, whose positions start at
@@ -90,8 +102,6 @@ impl DeviceSequence {
         };
         let config = &self.backend.config;
         let kernels = &*self.backend.kernels;
-        let kv_width = config.kv_proj_width();
-        let attn_width = config.attn_out_width();
         self.dense4(
             [
                 q_proj.clone(),
@@ -106,33 +116,13 @@ impl DeviceSequence {
         // The whole chunk goes through each projection once, instead of the chunk
         // going through every projection once per token: 13 launches per chunk
         // rather than 13 per token on every sparse layer.
-        self.call(
-            kernels.deinterleave,
-            calls::deinterleave(
-                self.qg.0,
-                (self.query.0, self.gate.0),
-                (config.num_attention_heads, config.head_dim),
-                batch,
-            ),
-        )?;
-        self.norm(
-            self.query,
-            *q_norm,
-            self.query,
-            attn_width,
-            config.head_dim,
-            true,
-            true,
-            batch,
-        )?;
-        self.norm(
-            self.kv_row,
-            *k_norm,
-            self.kv_row,
-            kv_width,
-            config.head_dim,
-            true,
-            true,
+        kernels.gqa.heads(
+            self,
+            &kernels.norm,
+            gqa_shape(config),
+            &self.gqa_rows(),
+            (Some(*q_norm), Some(*k_norm)),
+            (config.rms_norm_eps as f32, true),
             batch,
         )?;
         self.prof_mark("sparse_proj")?;
@@ -173,53 +163,16 @@ impl DeviceSequence {
         let idx_q_width = config.indexer_n_heads * config.indexer_head_dim;
         let ratio = config.indexer_compress_ratio.max(1);
         let score_stride = self.score_stride;
-        self.call(
-            kernels.rope,
-            Rope {
-                rows: self.query.0,
-                heads: config.num_attention_heads,
-                head_dim: config.head_dim,
-                rotary: config.rotary_dim(),
-                position,
-                theta: config.rope_theta as f32,
-                row_stride: attn_width,
-                tokens: batch,
-            }
-            .call(),
-        )?;
-        self.call(
-            kernels.rope,
-            Rope {
-                rows: self.kv_row.0,
-                heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
-                rotary: config.rotary_dim(),
-                position,
-                theta: config.rope_theta as f32,
-                row_stride: kv_width,
-                tokens: batch,
-            }
-            .call(),
-        )?;
         // The chunk's keys and values land in the cache as one contiguous run, so the append
         // narrows batch * kv_width f32 projections to BF16 in one pass rather than one copy per
         // token. The cache holds the model dtype, not the kernels' working f32.
-        let kv_elems = batch * kv_width;
-        self.call(
-            kernels.cache_bf16,
-            calls::cache_bf16(
-                keys.offset(position * kv_width * 2).0,
-                self.kv_row.0,
-                kv_elems,
-            ),
-        )?;
-        self.call(
-            kernels.cache_bf16,
-            calls::cache_bf16(
-                values.offset(position * kv_width * 2).0,
-                self.value_row.0,
-                kv_elems,
-            ),
+        kernels.gqa.append(
+            self,
+            gqa_shape(config),
+            &self.gqa_rows(),
+            (keys, values),
+            position,
+            (0, batch),
         )?;
         if config.full_attention() {
             self.probe_finite(slot, "sparse_query", self.query, batch * attn_width)?;
@@ -244,7 +197,7 @@ impl DeviceSequence {
             (idx_row_width, idx_q_width),
         )?;
         self.call(
-            kernels.rope,
+            kernels.gqa.rope(),
             Rope {
                 rows: self.index_query.0,
                 heads: config.indexer_n_heads,
@@ -393,35 +346,29 @@ impl DeviceSequence {
         position: usize,
         batch: usize,
     ) -> Result<(), BackendError> {
-        let config = &self.backend.config;
-        let kernels = &*self.backend.kernels;
-        let attn_width = config.attn_out_width();
-        let mut base = 0usize;
-        while base < batch {
-            let rows = ATTENTION_CHUNK.min(batch - base);
-            let attention = calls::FullAttention {
-                query: self.query.offset(base * attn_width * 4).0,
-                keys: keys.0,
-                values: values.0,
-                partials: self.qsa_block_scores.0,
-                position: position + base,
-                rows,
-                heads: config.num_attention_heads,
-                kv_heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
-            };
-            self.call(kernels.attn_full, attention.call())?;
-            self.call(
-                kernels.attn_full_combine,
-                attention.combine(
-                    self.gate.offset(base * attn_width * 4).0,
-                    self.attention_out.offset(base * attn_width * 4).0,
-                ),
-            )?;
-            self.prof_mark("sparse_attn")?;
-            base += rows;
+        self.backend.kernels.gqa.attend(
+            self,
+            gqa_shape(&self.backend.config),
+            &self.gqa_rows(),
+            (keys, values),
+            position,
+            (0, batch),
+            || self.prof_mark("sparse_attn"),
+        )
+    }
+
+    /// The session's grouped-query attention rows: the interleaved projection, the queries,
+    /// gates, keys and values, the full attention's partials and the attended heads.
+    fn gqa_rows(&self) -> GqaRows {
+        GqaRows {
+            interleaved: self.qg,
+            query: self.query,
+            gate: self.gate,
+            key: self.kv_row,
+            value: self.value_row,
+            partials: self.qsa_block_scores,
+            attended: self.attention_out,
         }
-        Ok(())
     }
 
     /// The row-independent tail of a sparse block: the output projection of `attention_out` into

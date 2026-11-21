@@ -862,6 +862,260 @@ impl Combine {
     }
 }
 
+/// A grouped-query attention layer's shape on this rank: its query and key/value heads, a head's
+/// floats, whether the query projection interleaves a sigmoid output gate with each head, and the
+/// rotary's rotated floats and base.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GqaShape {
+    /// The query heads.
+    pub heads: usize,
+    /// The key/value heads.
+    pub kv_heads: usize,
+    /// A head's floats.
+    pub head_dim: usize,
+    /// The query projection interleaves a gate head with each query head.
+    pub gated: bool,
+    /// The floats of a head that rotate (none below two).
+    pub rotary: usize,
+    /// The rotary base.
+    pub theta: f32,
+}
+
+impl GqaShape {
+    /// A query row's floats.
+    #[must_use]
+    pub const fn query_width(&self) -> usize {
+        self.heads * self.head_dim
+    }
+
+    /// A key (or value) row's floats.
+    #[must_use]
+    pub const fn kv_width(&self) -> usize {
+        self.kv_heads * self.head_dim
+    }
+}
+
+/// The f32 rows a grouped-query attention reads and writes, a row a token.
+#[derive(Clone, Copy, Debug)]
+pub struct GqaRows {
+    /// A gated layer's interleaved query-and-gate projection, which [GqaAttention::heads] splits.
+    pub interleaved: Deviceptr,
+    /// The queries, `[rows][query_width]`.
+    pub query: Deviceptr,
+    /// A gated layer's gates, `[rows][query_width]`.
+    pub gate: Deviceptr,
+    /// The keys, `[rows][kv_width]`.
+    pub key: Deviceptr,
+    /// The values, `[rows][kv_width]`.
+    pub value: Deviceptr,
+    /// The split partials of one launch's rows ([calls::FullAttention::partial_floats]).
+    pub partials: Deviceptr,
+    /// The attended heads, `[rows][query_width]`.
+    pub attended: Deviceptr,
+}
+
+/// Grouped-query attention after its projections: the gate deinterleave and the per-head q/k
+/// RMSNorms over every row ([Self::heads]); then a sequence at a time the rotary and the BF16
+/// cache append ([Self::append]), and the causal attention over the cache with its combine
+/// (`q4e_attn_full`, `q4e_attn_full_combine`, [Self::attend]).
+///
+/// The attention takes a sequence's rows in one launch, or, configured with a chunk, `chunk` rows
+/// a launch: a launch's split count follows its own last row, so the two differ in bits, and
+/// each arm keeps the one its records hold.
+#[derive(Clone, Copy, Debug)]
+pub struct GqaAttention {
+    deinterleave: Bound,
+    rope: Bound,
+    cache: Bound,
+    attention: Bound,
+    combine: Bound,
+    chunk: Option<usize>,
+}
+
+impl GqaAttention {
+    /// The kernels in the order [Self::new] takes them.
+    pub const SYMBOLS: [&'static str; 5] = [
+        "q4e_deinterleave",
+        "q4e_rope",
+        "q4e_cache_bf16",
+        "q4e_attn_full",
+        "q4e_attn_full_combine",
+    ];
+
+    /// The loaded [Self::SYMBOLS], the attention taking `chunk` rows a launch when given.
+    ///
+    /// # Errors
+    /// Another kernel in a place, by name, or a zero chunk.
+    pub fn new(kernels: [Bound; 5], chunk: Option<usize>) -> Result<Self, String> {
+        for (kernel, symbol) in kernels.iter().zip(Self::SYMBOLS) {
+            runs(*kernel, symbol, "grouped-query attention").map_err(|error| error.to_string())?;
+        }
+        if chunk == Some(0) {
+            return Err("grouped-query attention takes no zero-row chunk".to_owned());
+        }
+        let [deinterleave, rope, cache, attention, combine] = kernels;
+        Ok(Self {
+            deinterleave,
+            rope,
+            cache,
+            attention,
+            combine,
+            chunk,
+        })
+    }
+
+    /// The rotary's kernel, which an arm's other heads (an indexer's) also take.
+    #[must_use]
+    pub const fn rope(&self) -> Bound {
+        self.rope
+    }
+
+    /// Over `count` rows: a gated layer's deinterleave of `rows.interleaved` into the queries and
+    /// gates, then the query heads' RMSNorm and the key heads' (each where the layer has its
+    /// gains) in place, a head a group under the same gains, zero-centred when `zero_centred`.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn heads<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        norm: &Norm,
+        shape: GqaShape,
+        rows: &GqaRows,
+        (q_norm, k_norm): (Option<Deviceptr>, Option<Deviceptr>),
+        (eps, zero_centred): (f32, bool),
+        count: usize,
+    ) -> Result<(), BackendError> {
+        if shape.gated {
+            cx.call(
+                self.deinterleave,
+                calls::deinterleave(
+                    rows.interleaved.0,
+                    (rows.query.0, rows.gate.0),
+                    (shape.heads, shape.head_dim),
+                    count,
+                ),
+            )?;
+        }
+        for (gains, values, width) in [
+            (q_norm, rows.query, shape.query_width()),
+            (k_norm, rows.key, shape.kv_width()),
+        ] {
+            if let Some(gains) = gains {
+                norm.run(
+                    cx,
+                    calls::RmsNorm::new(values.0, gains.0, values.0, width, eps)
+                        .zero_centred(zero_centred)
+                        .groups(shape.head_dim, true),
+                    count,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One sequence's `count` rows from row `first`, at `position` on: the queries' and keys'
+    /// rotary (when two floats or more rotate), then the keys and values narrowed to BF16 into
+    /// `keys` and `values` (`[capacity][kv_width]`) at `position`.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn append<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        shape: GqaShape,
+        rows: &GqaRows,
+        (keys, values): (Deviceptr, Deviceptr),
+        position: usize,
+        (first, count): (usize, usize),
+    ) -> Result<(), BackendError> {
+        let (query_width, kv_width) = (shape.query_width(), shape.kv_width());
+        let row = |base: Deviceptr, width: usize| base.0 + (first * width * 4) as u64;
+        if shape.rotary >= 2 {
+            for (values, heads, width) in [
+                (rows.query, shape.heads, query_width),
+                (rows.key, shape.kv_heads, kv_width),
+            ] {
+                let rope = calls::Rope {
+                    rows: row(values, width),
+                    heads,
+                    head_dim: shape.head_dim,
+                    rotary: shape.rotary,
+                    position,
+                    theta: shape.theta,
+                    row_stride: width,
+                    tokens: count,
+                };
+                cx.call(self.rope, rope.call())?;
+            }
+        }
+        let at = (position * kv_width * 2) as u64;
+        cx.call(
+            self.cache,
+            calls::cache_bf16(keys.0 + at, row(rows.key, kv_width), count * kv_width),
+        )?;
+        cx.call(
+            self.cache,
+            calls::cache_bf16(values.0 + at, row(rows.value, kv_width), count * kv_width),
+        )
+    }
+
+    /// One sequence's `count` rows from row `first`, at `position` on, attending over the
+    /// `keys` and `values` cache through its own row, combined into `rows.attended` (times the
+    /// sigmoid of the gates on a gated layer); `each` runs after every launch's combine. The
+    /// partials are a launch's: its combine reads them before the next launch writes them.
+    ///
+    /// # Errors
+    /// The driver's refusal, or `each`'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        shape: GqaShape,
+        rows: &GqaRows,
+        (keys, values): (Deviceptr, Deviceptr),
+        position: usize,
+        (first, count): (usize, usize),
+        mut each: impl FnMut() -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let width = shape.query_width();
+        let row = |base: Deviceptr, at: usize| base.0 + ((first + at) * width * 4) as u64;
+        let mut piece = |at: usize, count: usize| {
+            let attention = calls::FullAttention {
+                query: row(rows.query, at),
+                keys: keys.0,
+                values: values.0,
+                partials: rows.partials.0,
+                position: position + at,
+                rows: count,
+                heads: shape.heads,
+                kv_heads: shape.kv_heads,
+                head_dim: shape.head_dim,
+            };
+            cx.call(self.attention, attention.call())?;
+            let gate = if shape.gated { row(rows.gate, at) } else { 0 };
+            cx.call(
+                self.combine,
+                attention.combine(gate, row(rows.attended, at)),
+            )?;
+            each()
+        };
+        match self.chunk {
+            None => piece(0, count),
+            Some(chunk) => {
+                let mut at = 0usize;
+                while at < count {
+                    let rows = chunk.min(count - at);
+                    piece(at, rows)?;
+                    at += rows;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// How a branch's rows reach the streams when the mix leaves the branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SumPath {
