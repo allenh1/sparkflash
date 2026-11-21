@@ -43,9 +43,10 @@ out/
 numerics/coverage/*.seen.json
 
 # Serving checkouts' artifacts: the converted weights a node serves from
-# (SPARKFLASH_CONVERTED_DIR), a second cargo target directory, and the bind
-# evidence a device arm writes beside the binary.
-/converted/
+# (SPARKFLASH_CONVERTED_DIR, now ~/.cache/sparkflash/converted; a checkout may keep a link
+# named converted to it), a second cargo target directory, and the bind evidence a device arm
+# writes beside the binary.
+/converted
 /target-cuda/
 /tp4-bind-r*.json
 /tp4-bind-names-r*.txt

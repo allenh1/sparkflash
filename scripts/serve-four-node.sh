@@ -41,7 +41,8 @@
 #                          used for V4.1 and for a packed model such as GLM that always runs on device
 #   SPARK_COMM_REDUCE      forwarded to every rank for a packed model (nccl / tcp); a V4.1 device
 #                          image always runs nccl, so it sets this itself
-#   SPARKFLASH_CONVERTED_DIR  directory of `sparkflash convert` rank files on every node (fast boot)
+#   SPARKFLASH_CONVERTED_DIR  directory of `sparkflash convert` rank files on every node (fast boot;
+#                          `sparkflash convert` writes under ~/.cache/sparkflash/converted by default)
 #   SPARKFLASH_MODEL       packed model selector, e.g. glm5.3-flash-fp8: adds --model
 #   SPARKFLASH_CONTEXT     packed model context window: adds --context
 #   SPARKFLASH_CONCURRENCY a packed group's fused lanes: N > 1 adds --concurrency N --fuse-batch,

@@ -464,8 +464,8 @@ web's fit read that one plan, and:
   checkpoint tensors in the shared plan's order (`DynamicRecords` in `convert.rs`), not a device
   layout. The generic writer is TP1: a world above one is refused rather than writing several
   whole copies labelled as shards. `convert --inspect` recognises the `dynamic` rank file and
-  verifies it, and a conversion with no `--output-dir` writes beside the working directory,
-  never inside the Hugging Face cache. A family `ArchitectureTensorPlan` names can use
+  verifies it, and a conversion with no `--output-dir` writes under the node's shared
+  `~/.cache/sparkflash/converted`, never inside the Hugging Face cache. A family `ArchitectureTensorPlan` names can use
   `SlotPack` directly; the novel path cannot yet;
 - a family this backend does not execute (MLA, KDA, CSA2, an indexer, a hyper-connection, PLE
   or Engram) is refused with the exact host-part list before a kernel is consulted. An MTP stage

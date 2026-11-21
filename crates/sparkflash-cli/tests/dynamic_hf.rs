@@ -715,12 +715,14 @@ fn the_tokenizer_flag_wins_and_an_unknown_tokenizer_is_refused() {
 fn a_default_output_directory_is_outside_the_hub_cache() {
     let cache = cache_fixture();
     let cwd = tempfile::tempdir().expect("working directory");
+    let home = tempfile::tempdir().expect("home");
     let convert = binary()
         .arg("convert")
         .arg("--model")
         .arg(MODEL_ID)
         .current_dir(cwd.path())
         .env("HF_HUB_CACHE", cache.path())
+        .env("HOME", home.path())
         .output()
         .expect("convert runs");
     assert!(
@@ -728,10 +730,23 @@ fn a_default_output_directory_is_outside_the_hub_cache() {
         "default-output convert failed: {}",
         String::from_utf8_lossy(&convert.stderr)
     );
-    let output = cwd
-        .path()
-        .join("models--acme--Custom-Flash-Test-converted")
-        .join("rank-0-of-1.bin");
+    // The node's shared converted root, in the checkpoint's own hashed directory.
+    let root = home.path().join(".cache/sparkflash/converted");
+    let scopes: Vec<_> = std::fs::read_dir(&root)
+        .expect("the shared converted root")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    assert_eq!(scopes.len(), 1, "one checkpoint directory: {scopes:?}");
+    let name = scopes[0]
+        .file_name()
+        .expect("name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        name.starts_with("models--acme--Custom-Flash-Test--"),
+        "{name}"
+    );
+    let output = scopes[0].join("rank-0-of-1.bin");
     assert!(
         output.is_file(),
         "the default rank file is outside the cache: {}",
