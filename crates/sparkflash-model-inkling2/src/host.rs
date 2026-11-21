@@ -244,7 +244,13 @@ pub(crate) fn choose(
     if logits.is_empty() {
         return None;
     }
-    let chosen = match gumbel_sampler(sampling) {
+    config.next_token(pick(sampler, logits, sampling))
+}
+
+/// The token [choose] draws from a non-empty row, before the end-of-generation check: the
+/// sampler's greedy choice, or the Gumbel-max sample at the sequence's index.
+pub(crate) fn pick(sampler: &mut Sampler, logits: &[f32], sampling: &Sampling) -> u32 {
+    match gumbel_sampler(sampling) {
         None => sampler.choose(logits, sampling),
         Some(gumbel) => {
             let scores = sampler.penalized(logits, sampling);
@@ -252,8 +258,7 @@ pub(crate) fn choose(
             let position = u32::try_from(sampler.history().len()).unwrap_or(u32::MAX);
             gumbel.pick_row(scores.as_deref().unwrap_or(logits), position)
         }
-    };
-    config.next_token(chosen)
+    }
 }
 
 /// The Gumbel parameters of a request that samples, `None` for a greedy one (temperature zero,

@@ -60,7 +60,7 @@ use sparkflash_ops::formats::{
 };
 use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::projection::{WIDE_SHARED, WideTile};
-use sparkflash_runtime::{ExpertUnionWall, Opened, TickServe};
+use sparkflash_runtime::{ExpertUnionWall, TickServe};
 use sparkflash_weights::quant::bf16_to_f32;
 use sparkflash_weights::{DType, WeightSource};
 
@@ -83,7 +83,7 @@ mod packed;
 mod tower;
 mod walk;
 
-pub use walk::{InklingDrafter, InklingSequence, InklingWalk};
+pub use walk::{InklingDrafter, InklingHost, InklingLane, InklingSequence, InklingWalk};
 
 use chunk::{BandOut, band_exchange, band_mix, device_error, exchange_gather, exchange_sum};
 pub use draft::DRAFT_FILE;
@@ -3526,7 +3526,7 @@ impl InklingDeviceBackend {
     /// # Errors
     /// A lane plan or a switch the walk cannot honour.
     pub fn walk_arm(&self) -> Result<InklingWalk, BackendError> {
-        InklingWalk::new(Arc::clone(&self.shared))
+        walk::walk(&self.shared)
     }
 
     /// The shared runtime over this rank's walk: the lanes, the prompt parts, the history,
@@ -3544,12 +3544,12 @@ impl InklingDeviceBackend {
     /// a runtime per session.
     ///
     /// The engine's config is Inkling's profile, read from the walk: the pass rows and chunk
-    /// [InklingWalk::limits] states - 4,096, 8,192 or 65,535, the `ChunkPolicy` size over the
-    /// arm's widest width - the verify width as the member cap ([BATCH_ROWS]), the drafter's own
-    /// depth as `k` and floor, no decoder-layer skip (only DeepSeek has those layers) and no row
-    /// exchange at one rank. The executor is the runtime, so a prompt is the chunk
-    /// [InklingWalk::walk_bulk] walked and a decode is the same round: the engine chooses *when*
-    /// a chunk or a step runs, not what it computes.
+    /// [sparkflash_runtime::Walk::limits] states - 4,096, 8,192 or 65,535, the `ChunkPolicy`
+    /// size over the arm's widest width - the verify width as the member cap ([BATCH_ROWS]), the
+    /// drafter's own depth as `k` and floor, no decoder-layer skip (only DeepSeek has those
+    /// layers) and no row exchange at one rank. The executor is the runtime, so a prompt is the
+    /// chunk [InklingHost]'s windows walk and a decode is the same round: the engine chooses
+    /// *when* a chunk or a step runs, not what it computes.
     ///
     /// A backend that does not call this still serves: [ModelBackend::open_session] starts a
     /// one-lane engine for each session, which is the one sequence memory a
@@ -4806,16 +4806,14 @@ impl Scratch {
 struct InklingDeviceSession {
     shared: Arc<Shared>,
     state: State,
-    history: Vec<u32>,
     /// The prompt's encoded image rows, in prompt order, while its chunks still read them.
     ///
     /// The runtime's image path encodes a prompt's fresh images once through
     /// [crate::device::walk::InklingVision] and clears them when the prompt ends; the walk
     /// injects a chunk's rows from here at the positions its span names.
     images: Option<Deviceptr>,
-    last_logits: Vec<f32>,
-    sampling: Sampling,
-    sampler: Sampler,
+    /// Each encoded image's first position and rows, in the buffer's order.
+    image_spans: Vec<(usize, usize)>,
     /// The verify buffer, opened at the first round that drafts.
     verify: Option<VerifyBuffer>,
     /// The last verify, while its drafts are fed back.
@@ -5311,17 +5309,14 @@ impl InklingDeviceSession {
         Ok(())
     }
 
-    /// Applies a request's sampler before its prompt runs: a fresh sampler, as a session gets.
-    fn set_sampling(&mut self, sampling: Sampling) {
-        self.sampling = sampling;
-        self.sampler.reset();
-        // A request reports its own drafts, not the session's lifetime.
-        self.speculator.reset();
-    }
-
-    /// The step the last verify holds for `token` ([Self::held]): the next draft's row. Any
-    /// other token steps through a shared walk, never here.
-    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
+    /// The step the last verify holds for `token` ([Self::held]): the next draft's row, chosen
+    /// with `sampler` under `sampling`. Any other token steps through a shared walk, never here.
+    fn decode(
+        &mut self,
+        token: u32,
+        sampler: &mut Sampler,
+        sampling: &Sampling,
+    ) -> Result<StepOutput, BackendError> {
         let Some(round) = self
             .round
             .as_mut()
@@ -5333,8 +5328,8 @@ impl InklingDeviceSession {
         };
         let logits = round.rows[round.fed].clone();
         round.fed += 1;
-        round.marks.push(self.sampler.mark());
-        Ok(self.decoded(token, logits))
+        round.marks.push(sampler.mark());
+        Ok(self.decoded(token, logits, sampler, sampling))
     }
 
     /// A fresh sequence on this rank: its own cache, histories and stack, no chunk buffer yet.
@@ -5365,11 +5360,8 @@ impl InklingDeviceSession {
             boundary: None,
             shared: Arc::clone(shared),
             state,
-            history: Vec::new(),
             images: None,
-            last_logits: Vec::new(),
-            sampling: Sampling::default(),
-            sampler: Sampler::new(),
+            image_spans: Vec::new(),
             verify: None,
             round: None,
             opening: None,
@@ -5389,7 +5381,7 @@ impl InklingDeviceSession {
     }
 
     /// Takes the sequence back to the last prompt's end: its histories and the drafter's
-    /// feature from the checkpoint, its position and history to the boundary.
+    /// feature from the checkpoint, its position to the boundary.
     fn rewind_to(&mut self, point: usize) -> Result<(), BackendError> {
         let boundary = self
             .boundary
@@ -5402,8 +5394,6 @@ impl InklingDeviceSession {
             drafter.rewind(point).map_err(Self::fail)?;
         }
         self.state.position = point;
-        self.history.truncate(point);
-        self.last_logits.clear();
         Ok(())
     }
 
@@ -5420,15 +5410,13 @@ impl InklingDeviceSession {
         if let Some(drafter) = self.drafter.as_mut() {
             drafter.reset();
         }
-        self.history.clear();
         self.free_images();
-        self.last_logits.clear();
-        self.sampler.reset();
         Ok(())
     }
 
     /// Drops the prompt's encoded image rows, once the chunks that read them are done.
     fn free_images(&mut self) {
+        self.image_spans.clear();
         let Some(buffer) = self.images.take() else {
             return;
         };
@@ -5445,9 +5433,9 @@ impl InklingDeviceSession {
     }
 
     /// Rolls back the last `count` drafts the caller was answered and never used
-    /// ([sparkflash_runtime::Drafter::give_back]): the history, the sampler and the round's fed rows go back to
+    /// ([sparkflash_runtime::Drafter::give_back]): `sampler` and the round's fed rows go back to
     /// where they stood, so the round settles at the caller's last token.
-    fn give_back(&mut self, count: usize) -> Result<(), BackendError> {
+    fn give_back(&mut self, count: usize, sampler: &mut Sampler) -> Result<(), BackendError> {
         if count == 0 {
             return Ok(());
         }
@@ -5462,23 +5450,22 @@ impl InklingDeviceSession {
             })?;
         for _ in 0..count {
             let mark = round.marks.pop().expect("the marks were just counted");
-            self.sampler.rewind(mark);
-            self.history.pop();
+            sampler.rewind(mark);
             round.fed -= 1;
         }
-        self.last_logits = round.rows[round.fed - 1].clone();
         Ok(())
     }
 
-    /// Opens this sequence's round on `token` for a shared walk ([sparkflash_runtime::Drafter::open_round]): the step the
-    /// last verify holds, or the last round settled and the next chain drafted whole, with the
-    /// chance each leading run of it is accepted. The walk's share of the chain comes later
-    /// ([Self::close]).
-    fn open_round(&mut self, token: u32) -> Result<Opened, BackendError> {
-        if self.held(token) {
-            return self.decode(token).map(Opened::Held);
-        }
-        self.settle()?;
+    /// Opens this sequence's round on `token` for a shared walk, once the last round settled
+    /// ([Self::settle]): the next chain drafted ([Self::draft_chain] over `lookup` and
+    /// `sampling`), with the chance each leading run of it is accepted. The walk's share of the
+    /// chain comes later ([Self::close]).
+    fn open_round(
+        &mut self,
+        token: u32,
+        lookup: &[u32],
+        sampling: &Sampling,
+    ) -> Result<Vec<f64>, BackendError> {
         self.opening = None;
         if self.state.position >= self.shared.context {
             return Err(BackendError::new("context", "the context is exhausted"));
@@ -5499,7 +5486,7 @@ impl InklingDeviceSession {
                 VerifyBuffer::allocate(&self.shared, rows, &self.state.conv).map_err(Self::fail)?,
             );
         }
-        let (drafts, confidence) = self.draft_chain(token)?;
+        let (drafts, confidence) = self.draft_chain(token, lookup, sampling)?;
         let room = self.shared.context.saturating_sub(self.state.position + 1);
         let mut chain = self.speculator.chain(&confidence, room);
         chain.truncate(drafts.len());
@@ -5509,12 +5496,18 @@ impl InklingDeviceSession {
             drafts,
             confidence,
         });
-        Ok(Opened::Round(chain))
+        Ok(chain)
     }
 
     /// The opened round's walk ran, verifying its anchor and the first `depth` drafts into
-    /// `rows`: the round takes them, and the anchor's step is answered.
-    fn close(&mut self, depth: usize, rows: Vec<Vec<f32>>) -> Result<StepOutput, BackendError> {
+    /// `rows`: the round takes them, and the anchor's step is answered with `sampler`.
+    fn close(
+        &mut self,
+        depth: usize,
+        rows: Vec<Vec<f32>>,
+        sampler: &mut Sampler,
+        sampling: &Sampling,
+    ) -> Result<StepOutput, BackendError> {
         let opening = self
             .opening
             .take()
@@ -5538,21 +5531,36 @@ impl InklingDeviceSession {
             fed: 1,
             marks: Vec::new(),
         });
-        Ok(self.decoded(opening.anchor, logits))
+        Ok(self.decoded(opening.anchor, logits, sampler, sampling))
     }
 
-    /// The bookkeeping of one decoded token whose logits a step computed: the history, the
-    /// penalties' counts, and the next choice.
-    fn decoded(&mut self, token: u32, logits: Vec<f32>) -> StepOutput {
-        self.history.push(token);
-        self.sampler.record(token);
-        self.last_logits = logits.clone();
-        self.output(logits)
+    /// The bookkeeping of one decoded token whose logits a step computed: the penalties'
+    /// counts in `sampler`, and the next choice.
+    fn decoded(
+        &self,
+        token: u32,
+        logits: Vec<f32>,
+        sampler: &mut Sampler,
+        sampling: &Sampling,
+    ) -> StepOutput {
+        sampler.record(token);
+        let next_token = choose(&self.shared.config, sampler, &logits, sampling);
+        StepOutput {
+            logits,
+            next_token,
+            draft: Vec::new(),
+        }
     }
 
     /// The drafts after `anchor` before any depth is picked: DSpark's whole chain, with the
-    /// probability it gave each draft, or prompt lookup's drafts at the policy's depth.
-    fn draft_chain(&mut self, anchor: u32) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
+    /// probability it gave each draft under `sampling`'s noise, or prompt lookup's drafts at
+    /// the policy's depth over `lookup`, the ids the sequence holds and the anchor.
+    fn draft_chain(
+        &mut self,
+        anchor: u32,
+        lookup: &[u32],
+        sampling: &Sampling,
+    ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
         let Some((drafter, _)) = self.shared.draft else {
             return Ok((Vec::new(), Vec::new()));
         };
@@ -5560,11 +5568,8 @@ impl InklingDeviceSession {
         match drafter {
             Drafter::Lookup => {
                 let depth = self.speculator.depth(&[], room);
-                let mut context = Vec::with_capacity(self.history.len() + 1);
-                context.extend_from_slice(&self.history);
-                context.push(anchor);
                 let (shortest, longest) = LOOKUP_NGRAMS;
-                Ok((lookup_draft(&context, shortest, longest, depth), Vec::new()))
+                Ok((lookup_draft(lookup, shortest, longest, depth), Vec::new()))
             }
             Drafter::Dspark => {
                 // The whole chain is drafted before the depth is known, since the depth comes from
@@ -5589,7 +5594,7 @@ impl InklingDeviceSession {
                     )));
                 }
                 // A sampled request's drafts take the noise its sample takes.
-                let noise = crate::host::gumbel_sampler(&self.sampling).map(|gumbel| {
+                let noise = crate::host::gumbel_sampler(sampling).map(|gumbel| {
                     let (inv_t, seed) = gumbel.draft_noise();
                     (f32::from_bits(inv_t as u32), seed)
                 });
@@ -5652,20 +5657,6 @@ impl InklingDeviceSession {
         Ok(())
     }
 
-    fn output(&mut self, logits: Vec<f32>) -> StepOutput {
-        let next_token = choose(
-            &self.shared.config,
-            &mut self.sampler,
-            &logits,
-            &self.sampling,
-        );
-        StepOutput {
-            logits,
-            next_token,
-            draft: Vec::new(),
-        }
-    }
-
     /// Make this sequence's chunk buffer at least `rows` wide: opened on the first chunk, reopened
     /// wider when a chunk outgrows it. A chunk copies the sequence's stacks and histories in at
     /// its start and back at its end, so a reopened buffer carries nothing over.
@@ -5673,19 +5664,6 @@ impl InklingDeviceSession {
     /// reports, so the error path must not hold a reference to it.
     fn fail(error: impl std::fmt::Display) -> BackendError {
         BackendError::new(DEVICE, error.to_string())
-    }
-
-    /// One token: the whole row schedule, in the plan's order ([RowRun]).
-    fn step(&mut self, token: u32) -> Result<Vec<f32>, BackendError> {
-        let taps = self.drafter.as_ref().map(DraftState::sink);
-        let mut run = RowRun::begin(&self.shared, self.state.view(), token, taps)?;
-        run.embed()?;
-        for (index, steps) in run.layer_steps().into_iter().enumerate() {
-            run.steps(index, 0, steps)?;
-        }
-        let logits = run.finish()?;
-        self.state.position += 1;
-        Ok(logits)
     }
 }
 
@@ -5734,16 +5712,6 @@ impl RowRun {
             cursor: 0,
             previous_conv: None,
         })
-    }
-
-    /// The layers the row schedule walks, and each one's steps.
-    fn layer_steps(&self) -> Vec<usize> {
-        self.shared
-            .plan
-            .layers()
-            .iter()
-            .map(|layer| layer.steps.len())
-            .collect()
     }
 
     /// The prologue: the token's embedding, gathered across the ranks and normed.

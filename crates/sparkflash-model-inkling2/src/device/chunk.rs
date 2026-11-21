@@ -1126,15 +1126,6 @@ impl ChunkRun {
         })
     }
 
-    /// The layers the chunk schedule walks, and each one's steps.
-    pub(super) fn layer_steps(&self) -> Result<Vec<usize>, BackendError> {
-        Ok(chunk_schedule(&self.shared)?
-            .layers()
-            .iter()
-            .map(|layer| layer.steps.len())
-            .collect())
-    }
-
     /// The prologue: each row's embedding, gathered across the ranks and normed, then the
     /// image rows ([Injection]) over the normed rows.
     pub(super) fn embed(&self) -> Result<(), BackendError> {
@@ -2161,24 +2152,6 @@ impl ChunkRun {
             .collect();
         Ok(values.chunks(unpadded).map(<[f32]>::to_vec).collect())
     }
-}
-
-/// The chunk schedule over `tokens` in one call: every stage of a [ChunkRun] in order.
-pub(super) fn walk_rows(
-    shared: &Arc<Shared>,
-    sequences: Rows,
-    chunk: &Chunk,
-    tokens: &[u32],
-    walk: PrefillWalk,
-    images: &[Injection],
-    taps: Option<TapSink>,
-) -> Result<Vec<Vec<f32>>, BackendError> {
-    let mut run = ChunkRun::begin(shared, sequences, chunk, tokens, walk, images, taps)?;
-    run.embed()?;
-    for (index, steps) in run.layer_steps()?.into_iter().enumerate() {
-        run.steps(index, 0, steps)?;
-    }
-    run.finish()
 }
 
 /// A segment's convolution input in its own tails, as a verify's launch reads it: the sequence's
