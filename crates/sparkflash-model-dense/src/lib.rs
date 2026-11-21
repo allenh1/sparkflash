@@ -99,6 +99,7 @@ use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
+use sparkflash_ops::roles::Bound;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -543,81 +544,6 @@ struct RoutedExperts {
     shared_gate: Option<Proj>,
 }
 
-/// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
-/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
-/// than a name it looked up.
-#[derive(Clone, Copy)]
-struct Bound {
-    /// The loaded driver function.
-    kernel: Kernel,
-    /// The arithmetic the catalogue entry accepts this body at.
-    precision: Precision,
-}
-
-impl Bound {
-    /// Whether `image` exports `symbol` and the catalogue carries it at `precision`.
-    fn carried(image: Image, symbol: &'static str, precision: Precision) -> Result<(), String> {
-        if !image.exported_symbols().contains(&symbol) {
-            return Err(format!("{} does not export {symbol}", image.name()));
-        }
-        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
-            entry.image == image
-                && entry
-                    .symbols
-                    .iter()
-                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
-        });
-        if !carried {
-            return Err(format!(
-                "the catalogue carries no {symbol} in {} accepting {}",
-                image.name(),
-                precision.name()
-            ));
-        }
-        Ok(())
-    }
-
-    /// Resolve `symbol` in `image` at `precision` and load it.
-    ///
-    /// # Errors
-    /// A symbol the image does not export, one the catalogue does not carry at this precision,
-    /// or the driver's load refusal.
-    fn new(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-    ) -> Result<Self, String> {
-        Self::carried(image, symbol, precision)?;
-        let (_, kernel) = cuda.load_named(cubin, symbol)?;
-        Ok(Self { kernel, precision })
-    }
-
-    /// [Self::new] for a body loaded with a dynamic shared-memory reservation.
-    ///
-    /// # Errors
-    /// As [Self::new], or the driver's attribute call.
-    fn shared(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-        shared_bytes: u32,
-    ) -> Result<Self, String> {
-        Self::carried(image, symbol, precision)?;
-        let (_, kernel) = cuda.load_named_shared(cubin, symbol, shared_bytes)?;
-        Ok(Self { kernel, precision })
-    }
-}
-
-impl From<Bound> for Kernel {
-    fn from(bound: Bound) -> Self {
-        bound.kernel
-    }
-}
-
 /// The routed layers' kernels, loaded when a layer routes.
 #[derive(Clone, Copy)]
 struct MoeKernels {
@@ -646,10 +572,10 @@ impl PackedKernels {
     /// The plain handles [packed::PackedSet] takes.
     fn raw(&self) -> packed::Kernels {
         packed::Kernels {
-            pack: self.pack.kernel,
-            unpack: self.unpack.kernel,
-            gemv: self.gemv.kernel,
-            gemv4: self.gemv4.kernel,
+            pack: self.pack.kernel(),
+            unpack: self.unpack.kernel(),
+            gemv: self.gemv.kernel(),
+            gemv4: self.gemv4.kernel(),
         }
     }
 }
@@ -835,13 +761,13 @@ impl Kernels {
         };
         debug_assert!(
             fp8.as_ref()
-                .is_none_or(|kernels| kernels.gemv.precision == Precision::Fp8E4M3),
+                .is_none_or(|kernels| kernels.gemv.precision() == Precision::Fp8E4M3),
             "the FP8 GEMV resolves at FP8 E4M3"
         );
         debug_assert!(
             moe.as_ref().is_none_or(|kernels| {
-                kernels.gate_up.precision == expert_precision
-                    && kernels.down.precision == expert_precision
+                kernels.gate_up.precision() == expert_precision
+                    && kernels.down.precision() == expert_precision
             }),
             "the expert bodies resolve at the checkpoint's expert format"
         );
@@ -2705,9 +2631,9 @@ impl Shared {
                 count,
             );
             self.cuda
-                .launch_async(kernels.scan.kernel, grid, block, &args)
+                .launch_async(kernels.scan.kernel(), grid, block, &args)
                 .map_err(|error| {
-                    BackendError::new(DEVICE, format!("{}: {error}", kernels.scan.kernel.name()))
+                    BackendError::new(DEVICE, format!("{}: {error}", kernels.scan.kernel().name()))
                 })?;
             first += count;
         }
@@ -2772,7 +2698,7 @@ impl Shared {
         let gemv = |input: u64, output: u64, batch: usize| {
             gemv_e4m3_tile(
                 &tiled,
-                kernels.gemv.kernel,
+                kernels.gemv.kernel(),
                 &GpuMatE4m3Tile {
                     weight: mat.data(),
                     scales: mat.scales().blocks().unwrap_or(Deviceptr(0)),
@@ -2816,7 +2742,7 @@ impl Shared {
                 )
                 .map_err(|error| BackendError::new(DEVICE, error))?;
                 self.cuda
-                    .launch_async(kernels.tile.kernel, tile.grid, tile.block, &tile.args)
+                    .launch_async(kernels.tile.kernel(), tile.grid, tile.block, &tile.args)
                     .map_err(|error| BackendError::new(DEVICE, format!("q4p_dense_fp8: {error}")))
             }
             Route::Wide | Route::BatchedGemv => batched(),
@@ -2887,7 +2813,12 @@ impl Shared {
                     WideTile::call(mat.data().0, input, output, mat.rows(), mat.columns(), rows)
                         .map_err(|error| BackendError::new(DEVICE, error))?;
                 self.cuda
-                    .launch_async(self.kernels.wide.kernel, tile.grid, tile.block, &tile.args)
+                    .launch_async(
+                        self.kernels.wide.kernel(),
+                        tile.grid,
+                        tile.block,
+                        &tile.args,
+                    )
                     .map_err(|error| BackendError::new(DEVICE, format!("dory_mma_wide: {error}")))
             }
             route @ (Route::Skinny | Route::Refuse) => Err(BackendError::new(
@@ -3571,7 +3502,7 @@ fn head_choices(
     shared
         .cuda
         .launch_async(
-            shared.kernels.argmax.kernel,
+            shared.kernels.argmax.kernel(),
             (rows, 1, 1),
             (ARGMAX_BLOCK, 1, 1),
             &[
@@ -4126,7 +4057,7 @@ mod tests {
             Precision::Bf16,
         )
         .expect("the Qwen4-Exp image carries q4e_gemv_bf16")
-        .kernel;
+        .kernel();
         let wide = Bound::shared(
             &cuda,
             Image::Dory,
@@ -4136,7 +4067,7 @@ mod tests {
             sparkflash_ops::projection::WIDE_SHARED,
         )
         .expect("the Dory image carries dory_mma_wide")
-        .kernel;
+        .kernel();
         let mut total = 0;
         let w = cuda.alloc(weight.len(), &mut total).expect("the weights");
         let x = cuda.alloc(input.len(), &mut total).expect("the input");
@@ -4230,7 +4161,7 @@ mod tests {
             Precision::Bf16,
         )
         .expect("the Qwen4-Exp image carries q4e_argmax_slices")
-        .kernel;
+        .kernel();
         let rows = toy_rows();
         let vocab = rows[0].len();
         assert!(rows.iter().all(|row| row.len() == vocab));

@@ -108,6 +108,7 @@ pub mod parts_backend;
 pub mod plan;
 pub mod projection;
 pub mod resolver;
+pub mod roles;
 pub mod sampler;
 pub mod scan;
 pub mod slot_pack;

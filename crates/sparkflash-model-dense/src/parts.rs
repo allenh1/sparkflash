@@ -34,6 +34,7 @@ use sparkflash_ops::calls::RmsNorm;
 use sparkflash_ops::formats::{Bf16, FormatKind, Mat};
 use sparkflash_ops::naming::{LayerNames, TensorNames};
 use sparkflash_ops::projection::WidePolicy;
+pub use sparkflash_ops::roles::SegmentRows;
 use sparkflash_ops::widen::LedgerRow;
 use sparkflash_runtime::{PartExec, PartHost, PartRegistry, RankSplit, Region};
 use sparkflash_weights::WeightSource;
@@ -113,20 +114,6 @@ pub struct PassCx<'a> {
     pub(crate) slot: usize,
     pub(crate) rows: usize,
     pub(crate) policy: Option<WidePolicy>,
-}
-
-/// One segment of a pass: a run of rows that belong to one sequence.
-#[derive(Debug, Clone, Copy)]
-pub struct SegmentRows<'a> {
-    /// The segment's first row in the pass.
-    pub first: usize,
-    /// Its rows.
-    pub rows: usize,
-    /// The sequence's position before the pass: the segment's first row is this position.
-    pub position: usize,
-    /// The part's regions in this sequence's lane, in the order [PartExec::state] declares
-    /// them. A positional region is backed up to `position + rows` rows.
-    pub regions: &'a [Deviceptr],
 }
 
 impl PassCx<'_> {

@@ -118,6 +118,7 @@ use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
+use sparkflash_ops::roles;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{host_sum, reduce_scatter, reduce_two_shot, takes_two_shots};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -369,15 +370,15 @@ fn moe_items(slots: usize, experts: usize) -> usize {
 /// Q4E_GLM_MAX_POOL, Q4E_GLM_MAX_INDEX_HEADS and Q4E_GLM_MAX_INDEX_DIM, and q4e_attn's head width.
 const MAX_EXPERTS: usize = 512;
 const MAX_TOPK: usize = 64;
-const MAX_HC: usize = 5;
+const MAX_HC: usize = roles::MAX_STREAMS;
 /// Q4E_MHC_COLUMNS: the columns of every stream copy a thread of q4e_mhc_in holds, so the hidden
 /// width is a multiple of [BLOCK] of at most this many. The kernel's array is 16 columns: a lift
 /// to 32 would add some 224 live floats a thread and a larger cap no released config uses
 /// (D98's correction).
-const MHC_COLUMNS: usize = 16;
-const MAX_POOL: usize = 16;
-const MAX_INDEX_HEADS: usize = 32;
-const MAX_INDEX_DIM: usize = 128;
+const MHC_COLUMNS: usize = roles::MIX_COLUMNS;
+const MAX_POOL: usize = roles::MAX_POOL;
+const MAX_INDEX_HEADS: usize = roles::MAX_INDEX_HEADS;
+const MAX_INDEX_DIM: usize = roles::MAX_INDEX_DIM;
 const MAX_ATTENTION_HEAD_DIM: usize = 256;
 
 fn cuda_error(error: String) -> BackendError {
