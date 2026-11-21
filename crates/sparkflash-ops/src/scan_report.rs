@@ -12,16 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The model scan: one row per part instance, with the reason it did or did not resolve.
+//! The model scan: one row per part instance, with the reason it resolved or did not.
 //!
 //! The scan is the one report the console, `onboard` and the load-time refusal print. It reads
-//! a checkpoint's config (and, when the caller has one, its tensor index), plans the model with
-//! the existing [EnginePlan], and resolves every requirement for both passes with the existing
-//! [KernelResolver]. Step 0 of milestone 1 fills the resolved rows and leaves the two coverage
-//! statuses empty; the tensor-claim and config-key passes land on top of the same report.
+//! a checkpoint's config, plans the model with the existing [EnginePlan], and resolves each part
+//! instance for the prefill and decode passes with the existing [KernelResolver]. Each instance
+//! is one row: it resolves only when a kernel is chosen for both passes, and a gap names the
+//! pass that refused it.
 //!
-//! Every refusal names the part, its shape, its stored format and the target, and carries what
-//! would fix it. The statuses are the seven of the plan's section 4, no more.
+//! Step 0 lands the kernel rows and the vocabulary of the two coverage checks. The tensor-claim
+//! and config-key passes themselves are not wired yet, so [ScanReport::coverage] records them as
+//! [CoverageState::NotChecked] and [ScanReport::is_clean] stays `false` even when every row
+//! resolved. A supplied tensor index is counted and printed, never treated as checked.
+//!
+//! The scan resolves against the catalogue, not against this build's images:
+//! [ScanReport::availability] is [Availability::Catalogue] and the report prints it. A caller
+//! that gates a load must consult the process's own availability policy; the scan never claims a
+//! build embeds an image it did not check.
+//!
+//! Every refusal names the part, the shape the config states, the stored format, the pass and
+//! the target, and carries what would fix it. The statuses are the seven of the plan's section 4,
+//! no more.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -72,12 +83,81 @@ impl TensorIndex {
     }
 }
 
+/// Whether one of the two coverage checks of the plan's section 4 has run.
+///
+/// Step 0 defines the states and leaves both checks [Self::NotChecked]; the tensor-claim and
+/// config-key passes land on the same report later. A check that has not run is never reported
+/// as clean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageState {
+    /// The check ran and every item was claimed or consumed.
+    Clean,
+    /// The check has not been wired in yet.
+    NotChecked,
+}
+
+impl CoverageState {
+    /// The stable name used by the renderer.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::NotChecked => "not checked",
+        }
+    }
+
+    /// Whether this check has run and found nothing to report.
+    #[must_use]
+    pub const fn is_clean(self) -> bool {
+        matches!(self, Self::Clean)
+    }
+}
+
+impl fmt::Display for CoverageState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// The two checks that make the report trustworthy: every tensor claimed, every key consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coverage {
+    /// Whether every indexed tensor was claimed by a planned part.
+    pub tensors: CoverageState,
+    /// Whether every config key was consumed or listed as ignorable with a reason.
+    pub config_keys: CoverageState,
+    /// How many tensors the caller supplied, when it supplied an index.
+    pub indexed_tensors: Option<usize>,
+}
+
+impl Coverage {
+    /// A scan whose coverage checks have not run.
+    #[must_use]
+    pub const fn not_checked(indexed_tensors: Option<usize>) -> Self {
+        Self {
+            tensors: CoverageState::NotChecked,
+            config_keys: CoverageState::NotChecked,
+            indexed_tensors,
+        }
+    }
+
+    /// Whether both coverage checks ran and found nothing to report.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.tensors.is_clean() && self.config_keys.is_clean()
+    }
+}
+
 /// What the scan reads.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanInputs<'a> {
     /// The checkpoint's `config.json` text.
     pub config: &'a str,
     /// The tensor index, when the caller has read the checkpoint's index files.
+    ///
+    /// Step 0 records how many tensors it holds and prints that count; the claim check that
+    /// consumes it lands with the layout reader. Passing an index therefore never turns an
+    /// unclaimed tensor into a clean report.
     pub tensors: Option<&'a TensorIndex>,
     /// The GPU target the scan resolves against.
     pub target: Target,
@@ -88,7 +168,7 @@ pub struct ScanInputs<'a> {
 /// The status of one row of the scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanStatus {
-    /// A kernel was chosen for the pass.
+    /// A kernel was chosen for both passes.
     Resolved,
     /// A kernel covers the operation, but not this shape or stored format.
     NotBuilt {
@@ -179,11 +259,16 @@ pub struct ScanRow {
     pub block: Option<usize>,
     /// The part kind.
     pub part: Part,
-    /// The rank-local shape the instance was resolved at.
+    /// The principal matrix the config states for the instance.
+    ///
+    /// This is the shape the checkpoint's typed fields size, or [Shape::unknown] when they do
+    /// not: a part whose operative shape needs the tensor names and the layout file is printed
+    /// as `?` rather than guessed. The layout work replaces the unknown with the stored shape.
     pub shape: Shape,
     /// The stored weight format.
     pub format: WeightFormat,
-    /// The pass this row resolves.
+    /// The pass this row reports: both when the instance resolved in both passes (or failed in
+    /// both), otherwise the single pass that refused it.
     pub pass: KernelPhase,
     /// The target this row resolves against.
     pub target: Target,
@@ -198,6 +283,10 @@ pub struct ScanReport {
     pub target: Target,
     /// The tensor-parallel world size the plan was built for.
     pub world: usize,
+    /// The availability policy the rows were resolved under.
+    pub availability: Availability,
+    /// The two coverage checks the plan requires.
+    pub coverage: Coverage,
     /// The rows, globals first and then the blocks in forward order.
     pub rows: Vec<ScanRow>,
     /// A failure that stopped the scan before it could produce rows.
@@ -210,17 +299,35 @@ impl ScanReport {
         self.rows.iter().filter(|row| !row.status.is_resolved())
     }
 
-    /// Whether the scan ran and every row resolved.
+    /// Whether the scan ran and every kernel row resolved.
+    ///
+    /// This is kernel coverage only. A checkpoint is clean when [Self::is_clean] is also true,
+    /// which additionally requires both coverage checks to have run.
     #[must_use]
     pub fn is_resolved(&self) -> bool {
         self.error.is_none() && self.rows.iter().all(|row| row.status.is_resolved())
+    }
+
+    /// Whether the checkpoint is clean: every part resolved and both coverage checks are clean.
+    ///
+    /// Step 0 never returns true because the coverage checks are not wired in yet. A caller must
+    /// not gate a load on [Self::is_resolved] alone.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.is_resolved() && self.coverage.is_complete()
     }
 
     /// The plain-text report the console, `onboard` and the load refusal print.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(out, "scan report: {} TP{}", self.target.name(), self.world);
+        let _ = writeln!(
+            out,
+            "scan report: {} TP{}, availability {}",
+            self.target.name(),
+            self.world,
+            self.availability.name()
+        );
         if let Some(error) = &self.error {
             let _ = writeln!(out, "scan failed: {error}");
         }
@@ -261,6 +368,18 @@ impl ScanReport {
             resolved,
             self.rows.len() - resolved
         );
+        let tensors = match (self.coverage.tensors, self.coverage.indexed_tensors) {
+            (CoverageState::NotChecked, Some(count)) => {
+                format!("{} ({count} indexed)", CoverageState::NotChecked.name())
+            }
+            (state, _) => state.name().to_owned(),
+        };
+        let _ = writeln!(
+            out,
+            "coverage: tensors {tensors}; config keys {}",
+            self.coverage.config_keys.name()
+        );
+        let _ = writeln!(out, "clean: {}", if self.is_clean() { "yes" } else { "no" });
         out
     }
 }
@@ -281,6 +400,8 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
     let mut report = ScanReport {
         target: inputs.target,
         world: inputs.world,
+        availability: Availability::Catalogue,
+        coverage: Coverage::not_checked(inputs.tensors.map(|index| index.tensors.len())),
         rows: Vec::new(),
         error: None,
     };
@@ -291,13 +412,13 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             return report;
         }
     };
-    // The coverage passes are deliberately not wired in yet: step 0 lands the rows the plan
-    // already knows. When they land they read this index and append the two coverage statuses.
-    let _ = inputs.tensors;
-    let resolver = KernelResolver::new(inputs.target, Availability::Catalogue);
+    // Step 0 records the index's size; the claim check that consumes its names is the coverage
+    // pass that lands on top of this report. Ignoring the index would let a checkpoint with an
+    // unclaimed tower print a clean scan, so the report states that the check did not run.
+    let resolver = KernelResolver::new(inputs.target, report.availability);
     let architecture = plan.architecture();
     for requirement in plan.globals() {
-        push_rows(
+        push_row(
             &mut report,
             architecture,
             &resolver,
@@ -308,7 +429,7 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
     }
     for layer in plan.layers() {
         for requirement in &layer.requirements {
-            push_rows(
+            push_row(
                 &mut report,
                 architecture,
                 &resolver,
@@ -321,7 +442,7 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
     report
 }
 
-fn push_rows(
+fn push_row(
     report: &mut ScanReport,
     architecture: &Architecture,
     resolver: &KernelResolver,
@@ -331,22 +452,24 @@ fn push_rows(
 ) {
     let shape = part_shape(requirement.part, &requirement.geometry);
     let format = architecture.stored_format(requirement.part);
-    for pass in [KernelPhase::Prefill, KernelPhase::Decode] {
-        let status = match resolver.resolve_for(requirement, pass) {
-            Ok(_) => ScanStatus::Resolved,
-            Err(error) => refusal_status(&error, &shape, format),
-        };
-        report.rows.push(ScanRow {
-            stack,
-            block,
-            part: requirement.part,
-            shape: shape.clone(),
-            format,
-            pass,
-            target: resolver.target(),
-            status,
-        });
-    }
+    let prefill = resolver.resolve_for(requirement, KernelPhase::Prefill);
+    let decode = resolver.resolve_for(requirement, KernelPhase::Decode);
+    let (pass, status) = match (prefill, decode) {
+        (Ok(_), Ok(_)) => (KernelPhase::Both, ScanStatus::Resolved),
+        (Err(error), Ok(_)) => (KernelPhase::Prefill, refusal_status(&error, &shape, format)),
+        (Ok(_), Err(error)) => (KernelPhase::Decode, refusal_status(&error, &shape, format)),
+        (Err(error), Err(_)) => (KernelPhase::Both, refusal_status(&error, &shape, format)),
+    };
+    report.rows.push(ScanRow {
+        stack,
+        block,
+        part: requirement.part,
+        shape,
+        format,
+        pass,
+        target: resolver.target(),
+        status,
+    });
 }
 
 fn refusal_status(error: &ResolveError, shape: &Shape, format: WeightFormat) -> ScanStatus {
@@ -357,15 +480,21 @@ fn refusal_status(error: &ResolveError, shape: &Shape, format: WeightFormat) -> 
                 error.part.name()
             ),
         },
-        ResolveCause::ShapeOrFormatRefused => ScanStatus::NotBuilt {
-            fix: format!(
-                "add a build-list line for `{}` at {} stored as {} on {} and rebuild",
-                error.part.name(),
-                shape,
-                format.name(),
-                error.target.name()
-            ),
-        },
+        ResolveCause::ShapeOrFormatRefused => {
+            let at = if shape.is_unknown() {
+                "at the checkpoint's shape (the config does not state it)".to_owned()
+            } else {
+                format!("at {shape}")
+            };
+            ScanStatus::NotBuilt {
+                fix: format!(
+                    "add a build-list line for `{}` {at} stored as {} on {} and rebuild",
+                    error.part.name(),
+                    format.name(),
+                    error.target.name()
+                ),
+            }
+        }
         ResolveCause::OtherTargetOnly { targets } => {
             let targets = targets
                 .iter()
@@ -391,6 +520,12 @@ fn stack_of(part: Part) -> StackKind {
     }
 }
 
+/// The principal matrix the config states for one part, or [Shape::unknown].
+///
+/// Only the parts whose operative matrix the config sizes are stated. A part whose shape needs
+/// the tensor index and the layout file (an Engram table, a hyper-connection seam, an indexer,
+/// a vision patch grid) is unknown: the report never substitutes the residual width for a shape
+/// it does not know.
 fn part_shape(part: Part, geometry: &PartGeometry) -> Shape {
     let dims = match part {
         Part::Embedding | Part::LmHead => vec![geometry.vocab, geometry.hidden],
@@ -400,9 +535,7 @@ fn part_shape(part: Part, geometry: &PartGeometry) -> Shape {
         }
         Part::DenseMlp => vec![geometry.intermediate, geometry.hidden],
         Part::Moe => vec![geometry.experts, geometry.intermediate, geometry.hidden],
-        Part::Vision => vec![geometry.patch_size, geometry.patch_size, geometry.hidden],
-        Part::Mtp => vec![geometry.rows, geometry.hidden],
-        _ => vec![geometry.hidden],
+        _ => Vec::new(),
     };
     Shape::new(dims.into_iter().filter(|dim| *dim > 0).collect::<Vec<_>>())
 }
@@ -410,6 +543,7 @@ fn part_shape(part: Part, geometry: &PartGeometry) -> Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::Precision;
 
     const CONFIG: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16}"#;
 
@@ -434,10 +568,54 @@ mod tests {
                 | ScanStatus::UnclaimedTensor { .. }
                 | ScanStatus::UnknownLayout { .. }
         )));
+        let plan = EnginePlan::from_json(CONFIG, Target::Sm121, 1, 0).expect("the plan");
+        assert_eq!(report.rows.len(), plan.requirements().count());
+        assert!(report.rows.iter().all(|row| row.pass == KernelPhase::Both));
+        assert_eq!(report.availability, Availability::Catalogue);
+        assert_eq!(report.coverage.tensors, CoverageState::NotChecked);
+        assert_eq!(report.coverage.config_keys, CoverageState::NotChecked);
+        assert!(!report.is_clean(), "step 0 cannot call a checkpoint clean");
         let text = report.render();
-        assert!(text.contains("sm121"));
-        assert!(text.contains("gqa_attention"));
-        assert_eq!(text, report.to_string());
+        assert!(text.contains("coverage: tensors not checked"), "{text}");
+        assert!(text.contains("clean: no"), "{text}");
+    }
+
+    #[test]
+    fn the_report_renders_the_exact_table_a_work_item_is_taken_from() {
+        let expected = concat!(
+            "scan report: sm121 TP1, availability catalogue\n",
+            "stack     block  part               shape            format   pass     status\n",
+            "language  global embedding          128x5120         BF16     both     resolved\n",
+            "language  global rms_norm           5120             BF16     both     resolved\n",
+            "language  global lm_head            128x5120         BF16     both     resolved\n",
+            "language  0      gqa_attention      1x128            BF16     both     resolved\n",
+            "language  0      dense_mlp          256x5120         BF16     both     resolved\n",
+            "5 rows, 5 resolved, 0 unresolved\n",
+            "coverage: tensors not checked; config keys not checked\n",
+            "clean: no\n",
+        );
+        assert_eq!(scan(inputs(Target::Sm121)).render(), expected);
+    }
+
+    #[test]
+    fn a_supplied_tensor_index_is_counted_and_never_turns_the_scan_clean() {
+        let index = TensorIndex::new(vec![TensorEntry::new(
+            "model.visual.nothing_claims_this",
+            vec![16, 16],
+            "BF16",
+        )]);
+        let report = scan(ScanInputs {
+            tensors: Some(&index),
+            ..inputs(Target::Sm121)
+        });
+        assert!(report.error.is_none(), "{report:?}");
+        assert!(report.is_resolved());
+        assert!(!report.is_clean());
+        assert_eq!(report.coverage.indexed_tensors, Some(1));
+        assert_eq!(report.coverage.tensors, CoverageState::NotChecked);
+        let text = report.render();
+        assert!(text.contains("tensors not checked (1 indexed)"), "{text}");
+        assert!(text.contains("clean: no"), "{text}");
     }
 
     #[test]
@@ -452,6 +630,7 @@ mod tests {
                 row.status
             );
             assert!(row.status.fix().is_some());
+            assert_eq!(row.pass, KernelPhase::Both);
         }
     }
 
@@ -466,5 +645,143 @@ mod tests {
         assert!(report.rows.is_empty());
         assert!(report.error.is_some());
         assert!(report.render().contains("scan failed"));
+    }
+
+    #[test]
+    fn a_tower_with_no_built_body_is_not_built_by_the_scan() {
+        const VISION_CONFIG: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16,"vision_config":{"depth":1,"hidden_size":64,"num_attention_heads":2,"intermediate_size":128,"patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2}}"#;
+        let report = scan(ScanInputs {
+            config: VISION_CONFIG,
+            tensors: None,
+            target: Target::Sm121,
+            world: 1,
+        });
+        assert!(report.error.is_none(), "{report:?}");
+        let vision = report
+            .rows
+            .iter()
+            .find(|row| row.part == Part::Vision)
+            .expect("the tower is a part instance");
+        assert!(
+            matches!(vision.status, ScanStatus::NotBuilt { .. }),
+            "{:?}",
+            vision.status
+        );
+        let fix = vision.status.fix().expect("a fix");
+        assert!(fix.contains("build-list line"), "{fix}");
+        assert!(!report.is_resolved(), "a 16-patch tower has no body");
+    }
+
+    #[test]
+    fn a_part_the_config_does_not_size_is_unknown_not_a_guess() {
+        let geometry = PartGeometry {
+            hidden: 5120,
+            intermediate: 256,
+            streams: 4,
+            compressed_vocab: 8192,
+            ..PartGeometry::new()
+        };
+        for part in [
+            Part::Engram,
+            Part::HyperConnection,
+            Part::SparseIndexer,
+            Part::Vision,
+        ] {
+            assert!(
+                part_shape(part, &geometry).is_unknown(),
+                "{part} must not be reported at the residual width"
+            );
+        }
+        assert_eq!(
+            part_shape(Part::DenseMlp, &geometry),
+            Shape::new([256, 5120])
+        );
+        assert_eq!(part_shape(Part::RmsNorm, &geometry), Shape::new([5120]));
+    }
+
+    #[test]
+    fn not_built_names_the_shape_and_the_build_list_line() {
+        let requirement = PartRequirement {
+            part: Part::MlaAttention,
+            geometry: PartGeometry {
+                hidden: 1,
+                heads: 1,
+                head_dim: 1,
+                ..PartGeometry::new()
+            },
+            precision: Precision::Bf16,
+        };
+        let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
+        let error = resolver
+            .resolve_for(&requirement, KernelPhase::Prefill)
+            .expect_err("the catalogue has no one-wide attention");
+        let shape = part_shape(requirement.part, &requirement.geometry);
+        let status = refusal_status(&error, &shape, WeightFormat::Bf16);
+        let ScanStatus::NotBuilt { fix } = &status else {
+            panic!("expected not built, got {status}");
+        };
+        assert!(fix.contains("build-list line"), "{fix}");
+        assert!(fix.contains("mla_attention"), "{fix}");
+        assert!(fix.contains("at 1x1"), "{fix}");
+        assert!(fix.contains("stored as BF16"), "{fix}");
+        assert!(fix.contains("sm121"), "{fix}");
+    }
+
+    #[test]
+    fn every_status_has_its_name_and_its_fix() {
+        let statuses = [
+            (ScanStatus::Resolved, "resolved", false),
+            (
+                ScanStatus::NotBuilt {
+                    fix: "f".to_owned(),
+                },
+                "not built",
+                true,
+            ),
+            (
+                ScanStatus::NoKernelOnTarget {
+                    fix: "f".to_owned(),
+                },
+                "no kernel on this target",
+                true,
+            ),
+            (
+                ScanStatus::NoPartKind {
+                    fix: "f".to_owned(),
+                },
+                "no part kind",
+                true,
+            ),
+            (
+                ScanStatus::UnknownKey {
+                    key: "k".to_owned(),
+                    fix: "f".to_owned(),
+                },
+                "unknown key",
+                true,
+            ),
+            (
+                ScanStatus::UnclaimedTensor {
+                    tensor: "t".to_owned(),
+                    fix: "f".to_owned(),
+                },
+                "unclaimed tensor",
+                true,
+            ),
+            (
+                ScanStatus::UnknownLayout {
+                    detail: "d".to_owned(),
+                    fix: "f".to_owned(),
+                },
+                "unknown layout",
+                true,
+            ),
+        ];
+        assert_eq!(statuses.len(), 7);
+        for (status, name, has_fix) in statuses {
+            assert_eq!(status.name(), name);
+            assert_eq!(status.to_string(), name);
+            assert_eq!(status.fix().is_some(), has_fix);
+        }
     }
 }

@@ -139,7 +139,10 @@ pub use plan::{
 pub use resolver::{
     Availability, KernelResolver, PlanContext, ResolveCause, ResolveError, ResolvedKernel,
 };
-pub use scan_report::{ScanInputs, ScanReport, ScanRow, ScanStatus, TensorEntry, TensorIndex};
+pub use scan_report::{
+    Coverage, CoverageState, ScanInputs, ScanReport, ScanRow, ScanStatus, TensorEntry, TensorIndex,
+    scan,
+};
 pub use slot_pack::{PackSlot, SlotPack};
 pub use tensor_plan::{ArchitectureTensorPlan, Role as TensorRole};
 pub use widen::{

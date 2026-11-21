@@ -154,8 +154,12 @@ impl ResolvedKernel {
 pub enum ResolveCause {
     /// The catalogue has no entry for the part on any target.
     NoCatalogueEntry,
-    /// The catalogue has an entry on this target, but none accepted the shape, format, pass or
-    /// availability policy.
+    /// The catalogue has an entry on this target, but none accepted the shape, stored format,
+    /// precision or pass.
+    ///
+    /// Under a non-catalogue [Availability] policy an entry this build cannot load also lands
+    /// here: the three causes classify the catalogue, and the policy that refused the image owns
+    /// that remedy.
     ShapeOrFormatRefused,
     /// The catalogue has entries for the part, but only on other targets.
     OtherTargetOnly {
@@ -327,7 +331,6 @@ fn cause_for(part: Part, target: Target) -> ResolveCause {
     if !any {
         return ResolveCause::NoCatalogueEntry;
     }
-    targets.sort_unstable();
     ResolveCause::OtherTargetOnly { targets }
 }
 

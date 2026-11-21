@@ -119,6 +119,66 @@ fn no_model_crate_depends_on_another_model_crate() {
 }
 
 #[test]
+fn the_language_stack_walk_matches_the_scan_and_the_plan_order() {
+    use sparkflash_model::{Architecture, Part, Target};
+    use sparkflash_ops::{ScanInputs, scan};
+
+    let config = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":2,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16}"#;
+    let architecture = Architecture::from_json(config).expect("a synthetic config");
+    let stacks = architecture.stacks();
+    let plan = sparkflash_ops::EnginePlan::from_json(config, Target::Sm121, 1, 0).expect("a plan");
+    assert_eq!(stacks.len(), 1);
+    assert_eq!(stacks[0].blocks.len(), plan.layers().len());
+
+    let report = scan(ScanInputs {
+        config,
+        tensors: None,
+        target: Target::Sm121,
+        world: 1,
+    });
+    for (block, layer) in stacks[0].blocks.iter().zip(plan.layers()) {
+        let from_plan: Vec<Part> = layer
+            .requirements
+            .iter()
+            .map(|requirement| requirement.part)
+            .collect();
+        let from_stack: Vec<Part> = block.parts.iter().map(|instance| instance.part).collect();
+        assert_eq!(from_stack, from_plan, "block {}", block.index);
+
+        let rows: Vec<_> = report
+            .rows
+            .iter()
+            .filter(|row| row.block == Some(block.index))
+            .collect();
+        assert_eq!(rows.len(), block.parts.len(), "one row per instance");
+        for (row, instance) in rows.iter().zip(&block.parts) {
+            assert_eq!(row.part, instance.part);
+            assert_eq!(
+                row.shape, instance.shape,
+                "the scan and the description must state the same shape for {}",
+                instance.part
+            );
+        }
+    }
+}
+
+#[test]
+fn the_scan_vocabulary_names_no_model_family() {
+    for (file, source) in [
+        (
+            "stack.rs",
+            include_str!("../../sparkflash-model/src/stack.rs"),
+        ),
+        ("scan_report.rs", include_str!("../src/scan_report.rs")),
+    ] {
+        let lower = source.to_lowercase();
+        for family in ["deepseek", "qwen", "glm", "inkling", "dory"] {
+            assert!(!lower.contains(family), "{file} names {family}");
+        }
+    }
+}
+
+#[test]
 fn the_ops_crate_is_a_workspace_member() {
     let manifest = std::fs::read_to_string(workspace_root().join("Cargo.toml")).expect("manifest");
     assert!(manifest.contains("\"crates/sparkflash-ops\""));
