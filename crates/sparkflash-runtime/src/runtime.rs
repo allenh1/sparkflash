@@ -325,10 +325,22 @@ impl<W: Walk> Runtime<W> {
         prompt: &PromptState,
     ) -> Result<(), BackendError> {
         if self.rewind {
-            slot.point = Some(prompt.tokens.len());
-            if checkpoint_after(&self.layout, prompt.tokens.len()).is_some() {
-                slot.seq.checkpoint(prompt.tokens.len())?;
+            let end = prompt.tokens.len();
+            let point = self.walk.rewind_point(end).min(end);
+            if checkpoint_after(&self.layout, end).is_some() {
+                if point != end {
+                    return Err(BackendError::new(
+                        "runtime",
+                        format!(
+                            "{} puts its rewind point at {point} of a {end}-id prompt, and its \
+                             recurrent state is checkpointed only at the prompt's end",
+                            std::any::type_name::<W>()
+                        ),
+                    ));
+                }
+                slot.seq.checkpoint(end)?;
             }
+            slot.point = Some(point);
         } else {
             slot.point = None;
         }
@@ -1350,6 +1362,8 @@ mod tests {
         /// Rows the walk keeps past the ones the caller was given tokens for, as a verify keeps
         /// its drafts' rows. Zero is the plain walk.
         kept_past: usize,
+        /// How many ids short of a prompt's end this walk puts its rewind point.
+        rewind_short: usize,
         drafter: Absent<&'static str>,
     }
 
@@ -1365,8 +1379,15 @@ mod tests {
                 walks: Mutex::new(Vec::new()),
                 sampling: Mutex::new(None),
                 kept_past: 0,
+                rewind_short: 0,
                 drafter: Absent("the toy walk drafts nothing"),
             }
+        }
+
+        /// The same walk with its rewind point `short` ids before the prompt's end.
+        fn rewind_short(mut self, short: usize) -> Self {
+            self.rewind_short = short;
+            self
         }
 
         /// The same walk, keeping `kept_past` rows past what the caller was given.
@@ -1411,6 +1432,10 @@ mod tests {
 
         fn set_sampling(&self, _seq: &mut Self::Seq, sampling: Sampling) {
             *self.sampling.lock().expect("the toy sampler record") = Some(sampling);
+        }
+
+        fn rewind_point(&self, prompt: usize) -> usize {
+            prompt.saturating_sub(self.rewind_short)
         }
 
         fn walk(
@@ -2175,6 +2200,38 @@ mod tests {
             .expect("the cold prompt");
         assert_eq!(warm.seq().rows, cold.seq().rows);
         assert_eq!(warm.history(), cold.history());
+    }
+
+    /// A walk states where its rewind point sits. A positional layout takes a point before the
+    /// prompt's end and resumes there; a recurrent region is checkpointed at the end, so a
+    /// point anywhere else is refused rather than restored at the wrong row.
+    #[test]
+    fn a_walk_states_where_its_rewind_point_sits() {
+        let prompt = [7u32, 9, 11, 13, 15, 17, 19];
+        let changed = [7u32, 9, 11, 13, 15, 17, 23];
+        let runtime =
+            Runtime::new(ToyWalk::new(8, 64).rewind_short(1), 0).expect("the runtime starts");
+        let mut slot = runtime.open_slot().expect("a slot");
+        runtime.prefill(&mut slot, &prompt).expect("the prompt");
+        assert_eq!(slot.rewind_point(), Some(prompt.len() - 1));
+        runtime
+            .prefill(&mut slot, &changed)
+            .expect("the changed turn parts from the point");
+        assert_eq!(slot.history(), &changed);
+
+        let recurrent = ToyWalk {
+            layout: StateLayout::new(vec![Region::Recurrent {
+                name: "state",
+                bytes: 16,
+            }]),
+            ..ToyWalk::new(8, 64).rewind_short(1)
+        };
+        let runtime = Runtime::new(recurrent, 0).expect("the runtime starts");
+        let mut slot = runtime.open_slot().expect("a slot");
+        let refused = runtime
+            .prefill(&mut slot, &prompt)
+            .expect_err("a moved point is refused");
+        assert!(refused.message().contains("rewind point"), "{refused}");
     }
 
     #[test]

@@ -2417,7 +2417,12 @@ Three findings, each with the change it implies.
 4. **Retire `FusedEngine`.** Two users remain: dense in a TP group (its lane frames cannot carry
    a chunk's rows yet) and Inkling's group with images. Both need a group.
 5. **Dory onto `Walk`.** It is the only served model with no reuse at TP 1 and the only one whose
-   ledger is written by hand.
+   ledger is written by hand. Done for the single-process device arm: `DoryWalk` (in
+   `crates/sparkflash-model-dory/src/device/walk.rs`) serves on the tick engine, so its lanes
+   keep a conversation and reuse a prompt's prefix, its layout and rewind point are stated rather
+   than hand-kept, and `sparkflash_runtime::conformance!` runs the same eight checks (six pass,
+   `TP 1 = 2 = 4` and `drafted = plain` skip). The arm's `DoryDeviceSession` is gone. Left: the
+   four-process recurrence group keeps its own ring session, and loop-1 drafting with it.
 6. **The part plug-in** (mechanism 2). Done for the dense arm: `sparkflash_runtime::part` holds
    `PartExec`, `PartHost` and `PartRegistry`; the dense walk runs a list of parts built from
    `Architecture::steps()` through `Dense::catalogue()`, and `Mixer` and `LayerFfn` are gone. A

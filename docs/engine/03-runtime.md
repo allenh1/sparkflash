@@ -133,11 +133,22 @@ belongs in the default instead.
    goes back to the prompt instead of starting cold.
 10. Lane memory for Qwen: its lanes allocate their caches for the whole context at open; on the
     shared `LanePool`, as GLM's and Inkling's are, kept conversations share one budget.
-11. Dory on the fused engine: its recurrence group keeps its own lanes, so it has no prompt
+11. Dory on the fused engine: its recurrence group keeps its own lanes, so it had no prompt
     parts, ledger or kept conversations of the runtime's. Done as Dory on the session contract
     with its own ring scheduling: the ring keeps a batch on every rank at once, which one fused
     walk a step cannot, so the arm keeps its scheduler and takes the contract's kept
-    conversations, `resume` and ledger.
+    conversations, `resume` and ledger. The single-process device arm is on `Walk` now
+    (`sparkflash-model-dory`'s `device/walk.rs`): `DoryWalk` runs a prompt chunk as one bulk pass
+    and a step as one row a lane, states its caches as positional regions, and its rewind point
+    is one id short of the prompt's end for the template's reason above. The row buffers are
+    shared by the lanes, so a pass over several lanes is the arm's own batched body. A prompt
+    row's bits must not depend on where the runtime cut the chunks, since reuse forwards a delta
+    as its own pass, so the walk keeps two of the arm's kernel rules: a per-loop pass of eight
+    rows or fewer runs `PREFILL_Q` rows with its own tokens repeated (the shift the arm's prompt
+    loop applied to a narrow last chunk), and a pass that starts off a `PREFILL_Q` boundary
+    re-runs the rows of its first query tile from the ids the sequence holds, because a prompt
+    attention block's key window is its first row's. Loop-1 drafting stayed on the recurrence
+    group: a single process has no second exit to draft from.
 12. More typed plans executed (step 6): attention, MoE, the indexer and the residual mixers.
     Done for grouped-query attention (`GqaBody`); the rest need descriptor fields first.
 13. The dispatcher's remaining rules (step 5): Qwen's split-K tile and the FP8 projections.
