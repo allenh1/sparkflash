@@ -33,7 +33,7 @@
 //!
 //! Nothing here touches the network or a device; callers pass the document and byte counts in.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{LazyLock, Mutex};
 
@@ -43,10 +43,8 @@ use sparkflash_model::{
     Architecture, MEMORY_FLOOR_BYTES, NODE_MEMORY_BUDGET_BYTES, Target, TpPlan,
     canonical_model_type, gib,
 };
-use sparkflash_ops::engine_plan::EnginePlan;
-use sparkflash_ops::parts::{serving, serving_language};
-use sparkflash_ops::resolver::{Availability, KernelResolver};
 use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
+use sparkflash_ops::{CoverageState, ScanInputs, ScanReport, TensorIndex, scan};
 
 use crate::config::{
     DEFAULT_WEIGHTS_ID, DYNAMIC_ENGINE_ID, MODEL_PROFILES, ModelProfile, profile_for_model_type,
@@ -58,6 +56,204 @@ pub const WORLDS: [usize; 3] = [1, 2, 4];
 /// The shortest window a configuration must hold to count as serving: 4,096 tokens, or the
 /// checkpoint's whole window when that is shorter.
 pub const MIN_CONTEXT_TOKENS: usize = 4096;
+
+/// The targets the console reports the scan for: every target the shared catalogue is keyed by.
+pub const SCAN_TARGETS: &[Target] = Target::ALL;
+
+/// One row of a scan, in the form the console's model page renders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanRowView {
+    /// The stack the instance belongs to.
+    pub stack: String,
+    /// The block index, or `None` for a global part.
+    pub block: Option<usize>,
+    /// The operation (part kind) the row is for.
+    pub operation: String,
+    /// The rank-local shape the plan resolved at.
+    pub shape: String,
+    /// The stored format, or `?` when the checkpoint does not state it.
+    pub format: String,
+    /// The pass this row reports.
+    pub pass: String,
+    /// The target this row resolves against.
+    pub target: String,
+    /// The status name.
+    pub status: String,
+    /// The config key or tensor the status refuses, when it names one.
+    pub subject: Option<String>,
+    /// What would fix the row, when it did not resolve.
+    pub fix: Option<String>,
+}
+
+/// One unresolved row, as a work item an implementer can take as written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanWorkItem {
+    /// The stack the instance belongs to.
+    pub stack: String,
+    /// The block index, or `None` for a global part.
+    pub block: Option<usize>,
+    /// The operation (part kind) to build or port.
+    pub operation: String,
+    /// The rank-local shape the plan asked for.
+    pub shape: String,
+    /// The stored format, or `?` when the checkpoint does not state it.
+    pub format: String,
+    /// The pass that refused the row.
+    pub pass: String,
+    /// The target the row was resolved against.
+    pub target: String,
+    /// The refusal's status name.
+    pub status: String,
+    /// The config key or tensor the status names, when it names one.
+    pub subject: Option<String>,
+    /// What would fix the gap.
+    pub fix: String,
+}
+
+/// One scan report for one target and tensor-parallel width.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanView {
+    /// The target's stable name.
+    pub target: String,
+    /// The tensor-parallel width.
+    pub world: usize,
+    /// Whether every row resolved and neither coverage check reports a gap.
+    pub clean: bool,
+    /// Whether the console may offer conversion for this report.
+    pub offers_convert: bool,
+    /// Whether the console may offer serving for this report.
+    pub offers_serve: bool,
+    /// A failure that stopped the scan before it produced rows.
+    pub error: Option<String>,
+    /// Every row, in the scan's order.
+    pub rows: Vec<ScanRowView>,
+    /// Every unresolved row, in the scan's order.
+    pub work_items: Vec<ScanWorkItem>,
+    /// The report exactly as the plain-text renderer prints it, so the page and `onboard` show
+    /// one rendering and not two.
+    pub plain: String,
+}
+
+impl ScanView {
+    fn of(report: &ScanReport) -> Self {
+        let rows = report
+            .rows
+            .iter()
+            .map(|row| ScanRowView {
+                stack: row.stack.name().to_owned(),
+                block: row.block,
+                operation: row.part.name().to_owned(),
+                shape: row.shape.to_string(),
+                format: row
+                    .format
+                    .map_or_else(|| "?".to_owned(), |format| format.name().to_owned()),
+                pass: row.pass.name().to_owned(),
+                target: row.target.name().to_owned(),
+                status: row.status.name().to_owned(),
+                subject: row.status.subject().map(str::to_owned),
+                fix: row.status.fix().map(str::to_owned),
+            })
+            .collect();
+        let work_items = report
+            .unresolved()
+            .map(|row| ScanWorkItem {
+                stack: row.stack.name().to_owned(),
+                block: row.block,
+                operation: row.part.name().to_owned(),
+                shape: row.shape.to_string(),
+                format: row
+                    .format
+                    .map_or_else(|| "?".to_owned(), |format| format.name().to_owned()),
+                pass: row.pass.name().to_owned(),
+                target: row.target.name().to_owned(),
+                status: row.status.name().to_owned(),
+                subject: row.status.subject().map(str::to_owned),
+                fix: row
+                    .status
+                    .fix()
+                    .unwrap_or("(the scan gave no fix)")
+                    .to_owned(),
+            })
+            .collect();
+        let clean = !report_has_gaps(report);
+        Self {
+            target: report.target.name().to_owned(),
+            world: report.world,
+            clean,
+            offers_convert: clean,
+            offers_serve: clean,
+            error: report.error.clone(),
+            rows,
+            work_items,
+            plain: report.render(),
+        }
+    }
+}
+
+/// Whether a report contains a gap the console must refuse for.
+///
+/// A coverage check that has not run is not a gap: step 0 leaves both checks
+/// [CoverageState::NotChecked] until their passes land, and a clean kernel scan must still be
+/// offerable while that is true. A check that ran and found something ([CoverageState::Dirty])
+/// is a gap.
+fn report_has_gaps(report: &ScanReport) -> bool {
+    report.error.is_some()
+        || report.rows.iter().any(|row| !row.status.is_resolved())
+        || matches!(report.coverage.tensors, CoverageState::Dirty)
+        || matches!(report.coverage.config_keys, CoverageState::Dirty)
+}
+
+/// The scan of `config` at every target and tensor-parallel width, in target then width order.
+#[must_use]
+pub fn scan_reports(
+    config: &str,
+    tensors: Option<&TensorIndex>,
+    targets: &[Target],
+    worlds: &[usize],
+) -> Vec<ScanReport> {
+    let mut reports = Vec::with_capacity(targets.len() * worlds.len());
+    for &target in targets {
+        for &world in worlds {
+            reports.push(scan(ScanInputs {
+                config,
+                tensors,
+                target,
+                world,
+            }));
+        }
+    }
+    reports
+}
+
+/// The reports in the form the console's model page renders.
+#[must_use]
+pub fn scan_views(
+    config: &str,
+    tensors: Option<&TensorIndex>,
+    targets: &[Target],
+    worlds: &[usize],
+) -> Vec<ScanView> {
+    scan_reports(config, tensors, targets, worlds)
+        .iter()
+        .map(ScanView::of)
+        .collect()
+}
+
+/// The one plain-text rendering of the scans: the console's plain view and `sparkflash onboard`
+/// both print this string, so the two can never drift.
+#[must_use]
+pub fn scan_plain(
+    config: &str,
+    tensors: Option<&TensorIndex>,
+    targets: &[Target],
+    worlds: &[usize],
+) -> String {
+    scan_reports(config, tensors, targets, worlds)
+        .iter()
+        .map(ScanReport::render)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// The Sparks a model would run on, and how much of each one it may claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -210,6 +406,9 @@ pub struct Fit {
     pub missing: Vec<String>,
     /// One entry a width in [WORLDS].
     pub configurations: Vec<Configuration>,
+    /// The one scan report at every target and width, in target then width order. Empty when no
+    /// `config.json` was read: a report is never invented for a document the caller lacks.
+    pub scans: Vec<ScanView>,
 }
 
 impl Fit {
@@ -250,26 +449,24 @@ pub fn architecture(text: &str) -> Result<Architecture, String> {
     Ok(architecture)
 }
 
-/// Why the device path cannot serve `architecture` at `world`, or `Ok` when it can.
+/// Why the device path cannot serve `config` at `world`, or `Ok` when it can.
 ///
-/// This is the engine half of a [Configuration]: the family's arm runs at the width, the
-/// document plans there, and every served part resolves a sm121 kernel. A family with no arm
-/// is still planned and resolved, so the reasons say how far the kernels already reach.
+/// This is the engine half of a [Configuration]. The family's arm must run at the width, and
+/// the one [ScanReport] must have no unresolved row at [Target::Sm121]. A family with no arm
+/// is still scanned, so the reasons say how far the kernels already reach.
 ///
 /// # Errors
 /// Each missing piece, named for the operator.
-pub fn engine_gaps(architecture: &Architecture, world: usize) -> Result<(), Vec<String>> {
-    let mut gaps = Vec::new();
+fn scan_gaps(config: &str, architecture: &Architecture, world: usize) -> Result<(), Vec<String>> {
     let profile = profile_for_model_type(&architecture.family);
     if let Some(profile) = profile
         && !profile.worlds.contains(&world)
     {
-        gaps.push(format!(
+        return Err(vec![format!(
             "the {} engine at TP={world} (it runs at {})",
             profile.label,
             widths(profile.worlds)
-        ));
-        return Err(gaps);
+        )]);
     }
     // A checkpoint no device arm reads may still be executable by the shared CPU host
     // reference. It is judged by that backend's own gate, not by the kernel catalogue: the
@@ -278,32 +475,35 @@ pub fn engine_gaps(architecture: &Architecture, world: usize) -> Result<(), Vec<
         return sparkflash_ops::parts::host_reference_refusal(architecture)
             .map_or(Ok(()), |reason| Err(vec![reason]));
     }
-    match EnginePlan::for_architecture(architecture.clone(), Target::Sm121, world, 0) {
-        Ok(plan) => {
-            let served = if plan.family() == "deepseek_v41" {
-                serving(Target::Sm121)
-            } else {
-                serving_language(Target::Sm121)
-            };
-            if let Err(failures) = KernelResolver::new(Target::Sm121, Availability::Catalogue)
-                .boot_check_serving(&plan, &served)
-            {
-                let mut kernels: Vec<String> = failures
-                    .iter()
-                    .map(|failure| {
-                        format!(
-                            "a sm121 {} kernel at {}",
-                            failure.part,
-                            failure.precision.name()
-                        )
-                    })
-                    .collect();
-                kernels.sort();
-                kernels.dedup();
-                gaps.extend(kernels);
-            }
+    let report = scan(ScanInputs {
+        config,
+        tensors: None,
+        target: Target::Sm121,
+        world,
+    });
+    if let Some(error) = &report.error {
+        return Err(vec![format!("an execution plan at TP={world}: {error}")]);
+    }
+    let mut gaps = Vec::new();
+    let mut seen = BTreeSet::new();
+    for row in report.unresolved() {
+        let reason = format!(
+            "{} at {} on {} ({}): {}",
+            row.part.name(),
+            row.shape,
+            row.target.name(),
+            row.status.name(),
+            row.status.fix().unwrap_or("the scan gave no fix")
+        );
+        if seen.insert(reason.clone()) {
+            gaps.push(reason);
         }
-        Err(error) => gaps.push(format!("an execution plan at TP={world}: {error}")),
+    }
+    if report.coverage.tensors == CoverageState::Dirty {
+        gaps.push("the tensor coverage check (an indexed tensor no part claimed)".to_owned());
+    }
+    if report.coverage.config_keys == CoverageState::Dirty {
+        gaps.push("the config-key coverage check (a key nothing consumed)".to_owned());
     }
     if gaps.is_empty() { Ok(()) } else { Err(gaps) }
 }
@@ -358,7 +558,7 @@ pub fn launch_check(text: &str) -> LaunchCheck {
             match profile_for_model_type(&architecture.family) {
                 None => gaps.push(no_engine(&architecture.family)),
                 Some(profile) => {
-                    if let Err(more) = engine_gaps(&architecture, profile.world_size) {
+                    if let Err(more) = scan_gaps(text, &architecture, profile.world_size) {
                         gaps.extend(more);
                     }
                 }
@@ -436,6 +636,7 @@ pub fn judge(evidence: &Evidence<'_>, cluster: &Cluster) -> Fit {
             configuration(
                 world,
                 architecture.map(|architecture| (architecture, document_key)),
+                evidence.config,
                 profile,
                 blocked,
                 evidence.weights,
@@ -458,6 +659,9 @@ pub fn judge(evidence: &Evidence<'_>, cluster: &Cluster) -> Fit {
         cluster: *cluster,
         missing,
         configurations,
+        scans: evidence.config.map_or_else(Vec::new, |config| {
+            scan_views(config, None, SCAN_TARGETS, &WORLDS)
+        }),
     };
     fit.summary = summary(&fit);
     fit
@@ -466,6 +670,7 @@ pub fn judge(evidence: &Evidence<'_>, cluster: &Cluster) -> Fit {
 fn configuration(
     world: usize,
     architecture: Option<(&Architecture, Option<u64>)>,
+    config: Option<&str>,
     profile: Option<&ModelProfile>,
     blocked: bool,
     weights: Option<WeightBytes>,
@@ -474,7 +679,7 @@ fn configuration(
 ) -> Configuration {
     let mut reasons = Vec::new();
     let mut notes = Vec::new();
-    let derived = architecture.map(|(architecture, key)| derive(architecture, key, world));
+    let derived = architecture.map(|(architecture, key)| derive(config, architecture, key, world));
     let architecture = architecture.map(|(architecture, _)| architecture);
     let engine_ready = match &derived {
         Some(derived) => match &derived.gaps {
@@ -642,9 +847,16 @@ const MEMO_ENTRIES: usize = 512;
 static MEMO: LazyLock<Mutex<HashMap<(u64, usize), Derived>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn derive(architecture: &Architecture, key: Option<u64>, world: usize) -> Derived {
+fn derive(
+    config: Option<&str>,
+    architecture: &Architecture,
+    key: Option<u64>,
+    world: usize,
+) -> Derived {
     let compute = || Derived {
-        gaps: engine_gaps(architecture, world),
+        // The architecture came from this same document; a report over no document is not a
+        // claim that the checkpoint is clean.
+        gaps: config.map_or(Ok(()), |config| scan_gaps(config, architecture, world)),
         planned: planned_rank_bytes(architecture, world),
     };
     let Some(key) = key else {
@@ -1123,5 +1335,85 @@ mod tests {
         assert_eq!(thousands(0), "0");
         assert_eq!(thousands(4096), "4,096");
         assert_eq!(thousands(1_048_576), "1,048,576");
+    }
+
+    const SCAN_CLEAN: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16}"#;
+
+    #[test]
+    fn a_clean_scan_offers_convert_and_serve() {
+        let views = scan_views(SCAN_CLEAN, None, &[Target::Sm121], &[1]);
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert!(view.clean, "{}", view.plain);
+        assert!(view.offers_convert);
+        assert!(view.offers_serve);
+        assert!(view.work_items.is_empty(), "{:?}", view.work_items);
+        assert!(!view.rows.is_empty());
+        assert!(
+            view.plain.starts_with("scan report: sm121 TP1,"),
+            "{}",
+            view.plain
+        );
+    }
+
+    #[test]
+    fn a_scan_with_a_gap_offers_neither_convert_nor_serve() {
+        // A 2560-wide MLA: the plan exists, but the catalogue's MLA bodies are built for other
+        // widths, so the row is a named gap and not a clean report.
+        let config = json!({
+            "model_type": "acme_custom_flash",
+            "hidden_size": 2560,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "vocab_size": 256,
+            "max_position_embeddings": 128,
+            "rms_norm_eps": 1e-5,
+            "eos_token_id": [0],
+            "layer_types": ["full_attention"],
+            "kv_lora_rank": 16
+        })
+        .to_string();
+        let views = scan_views(&config, None, &[Target::Sm121], &[1, 2, 4]);
+        assert_eq!(views.len(), 3);
+        for view in &views {
+            assert!(!view.clean, "{}", view.plain);
+            assert!(!view.offers_convert, "TP{} offered convert", view.world);
+            assert!(!view.offers_serve, "TP{} offered serve", view.world);
+            assert!(!view.work_items.is_empty(), "{}", view.plain);
+        }
+        assert!(
+            views
+                .iter()
+                .flat_map(|view| &view.work_items)
+                .any(|item| item.operation == "mla_attention"
+                    && item.target == "sm121"
+                    && item.fix.contains("build-list")),
+            "{:#?}",
+            views
+                .iter()
+                .map(|view| &view.work_items)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_plain_view_is_one_report_per_target_and_width() {
+        let plain = scan_plain(SCAN_CLEAN, None, SCAN_TARGETS, &WORLDS);
+        for target in SCAN_TARGETS {
+            for world in WORLDS {
+                assert!(
+                    plain.contains(&format!("scan report: {} TP{world},", target.name())),
+                    "no {} TP{world} report",
+                    target.name()
+                );
+            }
+        }
+        assert_eq!(
+            plain.matches("scan report:").count(),
+            SCAN_TARGETS.len() * WORLDS.len()
+        );
     }
 }
