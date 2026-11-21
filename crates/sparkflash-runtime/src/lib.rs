@@ -43,6 +43,7 @@ pub mod ledger;
 pub mod part;
 pub mod plan;
 pub mod pool;
+pub mod record;
 pub mod resume;
 pub mod rounds;
 pub mod runtime;

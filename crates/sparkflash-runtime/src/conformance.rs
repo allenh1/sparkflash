@@ -859,6 +859,50 @@ fn drafted_equals_plain<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
     Ok(CheckOutcome::Passed)
 }
 
+/// `tokens` greedy tokens on rank 0 of a group's fixture, through the tick engine: the bit
+/// record's group run.
+pub(crate) fn group_tokens<W: Walk>(
+    walk: W,
+    group: Option<TickGroup>,
+    prompt: &[u32],
+    tokens: usize,
+) -> Result<Vec<Option<u32>>, BackendError> {
+    group_run(walk, group, prompt, tokens)
+}
+
+/// The four conformance prompts stepped together on a fresh fixture, as the arm serves them:
+/// the bit record's four-at-once run.
+pub(crate) fn four_tokens<A: ArmFixture>(
+    tokens: usize,
+) -> Result<Vec<Vec<Option<u32>>>, BackendError> {
+    let prompts = [
+        CONFORMANCE_PROMPT,
+        CONFORMANCE_OTHER,
+        CONFORMANCE_THIRD,
+        CONFORMANCE_FOURTH,
+    ];
+    let walk = A::fixture(1)?.walk;
+    if A::tick_engine() {
+        engine_four(walk, &prompts, tokens)
+    } else {
+        runtime_four(&Runtime::new(walk, 0)?, &prompts, tokens)
+    }
+}
+
+/// `prompt` and `tokens` greedy tokens on a fresh fixture through the runtime's step, drafted
+/// when the arm drafts: the bit record's drafted run.
+pub(crate) fn drafted_tokens<A: ArmFixture>(
+    prompt: &[u32],
+    tokens: usize,
+) -> Result<Vec<Option<u32>>, BackendError> {
+    let walk = A::fixture(1)?.walk;
+    if A::tick_engine() {
+        engine_run(walk, prompt, tokens)
+    } else {
+        runtime_run(&Runtime::new(walk, 0)?, prompt, tokens)
+    }
+}
+
 /// A failure that names the two token runs.
 fn disagreement(
     what: &str,
@@ -1356,6 +1400,15 @@ macro_rules! conformance {
             #[ignore = "boots the arm's fixture; run scripts/onboard-gate.sh <arm>"]
             fn tp_one_two_four() {
                 $crate::run_generated::<$arm>($crate::ConformanceCheck::TpWithinExactness);
+            }
+
+            #[test]
+            #[ignore = "boots the arm's fixture; set SPARKFLASH_BITS_RECORD=<dir>"]
+            fn bits_equal_the_record() {
+                match $crate::record::check_record::<$arm>() {
+                    Ok(report) => println!("record: {}: {report}", ARM),
+                    Err(error) => panic!("record: {}: {}", ARM, error.message()),
+                }
             }
 
             #[test]
