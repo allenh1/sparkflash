@@ -205,7 +205,8 @@ pub const NEUTRAL_FIELDS: &[&str] = &[
 ];
 
 /// The arithmetic switches an arm still reads directly, outside the profile table, until their
-/// typed field lands (docs/adding-a-model.md); each moves to [ARITHMETIC_FIELDS] when it does.
+/// typed field lands (docs/arm-reference.md section 3); each moves to [ARITHMETIC_FIELDS] when
+/// it does.
 /// The last column spells the arm's default: a switch set to one of those values selects exactly
 /// what leaving it unset selects (production's `SPARK_COMM_REDUCE=nccl` on a TP world), so it
 /// keeps the claim. Any other value withdraws it, including a spelling the arm happens to read as

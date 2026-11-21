@@ -22,13 +22,17 @@ limitations under the License.
 
 # Adding a model arm
 
-Read `docs/adding-a-model.md` first. This skill is the short, enforceable form.
+Read `docs/adding-a-model.md` first and run `sparkflash onboard ORG/REPO --emit DIR`; the
+internals are in `docs/arm-reference.md`. This skill is the short, enforceable form.
 
 ## Before writing code
 
-1. Find the model's existing host reference and descriptor. Do not start from the device arm.
-2. Check `crates/sparkflash-ops/src` for a plan that already covers each operation.
-3. Load the arm's TOML profile and its fields. If a behaviour has no typed field, add one first.
+1. Run `sparkflash onboard ORG/REPO`. It names the parts the catalogue has, the parts that need a
+   `PartExec`, the stored formats, the switches the parser does not model and the fit.
+2. Teach `sparkflash_model::Architecture` every unmodelled switch the family needs before writing
+   a part for it.
+3. Run `sparkflash onboard ORG/REPO --emit DIR`. A catalogue-only family needs no crate; any
+   other gets its skeleton and the list of edits outside it.
 
 ## Hard rules
 
@@ -43,13 +47,13 @@ Read `docs/adding-a-model.md` first. This skill is the short, enforceable form.
 
 ## Implementation order
 
-1. Parse the released config into the model's typed config.
-2. Plan the tensors and validate the byte identity against the checkpoint index.
-3. Write the host reference forward.
-4. Compose `LayerPlan` from typed ops, in forward order.
-5. Implement the arm's `GemvDevice`; implement `DraftDevice` only if it drafts.
-6. Run `sparkflash_ops::parity` layer by layer against the host reference before serving.
-7. Register the descriptor and the profile; print `boot_summary()`.
+1. Fill each emitted `PartExec` stub: `state`, `split`, `rows`, `token`. Reuse the catalogue
+   constructors through `OpenCx` where a part wraps one.
+2. Write the tiny fixture checkpoint and the stated profile in `tests/conformance.rs`, so the
+   generated checks run (`crates/sparkflash-model-dense/tests/onboard_example.rs` is the model).
+3. Make the edits outside the crate that `--emit` printed; the tests named in
+   `docs/adding-a-model.md` section 4 fail until each is made.
+4. Run `scripts/onboard-gate.sh <arm>` for the served gate and the first numerics reference.
 
 ## Verification
 
@@ -58,7 +62,7 @@ Run these before declaring the arm done:
 ```sh
 cargo test -p sparkflash-ops
 cargo test -p sparkflash-model
-cargo check -p <model-crate> --all-targets
+cargo test -p <model-crate>
 ```
 
 A missing cubin must skip the device test loudly, never fall back to a different arithmetic.

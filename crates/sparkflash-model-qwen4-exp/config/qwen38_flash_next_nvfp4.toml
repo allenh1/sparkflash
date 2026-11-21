@@ -2,7 +2,7 @@
 #
 # The typed source of truth for this arm. A field left unset takes the arm's default; the
 # environment variables listed in sparkflash_model::profile::ENV_OVERRIDES remain overrides and
-# are documented in docs/adding-a-model.md.
+# are documented in docs/arm-reference.md.
 
 model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 family = "qwen4-exp"

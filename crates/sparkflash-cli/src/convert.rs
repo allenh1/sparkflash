@@ -34,7 +34,7 @@
 //! ([Converter]): a released family keeps its pack converter, DeepSeek keeps the B12x converter,
 //! and any other resolved architecture goes to the generic dynamic writer
 //! (raw tensors in `Architecture` walk order through the same rank-file container). That writer
-//! is the phase-4 placeholder documented in `docs/adding-a-model.md` section 7.
+//! is the phase-4 placeholder documented in `docs/arm-reference.md` section 6.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -283,7 +283,7 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
                 // Phase 4's ArchitectureTensorPlan is merged, but its builder names the released
                 // Qwen/GLM families; a novel family still needs this raw-tensor form: every
                 // tensor the dynamic host path reads, in walk order, in the rank file container.
-                // The limitation is stated in docs/adding-a-model.md section 7.
+                // The limitation is stated in docs/arm-reference.md section 6.
                 let unsupported = crate::dynamic::unsupported_parts(&architecture);
                 if !unsupported.is_empty() {
                     let names: Vec<String> = unsupported.iter().map(ToString::to_string).collect();

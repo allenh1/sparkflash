@@ -22,7 +22,8 @@
 //!
 //! The table [ENV_OVERRIDES] is the complete environment surface this module owns. Arms with
 //! switches not listed here keep them as deprecated aliases until their typed field lands; the
-//! gate in docs/adding-a-model.md says a new switch must be added here, not read directly.
+//! gate in docs/arm-reference.md section 3 says a new switch must be added here, not read
+//! directly.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

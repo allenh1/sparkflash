@@ -29,7 +29,7 @@
 //! operator who opts out with [DENSE_DEVICE_ENV]`=0`, are served by
 //! [super::dynamic_host::DynamicHostBackend], the CPU reference path that runs [Architecture]'s
 //! parts. The boot line names which one answers and, on the host, why the device arm did not;
-//! docs/adding-a-model.md section 7 states the limits. The dense arm serves on the shared
+//! docs/arm-reference.md section 6 states the limits. The dense arm serves on the shared
 //! [sparkflash_runtime::TickEngine] with [dense_lanes] lanes; the host reference answers one
 //! request at a time and refuses `--concurrency` and `--fuse-batch`.
 

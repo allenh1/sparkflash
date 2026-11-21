@@ -185,7 +185,7 @@ DeepSeek's 3-layer, block-5 drafter, not a 5-layer RNN-headed model. There is no
 * A new `crates/sparkflash-model-inkling2` crate with its typed config, profile TOML,
   descriptor, host reference and device arm. The profile names
   `model = "thinkingmachines/Inkling-2-Small"` and its weights id; every switch is a typed
-  profile field with an `ENV_OVERRIDES` alias, per `docs/adding-a-model.md`.
+  profile field with an `ENV_OVERRIDES` alias, per `docs/arm-reference.md`.
 
 ### 2. Parts and plans
 
@@ -606,7 +606,7 @@ arm landed afterwards; section 14 is that work and the tokens it served.
 4. **Vision.** Add the patch-20 ViT, axial RoPE, merger and image preprocessing; then
    declare `Capabilities::ALL` rather than text-only.
 
-Run the gates in `docs/adding-a-model.md`: `cargo test -p sparkflash-ops`,
+Run the gates in `.agents/skills/adding-a-model/SKILL.md`: `cargo test -p sparkflash-ops`,
 `cargo test -p sparkflash-model`, `cargo check -p sparkflash-model-inkling2 --all-targets`,
 the layer-by-layer `sparkflash_ops::parity` harness against the host reference, and the
 released-config `engine_plan` test at TP=1 and TP=4. Capture the new profile's arithmetic in

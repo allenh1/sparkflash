@@ -152,7 +152,7 @@ EVIDENCE = ("logprobs", "text")
 # cannot bump, because there is no comparison that would justify the change.
 ANCHOR_EXEMPT_EVIDENCE = ("text",)
 TOKEN_ID_PREFIX = "token_id:"
-# The arm profiles (docs/adding-a-model.md §3): the defaults each arm serves. Each names the
+# The arm profiles (docs/arm-reference.md §3): the defaults each arm serves. Each names the
 # registry model it configures (`model`), which a sparkflash-model test holds to the descriptor its
 # weights select; a profile that names none fails the declaration check.
 PROFILE_GLOB = "crates/sparkflash-model-*/config/*.toml"
@@ -1619,7 +1619,7 @@ def declaration_findings(
         if after and not isinstance(after.get("model"), str):
             findings.append(
                 f"{path}: names no model, so no registered reference can be held to it; add "
-                '`model = "<registry id>"` beside its family and weights (docs/adding-a-model.md §3)'
+                '`model = "<registry id>"` beside its family and weights (docs/arm-reference.md §3)'
             )
             continue
         models = sorted({side["model"] for side in (before, after) if isinstance(side.get("model"), str)})

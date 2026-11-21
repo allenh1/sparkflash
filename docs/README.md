@@ -8,7 +8,8 @@
 | [thermal-fan-control.md](thermal-fan-control.md) | The GB10 fan path that actually works (EC mailbox over FF-A eSPI), the max-RPM setup on all four nodes, measured temperatures and the firmware caveat |
 | [serving.md](serving.md) | Converting weights, launching the four ranks, the HTTP API, behaviour and tuning knobs |
 | [web.md](web.md) | The `sparkflash --web` lead-node control plane: TOML, mDNS/SSH discovery, launch/convert actions and live graphs |
-| [adding-a-model.md](adding-a-model.md) | The one-stack bring-up path: typed ops, per-model profiles, the environment override table, and the parity harness |
+| [adding-a-model.md](adding-a-model.md) | Onboarding a family: the `onboard` command, what a family supplies, the worked example, and the test or gate that holds each rule |
+| [arm-reference.md](arm-reference.md) | The arm internals behind it: the one stack, typed ops and the execution plan, the serving contract, profiles and switches, parity, shared homes, the dynamic Hugging Face path |
 | [agent-setup.md](agent-setup.md) | Step-by-step instructions for an AI agent to build, configure, stage and launch a four-node cluster (or one local Qwen server) |
 | [rdma-exchange.md](rdma-exchange.md) | The direct-RDMA exchange: the hardware gate, the four-rank measurements, the two wait bugs, the A/B that returned 2% and not 20%, and why |
 | [DECISIONS.md](DECISIONS.md) | The decision register: one row per hard-to-reverse choice, cited from source comments as `Dnn` |
