@@ -335,7 +335,7 @@ pub(crate) fn with_recording<R>(root: &Value, parse: impl FnOnce() -> R) -> (R, 
 }
 
 /// Read name from value, recording the full key path when a parse is being recorded.
-pub(crate) fn field<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+pub(crate) fn read_key<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     let child = value.get(name);
     ACTIVE.with(|slot| {
         if let Some(recorder) = slot.borrow_mut().as_mut() {
@@ -373,10 +373,10 @@ mod tests {
             "vision_config": {"patch_size": 14}
         });
         let ((), coverage) = with_recording(&root, || {
-            let text = field(&root, "text_config").expect("text_config");
-            let vision = field(&root, "vision_config").expect("vision_config");
-            field(text, "hidden_size").expect("hidden_size");
-            field(vision, "patch_size").expect("patch_size");
+            let text = read_key(&root, "text_config").expect("text_config");
+            let vision = read_key(&root, "vision_config").expect("vision_config");
+            read_key(text, "hidden_size").expect("hidden_size");
+            read_key(vision, "patch_size").expect("patch_size");
         });
         assert!(
             coverage
@@ -417,8 +417,8 @@ mod tests {
             "vision_config": {"dtype": "bf16"}
         });
         let ((), coverage) = with_recording(&root, || {
-            let text = field(&root, "text_config").expect("text_config");
-            field(text, "dtype").expect("dtype");
+            let text = read_key(&root, "text_config").expect("text_config");
+            read_key(text, "dtype").expect("dtype");
         });
         assert!(coverage.unknown_keys().is_empty());
         assert_eq!(coverage.ignored_keys().len(), 1);
@@ -442,7 +442,7 @@ mod tests {
         let first: Value = serde_json::json!({"a": 1});
         let second: Value = serde_json::json!({"a": 1});
         with_recording(&first, || {
-            field(&first, "a");
+            read_key(&first, "a");
         });
         let ((), coverage) = with_recording(&second, || {});
         assert!(coverage.read_keys().next().is_none());
