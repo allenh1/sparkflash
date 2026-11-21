@@ -859,4 +859,18 @@ pub trait Walk: 'static {
     fn rewind_slack(&self) -> usize {
         usize::MAX
     }
+
+    /// Where the rewind point of a prompt of `prompt` ids sits: its end, unless the arm says
+    /// otherwise.
+    ///
+    /// A changed turn resumes at the point when it keeps every id before it. An arm whose chat
+    /// template writes a past turn back with other ids at the old prompt's end states the
+    /// earlier position those turns still share (Dory's prompt ends on ids the next turn
+    /// replaces, so its point is one id short). Only an arm whose state is all positional may
+    /// move the point: a recurrent region's checkpoint is taken at the prompt's end, and the
+    /// runtime refuses a point anywhere else for such a layout.
+    #[must_use]
+    fn rewind_point(&self, prompt: usize) -> usize {
+        prompt
+    }
 }
