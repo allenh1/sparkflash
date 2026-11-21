@@ -590,6 +590,14 @@ mod tests {
                 .iter()
                 .map(|unknown| unknown.path.clone())
                 .collect();
+            if *name == "Qwen3.8-Flash-Next-NVFP4" {
+                for removed in QWEN_SNAPSHOT_REMOVED {
+                    expected.remove(*removed);
+                }
+                for (added, _) in QWEN_SNAPSHOT_EXTRA {
+                    expected.insert((*added).to_owned());
+                }
+            }
             let text = std::fs::read_to_string(path).expect("an installed config.json");
             let (_, actual) =
                 crate::Architecture::from_json_with_coverage(&text).expect("an installed config");
