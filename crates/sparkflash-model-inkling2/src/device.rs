@@ -41,8 +41,8 @@ use std::sync::{Arc, Mutex};
 
 use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{
-    Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, Kernel, Module,
-    SideStream, StreamEvent,
+    Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, Kernel, SideStream,
+    StreamEvent,
 };
 use sparkflash_kernels::images::Image;
 use sparkflash_kernels::images::{
@@ -91,6 +91,7 @@ use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 use packed::pack_dense;
 use sparkflash_ops::packed::{Form as DenseForm, Layout, Packed, PackedSet, Tiled};
 use sparkflash_ops::plan::Precision;
+use sparkflash_ops::roles::Bound;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 pub use tower::InklingVisionTower;
 
@@ -786,84 +787,8 @@ fn from_bytes(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// One loaded symbol and the catalogue entry it was resolved from: the image's symbol list and
-/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
-/// than a name it looked up.
-#[derive(Debug, Clone, Copy)]
-struct Bound {
-    /// The loaded driver function.
-    kernel: Kernel,
-    /// The arithmetic the catalogue entry accepts this body at.
-    precision: Precision,
-}
-
-impl Bound {
-    /// Whether the image exports the symbol and the catalogue carries it at this precision.
-    fn carried(image: Image, symbol: &'static str, precision: Precision) -> Result<(), String> {
-        if !image.exported_symbols().contains(&symbol) {
-            return Err(format!("{} does not export {symbol}", image.name()));
-        }
-        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
-            entry.image == image
-                && entry
-                    .symbols
-                    .iter()
-                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
-        });
-        if !carried {
-            return Err(format!(
-                "the catalogue carries no {symbol} in {} accepting {}",
-                image.name(),
-                precision.name()
-            ));
-        }
-        Ok(())
-    }
-
-    /// Resolve a symbol in an image at a precision and load it, with the module that must stay
-    /// loaded for its handle to launch.
-    ///
-    /// # Errors
-    /// A symbol the image does not export, one the catalogue does not carry at this precision,
-    /// or the driver's load refusal.
-    fn new(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-    ) -> Result<(Module, Self), String> {
-        Self::carried(image, symbol, precision)?;
-        let (module, kernel) = cuda.load_named(cubin, symbol)?;
-        Ok((module, Self { kernel, precision }))
-    }
-
-    /// Self::new for a body loaded with a dynamic shared-memory reservation.
-    ///
-    /// # Errors
-    /// As Self::new, or the driver's attribute call.
-    fn shared(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-        shared_bytes: u32,
-    ) -> Result<(Module, Self), String> {
-        Self::carried(image, symbol, precision)?;
-        let (module, kernel) = cuda.load_named_shared(cubin, symbol, shared_bytes)?;
-        Ok((module, Self { kernel, precision }))
-    }
-}
-
-/// The former name of [Bound] in the submodules that launch a loaded symbol.
-type Entry = Bound;
-
 /// Every kernel the walk launches, loaded by the name the plan records.
 struct Kernels {
-    /// The modules the symbols came from. A dropped module unloads its symbols, so the backend
-    /// keeps them for as long as it launches.
-    _modules: Vec<Module>,
     embed: Bound,
     rmsnorm: Bound,
     gemv: Bound,
@@ -1023,16 +948,13 @@ impl Kernels {
                     .to_owned(),
             );
         }
-        let mut modules = Vec::new();
-        let mut shared = |image: Image,
-                          cubin: &'static [u8],
-                          name: &'static str,
-                          precision: Precision,
-                          bytes: u32|
+        let shared = |image: Image,
+                      cubin: &'static [u8],
+                      name: &'static str,
+                      precision: Precision,
+                      bytes: u32|
          -> Result<Bound, String> {
-            let (module, bound) = Bound::shared(cuda, image, cubin, name, precision, bytes)?;
-            modules.push(module);
-            Ok(bound)
+            Bound::shared(cuda, image, cubin, name, precision, bytes)
         };
         let wide = shared(
             Image::GlmPrefill,
@@ -1058,14 +980,12 @@ impl Kernels {
             )?),
             None => None,
         };
-        let mut load = |image: Image,
-                        cubin: &'static [u8],
-                        name: &'static str,
-                        precision: Precision|
+        let load = |image: Image,
+                    cubin: &'static [u8],
+                    name: &'static str,
+                    precision: Precision|
          -> Result<Bound, String> {
-            let (module, bound) = Bound::new(cuda, image, cubin, name, precision)?;
-            modules.push(module);
-            Ok(bound)
+            Bound::new(cuda, image, cubin, name, precision)
         };
         Ok(Self {
             wide,
@@ -1342,7 +1262,6 @@ impl Kernels {
                 "inkling_conv_history_restore",
                 Precision::F32,
             )?,
-            _modules: modules,
         })
     }
 }
@@ -1589,15 +1508,21 @@ impl Shared {
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), String> {
+        self.launch_at(entry.kernel(), entry.precision(), grid, block, args)
+    }
+
+    /// [Self::launch] of a kernel a shared table loaded, at the arithmetic it runs.
+    fn launch_at(
+        &self,
+        kernel: Kernel,
+        precision: Precision,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
         self.cuda
-            .launch(entry.kernel, grid, block, args)
-            .map_err(|error| {
-                format!(
-                    "{} ({}): {error}",
-                    entry.kernel.name(),
-                    entry.precision.name()
-                )
-            })
+            .launch(kernel, grid, block, args)
+            .map_err(|error| format!("{} ({}): {error}", kernel.name(), precision.name()))
     }
 
     /// One dense BF16 projection of one row (a packed matrix's through the packed walk, the same
@@ -3881,7 +3806,7 @@ fn widen_clips(
             (relative_index, relative, heads * d_rel),
         ] {
             cuda.launch(
-                kernels.widen.kernel,
+                kernels.widen.kernel(),
                 (flat(count), 1, 1),
                 (ELEMENT_BLOCK, 1, 1),
                 &[weights.get(source).pointer.0, destination.0, count as u64],

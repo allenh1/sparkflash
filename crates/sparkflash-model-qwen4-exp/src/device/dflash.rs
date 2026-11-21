@@ -58,7 +58,7 @@ pub(super) fn load_dflash_from_env(
             rows: head.rows(),
             columns: head.columns(),
         };
-        GpuMatE4m3::quantize(cuda, quantize.kernel, &head, &mut 0)
+        GpuMatE4m3::quantize(cuda, quantize.kernel(), &head, &mut 0)
     })
     .and_then(|head| {
         GpuDflash2::load(cuda, &directory, target, &head, (0, 1)).inspect_err(|_| head.free(cuda))

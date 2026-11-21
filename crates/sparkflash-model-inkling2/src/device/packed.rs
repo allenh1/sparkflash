@@ -22,12 +22,13 @@
 
 use std::collections::BTreeSet;
 
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_ops::calls::Call;
 use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement, Walk, packable};
+use sparkflash_ops::plan::Precision;
 use sparkflash_weights::DType;
 
-use super::{Entry, Kernels, Shared, Weights};
+use super::{Kernels, Shared, Weights};
 use crate::device_plan::{InklingDevicePlan, Op, Projection, Target};
 
 /// The served-plan slots only the dense GEMV walks read, and the head among them: a slot any
@@ -104,8 +105,9 @@ pub(super) fn pack_dense(
 }
 
 impl Shared {
-    fn launch_call<const N: usize>(&self, kernel: Entry, call: &Call<N>) -> Result<(), String> {
-        self.launch(kernel, call.grid, call.block, &call.args)
+    /// One of the packed form's kernels, whose sums are BF16's.
+    fn launch_call<const N: usize>(&self, kernel: Kernel, call: &Call<N>) -> Result<(), String> {
+        self.launch_at(kernel, Precision::Bf16, call.grid, call.block, &call.args)
     }
 
     /// A packed matrix's projection of `groups` groups of `batch` rows: q4e_gemv_bf16's walk and
@@ -122,13 +124,7 @@ impl Shared {
         groups: u32,
     ) -> Result<(), String> {
         let call = packed::gemv(matrix, input, out, (rows, columns), batch, groups)?;
-        self.launch_call(
-            Entry {
-                kernel: self.kernels.packed.gemv,
-                precision: sparkflash_ops::plan::Precision::Bf16,
-            },
-            &call,
-        )
+        self.launch_call(self.kernels.packed.gemv, &call)
     }
 
     /// Up to four packed matrices over `batch` rows, as one launch: q4e_gemv4_bf16's walk and
@@ -141,13 +137,7 @@ impl Shared {
         batch: usize,
     ) -> Result<(), String> {
         let call = packed::gemv4(parts, input, columns, batch)?;
-        self.launch_call(
-            Entry {
-                kernel: self.kernels.packed.gemv4,
-                precision: sparkflash_ops::plan::Precision::Bf16,
-            },
-            &call,
-        )
+        self.launch_call(self.kernels.packed.gemv4, &call)
     }
 
     /// The BF16 rows a prompt tile reads for `weight`: the matrix itself, or a packed matrix's
@@ -162,13 +152,7 @@ impl Shared {
     ) -> Result<Deviceptr, String> {
         let (unpack, rows_at) = self.dense.bf16_rows(weight, rows, columns, 0)?;
         if let Some(call) = unpack {
-            self.launch_call(
-                Entry {
-                    kernel: self.kernels.packed.unpack,
-                    precision: sparkflash_ops::plan::Precision::Bf16,
-                },
-                &call,
-            )?;
+            self.launch_call(self.kernels.packed.unpack, &call)?;
         }
         Ok(rows_at)
     }

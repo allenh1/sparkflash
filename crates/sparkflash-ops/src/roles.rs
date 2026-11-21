@@ -138,6 +138,12 @@ impl Bound {
     pub const fn precision(self) -> Precision {
         self.precision
     }
+
+    /// The dynamic shared-memory reservation the handle was loaded with, 0 for none.
+    #[must_use]
+    pub fn shared_bytes(self) -> u32 {
+        self.kernel.shared_bytes()
+    }
 }
 
 // SAFETY: a Kernel is an opaque driver function word, and the handle only names it. The context

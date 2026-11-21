@@ -43,6 +43,7 @@ use sparkflash_ops::formats::{Bf16, FormatKind, Mat, Scales, Tensor, upload as u
 use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement};
 use sparkflash_ops::plan::Precision;
+use sparkflash_ops::roles::Bound;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog};
 // dory_mma_wide's tile is the shared wide tile: its geometry, launch and when a projection
 // takes it are the dispatcher's.
@@ -302,89 +303,6 @@ impl DoryStage {
             Partition::Recurrent if block.cache_slots > 1 => self.loops.contains(&slot),
             _ => self.runs(block),
         }
-    }
-}
-
-/// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
-/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
-/// than a name it looked up.
-#[derive(Clone, Copy)]
-struct Bound {
-    /// The loaded driver function.
-    kernel: Kernel,
-}
-
-impl Bound {
-    /// Resolve a symbol in an image at a precision and load it.
-    ///
-    /// # Errors
-    /// A symbol the image does not export, one the catalogue does not carry at this precision,
-    /// or the driver's load refusal.
-    fn new(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-    ) -> Result<Self, String> {
-        if !image.exported_symbols().contains(&symbol) {
-            return Err(format!("{} does not export {symbol}", image.name()));
-        }
-        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
-            entry.image == image
-                && entry
-                    .symbols
-                    .iter()
-                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
-        });
-        if !carried {
-            return Err(format!(
-                "the catalogue carries no {symbol} in {} accepting {}",
-                image.name(),
-                precision.name()
-            ));
-        }
-        let (_, kernel) = cuda.load_named(cubin, symbol)?;
-        Ok(Self { kernel })
-    }
-
-    /// Self::new for a body loaded with a dynamic shared-memory reservation.
-    ///
-    /// # Errors
-    /// As Self::new, or the driver's attribute call.
-    fn shared(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-        shared_bytes: u32,
-    ) -> Result<Self, String> {
-        if !image.exported_symbols().contains(&symbol) {
-            return Err(format!("{} does not export {symbol}", image.name()));
-        }
-        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
-            entry.image == image
-                && entry
-                    .symbols
-                    .iter()
-                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
-        });
-        if !carried {
-            return Err(format!(
-                "the catalogue carries no {symbol} in {} accepting {}",
-                image.name(),
-                precision.name()
-            ));
-        }
-        let (_, kernel) = cuda.load_named_shared(cubin, symbol, shared_bytes)?;
-        Ok(Self { kernel })
-    }
-}
-
-impl From<Bound> for Kernel {
-    fn from(bound: Bound) -> Self {
-        bound.kernel
     }
 }
 

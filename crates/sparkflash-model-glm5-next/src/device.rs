@@ -119,6 +119,7 @@ use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
 use sparkflash_ops::roles;
+use sparkflash_ops::roles::Bound;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{host_sum, reduce_scatter, reduce_two_shot, takes_two_shots};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -485,79 +486,6 @@ fn append(into: &mut Vec<u8>, bytes: Vec<u8>) {
 /// 6,160 x 4,096 191 against 216 us at one row, even at eight; 4,096 x 2,048 79 against 78 us at
 /// one row and 102 against 81 at eight; the 288 x 4,096 router lost at every batch.
 const PACK_MIN_WEIGHTS: usize = 1 << 24;
-
-/// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
-/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
-/// than a name it looked up.
-#[derive(Clone, Copy)]
-struct Bound {
-    /// The loaded driver function.
-    kernel: Kernel,
-}
-
-impl Bound {
-    /// Whether the image exports the symbol and the catalogue carries it at this precision.
-    fn carried(image: Image, symbol: &'static str, precision: Precision) -> Result<(), String> {
-        if !image.exported_symbols().contains(&symbol) {
-            return Err(format!("{} does not export {symbol}", image.name()));
-        }
-        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
-            entry.image == image
-                && entry
-                    .symbols
-                    .iter()
-                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
-        });
-        if !carried {
-            return Err(format!(
-                "the catalogue carries no {symbol} in {} accepting {}",
-                image.name(),
-                precision.name()
-            ));
-        }
-        Ok(())
-    }
-
-    /// Resolve a symbol in an image at a precision and load it.
-    ///
-    /// # Errors
-    /// A symbol the image does not export, one the catalogue does not carry at this precision,
-    /// or the driver's load refusal.
-    fn new(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-    ) -> Result<Self, String> {
-        Self::carried(image, symbol, precision)?;
-        let (_, kernel) = cuda.load_named(cubin, symbol)?;
-        Ok(Self { kernel })
-    }
-
-    /// Self::new for a body loaded with a dynamic shared-memory reservation.
-    ///
-    /// # Errors
-    /// As Self::new, or the driver's attribute call.
-    fn shared(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-        shared_bytes: u32,
-    ) -> Result<Self, String> {
-        Self::carried(image, symbol, precision)?;
-        let (_, kernel) = cuda.load_named_shared(cubin, symbol, shared_bytes)?;
-        Ok(Self { kernel })
-    }
-}
-
-impl From<Bound> for Kernel {
-    fn from(bound: Bound) -> Self {
-        bound.kernel
-    }
-}
 
 /// The kernels a rank launches, by name from the pack's cubin.
 #[derive(Clone, Copy)]
@@ -3086,7 +3014,7 @@ impl DeviceRank {
         let memory = &mut self.memory;
         let head = GpuMatE4m3::quantize(
             &self.cuda,
-            self.kernels.quantize_e4m3.kernel,
+            self.kernels.quantize_e4m3.kernel(),
             &matrix,
             &mut memory.bytes,
         )
@@ -3939,7 +3867,7 @@ impl DeviceRank {
         launch_fp8_token_body(
             &self.cuda,
             &self.stream,
-            self.kernels.prefill_dense_fp8_rows.kernel,
+            self.kernels.prefill_dense_fp8_rows.kernel(),
             planes,
             linear,
             input,
@@ -3994,9 +3922,9 @@ impl DeviceRank {
                 match WidePolicy::GLM.bulk(part_rows, columns, rows) {
                     Route::Wide => {
                         let bf16 = if self.prefill_activation == PrefillActivation::Bf16 {
-                            self.kernels.prefill_dense_bf16_bf16a.kernel
+                            self.kernels.prefill_dense_bf16_bf16a.kernel()
                         } else {
-                            self.kernels.prefill_dense_bf16.kernel
+                            self.kernels.prefill_dense_bf16.kernel()
                         };
                         let tile =
                             WideTile::call(weight.0, input.0, out.0, part_rows, columns, rows)
@@ -4004,7 +3932,7 @@ impl DeviceRank {
                         self.launch(bf16, tile.grid, tile.block.0, &tile.args)?;
                     }
                     Route::Skinny => self.launch(
-                        self.kernels.prefill_skinny[part_rows.div_ceil(8) - 1].kernel,
+                        self.kernels.prefill_skinny[part_rows.div_ceil(8) - 1].kernel(),
                         (rows.div_ceil(16) as u32, 1, 1),
                         BLOCK,
                         &[
@@ -4033,9 +3961,9 @@ impl DeviceRank {
             }
             let grid = Fp8Tile::grid(part_rows, rows);
             let fp8 = if self.prefill_activation == PrefillActivation::Bf16 {
-                self.kernels.prefill_dense_fp8_bf16a.kernel
+                self.kernels.prefill_dense_fp8_bf16a.kernel()
             } else {
-                self.kernels.prefill_dense_fp8.kernel
+                self.kernels.prefill_dense_fp8.kernel()
             };
             if self.prefill_activation == PrefillActivation::Fp8
                 && columns.is_multiple_of(FP8_BLOCK)
@@ -4047,7 +3975,7 @@ impl DeviceRank {
                 }
                 let s = &self.scratch;
                 self.launch(
-                    self.kernels.prefill_dense_q8.kernel,
+                    self.kernels.prefill_dense_q8.kernel(),
                     grid,
                     BLOCK,
                     &[
@@ -4095,7 +4023,7 @@ impl DeviceRank {
         // One warp a 128-column block.
         let warps = rows * columns / FP8_BLOCK;
         self.launch(
-            self.kernels.prefill_quantise.kernel,
+            self.kernels.prefill_quantise.kernel(),
             ((warps * 32).div_ceil(BLOCK as usize) as u32, 1, 1),
             BLOCK,
             &[
@@ -4174,7 +4102,7 @@ impl DeviceRank {
                 && tiled_gemv_splits(part_rows.div_ceil(TILE_ROWS), columns) == rounds
             {
                 self.launch(
-                    self.kernels.prefill_exact.kernel,
+                    self.kernels.prefill_exact.kernel(),
                     (
                         part_rows.div_ceil(EXACT_OUTS) as u32,
                         rows.div_ceil(EXACT_ROWS) as u32,
@@ -4248,17 +4176,17 @@ impl DeviceRank {
             .filter(|packed| packed.admits(linear.rows, linear.columns, input).is_ok());
         let (kernel, splits, mut args) = match (linear.weight.scales(), packed) {
             (None, Some(packed)) => (
-                self.kernels.gemv_packed.kernel,
+                self.kernels.gemv_packed.kernel(),
                 tiled_gemv_splits(tiles, linear.columns),
                 packed.tiled_planes()[..3].to_vec(),
             ),
             (None, None) => (
-                self.kernels.gemv_bf16.kernel,
+                self.kernels.gemv_bf16.kernel(),
                 tiled_gemv_splits(tiles, linear.columns),
                 vec![linear.weight.data().0],
             ),
             (Some(scales), _) => (
-                self.kernels.gemv_fp8.kernel,
+                self.kernels.gemv_fp8.kernel(),
                 tiled_gemv_e4m3_splits(tiles, linear.columns),
                 vec![linear.weight.data().0, scales.0],
             ),
@@ -4300,7 +4228,7 @@ impl DeviceRank {
     ) -> Result<(), BackendError> {
         let topk = self.config.num_experts_per_tok;
         self.launch(
-            self.kernels.expert_fp8.kernel,
+            self.kernels.expert_fp8.kernel(),
             (outputs.div_ceil(TILE_ROWS) as u32, 1, (rows * topk) as u32),
             BLOCK,
             &[
@@ -4348,7 +4276,7 @@ impl DeviceRank {
                 .side_launch_on(
                     &self.stream,
                     &prefetch.side,
-                    self.kernels.prefetch_l2.kernel,
+                    self.kernels.prefetch_l2.kernel(),
                     (1, 1, 1),
                     (32, 1, 1),
                     &args,
@@ -4389,7 +4317,7 @@ impl DeviceRank {
             self.gemv(&hyper.projection, streams, raw, rows)?;
         }
         self.launch(
-            self.kernels.mhc_in.kernel,
+            self.kernels.mhc_in.kernel(),
             (2, count as u32, 1),
             BLOCK,
             &[
@@ -4520,7 +4448,7 @@ impl DeviceRank {
     /// two-shot reduce's sum, in rank order from 0.0 as `q4e_mhc_post` folds the one-shot's.
     fn sum_slots(&self, mine: Deviceptr, count: usize) -> Result<(), BackendError> {
         self.launch(
-            self.kernels.sum_slots.kernel,
+            self.kernels.sum_slots.kernel(),
             (blocks(count / 4), 1, 1),
             BLOCK,
             &[
@@ -4581,7 +4509,7 @@ impl DeviceRank {
         let s = &self.scratch;
         let hidden = self.geometry.dim;
         self.launch(
-            self.kernels.mhc_post.kernel,
+            self.kernels.mhc_post.kernel(),
             (blocks(hidden), rows as u32, 1),
             BLOCK,
             &[
@@ -4682,7 +4610,7 @@ impl DeviceRank {
                 let width = (mixes, config.linear_conv_kernel_dim);
                 let call = gdn::conv_rows(raw.0, conv.0, kda.conv.0, mixed.0, width, run.len);
                 self.launch(
-                    self.kernels.conv_rows.kernel,
+                    self.kernels.conv_rows.kernel(),
                     call.grid,
                     call.block.0,
                     &call.args,
@@ -4690,7 +4618,7 @@ impl DeviceRank {
                 // A chunk never verifies, so it keeps no windows.
                 let call = gdn::conv_history(raw.0, conv.0, width, run.len, (0, 0, 0));
                 self.launch(
-                    self.kernels.conv_history.kernel,
+                    self.kernels.conv_history.kernel(),
                     call.grid,
                     call.block.0,
                     &call.args,
@@ -4708,7 +4636,7 @@ impl DeviceRank {
                 (0, 0)
             };
             self.launch(
-                self.kernels.conv.kernel,
+                self.kernels.conv.kernel(),
                 (blocks(mixes), 1, 1),
                 BLOCK,
                 &[
@@ -4728,7 +4656,7 @@ impl DeviceRank {
         self.gemv(&kda.f_b, f_a, s.forget, rows)?;
         self.gemv(&kda.g_b, g_a, s.gate, rows)?;
         self.launch(
-            self.kernels.kda_decay.kernel,
+            self.kernels.kda_decay.kernel(),
             (blocks(rows * width), 1, 1),
             BLOCK,
             &[
@@ -4834,7 +4762,7 @@ impl DeviceRank {
         // One value head a key head.
         let groups = 1;
         self.launch(
-            self.kernels.kda_prep.kernel,
+            self.kernels.kda_prep.kernel(),
             (heads as u32, len as u32, 1),
             GDN_KEY as u32,
             &[
@@ -4865,7 +4793,7 @@ impl DeviceRank {
             ));
         }
         self.launch(
-            self.kernels.kda_scan.kernel,
+            self.kernels.kda_scan.kernel(),
             launch.grid,
             launch.block.0,
             &[
@@ -4896,7 +4824,7 @@ impl DeviceRank {
             len,
         );
         self.launch(
-            self.kernels.kda_gate.kernel,
+            self.kernels.kda_gate.kernel(),
             call.grid,
             call.block.0,
             &call.args,
@@ -4918,7 +4846,7 @@ impl DeviceRank {
         let config = &self.config;
         let head = config.linear_head_dim;
         self.launch(
-            self.kernels.recur.kernel,
+            self.kernels.recur.kernel(),
             (kda.heads as u32, recur_parts(head) as u32, 1),
             RECUR_THREADS,
             &[
@@ -4943,7 +4871,7 @@ impl DeviceRank {
                 // The sigmoid output gate.
                 1,
                 len as u64,
-                u64::from(self.kernels.recur.kernel.shared_bytes()),
+                u64::from(self.kernels.recur.kernel().shared_bytes()),
                 decay.0,
                 self.scratch.recur_counters.0,
             ],
@@ -4985,7 +4913,7 @@ impl DeviceRank {
             (latent, dsa.kv_a_norm, kv_lora),
         ] {
             self.call(
-                self.kernels.rmsnorm.kernel,
+                self.kernels.rmsnorm.kernel(),
                 RmsNorm::new(part.0, norm.0, part.0, width, eps).call(rows),
             )?;
         }
@@ -5003,7 +4931,7 @@ impl DeviceRank {
             let source = latent.offset(floats(run.first * kv_lora)).0;
             if dsa.quantise {
                 self.launch(
-                    self.kernels.mla_cache_fp8.kernel,
+                    self.kernels.mla_cache_fp8.kernel(),
                     (run.len as u32, 1, 1),
                     BLOCK,
                     &[
@@ -5017,7 +4945,7 @@ impl DeviceRank {
                 )?;
             } else {
                 self.launch(
-                    self.kernels.mla_cache.kernel,
+                    self.kernels.mla_cache.kernel(),
                     (run.len as u32, 1, 1),
                     BLOCK,
                     &[
@@ -5075,7 +5003,7 @@ impl DeviceRank {
             };
             let (first, len) = (run.first as u64, run.len as u32);
             self.launch(
-                self.kernels.mla_absorb.kernel,
+                self.kernels.mla_absorb.kernel(),
                 (heads as u32, len, latent.div_ceil(BLOCK as usize) as u32),
                 BLOCK,
                 &[
@@ -5092,7 +5020,7 @@ impl DeviceRank {
             let selection = [s.selected.0, s.count.0];
             let quantise = u64::from(dsa.quantise);
             self.launch(
-                self.kernels.mla_scores.kernel,
+                self.kernels.mla_scores.kernel(),
                 (
                     (MAX_SELECTED_TOKENS / MLA_SCORE_SLOTS) as u32,
                     len,
@@ -5116,13 +5044,13 @@ impl DeviceRank {
                 .concat(),
             )?;
             self.launch(
-                self.kernels.mla_softmax.kernel,
+                self.kernels.mla_softmax.kernel(),
                 (heads as u32, len, 1),
                 BLOCK,
                 &[s.mla_logits.0, s.count.0, s.mla_total.0, first],
             )?;
             self.launch(
-                self.kernels.mla_mix.kernel,
+                self.kernels.mla_mix.kernel(),
                 (
                     latent.div_ceil(32) as u32,
                     heads.div_ceil(MLA_MIX_HEADS) as u32,
@@ -5146,7 +5074,7 @@ impl DeviceRank {
                 .concat(),
             )?;
             self.launch(
-                self.kernels.mla_project.kernel,
+                self.kernels.mla_project.kernel(),
                 (
                     heads as u32,
                     (value as u32).div_ceil(MLA_PROJECT_THREADS),
@@ -5195,7 +5123,7 @@ impl DeviceRank {
         let row_tiles = rows.div_ceil(128) as u32;
         match dsa.kv_key_t {
             Some(key_t) => self.launch(
-                self.kernels.prefill_heads_bf16.kernel,
+                self.kernels.prefill_heads_bf16.kernel(),
                 ((latent / 128) as u32, row_tiles, heads as u32),
                 BLOCK,
                 &[
@@ -5213,7 +5141,7 @@ impl DeviceRank {
                 ],
             )?,
             None => self.launch(
-                self.kernels.mla_absorb.kernel,
+                self.kernels.mla_absorb.kernel(),
                 (
                     heads as u32,
                     rows as u32,
@@ -5232,9 +5160,9 @@ impl DeviceRank {
             )?,
         }
         let attend = if self.prefill_activation == PrefillActivation::Bf16 {
-            self.kernels.prefill_mla_attend_bf16a.kernel
+            self.kernels.prefill_mla_attend_bf16a.kernel()
         } else {
-            self.kernels.prefill_mla_attend.kernel
+            self.kernels.prefill_mla_attend.kernel()
         };
         for run in runs {
             let SequenceLayer::Sparse {
@@ -5288,12 +5216,12 @@ impl DeviceRank {
                 ];
                 args.extend(geometry);
                 args.push(((per_head / FP8_BLOCK) * blocks) as u64);
-                self.launch(self.kernels.prefill_heads_fp8.kernel, grid, BLOCK, &args)
+                self.launch(self.kernels.prefill_heads_fp8.kernel(), grid, BLOCK, &args)
             }
             None => {
                 let mut args = vec![weight.0, s.q_abs.0, s.attn_out.0];
                 args.extend(geometry);
-                self.launch(self.kernels.prefill_heads_bf16.kernel, grid, BLOCK, &args)
+                self.launch(self.kernels.prefill_heads_bf16.kernel(), grid, BLOCK, &args)
             }
         }
     }
@@ -5334,7 +5262,7 @@ impl DeviceRank {
             };
             let cached = floats(run.position * dim);
             self.launch(
-                self.kernels.layer_norm.kernel,
+                self.kernels.layer_norm.kernel(),
                 (run.len as u32, 1, 1),
                 BLOCK,
                 &[
@@ -5347,7 +5275,7 @@ impl DeviceRank {
                 ],
             )?;
             self.launch(
-                self.kernels.copy_flat.kernel,
+                self.kernels.copy_flat.kernel(),
                 (blocks(run.len * dim), 1, 1),
                 BLOCK,
                 &[
@@ -5358,7 +5286,7 @@ impl DeviceRank {
             )?;
             let (grid, block) = IndexerPass::new(run.position, run.len, pool).per_row();
             self.launch(
-                self.kernels.pool.kernel,
+                self.kernels.pool.kernel(),
                 grid,
                 block.0,
                 &[
@@ -5417,7 +5345,7 @@ impl DeviceRank {
                 // A prefill run's rows share their pooled keys: glm_prefill_index_scores keeps a
                 // tile of them while it walks the rows, and computes the decode kernel's floats.
                 self.launch(
-                    self.kernels.prefill_index_scores.kernel,
+                    self.kernels.prefill_index_scores.kernel(),
                     grid,
                     block.0,
                     &[
@@ -5436,7 +5364,7 @@ impl DeviceRank {
             } else {
                 let (grid, block) = pass.scores();
                 self.launch(
-                    self.kernels.index_scores.kernel,
+                    self.kernels.index_scores.kernel(),
                     grid,
                     block.0,
                     &[
@@ -5456,7 +5384,7 @@ impl DeviceRank {
             }
             let (grid, block) = pass.per_row();
             self.launch(
-                self.kernels.pick.kernel,
+                self.kernels.pick.kernel(),
                 grid,
                 block.0,
                 &[
@@ -5480,7 +5408,7 @@ impl DeviceRank {
         let width = mlp.gate_up.rows / 2;
         self.gemv(&mlp.gate_up, s.collapsed, s.gate_up, rows)?;
         self.launch(
-            self.kernels.swiglu.kernel,
+            self.kernels.swiglu.kernel(),
             (blocks(width), rows as u32, 1),
             BLOCK,
             &[
@@ -5514,7 +5442,7 @@ impl DeviceRank {
             self.exact_prefill,
         )?;
         self.launch(
-            self.kernels.router.kernel,
+            self.kernels.router.kernel(),
             (rows as u32, 1, 1),
             // One warp a row picks.
             32,
@@ -5545,7 +5473,7 @@ impl DeviceRank {
         )?;
         self.prof_mark("moe_up");
         self.launch(
-            self.kernels.swiglu.kernel,
+            self.kernels.swiglu.kernel(),
             (blocks(width), (rows * topk) as u32, 1),
             BLOCK,
             &[
@@ -5604,7 +5532,7 @@ impl DeviceRank {
         .zeroing(s.expert_out.0, hidden);
         let (grid, block) = MoePlanCall::launch();
         self.launch(
-            self.kernels.prefill_moe_plan.kernel,
+            self.kernels.prefill_moe_plan.kernel(),
             grid,
             block.0,
             &plan.args(),
@@ -5617,9 +5545,9 @@ impl DeviceRank {
             return self.combine_experts(layer, rows);
         }
         let mma = if self.prefill_activation == PrefillActivation::Bf16 {
-            self.kernels.prefill_moe_mma_bf16a.kernel
+            self.kernels.prefill_moe_mma_bf16a.kernel()
         } else {
-            self.kernels.prefill_moe_mma.kernel
+            self.kernels.prefill_moe_mma.kernel()
         };
         self.launch(
             mma,
@@ -5638,7 +5566,7 @@ impl DeviceRank {
             ],
         )?;
         self.launch(
-            self.kernels.prefill_moe_swiglu.kernel,
+            self.kernels.prefill_moe_swiglu.kernel(),
             (blocks(moe_rows * width), 1, 1),
             BLOCK,
             &[
@@ -5683,7 +5611,7 @@ impl DeviceRank {
         q8_inner(width)?;
         self.quantise(s.collapsed, rows, hidden)?;
         self.launch(
-            self.kernels.prefill_moe_q8.kernel,
+            self.kernels.prefill_moe_q8.kernel(),
             ((2 * width).div_ceil(128) as u32, 1, items as u32),
             BLOCK,
             &[
@@ -5703,7 +5631,7 @@ impl DeviceRank {
         // One warp a 128-column block of an item row.
         let warps = moe_rows * width / FP8_BLOCK;
         self.launch(
-            self.kernels.prefill_moe_swiglu_q8.kernel,
+            self.kernels.prefill_moe_swiglu_q8.kernel(),
             ((warps * 32).div_ceil(BLOCK as usize) as u32, 1, 1),
             BLOCK,
             &[
@@ -5716,7 +5644,7 @@ impl DeviceRank {
             ],
         )?;
         self.launch(
-            self.kernels.prefill_moe_q8.kernel,
+            self.kernels.prefill_moe_q8.kernel(),
             (hidden.div_ceil(128) as u32, 1, items as u32),
             BLOCK,
             &[
@@ -5744,7 +5672,7 @@ impl DeviceRank {
         let config = &self.config;
         let (grid, block) = combine_grid(config.hidden_size, rows);
         self.launch(
-            self.kernels.combine.kernel,
+            self.kernels.combine.kernel(),
             grid,
             block.0,
             &[
@@ -6356,7 +6284,7 @@ impl DeviceRank {
                 )?;
                 let window = Self::window_floats(config, width);
                 self.launch(
-                    self.kernels.copy_flat.kernel,
+                    self.kernels.copy_flat.kernel(),
                     (blocks(window), 1, 1),
                     BLOCK,
                     &[
@@ -6787,7 +6715,7 @@ impl DeviceRank {
         self.finish_numerics();
         self.prof_mark("tail");
         self.launch(
-            self.kernels.fold.kernel,
+            self.kernels.fold.kernel(),
             (blocks(count * hidden), 1, 1),
             BLOCK,
             &[
@@ -6801,7 +6729,7 @@ impl DeviceRank {
         )?;
         let normed = row(s.head_normed, hidden);
         self.call(
-            self.kernels.rmsnorm.kernel,
+            self.kernels.rmsnorm.kernel(),
             RmsNorm::new(
                 row(s.head, hidden).0,
                 self.norm.0,
@@ -6869,7 +6797,14 @@ impl DeviceRank {
             s.logits
         };
         match self.draft_head.filter(|_| draft) {
-            Some(head) => gemv_e4m3(self, self.kernels.gemv_e4m3.kernel, &head, input, own, rows)?,
+            Some(head) => gemv_e4m3(
+                self,
+                self.kernels.gemv_e4m3.kernel(),
+                &head,
+                input,
+                own,
+                rows,
+            )?,
             None => self.gemv(&self.lm_head, input, own, rows)?,
         }
         if !device_leg {
@@ -6975,7 +6910,7 @@ impl DeviceRank {
         probs: Deviceptr,
     ) -> Result<(), BackendError> {
         self.launch(
-            self.kernels.argmax_prob.kernel,
+            self.kernels.argmax_prob.kernel(),
             (rows as u32, 1, 1),
             ARGMAX_BLOCK,
             &[
@@ -6992,7 +6927,7 @@ impl DeviceRank {
     /// The argmax of each of `rows` rows of the gathered logits into `tokens`, a u32 a row.
     fn argmax_rows(&self, rows: usize, tokens: Deviceptr) -> Result<(), BackendError> {
         self.launch(
-            self.kernels.argmax.kernel,
+            self.kernels.argmax.kernel(),
             (rows as u32, 1, 1),
             ARGMAX_BLOCK,
             &[
@@ -7025,7 +6960,7 @@ impl DeviceRank {
         slab.write_at(0, bytemuck::cast_slice(tokens))
             .map_err(cuda_error)?;
         self.call(
-            self.kernels.embed.kernel,
+            self.kernels.embed.kernel(),
             calls::embed_rows(
                 self.embed.0,
                 out.0,
@@ -7046,7 +6981,7 @@ impl DeviceRank {
         let hidden = self.config.hidden_size;
         let tokens = s.drafted.device().offset(iteration * MAX_ROWS * 4);
         self.call(
-            self.kernels.embed.kernel,
+            self.kernels.embed.kernel(),
             calls::embed_rows(
                 self.embed.0,
                 s.mtp_embed.0,
@@ -7075,7 +7010,7 @@ impl DeviceRank {
             self.config.rms_norm_eps as f32,
         );
         self.call(
-            self.kernels.rmsnorm_rows.kernel,
+            self.kernels.rmsnorm_rows.kernel(),
             norm.rows_call(rows, src_stride, dst_stride),
         )
     }
@@ -7171,7 +7106,7 @@ impl DeviceRank {
             if let Some(drafter) = run.drafter {
                 let kept = run.len.min(MAX_ROWS);
                 self.launch(
-                    self.kernels.copy_flat.kernel,
+                    self.kernels.copy_flat.kernel(),
                     (blocks(kept * hidden), 1, 1),
                     BLOCK,
                     &[
@@ -7546,7 +7481,7 @@ impl DeviceRank {
             draft.merge(self, scratch, lists(gathered, row), world, slot)?;
             draft.select(self, scratch, *next)?;
             self.launch(
-                self.kernels.copy_flat.kernel,
+                self.kernels.copy_flat.kernel(),
                 (blocks(2 * block_size), 1, 1),
                 BLOCK,
                 &[
@@ -7776,7 +7711,7 @@ mod tests {
             Precision::Fp8E4M3,
         )
         .expect("glm_prefill_fp8b128_mma")
-        .kernel;
+        .kernel();
         let body = Bound::new(
             &cuda,
             Image::GlmDecode,
@@ -7785,7 +7720,7 @@ mod tests {
             Precision::Fp8E4M3,
         )
         .expect("glm_decode_fp8b128_rows")
-        .kernel;
+        .kernel();
 
         const COLS: usize = 256;
         const INNER: usize = 512;

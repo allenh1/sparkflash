@@ -111,6 +111,7 @@ pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
 use sparkflash_ops::packed::{Form, PackedSet, Placement, Tiled};
 use sparkflash_ops::plan::Precision;
+use sparkflash_ops::roles::Bound;
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -583,107 +584,6 @@ pub(crate) struct GpuWeights {
     ledger: Vec<LedgerRow>,
     /// Each uploaded matrix's device address and its checkpoint name, for the packed copies.
     labels: Vec<(u64, String)>,
-}
-
-/// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
-/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
-/// than a name it looked up.
-#[derive(Clone, Copy)]
-struct Bound {
-    /// The loaded driver function.
-    kernel: Kernel,
-    /// The arithmetic the catalogue entry accepts this body at.
-    precision: Precision,
-    /// The dynamic shared-memory reservation the handle was loaded with, 0 for none.
-    shared: u32,
-}
-
-impl Bound {
-    /// Whether `image` exports `symbol` and the catalogue carries it at `precision`.
-    fn carried(image: Image, symbol: &'static str, precision: Precision) -> Result<(), String> {
-        if !image.exported_symbols().contains(&symbol) {
-            return Err(format!("{} does not export {symbol}", image.name()));
-        }
-        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
-            entry.image == image
-                && entry
-                    .symbols
-                    .iter()
-                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
-        });
-        if !carried {
-            return Err(format!(
-                "the catalogue carries no {symbol} in {} accepting {}",
-                image.name(),
-                precision.name()
-            ));
-        }
-        Ok(())
-    }
-
-    /// Resolve `symbol` in `image` at `precision` and load it.
-    ///
-    /// # Errors
-    /// A symbol the image does not export, one the catalogue does not carry at this precision,
-    /// or the driver's load refusal.
-    fn new(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-    ) -> Result<Self, String> {
-        Self::carried(image, symbol, precision)?;
-        let (_, kernel) = cuda.load_named(cubin, symbol)?;
-        Ok(Self {
-            kernel,
-            precision,
-            shared: 0,
-        })
-    }
-
-    /// [Self::new] for a body loaded with a dynamic shared-memory reservation.
-    ///
-    /// # Errors
-    /// As [Self::new], or the driver's attribute call.
-    fn shared(
-        cuda: &Cuda,
-        image: Image,
-        cubin: &'static [u8],
-        symbol: &'static str,
-        precision: Precision,
-        shared: u32,
-    ) -> Result<Self, String> {
-        Self::carried(image, symbol, precision)?;
-        let (_, kernel) = cuda.load_named_shared(cubin, symbol, shared)?;
-        Ok(Self {
-            kernel,
-            precision,
-            shared,
-        })
-    }
-
-    /// The dynamic shared-memory reservation the handle carries.
-    const fn shared_bytes(&self) -> u32 {
-        self.shared
-    }
-}
-
-impl From<Bound> for Kernel {
-    fn from(bound: Bound) -> Self {
-        bound.kernel
-    }
-}
-
-impl std::fmt::Debug for Bound {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Bound")
-            .field("kernel", &self.kernel)
-            .field("precision", &self.precision)
-            .field("shared", &self.shared)
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3408,7 +3308,7 @@ impl Qwen4ExpDeviceBackend {
         self.shared
             .cuda
             .launch(
-                self.shared.kernels.rmsnorm.kernel,
+                self.shared.kernels.rmsnorm.kernel(),
                 norm.grid,
                 norm.block,
                 &norm.args,
@@ -4754,7 +4654,7 @@ impl DeviceSequence {
             let count = GEMV_MAX_BATCH.min(batch - base);
             gemv_e4m3_tile(
                 self,
-                self.backend.kernels.gemv_tiled_e4m3_tile.kernel,
+                self.backend.kernels.gemv_tiled_e4m3_tile.kernel(),
                 &tile,
                 input.offset(base * matrix.columns() * 4),
                 output.offset(base * matrix.rows() * 4),
@@ -5990,7 +5890,7 @@ impl DeviceSequence {
             let blocks = elements.div_ceil(256).max(1) as u32;
             cuda.launch_on(
                 &stream,
-                shared.kernels.zero.kernel,
+                shared.kernels.zero.kernel(),
                 (blocks, 1, 1),
                 (256, 1, 1),
                 &[pointer.0, elements as u64],
@@ -7110,7 +7010,7 @@ pub fn device_self_test() -> Result<(), BackendError> {
     .zero_centred(true)
     .groups(width, true)
     .call(1);
-    cuda.launch(kernels.rmsnorm.kernel, norm.grid, norm.block, &norm.args)
+    cuda.launch(kernels.rmsnorm.kernel(), norm.grid, norm.block, &norm.args)
         .map_err(|error| BackendError::new("qwen4_device", error))?;
     let mut bytes = vec![0u8; width * 4];
     cuda.copy_dtoh(&mut bytes, &device_output)

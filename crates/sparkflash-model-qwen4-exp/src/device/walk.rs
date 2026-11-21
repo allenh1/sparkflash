@@ -1612,7 +1612,7 @@ impl DeviceSequence {
             let blocks = elements.div_ceil(256).max(1) as u32;
             cuda.launch_on(
                 &self.stream,
-                self.backend.kernels.zero.kernel,
+                self.backend.kernels.zero.kernel(),
                 (blocks, 1, 1),
                 (256, 1, 1),
                 &[pointer.0, elements as u64],

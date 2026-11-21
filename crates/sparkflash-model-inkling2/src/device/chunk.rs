@@ -158,7 +158,7 @@ fn sum_slots(
         // side_launch always launches.
         Some(side) => shared
             .cuda
-            .side_launch(side, entry.kernel, grid, (SUM_BLOCK, 1, 1), &args),
+            .side_launch(side, entry.kernel(), grid, (SUM_BLOCK, 1, 1), &args),
     }
     .map_err(device_error)
 }
@@ -2532,9 +2532,9 @@ fn attention_half(
 /// The kernels and table one layer's halves run.
 struct HalvesBand {
     meta: MmaTable,
-    gate_up: Entry,
+    gate_up: Bound,
     /// The down pass over the gathered runs (q4p_moe_down_runs or its MXFP8 form).
-    down: Entry,
+    down: Bound,
 }
 
 /// One half's places in the chunk's scratch ([run_band_halves]).

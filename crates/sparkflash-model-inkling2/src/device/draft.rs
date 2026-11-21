@@ -96,7 +96,6 @@ const PICK_SLOT: usize = 4;
 
 /// The drafter's kernels.
 struct DraftKernels {
-    _modules: Vec<Module>,
     capture: Bound,
     mix_norm: Bound,
     masks: Bound,
@@ -134,15 +133,12 @@ impl DraftKernels {
                     .to_owned(),
             );
         }
-        let mut modules = Vec::new();
-        let mut load = |image: Image,
-                        cubin: &'static [u8],
-                        name: &'static str,
-                        precision: Precision|
+        let load = |image: Image,
+                    cubin: &'static [u8],
+                    name: &'static str,
+                    precision: Precision|
          -> Result<Bound, String> {
-            let (module, bound) = Bound::new(cuda, image, cubin, name, precision)?;
-            modules.push(module);
-            Ok(bound)
+            Bound::new(cuda, image, cubin, name, precision)
         };
         Ok(Self {
             capture: load(
@@ -241,7 +237,6 @@ impl DraftKernels {
                 "q4d_attn_span_merge",
                 Precision::Bf16,
             )?,
-            _modules: modules,
         })
     }
 }

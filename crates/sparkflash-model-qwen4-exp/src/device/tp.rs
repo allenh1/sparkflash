@@ -325,7 +325,7 @@ impl DeviceSequence {
             )
         })?;
         if self.overlap.is_none() {
-            self.overlap = Some(Overlap::new(&backend.cuda, backend.kernels.zero.kernel)?);
+            self.overlap = Some(Overlap::new(&backend.cuda, backend.kernels.zero.kernel())?);
         }
         let config = &backend.config;
         let (rank, world) = (tp.runtime().rank(), tp.runtime().world());
