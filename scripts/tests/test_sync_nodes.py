@@ -86,12 +86,14 @@ class SyncNodesTest(unittest.TestCase):
         self.model = model
         self.repo = self.tmp / "src" / "checkout"
 
-    def run_script(self, *hosts: str) -> subprocess.CompletedProcess:
+    def run_script(self, *hosts: str, prune: bool = False) -> subprocess.CompletedProcess:
         argv = [sys.executable, "-I", str(SCRIPT), "--path", str(self.model),
                 "--exclude", "*.incomplete", "--ensure-dir", str(self.repo), "--streams", "2",
                 "--ssh-arg=-o", "--ssh-arg=BatchMode=yes",
                 "--ssh", shlex.join([sys.executable, str(self.fake)]),
                 "--dest-root", f"{self.dest}/@HOST@"]
+        if prune:
+            argv.append("--prune")
         for host in hosts:
             argv += ["--host", host]
         env = dict(os.environ, FAKE_SSH_LOG=str(self.log))
@@ -125,6 +127,44 @@ class SyncNodesTest(unittest.TestCase):
         # A rerun has nothing left to send and still succeeds.
         again = self.run_script("spark@198.51.100.12,spark-1", "spark-2")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+
+    def test_prune_mirrors_a_directory_and_leaves_excluded_names_and_siblings(self):
+        hosts = ("198.51.100.12", "spark-2")
+        for host in hosts:
+            copy = Path(f"{self.dest}/{host}{self.model}")
+            (copy / "blobs").mkdir(parents=True)
+            (copy / "blobs" / "stale").write_text("a kernel the lead no longer builds")
+            (copy / "blobs" / "keep.incomplete").write_text("a download in progress")
+            (copy / "snapshots" / "abc" / "stale-dir").mkdir(parents=True)
+            (copy / "snapshots" / "abc" / "stale-dir" / "stale").write_text("old")
+            sibling = Path(f"{self.dest}/{host}{self.repo}") / "keep.txt"
+            sibling.parent.mkdir(parents=True, exist_ok=True)
+            sibling.write_text("not under the copied directory")
+
+        result = self.run_script(*("spark@198.51.100.12,spark-1", "spark-2"), prune=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for host in hosts:
+            copy = Path(f"{self.dest}/{host}{self.model}")
+            self.assertEqual((copy / "blobs" / "aaaa").read_bytes(),
+                             (self.model / "blobs" / "aaaa").read_bytes())
+            self.assertFalse((copy / "blobs" / "stale").exists(), "a stale file is removed")
+            self.assertTrue((copy / "blobs" / "keep.incomplete").exists(),
+                            "an excluded name is never deleted")
+            self.assertFalse((copy / "snapshots" / "abc" / "stale-dir").exists(),
+                             "a stale directory is removed")
+            self.assertTrue(
+                (Path(f"{self.dest}/{host}{self.repo}") / "keep.txt").exists(),
+                "a sibling outside the copied directory is not touched",
+            )
+
+        # Without --prune the same tree is copied but nothing is deleted.
+        for host in hosts:
+            copy = Path(f"{self.dest}/{host}{self.model}")
+            (copy / "blobs" / "stale").write_text("do not delete me")
+        again = self.run_script(*("spark@198.51.100.12,spark-1", "spark-2"))
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        for host in hosts:
+            self.assertTrue((Path(f"{self.dest}/{host}{self.model}") / "blobs" / "stale").exists())
 
     def test_an_unreachable_host_is_named_before_anything_is_copied(self):
         result = self.run_script("spark-1", "unreachable")

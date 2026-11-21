@@ -454,6 +454,10 @@ pub fn sync_command(
     let mut args = vec![
         "-I".to_owned(),
         root.join("scripts/sync-nodes.py").display().to_string(),
+        // A rerun must remove a file the lead no longer builds (a renamed kernel, for example).
+        // The node check hashes the whole tree, so a stale file would leave the copy "outdated"
+        // forever and the provisioner would retry it every ten seconds.
+        "--prune".to_owned(),
     ];
     // The connection may use the fast-network address; HostKeyAlias checks it against the key
     // already trusted for the node's name, so nothing new lands in known_hosts.
@@ -872,6 +876,7 @@ mod tests {
         assert_eq!(software.kind, "sync-software");
         for expected in [
             "/srv/sparkflash/scripts/sync-nodes.py",
+            "--prune",
             "--host=spark@198.51.100.12,spark1",
             "--ensure-dir=/srv/sparkflash",
             "--path=/srv/sparkflash/target/release/sparkflash",

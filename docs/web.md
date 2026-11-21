@@ -167,7 +167,9 @@ the files into four lists of about equal size and runs one `rsync` per list and 
 because one SSH stream does not fill the link. Once a check has confirmed the fast network, it
 connects to each node's peer address, with `HostKeyAlias` set to the node's SSH name, so the
 known host key is checked and nothing new lands in `known_hosts`. A rerun skips files that already
-match.
+match and, after every copy finishes, mirrors each copied directory: a file or directory the lead
+no longer has is deleted on the other Sparks, while an excluded name (an in-progress download) is
+never deleted. A copied single file never deletes its siblings.
 
 Downloads, copies and weight conversions print `@progress {"done": N, "total": N, "detail":
 "..."}` lines. The job keeps the latest one as its `progress`, and the UI draws each rank's
@@ -372,7 +374,7 @@ cannot remove. `scripts/setup.sh` runs it for the Sparks picked in the terminal.
 | Action | What it runs |
 | :-- | :-- |
 | **Download** | `python3 -I scripts/hf-download.py --repo <model.id> --cache <hub cache>` on the lead |
-| **Deploy** / **Copy** | `python3 -I scripts/sync-nodes.py --host <address>,<ssh name> … --path …` on the lead (software: binary, cubins, NCCL; model: the model's cache folder without `*.incomplete` files). Deploy runs automatically when the node check finds a missing or older copy |
+| **Deploy** / **Copy** | `python3 -I scripts/sync-nodes.py --prune --host <address>,<ssh name> … --path …` on the lead (software: binary, cubins, NCCL; model: the model's cache folder without `*.incomplete` files). Deploy runs automatically when the node check finds a missing or older copy |
 | **Prepare the weights** / per-rank **Convert** | One job per rank: rank 0 locally when `local = true`, the others over SSH. Each runs `sparkflash convert --checkpoint … --output-dir … --tp-world-size <world_size> --tp-rank R --no-verify`, plus `--no-pad-moe-640` for V4.1; the TP=1 Qwen pack converts rank 0 of 1 |
 | **Launch cluster** | `scripts/serve-four-node.sh launch` with `SPARK_NODES`, `SPARK_PEERS`, `SPARK_LOCAL_RANKS` (the `local = true` ranks, started on the lead without SSH), `SPARK_MAX_SEQ_LEN`, `SPARKFLASH_LANES` (or `SPARKFLASH_CONCURRENCY` and the lane knobs for a lane group), paths, and every `NCCL_*` value from the TOML. GLM's ranks take `--tp4-rank`; Inkling's take its own group flags (`--rank`, `--peer`, `--world`, `--converted`), which the launcher picks from the model (`SPARKFLASH_GROUP_FORM`). Each rank is started detached, so the job ends once all four are running |
 | **Start server** (local) | `scripts/serve-single-node.sh launch` with the binary, checkpoint, tokenizer, context, HTTP bind and `SPARKFLASH_QWEN_CONVERTED_DIR` (the one rank file the pack boots from). The one TP=1 process is started detached; its log and pid file are under `paths.log_root` |
