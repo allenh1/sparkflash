@@ -34,8 +34,9 @@ const ENV_READ_EXCEPTIONS: &[(&str, usize)] = &[
     // The generated conformance checks name the dense arm's synthetic checkpoint by
     // SPARKFLASH_CONFORMANCE_CHECKPOINT and the tokenizer it is written from by
     // SPARKFLASH_TOKENIZER_DIR; both are the check's fixture, not a served setting, so they stay
-    // out of the profile.
-    ("sparkflash-model-dense", 2),
+    // out of the profile. The third is the part plug-in's integration test, which boots the same
+    // synthetic checkpoint through the same switch.
+    ("sparkflash-model-dense", 3),
     // Two are the L2 prefetch knobs. The third is the monitor dump's switches, read once when
     // the rank loads (`SPARKFLASH_NUMERICS_MONITORS` and its `_MODEL`/`_SAMPLE` overrides,
     // `crates/sparkflash-model-glm5-next/src/device/numerics.rs`); they select a diagnostic dump
