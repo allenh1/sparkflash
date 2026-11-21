@@ -1699,28 +1699,7 @@ impl StageCore {
 
     /// Copies the first `rows` vocabulary rows the head left on the device to the host.
     pub(crate) fn read_logits_rows(&self, rows: usize) -> Result<Vec<Vec<f32>>, BackendError> {
-        if rows > LANE_BATCH {
-            return Err(BackendError::new(
-                DEVICE,
-                format!("the head leaves at most {LANE_BATCH} vocabulary rows, not {rows}"),
-            ));
-        }
-        let vocab = self.shared.config.vocab_size;
-        let mut bytes = vec![0u8; rows * vocab * 4];
-        self.shared
-            .cuda
-            .copy_dtoh(&mut bytes, &self.scratch.logits)
-            .map_err(|error| BackendError::new(DEVICE, error))?;
-        Ok(bytes
-            .chunks(vocab * 4)
-            .map(|row| {
-                row.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| f32::from_le_bytes(*chunk))
-                    .collect()
-            })
-            .collect())
+        logits_rows(&self.shared, &self.scratch, rows)
     }
 
     /// Copies the vocabulary row [StageCore::forward] left on the device to the host.
@@ -1766,12 +1745,35 @@ impl StageCore {
         Ok((keys, keys.offset(rows * kv_width * 2), rows, ring))
     }
 
-    /// One decoder block over one row of each of `lanes`, each at its own position.
+    /// One decoder block over one row of each of `lanes`, each at its own position: its
+    /// attention ([StageCore::attention_lanes]), then its MLP ([mlp]).
+    fn block_lanes(
+        lanes: &[&StageCore],
+        active: &[bool],
+        block_index: usize,
+        block: &Block,
+        loop_index: usize,
+    ) -> Result<(), BackendError> {
+        let Some(first) = lanes.first() else {
+            return Ok(());
+        };
+        Self::attention_lanes(lanes, active, block_index, block, loop_index)?;
+        mlp(
+            &first.shared,
+            &first.scratch,
+            block_index,
+            loop_index,
+            lanes.len(),
+        )
+    }
+
+    /// A decoder block's attention over one row of each of `lanes`, each at its own position,
+    /// from `hidden` into `state`.
     ///
     /// The projections run once over all the rows; rope, the cache append and split attention run
     /// lane by lane, each on its own cache, skipping a lane `active` marks false. One lane is a
     /// decode step or a one-row prompt chunk.
-    fn block_lanes(
+    fn attention_lanes(
         lanes: &[&StageCore],
         active: &[bool],
         block_index: usize,
@@ -1785,13 +1787,10 @@ impl StageCore {
         let scratch = &first.scratch;
         let cuda = &shared.cuda;
         let config = &shared.config;
-        let weights = shared.weights.blocks[block_index]
-            .as_ref()
-            .ok_or_else(|| stage_refusal(block_index, loop_index))?;
+        let weights = block_weights(shared, block_index, loop_index)?;
         let count = lanes.len();
         let hidden = config.hidden_size;
         let q_width = config.num_attention_heads * config.head_dim;
-        let intermediate = config.intermediate_size;
         let alpha_scale = config.alpha_scale() as f32;
         let gate_factor = config.gate_scale_factor() as f32;
         let theta = block.rope_theta as f32;
@@ -1936,67 +1935,31 @@ impl StageCore {
                 hidden as u64,
                 alpha_scale.to_bits() as u64,
             ],
-        )?;
-
-        gemv_group(
-            cuda,
-            &shared.kernels,
-            &shared.packed,
-            &[
-                (&weights.mlp.gate, scratch.mlp_gate),
-                (&weights.mlp.up, scratch.mlp_up),
-            ],
-            scratch.state,
-            count,
-        )?;
-        launch(
-            cuda,
-            shared.kernels.mlp_epilogue,
-            (1, count as u32, 1),
-            (256, 1, 1),
-            &[
-                scratch.mlp_gate.0,
-                scratch.mlp_up.0,
-                weights.mlp.suv_gate.0,
-                weights.mlp.suv_up.0,
-                scratch.mlp_hidden.0,
-                intermediate as u64,
-                (config.mlp_scale_factor() as f32).to_bits() as u64,
-            ],
-        )?;
-        gemv_batch(
-            cuda,
-            &shared.kernels,
-            &shared.packed,
-            &weights.mlp.down,
-            scratch.mlp_hidden,
-            scratch.branch,
-            count,
-        )?;
-        launch(
-            cuda,
-            shared.kernels.slerp,
-            (1, count as u32, 1),
-            (256, 1, 1),
-            &[
-                scratch.state.0,
-                scratch.branch.0,
-                weights.mlp.alpha.0,
-                scratch.hidden.0,
-                hidden as u64,
-                alpha_scale.to_bits() as u64,
-            ],
-        )?;
-        Ok(())
+        )
     }
 
-    /// One decoder block over up to PREFILL_BATCH positions.
+    /// One decoder block over up to PREFILL_BATCH positions: its attention
+    /// ([StageCore::attention_batch]), then its MLP ([mlp]).
+    fn block_batch(
+        &self,
+        block_index: usize,
+        block: &Block,
+        loop_index: usize,
+        position: usize,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        self.attention_batch(block_index, block, loop_index, position, batch)?;
+        mlp(&self.shared, &self.scratch, block_index, loop_index, batch)
+    }
+
+    /// A decoder block's attention over up to PREFILL_BATCH positions from `position`, from
+    /// `hidden` into `state`.
     ///
     /// The projections read each weight row once for every token in the chunk; the elementwise
     /// kernels keep a block per token, so every row's reduction is the one a single-token step
     /// computes. The cache rows for the whole chunk are written before attention, and a query
     /// still stops at its own position.
-    fn block_batch(
+    fn attention_batch(
         &self,
         block_index: usize,
         block: &Block,
@@ -2007,12 +1970,9 @@ impl StageCore {
         let shared = &self.shared;
         let cuda = &shared.cuda;
         let config = &shared.config;
-        let weights = shared.weights.blocks[block_index]
-            .as_ref()
-            .ok_or_else(|| stage_refusal(block_index, loop_index))?;
+        let weights = block_weights(shared, block_index, loop_index)?;
         let hidden = config.hidden_size;
         let q_width = config.num_attention_heads * config.head_dim;
-        let intermediate = config.intermediate_size;
         let alpha_scale = config.alpha_scale() as f32;
         let gate_factor = config.gate_scale_factor() as f32;
         let theta = block.rope_theta as f32;
@@ -2099,59 +2059,86 @@ impl StageCore {
                 hidden as u64,
                 alpha_scale.to_bits() as u64,
             ],
-        )?;
-
-        gemv_group(
-            cuda,
-            &shared.kernels,
-            &shared.packed,
-            &[
-                (&weights.mlp.gate, self.scratch.mlp_gate),
-                (&weights.mlp.up, self.scratch.mlp_up),
-            ],
-            self.scratch.state,
-            batch,
-        )?;
-        launch(
-            cuda,
-            shared.kernels.mlp_epilogue,
-            (1, batch as u32, 1),
-            (256, 1, 1),
-            &[
-                self.scratch.mlp_gate.0,
-                self.scratch.mlp_up.0,
-                weights.mlp.suv_gate.0,
-                weights.mlp.suv_up.0,
-                self.scratch.mlp_hidden.0,
-                intermediate as u64,
-                (config.mlp_scale_factor() as f32).to_bits() as u64,
-            ],
-        )?;
-        gemv_batch(
-            cuda,
-            &shared.kernels,
-            &shared.packed,
-            &weights.mlp.down,
-            self.scratch.mlp_hidden,
-            self.scratch.branch,
-            batch,
-        )?;
-        launch(
-            cuda,
-            shared.kernels.slerp,
-            (1, batch as u32, 1),
-            (256, 1, 1),
-            &[
-                self.scratch.state.0,
-                self.scratch.branch.0,
-                weights.mlp.alpha.0,
-                self.scratch.hidden.0,
-                hidden as u64,
-                alpha_scale.to_bits() as u64,
-            ],
-        )?;
-        Ok(())
+        )
     }
+}
+
+/// The weights of `block_index`, which the stage runs in loop `loop_index`.
+fn block_weights(
+    shared: &DeviceShared,
+    block_index: usize,
+    loop_index: usize,
+) -> Result<&DeviceBlock, BackendError> {
+    shared.weights.blocks[block_index]
+        .as_ref()
+        .ok_or_else(|| stage_refusal(block_index, loop_index))
+}
+
+/// A decoder block's MLP over `rows` rows of `scratch`, from `state` into `hidden`: one decode
+/// row a lane and a prompt chunk alike.
+///
+/// The projections read each weight row once for every row; the epilogue and the lerp keep a
+/// block a row, so a row's reduction is the one a pass of its own computes.
+fn mlp(
+    shared: &DeviceShared,
+    scratch: &Scratch,
+    block_index: usize,
+    loop_index: usize,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let cuda = &shared.cuda;
+    let config = &shared.config;
+    let weights = block_weights(shared, block_index, loop_index)?;
+    let alpha_scale = config.alpha_scale() as f32;
+    gemv_group(
+        cuda,
+        &shared.kernels,
+        &shared.packed,
+        &[
+            (&weights.mlp.gate, scratch.mlp_gate),
+            (&weights.mlp.up, scratch.mlp_up),
+        ],
+        scratch.state,
+        rows,
+    )?;
+    launch(
+        cuda,
+        shared.kernels.mlp_epilogue,
+        (1, rows as u32, 1),
+        (256, 1, 1),
+        &[
+            scratch.mlp_gate.0,
+            scratch.mlp_up.0,
+            weights.mlp.suv_gate.0,
+            weights.mlp.suv_up.0,
+            scratch.mlp_hidden.0,
+            config.intermediate_size as u64,
+            (config.mlp_scale_factor() as f32).to_bits() as u64,
+        ],
+    )?;
+    gemv_batch(
+        cuda,
+        &shared.kernels,
+        &shared.packed,
+        &weights.mlp.down,
+        scratch.mlp_hidden,
+        scratch.branch,
+        rows,
+    )?;
+    launch(
+        cuda,
+        shared.kernels.slerp,
+        (1, rows as u32, 1),
+        (256, 1, 1),
+        &[
+            scratch.state.0,
+            scratch.branch.0,
+            weights.mlp.alpha.0,
+            scratch.hidden.0,
+            config.hidden_size as u64,
+            alpha_scale.to_bits() as u64,
+        ],
+    )
 }
 
 /// The rows at or below which gemv_batch hands a chunk to the token GEMV rather than the batched
@@ -2353,20 +2340,85 @@ fn walk(
     if head.is_some() && !suffix {
         return Err(head_refusal());
     }
-    let hidden = config.hidden_size;
-    let bytes = hidden * rows * 4;
-
-    if prefix {
-        for (block_index, input) in config.input_blocks().iter().enumerate() {
-            block(block_index, input, 0)?;
+    for step in schedule(config, prefix, loops, suffix) {
+        match step {
+            Step::Block { index, loop_index } => block(index, &config.blocks[index], loop_index)?,
+            Step::Edge(at) => edge(shared, scratch, at, rows)?,
         }
-        copy(cuda, scratch.input_h, scratch.hidden, bytes)?;
-        copy(cuda, scratch.state, scratch.hidden, bytes)?;
     }
+    if let Some(head) = head {
+        head_rows(shared, scratch, rows, head)?;
+    }
+    Ok(())
+}
 
-    let start = config.input_blocks().len();
-    for loop_index in loops {
-        launch(
+/// One step of a stage's walk: a block in a loop, or the work between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Physical block `index`, in loop `loop_index` (loop 0 for a prefix or suffix block).
+    Block { index: usize, loop_index: usize },
+    /// The work between blocks.
+    Edge(Edge),
+}
+
+/// The work a stage's walk runs between its blocks ([edge]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    /// The prefix's end: its rows become the loops' input and their first state.
+    Prefix,
+    /// A loop's start: the state it takes, combined with the input.
+    LoopStart,
+    /// A loop's end: its rows normalised, kept as the state.
+    LoopEnd,
+    /// The suffix's start: the state the last loop left.
+    Suffix,
+}
+
+/// A stage's walk, in order: the input prefix when `prefix`, each of `loops` over the recurrent
+/// blocks, and the output suffix when `suffix`, with the edges between them.
+fn schedule(
+    config: &DoryConfig,
+    prefix: bool,
+    loops: Range<usize>,
+    suffix: bool,
+) -> impl Iterator<Item = Step> + use<> {
+    let input = config.input_blocks().len();
+    let recurrent = config.recurrent_blocks().len();
+    let output = config.output_blocks().len();
+    let blocks = |range: Range<usize>, loop_index: usize| {
+        range.map(move |index| Step::Block { index, loop_index })
+    };
+    let prefix_blocks = blocks(0..if prefix { input } else { 0 }, 0);
+    let looped = loops.flat_map(move |loop_index| {
+        std::iter::once(Step::Edge(Edge::LoopStart))
+            .chain(blocks(input..input + recurrent, loop_index))
+            .chain(std::iter::once(Step::Edge(Edge::LoopEnd)))
+    });
+    let start = input + recurrent;
+    let suffix_blocks = blocks(start..if suffix { start + output } else { start }, 0);
+    prefix_blocks
+        .chain(prefix.then_some(Step::Edge(Edge::Prefix)))
+        .chain(looped)
+        .chain(suffix.then_some(Step::Edge(Edge::Suffix)))
+        .chain(suffix_blocks)
+}
+
+/// The edge `at` of a stage's walk over `rows` rows of `scratch`.
+fn edge(
+    shared: &DeviceShared,
+    scratch: &Scratch,
+    at: Edge,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let cuda = &shared.cuda;
+    let hidden = shared.config.hidden_size;
+    let bytes = hidden * rows * 4;
+    match at {
+        Edge::Prefix => {
+            copy(cuda, scratch.input_h, scratch.hidden, bytes)?;
+            copy(cuda, scratch.state, scratch.hidden, bytes)
+        }
+        Edge::LoopStart => launch(
             cuda,
             shared.kernels.loop_combine,
             (1, rows as u32, 1),
@@ -2377,31 +2429,19 @@ fn walk(
                 scratch.hidden.0,
                 hidden as u64,
             ],
-        )?;
-        for (offset, recurrent) in config.recurrent_blocks().iter().enumerate() {
-            block(start + offset, recurrent, loop_index)?;
+        ),
+        Edge::LoopEnd => {
+            launch(
+                cuda,
+                shared.kernels.justnorm,
+                (1, rows as u32, 1),
+                (256, 1, 1),
+                &[scratch.hidden.0, hidden as u64],
+            )?;
+            copy(cuda, scratch.state, scratch.hidden, bytes)
         }
-        launch(
-            cuda,
-            shared.kernels.justnorm,
-            (1, rows as u32, 1),
-            (256, 1, 1),
-            &[scratch.hidden.0, hidden as u64],
-        )?;
-        copy(cuda, scratch.state, scratch.hidden, bytes)?;
+        Edge::Suffix => copy(cuda, scratch.hidden, scratch.state, bytes),
     }
-
-    if suffix {
-        copy(cuda, scratch.hidden, scratch.state, bytes)?;
-        let start = config.input_blocks().len() + config.recurrent_blocks().len();
-        for (offset, output) in config.output_blocks().iter().enumerate() {
-            block(start + offset, output, 0)?;
-        }
-        if let Some(head) = head {
-            head_rows(shared, scratch, rows, head)?;
-        }
-    }
-    Ok(())
 }
 
 /// The vocabulary head over the rows `head` of the `rows` hidden rows a walk with the suffix left
@@ -2452,6 +2492,36 @@ fn head_rows(
             (config.logit_scale_divisor() as f32).to_bits() as u64,
         ],
     )
+}
+
+/// Copies the first `rows` vocabulary rows the head left in `scratch` to the host.
+fn logits_rows(
+    shared: &DeviceShared,
+    scratch: &Scratch,
+    rows: usize,
+) -> Result<Vec<Vec<f32>>, BackendError> {
+    if rows > LANE_BATCH {
+        return Err(BackendError::new(
+            DEVICE,
+            format!("the head leaves at most {LANE_BATCH} vocabulary rows, not {rows}"),
+        ));
+    }
+    let vocab = shared.config.vocab_size;
+    let mut bytes = vec![0u8; rows * vocab * 4];
+    shared
+        .cuda
+        .copy_dtoh(&mut bytes, &scratch.logits)
+        .map_err(|error| BackendError::new(DEVICE, error))?;
+    Ok(bytes
+        .chunks(vocab * 4)
+        .map(|row| {
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
+                .collect()
+        })
+        .collect())
 }
 
 fn copy(
