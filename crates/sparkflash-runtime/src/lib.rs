@@ -57,7 +57,8 @@ pub use conformance::{
     check_claims, checks_for, run_check, run_generated,
 };
 pub use engine::{
-    Kept as TickKept, RequestId, TickConfig, TickEngine, TickEvent, TickServe, TickSession,
+    Kept as TickKept, PROMPT_PARTS_ENV, RequestId, TickConfig, TickEngine, TickEvent, TickServe,
+    TickSession,
 };
 pub use group::{
     GroupWire, Split, TextWire, TickGroup, end_group, mirror_tick_lanes, mirror_tick_lanes_seen,

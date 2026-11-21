@@ -494,8 +494,8 @@ arm's own prefill chunks, so the chunk boundaries and every bit stay as they wer
 leaves for the next one (caches, the drafter's state, the MTP's stash) is the sequence's own, and
 the shared prefill scratch carries nothing between chunks. A group broadcasts each chunk's rows
 (`LaneRows`) so every rank runs the same rows between the same steps. This was the fused
-engine's schedule; the tick engine runs the same decisions, and `SPARKFLASH_PROMPT_PARTS` went
-with the engine.
+engine's schedule; the tick engine runs the same decisions, and `SPARKFLASH_PROMPT_PARTS=off`
+is refused at start (its `on` is what this engine runs).
 
 An arm that does not split its prompts runs the whole prompt as one chunk.
 

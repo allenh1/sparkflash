@@ -414,6 +414,40 @@ fn release_lane<W: Walk>(
     }
 }
 
+/// The fused engine's prompt-schedule switch. It is no longer read by any engine: the tick
+/// engine always runs a prompt in chunks between the decoders' steps. A value that asks for
+/// something else is refused rather than ignored.
+pub const PROMPT_PARTS_ENV: &str = "SPARKFLASH_PROMPT_PARTS";
+
+/// [PROMPT_PARTS_ENV] as set.
+///
+/// # Errors
+/// A value that asks for a schedule this engine does not run, or a variable that is not UTF-8.
+fn prompt_parts() -> Result<(), String> {
+    match std::env::var(PROMPT_PARTS_ENV) {
+        Err(std::env::VarError::NotPresent) => prompt_parts_request(None),
+        Ok(value) => prompt_parts_request(Some(&value)),
+        Err(error) => Err(format!("{PROMPT_PARTS_ENV}: {error}")),
+    }
+}
+
+/// What a [PROMPT_PARTS_ENV] of `value` asks for. `on` (and unset) is the schedule the tick
+/// engine runs, so it is accepted; `off` asked the fused engine to run every prompt whole as
+/// it arrived, which this engine does not do, and is refused by name.
+///
+/// # Errors
+/// `off`, or a value that is neither `on` nor `off`.
+fn prompt_parts_request(value: Option<&str>) -> Result<(), String> {
+    match value.map(str::trim) {
+        None | Some("" | "on") => Ok(()),
+        Some("off") => Err(format!(
+            "{PROMPT_PARTS_ENV}=off ran every prompt whole in the fused engine, which is retired: \
+             the tick engine chunks every prompt, so unset it"
+        )),
+        Some(other) => Err(format!("{PROMPT_PARTS_ENV}={other} is neither on nor off")),
+    }
+}
+
 /// DeepSeek's tick over one Walk.
 pub struct TickEngine<W: Walk> {
     runtime: Runtime<W>,
@@ -543,6 +577,7 @@ impl<W: Walk> TickEngine<W> {
     /// # Errors
     /// A runtime that refuses the walk, or a lane the arm cannot open.
     pub fn new(walk: W, capacity: usize) -> Result<Self, BackendError> {
+        prompt_parts().map_err(|error| BackendError::new("tick", error))?;
         if capacity == 0 {
             return Err(BackendError::new(
                 "tick",
@@ -2260,4 +2295,23 @@ fn trace_path() -> Option<PathBuf> {
     let value = std::env::var_os("SPARKFLASH_TICK_TRACE")?;
     let path = PathBuf::from(value);
     (!path.as_os_str().is_empty()).then_some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fused engine's switch went with the engine. What it asked for that the tick engine
+    /// runs is accepted; the rest is refused by name rather than ignored.
+    #[test]
+    fn the_retired_prompt_parts_switch_accepts_what_the_engine_runs_and_refuses_the_rest() {
+        for on in [None, Some(""), Some("on")] {
+            assert_eq!(prompt_parts_request(on), Ok(()), "{on:?}");
+        }
+        let off = prompt_parts_request(Some("off")).expect_err("off asked for whole prompts");
+        assert!(off.contains(PROMPT_PARTS_ENV), "{off}");
+        assert!(off.contains("retired"), "{off}");
+        let other = prompt_parts_request(Some("0")).expect_err("not a switch value");
+        assert!(other.contains(PROMPT_PARTS_ENV), "{other}");
+    }
 }
