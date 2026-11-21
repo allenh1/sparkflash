@@ -368,6 +368,20 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
         false
     }
 
+    /// The token the head chooses from one row's `logits`, once the row's input is recorded in
+    /// `sampler`: the sampler's own choice by default. A host whose draws are its own (a sampled
+    /// request's noise a function of the row's position) chooses here; [`Self::ends`] still
+    /// decides whether the token ends the reply.
+    fn choose(&self, sampler: &mut Sampler, logits: &[f32], sampling: &Sampling) -> u32 {
+        sampler.choose(logits, sampling)
+    }
+
+    /// The floats one row of [`Self::logits`] holds: the vocabulary by default. A host whose
+    /// head trims a padded vocabulary states the trimmed width.
+    fn logits_width(&self) -> usize {
+        self.vocab()
+    }
+
     /// How many positions past the rewind point a sequence's state can still go back from
     /// ([`Walk::rewind_slack`]): every position by default; a host whose cache slides states
     /// its reach.
@@ -725,8 +739,9 @@ impl<H: PlanHost> PlanWalk<H> {
 
 /// The head of `rows`, from the residual rows the last walk left: each row's input recorded in
 /// its sampler first and a lane's held answer taken as it stands ([`PlanHost::answered`]); then
-/// one device pick a row when every other row takes its argmax, else the logits and the host
-/// sampler. A token the host ends the reply on ([`PlanHost::ends`]) answers `None`.
+/// one device pick a row when every other row takes its argmax and the host keeps no logits
+/// ([`PlanHost::KEEPS_LOGITS`]), else the logits and the host's choice ([`PlanHost::choose`]).
+/// A token the host ends the reply on ([`PlanHost::ends`]) answers `None`.
 ///
 /// # Errors
 /// The host's failure, or a host that answers another number of rows.
@@ -781,10 +796,10 @@ pub fn plan_head<H: PlanHost>(
     } else {
         // A sampling request needs the row: temperature, top-k, top-p, penalties and the draw
         // stay on the host over the logits the step copies back.
-        let vocab = host.vocab();
+        let width = host.logits_width();
         let logits: Vec<Vec<f32>> = if contiguous {
             host.logits(scratch, 0, asked)?
-                .chunks(vocab)
+                .chunks(width)
                 .map(<[f32]>::to_vec)
                 .collect()
         } else {
@@ -800,7 +815,7 @@ pub fn plan_head<H: PlanHost>(
             // The row's token is already recorded above, once: a second record here would count
             // every sampled token twice in the penalties and leave the history a token a step
             // ahead of the position a rewind truncates it to.
-            let chosen = seq.sampler.choose(&logits, &seq.sampling);
+            let chosen = host.choose(&mut seq.sampler, &logits, &seq.sampling);
             steps[at] = Some(StepOutput {
                 logits,
                 next_token: ends(chosen),
