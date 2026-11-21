@@ -192,6 +192,10 @@ const IGNORABLE: &[(&str, &str)] = &[
         "library_name",
         "the producer library that wrote the file; the arithmetic is read from its typed fields",
     ),
+    (
+        "producer",
+        "the ModelOpt producer block that names the tool and version; the arithmetic is read from quant_algo and quantized_layers",
+    ),
 ];
 
 /// The ignorable reason for a key name, if it has one.
@@ -287,16 +291,18 @@ fn collect(
                 let full = child_path(path, name);
                 if !reads.contains(&full) {
                     if let Some(reason) = ignorable_reason(name) {
+                        // An ignorable key's reason covers its value too: a producer metadata
+                        // block is ignored whole, not one member at a time.
                         ignored.push(IgnoredKey {
                             path: full.clone(),
                             reason,
                         });
-                    } else {
-                        unknown.push(UnknownKey {
-                            fix: UnknownKey::fix(&full),
-                            path: full.clone(),
-                        });
+                        continue;
                     }
+                    unknown.push(UnknownKey {
+                        fix: UnknownKey::fix(&full),
+                        path: full.clone(),
+                    });
                 }
                 collect(child, &full, reads, unknown, ignored);
             }
@@ -489,44 +495,215 @@ mod tests {
         ),
     ];
 
-    #[test]
-    fn the_five_carried_configs_consume_every_key() {
-        let mut unread = Vec::new();
+    /// Keys present in a carried config that no shared-reader parse consumes yet.
+    ///
+    /// This is the honest residual, not a permission list: the test below fails when a key here
+    /// stops being unread (remove it) or when a key outside this list becomes unread (teach the
+    /// reader or record the new owner). The owner column says where the read must land:
+    /// `model crate parser` (its typed parser already reads it), `description work` (the shared
+    /// reader must learn it), `truly unread` (a duplicate declaration nothing needs), or
+    /// `vision reader (piece A)` (the vision stack parse A lands in parallel).
+    ///
+    /// The zero-key milestone is reached when this table is empty.
+    #[rustfmt::skip]
+    const REMAINING: &[(&str, &str, &str)] = &[
+        ("DeepSeek-V4.1-Flash", "text_config.dspark_markov_rank", "model crate parser"),
+        ("DeepSeek-V4.1-Flash", "text_config.dspark_noise_token_id", "model crate parser"),
+        ("DeepSeek-V4.1-Flash", "text_config.model_type", "truly unread (duplicate declaration)"),
+        ("DeepSeek-V4.1-Flash", "text_config.num_key_value_heads", "model crate parser"),
+        ("DeepSeek-V4.1-Flash", "vision_config.downsample_ratio", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.hidden_size", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.intermediate_size", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.max_image_tokens", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.max_wh_ratio", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.min_pixels", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.model_type", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.num_attention_heads", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.num_hidden_layers", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.patch_size", "vision reader (piece A)"),
+        ("DeepSeek-V4.1-Flash", "vision_config.rope_theta", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "quantization_config.modules_to_not_convert", "description work"),
+        ("GLM-5.3-Flash", "text_config.index_kpool_compress", "description work"),
+        ("GLM-5.3-Flash", "text_config.index_share_for_mtp_iteration", "description work"),
+        ("GLM-5.3-Flash", "text_config.indexer_rope_interleave", "description work"),
+        ("GLM-5.3-Flash", "text_config.linear_attn_config.full_attn_layers", "description work"),
+        ("GLM-5.3-Flash", "text_config.linear_attn_config.kda_layers", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.mla_use_nope", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.model_type", "truly unread (duplicate declaration)"),
+        ("GLM-5.3-Flash", "text_config.moe_router_dtype", "description work"),
+        ("GLM-5.3-Flash", "text_config.num_key_value_heads", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.qk_head_dim", "description work"),
+        ("GLM-5.3-Flash", "tie_word_embeddings", "truly unread (duplicate declaration)"),
+        ("GLM-5.3-Flash", "vision_config.attention_bias", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.depth", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.hidden_act", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.hidden_size", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.image_size", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.in_channels", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.intermediate_size", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.model_type", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.num_heads", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.out_hidden_size", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.patch_size", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.projection_intermediate_size", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.rms_norm_eps", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.spatial_merge_size", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.swiglu_limit", "vision reader (piece A)"),
+        ("GLM-5.3-Flash", "vision_config.temporal_patch_size", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "language_model_only", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.dynamic", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.group_size", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.num_bits", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.type", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.targets", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.dynamic", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.group_size", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.num_bits", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.type", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.targets", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.dynamic", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.group_size", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.num_bits", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.type", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.group_size", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.kv_cache_quant_algo", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.quantized_layers.model.language_model.layers.1.ple.ple_embedding.ngram_embedding.quant_algo", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.full_attention_interval", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mamba_ssm_dtype", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.model_type", "truly unread (duplicate declaration)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.layer_types", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.mtp_use_hidden_state_from_layer", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.rope_theta", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.number_of_conv_states", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.rope_parameters.mrope_interleaved", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.rope_parameters.rope_type", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "tie_word_embeddings", "truly unread (duplicate declaration)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.deepstack_visual_indexes", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.depth", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.hidden_act", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.hidden_size", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.in_channels", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.intermediate_size", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.model_type", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.num_heads", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.num_position_embeddings", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.out_hidden_size", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.patch_size", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.spatial_merge_size", "vision reader (piece A)"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.temporal_patch_size", "vision reader (piece A)"),
+        ("Inkling-2-Small", "mtp_config.head_dim", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.hidden_size", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.intermediate_size", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.local_layer_ids", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.markov_head_type", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.markov_rank", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.max_position_embeddings", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.num_attention_heads", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.num_key_value_heads", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.o_bias", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.q_bias", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.rms_norm_eps", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.rope_theta", "description work (nested draft head)"),
+        ("Inkling-2-Small", "mtp_config.sliding_window_size", "description work (nested draft head)"),
+        ("Inkling-2-Small", "text_config.final_norm_pre_affine", "description work"),
+        ("Inkling-2-Small", "text_config.o_bias", "description work"),
+        ("Inkling-2-Small", "text_config.pre_norm_pre_affine", "description work"),
+        ("Inkling-2-Small", "text_config.q_bias", "description work"),
+        ("Inkling-2-Small", "text_config.swa_head_dim", "description work"),
+        ("Inkling-2-Small", "text_config.swa_num_attention_heads", "description work"),
+        ("Inkling-2-Small", "text_config.swa_num_key_value_heads", "description work"),
+        ("Inkling-2-Small", "text_config.use_gate_bias", "description work"),
+        ("Inkling-2-Small", "vision_config.adapter_merge_size", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.hidden_size", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.layer_norm_eps", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.mlp_ratio", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.native_patch_size", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.num_attention_heads", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.num_hidden_layers", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.posemb_grid_size", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.projection_hidden_dim", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.projector_bias", "vision reader (piece A)"),
+        ("Inkling-2-Small", "vision_config.temporal_patch_size", "vision reader (piece A)"),
+        ("Dory1.0-4B-BF16", "mlp_bias", "model crate parser"),
+        ("Dory1.0-4B-BF16", "ngpt_alpha_init", "model crate parser"),
+        ("Dory1.0-4B-BF16", "rope_parameters.full_attention.rope_type", "description work"),
+        ("Dory1.0-4B-BF16", "rope_parameters.sliding_attention.rope_type", "description work"),
+    ];
+
+    /// The unknown keys a carried config reports, as `(config, path)`.
+    fn unknown_pairs() -> std::collections::BTreeSet<(String, String)> {
+        let mut pairs = std::collections::BTreeSet::new();
         for (name, text) in CARRIED {
             let (_, coverage) =
                 crate::Architecture::from_json_with_coverage(text).expect("a carried config");
             for unknown in coverage.unknown_keys() {
-                unread.push(format!("{name}: {}", unknown.path));
+                pairs.insert(((*name).to_owned(), unknown.path.clone()));
             }
         }
+        pairs
+    }
+
+    #[test]
+    fn the_five_carried_configs_leave_only_the_pinned_residual() {
+        let expected: std::collections::BTreeSet<(String, String)> = REMAINING
+            .iter()
+            .map(|(name, path, _)| ((*name).to_owned(), (*path).to_owned()))
+            .collect();
+        let actual = unknown_pairs();
+        let unexpected: Vec<&(String, String)> = actual.difference(&expected).collect();
+        let resolved: Vec<&(String, String)> = expected.difference(&actual).collect();
         assert!(
-            unread.is_empty(),
-            "config keys no read consumed: {unread:#?}"
+            unexpected.is_empty(),
+            "config keys no read consumed and no owner pinned: {unexpected:#?}"
+        );
+        assert!(
+            resolved.is_empty(),
+            "config keys are read now; remove them from REMAINING: {resolved:#?}"
         );
     }
 
     /// The same check against the config.json files installed in the Hugging Face cache.
     ///
-    /// Set SPARKFLASH_CONFIG_SNAPSHOTS to a colon-separated list of config paths to run it.
-    /// It is a host check, not a fixture check: the fixture test above always runs, and this
-    /// one proves the installed snapshot has not drifted from it.
+    /// Set SPARKFLASH_CONFIG_SNAPSHOTS to a colon-separated list of config paths in CARRIED
+    /// order (DeepSeek, GLM, Qwen, Inkling, Dory). This is a host check, not a fixture check:
+    /// it proves each installed snapshot reports exactly the fixture's residual, so the fixtures
+    /// have not drifted from the snapshots.
     #[test]
-    fn the_installed_snapshots_consume_every_key() {
+    fn the_installed_snapshots_match_the_carried_fixtures() {
         let Ok(paths) = std::env::var("SPARKFLASH_CONFIG_SNAPSHOTS") else {
             return;
         };
-        for path in paths.split(':').filter(|path| !path.is_empty()) {
+        let paths: Vec<&str> = paths.split(':').filter(|path| !path.is_empty()).collect();
+        assert_eq!(
+            paths.len(),
+            CARRIED.len(),
+            "name one snapshot config per carried config, in order"
+        );
+        for ((name, fixture), path) in CARRIED.iter().zip(paths) {
+            let (_, expected) =
+                crate::Architecture::from_json_with_coverage(fixture).expect("a carried fixture");
             let text = std::fs::read_to_string(path).expect("an installed config.json");
-            let (_, coverage) =
+            let (_, actual) =
                 crate::Architecture::from_json_with_coverage(&text).expect("an installed config");
-            let unknown: Vec<&str> = coverage
+            let expected: Vec<&str> = expected
                 .unknown_keys()
                 .iter()
                 .map(|unknown| unknown.path.as_str())
                 .collect();
-            assert!(
-                unknown.is_empty(),
-                "{path} has config keys no read consumed: {unknown:#?}"
+            let actual: Vec<&str> = actual
+                .unknown_keys()
+                .iter()
+                .map(|unknown| unknown.path.as_str())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "{name} at {path} differs from its fixture"
             );
         }
     }
