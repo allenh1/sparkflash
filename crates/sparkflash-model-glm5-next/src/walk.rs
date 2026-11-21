@@ -16,7 +16,8 @@
 //!
 //! The runtime drives an arm: it owns the prompt parts, the history, reuse, rewind, the lane
 //! pool, give-back and the ledger, and this walk supplies only what GLM alone knows. GLM's
-//! serving construction opens [sparkflash_runtime::Fusion] over a [Runtime] of this walk
+//! serving construction opens [sparkflash_runtime::Fusion] over a
+//! [`sparkflash_runtime::Runtime`] of this walk
 //! ([crate::serve::Glm5NextDeviceBackend::enable_fusion]); nothing of the arm's own session,
 //! prompt-part or round glue is left.
 //!
@@ -49,9 +50,8 @@ use sparkflash_model::{DepthPolicy, Queue, Speculator, kept_to_end, verdict};
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{
     ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, HeadRow, LaneState, Limits,
-    NoVision, OutputConstraint, Pass, PassKind, PassMask, Region, Residual, Runtime, Segment,
-    Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities, check_checkpoint,
-    check_rewind,
+    NoVision, OutputConstraint, Pass, PassKind, PassMask, Region, Residual, Segment, Segments,
+    StateKind, StateLayout, StepWall, Walk, WalkCapabilities, check_checkpoint, check_rewind,
 };
 use sparkflash_weights::tp::{BitGatherHandle, TpRuntime};
 
@@ -623,22 +623,6 @@ fn layout_of(plan: sparkflash_model::KvPlan) -> StateLayout {
     StateLayout::new(regions)
 }
 
-/// The runtime over a GLM walk: the serving arm the backend's [sparkflash_runtime::Fusion]
-/// opens.
-///
-/// # Errors
-/// A device allocation the first slot cannot make, a [sparkflash_runtime::REWIND_ENV] that is
-/// not a switch, or a [sparkflash_runtime::JOINT_ROUNDS_ENV] that is not one.
-pub(crate) fn runtime(
-    shared: Arc<Shared>,
-    context_limit: usize,
-) -> Result<Runtime<GlmWalk>, BackendError> {
-    let walk = GlmWalk::new(shared, context_limit)?;
-    // No free-memory figure is measured for the chunk: the rank's scratch decides the width,
-    // which is what its profile's prefill.chunk sized.
-    Runtime::new(walk, 0)
-}
-
 impl Walk for GlmWalk {
     type Seq = GlmSequence;
     type Hidden = GlmHidden;
@@ -878,7 +862,7 @@ impl GlmWalk {
 mod tests {
     use sparkflash_model::ledger::Strategy;
     use sparkflash_runtime::testing::{ShapeWalk, format_rule, token_bytes};
-    use sparkflash_runtime::{Fixture, Mode, Walk, WalkFixture, ledger_for};
+    use sparkflash_runtime::{Fixture, Mode, Runtime, Walk, WalkFixture, ledger_for};
 
     use super::*;
 

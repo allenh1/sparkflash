@@ -37,8 +37,8 @@ use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculatio
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
     ChunkPolicy, ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, HeadInput,
-    HeadRow, Hidden, LaneState, Limits, Pass, PassKind, PassMask, Region, Residual, Runtime,
-    Segment, Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities, check_checkpoint,
+    HeadRow, Hidden, LaneState, Limits, Pass, PassKind, PassMask, Region, Residual, Segment,
+    Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities, check_checkpoint,
     check_rewind,
 };
 
@@ -385,18 +385,6 @@ fn pass_rows(chunk: usize) -> usize {
 /// [MAX_BATCH] is the arm's own batch width.
 fn walk_limits(chunk: usize, context: usize, capacity: usize) -> Limits {
     Limits::new(pass_rows(chunk), context).with_members(capacity.clamp(1, MAX_BATCH))
-}
-
-/// The arm's runtime: the tick engine's executor and the group mirror see this one type.
-///
-/// # Errors
-/// A device allocation or a [sparkflash_runtime::REWIND_ENV] that is not a switch.
-pub(super) fn runtime(
-    shared: Arc<SequenceShared>,
-    context_limit: usize,
-    capacity: usize,
-) -> Result<Runtime<QwenWalk>, BackendError> {
-    Runtime::new(QwenWalk::new(shared, context_limit, capacity)?, 0)
 }
 
 /// The arm's draft source: the checkpoint's MTP stage, or a loaded DFlash 2 head.
