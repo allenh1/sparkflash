@@ -1848,7 +1848,7 @@ impl StageCore {
         shared
             .kernels
             .justnorm
-            .run(shared, scratch.attention, q_width, count)?;
+            .run(shared.as_ref(), scratch.attention, q_width, count)?;
         gemv_batch(
             cuda,
             &shared.kernels,
@@ -1969,7 +1969,7 @@ impl StageCore {
         shared
             .kernels
             .justnorm
-            .run(shared, self.scratch.attention, q_width, batch)?;
+            .run(shared.as_ref(), self.scratch.attention, q_width, batch)?;
         gemv_batch(
             cuda,
             &shared.kernels,

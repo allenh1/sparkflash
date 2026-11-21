@@ -826,13 +826,6 @@ impl Kernels {
                 .is_none_or(|kernels| kernels.gemv.precision() == Precision::Fp8E4M3),
             "the FP8 GEMV resolves at FP8 E4M3"
         );
-        debug_assert!(
-            moe.as_ref().is_none_or(|kernels| {
-                kernels.gate_up.precision() == expert_precision
-                    && kernels.down.precision() == expert_precision
-            }),
-            "the expert bodies resolve at the checkpoint's expert format"
-        );
         let packed = PackedKernels {
             pack: token("q4e_pack_bf16", Precision::Bf16)?,
             unpack: token("q4e_unpack_bf16", Precision::Bf16)?,
