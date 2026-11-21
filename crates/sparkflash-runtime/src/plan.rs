@@ -230,6 +230,11 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
     /// The roles beyond the token mixer and the feed-forward this host frames
     /// ([`plan_layer`]'s `hosted`); every other role is refused by name.
     const ROLES: &'static [StepRole] = &[];
+    /// Whether every head row hands its logits over, a greedy one too: a host that reads every
+    /// row back whatever the pick, whose sessions have always answered the row's logits. A greedy
+    /// row then takes the sampler's own argmax over them, the pick [`Self::choices`] would make.
+    /// Off by default: a greedy row's pick is the host's [`Self::choices`].
+    const KEEPS_LOGITS: bool = false;
 
     /// The number of layers.
     fn layers(&self) -> usize;
@@ -738,9 +743,10 @@ pub fn plan_head<H: PlanHost>(
     let ends = |token: u32| (!host.ends(token)).then_some(token);
     // A greedy sampler whose penalties change nothing takes the row's argmax as it stands.
     // Choose it on the device and copy one u32 a row, not the vocabulary.
-    if open
-        .iter()
-        .all(|&at| rows[at].seq.sampler.takes_argmax(&rows[at].seq.sampling))
+    if !H::KEEPS_LOGITS
+        && open
+            .iter()
+            .all(|&at| rows[at].seq.sampler.takes_argmax(&rows[at].seq.sampling))
     {
         let picks: Vec<u32> = if contiguous {
             host.choices(scratch, 0, asked)?
