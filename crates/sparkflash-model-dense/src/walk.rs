@@ -14,8 +14,9 @@
 
 //! The dense arm as a Walk.
 //!
-//! The runtime drives it: [runtime] opens a [`sparkflash_runtime::Runtime`] over this walk, and
-//! the runtime owns the prompt parts, history, reuse, rewind, lane pool and ledger. This walk
+//! The runtime drives it: the arm's serving entry opens a [`sparkflash_runtime::Runtime`] over
+//! this walk, and the runtime owns the prompt parts, history, reuse, rewind, lane pool and
+//! ledger. This walk
 //! routes every Pass to the same free walk the old serving loop called, with the arm's
 //! [`WidePolicy::DENSE`] for every pass: a prompt chunk takes the wide tile, and a token step
 //! takes the tile once it batches more than the row GEMV's eight rows (below that the policy still
@@ -34,7 +35,7 @@ use sparkflash_model::ledger::State;
 use sparkflash_ops::projection::WidePolicy;
 use sparkflash_runtime::{
     Absent, ComputeDeclaration, HeadRow, Hidden, LaneState, Limits, NoVision, Pass, PassKind,
-    PassMask, Region, Runtime, Segment, Segments, StateKind, StateLayout, Walk, WalkCapabilities,
+    PassMask, Region, Segment, Segments, StateKind, StateLayout, Walk, WalkCapabilities,
     check_checkpoint, check_rewind,
 };
 
@@ -109,20 +110,6 @@ impl DenseWalk {
             .lock()
             .map_err(|_| BackendError::new(DEVICE, "the walk's scratch is poisoned"))
     }
-}
-
-/// The runtime over a dense walk for `shared`'s weights and `capacity` lanes: the serving arm the
-/// dense backend opens. The runtime owns the prompt parts, history, reuse, rewind, lane pool and
-/// ledger; the walk only runs rows and heads them.
-///
-/// # Errors
-/// A device allocation the walk's scratch cannot make, or a `SPARKFLASH_REWIND` that is not a
-/// switch.
-pub(crate) fn runtime(
-    shared: Arc<Shared>,
-    capacity: usize,
-) -> Result<Runtime<DenseWalk>, BackendError> {
-    Runtime::new(walk(shared, capacity)?, 0)
 }
 
 /// The dense walk for `shared`'s weights and `capacity` lanes, for the tick engine's thread.
@@ -347,7 +334,7 @@ impl Walk for DenseWalk {
 #[cfg(test)]
 mod tests {
     use sparkflash_runtime::testing::format_rule;
-    use sparkflash_runtime::{Fixture, FusedArm, WalkFixture};
+    use sparkflash_runtime::{Fixture, FusedArm, Runtime, WalkFixture};
 
     use super::*;
 
