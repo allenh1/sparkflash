@@ -25,19 +25,20 @@
 //! is missing; it never falls back to another arithmetic.
 //!
 //! A process runs one [DoryStage] of the looped walk. The whole model is the single-node
-//! [DoryDeviceBackend]; a latent-recurrence group ([crate::recurrence]) gives each rank a run of
+//! [DoryDeviceBackend], which serves on the shared tick engine through [walk::DoryWalk]; a
+//! latent-recurrence group ([crate::recurrence]) gives each rank a run of
 //! loops, rank 0 the embedding and the input prefix, and the last rank the output suffix and the
 //! vocabulary head. A stage uploads and caches only its own blocks, and every stage runs the same
 //! forward body, so a row's bits do not depend on where its loops ran.
 
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::{Image, dory_cubin, qwen4_exp_cubin, qwen4_prefill_cubin};
 use sparkflash_model::ModelDescriptor;
-use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession};
 use sparkflash_ops::formats::{Bf16, FormatKind, Mat, Scales, Tensor, upload as upload_format};
 use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement};
@@ -48,7 +49,7 @@ use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog};
 use sparkflash_ops::projection::{
     Route, WIDE_COLUMNS, WIDE_SHARED, WidePolicy, WideTile, route_bf16,
 };
-use sparkflash_ops::sampler::Sampler;
+use sparkflash_runtime::{Runtime, RuntimeSession, TickServe};
 #[cfg(test)]
 use sparkflash_weights::TensorSpec;
 use sparkflash_weights::safetensors::open_checkpoint;
@@ -56,6 +57,8 @@ use sparkflash_weights::{DType, WeightSource};
 
 use crate::config::{Block, DoryConfig, KvCacheMode, Partition};
 use crate::tensor::DoryTensorPlan;
+
+mod walk;
 
 /// The host-facing name of a device refusal.
 const DEVICE: &str = "dory_device";
@@ -437,9 +440,16 @@ impl Drop for DeviceShared {
 }
 
 /// The Dory model on the device.
+///
+/// Its sessions are the shared tick engine's ([TickServe]) over [walk::DoryWalk]: the runtime
+/// owns the prompt parts, the history, reuse, the rewind point, the lanes and the ledger, and
+/// this arm supplies the walk and its head.
 pub struct DoryDeviceBackend {
     descriptor: ModelDescriptor,
     shared: Arc<DeviceShared>,
+    /// The engine, started by [Self::enable_fusion]. A backend that is never told serves its
+    /// sessions on a runtime of their own.
+    serve: OnceLock<Arc<TickServe<walk::DoryWalk>>>,
 }
 
 impl DoryDeviceBackend {
@@ -472,6 +482,7 @@ impl DoryDeviceBackend {
         Ok(Self {
             descriptor,
             shared: Arc::new(shared),
+            serve: OnceLock::new(),
         })
     }
 
@@ -479,6 +490,57 @@ impl DoryDeviceBackend {
     #[must_use]
     pub fn weight_bytes(&self) -> usize {
         self.shared.allocated_bytes
+    }
+
+    /// The most lanes one process steps: the rows of one batched token pass
+    /// ([StageCore::forward_lanes]).
+    #[must_use]
+    pub const fn lane_limit(&self) -> usize {
+        LANE_BATCH
+    }
+
+    /// The arm as a bare walk, for the generated conformance checks: they open the runtime
+    /// themselves, so a check can drive a prompt, a continued turn and a rewind.
+    ///
+    /// # Errors
+    /// A scratch allocation the device refuses.
+    pub(crate) fn walk_arm(&self) -> Result<walk::DoryWalk, BackendError> {
+        walk::DoryWalk::new(Arc::clone(&self.shared))
+    }
+
+    /// Serves this backend's sessions on `capacity` lanes of the shared tick engine: their token
+    /// rows share one pass, a prompt runs a chunk at a time between the lanes' steps, and a lane
+    /// keeps its conversation between requests. Each lane holds the KV caches of the served
+    /// context, and every lane steps through one set of row buffers. Call it before the first
+    /// session opens, with the driver's concurrency; a backend that is never told serves each
+    /// session on a runtime of its own.
+    ///
+    /// # Errors
+    /// A capacity outside 1..=[Self::lane_limit], lanes that are already open, a scratch or
+    /// cache the device refuses, or a thread that cannot start.
+    pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
+        if self.serve.get().is_some() {
+            return Err(BackendError::new(
+                DEVICE,
+                "the Dory device arm's lanes are already open",
+            ));
+        }
+        let serve = self.start(capacity)?;
+        self.serve = OnceLock::from(serve);
+        Ok(())
+    }
+
+    fn start(&self, capacity: usize) -> Result<Arc<TickServe<walk::DoryWalk>>, BackendError> {
+        if capacity == 0 || capacity > LANE_BATCH {
+            return Err(BackendError::new(
+                DEVICE,
+                format!(
+                    "the Dory device arm steps 1..={LANE_BATCH} lanes in one process, not \
+                     {capacity}"
+                ),
+            ));
+        }
+        TickServe::start(self.walk_arm()?, capacity)
     }
 }
 
@@ -545,11 +607,11 @@ fn profile_refusal(profile: &sparkflash_model::profile::ModelProfile) -> Result<
         );
     }
     if let Some(concurrency) = profile.runtime.concurrency
-        && concurrency > 1
+        && concurrency > LANE_BATCH
     {
         return Err(format!(
-            "the Dory device arm's process holds one sequence; use --concurrency on a \
-             recurrence group, not runtime.concurrency = {concurrency}"
+            "the Dory device arm steps at most {LANE_BATCH} lanes in one process, not \
+             runtime.concurrency = {concurrency}"
         ));
     }
     if matches!(
@@ -1034,13 +1096,17 @@ impl ModelBackend for DoryDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        let core = StageCore::open(Arc::clone(&self.shared))
-            .map_err(|error| BackendError::new(DEVICE, error))?;
-        Ok(Box::new(DoryDeviceSession {
-            core,
-            sampler: Sampler::new(),
-            sampling: Sampling::default(),
-        }))
+        match self.serve.get() {
+            // A request is a handle on the engine's lanes, so its prompt shares a pass with
+            // the other requests' rows and its lane keeps the conversation between them.
+            Some(serve) => Ok(Box::new(serve.open()?)),
+            // A backend nobody told about lanes serves each session on a runtime of its own, as
+            // the arm's own session did: one sequence, its own caches and its own scratch.
+            None => {
+                let runtime = Runtime::new(self.walk_arm()?, 0)?;
+                Ok(Box::new(RuntimeSession::open(runtime)?))
+            }
+        }
     }
 }
 
@@ -1326,6 +1392,8 @@ impl Drop for StageCore {
 }
 
 impl StageCore {
+    /// One sequence on a scratch set of its own: a session that shares no pass with another.
+    #[cfg(test)]
     pub(crate) fn open(shared: Arc<DeviceShared>) -> Result<Self, String> {
         shared.cuda.make_current()?;
         let scratch = Arc::new(OwnedScratch {
@@ -2086,26 +2154,6 @@ impl StageCore {
     }
 }
 
-/// The whole model's sequence, with the shared sampler over its logits.
-struct DoryDeviceSession {
-    core: StageCore,
-    sampler: Sampler,
-    sampling: Sampling,
-}
-
-impl DoryDeviceSession {
-    /// One row or one chunk of the whole walk, returning the last row's logits when asked.
-    fn run(&mut self, tokens: &[u32], want_logits: bool) -> Result<Vec<f32>, BackendError> {
-        self.core.embed(tokens)?;
-        self.core.forward(tokens.len(), want_logits)?;
-        if want_logits {
-            self.core.read_logits()
-        } else {
-            Ok(Vec::new())
-        }
-    }
-}
-
 /// The rows at or below which gemv_batch hands a chunk to the token GEMV rather than the batched
 /// tensor-core GEMM.
 const TOKEN_ROWS: usize = 8;
@@ -2146,54 +2194,6 @@ pub(crate) fn prompt_chunks(mode: KvCacheMode, prompt: usize, width: usize) -> V
         last.start -= PREFILL_Q;
     }
     chunks
-}
-
-impl ModelSession for DoryDeviceSession {
-    fn set_sampling(&mut self, sampling: Sampling) {
-        // The penalties, temperature, top-k and top-p run on the host over the row every step
-        // already copies back, so a non-greedy request is served rather than approximated.
-        self.sampling = sampling;
-        self.sampler.reset();
-    }
-
-    fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        if tokens.is_empty() {
-            return Err(BackendError::new(DEVICE, "the prompt has no tokens"));
-        }
-        let chunks = prompt_chunks(
-            self.core.shared.config.recurrent_kv_cache_mode,
-            tokens.len(),
-            PREFILL_BATCH,
-        );
-        let mut logits = Vec::new();
-        for (index, chunk) in chunks.iter().enumerate() {
-            let last = index + 1 == chunks.len();
-            logits = self.run(&tokens[chunk.clone()], last)?;
-        }
-        self.sampler.reset();
-        self.sampler.record_prompt(tokens);
-        let token = self.sampler.choose(&logits, &self.sampling);
-        Ok(StepOutput {
-            next_token: self.core.shared.config.next_token(token),
-            logits,
-            draft: Vec::new(),
-        })
-    }
-
-    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        let logits = self.run(&[token], true)?;
-        self.sampler.record(token);
-        let chosen = self.sampler.choose(&logits, &self.sampling);
-        Ok(StepOutput {
-            next_token: self.core.shared.config.next_token(chosen),
-            logits,
-            draft: Vec::new(),
-        })
-    }
-
-    fn reusable_prefix(&self) -> Option<&[u32]> {
-        None
-    }
 }
 
 /// The scratch `lanes` share, checked for one batched pass of `rows` rows: one row a lane, at
@@ -2398,41 +2398,60 @@ fn walk(
             block(start + offset, output, 0)?;
         }
         if let Some(head) = head {
-            let (Some(lm_head), Some(logit_scale)) =
-                (shared.weights.lm_head.as_ref(), shared.weights.logit_scale)
-            else {
-                return Err(head_refusal());
-            };
-            if head.len() > LANE_BATCH || head.end > rows {
-                return Err(BackendError::new(
-                    DEVICE,
-                    format!("a head over rows {head:?} of {rows}"),
-                ));
-            }
-            gemv_batch(
-                cuda,
-                &shared.kernels,
-                &shared.packed,
-                lm_head,
-                scratch.hidden.offset(head.start * hidden * 4),
-                scratch.logits,
-                head.len(),
-            )?;
-            launch(
-                cuda,
-                shared.kernels.logit_scale,
-                (config.vocab_size.div_ceil(256) as u32, head.len() as u32, 1),
-                (256, 1, 1),
-                &[
-                    logit_scale.0,
-                    scratch.logits.0,
-                    config.vocab_size as u64,
-                    (config.logit_scale_divisor() as f32).to_bits() as u64,
-                ],
-            )?;
+            head_rows(shared, scratch, rows, head)?;
         }
     }
     Ok(())
+}
+
+/// The vocabulary head over the rows `head` of the `rows` hidden rows a walk with the suffix left
+/// in `scratch`, into the logits rows from 0.
+///
+/// [walk] ends with it when it is asked for a head; [walk::DoryWalk] calls it once the runtime
+/// names the rows it wants, with nothing queued between the suffix and these launches.
+fn head_rows(
+    shared: &DeviceShared,
+    scratch: &Scratch,
+    rows: usize,
+    head: Range<usize>,
+) -> Result<(), BackendError> {
+    let cuda = &shared.cuda;
+    let config = &shared.config;
+    let (Some(lm_head), Some(logit_scale)) =
+        (shared.weights.lm_head.as_ref(), shared.weights.logit_scale)
+    else {
+        return Err(BackendError::new(
+            DEVICE,
+            "the vocabulary head belongs to the last recurrence rank",
+        ));
+    };
+    if head.len() > LANE_BATCH || head.end > rows {
+        return Err(BackendError::new(
+            DEVICE,
+            format!("a head over rows {head:?} of {rows}"),
+        ));
+    }
+    gemv_batch(
+        cuda,
+        &shared.kernels,
+        &shared.packed,
+        lm_head,
+        scratch.hidden.offset(head.start * config.hidden_size * 4),
+        scratch.logits,
+        head.len(),
+    )?;
+    launch(
+        cuda,
+        shared.kernels.logit_scale,
+        (config.vocab_size.div_ceil(256) as u32, head.len() as u32, 1),
+        (256, 1, 1),
+        &[
+            logit_scale.0,
+            scratch.logits.0,
+            config.vocab_size as u64,
+            (config.logit_scale_divisor() as f32).to_bits() as u64,
+        ],
+    )
 }
 
 fn copy(
@@ -2853,7 +2872,13 @@ mod tests {
         );
         assert!(refused(|profile| profile.speculation.enabled = Some(true)).contains("drafting"));
         assert!(refused(|profile| profile.sequence.parallel = Some(true)).contains("sequence"));
-        assert!(refused(|profile| profile.runtime.concurrency = Some(4)).contains("one sequence"));
+        assert!(
+            refused(|profile| profile.runtime.concurrency = Some(LANE_BATCH + 1)).contains("lanes")
+        );
+        // The shared serving default is four lanes, which the arm steps in one process now.
+        let mut four = ModelProfile::default();
+        four.runtime.concurrency = Some(LANE_BATCH);
+        assert!(profile_refusal(&four).is_ok());
     }
 
     #[test]
