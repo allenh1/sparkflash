@@ -121,6 +121,8 @@ if [ -z "$CRATE" ]; then
             CRATE="sparkflash-model-qwen4-exp" ;;
         inkling|inkling2|inkling-2-small|inkling2-small)
             CRATE="sparkflash-model-inkling2" ;;
+        dory|dory1|dory1.0|dory10|dory-1.0-4b|dory-1.0-4b-bf16)
+            CRATE="sparkflash-model-dory" ;;
         runtime) CRATE="sparkflash-runtime" ;;
         *)
             echo "onboard-gate: no conformance crate for arm \"$ARM\"; pass --crate" >&2

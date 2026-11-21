@@ -516,13 +516,12 @@ mod tests {
         let walk = fixture.walk;
         let prompt: Vec<u32> = (1..=40).collect();
         let mut whole = walk.open().expect("a sequence");
-        let hidden = walk
+        let mut hidden = walk
             .walk(
                 &mut [Segment::new(&mut whole, &prompt)],
                 Pass::bulk(prompt.len()).with_prompt_end(0),
             )
             .expect("the whole prompt");
-        let mut hidden = hidden;
         let last = hidden.rows - 1;
         let cold = walk
             .head(
@@ -537,13 +536,12 @@ mod tests {
             Pass::bulk(head.len()).with_prompt_end(tail.len()),
         )
         .expect("the prompt but its last id");
-        let hidden = walk
+        let mut hidden = walk
             .walk(
                 &mut [Segment::new(&mut rewound, tail)],
                 Pass::bulk(tail.len()).with_prompt_end(0),
             )
             .expect("the last id on its own");
-        let mut hidden = hidden;
         let last = hidden.rows - 1;
         let warm = walk
             .head(
@@ -581,7 +579,6 @@ mod tests {
                     )
                     .expect("a pass");
             }
-            let mut hidden = hidden;
             let last = hidden.rows - 1;
             let step = walk
                 .head(&mut hidden, &mut [HeadRow::prompt(&mut seq, last, &all)])
