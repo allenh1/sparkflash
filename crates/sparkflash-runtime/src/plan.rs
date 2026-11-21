@@ -234,6 +234,9 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
     /// The roles beyond the token mixer and the feed-forward this host frames
     /// ([`plan_layer`]'s `hosted`); every other role is refused by name.
     const ROLES: &'static [StepRole] = &[];
+    /// The roles this host's parts run inside another part, with no branch of their own
+    /// ([`plan_layer_folding`]'s `folded`).
+    const FOLDED: &'static [StepRole] = &[];
     /// Whether every head row hands its logits over, a greedy one too: a host that reads every
     /// row back whatever the pick, whose sessions have always answered the row's logits. A greedy
     /// row then takes the sampler's own argmax over them, the pick [`Self::choices`] would make.
@@ -504,6 +507,36 @@ pub struct PlanLayer {
 /// # Errors
 /// The first role neither the walk nor the host runs.
 pub fn plan_layer(step: &LayerStep, hosted: &[StepRole]) -> Result<PlanLayer, String> {
+    plan_layer_folding(step, hosted, &[])
+}
+
+/// [`plan_layer`] for a host whose parts also run the roles in `folded` inside another part,
+/// such as a sparse indexer its attention's part selects with: a folded role is planned like a
+/// hosted one and then names no branch of its own.
+///
+/// Only the attention's own sublayers fold: a [`StepRole::Compression`] or a
+/// [`StepRole::Indexer`] runs inside the token mixer's step. Any other folded role is refused by
+/// name.
+///
+/// # Errors
+/// A folded role that is not one of the attention's sublayers, or as [`plan_layer`].
+pub fn plan_layer_folding(
+    step: &LayerStep,
+    hosted: &[StepRole],
+    folded: &[StepRole],
+) -> Result<PlanLayer, String> {
+    for role in folded {
+        match role {
+            StepRole::Compression | StepRole::Indexer => {}
+            StepRole::Attention | StepRole::Ffn | StepRole::Residual | StepRole::Side => {
+                return Err(format!(
+                    "a {role:?} step does not fold into another part: only the attention's \
+                     compression and indexer run inside its step"
+                ));
+            }
+        }
+    }
+    let runs: Vec<StepRole> = hosted.iter().chain(folded).copied().collect();
     let mut layer = PlanLayer {
         residual: None,
         branches: Vec::new(),
@@ -513,7 +546,7 @@ pub fn plan_layer(step: &LayerStep, hosted: &[StepRole]) -> Result<PlanLayer, St
         let framed = match role {
             StepRole::Attention | StepRole::Ffn => true,
             StepRole::Compression | StepRole::Indexer | StepRole::Residual | StepRole::Side => {
-                hosted.contains(&role)
+                runs.contains(&role)
             }
         };
         if !framed {
@@ -522,12 +555,15 @@ pub fn plan_layer(step: &LayerStep, hosted: &[StepRole]) -> Result<PlanLayer, St
                  layer's token mixer and its feed-forward{}",
                 step.index,
                 part.name(),
-                if hosted.is_empty() {
+                if runs.is_empty() {
                     String::new()
                 } else {
-                    format!(" and its {hosted:?} steps")
+                    format!(" and its {runs:?} steps")
                 }
             ));
+        }
+        if folded.contains(&role) {
+            continue;
         }
         match role {
             StepRole::Residual => layer.residual = Some(part),
@@ -961,6 +997,32 @@ mod tests {
         );
         let partial = plan_layer(&hyper_step(), &[StepRole::Side, StepRole::Residual]);
         assert!(partial.unwrap_err().contains("Indexer"));
+    }
+
+    #[test]
+    fn a_folded_indexer_is_planned_and_names_no_branch() {
+        let hosted = [StepRole::Side, StepRole::Residual];
+        let layer = plan_layer_folding(&hyper_step(), &hosted, &[StepRole::Indexer]).unwrap();
+        assert_eq!(layer.residual, Some(PartKind::HyperConnection));
+        assert_eq!(
+            layer.branches,
+            vec![
+                (StepRole::Side, PartKind::Engram),
+                (StepRole::Attention, PartKind::MlaAttention),
+                (StepRole::Ffn, PartKind::Moe),
+            ]
+        );
+        assert_eq!(
+            plan_layer_folding(&hyper_step(), &hosted, &[]),
+            plan_layer(&hyper_step(), &hosted)
+        );
+        for role in [StepRole::Side, StepRole::Residual, StepRole::Ffn] {
+            let error = plan_layer_folding(&hyper_step(), &[], &[role]).unwrap_err();
+            assert!(error.contains("does not fold"), "{error}");
+        }
+        let unframed =
+            plan_layer_folding(&hyper_step(), &[StepRole::Residual], &[StepRole::Indexer]);
+        assert!(unframed.unwrap_err().contains("Side"));
     }
 
     #[test]

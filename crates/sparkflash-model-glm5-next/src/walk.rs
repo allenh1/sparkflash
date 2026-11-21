@@ -52,7 +52,7 @@ use sparkflash_runtime::{
     ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, Limits, NoVision,
     OutputConstraint, PartExec, PartHost, Pass, PassKind, PassMask, PlanBranch, PlanHost, PlanLane,
     PlanPart, PlanPass, PlanRows, PlanSeq, PlanWalk, PlanWindow, RankSplit, Region, Segment,
-    Segments, StateKind, StepWall, Walk, WalkCapabilities, plan_layer,
+    Segments, StateKind, StepWall, Walk, WalkCapabilities, plan_layer_folding,
 };
 use sparkflash_weights::tp::{BitGatherHandle, TpRuntime};
 
@@ -142,16 +142,12 @@ impl Shared {
         }
         let mut branches = Vec::with_capacity(steps.len());
         for (step, (mixer, ffn)) in steps.iter().zip(built) {
-            let layer = plan_layer(step, <Self as PlanHost>::ROLES)
-                .map_err(|error| BackendError::new(DEVICE, error))?;
             // The sparse indexer is folded into the DSA attention's part: the rank runs the
             // selection inside the attention step, so it is no branch of its own.
-            let planned: Vec<Part> = layer
-                .branches
-                .iter()
-                .filter(|(role, _)| *role != StepRole::Indexer)
-                .map(|&(_, part)| part)
-                .collect();
+            let layer =
+                plan_layer_folding(step, <Self as PlanHost>::ROLES, <Self as PlanHost>::FOLDED)
+                    .map_err(|error| BackendError::new(DEVICE, error))?;
+            let planned: Vec<Part> = layer.branches.iter().map(|&(_, part)| part).collect();
             if planned != [mixer, ffn] || layer.residual.is_none() {
                 return Err(BackendError::new(
                     DEVICE,
@@ -522,9 +518,10 @@ impl PlanHost for Shared {
             rewind: State::Native("a prompt that goes back to the last prompt's end"),
         },
     };
-    /// The manifold hyper-connection is the frames; the sparse indexer runs inside the DSA
-    /// attention's part.
-    const ROLES: &'static [StepRole] = &[StepRole::Residual, StepRole::Indexer];
+    /// The manifold hyper-connection is the frames.
+    const ROLES: &'static [StepRole] = &[StepRole::Residual];
+    /// The sparse indexer runs inside the DSA attention's part.
+    const FOLDED: &'static [StepRole] = &[StepRole::Indexer];
 
     fn layers(&self) -> usize {
         self.branches.len()
