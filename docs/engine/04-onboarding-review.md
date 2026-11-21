@@ -2300,8 +2300,11 @@ Measured at this tip, by reading (line ranges are in the two sweeps' notes, not 
   and most of that was the same CPU shape walk, the same tick-engine profile tests and the same
   fixture helpers, copied with the type name changed (Qwen's and Inkling's shape walks differed
   in 61 of about 322 lines). The shape walk is now one type,
-  `sparkflash_runtime::testing::ShapeWalk`, and the three test modules are 409 to 508 lines; the
-  profile tests and the fixture helpers are still copied.
+  `sparkflash_runtime::testing::ShapeWalk`, and the three test modules are 205 to 295 lines.
+  `sparkflash_runtime::profile_checks!` emits their compute-row and tick-profile tests (the
+  config, the prompt chunks, the joint round, the speculative round) from the arm's stated chunk
+  list, member cap and drafter depth, and the fixture helpers are `testing::format_rule` and
+  `testing::token_bytes`.
 * **Serving glue.** `enable_fusion`, `enable_group_fusion`, `mirror_group`, `lane_limit`, `wire`,
   `group_rank` and a serving enum in each arm: three to eight lines of body each under ten to
   twenty of comment, near-identical between GLM, Qwen and dense.
@@ -2383,9 +2386,29 @@ Three findings, each with the change it implies.
    and step wall; `prompt` and `decode` drive a tick engine to a request's answer). An arm states
    a constructor of ten to twenty lines where it carried about 320. GLM's copy took the stricter
    behaviour of the other two (one segment a bulk pass, a paired pass refused, the pass hook
-   called); its 91 tests pass unchanged. Next, `conformance!` emits the tick-profile and
-   compute-row tests from the arm's stated chunk list and member cap.
-3. **The contract** (finding 3), one item at a time, each gated by the generated checks.
+   called); its 91 tests pass unchanged. `profile_checks!` now emits the tick-profile and
+   compute-row tests from the arm's stated chunk list, member cap and drafter depth: the arm
+   states a chunk list, a depth and its `ShapeWalk` constructor, and the macro emits the config,
+   chunk-split, joint-round, speculative-round and arms-table checks. Qwen's and Inkling's test
+   modules keep only their arm-specific policy, layout, budget and capability tests.
+3. **The contract** (finding 3). Done for what was a real duplication:
+   * `Walk` gains `type Hidden: Residual`; `walk` returns it and `head` takes it by `&mut`, so
+     a pass's answers travel in the value. GLM's two sequence fields, Qwen's queue under a lock
+     and Inkling's three fields are gone. The runtime reads `Residual::rows` and nothing else;
+     a `WalkHook` still sees the plain `Hidden`. Dense names `Hidden` itself: its scratch is
+     the device buffer the residual lives in, not a copy carried between the two calls.
+   * `HeadInput::record` is the one sampler record a head makes for a row (a prompt resets and
+     records the prompt, a token or verify row records its token). Dense, GLM and Inkling call
+     it. Qwen's token and verify rows are recorded inside its batch during the walk, and its
+     prompt record has never reset the sampler, so its head is unchanged. The choice after the
+     record is three different rules (dense's device argmax, GLM's and Qwen's end-of-turn list,
+     Inkling's Gumbel draw) and stays with the arms.
+   * `check_checkpoint` and `check_rewind` are the bounds checks of every `LaneState`.
+   * `Walk::open` takes no argument; the runtime keeps the lane's reservation with the slot as
+     before, and the accounting it prints is unchanged.
+   * `DraftBudget` (`AnchorsAndDrafts`, `OnePass(rows)`) is the budget rule of Qwen, GLM and
+     Inkling, and `ExpertUnionWall::with_experts` builds each arm's wall from its fitted
+     constant and the checkpoint's expert counts.
 4. **Retire `FusedEngine`.** Two users remain: dense in a TP group (its lane frames cannot carry
    a chunk's rows yet) and Inkling's group with images. Both need a group.
 5. **Dory onto `Walk`.** It is the only served model with no reuse at TP 1 and the only one whose

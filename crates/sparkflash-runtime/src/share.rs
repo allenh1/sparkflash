@@ -93,6 +93,18 @@ pub struct ExpertUnionWall {
 }
 
 impl ExpertUnionWall {
+    /// This fit with the checkpoint's expert counts: `experts` routed, `top_k` picked a row.
+    /// An arm states its fitted milliseconds once, as a constant with no experts, and every walk
+    /// it opens takes the counts from the checkpoint it loaded.
+    #[must_use]
+    pub const fn with_experts(self, experts: usize, top_k: usize) -> Self {
+        Self {
+            experts,
+            top_k,
+            ..self
+        }
+    }
+
     /// The distinct experts `rows` rows are expected to read.
     #[must_use]
     pub fn distinct(&self, rows: usize) -> f64 {
@@ -111,6 +123,33 @@ impl StepWall for ExpertUnionWall {
             + self.expert_ms * self.distinct(rows)
             + self.row_ms * rows as f64
             + self.seq_ms * seqs.saturating_sub(1) as f64
+    }
+}
+
+/// The rule an arm's [`crate::Drafter::budget`] follows: the most rows [`share_rows`] may hand
+/// out in one walk of `seqs` members drafting `depth` deep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftBudget {
+    /// Every member's anchor and whole depth, `seqs * (1 + depth)`: the arm's verify has no row
+    /// cap of its own, and the members' own chains bound what is shared out.
+    AnchorsAndDrafts,
+    /// Every member's whole depth, capped so the anchors and the drafts fit one verify pass of
+    /// this many rows: `min(seqs * depth, rows - seqs)`.
+    OnePass(usize),
+}
+
+impl DraftBudget {
+    /// The budget for `seqs` members drafting `depth` deep.
+    #[must_use]
+    pub const fn rows(self, seqs: usize, depth: usize) -> usize {
+        match self {
+            Self::AnchorsAndDrafts => seqs.saturating_mul(1 + depth),
+            Self::OnePass(rows) => {
+                let drafts = seqs * depth;
+                let room = rows.saturating_sub(seqs);
+                if drafts < room { drafts } else { room }
+            }
+        }
     }
 }
 
@@ -220,6 +259,54 @@ mod tests {
         assert_eq!(
             share_rows(&chains, 40, 0.0, &cheap).iter().sum::<usize>(),
             40
+        );
+    }
+
+    #[test]
+    fn the_draft_budgets_are_the_two_rules_the_arms_state() {
+        for depth in [0, 1, 3, 7] {
+            assert_eq!(DraftBudget::AnchorsAndDrafts.rows(0, depth), 0);
+            assert_eq!(DraftBudget::AnchorsAndDrafts.rows(1, depth), 1 + depth);
+            assert_eq!(
+                DraftBudget::AnchorsAndDrafts.rows(4, depth),
+                4 * (1 + depth)
+            );
+        }
+        // One pass of eight rows: a lone member drafts its depth, four members share the four
+        // rows their anchors leave, and eight anchors leave none.
+        let pass = DraftBudget::OnePass(8);
+        assert_eq!(pass.rows(1, 3), 3);
+        assert_eq!(pass.rows(1, 7), 7);
+        assert_eq!(pass.rows(2, 3), 6);
+        assert_eq!(pass.rows(4, 3), 4);
+        assert_eq!(pass.rows(8, 3), 0);
+        assert_eq!(
+            pass.rows(9, 3),
+            0,
+            "more anchors than rows is no drafts, not a wrap"
+        );
+        for seqs in 1..=8 {
+            assert!(seqs + pass.rows(seqs, 7) <= 8);
+        }
+    }
+
+    #[test]
+    fn a_wall_takes_the_checkpoints_expert_counts() {
+        const FIT: ExpertUnionWall = ExpertUnionWall {
+            fixed_ms: 24.0,
+            expert_ms: 1.0,
+            row_ms: 0.5,
+            seq_ms: 2.0,
+            experts: 0,
+            top_k: 0,
+        };
+        assert_eq!(
+            FIT.with_experts(384, 8),
+            ExpertUnionWall {
+                experts: 384,
+                top_k: 8,
+                ..FIT
+            }
         );
     }
 

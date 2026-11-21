@@ -31,15 +31,15 @@
 //! chooses when a chunk or a step runs; the rows and the shape are the runtime's, which is what
 //! keeps the arm's chunk boundaries and its verify width.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
-    ChunkPolicy, ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden,
-    LaneMemory, LaneState, Limits, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments,
-    StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
+    ChunkPolicy, ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, HeadInput,
+    HeadRow, Hidden, LaneState, Limits, Pass, PassKind, PassMask, Region, Residual, Runtime,
+    Segment, Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities, check_checkpoint,
+    check_rewind,
 };
 
 use sparkflash_kernels::cuda_driver::Deviceptr;
@@ -60,6 +60,26 @@ pub(super) const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
     top_k: 0,
 };
 
+/// What a Qwen pass hands its head.
+///
+/// A token or verify pass resolves each member's step inside its batch (the sampler's record,
+/// the choice and the draft verdict are the batch's), so the head has only to hand the steps
+/// over. A prompt chunk leaves no step: its last row waits on the sequence as the deferred head
+/// and the head folds it into logits.
+pub(super) struct QwenHidden {
+    /// The pass's residual rows: one a member for a token or verify pass, the chunk's rows for
+    /// a prompt.
+    rows: usize,
+    /// The steps the batch resolved, in segment order; empty after a prompt chunk.
+    steps: Vec<StepOutput>,
+}
+
+impl Residual for QwenHidden {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
 /// The Qwen arm, exposed to the shared runtime as a [Walk].
 pub(super) struct QwenWalk {
     shared: Arc<SequenceShared>,
@@ -70,8 +90,6 @@ pub(super) struct QwenWalk {
     batch: Mutex<Option<BatchBuffers>>,
     /// The most members one token pass may hold: the driver's concurrency.
     members: usize,
-    /// The steps a token or verify pass already resolved, in segment order, for the head.
-    pending: Mutex<VecDeque<StepOutput>>,
     /// The arm's draft source, behind the runtime's round contract.
     drafter: QwenDrafter,
 }
@@ -89,11 +107,8 @@ impl QwenWalk {
         let members = limits.members;
         let joint = sparkflash_runtime::joint_rounds()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
-        let wall = ExpertUnionWall {
-            experts: shared.config.num_experts,
-            top_k: shared.config.num_experts_per_tok,
-            ..JOINT_WALL
-        };
+        let wall =
+            JOINT_WALL.with_experts(shared.config.num_experts, shared.config.num_experts_per_tok);
         let drafter = QwenDrafter {
             depth: shared.verify_rows.saturating_sub(1),
             wall,
@@ -105,7 +120,6 @@ impl QwenWalk {
             limits,
             batch: Mutex::new(None),
             members,
-            pending: Mutex::new(VecDeque::new()),
             drafter,
         })
     }
@@ -198,7 +212,7 @@ impl QwenWalk {
     fn token_pass(
         &self,
         segments: &mut [Segment<'_, DeviceSequence>],
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<QwenHidden, BackendError> {
         let mut steps: Vec<Option<StepOutput>> = (0..segments.len()).map(|_| None).collect();
         let mut forward: Vec<usize> = Vec::new();
         for index in 0..segments.len() {
@@ -245,24 +259,25 @@ impl QwenWalk {
                 steps[index] = Some(step);
             }
         }
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?;
-        pending.clear();
-        for step in steps {
-            pending.push_back(step.ok_or_else(|| {
-                BackendError::new("qwen4_device", "a token pass left a member without a step")
-            })?);
-        }
-        Ok(Hidden::new(segments.len()))
+        let steps = steps
+            .into_iter()
+            .map(|step| {
+                step.ok_or_else(|| {
+                    BackendError::new("qwen4_device", "a token pass left a member without a step")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(QwenHidden {
+            rows: segments.len(),
+            steps,
+        })
     }
 
     /// A verify pass: every segment's anchor token and drafts, one batch.
     fn verify_pass(
         &self,
         segments: &mut [Segment<'_, DeviceSequence>],
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<QwenHidden, BackendError> {
         let mut drafts = Vec::with_capacity(segments.len());
         let mut confidence = Vec::with_capacity(segments.len());
         let mut tokens = Vec::with_capacity(segments.len());
@@ -289,13 +304,10 @@ impl QwenWalk {
             .map(|segment| &mut *segment.seq)
             .collect::<Vec<_>>();
         let steps = self.batch(&mut members, &drafts, &confidence, &tokens)?;
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?;
-        pending.clear();
-        pending.extend(steps);
-        Ok(Hidden::new(segments.len()))
+        Ok(QwenHidden {
+            rows: segments.len(),
+            steps,
+        })
     }
 }
 
@@ -441,12 +453,7 @@ impl Drafter<QwenWalk> for QwenDrafter {
         _depths: &[usize],
     ) -> Result<Vec<Self::Rows>, BackendError> {
         let members = segments.len();
-        walk.verify_pass(segments)?;
-        let mut pending = walk
-            .pending
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?;
-        let steps: Vec<StepOutput> = pending.drain(..).collect();
+        let steps = walk.verify_pass(segments)?.steps;
         if steps.len() != members {
             return Err(BackendError::new(
                 "qwen4_device",
@@ -473,7 +480,7 @@ impl Drafter<QwenWalk> for QwenDrafter {
     /// drafts, which is the batch buffers' width. `share_rows` spends it on drafts only, so a
     /// chain's own depth still bounds what a member takes.
     fn budget(&self, seqs: usize) -> usize {
-        seqs.saturating_mul(1 + self.depth)
+        DraftBudget::AnchorsAndDrafts.rows(seqs, self.depth)
     }
 
     fn ready(&self, seq: &DeviceSequence, token: u32) -> bool {
@@ -518,6 +525,7 @@ impl Drafter<QwenWalk> for QwenDrafter {
 
 impl Walk for QwenWalk {
     type Seq = DeviceSequence;
+    type Hidden = QwenHidden;
     type Drafter = QwenDrafter;
     type Vision = sparkflash_runtime::NoVision;
 
@@ -541,8 +549,7 @@ impl Walk for QwenWalk {
         &self.layout
     }
 
-    fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError> {
-        let _ = memory;
+    fn open(&self) -> Result<Self::Seq, BackendError> {
         let mut seq = DeviceSequence::allocate(Arc::clone(&self.shared), self.limits.context)?;
         // Without joint rounds the arm drafts nothing, exactly as the fusion's own policy did: a
         // member would otherwise run the MTP's prompt pass and then throw every chain away.
@@ -572,7 +579,7 @@ impl Walk for QwenWalk {
         &self,
         segments: &mut [Segment<'_, Self::Seq>],
         pass: Pass<'_>,
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<QwenHidden, BackendError> {
         let hidden = match pass.kind {
             PassKind::TokenRows => self.token_pass(segments)?,
             PassKind::Verify { .. } => self.verify_pass(segments)?,
@@ -585,13 +592,12 @@ impl Walk for QwenWalk {
                 }
                 let segment = &mut segments[0];
                 let rows = segment.rows.len();
-                self.pending
-                    .lock()
-                    .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?
-                    .clear();
                 let (seq, tokens) = (&mut *segment.seq, segment.rows);
                 self.prompt_chunk(seq, tokens, pass.prompt_end)?;
-                Hidden::new(rows)
+                QwenHidden {
+                    rows,
+                    steps: Vec::new(),
+                }
             }
             PassKind::Paired { .. } => {
                 return Err(BackendError::new(
@@ -601,22 +607,18 @@ impl Walk for QwenWalk {
             }
         };
         if let Some(hook) = pass.hook {
-            hook.after_layers(&hidden)?;
+            hook.after_layers(&Hidden::new(hidden.rows))?;
         }
         Ok(hidden)
     }
 
     fn head(
         &self,
-        hidden: &Hidden,
+        hidden: &mut QwenHidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_device", "the head queue is poisoned"))?;
-        if !pending.is_empty() {
-            let steps: Vec<StepOutput> = pending.drain(..).collect();
+        if !hidden.steps.is_empty() {
+            let steps = std::mem::take(&mut hidden.steps);
             if steps.len() != rows.len() {
                 return Err(BackendError::new(
                     "qwen4_device",
@@ -629,7 +631,6 @@ impl Walk for QwenWalk {
             }
             return Ok(steps);
         }
-        drop(pending);
         // A prompt head: the last chunk's deferred row, folded into logits here and chosen with
         // the prompt in the sampler.
         let logits = match rows.first_mut() {
@@ -646,6 +647,8 @@ impl Walk for QwenWalk {
         for row in rows.iter_mut() {
             let token = match &row.input {
                 HeadInput::Prompt(tokens) => {
+                    // Not [HeadInput::record]: that resets the sampler first, and this arm has
+                    // always recorded a prompt onto whatever [Walk::set_sampling] left.
                     row.seq.sampler.record_prompt(tokens);
                     let position = row.seq.position;
                     // The point is the prompt's end, before any draft past it, exactly as the
@@ -688,7 +691,6 @@ impl Walk for QwenWalk {
                 draft: Vec::new(),
             });
         }
-        let _ = hidden;
         Ok(steps)
     }
 }
@@ -702,15 +704,7 @@ impl LaneState for DeviceSequence {
         if self.rewind_point() == Some(at) {
             return Ok(());
         }
-        if at != self.position {
-            return Err(BackendError::new(
-                "qwen4_device",
-                format!(
-                    "a checkpoint is asked for position {at}, the sequence is at {}",
-                    self.position
-                ),
-            ));
-        }
+        check_checkpoint("qwen4_device", at, self.position)?;
         self.keep_point()
     }
 
@@ -727,15 +721,7 @@ impl DeviceSequence {
     /// The runtime's rewind: a prompt end restores the arm's point, and zero clears the state a
     /// fresh sequence would have.
     pub(super) fn rewind_state(&mut self, to: usize) -> Result<(), BackendError> {
-        if to > self.position {
-            return Err(BackendError::new(
-                "qwen4_device",
-                format!(
-                    "the rewind is to position {to}, the sequence is at {}",
-                    self.position
-                ),
-            ));
-        }
+        check_rewind("qwen4_device", to, self.position)?;
         if to == self.position {
             return Ok(());
         }
@@ -830,15 +816,16 @@ fn fresh_hashers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sparkflash_model::ledger::{Strategy as LedgerStrategy, ledger_for_arm};
-    use sparkflash_runtime::testing::{self, ShapeWalk, pick, wrong};
-    use sparkflash_runtime::{ChunkPolicy, Fixture, TickEngine, TickEvent, WalkFixture};
+    use sparkflash_runtime::testing::{self, ShapeWalk, format_rule, token_bytes};
+    use sparkflash_runtime::{ChunkPolicy, Fixture, TickEngine, WalkFixture};
 
     use crate::config::Qwen4ExpConfig;
-    use crate::device::prefill::{DEFAULT_PREFILL_CHUNK, PrefillPlan};
+    use crate::device::MTP_VERIFY_ROWS;
+    use crate::device::batch::MAX_BATCH;
+    use crate::device::prefill::{DEFAULT_PREFILL_CHUNK, PrefillPlan, TOKEN_PREFILL_CHUNK};
 
     /// The stored bytes a token pass must read at this rank, and the floor the plan states.
-    fn token_bytes(
+    fn fixture_token_bytes(
         architecture: &sparkflash_model::Architecture,
         experts: usize,
         top_k: usize,
@@ -851,27 +838,7 @@ mod tests {
         let total = u64::try_from(tensors.rank_bytes()).unwrap_or(u64::MAX);
         let expert = u64::try_from(tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts))
             .unwrap_or(u64::MAX);
-        let floor = total.saturating_sub(expert);
-        let share = if experts == 0 {
-            0
-        } else {
-            expert.saturating_mul(top_k as u64) / experts as u64
-        };
-        Ok((floor.saturating_add(share), floor))
-    }
-
-    /// The stored format names the fixture's classes use.
-    fn format_rule(
-        format: sparkflash_model::architecture::WeightFormat,
-    ) -> sparkflash_runtime::FormatRule {
-        use sparkflash_model::architecture::WeightFormat;
-        let name = match format {
-            WeightFormat::Bf16 => "BF16",
-            WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
-            WeightFormat::MxFp8 { .. } => "MX FP8",
-            WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
-        };
-        sparkflash_runtime::FormatRule::stored(name)
+        Ok(token_bytes(total, expert, experts, top_k))
     }
 
     /// The Qwen fixture: the synthetic tiny checkpoint, opened through the arm's own TP=1
@@ -904,7 +871,7 @@ mod tests {
                 config.max_position_embeddings,
             )?;
             let walk = backend.walk_arm(4)?;
-            let (bytes, floor) = token_bytes(
+            let (bytes, floor) = fixture_token_bytes(
                 &config.architecture,
                 config.num_experts,
                 config.num_experts_per_tok,
@@ -921,28 +888,6 @@ mod tests {
                 formats,
                 Some(Box::new(directory)),
             ))
-        }
-    }
-
-    /// The walk's four declared rows are the arm's static declaration, so the runtime's ledger
-    /// and the `sparkflash arms --ledger` table cannot drift while Qwen moves onto the runtime.
-    #[test]
-    fn the_declared_compute_rows_are_the_arm_ledger_rows() {
-        let declared = ledger_for_arm("Qwen").expect("Qwen's declaration");
-        let capabilities = <QwenWalk as Walk>::CAPABILITIES.compute;
-        for (strategy, stated) in [
-            (LedgerStrategy::TensorCorePrompt, capabilities.prompt),
-            (LedgerStrategy::TensorCoreDecode, capabilities.token),
-            (LedgerStrategy::StoredArithmetic, capabilities.stored),
-            (LedgerStrategy::Rewind, capabilities.rewind),
-        ] {
-            let from_table = declared
-                .rows
-                .iter()
-                .find(|(row, _)| *row == strategy)
-                .map(|(_, state)| *state)
-                .expect("the arm states every strategy");
-            assert_eq!(stated, from_table, "{} drifted", strategy.name());
         }
     }
 
@@ -1031,98 +976,13 @@ mod tests {
         .with_code("qwen4_shape")
     }
 
-    /// The generated checks drive the path Qwen serves TP=1 on, as dense's and GLM's do.
+    /// The prefill plan keeps its forward boundaries: a 4,096-row chunk is one forward and so is
+    /// a short tail, so the runtime's chunk is the plan's own unit.
     #[test]
-    fn the_generated_checks_drive_the_tick_engine() {
-        assert!(<QwenWalk as WalkFixture>::tick_engine());
-    }
-
-    /// The tick engine's config is Qwen's profile: the prefill plan's chunk as the pass width,
-    /// the batch's four members as the verify width, the drafter's own depth, the joint-round
-    /// switch, no decoder-layer skip and no row exchange.
-    #[test]
-    fn the_tick_config_is_the_qwen_profile() {
-        use sparkflash_runtime::TickConfig;
-
-        let walk = shape_walk(
-            DEFAULT_PREFILL_CHUNK,
-            super::super::batch::MAX_BATCH,
-            super::super::MTP_VERIFY_ROWS - 1,
-        );
-        let config = TickConfig::for_walk(&walk, super::super::batch::MAX_BATCH);
-        assert_eq!(config.rows_max, DEFAULT_PREFILL_CHUNK);
-        assert_eq!(config.chunk_rows, DEFAULT_PREFILL_CHUNK);
-        assert_eq!(
-            config.members,
-            super::super::batch::MAX_BATCH,
-            "the verify width is the member cap"
-        );
-        assert_eq!(
-            config.k,
-            super::super::MTP_VERIFY_ROWS,
-            "a member's anchor and the drafter's own drafts"
-        );
-        assert!(config.batch_spec.is_some(), "the arm drafts");
-        assert!(
-            config.shared_rounds,
-            "the arm's joint rounds are on by default"
-        );
-        assert!(!config.decoder_skip, "Qwen has no decoder layers to skip");
-        assert!(!config.exchange, "TP=1 has no row exchange");
-
-        // The engine's shared-round switch is the runtime's, not a second rule.
-        let joint = Runtime::new(shape_walk(DEFAULT_PREFILL_CHUNK, 4, 2), 0)
-            .expect("the runtime")
-            .with_joint_rounds(true);
-        assert!(
-            TickConfig::for_runtime(&joint, 4).shared_rounds,
-            "joint rounds on: the shared verify"
-        );
-        let alone = Runtime::new(shape_walk(DEFAULT_PREFILL_CHUNK, 4, 2), 0)
-            .expect("the runtime")
-            .with_joint_rounds(false);
-        assert!(
-            !TickConfig::for_runtime(&alone, 4).shared_rounds,
-            "joint rounds off: plain rows, as the runtime would plan"
-        );
-    }
-
-    /// Qwen's prompt chunks through the tick engine are the chunks it ran before: the engine's
-    /// pass width is the runtime's `ChunkPolicy` over the same limits, so a 5,000-row
-    /// prompt is 4,096 rows and its tail, both on the single process's exact path and on a
-    /// group's bulk path.
-    #[test]
-    fn the_tick_engine_hands_qwen_the_prefill_plans_chunks() {
-        use sparkflash_runtime::TickConfig;
-
+    fn the_prefill_plan_runs_one_forward_a_chunk() {
         let plan = PrefillPlan::new(DEFAULT_PREFILL_CHUNK, false);
         assert_eq!(plan.forwards(4_096), vec![0..4_096], "one forward a chunk");
         assert_eq!(plan.forwards(904), vec![0..904], "the tail is one forward");
-        let mut engine =
-            TickEngine::new(shape_walk(plan.chunk, 4, 0), 1).expect("the tick engine starts");
-        assert_eq!(engine.config().chunk_rows, plan.chunk);
-        let _ = testing::prompt(&mut engine, &vec![7u32; 5_000]);
-        assert_eq!(
-            engine.walk().chunks(),
-            vec![4_096, 904],
-            "a 5,000-row prompt runs 4,096 then 904, as the old runtime ran it"
-        );
-
-        // A group's row exchange marks the bulk path; the rows are the same split.
-        let walk = shape_walk(plan.chunk, 4, 0);
-        let mut group = TickConfig::for_walk(&walk, 1);
-        group.exchange = true;
-        let mut engine = TickEngine::new(walk, 1)
-            .expect("the tick engine starts")
-            .with_config(group)
-            .expect("the group config");
-        assert!(engine.config().exchange);
-        let _ = testing::prompt(&mut engine, &vec![7u32; 5_000]);
-        assert_eq!(
-            engine.walk().chunks(),
-            vec![4_096, 904],
-            "the group's bulk chunks are the single process's chunks"
-        );
     }
 
     /// The token-kernel plan keeps its 256-row pass and its 128-row forwards: the engine runs the
@@ -1148,92 +1008,13 @@ mod tests {
         );
     }
 
-    /// Several decoding lanes verify in one shared round: the old fused engine's joint round is
-    /// the engine's shared plan, and one verify holds every member's chain.
-    #[test]
-    fn the_tick_engine_keeps_qwens_joint_round() {
-        let mut engine = TickEngine::new(
-            shape_walk(DEFAULT_PREFILL_CHUNK, super::super::batch::MAX_BATCH, 2),
-            3,
-        )
-        .expect("the tick engine starts")
-        .with_trace();
-        let mut ids = Vec::new();
-        let mut firsts = Vec::new();
-        for at in 0..3u32 {
-            let prompt: Vec<u32> = (0..7).map(|index| 1 + at * 13 + index).collect();
-            let (id, step) = testing::prompt(&mut engine, &prompt);
-            assert_eq!(engine.kept(id).and_then(|kept| kept.history), Some(7));
-            ids.push(id);
-            firsts.push(step.next_token.expect("a token"));
-        }
-        for (id, token) in ids.iter().zip(&firsts) {
-            engine.feed(*id, *token).expect("the row is fed");
-        }
-        let mut answered = 0;
-        while answered < ids.len() {
-            for event in engine.tick().expect("the shared tick") {
-                if matches!(event, TickEvent::Decode { .. }) {
-                    answered += 1;
-                }
-            }
-        }
-        let trace = engine.trace().expect("the trace").render();
-        assert!(
-            trace.contains("plan=shared"),
-            "three lanes share one verify: {trace}"
-        );
-        let verifies = engine.walk().verifies();
-        assert_eq!(verifies.len(), 1, "one shared verify, not one a lane");
-        assert_eq!(verifies[0].len(), 3, "every member's chain is in the pass");
-        assert!(
-            verifies[0].iter().sum::<usize>() <= 3 * 3,
-            "the verify holds the batch's rows: {verifies:?}"
-        );
-    }
-
-    /// One decoding row runs one speculative round; the draft it gets wrong is rejected, and only
-    /// the accepted rows reach the request.
-    #[test]
-    fn a_speculative_round_keeps_its_accepted_rows_only() {
-        let mut engine = TickEngine::new(
-            shape_walk(DEFAULT_PREFILL_CHUNK, super::super::batch::MAX_BATCH, 2),
-            1,
-        )
-        .expect("the tick engine starts")
-        .with_trace();
-        let (id, first) = testing::prompt(&mut engine, &[10, 11, 12, 13]);
-        let anchor = first.next_token.expect("a token");
-        let steps = testing::decode(&mut engine, id, anchor);
-        assert_eq!(steps.len(), 2, "the anchor and the accepted draft");
-        assert_eq!(steps[0].next_token, Some(pick(anchor)));
-        assert_eq!(steps[1].next_token, Some(pick(pick(anchor))));
-        assert_eq!(
-            engine.history(id).map(<[u32]>::to_vec),
-            Some(vec![10, 11, 12, 13, anchor, pick(anchor)]),
-            "the accepted draft reaches the history"
-        );
-        assert!(
-            !engine
-                .history(id)
-                .expect("the history")
-                .contains(&wrong(anchor)),
-            "the rejected draft never reaches the request"
-        );
-        assert_eq!(
-            engine.walk().verifies(),
-            vec![vec![3]],
-            "the anchor and both drafts verified in one pass"
-        );
-        assert!(
-            engine
-                .trace()
-                .expect("the trace")
-                .render()
-                .contains("plan=spec"),
-            "one row takes the speculative plan"
-        );
-    }
+    sparkflash_runtime::profile_checks!(
+        QwenWalk,
+        table: "Qwen",
+        depth: MTP_VERIFY_ROWS - 1,
+        chunks: [DEFAULT_PREFILL_CHUNK, TOKEN_PREFILL_CHUNK],
+        shape: |chunk, depth| shape_walk(chunk, MAX_BATCH, depth)
+    );
 
     sparkflash_runtime::conformance!(QwenWalk);
 }

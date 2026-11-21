@@ -216,6 +216,8 @@ Replace the per-strategy hooks with one small required trait. Sketch:
 pub trait Walk: 'static {
     /// One sequence's device state.
     type Seq;
+    /// What `walk` hands `head`; the runtime reads only its row count.
+    type Hidden: Residual;
     /// The draft source. An arm without one names `Absent<Reason>`; there is no default.
     type Drafter: Drafter<Self>;
     /// The image path, on the same terms.
@@ -223,14 +225,15 @@ pub trait Walk: 'static {
 
     /// Which state grows with position (a KV cache) and which is recurrent.
     fn layout(&self) -> &StateLayout;
-    fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError>;
+    fn open(&self) -> Result<Self::Seq, BackendError>;
     /// Most rows one pass may hold, and the context.
     fn limits(&self) -> Limits;
     /// Run these rows of these sequences through the layers, in one pass.
     fn walk(&self, segments: &mut [Segment<'_, Self::Seq>], pass: Pass)
-        -> Result<Hidden, BackendError>;
+        -> Result<Self::Hidden, BackendError>;
     /// Turn the last rows into tokens, on the device.
-    fn head(&self, hidden: &Hidden, rows: &[HeadRow<'_>]) -> Result<Vec<StepOutput>, BackendError>;
+    fn head(&self, hidden: &mut Self::Hidden, rows: &mut [HeadRow<'_, Self::Seq>])
+        -> Result<Vec<StepOutput>, BackendError>;
 }
 ```
 

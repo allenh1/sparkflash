@@ -36,7 +36,7 @@ use crate::ledger::{Ledger, Mode, Strategy};
 use crate::pool::{LaneMemory, LanePool};
 use crate::resume::{Restore, checkpoint_after, rewind_plan};
 use crate::share::share_rows;
-use crate::walk::{Draft, Drafter, HeadRow, Pass, PassMask, Segment, Vision, Walk};
+use crate::walk::{Draft, Drafter, HeadRow, Pass, PassMask, Residual, Segment, Vision, Walk};
 
 /// A prompt the runtime is feeding a chunk at a time.
 #[derive(Debug)]
@@ -287,7 +287,7 @@ impl<W: Walk> Runtime<W> {
             .ok_or_else(|| BackendError::new("runtime", "the sequence has no prompt in parts"))?;
         let end = (prompt.next + rows).min(prompt.tokens.len());
         let rows = &prompt.tokens[prompt.next..end];
-        let hidden = {
+        let mut hidden = {
             let mut segments = [Segment::with_images(&mut slot.seq, rows, &prompt.fresh)];
             let mut pass = Pass::bulk(rows.len()).with_prompt_end(prompt.tokens.len() - end);
             if let Some(hook) = hook {
@@ -305,11 +305,11 @@ impl<W: Walk> Runtime<W> {
             });
             return Ok(Part::More);
         }
-        let row = hidden.rows.checked_sub(1).ok_or_else(|| {
+        let row = hidden.rows().checked_sub(1).ok_or_else(|| {
             BackendError::new("runtime", "a prompt walk left no residual row to head")
         })?;
         let mut head_rows = [HeadRow::prompt(&mut slot.seq, row, &prompt.tokens)];
-        let mut steps = self.walk.head(&hidden, &mut head_rows)?;
+        let mut steps = self.walk.head(&mut hidden, &mut head_rows)?;
         let step = steps
             .pop()
             .ok_or_else(|| BackendError::new("runtime", "the head answered no step"))?;
@@ -386,7 +386,7 @@ impl<W: Walk> Runtime<W> {
             }
             prompts.push(prompt);
         }
-        let hidden = {
+        let mut hidden = {
             let mut segments: Vec<Segment<'_, W::Seq>> = slots
                 .iter_mut()
                 .zip(&prompts)
@@ -402,12 +402,12 @@ impl<W: Walk> Runtime<W> {
             .iter()
             .map(|prompt| prompt.tokens.len() - prompt.next)
             .sum();
-        if hidden.rows != rows {
+        if hidden.rows() != rows {
             return Err(BackendError::new(
                 "runtime",
                 format!(
                     "a paired walk of {rows} rows left {} residual rows",
-                    hidden.rows
+                    hidden.rows()
                 ),
             ));
         }
@@ -419,7 +419,7 @@ impl<W: Walk> Runtime<W> {
             last += rest.len();
             head_rows.push(HeadRow::prompt(&mut slot.seq, last - 1, &prompt.tokens));
         }
-        let steps = self.walk.head(&hidden, &mut head_rows)?;
+        let steps = self.walk.head(&mut hidden, &mut head_rows)?;
         drop(head_rows);
         if steps.len() != slots.len() {
             return Err(BackendError::new(
@@ -465,7 +465,7 @@ impl<W: Walk> Runtime<W> {
                 rows
             })
             .collect();
-        let hidden = {
+        let mut hidden = {
             let mut segments: Vec<Segment<'_, W::Seq>> = members
                 .iter_mut()
                 .zip(tokens.iter())
@@ -492,7 +492,7 @@ impl<W: Walk> Runtime<W> {
                     break;
                 }
                 let mut head_rows = [HeadRow::verify(&mut slot.seq, base + row, rows, row)];
-                let mut answered = self.walk.head(&hidden, &mut head_rows)?;
+                let mut answered = self.walk.head(&mut hidden, &mut head_rows)?;
                 let step = answered
                     .pop()
                     .ok_or_else(|| BackendError::new("runtime", "a verify row answered nothing"))?;
@@ -641,7 +641,7 @@ impl<W: Walk> Runtime<W> {
     /// An exhausted lane pool, or a sequence the arm cannot open.
     pub fn open_slot(&self) -> Result<RuntimeSlot<W>, BackendError> {
         let lane = self.lanes()?.acquire();
-        let seq = self.walk.open(lane)?;
+        let seq = self.walk.open()?;
         Ok(RuntimeSlot {
             seq,
             lane,
@@ -847,7 +847,7 @@ impl<W: Walk> Runtime<W> {
         members: &mut [(RuntimeSlot<W>, u32)],
     ) -> Result<Vec<StepOutput>, BackendError> {
         let tokens: Vec<u32> = members.iter().map(|(_, token)| *token).collect();
-        let hidden = {
+        let mut hidden = {
             let mut segments: Vec<Segment<'_, W::Seq>> = members
                 .iter_mut()
                 .zip(tokens.iter())
@@ -855,13 +855,13 @@ impl<W: Walk> Runtime<W> {
                 .collect();
             self.walk.walk(&mut segments, Pass::token_rows())?
         };
-        if hidden.rows != members.len() {
+        if hidden.rows() != members.len() {
             return Err(BackendError::new(
                 "runtime",
                 format!(
                     "a token pass of {} rows left {} hidden rows",
                     members.len(),
-                    hidden.rows
+                    hidden.rows()
                 ),
             ));
         }
@@ -871,7 +871,7 @@ impl<W: Walk> Runtime<W> {
             .enumerate()
             .map(|(row, ((slot, _), token))| HeadRow::token(&mut slot.seq, row, *token))
             .collect();
-        let steps = self.walk.head(&hidden, &mut head_rows)?;
+        let steps = self.walk.head(&mut hidden, &mut head_rows)?;
         for (slot, token) in members.iter_mut() {
             slot.history.push(*token);
         }
@@ -1383,6 +1383,7 @@ mod tests {
 
     impl Walk for ToyWalk {
         type Seq = ToySeq;
+        type Hidden = Hidden;
         type Drafter = Absent<&'static str>;
         type Vision = NoVision;
 
@@ -1392,7 +1393,7 @@ mod tests {
             &self.layout
         }
 
-        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+        fn open(&self) -> Result<Self::Seq, BackendError> {
             Ok(ToySeq::default())
         }
 
@@ -1438,7 +1439,7 @@ mod tests {
 
         fn head(
             &self,
-            hidden: &Hidden,
+            hidden: &mut Hidden,
             rows: &mut [HeadRow<'_, Self::Seq>],
         ) -> Result<Vec<StepOutput>, BackendError> {
             rows.iter_mut()
@@ -1491,6 +1492,7 @@ mod tests {
 
     impl Walk for ImageWalk {
         type Seq = ToySeq;
+        type Hidden = Hidden;
         type Drafter = Absent<&'static str>;
         type Vision = ImageVision;
 
@@ -1500,7 +1502,7 @@ mod tests {
             &self.layout
         }
 
-        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+        fn open(&self) -> Result<Self::Seq, BackendError> {
             Ok(ToySeq::default())
         }
 
@@ -1538,7 +1540,7 @@ mod tests {
 
         fn head(
             &self,
-            _hidden: &Hidden,
+            _hidden: &mut Hidden,
             rows: &mut [HeadRow<'_, Self::Seq>],
         ) -> Result<Vec<StepOutput>, BackendError> {
             rows.iter_mut()
@@ -1624,6 +1626,7 @@ mod tests {
 
     impl Walk for OffWalk {
         type Seq = ToySeq;
+        type Hidden = Hidden;
         type Drafter = OffDrafter;
         type Vision = NoVision;
 
@@ -1633,7 +1636,7 @@ mod tests {
             &self.layout
         }
 
-        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+        fn open(&self) -> Result<Self::Seq, BackendError> {
             Ok(ToySeq::default())
         }
 
@@ -1666,7 +1669,7 @@ mod tests {
 
         fn head(
             &self,
-            _hidden: &Hidden,
+            _hidden: &mut Hidden,
             rows: &mut [HeadRow<'_, Self::Seq>],
         ) -> Result<Vec<StepOutput>, BackendError> {
             rows.iter_mut()
@@ -1836,6 +1839,7 @@ mod tests {
 
     impl Walk for DraftWalk {
         type Seq = DraftSeq;
+        type Hidden = Hidden;
         type Drafter = ToyDraftDrafter;
         type Vision = NoVision;
 
@@ -1845,7 +1849,7 @@ mod tests {
             &self.layout
         }
 
-        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+        fn open(&self) -> Result<Self::Seq, BackendError> {
             Ok(DraftSeq::default())
         }
 
@@ -1887,7 +1891,7 @@ mod tests {
 
         fn head(
             &self,
-            _hidden: &Hidden,
+            _hidden: &mut Hidden,
             rows: &mut [HeadRow<'_, Self::Seq>],
         ) -> Result<Vec<StepOutput>, BackendError> {
             rows.iter_mut()

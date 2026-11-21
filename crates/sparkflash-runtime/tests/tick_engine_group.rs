@@ -30,9 +30,9 @@ use sparkflash_comm::control::{Tp4ControlFrame, Tp4ControlHub, Tp4ControlWorker}
 use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
 use sparkflash_model::verdict;
 use sparkflash_runtime::{
-    Draft, Drafter, HeadInput, HeadRow, Hidden, LaneMemory, LaneState, Limits, NoVision,
-    OutputConstraint, Pass, PassKind, Region, Runtime, Segment, StateLayout, StepWall, TickEngine,
-    TickEvent, TickGroup, Walk, WalkCapabilities, mirror_tick_lanes, mirror_tick_lanes_seen,
+    Draft, Drafter, HeadInput, HeadRow, Hidden, LaneState, Limits, NoVision, OutputConstraint,
+    Pass, PassKind, Region, Runtime, Segment, StateLayout, StepWall, TickEngine, TickEvent,
+    TickGroup, Walk, WalkCapabilities, check_rewind, mirror_tick_lanes, mirror_tick_lanes_seen,
 };
 
 /// The model's own pick after `token`: the plain path's next token.
@@ -68,9 +68,7 @@ impl LaneState for Seq {
     }
 
     fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-        if to > self.rows.len() {
-            return Err(BackendError::new("toy", "a rewind past the position"));
-        }
+        check_rewind("toy", to, self.rows.len())?;
         self.rows.truncate(to);
         self.pending.clear();
         Ok(())
@@ -123,6 +121,7 @@ struct GroupDrafter;
 
 impl Walk for GroupWalk {
     type Seq = Seq;
+    type Hidden = Hidden;
     type Drafter = GroupDrafter;
     type Vision = NoVision;
 
@@ -133,7 +132,7 @@ impl Walk for GroupWalk {
         &self.layout
     }
 
-    fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+    fn open(&self) -> Result<Self::Seq, BackendError> {
         Ok(Seq::default())
     }
 
@@ -176,7 +175,7 @@ impl Walk for GroupWalk {
 
     fn head(
         &self,
-        _hidden: &Hidden,
+        _hidden: &mut Hidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
         Ok(rows

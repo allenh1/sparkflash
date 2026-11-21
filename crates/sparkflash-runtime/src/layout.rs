@@ -264,6 +264,41 @@ pub trait LaneState {
     fn room(&self, positions: usize, reset: bool) -> bool;
 }
 
+/// Refuses a checkpoint asked for anywhere but the sequence's position: the recurrent regions
+/// hold one live value, the one at `position`. Every [`LaneState::checkpoint`] starts here, so
+/// the refusal reads the same on every arm; `code` is the arm's error code.
+///
+/// # Errors
+/// `at` is not `position`.
+pub fn check_checkpoint(
+    code: &'static str,
+    at: usize,
+    position: usize,
+) -> Result<(), BackendError> {
+    if at == position {
+        return Ok(());
+    }
+    Err(BackendError::new(
+        code,
+        format!("the checkpoint is asked for position {at}, the sequence is at {position}"),
+    ))
+}
+
+/// Refuses a rewind to a position the sequence has not reached. Every [`LaneState::rewind`]
+/// starts here; `code` is the arm's error code.
+///
+/// # Errors
+/// `to` is past `position`.
+pub fn check_rewind(code: &'static str, to: usize, position: usize) -> Result<(), BackendError> {
+    if to <= position {
+        return Ok(());
+    }
+    Err(BackendError::new(
+        code,
+        format!("the rewind is to position {to}, the sequence is at {position}"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +335,26 @@ mod tests {
         assert_eq!(both.bytes_at(2), 80);
         assert_eq!(both.bytes_per_row(), 8);
         assert_eq!(StateLayout::empty().kind(), StateKind::None);
+    }
+
+    #[test]
+    fn the_bounds_checks_name_both_positions() {
+        assert_eq!(check_checkpoint("arm", 4, 4), Ok(()));
+        assert_eq!(
+            check_checkpoint("arm", 3, 4),
+            Err(BackendError::new(
+                "arm",
+                "the checkpoint is asked for position 3, the sequence is at 4"
+            ))
+        );
+        assert_eq!(check_rewind("arm", 0, 4), Ok(()));
+        assert_eq!(check_rewind("arm", 4, 4), Ok(()));
+        assert_eq!(
+            check_rewind("arm", 5, 4),
+            Err(BackendError::new(
+                "arm",
+                "the rewind is to position 5, the sequence is at 4"
+            ))
+        );
     }
 }

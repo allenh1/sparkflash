@@ -56,9 +56,10 @@ use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput}
 use sparkflash_model::ledger::State;
 use sparkflash_model::vision::VisionImage;
 use sparkflash_runtime::{
-    ChunkPolicy, ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden,
-    LaneMemory, LaneState, Limits, Opened, Pass, PassKind, PassMask, Region, Segment as RunSegment,
-    Segments, StateKind, StateLayout, StepWall, Vision, Walk, WalkCapabilities,
+    ChunkPolicy, ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, HeadInput,
+    HeadRow, Hidden, LaneState, Limits, Opened, Pass, PassKind, PassMask, Region, Residual,
+    Segment as RunSegment, Segments, StateKind, StateLayout, StepWall, Vision, Walk,
+    WalkCapabilities, check_checkpoint, check_rewind,
 };
 
 use super::chunk::{Injection, Rows, Segment, exchange_sum, walk_rows};
@@ -67,35 +68,95 @@ use super::{
     JOINT_WALL, Opening, PrefillWalk, Shared, choose, open_buffer,
 };
 
+/// The drafts one verify may hold: one verify is the members' anchors and their drafts, and the
+/// rank's verify batch holds [BATCH_ROWS] rows, so members x (1 + depth) never exceeds it.
+const DRAFT_BUDGET: DraftBudget = DraftBudget::OnePass(BATCH_ROWS);
+
 /// One sequence's device state, as the runtime drives it.
 ///
 /// The runtime owns the tokens it has fed; this owns the rank's caches and the request's
-/// sampler. A pass's answers wait here for [Walk::head], because the runtime asks for them in a
-/// second call.
+/// sampler. A pass's answers travel to [Walk::head] in the pass's [InklingHidden].
 pub struct InklingSequence {
     session: InklingDeviceSession,
-    /// The one row the last token or prompt pass answered, waiting for its head.
-    answered: Option<Vec<f32>>,
-    /// A verify pass's answers, one a row, in the order the pass walked them.
-    verified: Vec<Vec<f32>>,
-    /// The first row of that verify pass in the walk's global row order.
-    verified_from: usize,
 }
 
 impl InklingSequence {
     fn new(session: InklingDeviceSession) -> Self {
+        Self { session }
+    }
+}
+
+/// The rows of logits a pass answered, which its head turns into tokens.
+enum Answers {
+    /// The one row a prompt chunk answers (its last), or one row a lane of a token pass: the
+    /// logits of the pass's rows from `first` on, each taken by the head that reads it.
+    Rows {
+        first: usize,
+        logits: Vec<Option<Vec<f32>>>,
+    },
+    /// A verify pass's answers, one a row in the order the pass walked them. A verify row's
+    /// head reads its row and leaves it.
+    Verified(Vec<Vec<f32>>),
+}
+
+/// What an Inkling pass hands its head: the row count and the logits the pass answered.
+pub struct InklingHidden {
+    rows: usize,
+    answers: Answers,
+}
+
+impl InklingHidden {
+    /// A prompt chunk's hidden: `rows` rows, of which the last answered `last`.
+    fn chunk(rows: usize, last: Option<Vec<f32>>) -> Self {
         Self {
-            session,
-            answered: None,
-            verified: Vec::new(),
-            verified_from: 0,
+            rows,
+            answers: Answers::Rows {
+                first: rows.saturating_sub(1),
+                logits: vec![last],
+            },
         }
     }
 
-    fn clear_answers(&mut self) {
-        self.answered = None;
-        self.verified.clear();
-        self.verified_from = 0;
+    /// A token pass's hidden: `rows` lanes, and the row each answered.
+    fn lanes(rows: usize, logits: Vec<Vec<f32>>) -> Self {
+        Self {
+            rows,
+            answers: Answers::Rows {
+                first: 0,
+                logits: logits.into_iter().map(Some).collect(),
+            },
+        }
+    }
+
+    /// A verify pass's hidden: every member's rows, in order.
+    fn verified(members: Vec<Vec<Vec<f32>>>) -> Self {
+        let logits: Vec<Vec<f32>> = members.into_iter().flatten().collect();
+        Self {
+            rows: logits.len(),
+            answers: Answers::Verified(logits),
+        }
+    }
+
+    /// Takes the logits a prompt or token pass answered at `row`, once.
+    fn take(&mut self, row: usize) -> Option<Vec<f32>> {
+        match &mut self.answers {
+            Answers::Rows { first, logits } => logits.get_mut(row.checked_sub(*first)?)?.take(),
+            Answers::Verified(_) => None,
+        }
+    }
+
+    /// The logits a verify pass answered at `row`.
+    fn verify_row(&self, row: usize) -> Option<&Vec<f32>> {
+        match &self.answers {
+            Answers::Rows { .. } => None,
+            Answers::Verified(logits) => logits.get(row),
+        }
+    }
+}
+
+impl Residual for InklingHidden {
+    fn rows(&self) -> usize {
+        self.rows
     }
 }
 
@@ -114,15 +175,7 @@ impl LaneState for InklingSequence {
     }
 
     fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
-        if at != self.session.state.position {
-            return Err(BackendError::new(
-                DEVICE,
-                format!(
-                    "the checkpoint is asked for position {at}, the sequence is at {}",
-                    self.session.state.position
-                ),
-            ));
-        }
+        check_checkpoint(DEVICE, at, self.session.state.position)?;
         self.session
             .save_boundary(at)
             .map_err(|error| BackendError::new(DEVICE, error))
@@ -130,16 +183,10 @@ impl LaneState for InklingSequence {
 
     fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
         let from = self.session.state.position;
-        if to > from {
-            return Err(BackendError::new(
-                DEVICE,
-                format!("the rewind is to position {to}, the sequence is at {from}"),
-            ));
-        }
+        check_rewind(DEVICE, to, from)?;
         if to == from {
             return Ok(());
         }
-        self.clear_answers();
         self.session.round = None;
         self.session.opening = None;
         if to == 0 {
@@ -184,11 +231,7 @@ impl InklingWalk {
             present: shared.draft.is_some(),
             kind: shared.draft.map(|(kind, _)| kind),
             depth: shared.draft.map_or(0, |(_, depth)| depth),
-            wall: ExpertUnionWall {
-                experts: config.n_routed_experts,
-                top_k: config.num_experts_per_tok,
-                ..JOINT_WALL
-            },
+            wall: JOINT_WALL.with_experts(config.n_routed_experts, config.num_experts_per_tok),
         };
         let layout = layout_of(&shared);
         // The pass's rows, not the buffers' width: the widest chunk the arm can walk is what the
@@ -234,7 +277,7 @@ impl InklingWalk {
         rows: &[u32],
         after: usize,
         images: &[VisionImage],
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<InklingHidden, BackendError> {
         let shared = &self.shared;
         let start = seq.session.state.position;
         if start + rows.len() > shared.context {
@@ -262,6 +305,7 @@ impl InklingWalk {
         let row_bytes = shared.hidden() * std::mem::size_of::<f32>();
         let injections = self.image_injections(seq, images, start, rows.len(), row_bytes)?;
         let mut walked = 0usize;
+        let mut last = None;
         for take in splits {
             let slice = &rows[walked..walked + take];
             let first = seq.session.state.position;
@@ -309,10 +353,10 @@ impl InklingWalk {
                 .map_err(|error| BackendError::new(DEVICE, error.to_string()))?;
             seq.session.history.extend_from_slice(slice);
             seq.session.last_logits = logits.clone();
-            seq.answered = Some(logits);
+            last = Some(logits);
             walked += take;
         }
-        Ok(Hidden::new(rows.len()))
+        Ok(InklingHidden::chunk(rows.len(), last))
     }
 
     /// The prompt's encoded image rows as chunk-relative runs, one a fresh image whose span
@@ -359,7 +403,7 @@ impl InklingWalk {
     fn walk_tokens(
         &self,
         segments: &mut [RunSegment<'_, InklingSequence>],
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<InklingHidden, BackendError> {
         let shared = &self.shared;
         for segment in segments.iter_mut() {
             if segment.rows.len() != 1 {
@@ -415,11 +459,7 @@ impl InklingWalk {
                 None,
             )?
         };
-        for (segment, logits) in segments.iter_mut().zip(rows) {
-            segment.seq.clear_answers();
-            segment.seq.answered = Some(logits);
-        }
-        Ok(Hidden::new(tokens.len()))
+        Ok(InklingHidden::lanes(tokens.len(), rows))
     }
 
     /// One walk of every segment's anchor and drafts ([Rows::Segments]), answering every row's
@@ -665,9 +705,7 @@ impl Drafter<InklingWalk> for InklingDrafter {
     }
 
     fn budget(&self, seqs: usize) -> usize {
-        // One verify is the members' anchors and their drafts, and the rank's verify batch
-        // holds [BATCH_ROWS] rows: members x (1 + depth) never exceeds it.
-        (seqs * self.depth).min(BATCH_ROWS.saturating_sub(seqs))
+        DRAFT_BUDGET.rows(seqs, self.depth)
     }
 
     fn ready(&self, seq: &InklingSequence, token: u32) -> bool {
@@ -824,6 +862,7 @@ impl Vision<InklingWalk> for InklingVision {
 
 impl Walk for InklingWalk {
     type Seq = InklingSequence;
+    type Hidden = InklingHidden;
     type Drafter = InklingDrafter;
     type Vision = InklingVision;
 
@@ -849,8 +888,7 @@ impl Walk for InklingWalk {
         &self.layout
     }
 
-    fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError> {
-        let _ = memory;
+    fn open(&self) -> Result<Self::Seq, BackendError> {
         InklingDeviceSession::open(&self.shared).map(InklingSequence::new)
     }
 
@@ -875,14 +913,13 @@ impl Walk for InklingWalk {
 
     fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
         seq.session.set_sampling(sampling);
-        seq.clear_answers();
     }
 
     fn walk(
         &self,
         segments: &mut [RunSegment<'_, Self::Seq>],
         pass: Pass<'_>,
-    ) -> Result<Hidden, BackendError> {
+    ) -> Result<InklingHidden, BackendError> {
         self.shared
             .cuda
             .make_current()
@@ -907,15 +944,7 @@ impl Walk for InklingWalk {
                     .iter()
                     .map(|segment| segment.rows.len().saturating_sub(1))
                     .collect();
-                let answered = self.verify_rows(segments, &depths)?;
-                let mut rows = 0;
-                for (segment, answered) in segments.iter_mut().zip(answered) {
-                    segment.seq.clear_answers();
-                    segment.seq.verified_from = rows;
-                    rows += answered.len();
-                    segment.seq.verified = answered;
-                }
-                Hidden::new(rows)
+                InklingHidden::verified(self.verify_rows(segments, &depths)?)
             }
             PassKind::Paired { .. } => {
                 return Err(BackendError::new(
@@ -925,14 +954,14 @@ impl Walk for InklingWalk {
             }
         };
         if let Some(hook) = pass.hook {
-            hook.after_layers(&hidden)?;
+            hook.after_layers(&Hidden::new(hidden.rows))?;
         }
         Ok(hidden)
     }
 
     fn head(
         &self,
-        hidden: &Hidden,
+        hidden: &mut InklingHidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
         self.shared
@@ -950,33 +979,30 @@ impl Walk for InklingWalk {
             }
             let seq = &mut *row.seq;
             let step = match &row.input {
-                HeadInput::Prompt(tokens) => {
-                    let logits = seq.answered.take().ok_or_else(|| {
+                HeadInput::Prompt(_) => {
+                    let logits = hidden.take(row.row).ok_or_else(|| {
                         BackendError::new(DEVICE, "a prompt head has no chunk's logits")
                     })?;
                     // The penalties count the whole prompt, the reused prefix included: it is
                     // one request, whatever the number of chunks it ran in.
-                    seq.session.sampler.reset();
-                    seq.session.sampler.record_prompt(tokens);
+                    row.input.record(&mut seq.session.sampler);
                     seq.session.last_logits = logits.clone();
                     seq.session.output(logits)
                 }
+                // The session's own bookkeeping of a decoded token: its history beside the
+                // sampler's record, as its other decode paths keep it.
                 HeadInput::Token(token) => {
-                    let logits = seq
-                        .answered
-                        .take()
+                    let logits = hidden
+                        .take(row.row)
                         .ok_or_else(|| BackendError::new(DEVICE, "a token head has no row"))?;
                     seq.session.decoded(*token, logits)
                 }
-                HeadInput::Verify { rows, row: index } => {
-                    let token = rows.get(*index).copied().unwrap_or_default();
-                    let at = row.row.checked_sub(seq.verified_from).ok_or_else(|| {
-                        BackendError::new(DEVICE, "a verify row is before its pass")
-                    })?;
-                    let logits = seq.verified.get(at).cloned().ok_or_else(|| {
+                HeadInput::Verify { .. } => {
+                    let at = row.row;
+                    let logits = hidden.verify_row(at).cloned().ok_or_else(|| {
                         BackendError::new(DEVICE, format!("the verify pass has no row {at}"))
                     })?;
-                    seq.session.sampler.record(token);
+                    row.input.record(&mut seq.session.sampler);
                     let next_token = choose(
                         &shared.config,
                         &mut seq.session.sampler,
@@ -1000,33 +1026,14 @@ impl Walk for InklingWalk {
 mod tests {
     use std::sync::Arc;
 
-    use sparkflash_model::backend::Sampling;
-    use sparkflash_model::ledger::Strategy;
-    use sparkflash_runtime::testing::{self, ShapeWalk, pick, wrong};
-    use sparkflash_runtime::{
-        ChunkPolicy, Fixture, Runtime, TickConfig, TickEngine, TickEvent, Walk, WalkFixture,
-        ledger_for,
-    };
+    use sparkflash_runtime::testing::{ShapeWalk, format_rule};
+    use sparkflash_runtime::{ChunkPolicy, Fixture, Walk, WalkFixture, ledger_for};
 
     use super::super::{
         DEFAULT_DRAFT_DEPTH, DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM,
         MAX_PREFILL_CHUNK,
     };
     use super::*;
-
-    /// The stored format names the fixture's classes use.
-    fn format_rule(
-        format: sparkflash_model::architecture::WeightFormat,
-    ) -> sparkflash_runtime::FormatRule {
-        use sparkflash_model::architecture::WeightFormat;
-        let name = match format {
-            WeightFormat::Bf16 => "BF16",
-            WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
-            WeightFormat::MxFp8 { .. } => "MX FP8",
-            WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
-        };
-        sparkflash_runtime::FormatRule::stored(name)
-    }
 
     /// The Inkling fixture: the tiny host fixture the device tests share, opened through the
     /// arm's own TP=1 constructor.
@@ -1078,29 +1085,6 @@ mod tests {
             base: DEFAULT_PREFILL_CHUNK,
             long: LONG_PREFILL_CHUNK,
             long_from: LONG_PREFILL_FROM,
-        }
-    }
-
-    /// The four compute rows the walk declares are the arm's static declaration, so the boot
-    /// ledger and the arms table cannot drift.
-    #[test]
-    fn the_declared_compute_rows_are_the_arm_ledger_rows() {
-        use sparkflash_model::ledger::ledger_for_arm;
-        let declared = ledger_for_arm("Inkling").expect("Inkling's declaration");
-        let capabilities = <InklingWalk as Walk>::CAPABILITIES.compute;
-        for (strategy, stated) in [
-            (Strategy::TensorCorePrompt, capabilities.prompt),
-            (Strategy::TensorCoreDecode, capabilities.token),
-            (Strategy::StoredArithmetic, capabilities.stored),
-            (Strategy::Rewind, capabilities.rewind),
-        ] {
-            let from_table = declared
-                .rows
-                .iter()
-                .find(|(row, _)| *row == strategy)
-                .map(|(_, state)| *state)
-                .expect("the arm states every strategy");
-            assert_eq!(stated, from_table, "{} drifted", strategy.name());
         }
     }
 
@@ -1174,11 +1158,7 @@ mod tests {
             present: true,
             kind: Some(DraftKind::Dspark),
             depth: 7,
-            wall: ExpertUnionWall {
-                experts: 0,
-                top_k: 0,
-                ..JOINT_WALL
-            },
+            wall: JOINT_WALL,
         };
         for seqs in 1..=BATCH_ROWS {
             let rows = seqs + drafter.budget(seqs);
@@ -1196,11 +1176,7 @@ mod tests {
             present: false,
             kind: None,
             depth: 0,
-            wall: ExpertUnionWall {
-                experts: 0,
-                top_k: 0,
-                ..JOINT_WALL
-            },
+            wall: JOINT_WALL,
         };
         assert!(
             !off.drafts(),
@@ -1277,231 +1253,20 @@ mod tests {
             depth,
         )
         .with_code(DEVICE)
-        .with_budget(|seqs, depth| (seqs * depth).min(BATCH_ROWS.saturating_sub(seqs)))
+        .with_budget(DRAFT_BUDGET)
     }
 
-    /// The generated checks drive the path Inkling serves its single process on, as dense's,
-    /// GLM's and Qwen's do.
-    #[test]
-    fn the_generated_checks_drive_the_tick_engine() {
-        assert!(<InklingWalk as WalkFixture>::tick_engine());
-    }
-
-    /// The tick engine's config is Inkling's profile: the arm's pass rows as the prompt chunk,
-    /// [BATCH_ROWS] as the verify width, the drafter's own depth and floor, the runtime's
-    /// joint-round switch, no decoder-layer skip and no row exchange at one rank.
-    #[test]
-    fn the_tick_config_is_the_inkling_profile() {
-        let widest = LONG_PREFILL_CHUNK;
-        let walk = shape_walk(widest, DEFAULT_DRAFT_DEPTH);
-        let config = TickConfig::for_walk(&walk, BATCH_ROWS);
-        assert_eq!(config.rows_max, widest, "the widest width is a policy size");
-        assert_eq!(
-            config.chunk_rows, widest,
-            "a prompt pass is the policy's `{widest}` rows"
-        );
-        assert_eq!(config.exact_tick_rows, widest);
-        assert_eq!(config.busy_chunk, widest);
-        assert_eq!(config.bulk_cap, Some(widest));
-        assert_eq!(
-            config.members, BATCH_ROWS,
-            "the verify width is the member cap"
-        );
-        assert_eq!(
-            config.k,
-            (DEFAULT_DRAFT_DEPTH).min(BATCH_ROWS - 1),
-            "a member's anchor and the drafter's own drafts"
-        );
-        assert!(config.batch_spec.is_some(), "the arm drafts");
-        assert!(
-            config.shared_rounds,
-            "the arm's joint rounds are on by default"
-        );
-        assert_eq!(
-            config.share_floor, 0.0,
-            "the arm states no confidence floor"
-        );
-        assert!(
-            !config.decoder_skip,
-            "Inkling has no decoder layers to skip"
-        );
-        assert!(!config.exchange, "TP=1 has no row exchange");
-
-        // The 65,535-row switch is a policy size too, so the arm's whole-context pass survives.
-        let whole = shape_walk(MAX_PREFILL_CHUNK, 0);
-        assert_eq!(
-            TickConfig::for_walk(&whole, 1).chunk_rows,
+    sparkflash_runtime::profile_checks!(
+        super::InklingWalk,
+        table: "Inkling",
+        depth: DEFAULT_DRAFT_DEPTH,
+        chunks: [
+            DEFAULT_PREFILL_CHUNK,
+            LONG_PREFILL_CHUNK,
             MAX_PREFILL_CHUNK
-        );
-
-        // The engine's shared-round switch is the runtime's, not a second rule.
-        let joint = Runtime::new(shape_walk(widest, DEFAULT_DRAFT_DEPTH), 0)
-            .expect("the runtime")
-            .with_joint_rounds(true);
-        assert!(
-            TickConfig::for_runtime(&joint, BATCH_ROWS).shared_rounds,
-            "joint rounds on: the shared verify"
-        );
-        let alone = Runtime::new(shape_walk(widest, DEFAULT_DRAFT_DEPTH), 0)
-            .expect("the runtime")
-            .with_joint_rounds(false);
-        assert!(
-            !TickConfig::for_runtime(&alone, BATCH_ROWS).shared_rounds,
-            "joint rounds off: plain rows, as the runtime would plan"
-        );
-    }
-
-    /// A prompt longer than one width runs the arm's own chunks: the engine hands the walk
-    /// `ChunkPolicy` rows at a time, and 8,192 rows is where the default schedule widens, so a
-    /// 20,000-row prompt is 8,192 + 8,192 + 3,616; at the 65,535-row switch it is 65,535 +
-    /// 34,465.
-    #[test]
-    fn the_tick_engine_hands_inkling_chunks_past_one_width() {
-        let mut engine =
-            TickEngine::new(shape_walk(LONG_PREFILL_CHUNK, 0), 1).expect("the tick engine starts");
-        assert_eq!(engine.config().chunk_rows, LONG_PREFILL_CHUNK);
-        let id = engine
-            .admit(&vec![7u32; 20_000], &[], Sampling::default())
-            .expect("the prompt");
-        loop {
-            let events = engine.tick().expect("the tick");
-            if events
-                .iter()
-                .any(|event| matches!(event, TickEvent::Prompt { id: got, .. } if *got == id))
-            {
-                break;
-            }
-        }
-        assert_eq!(
-            engine.walk().chunks(),
-            vec![
-                LONG_PREFILL_CHUNK,
-                LONG_PREFILL_CHUNK,
-                20_000 - 2 * LONG_PREFILL_CHUNK
-            ],
-            "a 20,000-row prompt runs 8,192, 8,192 then 3,616, as the old runtime ran it"
-        );
-
-        let mut wide =
-            TickEngine::new(shape_walk(MAX_PREFILL_CHUNK, 0), 1).expect("the tick engine starts");
-        assert_eq!(wide.config().chunk_rows, MAX_PREFILL_CHUNK);
-        let _ = testing::prompt(&mut wide, &vec![7u32; 100_000]);
-        assert_eq!(
-            wide.walk().chunks(),
-            vec![MAX_PREFILL_CHUNK, 100_000 - MAX_PREFILL_CHUNK],
-            "the whole-context width splits a 100,000-row prompt twice"
-        );
-
-        // A group's row exchange marks the bulk path; the rows are the same split.
-        let walk = shape_walk(LONG_PREFILL_CHUNK, 0);
-        let mut group = TickConfig::for_walk(&walk, 1);
-        group.exchange = true;
-        let mut engine = TickEngine::new(walk, 1)
-            .expect("the tick engine starts")
-            .with_config(group)
-            .expect("the group config");
-        assert!(engine.config().exchange);
-        let _ = testing::prompt(&mut engine, &vec![7u32; 20_000]);
-        assert_eq!(
-            engine.walk().chunks(),
-            vec![
-                LONG_PREFILL_CHUNK,
-                LONG_PREFILL_CHUNK,
-                20_000 - 2 * LONG_PREFILL_CHUNK
-            ],
-            "the group's bulk chunks are the single process's chunks"
-        );
-    }
-
-    /// Several decoding lanes verify in one shared round: the old fused engine's joint round is
-    /// the engine's shared plan, one verify holds every member's chain, and the verify is no
-    /// wider than the rank's [BATCH_ROWS] rows.
-    #[test]
-    fn the_tick_engine_keeps_inklings_joint_round() {
-        let mut engine = TickEngine::new(shape_walk(LONG_PREFILL_CHUNK, 2), 3)
-            .expect("the tick engine starts")
-            .with_trace();
-        let mut ids = Vec::new();
-        let mut firsts = Vec::new();
-        for at in 0..3u32 {
-            let prompt: Vec<u32> = (0..7).map(|index| 1 + at * 13 + index).collect();
-            let (id, step) = testing::prompt(&mut engine, &prompt);
-            assert_eq!(engine.kept(id).and_then(|kept| kept.history), Some(7));
-            ids.push(id);
-            firsts.push(step.next_token.expect("a token"));
-        }
-        for (id, token) in ids.iter().zip(&firsts) {
-            engine.feed(*id, *token).expect("the row is fed");
-        }
-        let mut answered = 0;
-        while answered < ids.len() {
-            for event in engine.tick().expect("the shared tick") {
-                if matches!(event, TickEvent::Decode { .. }) {
-                    answered += 1;
-                }
-            }
-        }
-        let trace = engine.trace().expect("the trace").render();
-        assert!(
-            trace.contains("plan=shared"),
-            "three lanes share one verify: {trace}"
-        );
-        let verifies = engine.walk().verifies();
-        assert_eq!(verifies.len(), 1, "one shared verify, not one a lane");
-        assert_eq!(
-            verifies[0].len(),
-            3,
-            "every member's chain is in the pass: {verifies:?}"
-        );
-        assert!(
-            verifies[0].iter().sum::<usize>() <= BATCH_ROWS,
-            "the three anchors and the drafts they share fit one rank step: {verifies:?}"
-        );
-        assert!(
-            verifies[0].iter().sum::<usize>() >= 4,
-            "the row share drafts at least one of them: {verifies:?}"
-        );
-    }
-
-    /// One decoding row runs one speculative round; the draft it gets wrong is rejected, and only
-    /// the accepted rows reach the request.
-    #[test]
-    fn a_speculative_round_keeps_its_accepted_rows_only() {
-        let mut engine = TickEngine::new(shape_walk(LONG_PREFILL_CHUNK, 2), 1)
-            .expect("the tick engine starts")
-            .with_trace();
-        let (id, first) = testing::prompt(&mut engine, &[10, 11, 12, 13]);
-        let anchor = first.next_token.expect("a token");
-        let steps = testing::decode(&mut engine, id, anchor);
-        assert_eq!(steps.len(), 2, "the anchor and the accepted draft");
-        assert_eq!(steps[0].next_token, Some(pick(anchor)));
-        assert_eq!(steps[1].next_token, Some(pick(pick(anchor))));
-        assert_eq!(
-            engine.history(id).map(<[u32]>::to_vec),
-            Some(vec![10, 11, 12, 13, anchor, pick(anchor)]),
-            "the accepted draft reaches the history"
-        );
-        assert!(
-            !engine
-                .history(id)
-                .expect("the history")
-                .contains(&wrong(anchor)),
-            "the rejected draft never reaches the request"
-        );
-        assert_eq!(
-            engine.walk().verifies(),
-            vec![vec![3]],
-            "the anchor and both drafts verified in one pass"
-        );
-        assert!(
-            engine
-                .trace()
-                .expect("the trace")
-                .render()
-                .contains("plan=spec"),
-            "one row takes the speculative plan"
-        );
-    }
+        ],
+        shape: |chunk, depth| shape_walk(chunk, depth)
+    );
 
     sparkflash_runtime::conformance!(super::InklingWalk);
 }

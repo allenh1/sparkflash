@@ -41,9 +41,8 @@ use std::any::Any;
 use sparkflash_model::backend::{BackendError, StepOutput};
 
 use crate::layout::StateKind;
-use crate::pool::LaneMemory;
 use crate::runtime::{Runtime, RuntimeSlot};
-use crate::walk::{Drafter, HeadRow, Hidden, Pass, PassMask, Segment, Segments, Walk};
+use crate::walk::{Drafter, HeadRow, Pass, PassMask, Residual, Segment, Segments, Walk};
 
 /// One check the generated arm tests cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -667,8 +666,8 @@ fn direct_run<W: Walk>(
     prompt: &[u32],
     mode: PromptMode,
 ) -> Result<Vec<Option<u32>>, BackendError> {
-    let mut seq = walk.open(LaneMemory::new(0, 0))?;
-    let hidden = match mode {
+    let mut seq = walk.open()?;
+    let mut hidden = match mode {
         PromptMode::Whole => walk.walk(
             &mut [Segment::new(&mut seq, prompt)],
             Pass::bulk(prompt.len()).with_prompt_end(0),
@@ -689,39 +688,31 @@ fn direct_run<W: Walk>(
             hidden
         }
         PromptMode::Token => {
-            let mut hidden = Hidden::new(0);
-            for (index, token) in prompt.iter().enumerate() {
-                let last = index + 1 == prompt.len();
-                hidden = walk.walk(
+            let mut hidden = None;
+            for token in prompt {
+                hidden = Some(walk.walk(
                     &mut [Segment::new(&mut seq, std::slice::from_ref(token))],
                     Pass::token_rows(),
-                )?;
-                if last {
-                    break;
-                }
+                )?);
             }
-            hidden
+            hidden.ok_or_else(|| {
+                BackendError::new("conformance", "an empty prompt leaves no row to head")
+            })?
         }
     };
-    let step = head_one(
-        walk,
-        &mut seq,
-        &hidden,
-        hidden.rows.saturating_sub(1),
-        None,
-        prompt,
-    )?;
+    let row = hidden.rows().saturating_sub(1);
+    let step = head_one(walk, &mut seq, &mut hidden, row, None, prompt)?;
     let mut run = vec![step.next_token];
     let mut token = step.next_token;
     while run.len() < CONFORMANCE_TOKENS {
         let Some(fed) = token else {
             break;
         };
-        let hidden = walk.walk(
+        let mut hidden = walk.walk(
             &mut [Segment::new(&mut seq, std::slice::from_ref(&fed))],
             Pass::token_rows(),
         )?;
-        let step = head_one(walk, &mut seq, &hidden, 0, Some(fed), &[])?;
+        let step = head_one(walk, &mut seq, &mut hidden, 0, Some(fed), &[])?;
         token = step.next_token;
         run.push(token);
     }
@@ -734,30 +725,24 @@ fn plain_run<W: Walk>(
     prompt: &[u32],
     tokens: usize,
 ) -> Result<Vec<Option<u32>>, BackendError> {
-    let mut seq = walk.open(LaneMemory::new(0, 0))?;
-    let hidden = walk.walk(
+    let mut seq = walk.open()?;
+    let mut hidden = walk.walk(
         &mut [Segment::new(&mut seq, prompt)],
         Pass::bulk(prompt.len()).with_prompt_end(0),
     )?;
-    let step = head_one(
-        walk,
-        &mut seq,
-        &hidden,
-        hidden.rows.saturating_sub(1),
-        None,
-        prompt,
-    )?;
+    let row = hidden.rows().saturating_sub(1);
+    let step = head_one(walk, &mut seq, &mut hidden, row, None, prompt)?;
     let mut run = vec![step.next_token];
     let mut token = step.next_token;
     while run.len() < tokens {
         let Some(fed) = token else {
             break;
         };
-        let hidden = walk.walk(
+        let mut hidden = walk.walk(
             &mut [Segment::new(&mut seq, std::slice::from_ref(&fed))],
             Pass::token_rows(),
         )?;
-        let step = head_one(walk, &mut seq, &hidden, 0, Some(fed), &[])?;
+        let step = head_one(walk, &mut seq, &mut hidden, 0, Some(fed), &[])?;
         token = step.next_token;
         run.push(token);
     }
@@ -768,7 +753,7 @@ fn plain_run<W: Walk>(
 fn head_one<W: Walk>(
     walk: &W,
     seq: &mut W::Seq,
-    hidden: &Hidden,
+    hidden: &mut W::Hidden,
     row: usize,
     token: Option<u32>,
     prompt: &[u32],
@@ -1072,6 +1057,7 @@ macro_rules! conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::walk::Hidden;
 
     /// A CPU walk whose generated checks go through the tick engine, the path dense serves on.
     struct TickToy {
@@ -1114,6 +1100,7 @@ mod tests {
 
     impl Walk for TickToy {
         type Seq = TickSeq;
+        type Hidden = Hidden;
         type Drafter = crate::Absent<&'static str>;
         type Vision = crate::NoVision;
 
@@ -1124,7 +1111,7 @@ mod tests {
             &self.layout
         }
 
-        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+        fn open(&self) -> Result<Self::Seq, BackendError> {
             Ok(TickSeq::default())
         }
 
@@ -1160,7 +1147,7 @@ mod tests {
 
         fn head(
             &self,
-            _hidden: &Hidden,
+            _hidden: &mut Hidden,
             rows: &mut [HeadRow<'_, Self::Seq>],
         ) -> Result<Vec<StepOutput>, BackendError> {
             Ok(rows

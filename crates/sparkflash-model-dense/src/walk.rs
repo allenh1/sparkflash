@@ -33,9 +33,9 @@ use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_ops::projection::WidePolicy;
 use sparkflash_runtime::{
-    Absent, ComputeDeclaration, HeadInput, HeadRow, Hidden, LaneMemory, LaneState, Limits,
-    NoVision, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments, StateKind, StateLayout,
-    Walk, WalkCapabilities,
+    Absent, ComputeDeclaration, HeadRow, Hidden, LaneState, Limits, NoVision, Pass, PassKind,
+    PassMask, Region, Runtime, Segment, Segments, StateKind, StateLayout, Walk, WalkCapabilities,
+    check_checkpoint, check_rewind,
 };
 
 use super::{
@@ -165,15 +165,7 @@ impl LaneState for Sequence {
     }
 
     fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
-        if at != self.history.len() {
-            return Err(BackendError::new(
-                DEVICE,
-                format!(
-                    "the checkpoint is asked for position {at}, the sequence is at {}",
-                    self.history.len()
-                ),
-            ));
-        }
+        check_checkpoint(DEVICE, at, self.history.len())?;
         let live = self.linear_regions();
         if let Some(checkpoint) = self.checkpoint.as_mut() {
             checkpoint
@@ -184,15 +176,7 @@ impl LaneState for Sequence {
     }
 
     fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-        if to > self.history.len() {
-            return Err(BackendError::new(
-                DEVICE,
-                format!(
-                    "the rewind is to position {to}, the sequence is at {}",
-                    self.history.len()
-                ),
-            ));
-        }
+        check_rewind(DEVICE, to, self.history.len())?;
         if to == 0 {
             self.clear_linear()?;
         } else if let Some(checkpoint) = &self.checkpoint {
@@ -213,6 +197,7 @@ impl LaneState for Sequence {
 
 impl Walk for DenseWalk {
     type Seq = Sequence;
+    type Hidden = Hidden;
     type Drafter = Absent<&'static str>;
     type Vision = NoVision;
 
@@ -235,8 +220,7 @@ impl Walk for DenseWalk {
         &self.layout
     }
 
-    fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError> {
-        let _ = memory;
+    fn open(&self) -> Result<Self::Seq, BackendError> {
         Sequence::open(Arc::clone(&self.shared)).map_err(|error| BackendError::new(DEVICE, error))
     }
 
@@ -283,7 +267,7 @@ impl Walk for DenseWalk {
 
     fn head(
         &self,
-        hidden: &Hidden,
+        hidden: &mut Hidden,
         rows: &mut [HeadRow<'_, Self::Seq>],
     ) -> Result<Vec<StepOutput>, BackendError> {
         if hidden.rows == 0 {
@@ -294,17 +278,7 @@ impl Walk for DenseWalk {
         // Record each row's token before asking whether its sampler is greedy: a prompt's record
         // resets and fills the history the penalty check reads.
         for row in rows.iter_mut() {
-            match &row.input {
-                HeadInput::Prompt(tokens) => {
-                    row.seq.sampler.reset();
-                    row.seq.sampler.record_prompt(tokens);
-                }
-                HeadInput::Token(token) => row.seq.sampler.record(*token),
-                HeadInput::Verify { rows, row: index } => row
-                    .seq
-                    .sampler
-                    .record(rows.get(*index).copied().unwrap_or_default()),
-            }
+            row.input.record(&mut row.seq.sampler);
         }
         // A greedy sampler whose penalties change nothing takes the row's argmax as it stands.
         // Choose it on the device and copy one u32 a row, not the vocabulary.
@@ -383,6 +357,7 @@ impl Walk for DenseWalk {
 
 #[cfg(test)]
 mod tests {
+    use sparkflash_runtime::testing::format_rule;
     use sparkflash_runtime::{Fixture, FusedArm, WalkFixture};
 
     use super::*;
@@ -573,20 +548,10 @@ mod tests {
             .map_err(|error| BackendError::new("fixture", error))?;
             let walk = backend.walk_arm(64)?;
             let bytes = backend.weight_bytes() as u64;
-            let mut formats = Vec::new();
-            for format in [
-                architecture.quantization.dense_format,
-                architecture.quantization.expert_format,
-            ] {
-                use sparkflash_model::architecture::WeightFormat;
-                let name = match format {
-                    WeightFormat::Bf16 => "BF16",
-                    WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
-                    WeightFormat::MxFp8 { .. } => "MX FP8",
-                    WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
-                };
-                formats.push(sparkflash_runtime::FormatRule::stored(name));
-            }
+            let formats = vec![
+                format_rule(architecture.quantization.dense_format),
+                format_rule(architecture.quantization.expert_format),
+            ];
             Ok(Fixture::new(
                 walk,
                 format!("the dense synthetic checkpoint at {}", path.display()),
@@ -735,6 +700,7 @@ mod tests {
 
     impl Walk for RecordingWalk {
         type Seq = RecordedSeq;
+        type Hidden = Hidden;
         type Drafter = Absent<&'static str>;
         type Vision = NoVision;
 
@@ -744,7 +710,7 @@ mod tests {
             &self.layout
         }
 
-        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+        fn open(&self) -> Result<Self::Seq, BackendError> {
             Ok(RecordedSeq::default())
         }
 
@@ -780,7 +746,7 @@ mod tests {
 
         fn head(
             &self,
-            hidden: &Hidden,
+            hidden: &mut Hidden,
             rows: &mut [HeadRow<'_, Self::Seq>],
         ) -> Result<Vec<StepOutput>, BackendError> {
             let _ = hidden;
