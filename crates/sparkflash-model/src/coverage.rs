@@ -352,7 +352,7 @@ pub(crate) fn read_key<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
 }
 
 /// Every member of an object the parser iterates, recorded as read.
-pub(crate) fn entries<'a>(value: &'a Value) -> Vec<(&'a str, &'a Value)> {
+pub(crate) fn entries(value: &Value) -> Vec<(&str, &Value)> {
     let pairs: Vec<(&str, &Value)> = match value.as_object() {
         Some(map) => map
             .iter()

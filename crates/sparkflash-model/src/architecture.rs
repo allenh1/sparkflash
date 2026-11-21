@@ -1052,7 +1052,7 @@ impl Architecture {
         }
         let routed_named = ["n_routed_experts", "num_experts"]
             .iter()
-            .any(|field| read_key(text, *field).is_some_and(|value| !value.is_null()));
+            .any(|field| read_key(text, field).is_some_and(|value| !value.is_null()));
         if !routed_named
             && let Some(experts) = read_key(text, "num_local_experts").and_then(Value::as_u64)
         {
@@ -2175,7 +2175,7 @@ fn has_linear_attention(text: &Value) -> bool {
             "linear_value_head_dim",
         ]
         .iter()
-        .any(|field| read_key(text, *field).is_some())
+        .any(|field| read_key(text, field).is_some())
 }
 
 /// The per-layer selection lists a released document uses.

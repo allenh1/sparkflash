@@ -638,16 +638,16 @@ pub fn judge(evidence: &Evidence<'_>, cluster: &Cluster) -> Fit {
     let configurations: Vec<Configuration> = WORLDS
         .iter()
         .map(|&world| {
-            configuration(
+            configuration(ConfigurationInputs {
                 world,
-                architecture.map(|architecture| (architecture, document_key)),
-                evidence.config,
+                architecture: architecture.map(|architecture| (architecture, document_key)),
+                config: evidence.config,
                 profile,
                 blocked,
-                evidence.weights,
+                weights: evidence.weights,
                 window,
                 cluster,
-            )
+            })
         })
         .collect();
     let verdict = overall(&configurations, blocked);
@@ -672,16 +672,28 @@ pub fn judge(evidence: &Evidence<'_>, cluster: &Cluster) -> Fit {
     fit
 }
 
-fn configuration(
+struct ConfigurationInputs<'a> {
     world: usize,
-    architecture: Option<(&Architecture, Option<u64>)>,
-    config: Option<&str>,
-    profile: Option<&ModelProfile>,
+    architecture: Option<(&'a Architecture, Option<u64>)>,
+    config: Option<&'a str>,
+    profile: Option<&'a ModelProfile>,
     blocked: bool,
     weights: Option<WeightBytes>,
     window: Option<usize>,
-    cluster: &Cluster,
-) -> Configuration {
+    cluster: &'a Cluster,
+}
+
+fn configuration(inputs: ConfigurationInputs<'_>) -> Configuration {
+    let ConfigurationInputs {
+        world,
+        architecture,
+        config,
+        profile,
+        blocked,
+        weights,
+        window,
+        cluster,
+    } = inputs;
     let mut reasons = Vec::new();
     let mut notes = Vec::new();
     let derived = architecture.map(|(architecture, key)| derive(config, architecture, key, world));

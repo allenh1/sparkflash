@@ -274,13 +274,13 @@ impl VisionTowerSpec {
             VisionNorm::Rms => VisionActivation::SwiGlu,
             VisionNorm::Layer => VisionActivation::GeluErf,
         });
-        let position = vision.position.unwrap_or_else(|| {
-            if geometry.num_position_embeddings > 0 {
+        let position = vision
+            .position
+            .unwrap_or(if geometry.num_position_embeddings > 0 {
                 VisionPosition::RotaryAndGrid
             } else {
                 VisionPosition::Rotary
-            }
-        });
+            });
         let rope_theta = geometry.rope_theta;
         let downsample = vision.downsample.unwrap_or(VisionDownsample::None);
         let merger_intermediate = if vision.merger_intermediate > 0 {

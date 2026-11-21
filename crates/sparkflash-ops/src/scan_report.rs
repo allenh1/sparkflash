@@ -735,9 +735,9 @@ fn stack_of_name(name: &str) -> StackKind {
         .any(|part| matches!(*part, "vision" | "visual" | "aligner"))
     {
         StackKind::Vision
-    } else if parts.iter().any(|part| *part == "audio") {
+    } else if parts.contains(&"audio") {
         StackKind::Audio
-    } else if parts.iter().any(|part| *part == "mtp") {
+    } else if parts.contains(&"mtp") {
         StackKind::Draft
     } else {
         StackKind::Language
@@ -758,10 +758,10 @@ fn part_of_stack(stack: StackKind) -> Part {
 fn block_of_name(name: &str) -> Option<usize> {
     let parts: Vec<&str> = name.split('.').collect();
     for pair in parts.windows(2) {
-        if matches!(pair[0], "layers" | "blocks") {
-            if let Ok(index) = pair[1].parse() {
-                return Some(index);
-            }
+        if matches!(pair[0], "layers" | "blocks")
+            && let Ok(index) = pair[1].parse()
+        {
+            return Some(index);
         }
     }
     None
