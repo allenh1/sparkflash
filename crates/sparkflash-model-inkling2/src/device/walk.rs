@@ -1026,8 +1026,8 @@ impl Walk for InklingWalk {
 mod tests {
     use std::sync::Arc;
 
-    use sparkflash_runtime::testing::{ShapeWalk, format_rule};
-    use sparkflash_runtime::{ChunkPolicy, Fixture, Walk, WalkFixture, ledger_for};
+    use sparkflash_runtime::testing::ArmProfile;
+    use sparkflash_runtime::{ChunkPolicy, Fixture, FormatRule, Walk, WalkFixture};
 
     use super::super::{
         DEFAULT_DRAFT_DEPTH, DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM,
@@ -1065,16 +1065,12 @@ mod tests {
             // The shared tensor plan does not spell Inkling's block-attention residual, so the
             // fixture's floor is the weights it uploaded: every dense weight is read a token.
             let bytes = backend.weight_bytes() as u64;
-            let formats = vec![
-                format_rule(config.architecture.quantization.dense_format),
-                format_rule(config.architecture.quantization.expert_format),
-            ];
             Ok(Fixture::new(
                 walk,
                 "the Inkling-2 tiny synthetic checkpoint",
                 bytes,
                 bytes,
-                formats,
+                FormatRule::classes(&config.architecture.quantization),
                 None,
             ))
         }
@@ -1150,10 +1146,10 @@ mod tests {
         assert_eq!(chunk_splits(widths, 10_000, 0), [4_096, 4_096, 1_808]);
     }
 
-    /// A verify is the members' anchors plus their drafts, and the share's budget caps it at
-    /// the rank's [BATCH_ROWS]-row verify width.
+    /// The drafter's budget is the rule the profile states, at the drafter's own depth, and an
+    /// off drafter says it drafts nothing.
     #[test]
-    fn the_verify_budget_caps_members_times_depth() {
+    fn the_drafter_budgets_by_the_stated_rule() {
         let drafter = InklingDrafter {
             present: true,
             kind: Some(DraftKind::Dspark),
@@ -1161,12 +1157,7 @@ mod tests {
             wall: JOINT_WALL,
         };
         for seqs in 1..=BATCH_ROWS {
-            let rows = seqs + drafter.budget(seqs);
-            assert!(
-                rows <= BATCH_ROWS,
-                "{seqs} members and {} drafts is {rows} rows",
-                drafter.budget(seqs)
-            );
+            assert_eq!(drafter.budget(seqs), DRAFT_BUDGET.rows(seqs, 7));
         }
         assert_eq!(drafter.budget(4), BATCH_ROWS - 4);
         assert_eq!(drafter.budget(8), 0);
@@ -1200,17 +1191,6 @@ mod tests {
         );
     }
 
-    /// The runtime's ledger states every row the walk declares, with no "does not state it".
-    #[test]
-    fn the_runtime_ledger_states_every_row_the_walk_declares() {
-        let ledger = ledger_for::<InklingWalk>();
-        assert!(
-            !ledger.line().contains("does not state it"),
-            "the runtime derives every row Inkling states: {}",
-            ledger.line()
-        );
-    }
-
     /// The walk and its sequences are what a fused engine thread takes.
     #[test]
     #[allow(clippy::assertions_on_constants)] // the claim is the point: it is a type constant
@@ -1225,48 +1205,28 @@ mod tests {
         );
     }
 
-    // ---- the tick engine ------------------------------------------------------------------
-
-    /// The positions a shape walk's sequence may hold: a prompt past every chunk width the tests
-    /// split has to be admissible.
-    const SHAPE_CONTEXT: usize = 1_048_576;
-
-    /// The runtime's CPU walk at the arm's widths: the pass rows a [ChunkPolicy] over a widest
-    /// prompt chunk of `widest` rows gives, as [InklingWalk::new] states them, [BATCH_ROWS] as
-    /// the member cap and `depth` drafts a member. The budget is the arm's own rule: a verify is
-    /// the members' anchors and their drafts, and the rank's verify batch holds [BATCH_ROWS]
-    /// rows.
-    fn shape_walk(widest: usize, depth: usize) -> ShapeWalk {
-        let pass = ChunkPolicy::for_limits(Limits::new(widest, SHAPE_CONTEXT)).rows();
-        ShapeWalk::new(
-            StateLayout::new(vec![
-                Region::Positional {
-                    name: "kv-cache",
-                    bytes_per_row: 4,
-                },
-                Region::Recurrent {
-                    name: "conv-histories-and-drafter",
-                    bytes: 64,
-                },
-            ]),
-            Limits::new(pass, SHAPE_CONTEXT).with_members(BATCH_ROWS),
-            depth,
+    /// What the arm states for the generated profile and round tests: the pass rows a
+    /// [ChunkPolicy] over a widest prompt chunk gives, as [InklingWalk::new] states them, with
+    /// [BATCH_ROWS] as the member cap; the default draft depth under the arm's budget and wall;
+    /// the key rows and the histories as its state; and the chunks a prompt past one width runs
+    /// in, at the default schedule's widest chunk and at the 65,535-row switch.
+    fn stated() -> ArmProfile {
+        let context = 1_048_576;
+        let limits = |widest: usize| {
+            let pass = ChunkPolicy::for_limits(Limits::new(widest, context)).rows();
+            Limits::new(pass, context).with_members(BATCH_ROWS)
+        };
+        ArmProfile::new(
+            "Inkling",
+            layout_from(64, 48, 1_024, 256),
+            limits(LONG_PREFILL_CHUNK),
         )
         .with_code(DEVICE)
-        .with_budget(DRAFT_BUDGET)
+        .drafting(DEFAULT_DRAFT_DEPTH, DRAFT_BUDGET)
+        .with_wall(JOINT_WALL)
+        .prompt(limits(LONG_PREFILL_CHUNK), 20_000, &[8_192, 8_192, 3_616])
+        .prompt(limits(MAX_PREFILL_CHUNK), 100_000, &[65_535, 34_465])
     }
 
-    sparkflash_runtime::profile_checks!(
-        super::InklingWalk,
-        table: "Inkling",
-        depth: DEFAULT_DRAFT_DEPTH,
-        chunks: [
-            DEFAULT_PREFILL_CHUNK,
-            LONG_PREFILL_CHUNK,
-            MAX_PREFILL_CHUNK
-        ],
-        shape: |chunk, depth| shape_walk(chunk, depth)
-    );
-
-    sparkflash_runtime::conformance!(super::InklingWalk);
+    sparkflash_runtime::conformance!(super::InklingWalk, profile: stated(), rounds);
 }

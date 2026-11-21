@@ -403,6 +403,9 @@ later (phase 7), because that is churn without new behaviour.
   * continued turn = cold; rewound turn = cold;
   * TP 1 = TP 2 = TP 4 within the arm's declared exactness;
   * no unrecorded widening; bytes per token within the floor.
+* `conformance!(Arm, profile: stated())` also emits the CPU tests an arm used to copy, from one
+  `testing::ArmProfile`: the compute rows against the ledger entry, the tick engine's config and
+  the stated prompts' chunks. With `rounds`, a drafting arm gets the budget and round tests too.
 * An `ARMS` entry needs a token that only the macro can construct. An arm without the tests does
   not compile.
 * `scripts/onboard-gate.sh <arm>` runs `served-gate.py all` and writes the first numerics

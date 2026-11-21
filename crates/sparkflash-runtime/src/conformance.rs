@@ -38,6 +38,7 @@
 
 use std::any::Any;
 
+use sparkflash_model::architecture::{Quantization, WeightFormat};
 use sparkflash_model::backend::{BackendError, StepOutput};
 
 use crate::layout::StateKind;
@@ -170,6 +171,51 @@ impl FormatRule {
             record: None,
         }
     }
+
+    /// A class a checkpoint stores in `format`, kept in that format. The name is the ledger's.
+    #[must_use]
+    pub const fn of(format: WeightFormat) -> Self {
+        Self::stored(match format {
+            WeightFormat::Bf16 => "BF16",
+            WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
+            WeightFormat::MxFp8 { .. } => "MX FP8",
+            WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
+        })
+    }
+
+    /// The two classes a checkpoint's quantization states, its dense projections and its
+    /// experts, each kept in its stored format: the `formats` of a fixture whose walk widens
+    /// nothing.
+    #[must_use]
+    pub fn classes(quantization: &Quantization) -> Vec<Self> {
+        vec![
+            Self::of(quantization.dense_format),
+            Self::of(quantization.expert_format),
+        ]
+    }
+}
+
+/// The stored bytes a token pass reads at one rank and the floor under them, from the rank's
+/// tensor plan: `rank_bytes` in all, `expert_bytes` of them the routed experts'. The floor is
+/// every weight that is not an expert's, which a token reads whatever it routes; the pass adds
+/// the `top_k` of `experts` experts a row picks. These are [`Fixture::new`]'s two byte counts
+/// for a mixture of experts.
+#[must_use]
+pub fn token_bytes(
+    rank_bytes: u128,
+    expert_bytes: u128,
+    experts: usize,
+    top_k: usize,
+) -> (u64, u64) {
+    let total = u64::try_from(rank_bytes).unwrap_or(u64::MAX);
+    let expert = u64::try_from(expert_bytes).unwrap_or(u64::MAX);
+    let floor = total.saturating_sub(expert);
+    let share = if experts == 0 {
+        0
+    } else {
+        expert.saturating_mul(top_k as u64) / experts as u64
+    };
+    (floor.saturating_add(share), floor)
 }
 
 /// What an arm's fixture is, values the checks read without opening it.
@@ -991,8 +1037,102 @@ fn engine_four<W: Walk>(
 /// ```ignore
 /// sparkflash_runtime::conformance!(MyWalk);
 /// ```
+///
+/// An arm that serves on the tick engine also states its [`ArmProfile`]: its ledger name, its
+/// layout, its limits, its budget rule, its wall and the chunks its prompts run in. The second
+/// form emits a `profile` module of CPU tests from it: the declared compute rows against the
+/// arm's ledger entry, the tick engine's config, and every stated prompt's chunks. The third
+/// form is a drafting arm's and adds a `rounds` module: the budget against the verify width,
+/// the joint round, the speculative round and the runtime's own rounds. None of them boots a
+/// fixture, so they run with the crate's other tests.
+///
+/// ```ignore
+/// sparkflash_runtime::conformance!(MyWalk, profile: my_profile());
+/// sparkflash_runtime::conformance!(MyWalk, profile: my_profile(), rounds);
+/// ```
+///
+/// [`ArmProfile`]: crate::testing::ArmProfile
 #[macro_export]
 macro_rules! conformance {
+    (@profile $arm:ty, $profile:expr, $rounds:expr) => {
+        /// The arm's stated profile against the runtime, with no device.
+        pub mod profile {
+            use super::*;
+
+            #[test]
+            fn the_declared_compute_rows_are_the_arm_ledger_rows() {
+                $crate::testing::check_compute_rows::<$arm>(&$profile);
+            }
+
+            #[test]
+            fn the_generated_checks_drive_the_tick_engine() {
+                $crate::testing::check_serving_path::<$arm>(&$profile, $rounds);
+            }
+
+            #[test]
+            fn the_runtime_ledger_states_every_row_the_walk_declares() {
+                $crate::testing::check_ledger::<$arm>(&$profile);
+            }
+
+            #[test]
+            fn the_tick_config_is_the_arms_profile() {
+                $crate::testing::check_tick_config(&$profile, $rounds);
+            }
+
+            #[test]
+            fn the_stated_prompts_run_in_the_stated_chunks() {
+                $crate::testing::check_prompt_chunks(&$profile);
+            }
+
+            #[test]
+            fn a_prompt_that_fits_runs_whole() {
+                $crate::testing::check_whole_prompts(&$profile);
+            }
+        }
+    };
+    ($arm:ty, profile: $profile:expr) => {
+        $crate::conformance!($arm);
+        $crate::conformance!(@profile $arm, $profile, false);
+    };
+    ($arm:ty, profile: $profile:expr, rounds) => {
+        $crate::conformance!($arm);
+        $crate::conformance!(@profile $arm, $profile, true);
+
+        /// The rounds the runtime runs at the arm's verify width, budget and wall.
+        pub mod rounds {
+            use super::*;
+
+            #[test]
+            fn the_verify_budget_fits_the_verify_width() {
+                $crate::testing::check_budget(&$profile);
+            }
+
+            #[test]
+            fn the_tick_engine_keeps_the_arms_joint_round() {
+                $crate::testing::check_joint_round(&$profile);
+            }
+
+            #[test]
+            fn a_speculative_round_keeps_its_accepted_rows_only() {
+                $crate::testing::check_speculative_round(&$profile);
+            }
+
+            #[test]
+            fn a_lone_member_verifies_its_own_depth_in_one_pass() {
+                $crate::testing::check_lone_round(&$profile);
+            }
+
+            #[test]
+            fn the_members_share_one_verify_pass() {
+                $crate::testing::check_shared_round(&$profile);
+            }
+
+            #[test]
+            fn with_joint_off_each_lane_walks_alone() {
+                $crate::testing::check_lone_rounds_with_joint_off(&$profile);
+            }
+        }
+    };
     ($arm:ty) => {
         /// The generated checks and the list this arm claims.
         pub mod conformance {
@@ -1225,5 +1365,32 @@ mod tests {
         };
         assert!(recorded.record.is_some());
         assert_eq!(FormatRule::stored("BF16").arithmetic, "BF16");
+    }
+
+    /// The format names are the ledger's, and a quantization states its two classes in order.
+    #[test]
+    fn a_checkpoints_formats_are_its_dense_and_expert_classes() {
+        assert_eq!(
+            FormatRule::of(WeightFormat::Bf16),
+            FormatRule::stored("BF16")
+        );
+        let classes = FormatRule::classes(&Quantization::default());
+        assert_eq!(classes.len(), 2);
+        assert_eq!(
+            classes[0],
+            FormatRule::of(Quantization::default().dense_format)
+        );
+        assert_eq!(
+            classes[1],
+            FormatRule::of(Quantization::default().expert_format)
+        );
+    }
+
+    /// A token pass reads everything that is not an expert's and its top-k share of the experts.
+    #[test]
+    fn a_token_pass_reads_the_floor_and_its_share_of_the_experts() {
+        assert_eq!(token_bytes(1_000, 800, 8, 2), (400, 200));
+        assert_eq!(token_bytes(1_000, 0, 0, 0), (1_000, 1_000), "no experts");
+        assert_eq!(token_bytes(100, 300, 4, 1), (75, 0), "the floor saturates");
     }
 }

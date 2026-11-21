@@ -2300,11 +2300,10 @@ Measured at this tip, by reading (line ranges are in the two sweeps' notes, not 
   and most of that was the same CPU shape walk, the same tick-engine profile tests and the same
   fixture helpers, copied with the type name changed (Qwen's and Inkling's shape walks differed
   in 61 of about 322 lines). The shape walk is now one type,
-  `sparkflash_runtime::testing::ShapeWalk`, and the three test modules are 205 to 295 lines.
-  `sparkflash_runtime::profile_checks!` emits their compute-row and tick-profile tests (the
-  config, the prompt chunks, the joint round, the speculative round) from the arm's stated chunk
-  list, member cap and drafter depth, and the fixture helpers are `testing::format_rule` and
-  `testing::token_bytes`.
+  `sparkflash_runtime::testing::ShapeWalk`, and the test modules are 132 to 208 lines for the
+  three text arms. `conformance!(Arm, profile: stated())` emits their compute-row, tick-profile
+  and round tests from one stated `testing::ArmProfile`, and the fixture helpers are
+  `FormatRule::classes` and `testing::token_bytes`.
 * **Serving glue.** `enable_fusion`, `enable_group_fusion`, `mirror_group`, `lane_limit`, `wire`,
   `group_rank` and a serving enum in each arm: three to eight lines of body each under ten to
   twenty of comment, near-identical between GLM, Qwen and dense.
@@ -2391,11 +2390,18 @@ Three findings, each with the change it implies.
    and step wall; `prompt` and `decode` drive a tick engine to a request's answer). An arm states
    a constructor of ten to twenty lines where it carried about 320. GLM's copy took the stricter
    behaviour of the other two (one segment a bulk pass, a paired pass refused, the pass hook
-   called); its 91 tests pass unchanged. `profile_checks!` now emits the tick-profile and
-   compute-row tests from the arm's stated chunk list, member cap and drafter depth: the arm
-   states a chunk list, a depth and its `ShapeWalk` constructor, and the macro emits the config,
-   chunk-split, joint-round, speculative-round and arms-table checks. Qwen's and Inkling's test
-   modules keep only their arm-specific policy, layout, budget and capability tests.
+   called); its 91 tests pass unchanged. `conformance!` now emits the rest. An arm states one
+   `testing::ArmProfile` (its ledger name, layout, limits, draft depth, `DraftBudget`, wall and
+   the chunks its prompts run in) and invokes `conformance!(Arm, profile: stated())`, or with
+   `rounds` when its walk drafts. The `profile` module checks the declared compute rows against
+   the arm's ledger entry, the ledger line, the tick engine's config, and every stated prompt's
+   chunks on the engine's exact path, a group's bulk path and the runtime's prompt loop. The
+   `rounds` module checks the budget against the verify width, the engine's joint and
+   speculative rounds and the runtime's lone, shared and joint-off rounds. A fixture takes its
+   format classes from `FormatRule::classes` and its two byte counts from `token_bytes`. The
+   test modules are 132 (GLM), 172 (Qwen), 208 (Inkling) and 436 lines (dense, most of it the
+   fixture writer); dense's own recording walk is gone. What an arm still
+   writes by hand is what only it can state: its fixture, its layout function, its chunk rule.
 3. **The contract** (finding 3). Done for what was a real duplication:
    * `Walk` gains `type Hidden: Residual`; `walk` returns it and `head` takes it by `&mut`, so
      a pass's answers travel in the value. GLM's two sequence fields, Qwen's queue under a lock

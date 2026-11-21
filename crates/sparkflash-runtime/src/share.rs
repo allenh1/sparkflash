@@ -151,6 +151,17 @@ impl DraftBudget {
             }
         }
     }
+
+    /// The widest verify the rule allows `seqs` members drafting `depth` deep: every anchor and
+    /// every draft the budget hands out. [`Self::AnchorsAndDrafts`] already counts the anchors;
+    /// [`Self::OnePass`] counts drafts, so its anchors are added.
+    #[must_use]
+    pub const fn widest(self, seqs: usize, depth: usize) -> usize {
+        match self {
+            Self::AnchorsAndDrafts => self.rows(seqs, depth),
+            Self::OnePass(_) => seqs + self.rows(seqs, depth),
+        }
+    }
 }
 
 /// Shares up to `budget` verify rows among the sequences' drafts, the likeliest accepted first:
@@ -288,6 +299,22 @@ mod tests {
         for seqs in 1..=8 {
             assert!(seqs + pass.rows(seqs, 7) <= 8);
         }
+    }
+
+    #[test]
+    fn the_widest_verify_is_the_anchors_and_the_budgets_drafts() {
+        assert_eq!(DraftBudget::AnchorsAndDrafts.widest(3, 2), 9);
+        assert_eq!(
+            DraftBudget::OnePass(8).widest(3, 2),
+            8,
+            "three anchors, five drafts"
+        );
+        assert_eq!(DraftBudget::OnePass(8).widest(1, 3), 4);
+        assert_eq!(
+            DraftBudget::OnePass(8).widest(8, 7),
+            8,
+            "no room for a draft"
+        );
     }
 
     #[test]

@@ -861,28 +861,10 @@ impl GlmWalk {
 #[cfg(test)]
 mod tests {
     use sparkflash_model::ledger::Strategy;
-    use sparkflash_runtime::testing::{ShapeWalk, format_rule, token_bytes};
-    use sparkflash_runtime::{Fixture, Mode, Runtime, Walk, WalkFixture, ledger_for};
+    use sparkflash_runtime::testing::ArmProfile;
+    use sparkflash_runtime::{Fixture, FormatRule, Mode, Walk, WalkFixture, ledger_for};
 
     use super::*;
-
-    /// The stored bytes a token pass must read at this rank, and the bytes the fixture's plan
-    /// says a token reads once the routed experts pay their top-k share.
-    fn fixture_token_bytes(
-        architecture: &sparkflash_model::Architecture,
-        experts: usize,
-        top_k: usize,
-    ) -> Result<(u64, u64), BackendError> {
-        let tp = sparkflash_model::TpPlan::new(1, 0)
-            .map_err(|error| BackendError::new("fixture", error.detail))?;
-        let tensors =
-            sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served_and_mtp(architecture, tp)
-                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
-        let total = u64::try_from(tensors.rank_bytes()).unwrap_or(u64::MAX);
-        let expert = u64::try_from(tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts))
-            .unwrap_or(u64::MAX);
-        Ok(token_bytes(total, expert, experts, top_k))
-    }
 
     /// The GLM fixture: the synthetic `small` checkpoint, opened through the arm's own TP=1
     /// constructor. It is a real checkpoint in the released storage formats, not a served image.
@@ -908,21 +890,25 @@ mod tests {
                 config.max_position_embeddings,
             )?;
             let walk = backend.walk_arm()?;
-            let (bytes, floor) = fixture_token_bytes(
+            let tp = sparkflash_model::TpPlan::new(1, 0)
+                .map_err(|error| BackendError::new("fixture", error.detail))?;
+            let tensors = sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served_and_mtp(
                 &config.architecture,
+                tp,
+            )
+            .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+            let (bytes, floor) = sparkflash_runtime::token_bytes(
+                tensors.rank_bytes(),
+                tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts),
                 config.n_routed_experts,
                 config.num_experts_per_tok,
-            )?;
-            let formats = vec![
-                format_rule(config.architecture.quantization.dense_format),
-                format_rule(config.architecture.quantization.expert_format),
-            ];
+            );
             Ok(Fixture::new(
                 walk,
                 "the GLM-5.3 synthetic small checkpoint",
                 bytes,
                 floor,
-                formats,
+                FormatRule::classes(&config.architecture.quantization),
                 Some(Box::new(directory)),
             ))
         }
@@ -974,48 +960,6 @@ mod tests {
         assert_eq!(both.bytes_at(2), 40_320 + 4_096);
     }
 
-    /// The walk declares its drafter, so the ledger's three round rows are the path's and the
-    /// seventh generated check is claimed rather than skipped.
-    #[test]
-    fn the_walk_declares_the_round_path_and_claims_its_check() {
-        const {
-            assert!(
-                <<GlmWalk as Walk>::Drafter as Drafter<GlmWalk>>::PRESENT,
-                "the GLM walk drafts through the runtime's round path"
-            );
-        }
-        let ledger = ledger_for::<GlmWalk>();
-        assert!(
-            matches!(ledger.mode(Strategy::Drafting), Mode::Native(_)),
-            "the runtime ledger states GLM's drafting: {}",
-            ledger.line()
-        );
-        assert!(
-            matches!(ledger.mode(Strategy::Runs), Mode::Native(_)),
-            "an accepted run reaches the request: {}",
-            ledger.line()
-        );
-        let joint = sparkflash_runtime::joint_rounds().unwrap_or(true);
-        assert_eq!(
-            matches!(ledger.mode(Strategy::JointRounds), Mode::Native(_)),
-            joint,
-            "the joint row follows the switch: {}",
-            ledger.line()
-        );
-        assert!(
-            !ledger.line().contains("does not state it"),
-            "the runtime derives every row GLM states: {}",
-            ledger.line()
-        );
-        let checks = sparkflash_runtime::checks_for::<GlmWalk>();
-        assert!(
-            checks.contains(&sparkflash_runtime::ConformanceCheck::DraftedEqualsPlain),
-            "a drafting arm claims drafted = plain"
-        );
-        sparkflash_runtime::check_claims::<GlmWalk>(checks)
-            .expect("every generated check is supported");
-    }
-
     /// The member cap is the rank's verify width, not the prompt chunk: a verify is one rank
     /// step, so the engine may hand the walk no more members than that.
     #[test]
@@ -1027,129 +971,22 @@ mod tests {
         assert_ne!(limits.members, limits.rows, "the two widths are separate");
     }
 
-    /// A profile's 4096-row chunk survives the runtime's ChunkPolicy quantization.
-    #[test]
-    fn the_runtime_chunks_a_glm_prompt_4096_rows_at_a_time() {
+    /// What the arm states for the generated profile and round tests: the default prefill rows
+    /// as the pass width and the rank's verify width as the member cap, as [walk_limits] states
+    /// them; the MTP chain's three drafts under the arm's budget and wall; the plan's two kinds
+    /// of state; and the chunks a 5,000-row prompt runs in.
+    fn stated() -> ArmProfile {
         let limits = walk_limits(crate::device::DEFAULT_PREFILL_ROWS, 1_048_576);
-        assert_eq!(
-            sparkflash_runtime::ChunkPolicy::for_limits(limits).rows(),
-            crate::device::DEFAULT_PREFILL_ROWS
-        );
-    }
-
-    /// The budget is one rank step: anchors plus drafts never exceed [MAX_ROWS].
-    #[test]
-    fn the_budget_caps_anchors_and_drafts_to_one_verify() {
-        for seqs in 1..=MAX_ROWS {
-            for depth in 0..MAX_ROWS {
-                let drafts = DRAFT_BUDGET.rows(seqs, depth);
-                assert!(
-                    seqs + drafts <= MAX_ROWS,
-                    "{seqs} member(s) at depth {depth} budget {drafts} rows"
-                );
-                assert_eq!(drafts, (seqs * depth).min(MAX_ROWS.saturating_sub(seqs)));
-            }
-        }
-        // Four members and a three-deep chain share four draft rows, so the verify is eight.
-        assert_eq!(DRAFT_BUDGET.rows(4, 3), 4);
-        assert_eq!(DRAFT_BUDGET.rows(1, 3), 3);
-    }
-
-    // The runtime's CPU walk shaped like GLM's: its verify width is [MAX_ROWS], its budget is
-    // [DRAFT_BUDGET], its wall is the arm's and its chains are as deep as the arm proposes.
-    // The runtime's policies can be checked with no device; the device path is compiled and
-    // stays `#[ignore]`d.
-
-    /// A shape walk at `limits` whose drafter proposes `depth` drafts a member, every one the
-    /// model's own pick, under the arm's budget and the arm's joint wall.
-    fn shape_walk(depth: usize, limits: Limits) -> ShapeWalk {
-        ShapeWalk::new(
-            StateLayout::new(vec![Region::Positional {
-                name: "shape",
-                bytes_per_row: 4,
-            }]),
+        ArmProfile::new(
+            "GLM",
+            layout_of(sparkflash_model::KvPlan::new(20_160, 4_096)),
             limits,
-            depth,
         )
-        .with_right_picks()
-        .with_budget(DRAFT_BUDGET)
-        .with_wall(Box::new(JOINT_WALL))
+        .with_code("glm5_shape")
+        .drafting(3, DRAFT_BUDGET)
+        .with_wall(JOINT_WALL)
+        .prompt(limits, 5_000, &[4_096, 904])
     }
 
-    fn shape_runtime(depth: usize) -> Runtime<ShapeWalk> {
-        Runtime::new(shape_walk(depth, walk_limits(64, 4_096)), 0)
-            .expect("the shape runtime starts")
-    }
-
-    fn prompted(
-        runtime: &Runtime<ShapeWalk>,
-        token: u32,
-    ) -> sparkflash_runtime::RuntimeSlot<ShapeWalk> {
-        let mut slot = runtime.open_slot().expect("a slot");
-        runtime
-            .prefill_slot(&mut slot, &[token])
-            .expect("the prompt");
-        slot
-    }
-
-    fn verifies(runtime: &Runtime<ShapeWalk>) -> Vec<Vec<usize>> {
-        runtime.walk().verifies()
-    }
-
-    /// One member keeps the drafter's own depth in one verify pass.
-    #[test]
-    fn a_lone_member_verifies_its_own_depth_in_one_pass() {
-        let runtime = shape_runtime(3);
-        let mut members = [(prompted(&runtime, 10), 11)];
-        runtime.step_slots(&mut members).expect("the round");
-        assert_eq!(verifies(&runtime), vec![vec![4]]);
-    }
-
-    /// Four members share one verify pass, and their anchors and drafts fit one rank step.
-    #[test]
-    fn four_members_share_one_verify_pass() {
-        let runtime = shape_runtime(3);
-        let mut members: Vec<_> = (0..4)
-            .map(|at| (prompted(&runtime, at + 1), at + 11))
-            .collect();
-        runtime.step_slots(&mut members).expect("the joint round");
-        let passes = verifies(&runtime);
-        assert_eq!(passes.len(), 1, "one verify pass for four members");
-        let rows: usize = passes[0].iter().sum();
-        assert_eq!(passes[0].len(), 4);
-        assert!(
-            passes[0].iter().all(|rows| *rows >= 1),
-            "every member steps"
-        );
-        assert!(
-            rows <= MAX_ROWS,
-            "the shared verify is one rank step: {rows} rows"
-        );
-        assert!(
-            rows < 4 * 4,
-            "the budget shared the drafts: {} rows for four chains of three",
-            rows
-        );
-    }
-
-    /// With joint rounds off, each lane's round walks alone at the drafter's own depth.
-    #[test]
-    fn with_joint_off_each_lane_walks_alone() {
-        let runtime = shape_runtime(3).with_joint_rounds(false);
-        let mut members: Vec<_> = (0..2)
-            .map(|at| (prompted(&runtime, at + 1), at + 11))
-            .collect();
-        runtime.step_slots(&mut members).expect("two lone rounds");
-        assert_eq!(verifies(&runtime), vec![vec![4], vec![4]]);
-    }
-
-    sparkflash_runtime::profile_checks!(
-        super::GlmWalk,
-        table: "GLM",
-        depth: 3,
-        chunks: [crate::device::DEFAULT_PREFILL_ROWS],
-        shape: |chunk, depth| shape_walk(depth, walk_limits(chunk, 1_048_576))
-    );
-
-    sparkflash_runtime::conformance!(super::GlmWalk);
+    sparkflash_runtime::conformance!(super::GlmWalk, profile: stated(), rounds);
 }

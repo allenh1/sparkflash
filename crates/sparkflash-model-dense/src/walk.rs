@@ -333,8 +333,8 @@ impl Walk for DenseWalk {
 
 #[cfg(test)]
 mod tests {
-    use sparkflash_runtime::testing::format_rule;
-    use sparkflash_runtime::{Fixture, Runtime, WalkFixture};
+    use sparkflash_runtime::testing::ArmProfile;
+    use sparkflash_runtime::{Fixture, FormatRule, Runtime, WalkFixture};
 
     use super::*;
 
@@ -524,16 +524,12 @@ mod tests {
             .map_err(|error| BackendError::new("fixture", error))?;
             let walk = backend.walk_arm(64)?;
             let bytes = backend.weight_bytes() as u64;
-            let formats = vec![
-                format_rule(architecture.quantization.dense_format),
-                format_rule(architecture.quantization.expert_format),
-            ];
             Ok(Fixture::new(
                 walk,
                 format!("the dense synthetic checkpoint at {}", path.display()),
                 bytes,
                 bytes,
-                formats,
+                FormatRule::classes(&architecture.quantization),
                 None,
             ))
         }
@@ -640,259 +636,21 @@ mod tests {
         assert_eq!(paired.offsets, [0, CHUNK_ROWS, CHUNK_ROWS + 1]);
     }
 
-    /// One row the runtime handed a dense-shaped walk: the pass kind and each segment's rows.
-    type Recorded = (PassKind, Vec<usize>);
-
-    #[derive(Default)]
-    struct RecordedSeq {
-        rows: Vec<u32>,
-    }
-
-    impl LaneState for RecordedSeq {
-        fn position(&self) -> usize {
-            self.rows.len()
-        }
-
-        fn checkpoint(&mut self, _at: usize) -> Result<(), BackendError> {
-            Ok(())
-        }
-
-        fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-            self.rows.truncate(to);
-            Ok(())
-        }
-
-        fn room(&self, _positions: usize, _reset: bool) -> bool {
-            true
-        }
-    }
-
-    /// A walk with dense's limits and no device, recording every pass the runtime gives it.
-    struct RecordingWalk {
-        layout: StateLayout,
-        limits: Limits,
-        passes: Mutex<Vec<Recorded>>,
-    }
-
-    impl Walk for RecordingWalk {
-        type Seq = RecordedSeq;
-        type Hidden = Hidden;
-        type Drafter = Absent<&'static str>;
-        type Vision = NoVision;
-
-        const CAPABILITIES: WalkCapabilities = WalkCapabilities::all(StateKind::Both);
-
-        fn layout(&self) -> &StateLayout {
-            &self.layout
-        }
-
-        fn open(&self) -> Result<Self::Seq, BackendError> {
-            Ok(RecordedSeq::default())
-        }
-
-        fn limits(&self) -> Limits {
-            self.limits
-        }
-
-        fn drafter(&self) -> &Self::Drafter {
-            /// The recording walk publishes no draft head.
-            static ABSENT: Absent<&'static str> = Absent("the recording walk drafts nothing");
-            &ABSENT
-        }
-
-        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
-
-        fn walk(
-            &self,
-            segments: &mut [Segment<'_, Self::Seq>],
-            pass: Pass<'_>,
-        ) -> Result<Hidden, BackendError> {
-            let lengths: Vec<usize> = segments.iter().map(|segment| segment.rows.len()).collect();
-            self.passes
-                .lock()
-                .expect("the pass record")
-                .push((pass.kind, lengths));
-            let mut rows = 0;
-            for segment in segments {
-                segment.seq.rows.extend_from_slice(segment.rows);
-                rows += segment.rows.len();
-            }
-            Ok(Hidden::new(rows))
-        }
-
-        fn head(
-            &self,
-            hidden: &mut Hidden,
-            rows: &mut [HeadRow<'_, Self::Seq>],
-        ) -> Result<Vec<StepOutput>, BackendError> {
-            let _ = hidden;
-            Ok(rows
-                .iter_mut()
-                .map(|row| {
-                    let token = row.seq.rows.last().copied().unwrap_or(0);
-                    StepOutput {
-                        logits: vec![0.0; 2],
-                        next_token: Some(token),
-                        draft: Vec::new(),
-                    }
-                })
-                .collect())
-        }
-    }
-
-    /// The runtime over a walk with dense's limits: `chunk` rows a pass, a served context.
-    fn dense_shaped_runtime(chunk: usize) -> Runtime<RecordingWalk> {
-        Runtime::new(
-            RecordingWalk {
-                layout: StateLayout::new(vec![
-                    Region::Positional {
-                        name: "kv",
-                        bytes_per_row: 4,
-                    },
-                    Region::Recurrent {
-                        name: "gated-deltanet",
-                        bytes: 16,
-                    },
-                ]),
-                limits: Limits::new(chunk, 32_768),
-                passes: Mutex::new(Vec::new()),
-            },
-            0,
-        )
-        .expect("the runtime starts")
-    }
-
-    fn prompt_passes_in(runtime: &Runtime<RecordingWalk>, len: usize) -> Vec<Recorded> {
-        let mut slot = runtime.open_slot().expect("a slot");
-        runtime
-            .prefill_slot(&mut slot, &vec![7u32; len])
-            .expect("the prefill");
-        runtime
-            .walk()
-            .passes
-            .lock()
-            .expect("the pass record")
-            .clone()
-    }
-
-    fn prompt_passes(len: usize) -> Vec<Recorded> {
-        let runtime = dense_shaped_runtime(CHUNK_ROWS);
-        assert_eq!(
-            runtime.chunk_policy().rows(),
-            CHUNK_ROWS,
-            "dense's chunk size comes from its limits through ChunkPolicy"
-        );
-        prompt_passes_in(&runtime, len)
-    }
-
-    /// The runtime's prompt loop is dense's old one: 256-row chunks and the remainder, in order.
+    /// The walk's Limits come from the arm's chunk rule: the default profile gets 256 rows a
+    /// pass, and a profile switch the policy documents gets the smaller pass. The generated
+    /// profile tests run a prompt at each.
     #[test]
-    fn the_runtime_hands_dense_256_row_bulk_chunks() {
-        assert_eq!(
-            prompt_passes(600),
-            vec![
-                (PassKind::Bulk { rows: 256 }, vec![256]),
-                (PassKind::Bulk { rows: 256 }, vec![256]),
-                (PassKind::Bulk { rows: 88 }, vec![88]),
-            ],
-            "a long prompt runs 256 rows a pass and its remainder last"
-        );
-        assert_eq!(
-            prompt_passes(257),
-            vec![
-                (PassKind::Bulk { rows: 256 }, vec![256]),
-                (PassKind::Bulk { rows: 1 }, vec![1]),
-            ]
-        );
-    }
-
-    /// The runtime's prompt chunk is the walk's Limits, and the Limits come from the arm's
-    /// ChunkPolicy: the default profile still gets 256, and a profile switch that the policy
-    /// documents gets the smaller pass.
-    #[test]
-    fn the_chunk_policy_keeps_256_unless_the_profile_switches_it() {
+    fn the_chunk_rule_keeps_256_unless_the_profile_switches_it() {
         use sparkflash_model::profile::ModelProfile;
 
         let default = crate::chunk_rows(&ModelProfile::default(), 32_768).expect("the default");
         assert_eq!(default, CHUNK_ROWS);
-        let runtime = dense_shaped_runtime(default);
-        assert_eq!(runtime.chunk_policy().rows(), CHUNK_ROWS);
-        assert_eq!(
-            prompt_passes_in(&runtime, 600),
-            vec![
-                (PassKind::Bulk { rows: 256 }, vec![256]),
-                (PassKind::Bulk { rows: 256 }, vec![256]),
-                (PassKind::Bulk { rows: 88 }, vec![88]),
-            ]
-        );
-
         let mut profile = ModelProfile::default();
-        profile.prefill.chunk = Some(64);
+        profile.prefill.chunk = Some(SWITCHED_CHUNK);
         let switched = crate::chunk_rows(&profile, 32_768).expect("the switch");
-        assert_eq!(switched, 64);
-        let runtime = dense_shaped_runtime(switched);
-        assert_eq!(runtime.chunk_policy().rows(), 64);
-        assert_eq!(
-            prompt_passes_in(&runtime, 150),
-            vec![
-                (PassKind::Bulk { rows: 64 }, vec![64]),
-                (PassKind::Bulk { rows: 64 }, vec![64]),
-                (PassKind::Bulk { rows: 22 }, vec![22]),
-            ]
-        );
+        assert_eq!(switched, SWITCHED_CHUNK);
     }
 
-    /// The dense arm's serving path is the tick engine: its chunks are still the 256 rows its
-    /// kernels were chosen for, decided by [crate::tick] over dense's own limits.
-    #[test]
-    fn the_tick_engine_hands_dense_256_row_chunks() {
-        use sparkflash_model::backend::Sampling;
-        use sparkflash_runtime::{TickEngine, TickEvent};
-
-        let recording = RecordingWalk {
-            layout: StateLayout::new(vec![
-                Region::Positional {
-                    name: "kv",
-                    bytes_per_row: 4,
-                },
-                Region::Recurrent {
-                    name: "gated-deltanet",
-                    bytes: 16,
-                },
-            ]),
-            limits: Limits::new(CHUNK_ROWS, 32_768),
-            passes: Mutex::new(Vec::new()),
-        };
-        let mut engine = TickEngine::new(recording, 1).expect("the tick engine starts");
-        assert_eq!(
-            engine.config().chunk_rows,
-            CHUNK_ROWS,
-            "the engine's chunk is the arm's ChunkPolicy chunk"
-        );
-        let id = engine
-            .admit(&vec![7u32; 600], &[], Sampling::default())
-            .expect("the prompt");
-        loop {
-            let events = engine.tick().expect("the tick");
-            if events
-                .iter()
-                .any(|event| matches!(event, TickEvent::Prompt { id: got, .. } if *got == id))
-            {
-                break;
-            }
-        }
-        assert_eq!(
-            *engine.walk().passes.lock().expect("the pass record"),
-            vec![
-                (PassKind::Bulk { rows: 256 }, vec![256]),
-                (PassKind::Bulk { rows: 256 }, vec![256]),
-                (PassKind::Bulk { rows: 88 }, vec![88]),
-            ],
-            "a 600-row prompt runs the chunks dense's old runtime ran"
-        );
-    }
-
-    /// A prompt that fits the chunk is one whole pass, as the old loop ran it.
     /// A sampled step records the token it consumed once, so the sampler's history is the
     /// sequence's tokens: the penalties count each token once, and a rewind truncates both to
     /// the same position.
@@ -925,17 +683,6 @@ mod tests {
         (slot, _) = members.into_iter().next().expect("the member");
         assert_eq!(slot.seq().sampler.history(), &[1, 2, 3, 4, first, second]);
         assert_eq!(slot.seq().sampler.history().len(), slot.seq().position());
-    }
-
-    #[test]
-    fn a_dense_prompt_that_fits_runs_whole() {
-        for len in [1usize, 255, CHUNK_ROWS] {
-            assert_eq!(
-                prompt_passes(len),
-                vec![(PassKind::Bulk { rows: len }, vec![len])],
-                "a {len}-row prompt is one pass"
-            );
-        }
     }
 
     #[test]
@@ -987,31 +734,36 @@ mod tests {
             ledger.mode(Strategy::TensorCoreDecode),
             Mode::from(TOKEN_DECODE)
         );
-        assert!(!ledger.line().contains("the arm does not state it"));
     }
 
-    /// The adapter's four declared rows are the arm's static declaration, so the two cannot
-    /// drift while phase 1 moves the arm onto the runtime.
-    #[test]
-    fn the_declared_compute_rows_are_the_arm_ledger_rows() {
-        use sparkflash_model::ledger::{Strategy, ledger_for_arm};
-        let declared = ledger_for_arm("dense").expect("dense's declaration");
-        let capabilities = <super::DenseWalk as Walk>::CAPABILITIES.compute;
-        for (strategy, stated) in [
-            (Strategy::TensorCorePrompt, capabilities.prompt),
-            (Strategy::TensorCoreDecode, capabilities.token),
-            (Strategy::StoredArithmetic, capabilities.stored),
-            (Strategy::Rewind, capabilities.rewind),
-        ] {
-            let from_table = declared
-                .rows
-                .iter()
-                .find(|(row, _)| *row == strategy)
-                .map(|(_, state)| *state)
-                .expect("the arm states every strategy");
-            assert_eq!(stated, from_table, "{} drifted", strategy.name());
-        }
+    /// The pass a profile's `prefill.chunk = 64` gives the walk.
+    const SWITCHED_CHUNK: usize = 64;
+
+    /// What the arm states for the generated profile tests: [CHUNK_ROWS] rows a pass and as many
+    /// members, as [DenseWalk::new] states its limits; a positional cache and the Gated DeltaNet
+    /// recurrence as its state; no drafter; and the chunks its prompts run in, at the default
+    /// pass and at a switched one.
+    fn stated() -> ArmProfile {
+        let limits = Limits::new(CHUNK_ROWS, 32_768);
+        ArmProfile::new(
+            "dense",
+            StateLayout::new(vec![
+                Region::Positional {
+                    name: "kv",
+                    bytes_per_row: 4,
+                },
+                Region::Recurrent {
+                    name: "gated-deltanet",
+                    bytes: 16,
+                },
+            ]),
+            limits,
+        )
+        .with_code(DEVICE)
+        .prompt(limits, 600, &[256, 256, 88])
+        .prompt(limits, 257, &[256, 1])
+        .prompt(Limits::new(SWITCHED_CHUNK, 32_768), 150, &[64, 64, 22])
     }
 
-    sparkflash_runtime::conformance!(super::DenseWalk);
+    sparkflash_runtime::conformance!(super::DenseWalk, profile: stated());
 }

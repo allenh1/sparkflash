@@ -42,6 +42,11 @@ use sparkflash_runtime::{
     check_rewind,
 };
 
+/// The verify budget: every member's anchor and its whole depth. The batch buffers hold that
+/// many rows, so a wider budget would claim memory the verify does not have and a narrower one
+/// would refuse a chain the runtime asked for.
+const DRAFT_BUDGET: DraftBudget = DraftBudget::AnchorsAndDrafts;
+
 use sparkflash_kernels::cuda_driver::Deviceptr;
 
 use super::batch::{BatchBuffers, MAX_BATCH};
@@ -468,7 +473,7 @@ impl Drafter<QwenWalk> for QwenDrafter {
     /// drafts, which is the batch buffers' width. `share_rows` spends it on drafts only, so a
     /// chain's own depth still bounds what a member takes.
     fn budget(&self, seqs: usize) -> usize {
-        DraftBudget::AnchorsAndDrafts.rows(seqs, self.depth)
+        DRAFT_BUDGET.rows(seqs, self.depth)
     }
 
     fn ready(&self, seq: &DeviceSequence, token: u32) -> bool {
@@ -804,30 +809,11 @@ fn fresh_hashers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sparkflash_runtime::testing::{self, ShapeWalk, format_rule, token_bytes};
-    use sparkflash_runtime::{ChunkPolicy, Fixture, TickEngine, WalkFixture};
+    use sparkflash_runtime::testing::ArmProfile;
+    use sparkflash_runtime::{ChunkPolicy, Fixture, FormatRule, WalkFixture};
 
     use crate::config::Qwen4ExpConfig;
-    use crate::device::MTP_VERIFY_ROWS;
-    use crate::device::batch::MAX_BATCH;
-    use crate::device::prefill::{DEFAULT_PREFILL_CHUNK, PrefillPlan, TOKEN_PREFILL_CHUNK};
-
-    /// The stored bytes a token pass must read at this rank, and the floor the plan states.
-    fn fixture_token_bytes(
-        architecture: &sparkflash_model::Architecture,
-        experts: usize,
-        top_k: usize,
-    ) -> Result<(u64, u64), BackendError> {
-        let tp = sparkflash_model::TpPlan::new(1, 0)
-            .map_err(|error| BackendError::new("fixture", error.detail))?;
-        let tensors =
-            sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served_and_mtp(architecture, tp)
-                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
-        let total = u64::try_from(tensors.rank_bytes()).unwrap_or(u64::MAX);
-        let expert = u64::try_from(tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts))
-            .unwrap_or(u64::MAX);
-        Ok(token_bytes(total, expert, experts, top_k))
-    }
+    use crate::device::prefill::{DEFAULT_PREFILL_CHUNK, PrefillPlan};
 
     /// The Qwen fixture: the synthetic tiny checkpoint, opened through the arm's own TP=1
     /// constructor. It is a real checkpoint in the released storage formats, not a served image.
@@ -859,21 +845,25 @@ mod tests {
                 config.max_position_embeddings,
             )?;
             let walk = backend.walk_arm(4)?;
-            let (bytes, floor) = fixture_token_bytes(
+            let tp = sparkflash_model::TpPlan::new(1, 0)
+                .map_err(|error| BackendError::new("fixture", error.detail))?;
+            let tensors = sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served_and_mtp(
                 &config.architecture,
+                tp,
+            )
+            .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+            let (bytes, floor) = sparkflash_runtime::token_bytes(
+                tensors.rank_bytes(),
+                tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts),
                 config.num_experts,
                 config.num_experts_per_tok,
-            )?;
-            let formats = vec![
-                format_rule(config.architecture.quantization.dense_format),
-                format_rule(config.architecture.quantization.expert_format),
-            ];
+            );
             Ok(Fixture::new(
                 walk,
                 "the Qwen3.5-MoE tiny synthetic checkpoint",
                 bytes,
                 floor,
-                formats,
+                FormatRule::classes(&config.architecture.quantization),
                 Some(Box::new(directory)),
             ))
         }
@@ -919,20 +909,18 @@ mod tests {
         assert_eq!(walk_limits(DEFAULT_PREFILL_CHUNK, 4_096, 2).members, 2);
     }
 
-    /// The drafter's budget is the verify's whole width: every member's anchor and its depth.
-    /// The batch buffers hold this many rows, so a wider budget would claim memory the verify
-    /// does not have and a narrower one would refuse a chain the runtime asked for.
+    /// The drafter's budget is the rule the profile states, at the drafter's own depth.
     #[test]
-    fn the_verify_budget_covers_every_anchor_and_draft() {
+    fn the_drafter_budgets_by_the_stated_rule() {
         for depth in [0, 1, 3] {
             let drafter = QwenDrafter {
                 depth,
                 wall: JOINT_WALL,
                 joint: true,
             };
-            assert_eq!(drafter.budget(0), 0);
-            assert_eq!(drafter.budget(1), 1 + depth);
-            assert_eq!(drafter.budget(4), 4 * (1 + depth));
+            for seqs in [0, 1, 4] {
+                assert_eq!(drafter.budget(seqs), DRAFT_BUDGET.rows(seqs, depth));
+            }
         }
     }
 
@@ -951,32 +939,14 @@ mod tests {
             .expect("every generated check is supported");
     }
 
-    /// The runtime's CPU walk at the Qwen arm's widths: the prefill plan's chunk as the pass
-    /// width and the batch's verify width, as [QwenWalk::new] states its limits, with room for
-    /// `capacity` members in one batch and `depth` drafts a member. The budget is the shape
-    /// walk's default, every member's anchor and its drafts, which is the batch buffers' width.
-    fn shape_walk(chunk: usize, capacity: usize, depth: usize) -> ShapeWalk {
-        ShapeWalk::new(
-            layout_of(&Qwen4ExpConfig::tiny()),
-            walk_limits(chunk, 65_536, capacity),
-            depth,
-        )
-        .with_code("qwen4_shape")
-    }
-
-    /// The prefill plan keeps its forward boundaries: a 4,096-row chunk is one forward and so is
-    /// a short tail, so the runtime's chunk is the plan's own unit.
+    /// The prefill plan's forwards inside the passes the profile states: a 4,096-row pass and
+    /// its tail are one forward each, and the token-kernel plan's 256-row pass is two of its
+    /// 128-row forwards.
     #[test]
-    fn the_prefill_plan_runs_one_forward_a_chunk() {
+    fn the_plans_forwards_fill_the_stated_passes() {
         let plan = PrefillPlan::new(DEFAULT_PREFILL_CHUNK, false);
         assert_eq!(plan.forwards(4_096), vec![0..4_096], "one forward a chunk");
         assert_eq!(plan.forwards(904), vec![0..904], "the tail is one forward");
-    }
-
-    /// The token-kernel plan keeps its 256-row pass and its 128-row forwards: the engine runs the
-    /// same 256/256/88 parts the runtime ran, and each part is still two of the plan's forwards.
-    #[test]
-    fn the_token_plans_pass_is_still_256_rows() {
         let plan = PrefillPlan::new(super::super::TOKEN_PREFILL_CHUNK, false);
         assert_eq!(plan.chunk, super::super::TOKEN_PREFILL_CHUNK);
         assert_eq!(pass_rows(plan.chunk), 256);
@@ -985,24 +955,26 @@ mod tests {
             vec![0..128, 128..256],
             "a pass is two of the plan's forwards"
         );
-        let mut engine =
-            TickEngine::new(shape_walk(plan.chunk, 4, 0), 1).expect("the tick engine starts");
-        assert_eq!(engine.config().chunk_rows, 256);
-        let _ = testing::prompt(&mut engine, &vec![7u32; 600]);
-        assert_eq!(
-            engine.walk().chunks(),
-            vec![256, 256, 88],
-            "a 600-row prompt runs 256/256/88, as the old runtime ran it"
-        );
     }
 
-    sparkflash_runtime::profile_checks!(
-        QwenWalk,
-        table: "Qwen",
-        depth: MTP_VERIFY_ROWS - 1,
-        chunks: [DEFAULT_PREFILL_CHUNK, TOKEN_PREFILL_CHUNK],
-        shape: |chunk, depth| shape_walk(chunk, MAX_BATCH, depth)
-    );
+    /// What the arm states for the generated profile and round tests: the prefill plan's chunk
+    /// as the pass width and the batch's verify width as the member cap, as [QwenWalk::new]
+    /// states its limits; the MTP verify's depth under the arm's budget and wall; and the
+    /// chunks the default plan's and the token-kernel plan's prompts run in.
+    fn stated() -> ArmProfile {
+        let members = super::super::batch::MAX_BATCH;
+        let limits = walk_limits(DEFAULT_PREFILL_CHUNK, 65_536, members);
+        ArmProfile::new("Qwen", layout_of(&Qwen4ExpConfig::tiny()), limits)
+            .with_code("qwen4_shape")
+            .drafting(super::super::MTP_VERIFY_ROWS - 1, DRAFT_BUDGET)
+            .with_wall(JOINT_WALL)
+            .prompt(limits, 5_000, &[4_096, 904])
+            .prompt(
+                walk_limits(super::super::TOKEN_PREFILL_CHUNK, 65_536, members),
+                600,
+                &[256, 256, 88],
+            )
+    }
 
-    sparkflash_runtime::conformance!(QwenWalk);
+    sparkflash_runtime::conformance!(QwenWalk, profile: stated(), rounds);
 }
