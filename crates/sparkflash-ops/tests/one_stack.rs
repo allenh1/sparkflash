@@ -162,8 +162,67 @@ fn the_language_stack_walk_matches_the_scan_and_the_plan_order() {
     }
 }
 
+fn model_families() -> Vec<String> {
+    let mut families: Vec<String> = std::fs::read_dir(workspace_root().join("crates"))
+        .expect("the workspace has a crates directory")
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter_map(|name| name.strip_prefix("sparkflash-model-").map(str::to_owned))
+        .map(|name| {
+            name.split('-')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(|character: char| character.is_ascii_digit())
+                .to_lowercase()
+        })
+        .filter(|name| !name.is_empty() && name != "dense")
+        .collect();
+    families.extend(["deepseek", "qwen", "glm", "inkling", "dory"].map(str::to_owned));
+    families.sort();
+    families.dedup();
+    families
+}
+
 #[test]
-fn the_scan_vocabulary_names_no_model_family() {
+fn a_tp4_scan_row_states_the_rank_local_shape_the_stack_describes_in_full() {
+    use sparkflash_model::stack::Shape;
+    use sparkflash_model::{Architecture, Part, Target};
+    use sparkflash_ops::{KernelPhase, ScanInputs, scan};
+
+    let config = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":8,"num_key_value_heads":8,"head_dim":128,"vocab_size":128,"max_position_embeddings":16}"#;
+    let architecture = Architecture::from_json(config).expect("a synthetic config");
+    let stacks = architecture.stacks();
+    let described = stacks[0].blocks[0]
+        .parts
+        .iter()
+        .find(|instance| instance.part == Part::GqaAttention)
+        .expect("the block's attention");
+    assert_eq!(described.shape, Shape::new([8, 128]));
+
+    let report = scan(ScanInputs {
+        config,
+        tensors: None,
+        target: Target::Sm121,
+        world: 4,
+    });
+    assert!(report.error.is_none(), "{report:?}");
+    let row = report
+        .rows
+        .iter()
+        .find(|row| row.block == Some(0) && row.part == Part::GqaAttention)
+        .expect("the rank's attention row");
+    assert_eq!(
+        row.shape,
+        Shape::new([2, 128]),
+        "four ranks hold two heads each"
+    );
+    assert_eq!(row.pass, KernelPhase::Both);
+}
+
+#[test]
+fn the_scan_vocabulary_names_no_model_family_or_crate() {
+    let families = model_families();
+    assert!(families.contains(&"deepseek".to_owned()));
     for (file, source) in [
         (
             "stack.rs",
@@ -172,9 +231,13 @@ fn the_scan_vocabulary_names_no_model_family() {
         ("scan_report.rs", include_str!("../src/scan_report.rs")),
     ] {
         let lower = source.to_lowercase();
-        for family in ["deepseek", "qwen", "glm", "inkling", "dory"] {
-            assert!(!lower.contains(family), "{file} names {family}");
+        for family in &families {
+            assert!(!lower.contains(family.as_str()), "{file} names {family}");
         }
+        assert!(
+            !lower.contains("sparkflash-model-"),
+            "{file} names a model crate"
+        );
     }
 }
 

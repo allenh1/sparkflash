@@ -1639,6 +1639,20 @@ impl Architecture {
         }
     }
 
+    /// Whether every decoder layer stores its routed experts at the architecture's expert format.
+    ///
+    /// A checkpoint may name one stored expert format a layer; when any layer differs, there is
+    /// no single stored expert format to report and a caller must ask the layer.
+    #[must_use]
+    pub fn expert_format_is_uniform(&self) -> bool {
+        self.inkling.as_ref().is_none_or(|inkling| {
+            inkling
+                .layer_expert_formats
+                .iter()
+                .all(|format| *format == self.quantization.expert_format)
+        })
+    }
+
     /// The vision tower's geometry in the shared structural form, when the checkpoint carries one.
     #[must_use]
     pub fn vision_geometry(&self) -> Option<VisionGeometry> {

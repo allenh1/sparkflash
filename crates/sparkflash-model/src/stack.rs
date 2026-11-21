@@ -125,8 +125,12 @@ pub struct PartInstance {
     pub part: Part,
     /// The shape the part runs at, when the description states one.
     pub shape: Shape,
-    /// The stored weight format.
-    pub format: WeightFormat,
+    /// The stored weight format, when the checkpoint's typed fields state it.
+    ///
+    /// `None` when the format belongs to a part whose tensors the config alone does not size
+    /// (a tower, an Engram table, a draft stage with its own storage). The layout reader fills
+    /// those; a guessed format is never reported as stored.
+    pub format: Option<WeightFormat>,
     /// The checkpoint tensor names this instance takes, in the layout's order.
     pub tensors: Vec<String>,
 }
@@ -134,7 +138,7 @@ pub struct PartInstance {
 impl PartInstance {
     /// An instance with no tensor names yet.
     #[must_use]
-    pub fn new(part: Part, shape: Shape, format: WeightFormat) -> Self {
+    pub fn new(part: Part, shape: Shape, format: Option<WeightFormat>) -> Self {
         Self {
             part,
             shape,
@@ -206,19 +210,28 @@ impl Architecture {
 
     /// The stored format of a part, read from the checkpoint's typed quantization block.
     ///
-    /// The embedding, the norms and the head are stored unquantized in every released
-    /// checkpoint; the experts and the MTP stage may name a format of their own. Every other
-    /// part follows the dense projections.
+    /// The format is stated only for the parts the quantization block sizes: the embedding, the
+    /// norms and the head (bf16 in every release), the routed experts, and the dense projections.
+    ///
+    /// A composite part (a vision tower, an Engram table, an indexer, a draft stage) keeps its
+    /// tensors' formats in its own tensors, and the per-layer expert overrides a checkpoint may
+    /// name are the layout reader's. `None` says so; it is never a default to the dense format.
     #[must_use]
-    pub fn stored_format(&self, part: Part) -> WeightFormat {
+    pub fn stored_format(&self, part: Part) -> Option<WeightFormat> {
         match part {
-            Part::Embedding | Part::RmsNorm | Part::LayerNorm | Part::LmHead => WeightFormat::Bf16,
-            Part::Moe => self.quantization.expert_format,
-            Part::Mtp => self
-                .quantization
-                .mtp_expert_format
-                .unwrap_or(self.quantization.expert_format),
-            _ => self.quantization.dense_format,
+            Part::Embedding | Part::RmsNorm | Part::LayerNorm | Part::LmHead => {
+                Some(WeightFormat::Bf16)
+            }
+            Part::Moe => {
+                // A checkpoint may store experts per layer, naming one format a layer. The
+                // single expert format is the stored format only when no layer overrides it.
+                self.expert_format_is_uniform()
+                    .then_some(self.quantization.expert_format)
+            }
+            Part::DenseMlp | Part::MlaAttention | Part::GqaAttention => {
+                Some(self.quantization.dense_format)
+            }
+            _ => None,
         }
     }
 
@@ -266,7 +279,19 @@ impl Architecture {
             },
             _ => Vec::new(),
         };
-        Shape::new(dims.into_iter().filter(|dim| *dim > 0).collect::<Vec<_>>())
+        shape_from(dims)
+    }
+}
+
+/// A shape from the config's dimensions, or unknown when any of them is unset.
+///
+/// A partially unset geometry (a head count of zero beside a real head width) must not become a
+/// lower-rank shape: it is unknown.
+fn shape_from(dims: Vec<usize>) -> Shape {
+    if dims.is_empty() || dims.contains(&0) {
+        Shape::unknown()
+    } else {
+        Shape::new(dims)
     }
 }
 
@@ -299,7 +324,8 @@ mod tests {
             .find(|instance| instance.part == Part::GqaAttention)
             .expect("the language stack's attention");
         assert_eq!(attention.shape, Shape::new([2, 4]));
-        assert_eq!(attention.format, WeightFormat::Bf16);
+        assert_eq!(attention.format, Some(WeightFormat::Bf16));
+        assert_eq!(architecture.stored_format(Part::Vision), None);
         assert!(attention.tensors.is_empty());
     }
 

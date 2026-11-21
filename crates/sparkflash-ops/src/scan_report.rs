@@ -30,8 +30,8 @@
 //! that gates a load must consult the process's own availability policy; the scan never claims a
 //! build embeds an image it did not check.
 //!
-//! Every refusal names the part, the shape the config states, the stored format, the pass and
-//! the target, and carries what would fix it. The statuses are the seven of the plan's section 4,
+//! Every refusal names the part, the rank-local shape the plan states, the stored format when the
+//! config states one, the pass and the target, and carries what would fix it. The statuses are the seven of the plan's section 4,
 //! no more.
 
 use std::fmt;
@@ -41,8 +41,8 @@ use sparkflash_model::architecture::{Architecture, WeightFormat};
 use sparkflash_model::stack::{Shape, StackKind};
 use sparkflash_model::{Part, Target};
 
-use crate::engine_plan::{EnginePlan, PartRequirement};
-use crate::plan::{KernelPhase, PartGeometry};
+use crate::engine_plan::{EnginePlan, PartRequirement, precision_of};
+use crate::plan::{KernelPhase, PartGeometry, Precision};
 use crate::resolver::{Availability, KernelResolver, ResolveCause, ResolveError};
 
 /// One tensor from a checkpoint's index: its name, stored shape and dtype.
@@ -181,6 +181,10 @@ pub enum ScanStatus {
         fix: String,
     },
     /// The description names an operation the shared op library lacks.
+    ///
+    /// Every [Part] variant has a catalogue entry today, so no current scan produces this row;
+    /// a layout file that names an operation outside the library will. It is defined and tested
+    /// so the classification is never dropped.
     NoPartKind {
         /// What would fix the gap.
         fix: String,
@@ -242,6 +246,23 @@ impl ScanStatus {
     pub const fn is_resolved(&self) -> bool {
         matches!(self, Self::Resolved)
     }
+
+    /// The key, tensor or detail this status refuses, when it has one.
+    ///
+    /// The renderer prints it beside the status name: a refusal that did not name the config key
+    /// or tensor would be the silent omission the plan's section 7 forbids.
+    #[must_use]
+    pub fn subject(&self) -> Option<&str> {
+        match self {
+            Self::Resolved
+            | Self::NotBuilt { .. }
+            | Self::NoKernelOnTarget { .. }
+            | Self::NoPartKind { .. } => None,
+            Self::UnknownKey { key, .. } => Some(key),
+            Self::UnclaimedTensor { tensor, .. } => Some(tensor),
+            Self::UnknownLayout { detail, .. } => Some(detail),
+        }
+    }
 }
 
 impl fmt::Display for ScanStatus {
@@ -259,14 +280,17 @@ pub struct ScanRow {
     pub block: Option<usize>,
     /// The part kind.
     pub part: Part,
-    /// The principal matrix the config states for the instance.
+    /// The rank-local principal matrix the instance was resolved at, or [Shape::unknown].
     ///
-    /// This is the shape the checkpoint's typed fields size, or [Shape::unknown] when they do
-    /// not: a part whose operative shape needs the tensor names and the layout file is printed
-    /// as `?` rather than guessed. The layout work replaces the unknown with the stored shape.
+    /// The plan is built at rank zero of the report's world size, so a TP4 row states the heads
+    /// and columns this rank holds, not the model's full width. A part whose operative shape
+    /// needs the tensor names and the layout file is printed as `?` rather than guessed.
     pub shape: Shape,
-    /// The stored weight format.
-    pub format: WeightFormat,
+    /// The stored weight format, when the checkpoint's typed fields state it.
+    ///
+    /// `None` is printed as `?`: a composite part's format is not in the config, and the scan
+    /// never reports a format it did not resolve at.
+    pub format: Option<WeightFormat>,
     /// The pass this row reports: both when the instance resolved in both passes (or failed in
     /// both), otherwise the single pass that refused it.
     pub pass: KernelPhase,
@@ -341,6 +365,13 @@ impl ScanReport {
                 .block
                 .map_or_else(|| "global".to_owned(), |index| index.to_string());
             let shape = row.shape.to_string();
+            let format = row
+                .format
+                .map_or_else(|| "?".to_owned(), |format| format.name().to_owned());
+            let status = match row.status.subject() {
+                Some(subject) => format!("{}: {subject}", row.status.name()),
+                None => row.status.name().to_owned(),
+            };
             let _ = writeln!(
                 out,
                 "{:<9} {:<6} {:<18} {:<16} {:<8} {:<8} {}",
@@ -348,9 +379,9 @@ impl ScanReport {
                 block,
                 row.part.name(),
                 shape,
-                row.format.name(),
+                format,
                 row.pass.name(),
-                row.status.name()
+                status
             );
             if let Some(fix) = row.status.fix() {
                 let _ = writeln!(out, "    fix: {fix}");
@@ -452,8 +483,8 @@ fn push_row(
 ) {
     let shape = part_shape(requirement.part, &requirement.geometry);
     let format = architecture.stored_format(requirement.part);
-    let prefill = resolver.resolve_for(requirement, KernelPhase::Prefill);
-    let decode = resolver.resolve_for(requirement, KernelPhase::Decode);
+    let prefill = resolve_pass(resolver, requirement, KernelPhase::Prefill, format);
+    let decode = resolve_pass(resolver, requirement, KernelPhase::Decode, format);
     let (pass, status) = match (prefill, decode) {
         (Ok(_), Ok(_)) => (KernelPhase::Both, ScanStatus::Resolved),
         (Err(error), Ok(_)) => (KernelPhase::Prefill, refusal_status(&error, &shape, format)),
@@ -472,7 +503,47 @@ fn push_row(
     });
 }
 
-fn refusal_status(error: &ResolveError, shape: &Shape, format: WeightFormat) -> ScanStatus {
+/// Resolve one instance for one pass at the format its row reports.
+///
+/// A stated format is resolved at exactly that precision, so the format column and the kernel
+/// lookup cannot disagree. An unstated format is tried at the plan's precision and then at every
+/// other: the row says a body exists without claiming which stored format it reads.
+fn resolve_pass(
+    resolver: &KernelResolver,
+    requirement: &PartRequirement,
+    phase: KernelPhase,
+    format: Option<WeightFormat>,
+) -> Result<(), ResolveError> {
+    if let Some(format) = format {
+        let requirement = PartRequirement {
+            precision: precision_of(format),
+            ..*requirement
+        };
+        return resolver.resolve_for(&requirement, phase).map(|_| ());
+    }
+    let mut plan_error = None;
+    for precision in [
+        requirement.precision,
+        Precision::Bf16,
+        Precision::F32,
+        Precision::MxFp8,
+        Precision::Fp8E4M3,
+        Precision::NvFp4,
+    ] {
+        let candidate = PartRequirement {
+            precision,
+            ..*requirement
+        };
+        match resolver.resolve_for(&candidate, phase) {
+            Ok(_) => return Ok(()),
+            Err(error) if precision == requirement.precision => plan_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    Err(plan_error.expect("the plan's precision was tried"))
+}
+
+fn refusal_status(error: &ResolveError, shape: &Shape, format: Option<WeightFormat>) -> ScanStatus {
     match &error.cause {
         ResolveCause::NoCatalogueEntry => ScanStatus::NoPartKind {
             fix: format!(
@@ -486,11 +557,14 @@ fn refusal_status(error: &ResolveError, shape: &Shape, format: WeightFormat) -> 
             } else {
                 format!("at {shape}")
             };
+            let stored = format.map_or_else(
+                || "whose stored format the config does not state".to_owned(),
+                |format| format!("stored as {}", format.name()),
+            );
             ScanStatus::NotBuilt {
                 fix: format!(
-                    "add a build-list line for `{}` {at} stored as {} on {} and rebuild",
+                    "add a build-list line for `{}` {at} {stored} on {} and rebuild",
                     error.part.name(),
-                    format.name(),
                     error.target.name()
                 ),
             }
@@ -520,12 +594,12 @@ fn stack_of(part: Part) -> StackKind {
     }
 }
 
-/// The principal matrix the config states for one part, or [Shape::unknown].
+/// The rank-local principal matrix the plan sizes for one part, or [Shape::unknown].
 ///
-/// Only the parts whose operative matrix the config sizes are stated. A part whose shape needs
-/// the tensor index and the layout file (an Engram table, a hyper-connection seam, an indexer,
-/// a vision patch grid) is unknown: the report never substitutes the residual width for a shape
-/// it does not know.
+/// Only the parts whose operative matrix the checkpoint's typed fields size are stated. A part
+/// whose shape needs the tensor index and the layout file (an Engram table, a hyper-connection
+/// seam, an indexer) is unknown: the report never substitutes the residual width for a shape it
+/// does not know. A partially unset geometry is unknown rather than a lower-rank shape.
 fn part_shape(part: Part, geometry: &PartGeometry) -> Shape {
     let dims = match part {
         Part::Embedding | Part::LmHead => vec![geometry.vocab, geometry.hidden],
@@ -535,9 +609,14 @@ fn part_shape(part: Part, geometry: &PartGeometry) -> Shape {
         }
         Part::DenseMlp => vec![geometry.intermediate, geometry.hidden],
         Part::Moe => vec![geometry.experts, geometry.intermediate, geometry.hidden],
+        Part::Vision => vec![geometry.patch_size, geometry.patch_size, geometry.hidden],
         _ => Vec::new(),
     };
-    Shape::new(dims.into_iter().filter(|dim| *dim > 0).collect::<Vec<_>>())
+    if dims.is_empty() || dims.contains(&0) {
+        Shape::unknown()
+    } else {
+        Shape::new(dims)
+    }
 }
 
 #[cfg(test)]
@@ -716,15 +795,132 @@ mod tests {
             .resolve_for(&requirement, KernelPhase::Prefill)
             .expect_err("the catalogue has no one-wide attention");
         let shape = part_shape(requirement.part, &requirement.geometry);
-        let status = refusal_status(&error, &shape, WeightFormat::Bf16);
+        let status = refusal_status(&error, &shape, Some(WeightFormat::Bf16));
         let ScanStatus::NotBuilt { fix } = &status else {
             panic!("expected not built, got {status}");
         };
-        assert!(fix.contains("build-list line"), "{fix}");
-        assert!(fix.contains("mla_attention"), "{fix}");
-        assert!(fix.contains("at 1x1"), "{fix}");
-        assert!(fix.contains("stored as BF16"), "{fix}");
-        assert!(fix.contains("sm121"), "{fix}");
+        assert_eq!(
+            fix,
+            "add a build-list line for `mla_attention` at 1x1 stored as BF16 on sm121 and rebuild"
+        );
+    }
+
+    #[test]
+    fn a_partially_unset_geometry_is_unknown_not_lower_rank() {
+        let geometry = PartGeometry {
+            hidden: 5120,
+            ..PartGeometry::new()
+        };
+        assert!(part_shape(Part::DenseMlp, &geometry).is_unknown());
+        assert!(part_shape(Part::GqaAttention, &geometry).is_unknown());
+    }
+
+    #[test]
+    fn a_tower_shape_the_catalogue_covers_resolves_with_an_unstated_format() {
+        const VISION_CONFIG: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16,"vision_config":{"depth":1,"hidden_size":64,"num_attention_heads":2,"intermediate_size":128,"patch_size":14,"temporal_patch_size":2,"spatial_merge_size":2}}"#;
+        let report = scan(ScanInputs {
+            config: VISION_CONFIG,
+            tensors: None,
+            target: Target::Sm121,
+            world: 1,
+        });
+        assert!(report.error.is_none(), "{report:?}");
+        let vision = report
+            .rows
+            .iter()
+            .find(|row| row.part == Part::Vision)
+            .expect("the tower is a part instance");
+        assert!(vision.status.is_resolved(), "{:?}", vision.status);
+        assert_eq!(
+            vision.format, None,
+            "the config does not state the tower's format"
+        );
+        assert_eq!(vision.shape, Shape::new([14, 14, 64]));
+        assert!(report.render().contains("14x14x64"), "{report:?}");
+    }
+
+    #[test]
+    fn a_missing_part_kind_is_named_by_the_scan() {
+        let error = ResolveError {
+            part: Part::Moe,
+            target: Target::Sm121,
+            precision: Precision::Bf16,
+            phase: KernelPhase::Prefill,
+            reasons: Vec::new(),
+            cause: ResolveCause::NoCatalogueEntry,
+        };
+        let status = refusal_status(&error, &Shape::unknown(), None);
+        assert_eq!(status.name(), "no part kind");
+        assert_eq!(
+            status.fix(),
+            Some("add a `moe` part kind to the shared op library")
+        );
+    }
+
+    #[test]
+    fn a_coverage_status_renders_the_key_tensor_or_detail_it_refuses() {
+        let report = ScanReport {
+            target: Target::Sm121,
+            world: 1,
+            availability: Availability::Catalogue,
+            coverage: Coverage::not_checked(None),
+            error: None,
+            rows: vec![
+                ScanRow {
+                    stack: StackKind::Language,
+                    block: None,
+                    part: Part::Embedding,
+                    shape: Shape::unknown(),
+                    format: None,
+                    pass: KernelPhase::Both,
+                    target: Target::Sm121,
+                    status: ScanStatus::UnknownKey {
+                        key: "model.new_switch".to_owned(),
+                        fix: "teach the reader".to_owned(),
+                    },
+                },
+                ScanRow {
+                    stack: StackKind::Language,
+                    block: None,
+                    part: Part::Embedding,
+                    shape: Shape::unknown(),
+                    format: None,
+                    pass: KernelPhase::Both,
+                    target: Target::Sm121,
+                    status: ScanStatus::UnclaimedTensor {
+                        tensor: "model.visual.patch.weight".to_owned(),
+                        fix: "add a layout entry".to_owned(),
+                    },
+                },
+                ScanRow {
+                    stack: StackKind::Language,
+                    block: None,
+                    part: Part::Embedding,
+                    shape: Shape::unknown(),
+                    format: None,
+                    pass: KernelPhase::Both,
+                    target: Target::Sm121,
+                    status: ScanStatus::UnknownLayout {
+                        detail: "no layout for the tower".to_owned(),
+                        fix: "ship a layout file".to_owned(),
+                    },
+                },
+            ],
+        };
+        let expected = concat!(
+            "scan report: sm121 TP1, availability catalogue\n",
+            "stack     block  part               shape            format   pass     status\n",
+            "language  global embedding          ?                ?        both     unknown key: model.new_switch\n",
+            "    fix: teach the reader\n",
+            "language  global embedding          ?                ?        both     unclaimed tensor: model.visual.patch.weight\n",
+            "    fix: add a layout entry\n",
+            "language  global embedding          ?                ?        both     unknown layout: no layout for the tower\n",
+            "    fix: ship a layout file\n",
+            "3 rows, 0 resolved, 3 unresolved\n",
+            "coverage: tensors not checked; config keys not checked\n",
+            "clean: no\n",
+        );
+        assert_eq!(report.render(), expected);
     }
 
     #[test]
