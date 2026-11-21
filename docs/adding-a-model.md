@@ -371,7 +371,8 @@ the mechanism there; never copy it into the arm.
 | a tensor's byte length against its slot | `sparkflash_weights::weights::check_length` |
 | walk-ordered rank files: placement, index, writer, read-back cursor | `sparkflash_weights::rank_file::{SlotPlan, SlotIndex, SlotFileWriter, SlotCursor, SlotRecords}` |
 | `sparkflash convert` for such a pack (ranks, read-back, refusals) | `SlotPack` in `sparkflash-cli/src/convert.rs` |
-| `sparkflash serve` at TP=1 and in a tensor-parallel group | `PackArm` in `sparkflash-cli/src/serve/pack.rs` |
+| `sparkflash serve` at TP=1 and in a tensor-parallel group: the engine around a walk | `sparkflash_runtime::WalkArm` (`serve`, `serve_group`, `mirror`, `lane_limit`) |
+| the family's boot on either serving path: fixture, configuration, descriptor, tokenizer, open | `PackArm` in `sparkflash-cli/src/serve/pack.rs` |
 | the descriptor a pack reports (window and vocabulary from the checkpoint) | `sparkflash_model::arm::PackIdentity` |
 | a session's KV claim and the `--concurrency`/`--kv-budget-gib` admission | `sparkflash_model::arm::KvPlan`, printed and refused by `pack::admit` |
 | which drafts a verify keeps, the tokens it queues, the depth, the counters | `sparkflash_model::spec::{verdict, Queue, Speculator}` |
@@ -382,10 +383,12 @@ the mechanism there; never copy it into the arm.
 | splitting a streamed answer into text and `<tool_call>` bodies | `sparkflash_api::tool_block::BlockSplitter` (the family parses the body) |
 | deterministic fixture weights and hash-table sizes | `sparkflash_weights::rng::{splitmix64, is_prime}` |
 
-A served family implements `PackArm` (its fixture, configuration, descriptor, tokenizer, open
-and response layer). Each release of it implements `Release` on its `sparkflash_model` marker
-type (the family's `PackArm`, a display name, a fixture name and a tiny configuration; the model
-id, profile, default context and output cap come from its `ARMS` entry) and adds one
+A served family implements `PackArm` (its fixture, configuration, descriptor, tokenizer and
+open) and states the serving glue its backend supplies as `WalkArm` (its walk, its group wire,
+the place it refuses and its group's engine); the runtime starts both paths. Each release of it
+implements `Release` on its `sparkflash_model` marker type (the family's `PackArm`, a display
+name, a fixture name and a tiny configuration; the model id, profile, default context, output
+cap and response dialect come from its `ARMS` entry) and adds one
 `TypedPack::of::<R>()` row to `TYPED_PACKS`, which serves both `--model` and a dynamic
 `--checkpoint` of that family. Its descriptor is `PackIdentity`'s, its cache claim
 is a `KvPlan` derived from its own geometry, and its speculative path is `spec`'s: a decode drafts,
@@ -393,9 +396,10 @@ one verify decides what survives, and the queue hands the rest back one token at
 (`--checkpoint`, the hub cache or the fixture), derives the context on every rank of a group from
 the same configuration, and refuses at parse time any option the arm does not apply
 (`Pack::unapplied`). A group whose arm opens lanes (`PackArm::open_lanes`: GLM's and Qwen's)
-steps four fused lanes by default (`--fuse-batch --concurrency N` for another count,
-`--concurrency 1` for one request at a time); a group whose arm opens none serves one request at a
-time and refuses `--concurrency` and `--fuse-batch`. `--kv-budget-gib` is refused in any group,
+steps the lanes its `ARMS` entry states (`GroupDefaults::lanes`, four today) by default
+(`--fuse-batch --concurrency N` for another count, `--concurrency 1` for one request at a
+time); a group whose arm opens none serves one request at a time and refuses `--concurrency` and
+`--fuse-batch`. `--kv-budget-gib` is refused in any group,
 and an arm without a fused batch or a KV budget says so at TP=1. A directory of rank files named by an environment variable resolves through
 `converted_rank_file`, which refuses a directory that holds no file for the rank.
 
@@ -414,8 +418,9 @@ Everything else is read from one registration or refused by the compiler:
   naming the gap and its measurement, a compile error. `Architecture::parts()` is the only
   description of what the model needs; `parts::missing` is the catalogue's answer.
 - **The `ARMS` table.** `sparkflash_model::ARMS` is the one model registration: arm id, model
-  id, weights, profile, default context, ledger, tokenizer and chat template, and conversion
-  defaults. `MODELS` is the descriptor list. `DEFAULTS` holds DeepSeek's measured defaults; an
+  id, weights, profile, default context, ledger, tokenizer and prompt dialect, the converter its
+  checkpoint goes through, its group's default context and lanes, its row of the web console's
+  deployments, and its crate and environment switches. `MODELS` is the descriptor list. `DEFAULTS` holds DeepSeek's measured defaults; an
   arm profile departs from one only with `measured = "docs/…"`.
 - **`sparkflash onboard ORG/REPO`.** Before any code is written it prints the parts `CATALOGUE`
   already has, the parts that need a `PartExec` (no tensor-core body in a pass and no `WAIVERS`
@@ -432,14 +437,16 @@ A checkpoint does not need a new `PackArm` to convert or serve. `sparkflash serv
 ORG/REPO` and `sparkflash serve --checkpoint DIR` resolve the snapshot through
 `sparkflash_weights::hub`, parse its `config.json` with the shared `Architecture`, plan it with
 `EnginePlan`, and check every requirement with `KernelResolver`. The descriptor is
-`ModelDescriptor::from_architecture`, the prompt codec is detected from `tokenizer.json`
-(GLm's `[gMASK]`/`<sop>`, ChatML's `<|im_start|>`/`<|im_end|>`), and the profile is the
+`ModelDescriptor::from_architecture`, the prompt dialect is the family's `ARMS` entry when
+it states one and the `tokenizer.json` markers otherwise (GLM's `[gMASK]`/`<sop>`, ChatML's
+`<|im_start|>`/`<|im_end|>`), and the profile is the
 canonical preset for a released family or `ModelProfile::default()` plus the declared environment
 overrides for a novel one. `MODELS` remains the canonical preset list, not a closed gate.
 
-`sparkflash convert --model ORG/REPO` dispatches from the same plan: a released Qwen/GLM
-checkpoint goes to its pack converter, DeepSeek goes to the B12x converter, and any other
-resolved architecture goes to the generic dynamic writer.
+`sparkflash convert --model ORG/REPO` dispatches from the same plan: the family's `ARMS`
+entry names the converter its checkpoint goes through (the Qwen and GLM packs' own, Inkling's
+plan-ordered writer, DeepSeek's B12x converter), and a family with no entry goes to the generic
+dynamic writer.
 
 **Phase-4 status.** `EngineBuilder`, `ArchitectureTensorPlan` and `SlotPack` are merged. The
 released Qwen and GLM arms implement `EngineBuilder` (`PartsDeviceBackend`), and `SlotPack` is

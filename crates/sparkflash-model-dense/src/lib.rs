@@ -102,7 +102,9 @@ use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
-use sparkflash_runtime::{ChunkPolicy, Fusion, Limits, TextWire, TickServe};
+use sparkflash_runtime::{
+    ChunkPolicy, GroupEngine, GroupWire, Limits, Place, Serving, TextWire, Walk, WalkArm,
+};
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, TensorSpec, WeightSource};
 
@@ -954,31 +956,49 @@ impl Drop for Shared {
     }
 }
 
-/// What a fused dense backend's sessions open on.
-enum DenseServing {
-    /// The fused engine, for the tensor-parallel group's rank 0 (and its workers' mirror).
-    Fused(Fusion<DenseLanes>),
-    /// The tick engine, for the single-process serving path: DeepSeek's scheduler over the
-    /// dense walk.
-    Tick(Arc<TickServe<DenseWalk>>),
-}
-
-impl DenseServing {
-    fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        match self {
-            Self::Fused(fusion) => fusion.open(),
-            Self::Tick(engine) => Ok(Box::new(engine.open()?)),
-        }
-    }
-}
-
 /// A dense grouped-query checkpoint on the device.
 pub struct DenseDeviceBackend {
     descriptor: ModelDescriptor,
     shared: Arc<Shared>,
     /// The engine its sessions open on once [Self::enable_fusion] (or, on rank 0 of a group,
     /// [Self::enable_group_fusion]) has run.
-    fused: Option<DenseServing>,
+    fused: Option<Serving>,
+}
+
+/// What the runtime serves this backend by ([sparkflash_runtime::serve] and its group forms).
+impl WalkArm for DenseDeviceBackend {
+    fn walk(&self, capacity: usize) -> Result<impl Walk<Seq: Send> + Send + Sync, BackendError> {
+        walk::walk(Arc::clone(&self.shared), capacity)
+    }
+
+    /// The arm serves text.
+    fn wire(&self) -> impl GroupWire {
+        TextWire::new("dense", "shared dense device", self.shared.context)
+    }
+
+    /// A rank of an [Self::open_rank] group holds the sums its peers step through, so it steps
+    /// only with them; a backend opened alone has no peers to step with.
+    fn admit(&self, place: Place) -> Result<(), BackendError> {
+        match (self.shared.sums.is_some(), place) {
+            (true, Place::Alone) => Err(BackendError::new(
+                DEVICE,
+                "a group's rank steps its lanes with its peers: fuse rank 0's with \
+                 enable_group_fusion and mirror them on the others with mirror_group",
+            )),
+            (false, Place::Group) => Err(BackendError::new(
+                DEVICE,
+                "group lanes need a group's rank (open_rank); this backend runs alone, so fuse \
+                 its sessions with enable_fusion",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Alone the arm serves on the tick engine. Its group still serves through the fused engine,
+    /// until its lane frames can carry a chunk's rows.
+    fn group_engine(&self) -> GroupEngine {
+        GroupEngine::Fused
+    }
 }
 
 impl DenseDeviceBackend {
@@ -1243,35 +1263,25 @@ impl DenseDeviceBackend {
         DenseDeviceSession::open(Arc::clone(&self.shared))
     }
 
-    /// Serves this backend's sessions on the shared fused engine: `capacity` lanes whose decode
-    /// rows share one walk, whose prompts run a part at a time between the lanes' steps, and which
-    /// keep their conversations between requests. Call it before the backend is shared with the
-    /// serving driver, with the driver's concurrency as the capacity.
+    /// Serves this backend's sessions on the tick engine ([sparkflash_runtime::serve]):
+    /// `capacity` lanes whose decode rows share one walk, whose prompts run a part at a time
+    /// between the lanes' steps, and which keep their conversations between requests. Call it
+    /// before the backend is shared with the serving driver, with the driver's concurrency as the
+    /// capacity.
     ///
     /// # Errors
-    /// A zero capacity, a scratch or lane the device refuses, or a thread that cannot start.
+    /// A group's rank, a zero capacity, a scratch or lane the device refuses, or a thread that
+    /// cannot start.
     pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
-        if self.shared.sums.is_some() {
-            return Err(BackendError::new(
-                DEVICE,
-                "a group's rank steps its lanes with its peers: fuse rank 0's with \
-                 enable_group_fusion and mirror them on the others with mirror_group",
-            ));
-        }
-        // The single-process path serves on the tick engine: DeepSeek's scheduler, the dense
-        // walk's arithmetic. The group path below still serves through the fused engine until
-        // its lane frames can carry a chunk's rows.
-        let walk = walk::walk(Arc::clone(&self.shared), capacity)?;
-        self.fused = Some(DenseServing::Tick(TickServe::start(walk, capacity)?));
+        self.fused = Some(sparkflash_runtime::serve(self, capacity)?);
         Ok(())
     }
 
-    /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group: every lane's prompt, step,
+    /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group
+    /// ([sparkflash_runtime::serve_group], on the fused engine): every lane's prompt, step,
     /// give-back and release is broadcast through `hub` before it runs here, and each worker
     /// replays them ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same
-    /// sequence on every rank and the sums inside a walk line up. A worker whose socket closes
-    /// ends this process, and so does a failure here after a frame went out
-    /// ([sparkflash_runtime::watched_hub], [sparkflash_runtime::end_group]).
+    /// sequence on every rank and the sums inside a walk line up.
     ///
     /// # Errors
     /// A backend that is not a group's rank, then as [Self::enable_fusion], or a watch that
@@ -1281,20 +1291,13 @@ impl DenseDeviceBackend {
         capacity: usize,
         hub: sparkflash_comm::control::Tp4ControlHub,
     ) -> Result<(), BackendError> {
-        self.group_rank()?;
-        let arm = walk::runtime(Arc::clone(&self.shared), capacity)?;
-        self.fused = Some(DenseServing::Fused(Fusion::group(
-            arm,
-            hub,
-            self.wire(),
-            capacity,
-        )?));
+        self.fused = Some(sparkflash_runtime::serve_group(self, capacity, hub)?);
         Ok(())
     }
 
     /// A worker of an [Self::open_rank] group: replays rank 0's lane frames over `capacity`
     /// lanes of this rank's own until the group can no longer serve, then ends the process
-    /// ([sparkflash_runtime::mirror_until_the_group_ends]).
+    /// ([sparkflash_runtime::mirror]).
     ///
     /// # Errors
     /// A backend that is not a group's rank, or the lanes' scratch, before any frame.
@@ -1303,27 +1306,7 @@ impl DenseDeviceBackend {
         control: &mut sparkflash_comm::control::Tp4ControlWorker,
         capacity: usize,
     ) -> Result<std::convert::Infallible, String> {
-        self.group_rank().map_err(|error| error.to_string())?;
-        let lanes =
-            walk::runtime(Arc::clone(&self.shared), capacity).map_err(|error| error.to_string())?;
-        sparkflash_runtime::mirror_until_the_group_ends(control, &lanes, &self.wire(), capacity)
-    }
-
-    /// What the group's frames carry and rank 0 refuses: the arm serves text.
-    fn wire(&self) -> TextWire {
-        TextWire::new("dense", "shared dense device", self.shared.context)
-    }
-
-    /// Refuses a backend that is no group's rank: its lanes have no peers to step with.
-    fn group_rank(&self) -> Result<(), BackendError> {
-        if self.shared.sums.is_none() {
-            return Err(BackendError::new(
-                DEVICE,
-                "group lanes need a group's rank (open_rank); this backend runs alone, so fuse \
-                 its sessions with enable_fusion",
-            ));
-        }
-        Ok(())
+        sparkflash_runtime::mirror(self, control, capacity)
     }
 
     /// The rank and world this backend holds its share at: `(0, 1)` alone.

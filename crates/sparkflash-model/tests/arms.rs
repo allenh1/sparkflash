@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sparkflash_model::{ARMS, ModelProfile, Strategy, arm_for_weights};
+use sparkflash_model::{ARMS, Arm as _, ModelProfile, Strategy, arm_for_weights};
 
 /// The model crates whose arms still read the environment at the point of use.
 ///
@@ -213,6 +213,119 @@ fn a_model_crate_reads_no_environment_beyond_the_recorded_table() {
         assert_eq!(
             measured, expected,
             "{name} has {measured} direct environment reads; {expected} are in the exception              table (move the rest through profile.rs, or record them here)"
+        );
+    }
+}
+
+/// Whether any `.rs` file under `directory` contains `needle`.
+fn source_contains(directory: &Path, needle: &str) -> bool {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            source_contains(&path, needle)
+        } else {
+            path.extension().is_some_and(|extension| extension == "rs")
+                && fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+        }
+    })
+}
+
+#[test]
+fn every_model_crate_is_an_arms_crate() {
+    let named = ARMS
+        .iter()
+        .map(|arm| arm.source().crate_name)
+        .collect::<BTreeSet<_>>();
+    for name in &named {
+        assert!(
+            root()
+                .join("crates")
+                .join(name)
+                .join("Cargo.toml")
+                .is_file(),
+            "an arm names the crate {name}, which the workspace does not hold"
+        );
+    }
+    for path in model_crates() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a crate name");
+        assert!(named.contains(name), "{name} is no ARMS entry's crate");
+    }
+}
+
+/// The onboarding gate derives an arm's conformance crate from its name. Every arm crate that
+/// declares the generated checks must be one the script can name, and the script names no crate
+/// that is not an arm's (or the runtime's own toy walk).
+#[test]
+fn the_onboard_gate_names_every_conformance_crate() {
+    let script =
+        fs::read_to_string(root().join("scripts/onboard-gate.sh")).expect("the onboarding gate");
+    let mut crates = BTreeSet::from(["sparkflash-runtime"]);
+    for arm in ARMS {
+        let name = arm.source().crate_name;
+        crates.insert(name);
+        let declares = source_contains(
+            &root().join("crates").join(name).join("src"),
+            "sparkflash_runtime::conformance!(",
+        );
+        assert_eq!(
+            script.contains(&format!("CRATE=\"{name}\"")),
+            declares,
+            "{name} declares the conformance checks: {declares}; scripts/onboard-gate.sh must \
+             name exactly the crates that do"
+        );
+    }
+    for line in script.lines() {
+        if let Some((_, rest)) = line.split_once("CRATE=\"sparkflash-") {
+            let name = format!("sparkflash-{}", rest.split('"').next().unwrap_or_default());
+            assert!(
+                crates.contains(name.as_str()),
+                "scripts/onboard-gate.sh names {name}, which is no arm's crate"
+            );
+        }
+    }
+}
+
+/// Every rank of a group must see the same value of an arm's own switches, so the group
+/// launcher forwards each prefix an arm states; a switch that reached rank 0 alone would make it
+/// a different program from its peers.
+#[test]
+fn the_group_launcher_forwards_every_arms_switches() {
+    let script = fs::read_to_string(root().join("scripts/serve-four-node.sh"))
+        .expect("the four-node launcher");
+    let pattern = script
+        .lines()
+        .find_map(|line| {
+            line.split_once("grep -E '^SPARKFLASH_(")?
+                .1
+                .split_once(")'")
+        })
+        .map(|(alternatives, _)| alternatives.split('|').collect::<Vec<_>>())
+        .expect("the launcher forwards SPARKFLASH_ knobs by one pattern");
+    for arm in ARMS {
+        for switch in arm.source().switches {
+            let name = switch.strip_prefix("SPARKFLASH_").unwrap_or_else(|| {
+                panic!("{}'s switch {switch} is not a SPARKFLASH_ name", arm.id())
+            });
+            assert!(
+                pattern.iter().any(|forwarded| name.starts_with(forwarded)),
+                "scripts/serve-four-node.sh does not forward {switch}* ({}) to every rank",
+                arm.id()
+            );
+        }
+    }
+    // Inkling's site launcher forwards the arm's own prefix the same way.
+    let inkling = fs::read_to_string(root().join("scripts/inkling-env.sh"))
+        .expect("the Inkling launcher's environment");
+    for switch in sparkflash_model::Inkling.source().switches {
+        assert!(
+            inkling.contains(&format!("grep '^{switch}'")),
+            "scripts/inkling-env.sh does not forward {switch}*"
         );
     }
 }

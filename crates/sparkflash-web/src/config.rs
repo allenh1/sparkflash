@@ -56,13 +56,13 @@ pub const SUPPORTED_ENGINES: &[&str] = &[
 ///
 /// The weights selector is the checkpoint's own Hugging Face id: a novel family has no registry
 /// entry, so the id is the only stable selector it has.
-pub const DYNAMIC_ENGINE_ID: &str = "dynamic";
+pub const DYNAMIC_ENGINE_ID: &str = sparkflash_model::arms::engine::DYNAMIC;
 
 /// The control-plane weight selector for V4.1-Flash.
 pub const DEFAULT_WEIGHTS_ID: &str = sparkflash_model::DEFAULT_WEIGHTS_ID;
 
 /// The control-plane engine selector for the TP=4 V4.1 engine.
-pub const DEFAULT_ENGINE_ID: &str = "deepseek-v4.1-flash";
+pub const DEFAULT_ENGINE_ID: &str = sparkflash_model::arms::engine::DEEPSEEK;
 
 /// The canonical Hugging Face id of the checkpoint the default engine reads.
 pub const DEFAULT_MODEL_ID: &str = sparkflash_model::DEFAULT_MODEL_ID;
@@ -86,13 +86,13 @@ pub const DORY_WEIGHTS_ID: &str = sparkflash_model::descriptor::DORY1_0_4B_BF16_
 pub const INKLING_WEIGHTS_ID: &str = sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID;
 
 /// The control-plane engine selector for the TP=4 Inkling-2-Small pack.
-pub const INKLING_ENGINE_ID: &str = "inkling2";
+pub const INKLING_ENGINE_ID: &str = sparkflash_model::arms::engine::INKLING;
 
 /// The canonical Hugging Face id of the Qwen3.6-35B-A3B checkpoint.
 pub const QWEN36_MODEL_ID: &str = sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID;
 
 /// The control-plane engine selector for the TP=1 Qwen pack.
-pub const QWEN_ENGINE_ID: &str = "qwen4-exp";
+pub const QWEN_ENGINE_ID: &str = sparkflash_model::arms::engine::QWEN;
 
 /// The canonical Hugging Face id of the Qwen3.8-Flash-Next checkpoint.
 pub const QWEN_MODEL_ID: &str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID;
@@ -101,7 +101,7 @@ pub const QWEN_MODEL_ID: &str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_
 pub const GLM_WEIGHTS_ID: &str = sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID;
 
 /// The control-plane engine selector for the TP=4 GLM-5.3-Flash pack.
-pub const GLM_ENGINE_ID: &str = "glm5-next";
+pub const GLM_ENGINE_ID: &str = sparkflash_model::arms::engine::GLM;
 
 /// The canonical Hugging Face id of the GLM-5.3-Flash checkpoint.
 pub const GLM_MODEL_ID: &str = sparkflash_model::descriptor::GLM53_FLASH_ID;
@@ -125,9 +125,9 @@ pub const SOLO_WORLD_SIZE: usize = 1;
 pub const MAX_CONCURRENCY: usize = 32;
 
 /// The fused lanes a lane group (GLM-5.3-Flash's and Inkling-2-Small's four-rank groups) steps
-/// unless the plan says otherwise: the CLI's own default for a GLM `--tp4-rank` group
-/// (`pack::GROUP_LANES`) and the Inkling site launcher's.
-pub const GROUP_LANES: usize = 4;
+/// unless the plan says otherwise: the CLI's own default for a GLM `--tp4-rank` group and the
+/// Inkling site launcher's.
+pub const GROUP_LANES: usize = sparkflash_model::GROUP_LANES;
 
 /// The widest prefill chunk Inkling's arm takes (`SPARKFLASH_INKLING_PREFILL_CHUNK`): a chunk's
 /// rows are a launch's grid rows.
@@ -173,111 +173,19 @@ pub struct ModelProfile {
     pub lane_group: bool,
 }
 
-/// The deployment fields a model profile needs that the model registry does not own.
-struct Deployment {
-    /// The engine selector that runs those weights.
-    engine: &'static str,
-    /// The default Hugging Face search term for this family.
-    search: &'static str,
-    /// How many ranks the console launches the family on.
-    world_size: usize,
-    /// Every tensor-parallel width the family's device arm runs.
-    worlds: &'static [usize],
-    /// The organization most of the family's checkpoints live under.
-    org: &'static str,
-    /// Whether launch needs a per-rank converted file.
-    requires_conversion: bool,
-    /// Whether launch loads the external cubin directory built by scripts/build-cubins.sh.
-    requires_cubins: bool,
-    /// Whether the four-rank group steps concurrent requests as fused lanes.
-    lane_group: bool,
-}
-
-/// The deployment fields for the weights selector, or a panic naming the unregistered family.
-fn deployment_for(weights: &str) -> Deployment {
-    match weights {
-        DEFAULT_WEIGHTS_ID => Deployment {
-            engine: DEFAULT_ENGINE_ID,
-            search: "DeepSeek-V4.1",
-            world_size: WORLD_SIZE,
-            // The V4.1 engine is the four-rank group; it has no narrower arm.
-            worlds: &[WORLD_SIZE],
-            org: "deepseek-ai",
-            requires_conversion: true,
-            requires_cubins: true,
-            lane_group: false,
-        },
-        QWEN_WEIGHTS_ID | QWEN_FP8_WEIGHTS_ID => Deployment {
-            engine: QWEN_ENGINE_ID,
-            search: "Qwen3.8-Flash",
-            world_size: SOLO_WORLD_SIZE,
-            // The pack's single-node arm and its TP=2/TP=4 group (!205, !207).
-            worlds: &[1, 2, 4],
-            org: "Qwen",
-            requires_conversion: true,
-            requires_cubins: false,
-            lane_group: false,
-        },
-        QWEN36_WEIGHTS_ID => Deployment {
-            // The dynamic engine launches Qwen3.5-MoE from the checkpoint: the FP8 release on
-            // the Qwen pack's device arm, a BF16 one on the shared CPU host reference, both at
-            // one rank (sparkflash_ops::parts::dynamic_device_arm decides which).
-            engine: DYNAMIC_ENGINE_ID,
-            search: "Qwen3.6",
-            world_size: SOLO_WORLD_SIZE,
-            worlds: &[SOLO_WORLD_SIZE],
-            org: "Qwen",
-            requires_conversion: false,
-            requires_cubins: false,
-            lane_group: false,
-        },
-        GLM_WEIGHTS_ID => Deployment {
-            engine: GLM_ENGINE_ID,
-            search: "GLM-5.3-Flash",
-            world_size: WORLD_SIZE,
-            // The pack's single-node arm (which refuses the released 328 GB on memory, not on
-            // capability) and its TP=2/TP=4 group.
-            worlds: &[1, 2, 4],
-            org: "zai-org",
-            requires_conversion: true,
-            requires_cubins: false,
-            lane_group: true,
-        },
-        DORY_WEIGHTS_ID => Deployment {
-            // The dynamic route opens Dory's device arm when its cubins are present, and its
-            // CPU host reference otherwise. Dory's multi-rank group splits recurrent loops,
-            // not layers, so it is not one of this console's tensor-parallel worlds.
-            engine: DYNAMIC_ENGINE_ID,
-            search: "Dory1.0",
-            world_size: SOLO_WORLD_SIZE,
-            worlds: &[SOLO_WORLD_SIZE],
-            org: "nvidia",
-            requires_conversion: false,
-            requires_cubins: false,
-            lane_group: false,
-        },
-        INKLING_WEIGHTS_ID => Deployment {
-            engine: INKLING_ENGINE_ID,
-            search: "Inkling-2",
-            world_size: WORLD_SIZE,
-            // The 393.5 GB checkpoint fits four Sparks; it does not fit one or two.
-            worlds: &[WORLD_SIZE],
-            org: "thinkingmachines",
-            requires_conversion: true,
-            // The arm's kernels are built into the binary (SPARKFLASH_INKLING_CUBIN at build
-            // time); its group takes no cubin directory.
-            requires_cubins: false,
-            lane_group: true,
-        },
-        other => panic!("no web deployment profile for the registry weights {other}"),
-    }
+/// The deployment fields for the weights selector: the row its arm's registration states
+/// ([sparkflash_model::Arm::deployment]), or a panic naming the unregistered family.
+fn deployment_for(weights: &str) -> sparkflash_model::Deployment {
+    sparkflash_model::arm_for_weights(weights)
+        .and_then(|arm| arm.deployment())
+        .unwrap_or_else(|| panic!("no web deployment profile for the registry weights {weights}"))
 }
 
 /// Every model family the web control plane can configure.
 ///
-/// The identity fields (model_type, label, id, weights, context) are the model registry's; only
-/// the deployment fields above are the web layer's. A new registry model must add a deployment
-/// entry, and a test holds the two sets to the same entries.
+/// The identity fields (model_type, label, id, weights, context) are the model registry's and the
+/// deployment fields are its arm's registration, so a new registry model is configurable here
+/// once its `sparkflash_model::ARMS` entry states a deployment row.
 pub static MODEL_PROFILES: LazyLock<Vec<ModelProfile>> = LazyLock::new(|| {
     sparkflash_model::MODELS
         .iter()

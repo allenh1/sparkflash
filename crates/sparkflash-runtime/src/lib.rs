@@ -27,7 +27,8 @@
 //! * [group]: fused lanes across a tensor-parallel group - rank 0 decides and broadcasts, every
 //!   other rank replays;
 //! * [ledger]: which of these an arm runs natively, looped or not at all, printed when its engine
-//!   starts.
+//!   starts;
+//! * [mod@serve]: the one entry a walk arm's backend serves through, alone or in a group.
 //!
 //! The plan, and what is still to move here, is
 //! [docs/engine/03-runtime.md](../../../docs/engine/03-runtime.md).
@@ -43,6 +44,7 @@ pub mod pool;
 pub mod resume;
 pub mod rounds;
 pub mod runtime;
+pub mod serve;
 pub mod share;
 pub mod testing;
 pub mod tick;
@@ -74,6 +76,7 @@ pub use pool::{LaneMemory, LanePool};
 pub use resume::{Restore, Rewind, checkpoint_after, rewind_plan};
 pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
 pub use runtime::{Runtime, RuntimeSession, RuntimeSlot, StepMode, ledger_for};
+pub use serve::{GroupEngine, Place, Serving, WalkArm, lane_limit, mirror, serve, serve_group};
 pub use share::{BandWall, DraftBudget, ExpertUnionWall, StepWall, share_rows};
 pub use walk::{
     Absent, ComputeDeclaration, Draft, Drafter, HeadInput, HeadRow, Hidden, NoVision,

@@ -16,13 +16,16 @@
 //!
 //! [ARMS] is the model table, not the serving paths. Each entry names the arm the console prints,
 //! the registry weight selectors it serves, the profile TOML it carries, its default context,
-//! its ledger declaration ([crate::ARM_LEDGERS]), the tokenizer and chat template it reads, and
-//! the conversion defaults its checkpoint was released with. [crate::MODELS] remains the
-//! registry: an arm's weights are selectors into it, and a test holds every one to a descriptor.
+//! its ledger declaration ([crate::ARM_LEDGERS]), the tokenizer and prompt dialect it reads, the
+//! converter its checkpoint goes through, the defaults its group serves by, the row the web
+//! console launches it from and the crate and switches the scripts know it by. [crate::MODELS]
+//! remains the registry: an arm's weights are selectors into it, and a test holds every one to a
+//! descriptor.
 //!
-//! A file that would have kept a second arm list reads this table instead. The serving dispatch
-//! in the CLI is not derived from it (the audit's entry-path table is the list of sites a new
-//! family still edits); this table makes the *model* registration one declaration.
+//! A file that would have kept a second arm list reads this table instead: the CLI's codec and
+//! response engine, its group defaults and its converter dispatch, the console's deployment rows,
+//! and (through the tests in `tests/arms.rs`) the launch scripts. The code a family brings (its
+//! codec, its converter, its backend) stays in its own crate; this table names which one answers.
 
 use crate::descriptor::{
     DEFAULT_WEIGHTS_ID, DORY1_0_4B_BF16_WEIGHTS_ID, DORY1_0_4B_CONTEXT_TOKENS,
@@ -33,26 +36,153 @@ use crate::descriptor::{
 };
 use crate::ledger::{ArmLedger, ledger_for_arm};
 
-/// The tokenizer and chat template an arm reads.
-///
-/// The ids are data for the console and for the conversion/onboarding surfaces; the family's
-/// codec still resolves the files (the audit records that registration as a remaining
-/// non-[ARMS] edit).
+/// The lanes a lane group steps when its operator names none: the CLI's default for a
+/// `--tp4-rank` group whose arm opens its ranks as lanes, the dynamic dense arm's own default,
+/// and what the web console writes into a lane group's plan.
+pub const GROUP_LANES: usize = 4;
+
+/// The control-plane engine selectors the web console launches an arm by ([Deployment::engine]).
+pub mod engine {
+    /// The TP=4 V4.1 engine.
+    pub const DEEPSEEK: &str = "deepseek-v4.1-flash";
+    /// The Qwen pack.
+    pub const QWEN: &str = "qwen4-exp";
+    /// The GLM-5.3-Flash pack.
+    pub const GLM: &str = "glm5-next";
+    /// The Inkling-2-Small pack.
+    pub const INKLING: &str = "inkling2";
+    /// The dynamic engine: the checkpoint's own arm, chosen when it is opened.
+    pub const DYNAMIC: &str = "dynamic";
+}
+
+/// A prompt dialect: the codec that renders and tokenizes a chat, and the response engine that
+/// reads the reply back into messages. The family's crate holds both; the serving path maps a
+/// dialect to them in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// DeepSeek's own renderer, which its reference path normally serves.
+    Deepseek,
+    /// ChatML's `<|im_start|>`/`<|im_end|>` turns with Qwen's template.
+    Qwen,
+    /// GLM's `[gMASK]<sop>` and `<|user|>` turns.
+    Glm,
+    /// ChatML's turn tokens under Dory's released template; replies read as Qwen's.
+    Dory,
+    /// Inkling-2's typed messages: `<|message_model|><|content_thinking|>...<|end_message|>`.
+    Inkling,
+}
+
+impl Dialect {
+    /// The chat template's name, as the console prints it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Deepseek => "deepseek",
+            Self::Qwen => "qwen",
+            Self::Glm => "glm",
+            Self::Dory => "dory",
+            Self::Inkling => "inkling2",
+        }
+    }
+}
+
+/// The tokenizer and prompt dialect an arm reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tokenizer {
     /// The tokenizer's identity: the checkpoint id whose `tokenizer.json` the arm reads.
     pub tokenizer_id: &'static str,
-    /// The chat template the arm renders with.
-    pub chat_template: &'static str,
+    /// The dialect the arm declares, or `None` when the checkpoint's own tokenizer says (the
+    /// shared dense arm serves whatever family lands on it).
+    pub dialect: Option<Dialect>,
 }
 
-/// How a checkpoint of this arm converts when the operator names no world size.
+impl Tokenizer {
+    /// The chat template the arm renders with, as the console prints it.
+    #[must_use]
+    pub fn chat_template(&self) -> &'static str {
+        self.dialect.map_or("dynamic", Dialect::name)
+    }
+}
+
+/// The converter a family's checkpoint goes through. The converters are the families' own code;
+/// the CLI maps each variant to its function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Converter {
+    /// DeepSeek's resident converter and its manifest.
+    DeepSeek,
+    /// The Qwen pack's walk-ordered rank files, with their NVFP4 scale pairs.
+    Qwen,
+    /// The GLM pack's walk-ordered rank files.
+    Glm,
+    /// Inkling-2's plan-ordered rank files, verified slot by slot against the checkpoint.
+    Inkling,
+    /// The shared architecture walk: every tensor the dynamic path reads, in walk order, at TP1.
+    Walk,
+}
+
+/// How a checkpoint of this arm converts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conversion {
-    /// The tensor-parallel world the released checkpoint converts at.
+    /// The tensor-parallel world the released checkpoint converts at when the operator names
+    /// none.
     pub world_size: usize,
-    /// Whether the converter has a released pack for this family (rather than the dynamic path).
-    pub released: bool,
+    /// The converter the checkpoint goes through.
+    pub converter: Converter,
+    /// The model, as a conversion error names it.
+    pub name: &'static str,
+    /// Whether `--no-pad-moe-640` means something to this converter. The flag is DeepSeek's
+    /// routed-expert layout; a pack whose files have one fixed layout refuses it.
+    pub takes_no_pad: bool,
+}
+
+impl Conversion {
+    /// Whether the converter has a released pack for this family (rather than the shared walk).
+    #[must_use]
+    pub fn released(&self) -> bool {
+        self.converter != Converter::Walk
+    }
+}
+
+/// The defaults a group of this arm serves by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupDefaults {
+    /// The window the arm's device group admits when the operator names none, when that is
+    /// narrower than the arm's whole window: every rank allocates its KV at the admitted context.
+    pub context: Option<usize>,
+    /// The lanes `serve` steps for a group of this arm when the operator names none. An arm
+    /// whose group serves one request at a time unless told otherwise says 1.
+    pub lanes: usize,
+}
+
+/// The web console's row for an arm: the deployment fields the model registry does not own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deployment {
+    /// The engine selector that runs the arm's weights ([engine]).
+    pub engine: &'static str,
+    /// The default Hugging Face search term for this family.
+    pub search: &'static str,
+    /// How many ranks the console launches the family on.
+    pub world_size: usize,
+    /// Every tensor-parallel width the family's device arm runs, narrowest first.
+    pub worlds: &'static [usize],
+    /// The organization most of the family's checkpoints live under.
+    pub org: &'static str,
+    /// Whether launch needs a per-rank converted file.
+    pub requires_conversion: bool,
+    /// Whether launch loads the external cubin directory built by scripts/build-cubins.sh.
+    pub requires_cubins: bool,
+    /// Whether the four-rank group steps concurrent requests as fused lanes.
+    pub lane_group: bool,
+}
+
+/// Where an arm's code lives and how the scripts name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Source {
+    /// The crate that carries the arm.
+    pub crate_name: &'static str,
+    /// The prefixes of the environment switches that are the arm's own. Every rank of a group
+    /// must see the same values, so a group launcher forwards each one.
+    pub switches: &'static [&'static str],
 }
 
 /// One serving arm's registration.
@@ -74,10 +204,33 @@ pub trait Arm: Sync {
     fn default_context(&self) -> usize;
     /// The ledger declaration, from [crate::ARM_LEDGERS].
     fn ledger(&self) -> &'static ArmLedger;
-    /// The tokenizer and chat template the arm reads.
+    /// The tokenizer and prompt dialect the arm reads.
     fn tokenizer(&self) -> Tokenizer;
-    /// The conversion defaults.
+    /// How the arm's checkpoint converts.
     fn conversion(&self) -> Conversion;
+    /// The defaults a group of this arm serves by.
+    fn group(&self) -> GroupDefaults;
+    /// The numerics report that holds the arm's tensor-core decode back, when its decode is the
+    /// row GEMV ([check_profile]); `None` for an arm that takes `decode.tensor_cores`.
+    fn row_decode_report(&self) -> Option<&'static str>;
+    /// The web console's row, for an arm the console launches by a registry selector.
+    fn deployment(&self) -> Option<Deployment>;
+    /// The arm's crate and its own environment switches.
+    fn source(&self) -> Source;
+}
+
+/// Refuses a profile `arm` does not serve: `decode.tensor_cores = true` on an arm whose decode
+/// is the row GEMV, in the one message every such arm gives.
+///
+/// # Errors
+/// As [crate::profile::refuse_tensor_core_decode].
+pub fn check_profile(arm: &dyn Arm, profile: &crate::ModelProfile) -> Result<(), String> {
+    match arm.row_decode_report() {
+        Some(report) => {
+            crate::profile::refuse_tensor_core_decode(arm.id(), arm.model_id(), report, profile)
+        }
+        None => Ok(()),
+    }
 }
 
 /// The numerics registry's status for an arm: the same classification `sparkflash arms` prints.
@@ -134,13 +287,43 @@ impl Arm for DeepSeek {
     fn tokenizer(&self) -> Tokenizer {
         Tokenizer {
             tokenizer_id: crate::descriptor::DEFAULT_MODEL_ID,
-            chat_template: "deepseek",
+            dialect: Some(Dialect::Deepseek),
         }
     }
     fn conversion(&self) -> Conversion {
         Conversion {
             world_size: 4,
-            released: true,
+            converter: Converter::DeepSeek,
+            name: "DeepSeek-V4.1",
+            takes_no_pad: true,
+        }
+    }
+    fn group(&self) -> GroupDefaults {
+        GroupDefaults {
+            context: None,
+            lanes: 1,
+        }
+    }
+    fn row_decode_report(&self) -> Option<&'static str> {
+        None
+    }
+    fn deployment(&self) -> Option<Deployment> {
+        Some(Deployment {
+            engine: engine::DEEPSEEK,
+            search: "DeepSeek-V4.1",
+            world_size: 4,
+            // The V4.1 engine is the four-rank group; it has no narrower arm.
+            worlds: &[4],
+            org: "deepseek-ai",
+            requires_conversion: true,
+            requires_cubins: true,
+            lane_group: false,
+        })
+    }
+    fn source(&self) -> Source {
+        Source {
+            crate_name: "sparkflash-model-deepseek-v41",
+            switches: &[],
         }
     }
 }
@@ -174,13 +357,43 @@ impl Arm for Qwen {
     fn tokenizer(&self) -> Tokenizer {
         Tokenizer {
             tokenizer_id: crate::descriptor::QWEN38_FLASH_NEXT_ID,
-            chat_template: "qwen",
+            dialect: Some(Dialect::Qwen),
         }
     }
     fn conversion(&self) -> Conversion {
         Conversion {
             world_size: 1,
-            released: true,
+            converter: Converter::Qwen,
+            name: "Qwen4-Exp",
+            takes_no_pad: false,
+        }
+    }
+    fn group(&self) -> GroupDefaults {
+        GroupDefaults {
+            context: None,
+            lanes: GROUP_LANES,
+        }
+    }
+    fn row_decode_report(&self) -> Option<&'static str> {
+        None
+    }
+    fn deployment(&self) -> Option<Deployment> {
+        Some(Deployment {
+            engine: engine::QWEN,
+            search: "Qwen3.8-Flash",
+            world_size: 1,
+            // The pack's single-node arm and its TP=2/TP=4 group (!205, !207).
+            worlds: &[1, 2, 4],
+            org: "Qwen",
+            requires_conversion: true,
+            requires_cubins: false,
+            lane_group: false,
+        })
+    }
+    fn source(&self) -> Source {
+        Source {
+            crate_name: "sparkflash-model-qwen4-exp",
+            switches: &["SPARKFLASH_QWEN4_"],
         }
     }
 }
@@ -212,14 +425,31 @@ impl Arm for QwenFp8 {
     fn tokenizer(&self) -> Tokenizer {
         Tokenizer {
             tokenizer_id: crate::descriptor::QWEN38_FLASH_NEXT_FP8_ID,
-            chat_template: "qwen",
+            dialect: Some(Dialect::Qwen),
         }
     }
     fn conversion(&self) -> Conversion {
         Conversion {
             world_size: 1,
-            released: true,
+            converter: Converter::Qwen,
+            name: "Qwen4-Exp",
+            takes_no_pad: false,
         }
+    }
+    fn group(&self) -> GroupDefaults {
+        GroupDefaults {
+            context: None,
+            lanes: GROUP_LANES,
+        }
+    }
+    fn row_decode_report(&self) -> Option<&'static str> {
+        None
+    }
+    fn deployment(&self) -> Option<Deployment> {
+        Qwen.deployment()
+    }
+    fn source(&self) -> Source {
+        Qwen.source()
     }
 }
 
@@ -252,14 +482,43 @@ impl Arm for Qwen36 {
     fn tokenizer(&self) -> Tokenizer {
         Tokenizer {
             tokenizer_id: crate::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID,
-            chat_template: "qwen",
+            dialect: Some(Dialect::Qwen),
         }
     }
     fn conversion(&self) -> Conversion {
         Conversion {
             world_size: 1,
-            released: false,
+            converter: Converter::Walk,
+            name: "dynamic",
+            takes_no_pad: true,
         }
+    }
+    fn group(&self) -> GroupDefaults {
+        GroupDefaults {
+            context: None,
+            lanes: GROUP_LANES,
+        }
+    }
+    fn row_decode_report(&self) -> Option<&'static str> {
+        None
+    }
+    fn deployment(&self) -> Option<Deployment> {
+        Some(Deployment {
+            // The dynamic engine launches Qwen3.5-MoE from the checkpoint: the FP8 release on
+            // the Qwen pack's device arm, a BF16 one on the shared CPU host reference, both at
+            // one rank (sparkflash_ops::parts::dynamic_device_arm decides which).
+            engine: engine::DYNAMIC,
+            search: "Qwen3.6",
+            world_size: 1,
+            worlds: &[1],
+            org: "Qwen",
+            requires_conversion: false,
+            requires_cubins: false,
+            lane_group: false,
+        })
+    }
+    fn source(&self) -> Source {
+        Qwen.source()
     }
 }
 
@@ -292,13 +551,44 @@ impl Arm for Glm {
     fn tokenizer(&self) -> Tokenizer {
         Tokenizer {
             tokenizer_id: crate::descriptor::GLM53_FLASH_ID,
-            chat_template: "glm",
+            dialect: Some(Dialect::Glm),
         }
     }
     fn conversion(&self) -> Conversion {
         Conversion {
             world_size: 4,
-            released: true,
+            converter: Converter::Glm,
+            name: "GLM-5.3",
+            takes_no_pad: false,
+        }
+    }
+    fn group(&self) -> GroupDefaults {
+        GroupDefaults {
+            context: None,
+            lanes: GROUP_LANES,
+        }
+    }
+    fn row_decode_report(&self) -> Option<&'static str> {
+        Some("docs/numerics/glm53/v3-gemv.md")
+    }
+    fn deployment(&self) -> Option<Deployment> {
+        Some(Deployment {
+            engine: engine::GLM,
+            search: "GLM-5.3-Flash",
+            world_size: 4,
+            // The pack's single-node arm (which refuses the released 328 GB on memory, not on
+            // capability) and its TP=2/TP=4 group.
+            worlds: &[1, 2, 4],
+            org: "zai-org",
+            requires_conversion: true,
+            requires_cubins: false,
+            lane_group: true,
+        })
+    }
+    fn source(&self) -> Source {
+        Source {
+            crate_name: "sparkflash-model-glm5-next",
+            switches: &["SPARKFLASH_GLM_"],
         }
     }
 }
@@ -332,16 +622,55 @@ impl Arm for Dory {
     fn tokenizer(&self) -> Tokenizer {
         Tokenizer {
             tokenizer_id: crate::descriptor::DORY1_0_4B_BF16_ID,
-            chat_template: "dory",
+            dialect: Some(Dialect::Dory),
         }
     }
     fn conversion(&self) -> Conversion {
         Conversion {
             world_size: 1,
-            released: false,
+            converter: Converter::Walk,
+            name: "dynamic",
+            takes_no_pad: true,
+        }
+    }
+    fn group(&self) -> GroupDefaults {
+        GroupDefaults {
+            context: None,
+            lanes: 1,
+        }
+    }
+    fn row_decode_report(&self) -> Option<&'static str> {
+        Some("docs/numerics/dory10/v2-gemv.md")
+    }
+    fn deployment(&self) -> Option<Deployment> {
+        Some(Deployment {
+            // The dynamic route opens Dory's device arm when its cubins are present, and its
+            // CPU host reference otherwise. Dory's multi-rank group splits recurrent loops,
+            // not layers, so it is not one of the console's tensor-parallel worlds.
+            engine: engine::DYNAMIC,
+            search: "Dory1.0",
+            world_size: 1,
+            worlds: &[1],
+            org: "nvidia",
+            requires_conversion: false,
+            requires_cubins: false,
+            lane_group: false,
+        })
+    }
+    fn source(&self) -> Source {
+        Source {
+            crate_name: "sparkflash-model-dory",
+            // Its knobs are the profile's; SPARKFLASH_DORY_CUBIN is read when the kernels build.
+            switches: &[],
         }
     }
 }
+
+/// The window Inkling's device group admits when the operator names none.
+///
+/// The release's window is 1M tokens; 256K is the arm's documented serving default, and the
+/// difference is 6 GiB of KV a rank.
+pub const INKLING2_GROUP_CONTEXT_TOKENS: usize = 262_144;
 
 /// The thinkingmachines Inkling-2-Small arm.
 pub struct Inkling;
@@ -372,13 +701,45 @@ impl Arm for Inkling {
     fn tokenizer(&self) -> Tokenizer {
         Tokenizer {
             tokenizer_id: crate::descriptor::INKLING2_SMALL_ID,
-            chat_template: "inkling2",
+            dialect: Some(Dialect::Inkling),
         }
     }
     fn conversion(&self) -> Conversion {
         Conversion {
             world_size: 1,
-            released: true,
+            converter: Converter::Inkling,
+            name: "Inkling-2-Small",
+            takes_no_pad: true,
+        }
+    }
+    fn group(&self) -> GroupDefaults {
+        GroupDefaults {
+            context: Some(INKLING2_GROUP_CONTEXT_TOKENS),
+            lanes: 1,
+        }
+    }
+    fn row_decode_report(&self) -> Option<&'static str> {
+        Some("docs/numerics/inkling2/v2-clean-head.md")
+    }
+    fn deployment(&self) -> Option<Deployment> {
+        Some(Deployment {
+            engine: engine::INKLING,
+            search: "Inkling-2",
+            world_size: 4,
+            // The 393.5 GB checkpoint fits four Sparks; it does not fit one or two.
+            worlds: &[4],
+            org: "thinkingmachines",
+            requires_conversion: true,
+            // The arm's kernels are built into the binary (SPARKFLASH_INKLING_CUBIN at build
+            // time); its group takes no cubin directory.
+            requires_cubins: false,
+            lane_group: true,
+        })
+    }
+    fn source(&self) -> Source {
+        Source {
+            crate_name: "sparkflash-model-inkling2",
+            switches: &["SPARKFLASH_INKLING_"],
         }
     }
 }
@@ -412,13 +773,33 @@ impl Arm for Dense {
     fn tokenizer(&self) -> Tokenizer {
         Tokenizer {
             tokenizer_id: "the checkpoint's tokenizer.json",
-            chat_template: "dynamic",
+            dialect: None,
         }
     }
     fn conversion(&self) -> Conversion {
         Conversion {
             world_size: 1,
-            released: false,
+            converter: Converter::Walk,
+            name: "dynamic",
+            takes_no_pad: true,
+        }
+    }
+    fn group(&self) -> GroupDefaults {
+        GroupDefaults {
+            context: None,
+            lanes: GROUP_LANES,
+        }
+    }
+    fn row_decode_report(&self) -> Option<&'static str> {
+        None
+    }
+    fn deployment(&self) -> Option<Deployment> {
+        None
+    }
+    fn source(&self) -> Source {
+        Source {
+            crate_name: "sparkflash-model-dense",
+            switches: &["SPARKFLASH_DENSE_"],
         }
     }
 }
@@ -465,8 +846,15 @@ mod tests {
             assert!(!ids.contains(&arm.id()), "{} is listed twice", arm.id());
             ids.push(arm.id());
             assert!(!arm.tokenizer().tokenizer_id.is_empty());
-            assert!(!arm.tokenizer().chat_template.is_empty());
+            assert!(!arm.tokenizer().chat_template().is_empty());
             assert!(arm.conversion().world_size >= 1);
+            assert!(!arm.conversion().name.is_empty());
+            assert!(arm.group().lanes >= 1, "{} steps no lane", arm.id());
+            assert!(
+                arm.source().crate_name.starts_with("sparkflash-model-"),
+                "{} names no model crate",
+                arm.id()
+            );
             assert_eq!(
                 arm.ledger().unstated(),
                 Vec::new(),

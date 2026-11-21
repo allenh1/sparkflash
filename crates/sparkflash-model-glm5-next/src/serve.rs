@@ -16,9 +16,9 @@
 //!
 //! The rank is the resident half - its weights, kernels and scratch. The shared runtime owns
 //! everything around it: the lanes, the prompt parts, the history, resume and rewind, the ledger
-//! and the round path. This file opens the rank, hands it to [Runtime] over [crate::walk::GlmWalk],
-//! and starts the tick engine ([TickServe]), alone or as rank 0 of a tensor-parallel group. A
-//! session is a handle on one engine thread, where the sessions of a step are one batch over the
+//! and the round path. This file opens the rank and states what the runtime serves it by
+//! ([WalkArm]: [crate::walk::GlmWalk] and the group's wire); the runtime starts the tick engine,
+//! alone or as rank 0 of a tensor-parallel group ([sparkflash_runtime::serve]). A session is a handle on one engine thread, where the sessions of a step are one batch over the
 //! rank and the weights are read once for every member's row.
 //!
 //! A session drafts once [Glm5NextDeviceBackend::enable_speculation] has been called:
@@ -40,7 +40,7 @@ use sparkflash_model::{
     PackIdentity,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
-use sparkflash_runtime::{Runtime, TextWire, TickServe, mirror_ticks_until_the_group_ends};
+use sparkflash_runtime::{GroupEngine, GroupWire, Place, Serving, TextWire, Walk, WalkArm};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
@@ -57,22 +57,30 @@ pub struct Glm5NextDeviceBackend {
     context_limit: usize,
     /// Set by [Glm5NextDeviceBackend::enable_fusion] or [Glm5NextDeviceBackend::enable_group_fusion]:
     /// sessions become handles on this engine.
-    fused: Option<GlmServing>,
+    fused: Option<Serving>,
 }
 
-/// What a fused GLM backend's sessions open on.
-enum GlmServing {
-    /// The tick engine: DeepSeek's scheduler over the GLM walk. It is rank 0 of a
-    /// tensor-parallel group when the backend was opened as one, and alone otherwise; the
-    /// frames differ, the engine does not.
-    Tick(Arc<TickServe<GlmWalk>>),
-}
+/// What the runtime serves this backend by ([sparkflash_runtime::serve] and its group forms):
+/// the tick engine, DeepSeek's scheduler, over the GLM walk. It is rank 0 of a tensor-parallel
+/// group when the backend was opened as one, and alone otherwise; the frames differ, the engine
+/// does not.
+impl WalkArm for Glm5NextDeviceBackend {
+    fn walk(&self, _capacity: usize) -> Result<impl Walk<Seq: Send> + Send + Sync, BackendError> {
+        GlmWalk::new(Arc::clone(&self.shared), self.context_limit)
+    }
 
-impl GlmServing {
-    fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        match self {
-            Self::Tick(engine) => Ok(Box::new(engine.open()?)),
-        }
+    /// The arm serves text.
+    fn wire(&self) -> impl GroupWire {
+        TextWire::new("glm", "GLM", self.context_limit)
+    }
+
+    /// The backend holds a collective alone and in a group, so it refuses neither place.
+    fn admit(&self, _place: Place) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn group_engine(&self) -> GroupEngine {
+        GroupEngine::Tick
     }
 }
 
@@ -309,37 +317,28 @@ impl Glm5NextDeviceBackend {
         })
     }
 
-    /// Step this rank's sessions together, one row each, as one pass over the weights.
+    /// Step this rank's sessions together, one row each, as one pass over the weights
+    /// ([sparkflash_runtime::serve]).
     ///
     /// The host driver gives every request its own session, so without this N workers read the
-    /// rank's 82 GB N times for N rows. With it each session is a handle on one engine thread,
-    /// which batches whatever is waiting into a single `forward_batch_greedy`. Call it before
-    /// the first session opens and after [Self::enable_speculation], if the sessions draft: then
-    /// their rounds verify together.
+    /// rank's 82 GB N times for N rows. With it each session is a handle on the tick engine,
+    /// whose config is GLM's profile: the 4,096-row prompt chunk, the verify width as the member
+    /// cap, no decoder-layer skip and no row exchange. Call it before the first session opens
+    /// and after [Self::enable_speculation], if the sessions draft: then their rounds verify
+    /// together.
     ///
     /// # Errors
     /// A slot the rank cannot allocate, a thread that cannot start, or a
     /// [sparkflash_runtime::JOINT_ROUNDS_ENV] that is neither on nor off.
     pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
-        // The single-process path serves on the tick engine: DeepSeek's scheduler over the GLM
-        // walk. Its config is GLM's profile - the 4,096-row prompt chunk, the verify width as
-        // the member cap, no decoder-layer skip and no row exchange - and its round path is the
-        // runtime's, so a speculative step is the same verify the fused engine ran.
-        let walk = GlmWalk::new(Arc::clone(&self.shared), self.context_limit)?;
-        self.fused = Some(GlmServing::Tick(TickServe::start(walk, capacity)?));
+        self.fused = Some(sparkflash_runtime::serve(self, capacity)?);
         Ok(())
     }
 
-    /// [Self::enable_fusion] on rank 0 of a group: every prompt's start, every prompt chunk's
-    /// rows, every decode step's shape, every give-back and every release is broadcast through
-    /// `hub` before it runs here, and each worker replays them ([Self::mirror_group]) over its
-    /// own `capacity` lanes, so lane `n` is the same sequence on every rank and the collectives
-    /// inside a step line up. The scheduler stays rank 0's: the lane, the hold, the chunk
-    /// boundary, the verify width and the tick-ahead plan are decided once. The row exchange is
-    /// on for the group, so a prompt takes the 4,096-row bulk chunks its profile states.
-    ///
-    /// A worker whose socket closes ends this process, and so does a failure here after a frame
-    /// went out ([sparkflash_runtime::watched_hub], [sparkflash_runtime::end_group]).
+    /// [Self::enable_fusion] on rank 0 of a group ([sparkflash_runtime::serve_group]): rank 0's
+    /// decisions are broadcast through `hub` and each worker replays them
+    /// ([Self::mirror_group]). The row exchange is on for the group, so a prompt takes the
+    /// 4,096-row bulk chunks its profile states.
     ///
     /// # Errors
     /// As [Self::enable_fusion], or a watch that cannot start.
@@ -348,20 +347,13 @@ impl Glm5NextDeviceBackend {
         capacity: usize,
         hub: Tp4ControlHub,
     ) -> Result<(), BackendError> {
-        let wire = TextWire::new("glm", "GLM", self.context_limit);
-        let walk = GlmWalk::new(Arc::clone(&self.shared), self.context_limit)?;
-        self.fused = Some(GlmServing::Tick(TickServe::start_group(
-            walk, capacity, hub, wire,
-        )?));
+        self.fused = Some(sparkflash_runtime::serve_group(self, capacity, hub)?);
         Ok(())
     }
 
     /// A worker of a group: replays rank 0's tick frames over `capacity` lanes of this rank's own
-    /// until the group can no longer serve, then ends the process
-    /// ([sparkflash_runtime::mirror_ticks_until_the_group_ends]). A prompt frame's start is
-    /// checked against this rank's own, a rows frame runs exactly those rows, and a step frame
-    /// runs the runtime's plain or round entry with rank 0's shape. Configure speculation first,
-    /// as rank 0 does.
+    /// until the group can no longer serve, then ends the process ([sparkflash_runtime::mirror]).
+    /// Configure speculation first, as rank 0 does.
     ///
     /// # Errors
     /// The arm's configuration, before any frame.
@@ -370,26 +362,16 @@ impl Glm5NextDeviceBackend {
         control: &mut Tp4ControlWorker,
         capacity: usize,
     ) -> Result<std::convert::Infallible, String> {
-        let runtime = self.lanes().map_err(|error| error.to_string())?;
-        let wire = TextWire::new("glm", "GLM", self.context_limit);
-        mirror_ticks_until_the_group_ends(control, &runtime, &wire, capacity)
+        sparkflash_runtime::mirror(self, control, capacity)
     }
 
-    /// The runtime over this rank's walk: the lanes, the prompt parts, the history, the round
-    /// path and the ledger are all the runtime's.
-    fn lanes(&self) -> Result<Runtime<GlmWalk>, BackendError> {
-        crate::walk::runtime(Arc::clone(&self.shared), self.context_limit)
-    }
-
-    /// The most lanes this rank's batch takes: the member width its runtime's Limits states.
-    ///
-    /// A group whose operator gave no `--concurrency` opens this many lanes, so the count comes
-    /// from the arm rather than a CLI constant.
+    /// The lanes a group opens when its operator gave no `--concurrency`: the member width this
+    /// rank's walk states ([sparkflash_runtime::lane_limit]).
     ///
     /// # Errors
     /// The runtime refuses this rank's walk.
     pub fn lane_limit(&self) -> Result<usize, BackendError> {
-        Ok(self.lanes()?.limits().members)
+        sparkflash_runtime::lane_limit(self)
     }
 
     /// The same rank as a bare walk, for the generated conformance checks: they open the
@@ -562,7 +544,7 @@ impl ModelBackend for Glm5NextDeviceBackend {
                     "the GLM arm serves on the shared runtime: call enable_fusion before opening                      a session",
                 ))
             },
-            GlmServing::open,
+            Serving::open,
         )
     }
 }
@@ -605,7 +587,7 @@ mod tests {
     fn the_backend_and_the_walk_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Glm5NextDeviceBackend>();
-        assert_send_sync::<Runtime<GlmWalk>>();
+        assert_send_sync::<sparkflash_runtime::Runtime<GlmWalk>>();
     }
 
     #[test]

@@ -71,11 +71,11 @@ fn a_group_steps_fused_lanes_unless_told_one_at_a_time() {
         // No flags: the group's arm opens lanes, so it steps four of them.
         let options = ServeOptions::parse(tp4_args(&["--model", model])).expect("parses");
         assert!(options.fuse_batch, "{model}: the group fuses by default");
-        assert_eq!(options.concurrency, pack::GROUP_LANES);
+        assert_eq!(options.concurrency, sparkflash_model::GROUP_LANES);
         // --fuse-batch alone takes the same default lane count.
         let options =
             ServeOptions::parse(tp4_args(&["--model", model, "--fuse-batch"])).expect("parses");
-        assert!(options.fuse_batch && options.concurrency == pack::GROUP_LANES);
+        assert!(options.fuse_batch && options.concurrency == sparkflash_model::GROUP_LANES);
         // --concurrency 1 is the opt-out: one request at a time through the group driver.
         let options = ServeOptions::parse(tp4_args(&["--model", model, "--concurrency", "1"]))
             .expect("parses");

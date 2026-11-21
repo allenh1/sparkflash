@@ -3052,7 +3052,7 @@ pub struct InklingDeviceBackend {
     shared: Arc<Shared>,
     /// The tick engine every session is a handle on, once `enable_fusion` opened it; `None`
     /// means a session's own one-lane engine.
-    fused: Option<Arc<TickServe<InklingWalk>>>,
+    fused: Option<sparkflash_runtime::Serving>,
 }
 
 impl std::fmt::Debug for InklingDeviceBackend {
@@ -3510,7 +3510,7 @@ impl ModelBackend for InklingDeviceBackend {
         // (201) on its first allocation - which is exactly how the four-rank server failed its
         // first request.
         match self.fused.as_ref() {
-            Some(engine) => Ok(Box::new(engine.open()?)),
+            Some(engine) => engine.open(),
             None => {
                 let engine = TickServe::start(self.walk_arm()?, 1)?;
                 Ok(Box::new(engine.open()?))
@@ -3539,9 +3539,9 @@ impl InklingDeviceBackend {
         sparkflash_runtime::Runtime::new(self.walk_arm()?, 0)
     }
 
-    /// Serves this rank's single-process sessions on the tick engine
-    /// ([sparkflash_runtime::TickServe] over [InklingWalk]): DeepSeek's scheduler with `capacity`
-    /// lanes, one a sequence, instead of a runtime per session.
+    /// Serves this rank's single-process sessions on the tick engine ([sparkflash_runtime::serve]
+    /// over [InklingWalk]): DeepSeek's scheduler with `capacity` lanes, one a sequence, instead of
+    /// a runtime per session.
     ///
     /// The engine's config is Inkling's profile, read from the walk: the pass rows and chunk
     /// [InklingWalk::limits] states - 4,096, 8,192 or 65,535, the `ChunkPolicy` size over the
@@ -3560,7 +3560,10 @@ impl InklingDeviceBackend {
     /// A walk the engine refuses (a switch that is not a switch, a lane the rank cannot open), or
     /// a thread that cannot start.
     pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
-        self.fused = Some(TickServe::start(self.walk_arm()?, capacity)?);
+        self.fused = Some(sparkflash_runtime::serve(
+            &crate::group::Rank::alone(self),
+            capacity,
+        )?);
         Ok(())
     }
 }

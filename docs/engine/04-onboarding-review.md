@@ -2376,11 +2376,16 @@ Three findings, each with the change it implies.
    the console's deployment rows read `ARMS`. This is the step that turns "25 edits in 15 files"
    into one declaration, and it lowers the CLI line gate as it goes. The group halves need a
    group to verify.
-   Done so far: the release identity, the typed-pack table and the converter's two lists read
-   `ARMS` (see "Outside the crate"). Left: the `WalkArm` entry itself, which moves Inkling and
-   dense off their own arms in `dynamic.rs`; the codec's tokenizer sniffing and `Dialect` match;
-   the converter's per-family branches; the console's deployment rows. The pack drivers' group
-   halves (`serve_group`, `serve_group_lanes`) compile on the new split and owe one group run.
+   Done: `sparkflash_runtime::WalkArm` and the four entry points, with GLM's, Qwen's, the shared
+   dense arm's and Inkling's serving glue and enums moved onto it; `Arm` now states the dialect,
+   the group defaults, the converter, the console's deployment row and the crate and switches,
+   and the CLI's codec, response engine, group defaults, converter dispatch and the console's
+   deployment rows read it. The CLI line gate records the gain. Left: Inkling's single-process
+   f32 host path still boots in `dynamic.rs` (routing it through `serve_arm_identity` would add
+   the kernel catalogue's boot gate, which that path deliberately bypasses), and the dense and
+   Inkling group halves stay on the fused engine through the same entry. The group halves of the
+   pack drivers (`serve_group`, `serve_group_lanes`) and `WalkArm`'s own `serve_group` and
+   `mirror` compile on the new split and owe one multi-rank run.
 2. **The scaffolding.** One parametrised CPU shape walk in the runtime replaces the three copies:
    done, as `sparkflash_runtime::testing` (`ShapeWalk` with the arm's layout, limits, budget rule
    and step wall; `prompt` and `decode` drive a tick engine to a request's answer). An arm states

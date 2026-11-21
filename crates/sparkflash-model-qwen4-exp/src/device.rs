@@ -2546,22 +2546,51 @@ pub struct Qwen4ExpDeviceBackend {
     /// It is the tick engine ([sparkflash_runtime::TickServe]) over [walk::QwenWalk]: rank 0 of a
     /// tensor-parallel group when the backend was opened as one, and alone otherwise. The frames
     /// differ, the engine does not.
-    fused: Option<QwenServing>,
+    fused: Option<sparkflash_runtime::Serving>,
 }
 
-/// What a fused Qwen backend's sessions open on.
-enum QwenServing {
-    /// The tick engine: DeepSeek's scheduler over the Qwen walk. It is rank 0 of a
-    /// tensor-parallel group when the backend was opened as one, and alone otherwise; the frames
-    /// differ, the engine does not.
-    Tick(Arc<sparkflash_runtime::TickServe<walk::QwenWalk>>),
-}
+/// What the runtime serves this backend by ([sparkflash_runtime::serve] and its group forms).
+impl sparkflash_runtime::WalkArm for Qwen4ExpDeviceBackend {
+    /// The walk with room for `capacity` members in one token pass, capped at the batch's own
+    /// width.
+    fn walk(
+        &self,
+        capacity: usize,
+    ) -> Result<impl sparkflash_runtime::Walk<Seq: Send> + Send + Sync, BackendError> {
+        walk::QwenWalk::new(Arc::clone(&self.shared), self.context_limit, capacity)
+    }
 
-impl QwenServing {
-    fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        match self {
-            Self::Tick(engine) => Ok(Box::new(engine.open()?)),
+    /// The arm serves text.
+    fn wire(&self) -> impl sparkflash_runtime::GroupWire {
+        sparkflash_runtime::TextWire::new("qwen", "Qwen", self.context_limit)
+    }
+
+    /// A rank of an [Self::open_rank] group steps only with its group, since every forward is
+    /// a collective; a backend opened alone has no peers to step with.
+    fn admit(&self, place: sparkflash_runtime::Place) -> Result<(), BackendError> {
+        use sparkflash_runtime::Place;
+        match (&self.shared.tp, place) {
+            (Some(tp), Place::Alone) => Err(BackendError::new(
+                "qwen4_tp",
+                format!(
+                    "rank {} of {} steps fused lanes only as a group: every forward is a \
+                     collective its group steps through together, so rank 0 broadcasts each \
+                     step (enable_group_fusion) and the workers replay it (mirror_group)",
+                    tp.runtime().rank(),
+                    tp.runtime().world()
+                ),
+            )),
+            (None, Place::Group) => Err(BackendError::new(
+                "qwen4_tp",
+                "group lanes need a group's rank (open_rank); this backend runs alone, so fuse \
+                 its sessions with enable_fusion",
+            )),
+            _ => Ok(()),
         }
+    }
+
+    fn group_engine(&self) -> sparkflash_runtime::GroupEngine {
+        sparkflash_runtime::GroupEngine::Tick
     }
 }
 
@@ -3247,8 +3276,8 @@ impl Qwen4ExpDeviceBackend {
         self.context_limit
     }
 
-    /// Serve this backend's sessions as one batch: `capacity` sequences whose decode steps share a
-    /// pass over the weights.
+    /// Serve this backend's sessions as one batch ([sparkflash_runtime::serve]): `capacity`
+    /// sequences on the tick engine, whose decode steps share a pass over the weights.
     ///
     /// Call it before the backend is shared with the serving driver, with the driver's concurrency
     /// as the capacity: each request takes one of the pooled sequences for its lifetime, so a
@@ -3257,43 +3286,16 @@ impl Qwen4ExpDeviceBackend {
     /// batch's four members together, drafting when the arm's drafter is on.
     ///
     /// # Errors
-    /// A pooled session the device refuses, or a thread that cannot be started.
+    /// A group's rank, a pooled session the device refuses, or a thread that cannot be started.
     pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
-        if let Some(tp) = &self.shared.tp {
-            return Err(BackendError::new(
-                "qwen4_tp",
-                format!(
-                    "rank {} of {} steps fused lanes only as a group: every forward is a \
-                     collective its group steps through together, so rank 0 broadcasts each \
-                     step (enable_group_fusion) and the workers replay it (mirror_group)",
-                    tp.runtime().rank(),
-                    tp.runtime().world()
-                ),
-            ));
-        }
-        // The single-process path serves on the tick engine: DeepSeek's scheduler over the Qwen
-        // walk. Its config is Qwen's profile - the prefill plan's chunk as the pass width, the
-        // batch's verify width as the member cap, the drafter's own depth and the joint-round
-        // switch - and its executor is the same runtime, so a prompt chunk and a speculative step
-        // are the rows they were.
-        let walk = walk::QwenWalk::new(Arc::clone(&self.shared), self.context_limit, capacity)?;
-        self.fused = Some(QwenServing::Tick(sparkflash_runtime::TickServe::start(
-            walk, capacity,
-        )?));
+        self.fused = Some(sparkflash_runtime::serve(self, capacity)?);
         Ok(())
     }
 
-    /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group: every prompt's start, every
-    /// prompt chunk's rows, every decode step's shape, every give-back and every release is
-    /// broadcast through `hub` before it runs here, and each worker replays them
-    /// ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same sequence on
-    /// every rank and the collectives inside a step line up. The scheduler stays rank 0's: the
-    /// lane, the hold, the chunk boundary, the verify width and the tick-ahead plan are decided
-    /// once. The row exchange is on for the group, so a prompt takes the prefill plan's chunks as
-    /// bulk passes.
-    ///
-    /// A worker whose socket closes ends this process, and so does a failure here after a frame
-    /// went out ([sparkflash_runtime::watched_hub], [sparkflash_runtime::end_group]).
+    /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group
+    /// ([sparkflash_runtime::serve_group]): rank 0's decisions are broadcast through `hub` and
+    /// each worker replays them ([Self::mirror_group]). The row exchange is on for the group, so
+    /// a prompt takes the prefill plan's chunks as bulk passes.
     ///
     /// # Errors
     /// A backend that is not a group's rank, then as [Self::enable_fusion], or a watch that
@@ -3303,19 +3305,13 @@ impl Qwen4ExpDeviceBackend {
         capacity: usize,
         hub: sparkflash_comm::control::Tp4ControlHub,
     ) -> Result<(), BackendError> {
-        self.group_rank()?;
-        let walk = walk::QwenWalk::new(Arc::clone(&self.shared), self.context_limit, capacity)?;
-        self.fused = Some(QwenServing::Tick(
-            sparkflash_runtime::TickServe::start_group(walk, capacity, hub, self.wire())?,
-        ));
+        self.fused = Some(sparkflash_runtime::serve_group(self, capacity, hub)?);
         Ok(())
     }
 
     /// A worker of an [Self::open_rank] group: replays rank 0's tick frames over `capacity`
     /// lanes of this rank's own until the group can no longer serve, then ends the process
-    /// ([sparkflash_runtime::mirror_ticks_until_the_group_ends]). A prompt frame's start is
-    /// checked against this rank's own, a rows frame runs exactly those rows, and a step frame
-    /// runs the runtime's plain or round entry with rank 0's shape.
+    /// ([sparkflash_runtime::mirror]).
     ///
     /// # Errors
     /// A backend that is not a group's rank, or the arm's configuration, before any frame.
@@ -3324,33 +3320,16 @@ impl Qwen4ExpDeviceBackend {
         control: &mut sparkflash_comm::control::Tp4ControlWorker,
         capacity: usize,
     ) -> Result<std::convert::Infallible, String> {
-        self.group_rank().map_err(|error| error.to_string())?;
-        let runtime = self.lanes(capacity).map_err(|error| error.to_string())?;
-        sparkflash_runtime::mirror_ticks_until_the_group_ends(
-            control,
-            &runtime,
-            &self.wire(),
-            capacity,
-        )
+        sparkflash_runtime::mirror(self, control, capacity)
     }
 
-    /// The runtime over this backend's sequences, with room for `capacity` in one pass.
-    fn lanes(
-        &self,
-        capacity: usize,
-    ) -> Result<sparkflash_runtime::Runtime<walk::QwenWalk>, BackendError> {
-        walk::runtime(Arc::clone(&self.shared), self.context_limit, capacity)
-    }
-
-    /// The most lanes this arm's batch takes: the member width its runtime's Limits states.
-    ///
-    /// A group whose operator gave no `--concurrency` opens this many lanes, so the count comes
-    /// from the arm rather than a CLI constant.
+    /// The lanes a group opens when its operator gave no `--concurrency`: the member width this
+    /// arm's walk states ([sparkflash_runtime::lane_limit]).
     ///
     /// # Errors
     /// The runtime refuses this rank's walk.
     pub fn lane_limit(&self) -> Result<usize, BackendError> {
-        Ok(self.lanes(batch::MAX_BATCH)?.limits().members)
+        sparkflash_runtime::lane_limit(self)
     }
 
     /// The same rank as a bare walk, for the generated conformance checks: they open the
@@ -3361,23 +3340,6 @@ impl Qwen4ExpDeviceBackend {
     #[cfg(test)]
     fn walk_arm(&self, capacity: usize) -> Result<walk::QwenWalk, BackendError> {
         walk::QwenWalk::new(Arc::clone(&self.shared), self.context_limit, capacity)
-    }
-
-    /// What the group's frames carry and rank 0 refuses: the arm serves text.
-    fn wire(&self) -> sparkflash_runtime::TextWire {
-        sparkflash_runtime::TextWire::new("qwen", "Qwen", self.context_limit)
-    }
-
-    /// Refuses a backend that is no group's rank: its lanes have no peers to step with.
-    fn group_rank(&self) -> Result<(), BackendError> {
-        if self.shared.tp.is_none() {
-            return Err(BackendError::new(
-                "qwen4_tp",
-                "group lanes need a group's rank (open_rank); this backend runs alone, so fuse \
-                 its sessions with enable_fusion",
-            ));
-        }
-        Ok(())
     }
 
     /// Whether this backend steps its sessions together.
