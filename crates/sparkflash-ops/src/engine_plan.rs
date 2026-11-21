@@ -424,7 +424,17 @@ fn precision_for(part: Part, policy: PrecisionPolicy) -> Precision {
         Part::MlaAttention | Part::GqaAttention | Part::GdnScan | Part::KdaScan => policy.attention,
         // The embedding, both norms and the head are stored and computed at bf16 in every
         // released arm, including the DeepSeek FP8 checkpoint (its head is not converted).
-        Part::Embedding | Part::RmsNorm | Part::LayerNorm | Part::LmHead => Precision::Bf16,
+        Part::Embedding
+        | Part::RmsNorm
+        | Part::LayerNorm
+        | Part::LmHead
+        | Part::VisionPatchEmbed
+        | Part::VisionPosition
+        | Part::VisionNorm
+        | Part::VisionAttention
+        | Part::VisionMlp
+        | Part::VisionDownsample
+        | Part::VisionMerger => Precision::Bf16,
         _ => policy.dense,
     }
 }
@@ -496,25 +506,56 @@ fn global_requirements(
             precision: precision.mtp,
         });
     }
-    if let Some(vision) = &architecture.vision {
-        globals.push(PartRequirement {
-            part: Part::Vision,
-            geometry: PartGeometry {
-                hidden: vision.hidden_size,
-                rows: vision.depth,
-                intermediate: vision.intermediate,
-                heads: vision.heads,
-                head_dim: vision.hidden_size / vision.heads.max(1),
-                patch_size: vision.patch_size,
-                spatial_merge: vision.spatial_merge,
-                out_hidden: vision.out_hidden_size,
-                positions: architecture.max_position_embeddings,
-                world: tp.world(),
-                rank: tp.rank(),
-                ..PartGeometry::new()
-            },
-            precision: precision.dense,
-        });
+    if let Some(vision) = architecture.vision_spec() {
+        let geometry = &vision.geometry;
+        let head_dim = geometry.hidden_size.checked_div(geometry.num_heads).unwrap_or(0);
+        let base = PartGeometry {
+            hidden: geometry.hidden_size,
+            rows: geometry.depth,
+            intermediate: geometry.intermediate_size,
+            heads: geometry.num_heads,
+            head_dim,
+            patch_size: geometry.patch_size,
+            spatial_merge: vision.downsample.factor(),
+            out_hidden: geometry.out_hidden_size,
+            in_channels: geometry.in_channels,
+            temporal_patch: geometry.temporal_patch_size,
+            norm_epsilon_bits: vision.norm_epsilon.to_bits(),
+            vision_norm: vision.norm.code(),
+            vision_activation: vision.activation.code(),
+            attention_bias: vision.attention_bias,
+            qk_norm: Some(vision.qk_norm),
+            vision_position: vision.position.code(),
+            vision_downsample: vision.downsample.code(),
+            merger_intermediate: vision.merger_intermediate,
+            positions: architecture.max_position_embeddings,
+            world: tp.world(),
+            rank: tp.rank(),
+            ..PartGeometry::new()
+        };
+        let mut push = |part: Part, geometry: PartGeometry| {
+            globals.push(PartRequirement {
+                part,
+                geometry,
+                precision: Precision::Bf16,
+            });
+        };
+        push(Part::VisionPatchEmbed, base);
+        push(Part::VisionPosition, base);
+        push(Part::VisionNorm, base);
+        push(Part::VisionAttention, base);
+        push(Part::VisionMlp, base);
+        let merger = PartGeometry {
+            vision_activation: vision.merger_activation.code(),
+            ..base
+        };
+        if !matches!(
+            vision.downsample,
+            sparkflash_model::VisionDownsample::Merge(_) | sparkflash_model::VisionDownsample::None
+        ) {
+            push(Part::VisionDownsample, base);
+        }
+        push(Part::VisionMerger, merger);
     }
     Ok(globals)
 }
@@ -771,6 +812,13 @@ fn geometry_for(
         }
         Part::Mtp
         | Part::Vision
+        | Part::VisionPatchEmbed
+        | Part::VisionPosition
+        | Part::VisionNorm
+        | Part::VisionAttention
+        | Part::VisionMlp
+        | Part::VisionDownsample
+        | Part::VisionMerger
         | Part::Embedding
         | Part::RmsNorm
         | Part::LayerNorm

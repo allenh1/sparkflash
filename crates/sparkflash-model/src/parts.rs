@@ -61,8 +61,23 @@ pub enum Part {
     Ple,
     /// A multi-token-prediction (MTP/DSpark) stage.
     Mtp,
-    /// A vision tower and its aligner.
+    /// The vision stack's name. It is not a part instance and has no catalogue entry; the
+    /// components below are what a tower is made of.
     Vision,
+    /// The vision tower's patch projection.
+    VisionPatchEmbed,
+    /// The vision tower's position scheme (rotary and/or a learned grid).
+    VisionPosition,
+    /// A vision block's norm.
+    VisionNorm,
+    /// The vision tower's attention.
+    VisionAttention,
+    /// A vision block's MLP.
+    VisionMlp,
+    /// The vision tower's downsample or unfold before the merger.
+    VisionDownsample,
+    /// The vision tower's merger into the language width.
+    VisionMerger,
     /// A shared dense projection, distinct from the dense MLP block.
     DenseGemm,
     /// A fused activation or gated activation epilogue.
@@ -112,7 +127,13 @@ impl Part {
         Self::Engram,
         Self::Ple,
         Self::Mtp,
-        Self::Vision,
+        Self::VisionPatchEmbed,
+        Self::VisionPosition,
+        Self::VisionNorm,
+        Self::VisionAttention,
+        Self::VisionMlp,
+        Self::VisionDownsample,
+        Self::VisionMerger,
         Self::DenseGemm,
         Self::Activation,
         Self::Rope,
@@ -150,6 +171,13 @@ impl Part {
             Self::Ple => "ple",
             Self::Mtp => "mtp",
             Self::Vision => "vision",
+            Self::VisionPatchEmbed => "vision_patch_embed",
+            Self::VisionPosition => "vision_position",
+            Self::VisionNorm => "vision_norm",
+            Self::VisionAttention => "vision_attention",
+            Self::VisionMlp => "vision_mlp",
+            Self::VisionDownsample => "vision_downsample",
+            Self::VisionMerger => "vision_merger",
             Self::DenseGemm => "dense_gemm",
             Self::Activation => "activation",
             Self::Rope => "rope",

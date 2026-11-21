@@ -96,7 +96,12 @@ fn the_part_set_names_every_new_inkling_mechanism() {
         Part::BlockAttentionResidual,
         Part::SoftcappedActivation,
         Part::Moe,
-        Part::Vision,
+        Part::VisionPatchEmbed,
+        Part::VisionPosition,
+        Part::VisionNorm,
+        Part::VisionAttention,
+        Part::VisionMlp,
+        Part::VisionMerger,
         Part::Mtp,
     ] {
         assert!(parts.contains(part), "{part} is missing");

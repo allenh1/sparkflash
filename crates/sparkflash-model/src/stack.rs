@@ -30,6 +30,7 @@ use std::fmt;
 use crate::architecture::{Architecture, AttentionKind, Ffn, Layer, WeightFormat};
 use crate::compose::LayerStep;
 use crate::parts::Part;
+use crate::vision_geometry::VisionDownsample;
 
 /// Which stack of a model description a block belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -202,10 +203,73 @@ impl Architecture {
             .iter()
             .map(|layer| self.language_block(layer))
             .collect();
-        vec![Stack {
+        let mut stacks = vec![Stack {
             kind: StackKind::Language,
             blocks,
-        }]
+        }];
+        if let Some(vision) = self.vision_stack() {
+            stacks.push(vision);
+        }
+        stacks
+    }
+
+    /// The vision tower as a stack of the components the checkpoint describes.
+    ///
+    /// One block holds one instance of each component: the depth a tower repeats its norm,
+    /// attention and MLP is geometry on those parts, not a second description. A component the
+    /// config and index leave undetermined is still an instance, so the scan can refuse it as
+    /// `unknown layout` instead of dropping it.
+    #[must_use]
+    pub fn vision_stack(&self) -> Option<Stack> {
+        let spec = self.vision_spec()?;
+        let geometry = &spec.geometry;
+        let head_dim = geometry.hidden_size.checked_div(geometry.num_heads)?;
+        let position_shape = if spec.position.has_grid() {
+            Shape::new([geometry.num_position_embeddings, geometry.hidden_size])
+        } else {
+            Shape::new([head_dim / 2])
+        };
+        let mut parts = vec![
+            PartInstance::new(
+                Part::VisionPatchEmbed,
+                Shape::new([geometry.hidden_size, spec.patch_features()]),
+                None,
+            ),
+            PartInstance::new(Part::VisionPosition, position_shape, None),
+            PartInstance::new(
+                Part::VisionNorm,
+                Shape::new([geometry.hidden_size]),
+                None,
+            ),
+            PartInstance::new(
+                Part::VisionAttention,
+                Shape::new([geometry.num_heads, head_dim]),
+                None,
+            ),
+            PartInstance::new(
+                Part::VisionMlp,
+                Shape::new([geometry.intermediate_size, geometry.hidden_size]),
+                None,
+            ),
+            PartInstance::new(
+                Part::VisionMerger,
+                Shape::new([geometry.out_hidden_size, spec.merged_width()]),
+                None,
+            ),
+        ];
+        if !matches!(spec.downsample, VisionDownsample::Merge(_) | VisionDownsample::None) {
+            let merger = parts.pop().expect("the merger is the last component");
+            parts.push(PartInstance::new(
+                Part::VisionDownsample,
+                Shape::new([spec.merged_width(), geometry.hidden_size]),
+                None,
+            ));
+            parts.push(merger);
+        }
+        Some(Stack {
+            kind: StackKind::Vision,
+            blocks: vec![Block { index: 0, parts }],
+        })
     }
 
     /// The stored format of a part, read from the checkpoint's typed quantization block.
@@ -327,7 +391,7 @@ mod tests {
             .expect("the language stack's attention");
         assert_eq!(attention.shape, Shape::new([2, 4]));
         assert_eq!(attention.format, Some(WeightFormat::Bf16));
-        assert_eq!(architecture.stored_format(Part::Vision), None);
+        assert_eq!(architecture.stored_format(Part::VisionNorm), None);
         assert!(attention.tensors.is_empty());
     }
 

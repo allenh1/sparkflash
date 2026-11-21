@@ -28,7 +28,9 @@ use serde_json::Value;
 
 use crate::config::{ConfigError, OneOrMany};
 use crate::parts::{Part, PartSet, Target, built};
-use crate::vision_geometry::VisionGeometry;
+use crate::vision_geometry::{
+    VisionActivation, VisionDownsample, VisionGeometry, VisionNorm, VisionPosition,
+};
 
 /// The architecture of one released checkpoint.
 #[derive(Debug, Clone, PartialEq)]
@@ -848,6 +850,28 @@ pub struct Vision {
     pub out_hidden_size: usize,
     /// Axial RoPE base.
     pub rope_theta: f64,
+    /// The block norm kind, when the config states it or the index proves it.
+    pub norm: Option<VisionNorm>,
+    /// The block norm epsilon, when the config states it.
+    pub norm_epsilon: Option<f64>,
+    /// Whether the attention projections carry a bias.
+    pub attention_bias: bool,
+    /// Whether queries and keys take a per-head norm, when a source states it.
+    pub qk_norm: Option<bool>,
+    /// The block MLP activation.
+    pub activation: Option<VisionActivation>,
+    /// The softcap on the block MLP's gate and up projections.
+    pub activation_clamp: Option<f64>,
+    /// The tower's position scheme.
+    pub position: Option<VisionPosition>,
+    /// The downsample or unfold before the merger.
+    pub downsample: Option<VisionDownsample>,
+    /// The merger MLP's width, or zero when it has no hidden layer.
+    pub merger_intermediate: usize,
+    /// The merger's activation.
+    pub merger_activation: Option<VisionActivation>,
+    /// Whether the merger applies a final norm after its projection.
+    pub merger_final_norm: bool,
 }
 
 impl Architecture {
@@ -857,9 +881,21 @@ impl Architecture {
     /// [ConfigError::Json] for a malformed document and [ConfigError::Invalid] for a document
     /// that does not describe a shape this parser can name.
     pub fn from_json(text: &str) -> Result<Self, ConfigError> {
+        Self::from_json_with_tensor_names(text, None)
+    }
+
+    /// Parse a released config with the checkpoint's tensor names, which settle components the
+    /// config leaves implicit (a tower's query/key norms, its norm kind, its merger's final norm).
+    ///
+    /// # Errors
+    /// As [Self::from_json].
+    pub fn from_json_with_tensor_names(
+        text: &str,
+        tensors: Option<&[String]>,
+    ) -> Result<Self, ConfigError> {
         let root: Value =
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
-        Self::from_value(&root)
+        Self::from_value_with_tensor_names(&root, tensors)
     }
 
     /// Read a released Hugging Face `config.json` from a path.
@@ -877,6 +913,17 @@ impl Architecture {
     /// # Errors
     /// As [Self::from_json].
     pub fn from_value(root: &Value) -> Result<Self, ConfigError> {
+        Self::from_value_with_tensor_names(root, None)
+    }
+
+    /// Parse an already-decoded config with the checkpoint's tensor names.
+    ///
+    /// # Errors
+    /// As [Self::from_value].
+    pub fn from_value_with_tensor_names(
+        root: &Value,
+        tensors: Option<&[String]>,
+    ) -> Result<Self, ConfigError> {
         let text = object(root, "text_config").unwrap_or(root);
         let family = string(root, "model_type")
             .or_else(|| string(text, "model_type"))
@@ -896,7 +943,7 @@ impl Architecture {
         let layers = layers(text, &family)?;
         let looped = loop_schedule(text, &family)?;
         let quantization = quantization(root)?;
-        let vision = vision(root, hidden_size)?;
+        let vision = vision(root, hidden_size, tensors)?;
         let mtp = mtp(root, text, hidden_size)?;
         let tokens = tokens(root, text)?;
         let inkling = inkling(text, root, vocab_size)?;
@@ -1659,6 +1706,14 @@ impl Architecture {
         self.vision.as_ref().map(VisionGeometry::from_vision)
     }
 
+    /// The vision tower as the component stack the scan resolves, when the checkpoint carries one.
+    #[must_use]
+    pub fn vision_spec(&self) -> Option<crate::vision_geometry::VisionTowerSpec> {
+        self.vision
+            .as_ref()
+            .map(crate::vision_geometry::VisionTowerSpec::from_vision)
+    }
+
     /// Whether the checkpoint's RMSNorm weights are zero-centred.
     ///
     /// Qwen's hybrid releases store `weight` around zero and compute `norm(x) * (1 + weight)`;
@@ -1683,7 +1738,13 @@ impl Architecture {
         parts.insert(Part::RmsNorm);
         parts.insert(Part::LmHead);
         if self.vision.is_some() {
-            parts.insert(Part::Vision);
+            parts.insert(Part::VisionPatchEmbed);
+            parts.insert(Part::VisionPosition);
+            parts.insert(Part::VisionNorm);
+            parts.insert(Part::VisionAttention);
+            parts.insert(Part::VisionMlp);
+            parts.insert(Part::VisionDownsample);
+            parts.insert(Part::VisionMerger);
         }
         if self.inkling.as_ref().is_some_and(|inkling| {
             inkling.softcaps.gate.is_finite() || inkling.softcaps.up.is_finite()
@@ -2960,7 +3021,11 @@ fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
     })
 }
 
-fn vision(root: &Value, language_hidden: usize) -> Result<Option<Vision>, ConfigError> {
+fn vision(
+    root: &Value,
+    language_hidden: usize,
+    tensors: Option<&[String]>,
+) -> Result<Option<Vision>, ConfigError> {
     let Some(config) = object(root, "vision_config") else {
         return Ok(None);
     };
@@ -2969,6 +3034,94 @@ fn vision(root: &Value, language_hidden: usize) -> Result<Option<Vision>, Config
     // language model its own width, not the tower's block width.
     let geometry = VisionGeometry::from_value(config, language_hidden)?;
     geometry.validate()?;
+    let mut norm = if optional_f64(config, "rms_norm_eps")?.is_some() {
+        Some(VisionNorm::Rms)
+    } else if optional_f64(config, "layer_norm_eps")?.is_some() {
+        Some(VisionNorm::Layer)
+    } else {
+        None
+    };
+    let mut qk_norm = optional_bool(config, "qk_norm")?;
+    let mut attention_bias = optional_bool(config, "attention_bias")?;
+    let mut position = if geometry.num_position_embeddings > 0 {
+        Some(VisionPosition::RotaryAndGrid)
+    } else if config.get("rope_theta").is_some() {
+        Some(VisionPosition::Rotary)
+    } else {
+        None
+    };
+    let mut downsample = if config
+        .get("downsample_ratio")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|ratio| ratio > 1)
+    {
+        Some(VisionDownsample::Unfold(
+            geometry.spatial_merge_size.max(1),
+        ))
+    } else if geometry.spatial_merge_size > 1 {
+        // A tower that declares an RMS epsilon and a merger MLP downsamples through a learned
+        // merge-cell projection; one that declares a layer norm and a merger width reshapes the
+        // cell instead (the CLIP-style merge). Both are structural declarations.
+        if optional_f64(config, "rms_norm_eps")?.is_some()
+            && geometry.projection_intermediate_size > 0
+        {
+            Some(VisionDownsample::Conv(geometry.spatial_merge_size))
+        } else {
+            Some(VisionDownsample::Merge(geometry.spatial_merge_size))
+        }
+    } else {
+        None
+    };
+    let mut merger_final_norm = false;
+    if let Some(names) = tensors {
+        let any = |needle: &str| names.iter().any(|name| name.contains(needle));
+        if any(".norm1.bias") || any(".ln_1.bias") {
+            norm = Some(VisionNorm::Layer);
+        } else if any(".norm1.weight") || any(".ln_1.weight") {
+            norm = Some(VisionNorm::Rms);
+        }
+        if any(".q_norm.weight") || any(".k_norm.weight") {
+            qk_norm = Some(true);
+        } else if any(".qkv.weight") || any(".wqkv.weight") {
+            qk_norm = Some(false);
+        }
+        if attention_bias.is_none() {
+            attention_bias = Some(any(".qkv.bias") || any(".wqkv.bias") || any(".attn.bias"));
+        }
+        if any("pos_embed") || any("position_embedding") {
+            position = Some(if geometry.num_position_embeddings > 0 {
+                if config.get("rope_theta").is_some() {
+                    VisionPosition::RotaryAndGrid
+                } else {
+                    VisionPosition::LearnedGrid
+                }
+            } else {
+                VisionPosition::LearnedGrid
+            });
+        }
+        if any(".downsample.weight") {
+            downsample = Some(VisionDownsample::Conv(geometry.spatial_merge_size.max(1)));
+        } else if any(".merger.linear_fc1") || any(".proj_in.") {
+            downsample = Some(VisionDownsample::Merge(geometry.spatial_merge_size.max(1)));
+        } else if any("aligner.w1") {
+            downsample = Some(VisionDownsample::Unfold(
+                geometry.spatial_merge_size.max(1),
+            ));
+        }
+        merger_final_norm = any("merger.post_projection_norm")
+            || any("merger.norm.weight")
+            || any("post_layernorm.weight");
+    }
+    let activation = optional_string(config, "hidden_act").map(|name| {
+        let name = name.to_ascii_lowercase();
+        if name.contains("gelu") && name.contains("tanh") {
+            VisionActivation::GeluTanh
+        } else if name.contains("gelu") {
+            VisionActivation::GeluErf
+        } else {
+            VisionActivation::SwiGlu
+        }
+    });
     Ok(Some(Vision {
         depth: geometry.depth,
         hidden_size: geometry.hidden_size,
@@ -2984,6 +3137,27 @@ fn vision(root: &Value, language_hidden: usize) -> Result<Option<Vision>, Config
         max_pixels: geometry.max_pixels,
         out_hidden_size: geometry.out_hidden_size,
         rope_theta: geometry.rope_theta,
+        norm,
+        norm_epsilon: optional_f64(config, "rms_norm_eps")?
+            .or(optional_f64(config, "layer_norm_eps")?),
+        attention_bias: attention_bias.unwrap_or(true),
+        qk_norm,
+        activation,
+        activation_clamp: optional_f64(config, "swiglu_limit")?,
+        position,
+        downsample,
+        merger_intermediate: geometry.projection_intermediate_size,
+        merger_activation: optional_string(config, "hidden_act").map(|name| {
+            let name = name.to_ascii_lowercase();
+            if name.contains("gelu") && name.contains("tanh") {
+                VisionActivation::GeluTanh
+            } else if name.contains("gelu") {
+                VisionActivation::GeluErf
+            } else {
+                VisionActivation::SwiGlu
+            }
+        }),
+        merger_final_norm,
     }))
 }
 
@@ -4196,13 +4370,13 @@ mod tests {
     #[test]
     fn the_released_parses_are_pinned_and_switch_nothing_on() {
         let pinned = [
-            0x9c15_e22e_cbea_7f28_u64,
+            0x1ece_5044_22e8_6e6e_u64,
             0xbf31_362c_fd8a_5fc0,
-            0x9e18_e48c_be4f_af44,
-            0xd46f_7b0d_aab8_7820,
-            0xb9b9_e985_99c3_c3b3,
-            0x1ad1_8446_4987_60d4,
-            0xb9a1_d18f_5235_d041,
+            0x0dab_25c8_bb73_8e5a,
+            0xa645_4ea2_74d4_d0ba,
+            0x7be1_06f7_5383_22d1,
+            0x56aa_e934_eaf3_8472,
+            0x677e_44dc_27a7_370b,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");

@@ -386,3 +386,63 @@ fn the_deepseek_forward_is_out_of_the_cli_and_the_cli_is_below_34k_lines() {
         "the DeepSeek device forward crate is missing"
     );
 }
+
+#[test]
+fn each_released_vision_tower_is_a_stack_of_named_components() {
+    use sparkflash_model::{Part, Target};
+    use sparkflash_ops::scan::{scan, ScanInputs};
+    use sparkflash_model::stack::StackKind;
+
+    const DEEPSEEK: &str =
+        include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
+    const INKLING: &str =
+        include_str!("../../sparkflash-model-inkling2/config/inkling2_small.hf.json");
+    const GLM: &str = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const QWEN: &str =
+        include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
+
+    for (name, config, rows, resolved) in [
+        ("deepseek", DEEPSEEK, 7, true),
+        ("inkling", INKLING, 6, true),
+        ("glm", GLM, 7, false),
+        ("qwen", QWEN, 6, false),
+    ] {
+        let report = scan(ScanInputs {
+            config,
+            tensors: None,
+            target: Target::Sm121,
+            world: 1,
+        });
+        assert!(report.error.is_none(), "{name}: {:?}", report.error);
+        let vision: Vec<_> = report
+            .rows
+            .iter()
+            .filter(|row| row.stack == StackKind::Vision)
+            .collect();
+        assert_eq!(vision.len(), rows, "{name}: {}\n{}", vision.len(), report.render());
+        for row in &vision {
+            assert!(
+                row.status.is_resolved() || row.status.fix().is_some(),
+                "{name}: {} has no fix: {}",
+                row.part,
+                report.render()
+            );
+        }
+        assert_eq!(
+            report.rows.iter().filter(|row| row.stack == StackKind::Vision).all(|row| row.status.is_resolved()),
+            resolved,
+            "{name}:\n{}",
+            report.render()
+        );
+    }
+
+    // The old opaque part is only the stack's name; it has no catalogue entry of its own.
+    assert_eq!(
+        sparkflash_ops::parts::kernels(Part::Vision, Target::Sm121).count(),
+        0
+    );
+    assert!(
+        sparkflash_ops::parts::kernels(Part::VisionPatchEmbed, Target::Sm121).count() > 0
+    );
+}
+

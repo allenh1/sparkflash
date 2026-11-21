@@ -564,7 +564,13 @@ fn refusal_status(error: &ResolveError, shape: &Shape, format: Option<WeightForm
 
 fn stack_of(part: Part) -> StackKind {
     match part {
-        Part::Vision => StackKind::Vision,
+        Part::VisionPatchEmbed
+        | Part::VisionPosition
+        | Part::VisionNorm
+        | Part::VisionAttention
+        | Part::VisionMlp
+        | Part::VisionDownsample
+        | Part::VisionMerger => StackKind::Vision,
         Part::Mtp => StackKind::Draft,
         _ => StackKind::Language,
     }
@@ -585,7 +591,22 @@ fn part_shape(part: Part, geometry: &PartGeometry) -> Shape {
         }
         Part::DenseMlp => vec![geometry.intermediate, geometry.hidden],
         Part::Moe => vec![geometry.experts, geometry.intermediate, geometry.hidden],
-        Part::Vision => vec![geometry.patch_size, geometry.patch_size, geometry.hidden],
+        Part::VisionPatchEmbed => vec![
+            geometry.hidden,
+            geometry.in_channels * geometry.temporal_patch * geometry.patch_size * geometry.patch_size,
+        ],
+        Part::VisionPosition => vec![geometry.head_dim / 2],
+        Part::VisionNorm => vec![geometry.hidden],
+        Part::VisionAttention => vec![geometry.heads, geometry.head_dim],
+        Part::VisionMlp => vec![geometry.intermediate, geometry.hidden],
+        Part::VisionDownsample => vec![
+            geometry.hidden * geometry.spatial_merge * geometry.spatial_merge,
+            geometry.hidden,
+        ],
+        Part::VisionMerger => vec![
+            geometry.out_hidden,
+            geometry.hidden * geometry.spatial_merge * geometry.spatial_merge,
+        ],
         _ => Vec::new(),
     };
     if dims.is_empty() || dims.contains(&0) {
@@ -715,8 +736,8 @@ mod tests {
         let vision = report
             .rows
             .iter()
-            .find(|row| row.part == Part::Vision)
-            .expect("the tower is a part instance");
+            .find(|row| row.part == Part::VisionPatchEmbed)
+            .expect("the tower's patch projection is a part instance");
         assert!(
             matches!(vision.status, ScanStatus::NotBuilt { .. }),
             "{:?}",
@@ -810,7 +831,7 @@ mod tests {
 
     #[test]
     fn a_tower_shape_the_catalogue_covers_resolves_with_an_unstated_format() {
-        const VISION_CONFIG: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16,"vision_config":{"depth":1,"hidden_size":64,"num_attention_heads":2,"intermediate_size":128,"patch_size":14,"temporal_patch_size":2,"spatial_merge_size":2}}"#;
+        const VISION_CONFIG: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16,"vision_config":{"depth":1,"hidden_size":1024,"num_attention_heads":16,"intermediate_size":2816,"patch_size":14,"temporal_patch_size":1,"out_hidden_size":5120,"projection_intermediate_size":5120,"rope_theta":10000,"downsample_ratio":3}}"#;
         let report = scan(ScanInputs {
             config: VISION_CONFIG,
             tensors: None,
@@ -821,15 +842,15 @@ mod tests {
         let vision = report
             .rows
             .iter()
-            .find(|row| row.part == Part::Vision)
-            .expect("the tower is a part instance");
+            .find(|row| row.part == Part::VisionPatchEmbed)
+            .expect("the tower's patch projection is a part instance");
         assert!(vision.status.is_resolved(), "{:?}", vision.status);
         assert_eq!(
             vision.format, None,
             "the config does not state the tower's format"
         );
-        assert_eq!(vision.shape, Shape::new([14, 14, 64]));
-        assert!(report.render().contains("14x14x64"), "{report:?}");
+        assert_eq!(vision.shape, Shape::new([1024, 588]));
+        assert!(report.render().contains("1024x588"), "{report:?}");
     }
 
     #[test]

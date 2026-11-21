@@ -104,4 +104,6 @@ pub use tp_plan::{Split, TpAxis, TpPlan, TpPlanError};
 pub use vision::{
     ImageGrid, ImageSpan, PreparedImage, SpanRow, VisionCodec, VisionError, VisionOptions,
 };
-pub use vision_geometry::VisionGeometry;
+pub use vision_geometry::{
+    VisionActivation, VisionDownsample, VisionGeometry, VisionNorm, VisionPosition, VisionTowerSpec,
+};

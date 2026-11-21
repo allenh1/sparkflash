@@ -53,6 +53,9 @@
 use sparkflash_kernels::images::Image;
 use sparkflash_model::Architecture;
 use sparkflash_model::architecture::WeightFormat;
+use sparkflash_model::vision_geometry::{
+    VisionActivation, VisionDownsample, VisionNorm, VisionPosition,
+};
 
 use crate::gemv::E4M3_TILE;
 use crate::plan::{ComputeClass, KernelPhase, KernelSymbol, Precision, RowBand, ShapeConstraint};
@@ -112,6 +115,18 @@ const VISION_PATCH_SIZES: &[usize] = &[14];
 /// part falls to `ShapeConstraint::ANY` and a Qwen 16-patch plan would resolve against
 /// Inkling's entry, which is the refusal D84 relies on.
 const INKLING_VISION_PATCH_SIZES: &[usize] = &[20];
+
+/// The width the shared vision image compiles its norms, attention and MLP at.
+const VISION_DIM: usize = 1024;
+/// The heads and per-head width the shared vision attention compiles.
+const VISION_HEADS: usize = 16;
+const VISION_HEAD_DIM: usize = 64;
+/// The SwiGLU width `opt_vision_swiglu` compiles.
+const VISION_MLP: usize = 2816;
+/// The blend row `opt_vision_span_rows` compiles.
+const VISION_ROW: usize = 5120;
+/// The epsilon `opt_vision_rmsnorm` hardcodes.
+const VISION_EPSILON_BITS: u64 = 1e-6f64.to_bits();
 
 /// The routed-expert `(hidden, experts, top-k)` shapes the Qwen MoE images are published at.
 ///
@@ -366,11 +381,71 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .experts_equals(128)
             .top_k_equals(3),
         (Part::Mtp, Image::Dflash2) => ShapeConstraint::ANY.hidden_multiple(256),
-        // The shared vision tower's 16-patch kernel exists, but no orchestrated 16-patch tower.
-        (Part::Vision, Image::Deepseek) => ShapeConstraint::ANY.patch_sizes(VISION_PATCH_SIZES),
-        (Part::Vision, Image::Inkling) => {
-            ShapeConstraint::ANY.patch_sizes(INKLING_VISION_PATCH_SIZES)
-        }
+        // The shared vision tower's components, each claiming only the shape its kernel source
+        // really compiles. The DeepSeek image carries the 14/16 patchify, 1024-wide norm and
+        // attention, 2816-wide SwiGLU, 3x3 unfold and 5120-wide aligner; Inkling's image carries
+        // its own 20-patch patchify, LayerNorm, axial rope, layer scale and 4096 GELU MLP.
+        (Part::VisionPatchEmbed, Image::Deepseek) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .patch_sizes(VISION_PATCH_SIZES)
+            .in_channels_equals(3)
+            .temporal_patch_equals(1),
+        (Part::VisionPatchEmbed, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .patch_sizes(INKLING_VISION_PATCH_SIZES)
+            .in_channels_equals(3)
+            .temporal_patch_equals(1),
+        (Part::VisionPosition, Image::Deepseek) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .head_dim_equals(VISION_HEAD_DIM)
+            .vision_position(VisionPosition::Rotary.code()),
+        (Part::VisionPosition, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .head_dim_equals(VISION_HEAD_DIM)
+            .vision_position(VisionPosition::RotaryAndGrid.code()),
+        (Part::VisionNorm, Image::Deepseek) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .vision_norm(VisionNorm::Rms.code())
+            .norm_epsilon_bits(VISION_EPSILON_BITS),
+        (Part::VisionNorm, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .vision_norm(VisionNorm::Layer.code()),
+        (Part::VisionAttention, Image::Deepseek) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .heads_multiple(VISION_HEADS)
+            .head_dim_equals(VISION_HEAD_DIM)
+            .attention_bias(true)
+            .qk_norm(false)
+            .vision_position(VisionPosition::Rotary.code()),
+        (Part::VisionAttention, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .heads_multiple(VISION_HEADS)
+            .head_dim_equals(VISION_HEAD_DIM)
+            .attention_bias(true)
+            .qk_norm(false)
+            .vision_position(VisionPosition::RotaryAndGrid.code()),
+        (Part::VisionMlp, Image::Deepseek) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .intermediate_equals(VISION_MLP)
+            .vision_activation(VisionActivation::SwiGlu.code()),
+        (Part::VisionMlp, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .intermediate_equals(4096)
+            .vision_activation(VisionActivation::GeluErf.code()),
+        (Part::VisionDownsample, Image::Deepseek) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .spatial_merge_equals(3)
+            .vision_downsample(VisionDownsample::Unfold(3).code()),
+        (Part::VisionMerger, Image::Deepseek) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .out_hidden_equals(VISION_ROW)
+            .merger_intermediate_equals(VISION_ROW)
+            .vision_activation(VisionActivation::GeluErf.code()),
+        (Part::VisionMerger, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(VISION_DIM)
+            .out_hidden_equals(4608)
+            .merger_intermediate_equals(4096)
+            .vision_activation(VisionActivation::GeluErf.code()),
         _ => ShapeConstraint::ANY,
     }
 }
@@ -1975,49 +2050,55 @@ pub const CATALOGUE: &[PartKernel] = &[
         false,
     ),
     sm121(
-        Part::Vision,
+        Part::VisionPatchEmbed,
         Image::Deepseek,
         &[
-            sym(
-                "opt_vision_patchify",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
-            sym(
-                "opt_vision_patchify_16",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
-            sym(
-                "opt_vision_gemm",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
-            sym(
-                "opt_vision_rmsnorm",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
-            sym(
-                "opt_vision_rope",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
-            sym(
-                "opt_vision_attn",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
-            sym(
-                "opt_vision_swiglu",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
-            sym(
-                "opt_vision_unfold",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
-            sym(
-                "opt_vision_span_rows",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
-            sym(
-                "opt_vision_route",
-                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
-            ),
+            sym("opt_vision_patchify", &[Precision::Bf16]),
+            sym("opt_vision_patchify_16", &[Precision::Bf16]),
+            sym("opt_vision_gemm", &[Precision::Bf16]),
+        ],
+        true,
+    ),
+    sm121(
+        Part::VisionPosition,
+        Image::Deepseek,
+        &[sym("opt_vision_rope", &[Precision::Bf16])],
+        true,
+    ),
+    sm121(
+        Part::VisionNorm,
+        Image::Deepseek,
+        &[sym("opt_vision_rmsnorm", &[Precision::Bf16])],
+        true,
+    ),
+    sm121(
+        Part::VisionAttention,
+        Image::Deepseek,
+        &[sym("opt_vision_attn", &[Precision::Bf16])],
+        true,
+    ),
+    sm121(
+        Part::VisionMlp,
+        Image::Deepseek,
+        &[
+            sym("opt_vision_gemm", &[Precision::Bf16]),
+            sym("opt_vision_swiglu", &[Precision::Bf16]),
+        ],
+        true,
+    ),
+    sm121(
+        Part::VisionDownsample,
+        Image::Deepseek,
+        &[sym("opt_vision_unfold", &[Precision::Bf16])],
+        true,
+    ),
+    sm121(
+        Part::VisionMerger,
+        Image::Deepseek,
+        &[
+            sym("opt_vision_gemm", &[Precision::Bf16]),
+            sym("opt_vision_span_rows", &[Precision::Bf16]),
+            sym("opt_vision_route", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -2043,18 +2124,68 @@ pub const CATALOGUE: &[PartKernel] = &[
         ],
         false,
     ),
-    // The Inkling vision tower's kernels, from the Inkling image.
+    // The Inkling vision tower's components, from the Inkling image. Its patchify, LayerNorm,
+    // axial rope and layer scale are bf16 in and out, so the claims name Bf16 as well as F32.
     sm121(
-        Part::Vision,
+        Part::VisionPatchEmbed,
         Image::Inkling,
         &[
-            sym("inkling_vision_patchify", &[Precision::F32]),
-            sym("inkling_vision_layernorm", &[Precision::F32]),
-            sym("inkling_vision_rope", &[Precision::F32]),
-            sym("inkling_vision_scale_add", &[Precision::F32]),
+            sym(
+                "inkling_vision_patchify",
+                &[Precision::Bf16, Precision::F32],
+            ),
             sym("opt_vision_gemm", &[Precision::Bf16]),
+        ],
+        false,
+    ),
+    sm121(
+        Part::VisionPosition,
+        Image::Inkling,
+        &[sym(
+            "inkling_vision_rope",
+            &[Precision::Bf16, Precision::F32],
+        )],
+        false,
+    ),
+    sm121(
+        Part::VisionNorm,
+        Image::Inkling,
+        &[sym(
+            "inkling_vision_layernorm",
+            &[Precision::Bf16, Precision::F32],
+        )],
+        false,
+    ),
+    sm121(
+        Part::VisionAttention,
+        Image::Inkling,
+        &[
             sym("opt_vision_attn", &[Precision::Bf16]),
-            sym("inkling_widen_f32", &[Precision::F32]),
+            sym(
+                "inkling_vision_scale_add",
+                &[Precision::Bf16, Precision::F32],
+            ),
+        ],
+        false,
+    ),
+    sm121(
+        Part::VisionMlp,
+        Image::Inkling,
+        &[
+            sym("opt_vision_gemm", &[Precision::Bf16]),
+            sym(
+                "inkling_vision_scale_add",
+                &[Precision::Bf16, Precision::F32],
+            ),
+        ],
+        false,
+    ),
+    sm121(
+        Part::VisionMerger,
+        Image::Inkling,
+        &[
+            sym("opt_vision_gemm", &[Precision::Bf16]),
+            sym("inkling_widen_f32", &[Precision::Bf16, Precision::F32]),
         ],
         false,
     ),
@@ -2437,7 +2568,14 @@ const fn part_bodies_ok(part: Part) -> bool {
         | Part::Engram
         | Part::Ple
         | Part::Mtp
-        | Part::Vision => !is_gemm_class(part),
+        | Part::Vision
+        | Part::VisionPatchEmbed
+        | Part::VisionPosition
+        | Part::VisionNorm
+        | Part::VisionAttention
+        | Part::VisionMlp
+        | Part::VisionDownsample
+        | Part::VisionMerger => !is_gemm_class(part),
     }
 }
 
@@ -2671,6 +2809,22 @@ pub const HOST_REFERENCE_PARTS: &[Part] = &[
     Part::LmHead,
 ];
 
+/// Whether a part belongs to the vision stack.
+#[must_use]
+pub const fn is_vision_part(part: Part) -> bool {
+    matches!(
+        part,
+        Part::Vision
+            | Part::VisionPatchEmbed
+            | Part::VisionPosition
+            | Part::VisionNorm
+            | Part::VisionAttention
+            | Part::VisionMlp
+            | Part::VisionDownsample
+            | Part::VisionMerger
+    )
+}
+
 /// The parts `architecture` names that the host reference backend does not execute.
 ///
 /// MTP and vision are optional for this backend: [Architecture::parts] inserts [Part::Mtp]
@@ -2688,7 +2842,7 @@ pub fn host_reference_missing(architecture: &Architecture) -> Vec<Part> {
     architecture
         .missing(&available)
         .into_iter()
-        .filter(|part| !matches!(part, Part::Mtp | Part::Vision))
+        .filter(|part| !matches!(part, Part::Mtp) && !is_vision_part(*part))
         .collect()
 }
 
@@ -3593,7 +3747,7 @@ pub fn serving(target: Target) -> PartSet {
 pub fn serving_language(target: Target) -> PartSet {
     serving(target)
         .into_iter()
-        .filter(|part| *part != Part::Vision)
+        .filter(|part| !is_vision_part(*part))
         .collect()
 }
 
@@ -4351,7 +4505,7 @@ mod tests {
         let architecture = Architecture::from_json(QWEN36).expect("the Qwen3.6 document parses");
         assert_eq!(architecture.family, "qwen3_5_moe");
         assert!(
-            architecture.parts().contains(Part::Vision),
+            architecture.parts().contains(Part::VisionPatchEmbed),
             "the premise: the document carries a tower"
         );
         assert!(
