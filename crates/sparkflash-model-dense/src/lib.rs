@@ -109,6 +109,7 @@ use sparkflash_runtime::{
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, TensorSpec, WeightSource};
 
+pub mod onboard;
 pub mod parts;
 mod walk;
 

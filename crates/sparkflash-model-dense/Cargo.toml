@@ -28,3 +28,5 @@ sparkflash-ops = { workspace = true }
 sparkflash-runtime = { workspace = true }
 sparkflash-comm = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }

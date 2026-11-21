@@ -39,8 +39,7 @@ use sparkflash_model::{
     ARMS, Architecture, DEFAULTS, MEMORY_FLOOR_BYTES, NODE_MEMORY_BUDGET_BYTES, Part, Target,
     canonical_model_type, find_model_by_type, gib,
 };
-use sparkflash_ops::parts::{CATALOGUE, WAIVERS, Waiver, carried};
-use sparkflash_ops::plan::{ComputeClass, KernelPhase, Precision};
+use sparkflash_ops::parts::carried;
 use sparkflash_ops::{EnginePlan, bytes_per_token_floor, stored_bytes_floor};
 
 /// The device target the catalogue is read at. The phase-8 preview is a build-time question, so it
@@ -49,12 +48,6 @@ const TARGET: Target = Target::Sm121;
 
 /// The tensor-parallel worlds the preview judges.
 const WORLDS: [usize; 3] = [1, 2, 4];
-
-/// The row count the catalogue uses for a prompt/prefill probe.
-const PROMPT_ROWS: usize = sparkflash_ops::projection::QWEN_GEMM_MIN_BATCH;
-
-/// The row count the catalogue uses for a token/decode probe.
-const TOKEN_ROWS: usize = 1;
 
 /// A checkpoint document and where it came from.
 struct Input {
@@ -66,23 +59,28 @@ struct Input {
     architecture: Architecture,
     /// Declarations [Architecture] reads through but does not model.
     unmodelled: Vec<String>,
+    /// The document as read, which `--emit` copies into the crate.
+    text: String,
 }
 
 /// Parse the arguments after `onboard`.
 ///
-/// `sparkflash onboard ORG/REPO [--config FILE]`; with `--config` the id is optional and names
-/// only the output's title.
+/// `sparkflash onboard ORG/REPO [--config FILE] [--emit DIR]`; with `--config` the id is optional
+/// and names only the output's title. `--emit` writes the family's crate into the new directory
+/// `DIR` ([sparkflash_model_dense::onboard]), or says no crate is needed.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
-    const USAGE: &str = "usage: sparkflash onboard <hf-id> [--config FILE]";
+    const USAGE: &str = "usage: sparkflash onboard <hf-id> [--config FILE] [--emit DIR]";
     let mut id: Option<String> = None;
     let mut config: Option<String> = None;
+    let mut emit: Option<String> = None;
     let mut args = args.peekable();
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--config" => match args.next() {
-                Some(path) => config = Some(path),
+            flag @ ("--config" | "--emit") => match args.next() {
+                Some(path) if flag == "--config" => config = Some(path),
+                Some(path) => emit = Some(path),
                 None => {
-                    eprintln!("sparkflash onboard: --config needs a path; {USAGE}");
+                    eprintln!("sparkflash onboard: {flag} needs a path; {USAGE}");
                     return ExitCode::FAILURE;
                 }
             },
@@ -115,7 +113,32 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         }
     };
     print!("{}", render(&input));
-    ExitCode::SUCCESS
+    let Some(dir) = emit else {
+        return ExitCode::SUCCESS;
+    };
+    let architecture = &input.architecture;
+    let survey = sparkflash_model_dense::onboard::survey(architecture, input.unmodelled.clone());
+    let title = input.id.as_deref().unwrap_or(architecture.family.as_str());
+    match sparkflash_model_dense::onboard::emit(
+        title,
+        &input.text,
+        architecture,
+        &survey,
+        dir.as_ref(),
+    ) {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(answer) if survey.catalogue_only() => {
+            print!("{answer}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("sparkflash onboard: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Load a document from `--config`, the hub cache, or the Hub, in that order.
@@ -143,6 +166,7 @@ fn load(id: Option<&str>, config: Option<&Path>) -> Result<Input, String> {
             source: format!("hub cache {}", directory.display()),
             architecture,
             unmodelled,
+            text,
         });
     }
     let text = fetch(id)?;
@@ -158,6 +182,7 @@ fn from_text(id: Option<&str>, text: &str, source: String) -> Result<Input, Stri
         source,
         unmodelled: unmodelled(text),
         architecture,
+        text: text.to_owned(),
     })
 }
 
@@ -381,63 +406,8 @@ fn render_parts(out: &mut String, architecture: &Architecture) {
         }
     );
 
-    let mut per_part: BTreeMap<Part, Vec<Precision>> = BTreeMap::new();
-    match EnginePlan::for_architecture(architecture.clone(), TARGET, 1, 0) {
-        Ok(plan) => {
-            for requirement in plan.requirements() {
-                let precisions = per_part.entry(requirement.part).or_default();
-                if !precisions.contains(&requirement.precision) {
-                    precisions.push(requirement.precision);
-                }
-            }
-        }
-        Err(_) => {
-            let policy = sparkflash_ops::PrecisionPolicy::from_architecture(architecture);
-            let all = [policy.dense, policy.experts, policy.attention, policy.mtp];
-            for part in needed.iter().filter(|part| expects_tensor_core(*part)) {
-                per_part.entry(part).or_default().extend(all);
-            }
-        }
-    }
-
-    let mut needing = BTreeSet::new();
-    let mut waived = BTreeSet::new();
-    for part in needed.iter().filter(|part| expects_tensor_core(*part)) {
-        let Some(precisions) = per_part.get(&part) else {
-            needing.insert(format!("{}: no TP1 requirement", part.name()));
-            continue;
-        };
-        for precision in precisions {
-            for (phase, rows) in [
-                (KernelPhase::Prefill, PROMPT_ROWS),
-                (KernelPhase::Decode, TOKEN_ROWS),
-            ] {
-                if has_tensor_core_body(part, *precision, phase, rows) {
-                    continue;
-                }
-                match waiver(part, *precision, phase, rows) {
-                    Some(waiver) => {
-                        waived.insert(format!(
-                            "{} {} {}: {}",
-                            part.name(),
-                            precision.name(),
-                            phase.name(),
-                            waiver.measurement
-                        ));
-                    }
-                    None => {
-                        needing.insert(format!(
-                            "{} {} {} ({} rows): no tensor-core body, no WAIVERS line",
-                            part.name(),
-                            precision.name(),
-                            phase.name(),
-                            rows
-                        ));
-                    }
-                }
-            }
-        }
-    }
+    let gaps = sparkflash_ops::parts::tensor_core_gaps(architecture, TARGET);
+    let (waived, needing) = (gaps.waived, gaps.needing);
     let _ = writeln!(out, "parts with tensor-core gaps:");
     if waived.is_empty() {
         let _ = writeln!(out, "  none");
@@ -454,40 +424,6 @@ fn render_parts(out: &mut String, architecture: &Architecture) {
             let _ = writeln!(out, "  {line}");
         }
     }
-}
-
-/// Whether the catalogue exports a tensor-core body for a part, precision, pass and row count.
-fn has_tensor_core_body(part: Part, precision: Precision, phase: KernelPhase, rows: usize) -> bool {
-    CATALOGUE
-        .iter()
-        .filter(|entry| entry.part == part && entry.target == TARGET)
-        .flat_map(|entry| entry.symbols)
-        .any(|symbol| {
-            symbol.class == ComputeClass::TensorCore && symbol.serves(precision, phase, rows)
-        })
-}
-
-/// The waiver that covers a gap, if one does.
-fn waiver(
-    part: Part,
-    precision: Precision,
-    phase: KernelPhase,
-    rows: usize,
-) -> Option<&'static Waiver> {
-    WAIVERS.iter().find(|waiver| {
-        waiver.part == Some(part)
-            && waiver.precision.is_none_or(|waived| waived == precision)
-            && waiver.phase.serves(phase)
-            && waiver.rows.contains(rows)
-    })
-}
-
-/// Whether a part's arithmetic is a matrix product, and so expects a tensor-core body.
-fn expects_tensor_core(part: Part) -> bool {
-    matches!(
-        part,
-        Part::DenseGemm | Part::DenseMlp | Part::Moe | Part::GroupedMoeGemm | Part::LmHead
-    )
 }
 
 /// The fit at each world and the stored-bytes-per-token floor.

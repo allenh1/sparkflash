@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The structural gates: no model CUDA tree, no model-to-model dependency, one workspace member.
+//! The structural gates: no model CUDA tree, no model-to-model dependency (a family may build on
+//! the shared dense host), one workspace member.
 
 use std::path::{Path, PathBuf};
 
@@ -83,6 +84,9 @@ fn no_model_crate_owns_cuda_or_a_kernel_build_script() {
     }
 }
 
+/// The one model crate another may depend on: the shared dense host.
+const SHARED_HOST: &str = "sparkflash-model-dense";
+
 #[test]
 fn no_model_crate_depends_on_another_model_crate() {
     let root = workspace_root();
@@ -97,7 +101,9 @@ fn no_model_crate_depends_on_another_model_crate() {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            if other_name == name {
+            // The shared dense host is the base a family's own parts plug into
+            // (`sparkflash onboard --emit` writes a crate on it), not a peer arm.
+            if other_name == name || other_name == SHARED_HOST {
                 continue;
             }
             assert!(

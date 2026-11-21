@@ -2467,6 +2467,126 @@ pub fn kernels(part: Part, target: Target) -> impl Iterator<Item = &'static Part
         .filter(move |entry| entry.part == part && entry.target == target)
 }
 
+/// The row count a tensor-core prompt probe asks the catalogue at: the grouped GEMM's floor.
+pub const TENSOR_CORE_PROMPT_ROWS: usize = crate::projection::QWEN_GEMM_MIN_BATCH;
+
+/// The tensor-core coverage of an architecture's matrix-product parts at TP 1, as
+/// `sparkflash onboard` reports it: for each part, precision and pass (a
+/// [TENSOR_CORE_PROMPT_ROWS]-row prompt and a one-row token), whether the catalogue has a
+/// tensor-core body, a [WAIVERS] line covers the gap, or neither does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TensorCoreGaps {
+    /// Gaps a [WAIVERS] line covers, each with the waiver's measurement.
+    pub waived: std::collections::BTreeSet<String>,
+    /// Gaps nothing covers: the family writes a body of its own (a `PartExec`).
+    pub needing: std::collections::BTreeSet<String>,
+}
+
+/// [TensorCoreGaps] for `architecture` at `target`.
+#[must_use]
+pub fn tensor_core_gaps(architecture: &Architecture, target: Target) -> TensorCoreGaps {
+    let needed = architecture.parts();
+    let mut per_part: std::collections::BTreeMap<Part, Vec<Precision>> =
+        std::collections::BTreeMap::new();
+    match crate::EnginePlan::for_architecture(architecture.clone(), target, 1, 0) {
+        Ok(plan) => {
+            for requirement in plan.requirements() {
+                let precisions = per_part.entry(requirement.part).or_default();
+                if !precisions.contains(&requirement.precision) {
+                    precisions.push(requirement.precision);
+                }
+            }
+        }
+        Err(_) => {
+            let policy = crate::PrecisionPolicy::from_architecture(architecture);
+            let all = [policy.dense, policy.experts, policy.attention, policy.mtp];
+            for part in needed.iter().filter(|part| expects_tensor_core(*part)) {
+                per_part.entry(part).or_default().extend(all);
+            }
+        }
+    }
+
+    let mut needing = std::collections::BTreeSet::new();
+    let mut waived = std::collections::BTreeSet::new();
+    for part in needed.iter().filter(|part| expects_tensor_core(*part)) {
+        let Some(precisions) = per_part.get(&part) else {
+            needing.insert(format!("{}: no TP1 requirement", part.name()));
+            continue;
+        };
+        for precision in precisions {
+            for (phase, rows) in [
+                (KernelPhase::Prefill, TENSOR_CORE_PROMPT_ROWS),
+                (KernelPhase::Decode, 1),
+            ] {
+                if has_tensor_core_body(target, part, *precision, phase, rows) {
+                    continue;
+                }
+                match tensor_core_waiver(part, *precision, phase, rows) {
+                    Some(waiver) => {
+                        waived.insert(format!(
+                            "{} {} {}: {}",
+                            part.name(),
+                            precision.name(),
+                            phase.name(),
+                            waiver.measurement
+                        ));
+                    }
+                    None => {
+                        needing.insert(format!(
+                            "{} {} {} ({} rows): no tensor-core body, no WAIVERS line",
+                            part.name(),
+                            precision.name(),
+                            phase.name(),
+                            rows
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    TensorCoreGaps { waived, needing }
+}
+
+/// Whether the catalogue exports a tensor-core body for a part, precision, pass and row count.
+fn has_tensor_core_body(
+    target: Target,
+    part: Part,
+    precision: Precision,
+    phase: KernelPhase,
+    rows: usize,
+) -> bool {
+    CATALOGUE
+        .iter()
+        .filter(|entry| entry.part == part && entry.target == target)
+        .flat_map(|entry| entry.symbols)
+        .any(|symbol| {
+            symbol.class == ComputeClass::TensorCore && symbol.serves(precision, phase, rows)
+        })
+}
+
+/// The waiver that covers a gap, if one does.
+fn tensor_core_waiver(
+    part: Part,
+    precision: Precision,
+    phase: KernelPhase,
+    rows: usize,
+) -> Option<&'static Waiver> {
+    WAIVERS.iter().find(|waiver| {
+        waiver.part == Some(part)
+            && waiver.precision.is_none_or(|waived| waived == precision)
+            && waiver.phase.serves(phase)
+            && waiver.rows.contains(rows)
+    })
+}
+
+/// Whether a part's arithmetic is a matrix product, and so expects a tensor-core body.
+fn expects_tensor_core(part: Part) -> bool {
+    matches!(
+        part,
+        Part::DenseGemm | Part::DenseMlp | Part::Moe | Part::GroupedMoeGemm | Part::LmHead
+    )
+}
+
 /// The parts the catalogue carries for target.
 ///
 /// A part is carried when at least one catalogue entry implements it, whether or not the image
