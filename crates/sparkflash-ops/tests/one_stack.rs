@@ -131,10 +131,11 @@ fn the_ops_crate_is_a_workspace_member() {
 /// arms: 36,566 -> 35,972 measured, so the gate is one above it. The one-serve-entry fold moved
 /// the arms' serving glue into `sparkflash_runtime::WalkArm` and the registration's remaining
 /// serving sites onto `sparkflash_model::ARMS`: 35,905 -> 35,855 measured, so the gate is one
-/// above it. Still owed: DeepSeek's 14,545-line serving path (`device_chain.rs`, `tp4_host.rs`,
+/// above it. Dory's serve on its tick engine and the one HTTP driver for the typed and the
+/// dynamic route leave 35,864. Still owed: DeepSeek's 14,545-line serving path (`device_chain.rs`, `tp4_host.rs`,
 /// `tp4_chain.rs`, `tp4_device_runner.rs`, `serve/device.rs`) folds into the common entry. The
 /// gate is lowered as those land; it never rises.
-const CLI_SOURCE_LINE_LIMIT: usize = 35_870;
+const CLI_SOURCE_LINE_LIMIT: usize = 35_865;
 
 #[test]
 fn the_deepseek_forward_is_out_of_the_cli_and_the_cli_is_below_34k_lines() {
