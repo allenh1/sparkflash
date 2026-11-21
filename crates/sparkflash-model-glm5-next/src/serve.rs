@@ -32,7 +32,7 @@
 //! as it scores a plain one.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
 use sparkflash_model::{
@@ -47,7 +47,7 @@ use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
 
 use crate::config::Glm5NextConfig;
 use crate::device::{CudaHandle, DeviceRank, LatentCache};
-use crate::walk::{GlmWalk, Shared, SpecConfig};
+use crate::walk::{Shared, SpecConfig};
 
 /// The device backend: one GLM-5.3-Flash rank on this host's GPU, alone or one of a
 /// tensor-parallel group.
@@ -66,7 +66,7 @@ pub struct Glm5NextDeviceBackend {
 /// does not.
 impl WalkArm for Glm5NextDeviceBackend {
     fn walk(&self, _capacity: usize) -> Result<impl Walk<Seq: Send> + Send + Sync, BackendError> {
-        GlmWalk::new(Arc::clone(&self.shared), self.context_limit)
+        crate::walk::walk(&self.shared)
     }
 
     /// The arm serves text.
@@ -301,13 +301,13 @@ impl Glm5NextDeviceBackend {
         let descriptor = descriptor_for(&config, context_limit);
         Ok(Self {
             descriptor,
-            shared: Arc::new(Shared {
-                rank: Mutex::new(rank),
+            shared: Arc::new(Shared::new(
+                rank,
                 tp,
                 gather,
-                eos: config.eos_token_ids.clone(),
-                spec: OnceLock::new(),
-            }),
+                config.eos_token_ids.clone(),
+                context_limit,
+            )?),
             context_limit,
             fused: None,
         })
@@ -376,8 +376,8 @@ impl Glm5NextDeviceBackend {
     /// # Errors
     /// A poisoned rank lock, or a rank whose cache plan cannot be read.
     #[cfg(test)]
-    pub(crate) fn walk_arm(&self) -> Result<GlmWalk, BackendError> {
-        GlmWalk::new(Arc::clone(&self.shared), self.context_limit)
+    pub(crate) fn walk_arm(&self) -> Result<crate::walk::GlmWalk, BackendError> {
+        crate::walk::walk(&self.shared)
     }
 
     /// Whether this backend steps its sessions together.
@@ -583,7 +583,7 @@ mod tests {
     fn the_backend_and_the_walk_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Glm5NextDeviceBackend>();
-        assert_send_sync::<sparkflash_runtime::Runtime<GlmWalk>>();
+        assert_send_sync::<sparkflash_runtime::Runtime<crate::walk::GlmWalk>>();
     }
 
     #[test]

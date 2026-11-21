@@ -245,7 +245,7 @@ pub use forward::{Glm5NextWeights, ReferenceState};
 pub use rank::{GlmDrafting, LoadedRank, glm_drafting};
 pub use serve::Glm5NextDeviceBackend;
 pub use tensor::{Glm5NextTensorPlan, Role, Split};
-pub use walk::{GlmDrafter, GlmSequence, GlmWalk};
+pub use walk::{GlmDrafter, GlmLane, GlmWalk};
 
 #[cfg(test)]
 mod tests {

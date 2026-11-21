@@ -2584,6 +2584,12 @@ impl DeviceSequence {
         self.capacity
     }
 
+    /// Whether the sequence holds a verify [DeviceRank::commit] has not settled.
+    #[must_use]
+    pub(crate) fn verifying(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Whether the rank's pool can back this sequence for `rows` positions now, counting the
     /// chunks a reset gives back first when `reset`: the answer [DeviceRank::back] would give.
     #[must_use]
@@ -3163,6 +3169,25 @@ impl DeviceRank {
     #[must_use]
     pub fn config(&self) -> &Glm5NextConfig {
         &self.config
+    }
+
+    /// Each layer's token mixer and feed-forward, as the parts the rank built them as: a KDA
+    /// recurrence or a DSA attention, a dense MLP or routed experts.
+    pub(crate) fn layer_parts(&self) -> Vec<(Part, Part)> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                let mixer = match layer.branch {
+                    DeviceBranch::Linear(_) => Part::KdaScan,
+                    DeviceBranch::Sparse(_) => Part::MlaAttention,
+                };
+                let ffn = match layer.ffn {
+                    DeviceFfn::Dense(_) => Part::DenseMlp,
+                    DeviceFfn::Moe(_) => Part::Moe,
+                };
+                (mixer, ffn)
+            })
+            .collect()
     }
 
     /// The rows one bulk prefill chunk may hold: the active profile's `prefill.chunk`, or
