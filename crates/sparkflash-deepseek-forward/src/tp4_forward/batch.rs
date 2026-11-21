@@ -69,10 +69,10 @@ use sparkflash_kernels::cuda_driver::HostMapped;
 use sparkflash_model::speculation::DepthPolicy;
 use sparkflash_model::vision::ImageSpan;
 use sparkflash_runtime::tick::{
-    ADOPT_MIN, Decision, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, QUEUE,
-    ShareClock, TickHost, TickRows, TogetherHost, TraceSink, WallClock, bulk_budget, bulk_from,
-    bulk_rows, common_prefix, decode_plan, decoder_resume, pick_lane, prefill_order,
-    reusable_shared, runs_decoder, skip_end_after, tick_prefill, tick_rows, whole_chunk_fits,
+    ADOPT_MIN, Decision, DecodePlan, DecodeShare, LaneCandidate, QUEUE, ShareClock, TickHost,
+    TickRows, TogetherHost, TraceSink, WallClock, bulk_budget, bulk_from, bulk_rows, common_prefix,
+    decode_plan, decoder_resume, pick_lane, prefill_order, reusable_shared, runs_decoder,
+    skip_end_after, tick_prefill, tick_rows, whole_chunk_fits,
 };
 use sparkflash_vision::IMAGE_TOKEN_ID;
 use std::sync::Arc;
@@ -373,7 +373,8 @@ pub(super) struct Batch<'b, 'a, 'r> {
     room: usize,
     reuse: bool,
     /// The shared-row floor below which a long-prefix lane is kept for another turn
-    /// ([`PREFIX_REUSE_MIN_ROWS`] unless SPARKFLASH_PREFIX_REUSE_MIN_ROWS says otherwise).
+    /// ([`sparkflash_runtime::tick::PREFIX_REUSE_MIN_ROWS`] unless
+    /// SPARKFLASH_PREFIX_REUSE_MIN_ROWS says otherwise).
     prefix_reuse_min_rows: usize,
     early: bool,
     exact_prefill: bool,
@@ -443,14 +444,8 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             exchange,
             counter: Cell::new(0),
             room,
-            reuse: sparkflash_model::active_profile()
-                .diagnostics
-                .prefix_cache
-                .unwrap_or(true),
-            prefix_reuse_min_rows: sparkflash_model::active_profile()
-                .diagnostics
-                .prefix_reuse_min_rows
-                .unwrap_or(PREFIX_REUSE_MIN_ROWS),
+            reuse: sparkflash_runtime::tick::prefix_reuse().0,
+            prefix_reuse_min_rows: sparkflash_runtime::tick::prefix_reuse().1,
             early: sparkflash_model::active_profile()
                 .diagnostics
                 .engram_ahead
@@ -1152,7 +1147,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             // The longest shared prefix, else the least recently used lane. A short match against
             // a lane holding a long prefix keeps the prefix: that lane is passed over (the least
             // recently used empty lane takes the sequence) so the next turn that does share the
-            // prefix still finds it. A match of [`PREFIX_REUSE_MIN_ROWS`] rows or more is always
+            // prefix still finds it. A match of `PREFIX_REUSE_MIN_ROWS` rows or more is always
             // used, and so is any match on a lane holding fewer.
             // SPARKFLASH_PREFIX_REUSE_MIN_ROWS moves the floor (`0` reuses every match).
             let Some(picked) = pick_lane(free.map(|lane| {

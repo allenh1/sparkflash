@@ -57,6 +57,23 @@ pub const SHARE_MIN_ROWS: usize = 16384;
 /// (SPARKFLASH_PREFIX_REUSE_MIN_ROWS).
 pub const PREFIX_REUSE_MIN_ROWS: usize = 256;
 
+/// Whether a prompt reuses what a lane holds, and the fewest shared rows a match on a lane
+/// holding a long prefix must have ([reusable_shared]), as the active profile states them
+/// (`diagnostics.prefix_cache`, SPARKFLASH_PREFIX_REUSE_MIN_ROWS); DeepSeek's defaults when it
+/// states neither. Every scheduler reads these here, so a switch is never honoured by one and
+/// ignored by another.
+#[must_use]
+pub fn prefix_reuse() -> (bool, usize) {
+    let profile = sparkflash_model::active_profile();
+    (
+        profile.diagnostics.prefix_cache.unwrap_or(true),
+        profile
+            .diagnostics
+            .prefix_reuse_min_rows
+            .unwrap_or(PREFIX_REUSE_MIN_ROWS),
+    )
+}
+
 /// The rows the shared step's cost model bends at: a step of up to this many rows is the
 /// narrow body, past it the wide one (the bucket split the model is fit over).
 pub const BAND_ROWS: usize = 16;

@@ -65,10 +65,10 @@ use crate::ledger::{Ledger, Mode, Strategy};
 use crate::runtime::Part;
 use crate::runtime::{Runtime, RuntimeSlot, StepMode};
 use crate::tick::{
-    Clock, Decision, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, QUEUE,
-    ShareClock, StepModel, TickHost, TickRows, TickTrace, TogetherHost, TraceSink, WallClock,
-    bulk_budget, bulk_from, common_prefix, decode_plan, pick_lane, prefill_order, reusable_shared,
-    tick_chunks, tick_prefill, tick_rows, whole_chunk_fits,
+    Clock, Decision, DecodePlan, DecodeShare, LaneCandidate, QUEUE, ShareClock, StepModel,
+    TickHost, TickRows, TickTrace, TogetherHost, TraceSink, WallClock, bulk_budget, bulk_from,
+    common_prefix, decode_plan, pick_lane, prefill_order, reusable_shared, tick_chunks,
+    tick_prefill, tick_rows, whole_chunk_fits,
 };
 use crate::walk::{Drafter, Hidden, PassMask, Vision, Walk, WalkHook};
 
@@ -147,10 +147,10 @@ impl TickConfig {
             busy_chunk: 2048,
             busy_exact_steps: 1,
             share: DecodeShare::new(0.5, 200_000.0),
-            prefix_reuse_min_rows: PREFIX_REUSE_MIN_ROWS,
+            prefix_reuse_min_rows: crate::tick::prefix_reuse().1,
             bulk_cap: Some(4096),
             ways: 3,
-            reuse: true,
+            reuse: crate::tick::prefix_reuse().0,
             exchange: true,
             decoder_skip: true,
             batch_spec: Some(0.2),
@@ -180,7 +180,7 @@ impl TickConfig {
             busy_chunk: chunk,
             busy_exact_steps: 1,
             share: DecodeShare::new(0.5, 200_000.0),
-            prefix_reuse_min_rows: PREFIX_REUSE_MIN_ROWS,
+            prefix_reuse_min_rows: crate::tick::prefix_reuse().1,
             bulk_cap: Some(chunk),
             // Several chunks a tick need the paired pass; an arm without it runs one.
             ways: if W::CAPABILITIES.passes.contains(PassMask::PAIRED) {
@@ -188,7 +188,7 @@ impl TickConfig {
             } else {
                 1
             },
-            reuse: true,
+            reuse: crate::tick::prefix_reuse().0,
             // Dense (and every arm but DeepSeek) has no row exchange to pair chunks over.
             exchange: false,
             decoder_skip: false,

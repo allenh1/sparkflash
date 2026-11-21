@@ -1053,11 +1053,17 @@ fn run_request(
         };
         lease.keep(Held { session, pending });
     }
-    ending.map_err(Ending::message)
+    // The client hears the end only once the sequence is back in the pool, so a next turn sent
+    // the moment this one ends finds it held rather than racing the keep.
+    let summary = ending.map_err(Ending::message)?;
+    job.replies
+        .blocking_send(Reply::Done(summary))
+        .map_err(|_| Ending::ClientGone.message())
 }
 
 /// Runs `job` on `session` as `plan` says, and returns how it ended with the step after the last
-/// token the session holds, when the request moved the session.
+/// token the session holds, when the request moved the session. A request that ran to its end
+/// returns its summary unsent: the caller keeps the sequence first, then sends it.
 fn serve_request(
     session: &mut dyn ModelSession,
     codec: &dyn PromptCodec,
@@ -1066,7 +1072,7 @@ fn serve_request(
     plan: &Continuation,
     pending: Option<&StepOutput>,
     started: Instant,
-) -> (Result<(), Ending>, Option<StepOutput>) {
+) -> (Result<Box<HostSummary>, Ending>, Option<StepOutput>) {
     let send = |reply: Reply| {
         job.replies
             .blocking_send(reply)
@@ -1203,14 +1209,14 @@ fn serve_request(
         FinishReason::Stop
     };
     let speculation = session.speculation();
-    let ending = send(Reply::Done(Box::new(HostSummary {
+    let summary = Box::new(HostSummary {
         completion_tokens,
         finish_reason,
         timing,
         speculation,
         cached_tokens: cached,
-    })));
-    (ending, Some(step))
+    });
+    (Ok(summary), Some(step))
 }
 
 /// Decodes the whole generated prefix and returns the part that is new ([settled_delta]).
