@@ -66,6 +66,8 @@ fn hyper() -> Residual {
         manifold: true,
         sinkhorn_iters: 20,
         epsilon: 1e-6,
+        ihc: false,
+        magnitude: None,
     })
 }
 
@@ -102,6 +104,7 @@ fn layer(index: usize, kind: AttentionKind, ffn: Ffn) -> Layer {
         ffn,
         residual: hyper(),
         sides: Vec::new(),
+        post_norm: false,
     }
 }
 

@@ -127,6 +127,8 @@ pub(crate) fn tiny_architecture() -> Architecture {
             manifold: false,
             sinkhorn_iters: 0,
             epsilon: 0.0,
+            ihc: false,
+            magnitude: None,
         })
     };
     Architecture {
@@ -171,6 +173,7 @@ pub(crate) fn tiny_architecture() -> Architecture {
                     split_parts: 2,
                     vocab_multiple: 8,
                 })],
+                post_norm: false,
             },
             Layer {
                 index: 1,
@@ -195,11 +198,13 @@ pub(crate) fn tiny_architecture() -> Architecture {
                         always_select_tail: false,
                         activation: Activation::Relu,
                         candidate_pool: None,
+                        compressed: None,
                     }),
                 },
                 ffn: ffn(),
                 residual: residual(),
                 sides: Vec::new(),
+                post_norm: false,
             },
         ],
         // The fixture's experts are the NVFP4 release's, declared the way the Qwen schema names
@@ -250,11 +255,13 @@ impl Qwen4ExpConfig {
         self.architecture.steps()
     }
 
-    /// Refuse a typed configuration that disagrees with the shared architecture.
+    /// Refuse a typed configuration that disagrees with the shared architecture, or a typed
+    /// switch the arm does not run.
     ///
     /// # Errors
-    /// [ConfigError::Invalid] naming the first field that differs.
+    /// [ConfigError::Invalid] naming the first field that differs, or the switches.
     pub fn cross_check(&self, architecture: &Architecture) -> Result<(), ConfigError> {
+        architecture.refuse_switches(&[])?;
         check("hidden_size", self.hidden_size, architecture.hidden_size)?;
         check("vocab_size", self.vocab_size, architecture.vocab_size)?;
         check(

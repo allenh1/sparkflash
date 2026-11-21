@@ -74,6 +74,8 @@ pub fn tiny_architecture() -> Architecture {
             manifold: true,
             sinkhorn_iters: 20,
             epsilon: 1e-6,
+            ihc: false,
+            magnitude: None,
         })
     }
     fn moe() -> Ffn {
@@ -121,6 +123,7 @@ pub fn tiny_architecture() -> Architecture {
             },
             residual: residual(),
             sides: Vec::new(),
+            post_norm: false,
         }
     }
     fn mla(index: usize, indexer: Option<Indexer>) -> Layer {
@@ -132,6 +135,9 @@ pub fn tiny_architecture() -> Architecture {
                     kv_lora_rank: 16,
                     v_head_dim: 8,
                     groups: None,
+                    output_gate: false,
+                    qk_norm: false,
+                    sinks: false,
                 },
                 heads: 4,
                 head_dim: 8,
@@ -143,6 +149,7 @@ pub fn tiny_architecture() -> Architecture {
             ffn: moe(),
             residual: residual(),
             sides: Vec::new(),
+            post_norm: false,
         }
     }
     let full_indexer = Indexer {
@@ -156,6 +163,7 @@ pub fn tiny_architecture() -> Architecture {
         always_select_tail: true,
         activation: Activation::Relu,
         candidate_pool: None,
+        compressed: None,
     };
     Architecture {
         family: MODEL_TYPE.to_owned(),
@@ -212,11 +220,12 @@ impl Glm5NextConfig {
     /// architecture's KDA and MLA counts; the dense and MoE layer counts; and the number of
     /// layers that run their own indexer. A disagreement is refused with the first field named,
     /// so a released document that changes shape cannot load while only one of the two views
-    /// follows it.
+    /// follows it. A typed switch the arm does not run is refused by name.
     ///
     /// # Errors
-    /// [ConfigError::Invalid] naming the first field whose values disagree.
+    /// [ConfigError::Invalid] naming the first field whose values disagree, or the switches.
     pub fn cross_check(&self, architecture: &Architecture) -> Result<(), ConfigError> {
+        architecture.refuse_switches(&[])?;
         if architecture.family != MODEL_TYPE {
             return Err(ConfigError::Invalid(format!(
                 "family = {:?} in the shared architecture, expected {MODEL_TYPE:?}",
@@ -371,6 +380,9 @@ mod tests {
             kv_lora_rank: config.kv_lora_rank,
             v_head_dim: config.v_head_dim,
             groups: None,
+            output_gate: false,
+            qk_norm: false,
+            sinks: false,
         };
         let error = config
             .cross_check(&architecture)

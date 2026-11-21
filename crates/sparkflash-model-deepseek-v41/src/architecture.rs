@@ -56,11 +56,13 @@ fn shared_error(error: sparkflash_model::ConfigError) -> ConfigError {
 }
 
 impl ModelConfig {
-    /// Refuse a typed configuration that disagrees with the shared architecture.
+    /// Refuse a typed configuration that disagrees with the shared architecture, or a typed
+    /// switch the arm does not run.
     ///
     /// # Errors
-    /// [ConfigError::Invalid] naming the first field that differs.
+    /// [ConfigError::Invalid] naming the first field that differs, or the switches.
     pub fn cross_check(&self, architecture: &Architecture) -> Result<(), ConfigError> {
+        architecture.refuse_switches(&[]).map_err(shared_error)?;
         check("hidden_size", self.dim, architecture.hidden_size)?;
         check("vocab_size", self.vocab_size, architecture.vocab_size)?;
         check(

@@ -3050,6 +3050,7 @@ pub fn dense_device_refusal_hosting(architecture: &Architecture, own: &[Part]) -
                 !matches!(layer.residual, Residual::Plain),
                 "a widened residual",
             ),
+            (layer.post_norm, "a norm after each sublayer"),
         ];
         if let Some((_, what)) = declared.iter().find(|(declared, _)| *declared) {
             return Some(format!(

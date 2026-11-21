@@ -183,6 +183,9 @@ pub struct Layer {
     pub residual: Residual,
     /// Lookups that land on this layer's input, such as Engram or the n-gram PLE.
     pub sides: Vec<Side>,
+    /// Whether each sublayer's output is normed before it lands on the residual, as well as its
+    /// input before it (`sandwich_norm`).
+    pub post_norm: bool,
 }
 
 /// The attention arithmetic of one layer.
@@ -217,6 +220,12 @@ pub enum AttentionKind {
         v_head_dim: usize,
         /// The grouped low-rank output, when the layer has one.
         groups: Option<OutputGroups>,
+        /// Whether the output is multiplied by a learned elementwise gate (`gated_mla`).
+        output_gate: bool,
+        /// Whether the queries and keys take per-head RMSNorms (`qk_norm`).
+        qk_norm: bool,
+        /// Whether every head carries a learned attention sink (`learnable_sink`).
+        sinks: bool,
     },
     /// Grouped-query attention.
     Gqa {
@@ -337,6 +346,9 @@ pub struct Indexer {
     pub activation: Activation,
     /// The hierarchical candidate pool, when the indexer builds or reads one.
     pub candidate_pool: Option<CandidatePool>,
+    /// The compressed stage that scores pooled keys ahead of the fine indexer, when the release
+    /// runs one (`use_compressed_indexer`).
+    pub compressed: Option<CompressedStage>,
 }
 
 impl Indexer {
@@ -346,6 +358,35 @@ impl Indexer {
     pub const fn max_selected(&self) -> usize {
         (self.topk / self.pool) * self.pool + self.pool.saturating_sub(1)
     }
+}
+
+/// The compressed indexer stage: its own heads score keys pooled `ratio` to one, and the
+/// positions of its best pools are the candidates the fine indexer picks from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressedStage {
+    /// The stage's query heads.
+    pub heads: usize,
+    /// The stage's head width.
+    pub head_dim: usize,
+    /// Tokens pooled into one scored key.
+    pub ratio: usize,
+    /// How a pool's keys become one key.
+    pub pooling: KeyPooling,
+    /// Token candidates the stage hands on.
+    pub candidates: usize,
+    /// Pools the stage keeps a query.
+    pub group_topk: usize,
+    /// Whether the stage reuses the fine indexer's projections instead of its own.
+    pub reuse_fine: bool,
+    /// Whether the stage's candidates are the selection, with no fine pick after it.
+    pub skip_fine: bool,
+}
+
+/// How a compressed indexer stage pools a run of keys into one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPooling {
+    /// A learned per-token gate weighs the pool's keys (`gated`).
+    Gated,
 }
 
 /// The HSI candidate pool.
@@ -471,6 +512,10 @@ pub struct HyperConnection {
     pub sinkhorn_iters: usize,
     /// The mix's epsilon.
     pub epsilon: f64,
+    /// Whether the mix is the iHC variant (`enable_ihc`).
+    pub ihc: bool,
+    /// The declared magnitude of the mix (`hc_magnitude`), when the release declares one.
+    pub magnitude: Option<f64>,
 }
 
 /// A lookup that lands on a layer's input.
@@ -499,6 +544,9 @@ pub struct EngramGeometry {
     pub compressed_vocab: usize,
     /// The padding id the compressor skips.
     pub pad_id: u32,
+    /// For each Engram layer (in the order of `tables`), the rows of each hash head's own table,
+    /// every n-gram order's heads in turn; empty for one compressed-vocabulary table a layer.
+    pub head_rows: Vec<Vec<usize>>,
 }
 
 /// n-gram PLE geometry.
@@ -520,6 +568,87 @@ pub struct PleGeometry {
     pub split_parts: usize,
     /// The table's padded row count is a multiple of this.
     pub vocab_multiple: u64,
+}
+
+/// A typed switch that changes a layer's arithmetic and that most arms do not run.
+///
+/// [Architecture::switches] lists the ones a parse turned on; an arm passes the ones it runs to
+/// [Architecture::refuse_switches], which refuses the rest by name. Every switch is off in every
+/// released config an arm serves today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Switch {
+    /// Learned attention sinks on an MLA layer.
+    Sinks,
+    /// The elementwise gate on an MLA layer's output.
+    MlaOutputGate,
+    /// Per-head query and key norms on an MLA layer.
+    MlaQkNorm,
+    /// Layers whose query heads are not the other layers' ([Attention::heads]).
+    SlidingHeads,
+    /// A norm after each sublayer as well as before it ([Layer::post_norm]).
+    PostNorm,
+    /// The iHC variant of the hyper-connection mix ([HyperConnection::ihc]).
+    Ihc,
+    /// A declared hyper-connection magnitude ([HyperConnection::magnitude]).
+    HcMagnitude,
+    /// The compressed stage ahead of the fine indexer ([Indexer::compressed]).
+    CompressedIndexer,
+    /// Per-head hashed Engram tables ([EngramGeometry::head_rows]).
+    EngramHeadTables,
+}
+
+impl Switch {
+    /// The `config.json` field that declares the switch.
+    #[must_use]
+    pub const fn field(self) -> &'static str {
+        match self {
+            Self::Sinks => "learnable_sink",
+            Self::MlaOutputGate => "gated_mla",
+            Self::MlaQkNorm => "qk_norm",
+            Self::SlidingHeads => "swa_num_attention_heads",
+            Self::PostNorm => "sandwich_norm",
+            Self::Ihc => "enable_ihc",
+            Self::HcMagnitude => "hc_magnitude",
+            Self::CompressedIndexer => "use_compressed_indexer",
+            Self::EngramHeadTables => "engram_layer_head_vocab_sizes",
+        }
+    }
+
+    /// What the switch does, for a refusal.
+    #[must_use]
+    pub const fn what(self) -> &'static str {
+        match self {
+            Self::Sinks => "learned attention sinks",
+            Self::MlaOutputGate => "a learned gate on MLA's output",
+            Self::MlaQkNorm => "per-head query and key norms in MLA",
+            Self::SlidingHeads => "sliding layers with a head count of their own",
+            Self::PostNorm => "a norm after each sublayer as well as before",
+            Self::Ihc => "the iHC residual mix",
+            Self::HcMagnitude => "a hyper-connection magnitude",
+            Self::CompressedIndexer => "a compressed indexer stage before the fine indexer",
+            Self::EngramHeadTables => "per-head hashed Engram tables",
+        }
+    }
+
+    /// The step role whose body runs the switch.
+    #[must_use]
+    pub const fn role(self) -> crate::compose::StepRole {
+        use crate::compose::StepRole;
+        match self {
+            Self::Sinks | Self::MlaOutputGate | Self::MlaQkNorm | Self::SlidingHeads => {
+                StepRole::Attention
+            }
+            Self::PostNorm | Self::Ihc | Self::HcMagnitude => StepRole::Residual,
+            Self::CompressedIndexer => StepRole::Indexer,
+            Self::EngramHeadTables => StepRole::Side,
+        }
+    }
+}
+
+impl std::fmt::Display for Switch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} ({})", self.field(), self.what())
+    }
 }
 
 /// The MTP/DSpark stages a checkpoint carries.
@@ -829,44 +958,117 @@ impl Architecture {
                  layers would parse as dense MLPs)"
             ));
         }
-        if text.get("engram_layer_head_vocab_sizes").is_some() {
-            found.push(
-                "engram_layer_head_vocab_sizes (per-head hashed Engram tables; this build's Engram \
-                 part looks up one compressed-vocabulary table a layer)"
-                    .to_owned(),
-            );
-        }
-        // Switches that change a layer's arithmetic and that no field of [Layer] carries. Each is
-        // named only when the document turns it on.
-        for (field, what) in [
+        // The typed switches ([Switch]) are fields of the parse, not drops; a switch is named here
+        // only when the layers it would land on are not there to carry it.
+        let layers = Self::from_value(root)
+            .map(|parsed| parsed.layers)
+            .unwrap_or_default();
+        let mla = layers
+            .iter()
+            .any(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }));
+        let hyper = layers
+            .iter()
+            .any(|layer| matches!(layer.residual, Residual::Hyper(_)));
+        let indexed = layers.iter().any(|layer| layer.attention.indexer.is_some());
+        let engram = layers.iter().any(|layer| {
+            layer
+                .sides
+                .iter()
+                .any(|side| matches!(side, Side::Engram(_)))
+        });
+        for (field, typed, what) in [
             (
-                "sandwich_norm",
-                "a norm after each sublayer as well as before is not modelled",
+                "learnable_sink",
+                mla,
+                "learned attention sinks are modelled on MLA layers only",
             ),
-            ("learnable_sink", "learned attention sinks are not modelled"),
+            (
+                "gated_mla",
+                mla,
+                "the gate on MLA's output has no MLA layer to land on",
+            ),
+            (
+                "qk_norm",
+                mla,
+                "per-head query/key norms are read for MLA layers only",
+            ),
             (
                 "enable_ihc",
-                "the iHC residual mix is not the hyper-connection this parser reads",
+                hyper,
+                "the iHC residual mix has no hyper-connected residual to land on",
             ),
             (
                 "use_compressed_indexer",
-                "the compressed indexer stage before the fine indexer is not modelled",
+                indexed,
+                "the compressed indexer stage has no indexer to precede",
             ),
-            ("gated_mla", "the gate on MLA's output is not modelled"),
-            ("qk_norm", "per-head query/key norms are not modelled"),
         ] {
-            if optional_bool(text, field).ok().flatten() == Some(true) {
+            if !typed && optional_bool(text, field).ok().flatten() == Some(true) {
                 found.push(format!("{field} ({what})"));
             }
         }
-        if text.get("d_rel").is_none()
-            && let Some(sliding) = text.get("swa_num_attention_heads").and_then(Value::as_u64)
-            && text.get("num_attention_heads").and_then(Value::as_u64) != Some(sliding)
+        if !engram && text.get("engram_layer_head_vocab_sizes").is_some() {
+            found.push(
+                "engram_layer_head_vocab_sizes (per-head Engram tables with no Engram layer to \
+                 land on)"
+                    .to_owned(),
+            );
+        }
+        if optional_bool(text, "dsa_skip_attn_post_norm")
+            .ok()
+            .flatten()
+            == Some(true)
         {
-            found.push(format!(
-                "swa_num_attention_heads {sliding} (sliding layers with heads and widths of their \
-                 own are read as the full layers' shape)"
-            ));
+            found.push(
+                "dsa_skip_attn_post_norm (sparse layers that skip their attention's post-norm \
+                 are not modelled)"
+                    .to_owned(),
+            );
+        }
+        if mla && optional_bool(text, "gated_mla").ok().flatten() == Some(true) {
+            let groups = text.get("gate_groups").and_then(Value::as_u64).unwrap_or(1);
+            let low_rank = text
+                .get("gate_lora_rank")
+                .is_some_and(|rank| !rank.is_null());
+            if groups > 1 || low_rank {
+                found.push(format!(
+                    "gate_groups {groups} / gate_lora_rank (a grouped or low-rank MLA output gate \
+                     is not the elementwise gate this parser reads)"
+                ));
+            }
+        }
+        if text.get("d_rel").is_none() && text.get("swa_num_attention_heads").is_some() {
+            // The sliding layers' head count is typed; head widths or key/value heads of their own
+            // are not, and would be read as the full layers' shape.
+            let sliding_layers = string_list(text.get("layer_types"))
+                .unwrap_or_default()
+                .iter()
+                .any(|kind| kind.contains("sliding"));
+            if !sliding_layers
+                && let Some(sliding) = text.get("swa_num_attention_heads").and_then(Value::as_u64)
+                && text.get("num_attention_heads").and_then(Value::as_u64) != Some(sliding)
+            {
+                found.push(format!(
+                    "swa_num_attention_heads {sliding} (a sliding head count with no sliding \
+                     layer to land on)"
+                ));
+            }
+            for (field, full) in [
+                ("swa_qk_head_dim", "qk_head_dim"),
+                ("swa_qk_nope_head_dim", "qk_nope_head_dim"),
+                ("swa_qk_rope_head_dim", "qk_rope_head_dim"),
+                ("swa_v_head_dim", "v_head_dim"),
+                ("swa_num_key_value_heads", "num_key_value_heads"),
+            ] {
+                if let Some(sliding) = text.get(field).and_then(Value::as_u64)
+                    && text.get(full).and_then(Value::as_u64) != Some(sliding)
+                {
+                    found.push(format!(
+                        "{field} {sliding} (sliding layers with a shape of their own are read as \
+                         the full layers' {full})"
+                    ));
+                }
+            }
         }
         if let Some(config) = quantization_config(root) {
             let declared = optional_string(config, "quant_method")
@@ -888,6 +1090,143 @@ impl Architecture {
             }
         }
         found
+    }
+
+    /// The typed switches this architecture turns on, in [Switch] order.
+    ///
+    /// Each layer is destructured whole, so a field added to [Layer], [Attention], the MLA kind,
+    /// [HyperConnection], [Indexer] or [EngramGeometry] has to be placed here or ignored here by
+    /// name.
+    #[must_use]
+    pub fn switches(&self) -> Vec<Switch> {
+        let mut on = std::collections::BTreeSet::new();
+        let first_heads = self.layers.first().map(|layer| layer.attention.heads);
+        for layer in &self.layers {
+            let Layer {
+                index: _,
+                attention,
+                ffn: _,
+                residual,
+                sides,
+                post_norm,
+            } = layer;
+            let Attention {
+                kind,
+                heads,
+                head_dim: _,
+                window: _,
+                rope: _,
+                compression: _,
+                indexer,
+            } = attention;
+            if *post_norm {
+                on.insert(Switch::PostNorm);
+            }
+            if Some(*heads) != first_heads {
+                on.insert(Switch::SlidingHeads);
+            }
+            match kind {
+                AttentionKind::Mla {
+                    q_lora_rank: _,
+                    kv_lora_rank: _,
+                    v_head_dim: _,
+                    groups: _,
+                    output_gate,
+                    qk_norm,
+                    sinks,
+                } => {
+                    for (declared, switch) in [
+                        (*output_gate, Switch::MlaOutputGate),
+                        (*qk_norm, Switch::MlaQkNorm),
+                        (*sinks, Switch::Sinks),
+                    ] {
+                        if declared {
+                            on.insert(switch);
+                        }
+                    }
+                }
+                AttentionKind::Gqa { .. }
+                | AttentionKind::Gdn(_)
+                | AttentionKind::Kda(_)
+                | AttentionKind::Inkling { .. } => {}
+            }
+            if let Some(Indexer {
+                heads: _,
+                head_dim: _,
+                kv_heads: _,
+                topk: _,
+                owns_keys: _,
+                reuse: _,
+                pool: _,
+                always_select_tail: _,
+                activation: _,
+                candidate_pool: _,
+                compressed,
+            }) = indexer
+                && compressed.is_some()
+            {
+                on.insert(Switch::CompressedIndexer);
+            }
+            match residual {
+                Residual::Hyper(HyperConnection {
+                    streams: _,
+                    lowrank: _,
+                    manifold: _,
+                    sinkhorn_iters: _,
+                    epsilon: _,
+                    ihc,
+                    magnitude,
+                }) => {
+                    if *ihc {
+                        on.insert(Switch::Ihc);
+                    }
+                    if magnitude.is_some() {
+                        on.insert(Switch::HcMagnitude);
+                    }
+                }
+                Residual::Plain | Residual::BlockAttention => {}
+            }
+            for side in sides {
+                match side {
+                    Side::Engram(EngramGeometry {
+                        tables: _,
+                        max_ngram: _,
+                        heads: _,
+                        head_dim: _,
+                        vocab_size: _,
+                        compressed_vocab: _,
+                        pad_id: _,
+                        head_rows,
+                    }) => {
+                        if !head_rows.is_empty() {
+                            on.insert(Switch::EngramHeadTables);
+                        }
+                    }
+                    Side::Ple(_) => {}
+                }
+            }
+        }
+        on.into_iter().collect()
+    }
+
+    /// Refuse, by name, every switch this architecture turns on that is not in `runs`.
+    ///
+    /// # Errors
+    /// [ConfigError::Invalid] naming each switch the caller does not run.
+    pub fn refuse_switches(&self, runs: &[Switch]) -> Result<(), ConfigError> {
+        let refused: Vec<String> = self
+            .switches()
+            .into_iter()
+            .filter(|switch| !runs.contains(switch))
+            .map(|switch| switch.to_string())
+            .collect();
+        if refused.is_empty() {
+            return Ok(());
+        }
+        Err(invalid(format!(
+            "the release declares {}, which this arm does not run",
+            refused.join(", ")
+        )))
     }
 
     /// Re-describe a Qwen FP8 release whose global `fp8` flag quantises only its routed experts.
@@ -1496,6 +1835,7 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
     let ple_layers = usize_list(text.get("ple_layer_ids"))?;
     let engram_geometry = engram_geometry(text)?;
     let ple_geometry = ple_geometry(text)?;
+    let post_norm = optional_bool(text, "sandwich_norm")?.unwrap_or(false);
     let schedule = Schedule {
         kv_sources: &kv_sources,
         index_sources: &index_sources,
@@ -1528,7 +1868,32 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
             ffn,
             residual,
             sides,
+            post_norm,
         });
+    }
+    if text.get("d_rel").is_none()
+        && let Some(sliding_heads) = optional_usize(text, "swa_num_attention_heads")?
+    {
+        // A release with sliding layers of their own head count (Hy4-flash's) names the count
+        // once. Its sliding layers take that count and the window and run no indexer; its other
+        // layers attend over the whole context. Head widths of their own are named by
+        // [Architecture::unmodelled_features].
+        if sliding_heads == 0 {
+            return Err(invalid("swa_num_attention_heads must not be zero"));
+        }
+        let window = optional_usize(text, "sliding_window")?;
+        for layer in &mut layers {
+            let sliding = layer_types
+                .get(layer.index)
+                .is_some_and(|kind| kind.contains("sliding"));
+            if sliding {
+                layer.attention.heads = sliding_heads;
+                layer.attention.window = window;
+                layer.attention.indexer = None;
+            } else {
+                layer.attention.window = None;
+            }
+        }
     }
     if text.get("d_rel").is_some() {
         // Inkling's attention is GQA shaped but has no rotary embedding: it carries a learned
@@ -1611,6 +1976,7 @@ fn dory_layers(text: &Value) -> Result<Vec<Layer>, ConfigError> {
             ffn,
             residual: Residual::Plain,
             sides: Vec::new(),
+            post_norm: false,
         });
     }
     Ok(layers)
@@ -1803,6 +2169,9 @@ fn attention(
                 (Some(groups), Some(rank)) => Some(OutputGroups { groups, rank }),
                 _ => None,
             },
+            output_gate: mla_output_gate(text)?,
+            qk_norm: optional_bool(text, "qk_norm")?.unwrap_or(false),
+            sinks: optional_bool(text, "learnable_sink")?.unwrap_or(false),
         }
     } else if is_sparse {
         // A standard dense/GQA configuration carries no learned output gate; the Qwen and GLM
@@ -1853,6 +2222,20 @@ fn attention(
         compression,
         indexer,
     })
+}
+
+/// Whether MLA's output takes the learned gate `gated_mla` declares; a gate of a kind other than
+/// elementwise is refused by name.
+fn mla_output_gate(text: &Value) -> Result<bool, ConfigError> {
+    if optional_bool(text, "gated_mla")? != Some(true) {
+        return Ok(false);
+    }
+    match optional_string(text, "gating_type").as_deref() {
+        None | Some("elementwise") => Ok(true),
+        Some(other) => Err(invalid(format!(
+            "gating_type {other:?} is not the elementwise MLA output gate this parser reads"
+        ))),
+    }
 }
 
 fn indexer(
@@ -1921,6 +2304,35 @@ fn indexer(
         candidate_pool: schedule
             .candidate_pool
             .filter(|pool| ratio > 0 && index >= pool.source_layer),
+        compressed: compressed_stage(text)?,
+    }))
+}
+
+/// The compressed indexer stage `use_compressed_indexer` turns on, read from its
+/// `compressed_indexer_*` fields.
+fn compressed_stage(text: &Value) -> Result<Option<CompressedStage>, ConfigError> {
+    if optional_bool(text, "use_compressed_indexer")? != Some(true) {
+        return Ok(None);
+    }
+    let context = "the compressed indexer stage";
+    let pooling = match optional_string(text, "compressed_indexer_key_pooling").as_deref() {
+        Some("gated") => KeyPooling::Gated,
+        other => {
+            return Err(invalid(format!(
+                "compressed_indexer_key_pooling {other:?} is not the gated pooling this parser \
+                 reads"
+            )));
+        }
+    };
+    Ok(Some(CompressedStage {
+        heads: required_usize(text, "compressed_indexer_num_attention_heads", context)?,
+        head_dim: required_usize(text, "compressed_indexer_head_dim", context)?,
+        ratio: required_usize(text, "compressed_indexer_compress_ratio", context)?,
+        pooling,
+        candidates: required_usize(text, "compressed_indexer_candidate_topk", context)?,
+        group_topk: required_usize(text, "compressed_indexer_group_topk", context)?,
+        reuse_fine: optional_bool(text, "compressed_indexer_reuse_fine_indexer")?.unwrap_or(false),
+        skip_fine: optional_bool(text, "compressed_indexer_skip_fine_select")?.unwrap_or(false),
     }))
 }
 
@@ -2019,6 +2431,8 @@ fn residual(text: &Value) -> Result<Residual, ConfigError> {
         manifold: optional_bool(text, "mhc")?.unwrap_or(false),
         sinkhorn_iters: optional_usize(text, "hc_sinkhorn_iters")?.unwrap_or(0),
         epsilon: optional_f64(text, "hc_eps")?.unwrap_or(0.0),
+        ihc: optional_bool(text, "enable_ihc")?.unwrap_or(false),
+        magnitude: optional_f64(text, "hc_magnitude")?,
     }))
 }
 
@@ -2125,6 +2539,7 @@ fn engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
         vocab_size: optional_usize(text, "engram_vocab_size")?.unwrap_or(0),
         compressed_vocab: optional_usize(text, "engram_compressed_vocab_size")?.unwrap_or(0),
         pad_id: optional_usize(text, "engram_pad_token_id")?.unwrap_or(0) as u32,
+        head_rows: Vec::new(),
     })
 }
 
@@ -2133,11 +2548,11 @@ fn engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
 /// hash head, its row count a prime (`engram_layer_head_vocab_sizes`, keyed by layer id). Each
 /// order's `engram_n_embed_per_ngram` columns are split over its `engram_n_head_per_ngram` heads.
 ///
-/// The geometry is read so a plan can size the tables: a layer's rows are the sum of its heads'
-/// rows, its heads are every order's heads, and `vocab_size` is zero because the document names
-/// no single vocabulary the keys are drawn from. The per-head hashing itself is a different
-/// lookup from the compressed-vocabulary one this build's Engram part runs, which
-/// [Architecture::unmodelled_features] names.
+/// A layer's rows are the sum of its heads' rows, its heads are every order's heads, and
+/// `vocab_size` is zero because the document names no single vocabulary the keys are drawn from.
+/// Each head's own row count is kept in `head_rows`: the per-head hashing is a different lookup
+/// from the compressed-vocabulary one this build's Engram part runs, and
+/// [Switch::EngramHeadTables] names it for an arm that does not run it.
 fn hashed_engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
     let orders = usize_list(text.get("engram_vocab_size"))?.len();
     let heads_per_order = optional_usize(text, "engram_n_head_per_ngram")?.unwrap_or(0);
@@ -2150,6 +2565,7 @@ fn hashed_engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
     }
     let per_layer = object(text, "engram_layer_head_vocab_sizes");
     let mut tables = Vec::new();
+    let mut head_rows = Vec::new();
     for layer in usize_list(text.get("engram_layer_ids"))? {
         let Some(sizes) = per_layer.and_then(|map| map.get(layer.to_string())) else {
             return Err(invalid(format!(
@@ -2167,6 +2583,7 @@ fn hashed_engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
             )));
         }
         let mut rows = 0usize;
+        let mut layer_rows = Vec::with_capacity(orders * heads_per_order);
         for order in sizes {
             let heads = usize_list(Some(order))?;
             if heads.len() != heads_per_order {
@@ -2177,8 +2594,10 @@ fn hashed_engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
                 )));
             }
             rows += heads.iter().sum::<usize>();
+            layer_rows.extend(heads);
         }
         tables.push(rows);
+        head_rows.push(layer_rows);
     }
     Ok(EngramGeometry {
         tables,
@@ -2188,6 +2607,7 @@ fn hashed_engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
         vocab_size: 0,
         compressed_vocab: 0,
         pad_id: optional_usize(text, "engram_pad_id")?.unwrap_or(0) as u32,
+        head_rows,
     })
 }
 
@@ -3711,6 +4131,196 @@ mod tests {
         }
     }
 
+    /// The released documents every arm serves, by name.
+    const RELEASED: [(&str, &str); 7] = [
+        (
+            "deepseek",
+            include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            ),
+        ),
+        (
+            "dory",
+            include_str!(
+                "../../sparkflash-model-dory/config/nvidia_nemotron_labs_dory1_0_4b_bf16.hf.json"
+            ),
+        ),
+        (
+            "glm",
+            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+        ),
+        (
+            "inkling",
+            include_str!("../../sparkflash-model-inkling2/config/inkling2_small.hf.json"),
+        ),
+        (
+            "qwen36",
+            include_str!("../config/qwen36_flash_35b_a3b_fp8.hf.json"),
+        ),
+        (
+            "qwen38 fp8",
+            include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_fp8.hf.json"),
+        ),
+        (
+            "qwen38 nvfp4",
+            include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json"),
+        ),
+    ];
+
+    /// FNV-1a over `bytes`: a digest that does not move with the toolchain.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// Every released parse is pinned whole, and turns no typed switch on.
+    ///
+    /// A change to the parser that moves any field of a released [Architecture] moves its digest.
+    /// A new field moves every digest too: diff the `{:#?}` text of the parse before and after,
+    /// check that only the new field at its default differs, and pin the new digests.
+    #[test]
+    fn the_released_parses_are_pinned_and_switch_nothing_on() {
+        let pinned = [
+            0x9c15_e22e_cbea_7f28_u64,
+            0xbf31_362c_fd8a_5fc0,
+            0x9e18_e48c_be4f_af44,
+            0xd46f_7b0d_aab8_7820,
+            0xb9b9_e985_99c3_c3b3,
+            0x1ad1_8446_4987_60d4,
+            0xb9a1_d18f_5235_d041,
+        ];
+        for ((name, text), pin) in RELEASED.iter().zip(pinned) {
+            let architecture = Architecture::from_json(text).expect("the released document parses");
+            assert_eq!(
+                architecture.switches(),
+                Vec::new(),
+                "{name} turns a switch on"
+            );
+            let digest = fnv1a(format!("{architecture:#?}").as_bytes());
+            assert_eq!(digest, pin, "{name}'s parse moved: {digest:#018x}");
+        }
+    }
+
+    /// A latent-attention release with Hy4-flash's switches (made-up small numbers): each is a
+    /// typed field, none is named as unmodelled, and an arm that runs none refuses all of them.
+    #[test]
+    fn a_hyper_connected_mla_release_types_its_switches() {
+        let text = r#"{
+            "model_type": "made_up_mla", "hidden_size": 256, "intermediate_size": 512,
+            "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 4,
+            "head_dim": 64, "kv_lora_rank": 64, "q_lora_rank": 128, "qk_nope_head_dim": 32,
+            "qk_rope_head_dim": 32, "v_head_dim": 64, "vocab_size": 512,
+            "layer_types": ["deepseek_sparse_attention", "sliding_attention"],
+            "sliding_window": 128, "swa_num_attention_heads": 8, "swa_v_head_dim": 64,
+            "indexer_types": ["full", "full"], "index_n_heads": 4, "index_head_dim": 32,
+            "index_topk": 64, "use_compressed_indexer": true,
+            "compressed_indexer_num_attention_heads": 2, "compressed_indexer_head_dim": 32,
+            "compressed_indexer_compress_ratio": 4, "compressed_indexer_key_pooling": "gated",
+            "compressed_indexer_candidate_topk": 64, "compressed_indexer_group_topk": 16,
+            "compressed_indexer_skip_fine_select": true,
+            "hc_mult": 4, "hc_eps": 1e-6, "enable_ihc": true, "hc_magnitude": 2.0,
+            "sandwich_norm": true, "learnable_sink": true, "gated_mla": true,
+            "gating_type": "elementwise", "gate_groups": 1, "gate_lora_rank": null,
+            "qk_norm": true
+        }"#;
+        let architecture = Architecture::from_json(text).expect("the release parses");
+        let [sparse, sliding] = &architecture.layers[..] else {
+            panic!("two layers");
+        };
+        assert_eq!((sparse.attention.heads, sparse.attention.window), (4, None));
+        assert_eq!(
+            (sliding.attention.heads, sliding.attention.window),
+            (8, Some(128))
+        );
+        assert!(sliding.attention.indexer.is_none());
+        let stage = sparse
+            .attention
+            .indexer
+            .as_ref()
+            .and_then(|indexer| indexer.compressed)
+            .expect("the compressed stage");
+        assert_eq!(
+            stage,
+            CompressedStage {
+                heads: 2,
+                head_dim: 32,
+                ratio: 4,
+                pooling: KeyPooling::Gated,
+                candidates: 64,
+                group_topk: 16,
+                reuse_fine: false,
+                skip_fine: true,
+            }
+        );
+        assert!(matches!(
+            sparse.attention.kind,
+            AttentionKind::Mla {
+                output_gate: true,
+                qk_norm: true,
+                sinks: true,
+                ..
+            }
+        ));
+        let Residual::Hyper(hyper) = &sparse.residual else {
+            panic!("a hyper-connected residual");
+        };
+        assert_eq!((hyper.ihc, hyper.magnitude), (true, Some(2.0)));
+        let root: Value = serde_json::from_str(text).expect("json");
+        assert_eq!(
+            Architecture::unmodelled_features(&root),
+            Vec::<String>::new()
+        );
+        let switches = architecture.switches();
+        assert_eq!(
+            switches,
+            vec![
+                Switch::Sinks,
+                Switch::MlaOutputGate,
+                Switch::MlaQkNorm,
+                Switch::SlidingHeads,
+                Switch::PostNorm,
+                Switch::Ihc,
+                Switch::HcMagnitude,
+                Switch::CompressedIndexer,
+            ]
+        );
+        let refused = architecture
+            .refuse_switches(&[Switch::Sinks])
+            .expect_err("an arm that runs only sinks")
+            .to_string();
+        for switch in &switches[1..] {
+            assert!(refused.contains(switch.field()), "{refused}");
+        }
+        assert!(!refused.contains("learnable_sink"), "{refused}");
+        architecture
+            .refuse_switches(&switches)
+            .expect("an arm that runs every switch");
+
+        // A sliding layer with a width of its own, a gate of another kind and a pooling of
+        // another kind are named, not read as the typed shapes.
+        let wide = text.replace(r#""swa_v_head_dim": 64"#, r#""swa_v_head_dim": 128"#);
+        let named = Architecture::unmodelled_features(&serde_json::from_str(&wide).expect("json"));
+        assert!(
+            named
+                .iter()
+                .any(|named| named.contains("swa_v_head_dim 128")),
+            "{named:?}"
+        );
+        let gated = text.replace(
+            r#""gating_type": "elementwise""#,
+            r#""gating_type": "headwise""#,
+        );
+        let error = Architecture::from_json(&gated).expect_err("another gate");
+        assert!(error.to_string().contains("gating_type"), "{error}");
+        let pooled = text.replace(r#"pooling": "gated""#, r#"pooling": "max""#);
+        let error = Architecture::from_json(&pooled).expect_err("another pooling");
+        assert!(
+            error.to_string().contains("compressed_indexer_key_pooling"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn a_ragged_or_zero_head_count_refuses_the_derived_width() {
         let ragged = r#"{
@@ -3844,7 +4454,8 @@ mod tests {
 
     /// A multimodal release that nests its language model (Hy4-flash's shape, with made-up small
     /// numbers): the quantization block inside `text_config` is read, the per-head Engram spelling
-    /// sizes its tables, and the switches the parser does not model are named.
+    /// sizes its tables, the switches the parser types are fields, and the ones with no layer to
+    /// land on are named.
     #[test]
     fn a_nested_release_reads_its_quantization_and_names_its_unmodelled_switches() {
         let text = r#"{
@@ -3881,20 +4492,35 @@ mod tests {
         };
         assert_eq!(engram.tables, vec![11 + 13 + 17 + 19]);
         assert_eq!((engram.heads, engram.head_dim, engram.pad_id), (4, 32, 3));
+        assert_eq!(engram.head_rows, vec![vec![11, 13, 17, 19]]);
+        assert!(architecture.layers.iter().all(|layer| layer.post_norm));
+        assert_eq!(
+            architecture.switches(),
+            vec![Switch::PostNorm, Switch::EngramHeadTables]
+        );
+        let refused = architecture
+            .refuse_switches(&[])
+            .expect_err("an arm that runs neither switch")
+            .to_string();
+        for field in ["sandwich_norm", "engram_layer_head_vocab_sizes"] {
+            assert!(refused.contains(field), "{field} is not refused: {refused}");
+        }
+        architecture
+            .refuse_switches(&[Switch::PostNorm, Switch::EngramHeadTables])
+            .expect("an arm that runs both");
         let root: Value = serde_json::from_str(text).expect("json");
         let named = Architecture::unmodelled_features(&root).join("; ");
-        for field in [
-            "engram_layer_head_vocab_sizes",
-            "sandwich_norm",
-            "learnable_sink",
-            "swa_num_attention_heads 8",
-        ] {
+        // Sinks are typed on MLA layers and this document's are GQA; its sliding head count has
+        // no sliding layer to land on.
+        for field in ["learnable_sink", "swa_num_attention_heads 8"] {
             assert!(named.contains(field), "{field} is not named: {named}");
         }
-        assert!(
-            !named.contains("qk_norm"),
-            "a switch left off is named: {named}"
-        );
+        for field in ["sandwich_norm", "engram_layer_head_vocab_sizes", "qk_norm"] {
+            assert!(
+                !named.contains(field),
+                "a typed or unset switch is named: {named}"
+            );
+        }
         let ragged = text.replace("[[11, 13], [17, 19]]", "[[11, 13]]");
         let error = Architecture::from_json(&ragged).expect_err("a missing order");
         assert!(error.to_string().contains("2 n-gram orders"), "{error}");

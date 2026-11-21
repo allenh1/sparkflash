@@ -354,6 +354,7 @@ pub fn launch_check(text: &str) -> LaunchCheck {
     }
     match architecture(text) {
         Ok(architecture) => {
+            gaps.extend(switch_gaps(&architecture));
             match profile_for_model_type(&architecture.family) {
                 None => gaps.push(no_engine(&architecture.family)),
                 Some(profile) => {
@@ -372,6 +373,14 @@ pub fn launch_check(text: &str) -> LaunchCheck {
             LaunchCheck { window: None, gaps }
         }
     }
+}
+
+/// The typed switches `architecture` turns on, each a gap: no arm runs one yet.
+fn switch_gaps(architecture: &Architecture) -> impl Iterator<Item = String> {
+    architecture
+        .switches()
+        .into_iter()
+        .map(|switch| format!("{switch}, which no device arm runs"))
 }
 
 /// Judges one checkpoint on `cluster`.
@@ -397,6 +406,9 @@ pub fn judge(evidence: &Evidence<'_>, cluster: &Cluster) -> Fit {
         .or_else(|| root.and_then(declared_model_type));
     if let Some(root) = root {
         missing.extend(Architecture::unmodelled_features(root));
+    }
+    if let Some(architecture) = architecture {
+        missing.extend(switch_gaps(architecture));
     }
     let profile = model_type.as_deref().and_then(profile_for_model_type);
     if let (Some(kind), None) = (&model_type, profile) {

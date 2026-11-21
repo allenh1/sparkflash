@@ -543,6 +543,12 @@ fn geometry_for(
                 kv_lora_rank,
                 v_head_dim,
                 groups,
+                // The gate, the q/k norms and the sinks change the part's arithmetic, not its
+                // geometry; an arm that does not run them refuses them by name
+                // ([Architecture::refuse_switches]).
+                output_gate: _,
+                qk_norm: _,
+                sinks: _,
             } => {
                 let heads = split(tp, attention.heads, TpAxis::Heads, 1)?;
                 geometry.heads = heads.padded;

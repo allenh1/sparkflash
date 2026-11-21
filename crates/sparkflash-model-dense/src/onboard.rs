@@ -33,6 +33,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use sparkflash_model::architecture::Switch;
 use sparkflash_model::compose::StepRole;
 use sparkflash_model::{Architecture, Part};
 
@@ -68,6 +69,9 @@ pub struct Survey {
     pub refusal: Option<String>,
     /// Declarations the shared description does not model ([Architecture::unmodelled_features]).
     pub unmodelled: Vec<String>,
+    /// Typed switches the checkpoint turns on ([Architecture::switches]), which no shared body
+    /// runs yet.
+    pub switches: Vec<Switch>,
 }
 
 impl Survey {
@@ -77,6 +81,7 @@ impl Survey {
     pub fn catalogue_only(&self) -> bool {
         self.refusal.is_none()
             && self.unmodelled.is_empty()
+            && self.switches.is_empty()
             && self.own.is_empty()
             && self.unhosted.is_empty()
             && self.capabilities.is_empty()
@@ -90,6 +95,7 @@ pub fn survey(architecture: &Architecture, unmodelled: Vec<String>) -> Survey {
     let registry = Dense::catalogue();
     let mut survey = Survey {
         unmodelled,
+        switches: architecture.switches(),
         ..Survey::default()
     };
     architecture.walk_roles(|_, role, part| match role {
@@ -235,6 +241,13 @@ pub fn emit(
     for capability in &survey.capabilities {
         let _ = writeln!(report, "  {capability}");
     }
+    for switch in &survey.switches {
+        let _ = writeln!(
+            report,
+            "  {switch} ({:?}): typed, the shared walk does not run it yet",
+            switch.role()
+        );
+    }
     for declaration in &survey.unmodelled {
         let _ = writeln!(report, "  describe first: {declaration}");
     }
@@ -300,6 +313,13 @@ fn lib_rs(id: &str, family: &str, survey: &Survey) -> String {
     }
     for capability in &survey.capabilities {
         let _ = writeln!(out, "//! Not hosted by the shared walk yet: {capability}.");
+    }
+    for switch in &survey.switches {
+        let _ = writeln!(
+            out,
+            "//! Typed, not run by the shared walk yet: {switch} ({:?} step).",
+            switch.role()
+        );
     }
     for declaration in &survey.unmodelled {
         let _ = writeln!(
@@ -516,8 +536,9 @@ mod tests {
 
     /// A checkpoint shaped like tencent/Hy4-flash-FP8 (a small config of the same structure:
     /// latent attention with a sparse indexer, a sliding layer, four hyper-connection streams,
-    /// hashed Engram tables a head, routed experts): its MLA is the family's part, which the
-    /// dense host now takes, and what is left is the three roles the shared walk does not run.
+    /// hashed Engram tables a head, routed experts, and the release's switches): its MLA is the
+    /// family's part, which the dense host now takes, its switches are typed rather than
+    /// unmodelled, and what is left is the three roles the shared walk does not run.
     #[test]
     fn a_hyper_connected_engram_checkpoint_names_the_roles_left() {
         let text = r#"{
@@ -535,9 +556,32 @@ mod tests {
             "engram_max_ngram_size": 3, "engram_n_embed_per_ngram": 64,
             "engram_n_head_per_ngram": 2, "engram_pad_id": 0, "vocab_size": 512,
             "max_position_embeddings": 512, "rms_norm_eps": 1e-6, "hidden_act": "silu",
-            "torch_dtype": "bfloat16"
+            "torch_dtype": "bfloat16", "swa_num_attention_heads": 8, "sandwich_norm": true,
+            "learnable_sink": true, "gated_mla": true, "gating_type": "elementwise",
+            "qk_norm": true, "enable_ihc": true, "hc_magnitude": 2.0,
+            "use_compressed_indexer": true, "compressed_indexer_num_attention_heads": 2,
+            "compressed_indexer_head_dim": 32, "compressed_indexer_compress_ratio": 4,
+            "compressed_indexer_key_pooling": "gated", "compressed_indexer_candidate_topk": 64,
+            "compressed_indexer_group_topk": 16, "compressed_indexer_skip_fine_select": true
         }"#;
         let (_, survey) = surveyed(text);
+        assert_eq!(survey.unmodelled, Vec::<String>::new(), "{survey:?}");
+        assert_eq!(
+            survey.switches,
+            vec![
+                Switch::Sinks,
+                Switch::MlaOutputGate,
+                Switch::MlaQkNorm,
+                Switch::SlidingHeads,
+                Switch::PostNorm,
+                Switch::Ihc,
+                Switch::HcMagnitude,
+                Switch::CompressedIndexer,
+                Switch::EngramHeadTables,
+            ],
+            "{survey:?}"
+        );
+        assert!(!survey.catalogue_only());
         assert_eq!(
             survey.own,
             BTreeSet::from([Part::MlaAttention]),
@@ -557,5 +601,20 @@ mod tests {
             assert!(refusal.contains(part), "{refusal}");
         }
         assert!(!refusal.contains("mla_attention"), "{refusal}");
+        let (architecture, _) = surveyed(text);
+        let dir =
+            std::env::temp_dir().join(format!("sparkflash-onboard-hyper-{}", std::process::id()));
+        let report = emit("acme/hyper", text, &architecture, &survey, &dir).expect("written");
+        let lib = std::fs::read_to_string(dir.join("src/lib.rs")).expect("lib.rs");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+        assert!(!report.contains("describe first"), "{report}");
+        for switch in &survey.switches {
+            let typed = format!("{switch} ({:?}): typed", switch.role());
+            assert!(report.contains(&typed), "{typed} is not listed: {report}");
+            assert!(
+                lib.contains(&switch.to_string()),
+                "{switch} is not listed: {lib}"
+            );
+        }
     }
 }

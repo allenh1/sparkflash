@@ -183,6 +183,8 @@ impl Inkling2Config {
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
         let text_config = object(&root, "text_config").unwrap_or(&root);
         let mut architecture = Architecture::from_value(&root)?;
+        // No typed switch is Inkling's arithmetic.
+        architecture.refuse_switches(&[])?;
         let quant_value = match quant {
             Some(text) => Some(
                 serde_json::from_str::<Value>(text)

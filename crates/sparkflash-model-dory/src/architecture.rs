@@ -21,9 +21,12 @@ const CARRIED_CONFIG: &str = include_str!("../config/nvidia_nemotron_labs_dory1_
 /// Parse a released Dory config.json into the shared architecture.
 ///
 /// # Errors
-/// A malformed document, or one the shared parser cannot describe.
+/// A malformed document, one the shared parser cannot describe, or one that turns on a typed
+/// switch the loop does not run.
 pub fn architecture_from_json(text: &str) -> Result<Architecture, ConfigError> {
-    Architecture::from_json(text)
+    let architecture = Architecture::from_json(text)?;
+    architecture.refuse_switches(&[])?;
+    Ok(architecture)
 }
 
 /// The shared architecture of the released checkpoint carried in this crate.

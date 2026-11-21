@@ -43,7 +43,11 @@ tower and a draft head ship beside the backbone.
 Three parser changes were needed to read it at all, and each is general: an Engram declared as
 per-layer, per-head table sizes (`engram_layer_head_vocab_sizes`), a `quantization_config` nested
 under `text_config`, and naming every switch the shared description does not model, so the
-preview lists them instead of computing as if they were absent.
+preview lists them instead of computing as if they were absent. The release's switches are now
+typed fields of the parse (`Architecture::switches`): the MLA sinks, output gate and q/k norms,
+the sliding layers' own head count and window, `Layer::post_norm`, the iHC variant and magnitude
+of the hyper-connection, the compressed indexer stage and the per-head Engram rows. Every released
+arm refuses a switch it does not run by name (`Architecture::refuse_switches`).
 
 ## The run
 
@@ -58,9 +62,10 @@ It reports, in order:
   MLP, routed experts, hyper-connection, Engram, vision) has a catalogue entry on sm121, and the
   only tensor-core gaps are the waived ones every family shares (the head, the one-row FP8
   experts);
-- eight switches to describe first: the per-head Engram tables' arithmetic, the sandwich norm,
-  learned sinks, the iHC residual mix, the compressed indexer stage, the MLA output gate, the
-  query/key norms and the sliding layers' own head count;
+- nine typed switches the shared walk does not run yet, each with its role: the MLA sinks,
+  output gate and query/key norms and the sliding layers' own head count (attention), the
+  sandwich norm, the iHC residual mix and its magnitude (residual), the compressed indexer stage
+  (indexer) and the per-head Engram tables (side); nothing is left to describe first;
 - no stored-bytes floor at TP 1, 2 or 4: the shared naming does not spell a hyper-connection;
 - the crate it wrote, `sparkflash-model-hy-v4-flash`: `Cargo.toml` (25 lines), `src/lib.rs` (94:
   the config, `architecture()`, `parts()` registering one `MlaAttentionPart` stub) and
