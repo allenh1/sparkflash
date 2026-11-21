@@ -2378,13 +2378,13 @@ struct Pending {
 /// Which rows of a step go through the LM head: all of them, or only the last (a prefill chunk
 /// needs one row's logits, not one a token).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeadRows {
+pub(crate) enum HeadRows {
     All,
     Last,
 }
 
 /// What a step hands back for each of its rows.
-trait StepRow: Sized {
+pub(crate) trait StepRow: Sized {
     /// Whether the rows' logits stay on the device for [DeviceRank::last_logits].
     const ON_DEVICE: bool;
     /// The rows of `input` through the LM head.
@@ -2428,7 +2428,7 @@ impl StepRow for u32 {
 /// A row of a greedy step's logits, which stay in `logits` until the rank's next LM head: the
 /// rank, the head that wrote them ([DeviceRank::heads]), the row and the step's rows.
 #[derive(Debug, Clone, Copy)]
-struct LogitsAt {
+pub(crate) struct LogitsAt {
     rank: u64,
     head: u64,
     row: usize,
@@ -2461,7 +2461,7 @@ enum SequenceLayer {
 /// One sequence's rows of a step: its next `len` tokens from `position`, rows
 /// `first..first + len` of the step. A verify's run leaves the state its rows read for the commit;
 /// a drafting sequence's run also fills the MTP layer's caches.
-struct Run<'s> {
+pub(crate) struct Run<'s> {
     layers: &'s [SequenceLayer],
     position: usize,
     first: usize,
@@ -2471,7 +2471,74 @@ struct Run<'s> {
     /// A block-drafting sequence's drafter scratch and the first of the run's rows it captures,
     /// into its first feature row: 0 for a step's rows, and for a prompt's chunk the first row
     /// the drafter's next block reads ([DeviceRank::forward_prefill]).
-    block: Option<(&'s DraftScratch, usize)>,
+    block: Option<(DraftScratch, usize)>,
+}
+
+impl<'s> Run<'s> {
+    /// `sequence`'s `len` rows from its position as rows `first..first + len` of a token step:
+    /// a verify's run when `verify` and it has more than one row, its block drafter capturing
+    /// every row.
+    pub(crate) fn token(
+        sequence: &'s DeviceSequence,
+        first: usize,
+        len: usize,
+        verify: bool,
+    ) -> Self {
+        Self {
+            layers: &sequence.layers,
+            position: sequence.position,
+            first,
+            len,
+            verify: verify && len > 1,
+            drafter: sequence.drafter.as_ref(),
+            block: sequence.block.map(|scratch| (scratch, 0)),
+        }
+    }
+
+    /// `sequence`'s `len` rows from its position as a bulk chunk's one run, capturing from the
+    /// row `plan` says.
+    pub(crate) fn chunk(sequence: &'s DeviceSequence, len: usize, plan: &ChunkPlan) -> Self {
+        Self {
+            layers: &sequence.layers,
+            position: sequence.position,
+            first: 0,
+            len,
+            verify: false,
+            drafter: sequence.drafter.as_ref(),
+            block: plan.scratch.zip(plan.captured),
+        }
+    }
+}
+
+/// What a bulk chunk's block drafter reads: its prompt-row scratch, the window rows the chunk
+/// commits to the drafter's context and the first row it captures ([DeviceRank::chunk_plan]).
+pub(crate) struct ChunkPlan {
+    scratch: Option<DraftScratch>,
+    commits: Vec<(usize, usize, usize)>,
+    captured: Option<usize>,
+}
+
+/// What every stage of one step reads ([DeviceRank::step_set]): whether the collectives take
+/// the device leg, the step's rows, this rank's rows of a sequence-parallel step, and the block
+/// drafter's captures (its scratch, the first row and the rows).
+#[derive(Clone)]
+pub(crate) struct StepSet {
+    device_leg: bool,
+    rows: usize,
+    share: Option<(usize, usize, usize)>,
+    captures: Vec<(DraftScratch, usize, usize)>,
+}
+
+impl StepSet {
+    /// This rank's rows of the step, over `tp`, when the step is sequence-parallel.
+    fn share<'t>(&self, tp: &'t TpRuntime) -> Option<Share<'t>> {
+        self.share.map(|(first, count, live)| Share {
+            tp,
+            first,
+            count,
+            live,
+        })
+    }
 }
 
 /// This rank's rows of a sequence-parallel step ([DeviceRank::sequence_parallel]).
@@ -3053,7 +3120,7 @@ impl DeviceRank {
     }
 
     /// Starts one forward's stage accounting ([sparkflash_model::StageProfiler]).
-    fn prof_begin(&self) {
+    pub(crate) fn prof_begin(&self) {
         if let Ok(mut prof) = self.prof.lock() {
             prof.start();
         }
@@ -3078,7 +3145,7 @@ impl DeviceRank {
     }
 
     /// Prints the forward's report, when profiling is on.
-    fn prof_end(&self, rows: usize, total_ms: f64) {
+    pub(crate) fn prof_end(&self, rows: usize, total_ms: f64) {
         if let Ok(mut prof) = self.prof.lock()
             && let Some(text) = prof.report(rows, total_ms)
         {
@@ -3357,7 +3424,7 @@ impl DeviceRank {
     /// The serving driver opens a session on one worker thread and may run its steps on another;
     /// the driver's current context is thread-local, so every device entry point makes it current
     /// here instead of assuming the thread that loaded the weights is the thread that uses them.
-    fn make_current(&self) -> Result<(), BackendError> {
+    pub(crate) fn make_current(&self) -> Result<(), BackendError> {
         self.cuda.make_current().map_err(cuda_error)
     }
 
@@ -5824,7 +5891,7 @@ impl DeviceRank {
     }
 
     /// Refuses a sequence this rank cannot run `tokens` through.
-    fn check_sequence(
+    pub(crate) fn check_sequence(
         &self,
         sequence: &DeviceSequence,
         tokens: &[u32],
@@ -5893,6 +5960,12 @@ impl DeviceRank {
     fn chunk_ready(&self, sequence: &DeviceSequence) -> bool {
         self.prefill.is_some() && (sequence.block.is_none() || self.drafting_prefill)
     }
+
+    /// Whether a prompt of `rows` rows on `sequence` takes the bulk chunks, not the token path
+    /// ([Self::begin_prefill]).
+    pub(crate) fn takes_chunks(&self, sequence: &DeviceSequence, rows: usize) -> bool {
+        self.prefill.is_some() && rows >= MIN_PREFILL_ROWS && self.chunk_ready(sequence)
+    }
     /// Prefill `tokens` in bulk chunks and return the last row's full-vocabulary logits
     /// ([Self::begin_prefill], then each [Self::prefill_chunk] in turn). A chunk
     /// carries up to [DeviceRank::prefill_rows] rows through the tensor-core GEMMs and the padded
@@ -5940,8 +6013,7 @@ impl DeviceRank {
         if tokens.is_empty() {
             return Err(refusal("an empty prompt has no logits"));
         }
-        if self.prefill.is_none() || tokens.len() < MIN_PREFILL_ROWS || !self.chunk_ready(sequence)
-        {
+        if !self.takes_chunks(sequence, tokens.len()) {
             let mut logits = self.forward_batch(tp, gather, &mut [(sequence, tokens)])?;
             return Ok(Prefill::Whole(
                 logits
@@ -5950,12 +6022,7 @@ impl DeviceRank {
                     .unwrap_or_default(),
             ));
         }
-        self.check_sequence(sequence, tokens)?;
-        if sequence.pending.is_some() {
-            return Err(refusal(
-                "the sequence's verify is not committed; commit it before its next step",
-            ));
-        }
+        self.admit(sequence, tokens)?;
         self.back(sequence, sequence.position + tokens.len())?;
         self.collective(tp, gather)?;
         Ok(Prefill::Chunks {
@@ -5979,10 +6046,34 @@ impl DeviceRank {
         end: usize,
     ) -> Result<Vec<f32>, BackendError> {
         let device_leg = self.collective(tp, gather)?;
-        // A block drafter's first block reads the prompt's last `window_left` positions: a chunk
-        // captures its rows from the first of those on into the drafter's prompt rows, a scratch
-        // that is otherwise the sequence's, and commits them to its context a step's rows at a
-        // time, as the token path's steps would ([Dflash2Config::window_commits]).
+        let plan = self.chunk_plan(sequence, part.len(), end)?;
+        self.next_step();
+        self.swap_prefill()?;
+        let run = Run::chunk(sequence, part.len(), &plan);
+        let result = self.step::<Vec<f32>>(tp, gather, &[run], part, device_leg, HeadRows::Last);
+        self.swap_prefill()?;
+        let rows = result?;
+        let last = rows.into_iter().next().unwrap_or_default();
+        self.after_chunk(sequence, part.len(), &plan)?;
+        Ok(last)
+    }
+
+    /// What a bulk chunk of `len` rows from `sequence`'s position, of a prompt that ends at
+    /// `end`, hands its block drafter.
+    ///
+    /// A block drafter's first block reads the prompt's last `window_left` positions: a chunk
+    /// captures its rows from the first of those on into the drafter's prompt rows, a scratch
+    /// that is otherwise the sequence's, and commits them to its context a step's rows at a
+    /// time, as the token path's steps would ([Dflash2Config::window_commits]).
+    ///
+    /// # Errors
+    /// A block drafter with no prompt rows.
+    pub(crate) fn chunk_plan(
+        &self,
+        sequence: &DeviceSequence,
+        len: usize,
+        end: usize,
+    ) -> Result<ChunkPlan, BackendError> {
         let block = match (&self.block, &sequence.block) {
             (Some(block), Some(scratch)) => {
                 let prompt = block.prompt.ok_or_else(|| {
@@ -5995,48 +6086,62 @@ impl DeviceRank {
         let start = sequence.position;
         let commits: Vec<(usize, usize, usize)> =
             block.as_ref().map_or_else(Vec::new, |(_, config)| {
-                config
-                    .window_commits((start, part.len()), end, MAX_ROWS)
-                    .collect()
+                config.window_commits((start, len), end, MAX_ROWS).collect()
             });
         let captured = commits.first().map(|&(row, _, _)| row);
-        let run = Run {
-            layers: &sequence.layers,
-            position: start,
-            first: 0,
-            len: part.len(),
-            verify: false,
-            drafter: sequence.drafter.as_ref(),
-            block: block
-                .as_ref()
-                .zip(captured)
-                .map(|((scratch, _), row)| (scratch, row)),
-        };
-        self.steps = self.steps.wrapping_add(1);
-        let prefill = self
+        Ok(ChunkPlan {
+            scratch: block.map(|(scratch, _)| scratch),
+            commits,
+            captured,
+        })
+    }
+
+    /// Swaps the bulk chunk's scratch in for the decode scratch, or back: a chunk runs between
+    /// two swaps.
+    ///
+    /// # Errors
+    /// A rank with no chunk scratch.
+    pub(crate) fn swap_prefill(&mut self) -> Result<(), BackendError> {
+        let other = self
             .prefill
-            .take()
+            .as_mut()
             .ok_or_else(|| refusal("the prefill scratch is missing"))?;
-        let decode = std::mem::replace(&mut self.scratch, prefill);
-        let result = self.step::<Vec<f32>>(tp, gather, &[run], part, device_leg, HeadRows::Last);
-        self.prefill = Some(std::mem::replace(&mut self.scratch, decode));
-        let rows = result?;
-        let last = rows.into_iter().next().unwrap_or_default();
-        sequence.position += part.len();
+        std::mem::swap(&mut self.scratch, other);
+        Ok(())
+    }
+
+    /// Counts a step: a verify commits before the rank's next.
+    pub(crate) fn next_step(&mut self) {
+        self.steps = self.steps.wrapping_add(1);
+    }
+
+    /// `sequence` after a bulk chunk of `len` rows ran with `plan`: its position, its MTP stash's
+    /// last row, and the block drafter's window commits.
+    ///
+    /// # Errors
+    /// The device refuses a commit.
+    pub(crate) fn after_chunk(
+        &self,
+        sequence: &mut DeviceSequence,
+        len: usize,
+        plan: &ChunkPlan,
+    ) -> Result<(), BackendError> {
+        sequence.position += len;
         sequence.logits_at = None;
         if let Some(drafter) = &mut sequence.drafter {
             // The chunk's last row is its stash's last ([Self::fill]).
-            drafter.last = Some(part.len().min(MAX_ROWS) - 1);
+            drafter.last = Some(len.min(MAX_ROWS) - 1);
         }
-        if let (Some(drafter), Some((scratch, _)), Some(captured)) = (&self.block, &block, captured)
+        if let (Some(drafter), Some(scratch), Some(captured)) =
+            (&self.block, &plan.scratch, plan.captured)
         {
-            for (row, rows, position) in commits {
+            for &(row, rows, position) in &plan.commits {
                 drafter
                     .draft
-                    .commit(&*self, scratch, row - captured, rows, position)?;
+                    .commit(self, scratch, row - captured, rows, position)?;
             }
         }
-        Ok(last)
+        Ok(())
     }
 
     /// Run each sequence's tokens through this rank's slice together and return each sequence's
@@ -6111,7 +6216,6 @@ impl DeviceRank {
     /// When the sequence's last step was not a greedy one of this rank, its verify is not
     /// committed, an LM head (a step's or a draft's) has run since, or the device refuses a copy.
     pub fn last_logits(&self, sequence: &DeviceSequence) -> Result<Vec<f32>, BackendError> {
-        self.make_current()?;
         let Some(at) = sequence.logits_at else {
             return Err(refusal(
                 "the sequence's last step was not a greedy step; its logits went to the host then",
@@ -6122,6 +6226,16 @@ impl DeviceRank {
                 "the sequence's verify is not committed, so its last row is not known yet",
             ));
         }
+        self.logits_row(at)
+    }
+
+    /// The full-vocabulary logits of the greedy step's row `at`, which stay on the device until
+    /// this rank's next LM head ([Self::last_logits]).
+    ///
+    /// # Errors
+    /// When another rank ran the step, an LM head has run since, or the device refuses a copy.
+    pub(crate) fn logits_row(&self, at: LogitsAt) -> Result<Vec<f32>, BackendError> {
+        self.make_current()?;
         if (at.rank, at.head) != (self.identity(), self.heads.load(Ordering::Relaxed)) {
             return Err(refusal(
                 "the sequence's last logits are gone: another rank ran its step, or an LM head \
@@ -6248,7 +6362,11 @@ impl DeviceRank {
 
     /// Refuses a collective or gather of another rank or world, and says whether the collectives
     /// take the device leg.
-    fn collective(&self, tp: &TpRuntime, gather: &BitGatherHandle) -> Result<bool, BackendError> {
+    pub(crate) fn collective(
+        &self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+    ) -> Result<bool, BackendError> {
         let layout = self.layout;
         for (what, rank, world) in [
             ("TP collective", tp.rank(), tp.world()),
@@ -6290,12 +6408,7 @@ impl DeviceRank {
         self.prof_begin();
         let device_leg = self.collective(tp, gather)?;
         for (sequence, tokens) in batch.iter() {
-            self.check_sequence(sequence, tokens)?;
-            if sequence.pending.is_some() {
-                return Err(refusal(
-                    "the sequence's verify is not committed; commit it before its next step",
-                ));
-            }
+            self.admit(sequence, tokens)?;
         }
         for (sequence, tokens) in batch.iter_mut() {
             let end = sequence.position + tokens.len();
@@ -6320,15 +6433,7 @@ impl DeviceRank {
                 let done = logits[member].len();
                 let take = (chunk.len() - done).min(MAX_ROWS - tokens.len());
                 if take > 0 {
-                    runs.push(Run {
-                        layers: &sequence.layers,
-                        position: sequence.position,
-                        first: tokens.len(),
-                        len: take,
-                        verify: verify && take > 1,
-                        drafter: sequence.drafter.as_ref(),
-                        block: sequence.block.as_ref().map(|scratch| (scratch, 0)),
-                    });
+                    runs.push(Run::token(sequence, tokens.len(), take, verify));
                     tokens.extend_from_slice(&chunk[done..done + take]);
                     members.push((member, take));
                 }
@@ -6339,48 +6444,98 @@ impl DeviceRank {
             // The marks a report drains were placed by the step above; a forward that placed none
             // (the switch is off) prints nothing.
             let firsts: Vec<usize> = runs.iter().map(|run| run.first).collect();
-            self.steps = self.steps.wrapping_add(1);
+            self.next_step();
             let prof_rows = tokens.len();
             let mut rows = self
                 .step::<R>(tp, gather, &runs, &tokens, device_leg, HeadRows::All)?
                 .into_iter();
             self.prof_end(prof_rows, prof_started.elapsed().as_secs_f64() * 1000.0);
-            let head = self.heads.load(Ordering::Relaxed);
+            let head = self.heads();
             for ((member, take), first) in members.into_iter().zip(firsts) {
                 logits[member].extend(rows.by_ref().take(take));
                 let sequence = &mut *batch[member].0;
-                let position = sequence.position;
-                sequence.position += take;
-                sequence.logits_at = R::ON_DEVICE.then_some(LogitsAt {
-                    rank: self.identity(),
-                    head,
-                    row: first + take - 1,
-                    rows: tokens.len(),
-                });
-                if let Some(drafter) = &mut sequence.drafter {
-                    drafter.last = Some(take - 1);
-                }
-                if verify && take > 1 {
-                    sequence.pending = Some(Pending {
-                        rank: self.identity(),
-                        step: self.steps,
-                        first,
-                        rows: take,
-                        step_rows: tokens.len(),
-                    });
-                } else if let (Some(block), Some(scratch)) = (&self.block, &sequence.block) {
-                    // A verify's rows wait for its commit, which knows how many the model kept.
-                    let draft = &block.draft;
-                    for (row, rows, at) in
-                        draft
-                            .config()
-                            .window_commits((position, take), ends[member], MAX_ROWS)
-                    {
-                        draft.commit(&*self, scratch, row, rows, at)?;
-                    }
-                }
+                let at = R::ON_DEVICE.then_some(head);
+                self.after_run(
+                    sequence,
+                    (first, take, tokens.len()),
+                    verify,
+                    ends[member],
+                    at,
+                )?;
             }
         }
+    }
+
+    /// Refuses `tokens` on `sequence` when the sequence is another model's, past its capacity or
+    /// an uncommitted verify's.
+    ///
+    /// # Errors
+    /// As [Self::check_sequence], and a verify not committed.
+    pub(crate) fn admit(
+        &self,
+        sequence: &DeviceSequence,
+        tokens: &[u32],
+    ) -> Result<(), BackendError> {
+        self.check_sequence(sequence, tokens)?;
+        if sequence.pending.is_some() {
+            return Err(refusal(
+                "the sequence's verify is not committed; commit it before its next step",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The LM heads this rank has run: what a greedy step's logits are stamped with.
+    pub(crate) fn heads(&self) -> u64 {
+        self.heads.load(Ordering::Relaxed)
+    }
+
+    /// `sequence` after its run of a token step, rows `first..first + take` of the step's
+    /// `step_rows`, of a pass whose rows of it end at `end`: its position, where its last row's
+    /// logits stay (`head`, the step's LM head, when they stay on the device), its MTP stash's
+    /// last row, and a verify's pending commit (`verify`, more than one row) or the block
+    /// drafter's window commits. Answers where the last row's logits stay.
+    ///
+    /// # Errors
+    /// The device refuses a commit.
+    pub(crate) fn after_run(
+        &self,
+        sequence: &mut DeviceSequence,
+        (first, take, step_rows): (usize, usize, usize),
+        verify: bool,
+        end: usize,
+        head: Option<u64>,
+    ) -> Result<Option<LogitsAt>, BackendError> {
+        let position = sequence.position;
+        sequence.position += take;
+        sequence.logits_at = head.map(|head| LogitsAt {
+            rank: self.identity(),
+            head,
+            row: first + take - 1,
+            rows: step_rows,
+        });
+        if let Some(drafter) = &mut sequence.drafter {
+            drafter.last = Some(take - 1);
+        }
+        if verify && take > 1 {
+            sequence.pending = Some(Pending {
+                rank: self.identity(),
+                step: self.steps,
+                first,
+                rows: take,
+                step_rows,
+            });
+        } else if let (Some(block), Some(scratch)) = (&self.block, &sequence.block) {
+            // A verify's rows wait for its commit, which knows how many the model kept.
+            let draft = &block.draft;
+            for (row, rows, at) in draft
+                .config()
+                .window_commits((position, take), end, MAX_ROWS)
+            {
+                draft.commit(self, scratch, row, rows, at)?;
+            }
+        }
+        Ok(sequence.logits_at)
     }
 
     /// One step: row `row` runs `tokens[row]`, and `runs` say which sequence's position each row
@@ -6388,6 +6543,10 @@ impl DeviceRank {
     /// with the logits left on the device. On the device leg every collective, the logits' gather
     /// too, is exchanged on the device, and the step's one host copy is the gathered logits or
     /// the picks.
+    ///
+    /// The step is its stages in order, the ones a planned walk runs a frame at a time
+    /// ([crate::walk::GlmWalk]): the embed, then each layer's entry, token mixer and exit, its
+    /// entry, feed-forward and exit, then the tail.
     fn step<R: StepRow>(
         &self,
         tp: &TpRuntime,
@@ -6397,73 +6556,208 @@ impl DeviceRank {
         device_leg: bool,
         head_rows: HeadRows,
     ) -> Result<Vec<R>, BackendError> {
+        let set = self.step_set(tp, runs, tokens.len(), device_leg);
+        self.step_embed(&set, runs.first().map(|run| run.position), tokens)?;
+        let mut fused = false;
+        for index in 0..self.layers.len() {
+            for ffn in [false, true] {
+                self.step_enter(tp, &set, index, ffn, fused)?;
+                if ffn {
+                    self.step_ffn(index, set.rows)?;
+                } else {
+                    self.step_mixer(index, runs, set.rows)?;
+                }
+                fused = self.step_leave(tp, &set, index, ffn)?;
+            }
+        }
+        self.step_tail((tp, gather), &set, runs, tokens, head_rows)
+    }
+
+    /// What every stage of a step of `rows` rows over `runs` reads: the device leg, this rank's
+    /// rows of a sequence-parallel step ([Self::sequence_parallel]) and the block drafter's
+    /// captures.
+    pub(crate) fn step_set(
+        &self,
+        tp: &TpRuntime,
+        runs: &[Run<'_>],
+        rows: usize,
+        device_leg: bool,
+    ) -> StepSet {
+        let share = self
+            .sequence_parallel(tp, runs, rows, device_leg)
+            .map(|share| (share.first, share.count, share.live));
+        let captures = runs
+            .iter()
+            .filter_map(|run| {
+                run.block
+                    .filter(|&(_, from)| from < run.len)
+                    .map(|(scratch, from)| (scratch, run.first + from, run.len - from))
+            })
+            .collect();
+        StepSet {
+            device_leg,
+            rows,
+            share,
+            captures,
+        }
+    }
+
+    /// A step's embed: the residual streams of this rank's rows of `tokens`, the first run at
+    /// `position`.
+    ///
+    /// This forward is one named coverage input, and the first decode step through the rank is
+    /// the monitor probe (docs/NUMERICS.md section 5): a prompt's prefill is wider than the
+    /// few-row band and does not consume it, so the step after it is what a pair measures. With
+    /// both switches off, this is one `Option` check a forward.
+    pub(crate) fn step_embed(
+        &self,
+        set: &StepSet,
+        position: Option<usize>,
+        tokens: &[u32],
+    ) -> Result<(), BackendError> {
         let s = &self.scratch;
-        let config = &self.config;
-        let (hc, hidden) = (config.hc_mult, config.hidden_size);
-        let rows = tokens.len();
-        // This forward is one named coverage input, and the first decode step through the rank is
-        // the monitor probe (docs/NUMERICS.md section 5): a prompt's prefill is wider than the
-        // few-row band and does not consume it, so the step after it is what a pair measures.
-        // With both switches off, this is one `Option` check a forward.
-        if let Some(run) = runs.first() {
-            self.begin_numerics(tokens, run.position, rows);
+        let (hc, hidden) = (self.config.hc_mult, self.config.hidden_size);
+        let rows = set.rows;
+        if let Some(position) = position {
+            self.begin_numerics(tokens, position, rows);
         }
         // A sequence-parallel step widens, mixes and folds this rank's rows alone.
-        let share = self.sequence_parallel(tp, runs, rows, device_leg);
-        let (first, count) = share.map_or((0, rows), |share| (share.first, share.live));
-        let row = |base: Deviceptr, width: usize| base.offset(first * width * 4);
+        let (first, count) = set
+            .share
+            .map_or((0, rows), |(first, _, live)| (first, live));
         self.embed_rows(
             &s.step_tokens,
             &tokens[first..first + count],
-            row(s.streams, hc * hidden),
+            s.streams.offset(first * hc * hidden * 4),
             hc,
         )?;
         self.prof_mark("embed");
-        let streams = (s.streams, s.coeffs, hc);
-        let mut linear = s.linear.iter();
-        let mut fused = false;
-        for (index, layer) in self.layers.iter().enumerate() {
-            self.mix_in(&layer.attn_hc, layer.input_norm, rows, fused, share)?;
+        Ok(())
+    }
+
+    /// Layer `index`'s entry into its token mixer, or with `ffn` into its feed-forward: the
+    /// streams' mix in and the norm. `fused` is what the exit before it answered.
+    pub(crate) fn step_enter(
+        &self,
+        tp: &TpRuntime,
+        set: &StepSet,
+        index: usize,
+        ffn: bool,
+        fused: bool,
+    ) -> Result<(), BackendError> {
+        let layer = &self.layers[index];
+        let share = set.share(tp);
+        if ffn {
+            self.mix_in(&layer.ffn_hc, layer.post_norm, set.rows, fused, share)
+        } else {
+            self.mix_in(&layer.attn_hc, layer.input_norm, set.rows, fused, share)?;
             self.prof_mark("mhc_in");
-            match &layer.branch {
-                DeviceBranch::Linear(kda) => {
-                    let own = linear.next().ok_or_else(other_kind)?;
-                    self.kda(kda, index, own, runs, rows)?;
-                    self.prof_mark("attn_kda");
-                }
-                DeviceBranch::Sparse(dsa) => {
-                    self.dsa(dsa, index, runs, rows)?;
-                    self.prof_mark("attn_dsa");
-                }
+            Ok(())
+        }
+    }
+
+    /// Layer `index`'s token mixer over `runs`: its KDA recurrence, or its DSA attention with the
+    /// indexer's selection.
+    pub(crate) fn step_mixer(
+        &self,
+        index: usize,
+        runs: &[Run<'_>],
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        match &self.layers[index].branch {
+            DeviceBranch::Linear(kda) => {
+                // The linear layers' scratch, one a KDA layer in layer order.
+                let before = self.layers[..index]
+                    .iter()
+                    .filter(|layer| matches!(layer.branch, DeviceBranch::Linear(_)))
+                    .count();
+                let own = self.scratch.linear.get(before).ok_or_else(other_kind)?;
+                self.kda(kda, index, own, runs, rows)?;
+                self.prof_mark("attn_kda");
             }
+            DeviceBranch::Sparse(dsa) => {
+                self.dsa(dsa, index, runs, rows)?;
+                self.prof_mark("attn_dsa");
+            }
+        }
+        Ok(())
+    }
+
+    /// Layer `index`'s feed-forward: its dense MLP or its routed experts.
+    pub(crate) fn step_ffn(&self, index: usize, rows: usize) -> Result<(), BackendError> {
+        match &self.layers[index].ffn {
+            DeviceFfn::Dense(mlp) => {
+                self.mlp(mlp, self.scratch.partial, rows)?;
+                self.prof_mark("mlp");
+            }
+            DeviceFfn::Moe(moe) => {
+                self.moe(moe, Some(index), rows)?;
+                self.prof_mark("moe");
+            }
+        }
+        Ok(())
+    }
+
+    /// Layer `index`'s exit from its token mixer, or with `ffn` from its feed-forward: the next
+    /// reads prefetched, the partials summed and mixed out into the streams, and after the
+    /// feed-forward the block drafter's captures of the layer. Answers whether the mix out also
+    /// worked out the next entry's projection ([Self::mix_out]).
+    pub(crate) fn step_leave(
+        &self,
+        tp: &TpRuntime,
+        set: &StepSet,
+        index: usize,
+        ffn: bool,
+    ) -> Result<bool, BackendError> {
+        let s = &self.scratch;
+        let streams = (s.streams, s.coeffs, self.config.hc_mult);
+        let share = set.share(tp);
+        let layer = &self.layers[index];
+        if !ffn {
             self.prefetch(&layer.ffn_reads())?;
-            fused = self.mix_out(tp, streams, Some(&layer.ffn_hc), rows, device_leg, share)?;
-            self.mix_in(&layer.ffn_hc, layer.post_norm, rows, fused, share)?;
-            match &layer.ffn {
-                DeviceFfn::Dense(mlp) => {
-                    self.mlp(mlp, s.partial, rows)?;
-                    self.prof_mark("mlp");
-                }
-                DeviceFfn::Moe(moe) => {
-                    self.moe(moe, Some(index), rows)?;
-                    self.prof_mark("moe");
-                }
-            }
-            let next = self.layers.get(index + 1);
-            match next {
-                Some(next) => self.prefetch(&next.attention_reads())?,
-                None => self.prefetch(&[self.lm_head.span()])?,
-            }
-            fused = self.mix_out(
+            return self.mix_out(
                 tp,
                 streams,
-                next.map(|n| &n.attn_hc),
-                rows,
-                device_leg,
+                Some(&layer.ffn_hc),
+                set.rows,
+                set.device_leg,
                 share,
-            )?;
-            self.capture(index, runs)?;
+            );
         }
+        let next = self.layers.get(index + 1);
+        match next {
+            Some(next) => self.prefetch(&next.attention_reads())?,
+            None => self.prefetch(&[self.lm_head.span()])?,
+        }
+        let fused = self.mix_out(
+            tp,
+            streams,
+            next.map(|n| &n.attn_hc),
+            set.rows,
+            set.device_leg,
+            share,
+        )?;
+        self.capture(index, &set.captures)?;
+        Ok(fused)
+    }
+
+    /// A step's tail: the streams folded and normed, a sequence-parallel step's rows gathered,
+    /// the LM head over `head_rows` and the MTP layer's caches of `runs`.
+    pub(crate) fn step_tail<R: StepRow>(
+        &self,
+        (tp, gather): (&TpRuntime, &BitGatherHandle),
+        set: &StepSet,
+        runs: &[Run<'_>],
+        tokens: &[u32],
+        head_rows: HeadRows,
+    ) -> Result<Vec<R>, BackendError> {
+        let s = &self.scratch;
+        let config = &self.config;
+        let (hc, hidden) = (config.hc_mult, config.hidden_size);
+        let rows = set.rows;
+        let share = set.share(tp);
+        let (first, count) = share.map_or((0, rows), |share| (share.first, share.live));
+        let row = |base: Deviceptr, width: usize| base.offset(first * width * 4);
         self.finish_numerics();
         self.prof_mark("tail");
         self.launch(
@@ -6496,36 +6790,35 @@ impl DeviceRank {
             share.gather(self, normed, s.head_normed, hidden)?;
         }
         let logits = match head_rows {
-            HeadRows::All => R::head(self, (tp, gather), s.head_normed, rows, device_leg)?,
+            HeadRows::All => R::head(self, (tp, gather), s.head_normed, rows, set.device_leg)?,
             HeadRows::Last => R::head(
                 self,
                 (tp, gather),
                 s.head_normed.offset((rows - 1) * hidden * 4),
                 1,
-                device_leg,
+                set.device_leg,
             )?,
         };
         self.fill(runs, tokens)?;
         Ok(logits)
     }
 
-    /// Layer `index`'s finished rows into the block drafter's target rows of each run that keeps
-    /// them, when the drafter reads that layer: the mean of each row's streams.
-    fn capture(&self, index: usize, runs: &[Run<'_>]) -> Result<(), BackendError> {
+    /// Layer `index`'s finished rows into the block drafter's target rows of each capture
+    /// ([StepSet]), when the drafter reads that layer: the mean of each row's streams.
+    fn capture(
+        &self,
+        index: usize,
+        captures: &[(DraftScratch, usize, usize)],
+    ) -> Result<(), BackendError> {
         let Some(block) = &self.block else {
             return Ok(());
         };
         let (hc, hidden) = (self.config.hc_mult, self.config.hidden_size);
-        for run in runs {
-            if let Some((scratch, from)) = run.block.filter(|&(_, from)| from < run.len) {
-                let streams = self
-                    .scratch
-                    .streams
-                    .offset((run.first + from) * hc * hidden * 4);
-                block
-                    .draft
-                    .capture(self, scratch, index, (streams, hc), 0, run.len - from)?;
-            }
+        for (scratch, first, rows) in captures {
+            let streams = self.scratch.streams.offset(first * hc * hidden * 4);
+            block
+                .draft
+                .capture(self, scratch, index, (streams, hc), 0, *rows)?;
         }
         Ok(())
     }
