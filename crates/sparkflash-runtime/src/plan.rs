@@ -389,6 +389,13 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
         usize::MAX
     }
 
+    /// Where the rewind point of a prompt of `prompt` ids sits ([`Walk::rewind_point`]): its
+    /// end by default; a host whose chat template rewrites a past turn's last ids states the
+    /// earlier position the next turn still shares.
+    fn rewind_point(&self, prompt: usize) -> usize {
+        prompt
+    }
+
     /// Backs the lane's positional regions up to `reach` positions.
     ///
     /// # Errors
@@ -855,6 +862,10 @@ impl<H: PlanHost> Walk for PlanWalk<H> {
 
     fn rewind_slack(&self) -> usize {
         self.host.rewind_slack()
+    }
+
+    fn rewind_point(&self, prompt: usize) -> usize {
+        self.host.rewind_point(prompt)
     }
 
     fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
