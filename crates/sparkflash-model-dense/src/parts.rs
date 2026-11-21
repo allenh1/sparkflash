@@ -32,14 +32,18 @@ use sparkflash_model::backend::BackendError;
 use sparkflash_model::{Architecture, Part, TpPlan};
 use sparkflash_ops::calls::RmsNorm;
 use sparkflash_ops::formats::{Bf16, FormatKind, Mat};
+use sparkflash_ops::moe::Launch;
 use sparkflash_ops::naming::{LayerNames, TensorNames};
 use sparkflash_ops::projection::WidePolicy;
+use sparkflash_ops::roles::DeviceCx;
 pub use sparkflash_ops::roles::SegmentRows;
 use sparkflash_ops::widen::LedgerRow;
 use sparkflash_runtime::{PartExec, PartHost, PartRegistry, RankSplit, Region};
 use sparkflash_weights::WeightSource;
 
-use super::{Buffers, DEVICE, DenseMlp, Gdn, Gqa, RoutedExperts, Sequence, Shape, Shared, Uploads};
+use super::{
+    Buffers, DEVICE, DenseMlp, Gdn, Gqa, Proj, RoutedExperts, Sequence, Shape, Shared, Uploads,
+};
 
 /// The shared dense device arm, as the host its parts plug into.
 #[derive(Debug, Clone, Copy)]
@@ -231,6 +235,51 @@ impl PassCx<'_> {
         args: &[u64],
     ) -> Result<(), BackendError> {
         self.shared.launch(kernel, (grid, block), args)
+    }
+}
+
+/// The dense host as a role body's device: its own projection dispatch under the pass's policy,
+/// its row sums at any width, and the walk's one stream.
+impl DeviceCx for PassCx<'_> {
+    type Linear = Proj;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn segments(&self) -> impl Iterator<Item = SegmentRows<'_>> + '_ {
+        PassCx::segments(self)
+    }
+
+    fn share(&self) -> Option<TpPlan> {
+        let plan = self.shared.shard.0;
+        (plan.world() > 1).then_some(plan)
+    }
+
+    fn launch(&self, kernel: Kernel, launch: Launch, args: &[u64]) -> Result<(), BackendError> {
+        self.shared.launch(kernel, launch, args)
+    }
+
+    fn project(
+        &self,
+        linear: &Proj,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        self.shared
+            .project(linear, self.b, input.0, output.0, rows, self.policy)
+    }
+
+    fn sum(&self, partial: Deviceptr, rows: usize, width: usize) -> Result<(), BackendError> {
+        self.shared.sum_width(partial, rows, width)
+    }
+
+    fn upload(&self, to: Deviceptr, bytes: &[u8]) -> Result<(), BackendError> {
+        self.shared
+            .cuda
+            .copy_htod(&to, bytes)
+            .map_err(|error| BackendError::new(DEVICE, format!("an upload: {error}")))
     }
 }
 

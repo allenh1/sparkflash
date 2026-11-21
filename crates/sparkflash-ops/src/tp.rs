@@ -171,25 +171,36 @@ impl RowSums {
     /// # Errors
     /// More rows than the slots hold.
     pub fn leg(&self, rows: usize) -> Result<SumLeg, BackendError> {
+        self.leg_width(rows, self.hidden)
+    }
+
+    /// The leg a sum of `rows` rows of `width` floats takes: a row as wide as the residual
+    /// ([Self::leg]), or a body's own narrower or wider rows within the slots' floats.
+    ///
+    /// # Errors
+    /// More floats than the slots hold, or on a device leg a row that is not whole float4s.
+    pub fn leg_width(&self, rows: usize, width: usize) -> Result<SumLeg, BackendError> {
         if !self.device_leg {
             return Ok(SumLeg::Host);
         }
-        if rows > self.rows {
+        if rows * width > self.rows * self.hidden {
             return Err(BackendError::new(
                 "tp",
                 format!(
-                    "a sum of {rows} rows is wider than the {} the collective's slots hold",
-                    self.rows
+                    "a sum of {rows} rows of {width} floats is wider than the {} rows of {} the \
+                     collective's slots hold",
+                    self.rows, self.hidden
                 ),
             ));
         }
+        if !width.is_multiple_of(4) {
+            return Err(BackendError::new(
+                "tp",
+                format!("a {width}-wide row is not whole float4s, which the device sum adds"),
+            ));
+        }
         Ok(
-            if takes_two_shots(
-                self.two_shot_rows,
-                rows,
-                rows * self.hidden,
-                self.runtime.world(),
-            ) {
+            if takes_two_shots(self.two_shot_rows, rows, rows * width, self.runtime.world()) {
                 SumLeg::TwoShot
             } else {
                 SumLeg::OneShot
@@ -211,11 +222,28 @@ impl RowSums {
         rows: usize,
         launch: impl Fn(Call<5>) -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
-        let count = rows * self.hidden;
+        self.sum_width(cuda, stream, partial, rows, self.hidden, launch)
+    }
+
+    /// [Self::sum] for `rows` rows of `width` floats each: a body's own rows, such as a lookup's
+    /// heads split over the group, summed in the same rank order.
+    ///
+    /// # Errors
+    /// As [Self::leg_width], a collective or copy failure, or whatever `launch` reports.
+    pub fn sum_width(
+        &self,
+        cuda: &Cuda,
+        stream: Option<&RunStream>,
+        partial: Deviceptr,
+        rows: usize,
+        width: usize,
+        launch: impl Fn(Call<5>) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        let count = rows * width;
         let (rank, world) = (self.runtime.rank(), self.runtime.world());
         let raw = stream.map_or(0, RunStream::raw);
         let device = |error: String| BackendError::new("tp", error);
-        match (self.leg(rows)?, self.slots) {
+        match (self.leg_width(rows, width)?, self.slots) {
             (SumLeg::Host, _) => host_sum(cuda, stream, &self.runtime, partial, count),
             (SumLeg::TwoShot, Some(slots)) => {
                 reduce_two_shot(&self.runtime, raw, partial, slots, count, |mine, chunk| {

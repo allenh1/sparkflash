@@ -31,7 +31,6 @@
 
 use std::sync::Arc;
 
-use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_model::backend::BackendError;
 use sparkflash_model::ledger::State;
 use sparkflash_ops::calls::{self, RmsNorm};
@@ -42,8 +41,8 @@ use sparkflash_runtime::{
 };
 
 use super::{
-    CHUNK_ROWS, DEVICE, Dense, DenseLane, PassCx, Scratch, Shared, TOKEN_DECODE, floats,
-    head as dense_head, head_choices as dense_head_choices,
+    CHUNK_ROWS, DEVICE, Dense, DenseFrame, DenseLane, Landing, PassCx, Scratch, Shared,
+    TOKEN_DECODE, floats, head as dense_head, head_choices as dense_head_choices,
 };
 
 /// The dense arm, exposed to the shared runtime as a Walk: the runtime's walk over [Shared].
@@ -101,7 +100,7 @@ impl PlanLane for DenseLane {
 
 impl PlanHost for Shared {
     type Parts = Dense;
-    type Frame = Deviceptr;
+    type Frame = DenseFrame;
     type Lane = DenseLane;
     type Scratch = Scratch;
     type Mode = Option<WidePolicy>;
@@ -128,7 +127,7 @@ impl PlanHost for Shared {
         self.layers.len()
     }
 
-    fn branches(&self, layer: usize) -> &[PlanBranch<Dense, Deviceptr>] {
+    fn branches(&self, layer: usize) -> &[PlanBranch<Dense, DenseFrame>] {
         &self.layers[layer].branches
     }
 
@@ -184,10 +183,18 @@ impl PlanHost for Shared {
         )
     }
 
-    fn enter(&self, scratch: &Scratch, norm: &Deviceptr, rows: usize) -> Result<(), BackendError> {
+    fn enter(
+        &self,
+        scratch: &Scratch,
+        frame: &DenseFrame,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        if let Some(streams) = &frame.streams {
+            return Err(streams.refusal());
+        }
         let b = &scratch.buffers;
         self.norm(
-            RmsNorm::new(b.x.0, norm.0, b.normed.0, self.hidden, self.eps),
+            RmsNorm::new(b.x.0, frame.norm.0, b.normed.0, self.hidden, self.eps),
             rows,
         )
     }
@@ -215,18 +222,50 @@ impl PlanHost for Shared {
     fn leave(
         &self,
         scratch: &Scratch,
-        _norm: &Deviceptr,
-        _next: Option<&Deviceptr>,
+        frame: &DenseFrame,
+        _next: Option<&DenseFrame>,
         summed: bool,
         rows: usize,
     ) -> Result<(), BackendError> {
+        if let Some(streams) = &frame.streams {
+            return Err(streams.refusal());
+        }
+        match frame.landing {
+            Landing::Added => {}
+            Landing::Landed if summed => {
+                return Err(BackendError::new(
+                    DEVICE,
+                    "a part that writes the residual itself sums its own rows, and this one asks \
+                     the frame to",
+                ));
+            }
+            Landing::Landed => return Ok(()),
+        }
         let b = &scratch.buffers;
         if summed {
             self.sum(b.projected, rows)?;
         }
+        // A norm after the sublayer reads the summed rows and leaves them in the part's input,
+        // which nothing reads after the part.
+        let landed = match frame.post_norm {
+            None => b.projected,
+            Some(post_norm) => {
+                self.norm(
+                    RmsNorm::new(
+                        b.projected.0,
+                        post_norm.0,
+                        b.normed.0,
+                        self.hidden,
+                        self.eps,
+                    ),
+                    rows,
+                )?;
+                b.normed
+            }
+        };
         self.call(
             self.kernels.add,
-            calls::add(b.x.0, b.projected.0, rows * self.hidden),
+            calls::add(b.x.0, landed.0, rows * self.hidden),
         )
     }
 

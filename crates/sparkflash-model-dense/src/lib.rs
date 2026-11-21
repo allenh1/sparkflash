@@ -99,7 +99,7 @@ use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
-use sparkflash_ops::roles::Bound;
+use sparkflash_ops::roles::{Bound, ManifoldMixer};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -401,7 +401,60 @@ struct Layer {
 /// One branch of a layer: its frame is the RMSNorm of the residual before the part (the group's
 /// sum of a partial and the residual add after it are the host's exit), then the part over the
 /// normed rows ([sparkflash_runtime::PlanBranch]; its slot is [LaneParts::regions]'s index).
-type Branch = PlanBranch<Dense, Deviceptr>;
+type Branch = PlanBranch<Dense, DenseFrame>;
+
+/// A branch's frame: the norm the part reads the residual through, and how the part's rows land
+/// back on it.
+///
+/// A plain residual's frame is its norm alone (`post_norm` and `streams` `None`, landing
+/// [Landing::Added]): the norm before the part, the group's sum of a partial, the add after it.
+#[derive(Debug, Clone)]
+pub struct DenseFrame {
+    /// The RMSNorm gains of the residual before the part.
+    pub norm: Deviceptr,
+    /// The gains of the norm over the part's rows before they land ([Layer::post_norm]), when
+    /// the layer declares one.
+    ///
+    /// [Layer::post_norm]: sparkflash_model::architecture::Layer::post_norm
+    pub post_norm: Option<Deviceptr>,
+    /// The hyper-connection streams the frame mixes the part's input from and lands its rows
+    /// on, when the residual is widened.
+    pub streams: Option<StreamFrame>,
+    /// How the part's rows reach the residual.
+    pub landing: Landing,
+}
+
+/// How a branch's rows reach the residual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landing {
+    /// The frame adds the part's rows, summed over the group when the part splits them.
+    Added,
+    /// The part writes the residual itself, as a lookup's gate and write does; the frame adds
+    /// nothing, and a part that splits its rows sums them itself
+    /// ([sparkflash_ops::roles::DeviceCx::sum]).
+    Landed,
+}
+
+/// The hyper-connection streams of a widened residual, as a branch's frame mixes them.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamFrame {
+    /// The manifold-constrained mix.
+    Manifold(ManifoldMixer),
+}
+
+impl StreamFrame {
+    /// The refusal of a frame the dense host does not mix yet.
+    fn refusal(&self) -> BackendError {
+        let Self::Manifold(mixer) = self;
+        BackendError::new(
+            DEVICE,
+            format!(
+                "the dense host does not widen its residual into {} hyper-connection streams yet",
+                mixer.geometry_of().hc_mult
+            ),
+        )
+    }
+}
 
 /// Every branch of `layers`, in walk order: the order of [Branch::slot].
 fn branches(layers: &[Layer]) -> impl Iterator<Item = &Branch> {
@@ -455,8 +508,10 @@ struct GdnLayer {
 /// ([sparkflash_ops::formats::upload]), so its stored dtype and its format's scale count were
 /// checked when it was read.
 #[derive(Debug, Clone)]
-enum Proj {
+pub enum Proj {
+    /// BF16 weights.
     Bf16(Mat<Bf16>),
+    /// E4M3 codes under one BF16 inverse scale a 128 x 128 tile.
     Fp8(Mat<Fp8E4m3>),
     /// E2M1 codes under one E4M3 scale a 16-value group: the routed experts' form.
     NvFp4(Mat<NvFp4>),
@@ -2364,9 +2419,19 @@ fn upload<'a>(
         let mut branches = Vec::with_capacity(built.len());
         for (role, part) in built {
             branches.push(Branch {
-                frame: match role {
-                    StepRole::Attention => input_norm,
-                    _ => post_norm,
+                // The catalogue refuses a layer that declares a norm after each sublayer or a
+                // widened residual, so every frame here is the plain residual's.
+                frame: DenseFrame {
+                    norm: match role {
+                        StepRole::Attention => input_norm,
+                        _ => post_norm,
+                    },
+                    post_norm: None,
+                    streams: None,
+                    landing: match role {
+                        StepRole::Side => Landing::Landed,
+                        _ => Landing::Added,
+                    },
                 },
                 summed: part.split(&open.plan) == RankSplit::Summed,
                 part,
@@ -2410,9 +2475,14 @@ impl Shared {
     /// A branch's `rows` partial rows at `partial` summed over the group, in place: nothing at one
     /// rank.
     fn sum(&self, partial: Deviceptr, rows: usize) -> Result<(), BackendError> {
+        self.sum_width(partial, rows, self.hidden)
+    }
+
+    /// [Self::sum] for `rows` rows of `width` floats each.
+    fn sum_width(&self, partial: Deviceptr, rows: usize, width: usize) -> Result<(), BackendError> {
         match &self.sums {
             None => Ok(()),
-            Some(sums) => sums.sum(&self.cuda, None, partial, rows, |call| {
+            Some(sums) => sums.sum_width(&self.cuda, None, partial, rows, width, |call| {
                 self.call(self.kernels.sum_slots, call)
             }),
         }
