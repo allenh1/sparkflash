@@ -106,31 +106,6 @@ if [ -z "$ARM" ]; then
     exit 2
 fi
 
-# The arm's conformance crate. A new arm names its crate with --crate; the four landed arms are
-# derived from their names so the gate cannot run another crate's checks by accident. The crates
-# are the ones the registrations state (sparkflash_model::ARMS, Source::crate_name): a test in
-# crates/sparkflash-model/tests/arms.rs fails when an arm crate declares the checks and this case
-# does not name it.
-if [ -z "$CRATE" ]; then
-    lower="$(printf '%s' "$ARM" | tr '[:upper:]' '[:lower:]')"
-    case "$lower" in
-        dense|acme-dense) CRATE="sparkflash-model-dense" ;;
-        glm|glm5|glm5-next|glm-5.3-flash|glm53-flash|glm5_next)
-            CRATE="sparkflash-model-glm5-next" ;;
-        qwen|qwen4|qwen4-exp|qwen3.8-flash-next|qwen4_exp)
-            CRATE="sparkflash-model-qwen4-exp" ;;
-        inkling|inkling2|inkling-2-small|inkling2-small)
-            CRATE="sparkflash-model-inkling2" ;;
-        dory|dory1|dory1.0|dory10|dory-1.0-4b|dory-1.0-4b-bf16)
-            CRATE="sparkflash-model-dory" ;;
-        runtime) CRATE="sparkflash-runtime" ;;
-        *)
-            echo "onboard-gate: no conformance crate for arm \"$ARM\"; pass --crate" >&2
-            exit 2
-            ;;
-    esac
-fi
-
 # The binary the gate reads ARMS through. A dry run on a host without a build still prints the
 # commands; the arm is then its own slug unless --model is supplied.
 BIN="${SPARKFLASH_BIN:-}"
@@ -139,6 +114,22 @@ if [ -z "$BIN" ]; then
         BIN="$ROOT/target/release/sparkflash"
     elif [ -x "$ROOT/target/debug/sparkflash" ]; then
         BIN="$ROOT/target/debug/sparkflash"
+    fi
+fi
+
+# The arm's conformance crate, read from the registration (`sparkflash arms --crate`, which
+# matches an arm's id, its model id or its crate's name). --crate names one directly, for an arm
+# not registered yet; `runtime` is the runtime's own toy walk.
+if [ -z "$CRATE" ]; then
+    lower="$(printf '%s' "$ARM" | tr '[:upper:]' '[:lower:]')"
+    if [ "$lower" = "runtime" ]; then
+        CRATE="sparkflash-runtime"
+    elif [ -n "$BIN" ] && [ -x "$BIN" ]; then
+        CRATE="$("$BIN" arms --crate "$ARM")" || exit 2
+    else
+        echo "onboard-gate: no sparkflash binary to read arm \"$ARM\"'s crate from;" \
+            "build it, set SPARKFLASH_BIN, or pass --crate" >&2
+        exit 2
     fi
 fi
 

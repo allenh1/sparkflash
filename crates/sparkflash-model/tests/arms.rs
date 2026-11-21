@@ -218,22 +218,6 @@ fn a_model_crate_reads_no_environment_beyond_the_recorded_table() {
     }
 }
 
-/// Whether any `.rs` file under `directory` contains `needle`.
-fn source_contains(directory: &Path, needle: &str) -> bool {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return false;
-    };
-    entries.filter_map(Result::ok).any(|entry| {
-        let path = entry.path();
-        if path.is_dir() {
-            source_contains(&path, needle)
-        } else {
-            path.extension().is_some_and(|extension| extension == "rs")
-                && fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
-        }
-    })
-}
-
 #[test]
 fn every_model_crate_is_an_arms_crate() {
     let named = ARMS
@@ -259,36 +243,22 @@ fn every_model_crate_is_an_arms_crate() {
     }
 }
 
-/// The onboarding gate derives an arm's conformance crate from its name. Every arm crate that
-/// declares the generated checks must be one the script can name, and the script names no crate
-/// that is not an arm's (or the runtime's own toy walk).
+/// The onboarding gate reads an arm's conformance crate from the registration
+/// (`sparkflash arms --crate`), so it keeps no list of arm crates that could fall behind `ARMS`.
 #[test]
-fn the_onboard_gate_names_every_conformance_crate() {
+fn the_onboard_gate_reads_an_arms_crate_from_the_registration() {
     let script =
         fs::read_to_string(root().join("scripts/onboard-gate.sh")).expect("the onboarding gate");
-    let mut crates = BTreeSet::from(["sparkflash-runtime"]);
+    assert!(
+        script.contains("arms --crate"),
+        "scripts/onboard-gate.sh reads the crate through `sparkflash arms --crate`"
+    );
     for arm in ARMS {
         let name = arm.source().crate_name;
-        crates.insert(name);
-        let declares = source_contains(
-            &root().join("crates").join(name).join("src"),
-            "sparkflash_runtime::conformance!(",
+        assert!(
+            !script.contains(&format!("CRATE=\"{name}\"")),
+            "scripts/onboard-gate.sh names {name} by hand; ARMS states it"
         );
-        assert_eq!(
-            script.contains(&format!("CRATE=\"{name}\"")),
-            declares,
-            "{name} declares the conformance checks: {declares}; scripts/onboard-gate.sh must \
-             name exactly the crates that do"
-        );
-    }
-    for line in script.lines() {
-        if let Some((_, rest)) = line.split_once("CRATE=\"sparkflash-") {
-            let name = format!("sparkflash-{}", rest.split('"').next().unwrap_or_default());
-            assert!(
-                crates.contains(name.as_str()),
-                "scripts/onboard-gate.sh names {name}, which is no arm's crate"
-            );
-        }
     }
 }
 

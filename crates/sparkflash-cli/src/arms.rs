@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `sparkflash arms --list|--ledger`: the serving arms and the strategies each states.
+//! `sparkflash arms --list|--ledger|--crate ARM`: the serving arms, the strategies each states,
+//! and the crate an arm's code lives in.
 //!
 //! `--list` reads `sparkflash_model::ARMS`, the one model table: the console id, the registry
 //! weight selectors, the default context, the tokenizer and chat template, the conversion
@@ -119,14 +120,47 @@ fn numerics(declaration: &ArmLedger) -> String {
 }
 
 /// Entry point called by `main.rs` with the arguments after `arms`.
-pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
-    const USAGE: &str = "usage: sparkflash arms [--list] [--ledger]";
+/// The crate an arm's code lives in, by the arm's id, its model id, its crate's name or that
+/// name without `sparkflash-model-`, ignoring case. `scripts/onboard-gate.sh` reads an arm's
+/// conformance crate through it, so the script keeps no list of its own.
+#[must_use]
+pub fn crate_for(name: &str) -> Option<&'static str> {
+    ARMS.iter()
+        .map(|arm| (arm, arm.source().crate_name))
+        .find_map(|(arm, krate)| {
+            let short = krate.strip_prefix("sparkflash-model-").unwrap_or(krate);
+            [arm.id(), arm.model_id(), krate, short]
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(name))
+                .then_some(krate)
+        })
+}
+
+pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
+    const USAGE: &str = "usage: sparkflash arms [--list] [--ledger] | --crate ARM";
     let mut list = false;
     let mut ledger = false;
-    for flag in args {
+    while let Some(flag) = args.next() {
         match flag.as_str() {
             "--list" => list = true,
             "--ledger" => ledger = true,
+            "--crate" => {
+                let Some(name) = args.next() else {
+                    eprintln!("sparkflash arms: --crate needs an arm; {USAGE}");
+                    return ExitCode::FAILURE;
+                };
+                if list || ledger || args.next().is_some() {
+                    eprintln!("sparkflash arms: --crate takes one arm and nothing else; {USAGE}");
+                    return ExitCode::FAILURE;
+                }
+                let Some(krate) = crate_for(&name) else {
+                    let known: Vec<&str> = ARMS.iter().map(|arm| arm.id()).collect();
+                    eprintln!("sparkflash arms: no arm {name:?}; the arms are {known:?}");
+                    return ExitCode::FAILURE;
+                };
+                println!("{krate}");
+                return ExitCode::SUCCESS;
+            }
             other => {
                 eprintln!("sparkflash arms: unknown argument {other:?}; {USAGE}");
                 return ExitCode::FAILURE;
@@ -149,6 +183,22 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every arm resolves to its own crate by its id, its model id and its crate's short name,
+    /// and a name no arm has resolves to none.
+    #[test]
+    fn an_arm_names_its_crate() {
+        for arm in ARMS {
+            let krate = arm.source().crate_name;
+            let short = krate.strip_prefix("sparkflash-model-").unwrap_or(krate);
+            for name in [arm.id(), arm.model_id(), krate, short] {
+                let found = crate_for(&name.to_ascii_uppercase());
+                assert_eq!(found, Some(krate), "{name} resolves to {found:?}");
+            }
+        }
+        assert_eq!(crate_for("glm"), Some("sparkflash-model-glm5-next"));
+        assert_eq!(crate_for("no-such-arm"), None);
+    }
 
     #[test]
     fn the_arm_table_names_every_entry_and_its_items() {
