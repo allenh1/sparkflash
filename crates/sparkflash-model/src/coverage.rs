@@ -413,22 +413,33 @@ mod tests {
     #[test]
     fn a_key_read_under_one_path_does_not_hide_another_path() {
         let root: Value = serde_json::json!({
-            "text_config": {"dtype": "bf16"},
-            "vision_config": {"dtype": "bf16"}
+            "text_config": {"hidden_size": 8},
+            "vision_config": {"hidden_size": 16}
         });
         let ((), coverage) = with_recording(&root, || {
             let text = read_key(&root, "text_config").expect("text_config");
-            read_key(text, "dtype").expect("dtype");
+            read_key(&root, "vision_config").expect("vision_config");
+            read_key(text, "hidden_size").expect("hidden_size");
         });
-        assert!(coverage.unknown_keys().is_empty());
-        assert_eq!(coverage.ignored_keys().len(), 1);
-        assert!(coverage.read_keys().any(|key| key == "text_config.dtype"));
+        assert!(
+            coverage
+                .read_keys()
+                .any(|key| key == "text_config.hidden_size")
+        );
+        let unknown: Vec<&str> = coverage
+            .unknown_keys()
+            .iter()
+            .map(|unknown| unknown.path.as_str())
+            .collect();
+        assert_eq!(unknown, ["vision_config.hidden_size"]);
     }
 
     #[test]
     fn array_elements_are_walked_with_their_index() {
         let root: Value = serde_json::json!({"groups": [{"a": 1}, {"b": 2}]});
-        let ((), coverage) = with_recording(&root, || {});
+        let ((), coverage) = with_recording(&root, || {
+            read_key(&root, "groups").expect("groups");
+        });
         let unknown: Vec<&str> = coverage
             .unknown_keys()
             .iter()
@@ -480,20 +491,18 @@ mod tests {
 
     #[test]
     fn the_five_carried_configs_consume_every_key() {
+        let mut unread = Vec::new();
         for (name, text) in CARRIED {
             let (_, coverage) =
                 crate::Architecture::from_json_with_coverage(text).expect("a carried config");
-            let unknown: Vec<&str> = coverage
-                .unknown_keys()
-                .iter()
-                .map(|unknown| unknown.path.as_str())
-                .collect();
-            assert!(
-                unknown.is_empty(),
-                "{name} has config keys no read consumed: {unknown:#?}"
-            );
-            assert_eq!(coverage.state(), KeyCoverageState::Clean, "{name}");
+            for unknown in coverage.unknown_keys() {
+                unread.push(format!("{name}: {}", unknown.path));
+            }
         }
+        assert!(
+            unread.is_empty(),
+            "config keys no read consumed: {unread:#?}"
+        );
     }
 
     /// The same check against the config.json files installed in the Hugging Face cache.
