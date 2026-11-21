@@ -35,6 +35,7 @@ use sparkflash_model::backend::BackendError;
 use sparkflash_model::ledger::State;
 use sparkflash_ops::calls::{self, RmsNorm};
 use sparkflash_ops::projection::WidePolicy;
+use sparkflash_ops::roles::{Embed, Launcher};
 use sparkflash_runtime::{
     Absent, ComputeDeclaration, Limits, NoVision, PassKind, PassMask, PlanBranch, PlanHost,
     PlanLane, PlanPass, PlanSeq, PlanWalk, Segments, StateKind, WalkCapabilities,
@@ -171,15 +172,11 @@ impl PlanHost for Shared {
         self.cuda
             .copy_htod(&b.tokens, &bytes)
             .map_err(|error| BackendError::new(DEVICE, error))?;
-        self.call(
-            self.kernels.embed,
-            calls::embed_rows(
-                self.embed.data().0,
-                b.x.0,
-                b.tokens.0,
-                (self.hidden, self.hidden),
-                ids.len(),
-            ),
+        Embed::new(self.kernels.embed, self.embed.data(), self.hidden, 1)?.rows(
+            self,
+            b.x,
+            b.tokens,
+            ids.len(),
         )
     }
 

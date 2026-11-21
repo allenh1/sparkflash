@@ -1224,15 +1224,11 @@ impl DraftState {
         // Row 0: the anchor's normed embedding, which only the rank that owns the id holds.
         match (anchor as usize).checked_sub(first_id) {
             Some(local) if local < rank_vocab => {
-                run(shared.call(
-                    shared.kernels.embed,
-                    sparkflash_ops::calls::embed(
-                        model.embed_table.0,
-                        self.block.0,
-                        local as u32,
-                        (hidden, hidden),
-                    ),
-                ))?;
+                Embed::new(shared.kernels.embed, model.embed_table, hidden, 1)?.row(
+                    shared,
+                    self.block,
+                    local as u32,
+                )?;
                 run(shared.rmsnorm(self.block, model.embed_norm, self.block, 1, hidden))?;
             }
             _ => run(shared.cuda.memset_d8_async(self.block, 0, hidden * f))?,

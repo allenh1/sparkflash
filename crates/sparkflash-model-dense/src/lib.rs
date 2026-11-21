@@ -80,7 +80,7 @@ use sparkflash_model::compose::{LayerStep, StepRole};
 use sparkflash_model::ledger::State;
 use sparkflash_model::{Architecture, Capabilities, ModelDescriptor, TpAxis, TpPlan};
 use sparkflash_ops::OpPlan;
-use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
+use sparkflash_ops::calls::{self, FullAttention, RmsNorm, Rope};
 use sparkflash_ops::dflash::{DraftUploader, Part as Run};
 use sparkflash_ops::engine_plan::{EnginePlan, PlanError};
 use sparkflash_ops::formats::{
@@ -99,7 +99,7 @@ use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
-use sparkflash_ops::roles::{Bound, ManifoldMixer};
+use sparkflash_ops::roles::{Bound, Launcher, ManifoldMixer};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -2471,6 +2471,21 @@ fn bf16(source: &dyn WeightSource, name: &str, shape: &[usize]) -> Result<(), St
     Ok(())
 }
 
+/// Every launch of the arm is on the context's null stream.
+impl Launcher for Shared {
+    fn launch(
+        &self,
+        kernel: impl Into<Kernel>,
+        (grid, block): Launch,
+        args: &[u64],
+    ) -> Result<(), BackendError> {
+        let kernel = kernel.into();
+        self.cuda
+            .launch_async(kernel, grid, block, args)
+            .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
+    }
+}
+
 impl Shared {
     /// A branch's `rows` partial rows at `partial` summed over the group, in place: nothing at one
     /// rank.
@@ -2486,17 +2501,6 @@ impl Shared {
                 self.call(self.kernels.sum_slots, call)
             }),
         }
-    }
-
-    fn call<const N: usize>(
-        &self,
-        kernel: impl Into<Kernel>,
-        call: Call<N>,
-    ) -> Result<(), BackendError> {
-        let kernel = kernel.into();
-        self.cuda
-            .launch_async(kernel, call.grid, call.block, &call.args)
-            .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
     }
 
     /// A grouped-query attention layer over the normed rows in `b.normed`, into `b.attended`: the
@@ -2909,18 +2913,6 @@ impl Shared {
         )
     }
 
-    fn launch(
-        &self,
-        kernel: impl Into<Kernel>,
-        (grid, block): Launch,
-        args: &[u64],
-    ) -> Result<(), BackendError> {
-        let kernel = kernel.into();
-        self.cuda
-            .launch_async(kernel, grid, block, args)
-            .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
-    }
-
     /// `output = down(silu(gate(normed)) * up(normed))` over `rows`, in the MLP scratch, the gate
     /// and up clamped first under the layer's `clamp`.
     fn mlp(
@@ -3090,17 +3082,18 @@ struct Tiled<'a> {
     counters: Deviceptr,
 }
 
-impl GemvDevice for Tiled<'_> {
+impl Launcher for Tiled<'_> {
     fn launch(
         &self,
-        kernel: Kernel,
-        grid: (u32, u32, u32),
-        block: (u32, u32, u32),
+        kernel: impl Into<Kernel>,
+        launch: Launch,
         args: &[u64],
     ) -> Result<(), BackendError> {
-        self.shared.launch(kernel, (grid, block), args)
+        self.shared.launch(kernel, launch, args)
     }
+}
 
+impl GemvDevice for Tiled<'_> {
     fn gemv(
         &self,
         matrix: &GpuMat,

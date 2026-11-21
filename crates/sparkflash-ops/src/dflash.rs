@@ -1032,11 +1032,13 @@ pub fn gemv_e4m3(
     device.launch(
         kernel,
         (
-            tiles as u32,
-            tiled_gemv_e4m3_splits(tiles, matrix.columns) as u32,
-            1,
+            (
+                tiles as u32,
+                tiled_gemv_e4m3_splits(tiles, matrix.columns) as u32,
+                1,
+            ),
+            (256, 1, 1),
         ),
-        (256, 1, 1),
         &[
             matrix.weight.0,
             matrix.scales.0,
@@ -1074,8 +1076,7 @@ impl GpuDflash2 {
         let hidden = config.hidden_size;
         device.launch(
             self.kernels.capture,
-            (hidden.div_ceil(256) as u32, rows as u32, 1),
-            (256, 1, 1),
+            ((hidden.div_ceil(256) as u32, rows as u32, 1), (256, 1, 1)),
             &[
                 streams.offset(first * hc * hidden * 4).0,
                 scratch
@@ -1134,8 +1135,7 @@ impl GpuDflash2 {
             let (key_ring, value_ring) = scratch.ring(config, index);
             device.launch(
                 self.kernels.kv_ring,
-                (kv_width.div_ceil(256) as u32, rows as u32, 1),
-                (256, 1, 1),
+                ((kv_width.div_ceil(256) as u32, rows as u32, 1), (256, 1, 1)),
                 &[
                     key_ring.0,
                     value_ring.0,
@@ -1175,8 +1175,7 @@ impl GpuDflash2 {
         let hidden = config.hidden_size;
         device.launch(
             kernels.block_embed,
-            (hidden.div_ceil(256) as u32, block as u32, 1),
-            (256, 1, 1),
+            ((hidden.div_ceil(256) as u32, block as u32, 1), (256, 1, 1)),
             &[
                 embed.0,
                 scratch.hidden.0,
@@ -1189,8 +1188,7 @@ impl GpuDflash2 {
         let into_residual = |kernel: Kernel| {
             device.launch(
                 kernel,
-                (rows.div_ceil(256) as u32, 1, 1),
-                (256, 1, 1),
+                ((rows.div_ceil(256) as u32, 1, 1), (256, 1, 1)),
                 &[scratch.residual.0, scratch.hidden.0, rows as u64],
             )
         };
@@ -1233,8 +1231,7 @@ impl GpuDflash2 {
         let parts = self.topk_parts();
         device.launch(
             kernels.topk_partial,
-            (parts as u32, edges as u32, 1),
-            (TOPK_THREADS as u32, 1, 1),
+            ((parts as u32, edges as u32, 1), (TOPK_THREADS as u32, 1, 1)),
             &[
                 scratch.logits.0,
                 scratch.part_values.0,
@@ -1289,8 +1286,10 @@ impl GpuDflash2 {
         let top_k = self.config.selector_top_k;
         device.launch(
             self.kernels.topk_final,
-            ((self.config.block_size - 1) as u32, 1, 1),
-            (topk_threads(parts * top_k)?, 1, 1),
+            (
+                ((self.config.block_size - 1) as u32, 1, 1),
+                (topk_threads(parts * top_k)?, 1, 1),
+            ),
             &[
                 part_values.0,
                 part_ids.0,
@@ -1319,8 +1318,7 @@ impl GpuDflash2 {
         let block = config.block_size;
         device.launch(
             self.kernels.select,
-            (1, 1, 1),
-            (256, 1, 1),
+            ((1, 1, 1), (256, 1, 1)),
             &[
                 scratch.candidate_ids.0,
                 scratch.candidate_values.0,
@@ -1420,8 +1418,10 @@ impl GpuDflash2 {
         let scale = 1.0 / (config.head_dim as f32).sqrt();
         device.launch(
             self.kernels.attn,
-            (config.num_attention_heads as u32, block as u32, 1),
-            (ATTN_THREADS, 1, 1),
+            (
+                (config.num_attention_heads as u32, block as u32, 1),
+                (ATTN_THREADS, 1, 1),
+            ),
             &[
                 scratch.query.0,
                 key_ring.0,
@@ -1541,8 +1541,10 @@ impl GpuDflash2 {
         let hidden = config.hidden_size;
         device.launch(
             self.kernels.conv,
-            (hidden.div_ceil(256) as u32, config.block_size as u32, 1),
-            (256, 1, 1),
+            (
+                (hidden.div_ceil(256) as u32, config.block_size as u32, 1),
+                (256, 1, 1),
+            ),
             &[
                 input.0,
                 taps.0,

@@ -100,7 +100,7 @@ use sparkflash_kernels::images::{self, Image};
 use sparkflash_kernels::lane_memory::{self, BackError, LanePlans, Layout, SequenceLanes};
 use sparkflash_model::{BackendError, Part, StepCost};
 use sparkflash_ops::OpPlan;
-use sparkflash_ops::calls::{self, Call, RmsNorm};
+use sparkflash_ops::calls::RmsNorm;
 use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 use sparkflash_ops::formats::{
     Bf16, CodePlanes, F32 as F32Format, FormatKind, Fp8E4m3, Mat, Scales, Tensor,
@@ -112,14 +112,14 @@ use sparkflash_ops::gemv::{
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
 use sparkflash_ops::indexer::{IndexerPass, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS};
-use sparkflash_ops::moe::{MoePlanCall, combine_grid};
+use sparkflash_ops::moe::{Launch, MoePlanCall, combine_grid};
 use sparkflash_ops::packed::{self, Form, PackedSet, Placement, Tiled};
 use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
 use sparkflash_ops::roles;
-use sparkflash_ops::roles::Bound;
+use sparkflash_ops::roles::{Bound, Embed, Launcher};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{host_sum, reduce_scatter, reduce_two_shot, takes_two_shots};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -3815,11 +3815,6 @@ impl DeviceRank {
             })
     }
 
-    /// Launch a typed call of the shared token kernels ([sparkflash_ops::calls]).
-    fn call<const N: usize>(&self, kernel: Kernel, call: Call<N>) -> Result<(), BackendError> {
-        self.launch(kernel, call.grid, call.block.0, &call.args)
-    }
-
     fn launch(
         &self,
         kernel: Kernel,
@@ -3827,9 +3822,7 @@ impl DeviceRank {
         threads: u32,
         args: &[u64],
     ) -> Result<(), BackendError> {
-        self.cuda
-            .launch_on(&self.stream, kernel, grid, (threads, 1, 1), args)
-            .map_err(|error| cuda_error(format!("{}: {error}", kernel.name())))
+        Launcher::launch(self, kernel, (grid, (threads, 1, 1)), args)
     }
 
     /// `output = W input` for `rows` rows, BF16 or block-scaled FP8 by the weight, each of a fused
@@ -6959,15 +6952,11 @@ impl DeviceRank {
             .map_err(cuda_error)?;
         slab.write_at(0, bytemuck::cast_slice(tokens))
             .map_err(cuda_error)?;
-        self.call(
-            self.kernels.embed.kernel(),
-            calls::embed_rows(
-                self.embed.0,
-                out.0,
-                slab.device().0,
-                (hidden, copies * hidden),
-                tokens.len(),
-            ),
+        Embed::new(self.kernels.embed, self.embed, hidden, copies)?.rows(
+            self,
+            out,
+            slab.device(),
+            tokens.len(),
         )?;
         self.cuda
             .record_event_on(&self.stream, &self.tokens_staged.0)
@@ -6980,16 +6969,7 @@ impl DeviceRank {
         let s = &self.scratch;
         let hidden = self.config.hidden_size;
         let tokens = s.drafted.device().offset(iteration * MAX_ROWS * 4);
-        self.call(
-            self.kernels.embed.kernel(),
-            calls::embed_rows(
-                self.embed.0,
-                s.mtp_embed.0,
-                tokens.0,
-                (hidden, hidden),
-                rows,
-            ),
-        )
+        Embed::new(self.kernels.embed, self.embed, hidden, 1)?.rows(self, s.mtp_embed, tokens, rows)
     }
 
     /// `rows` rows of `x`, `src_stride` floats apart, RMS-normed by `weight` into `out`,
@@ -7517,20 +7497,23 @@ impl DeviceRank {
     }
 }
 
-/// The block drafter's launches go on the rank's stream, and its BF16 GEMVs through the rank's.
-impl GemvDevice for DeviceRank {
+/// Every launch of the rank is on its stream.
+impl Launcher for DeviceRank {
     fn launch(
         &self,
-        kernel: Kernel,
-        grid: (u32, u32, u32),
-        block: (u32, u32, u32),
+        kernel: impl Into<Kernel>,
+        (grid, block): Launch,
         args: &[u64],
     ) -> Result<(), BackendError> {
+        let kernel = kernel.into();
         self.cuda
             .launch_on(&self.stream, kernel, grid, block, args)
-            .map_err(cuda_error)
+            .map_err(|error| cuda_error(format!("{}: {error}", kernel.name())))
     }
+}
 
+/// The block drafter's launches go on the rank's stream, and its BF16 GEMVs through the rank's.
+impl GemvDevice for DeviceRank {
     fn gemv(
         &self,
         matrix: &GpuMat,
@@ -7558,17 +7541,18 @@ struct Scoring<'r> {
     device_leg: bool,
 }
 
-impl GemvDevice for Scoring<'_> {
+impl Launcher for Scoring<'_> {
     fn launch(
         &self,
-        kernel: Kernel,
-        grid: (u32, u32, u32),
-        block: (u32, u32, u32),
+        kernel: impl Into<Kernel>,
+        launch: Launch,
         args: &[u64],
     ) -> Result<(), BackendError> {
-        GemvDevice::launch(self.rank, kernel, grid, block, args)
+        Launcher::launch(self.rank, kernel, launch, args)
     }
+}
 
+impl GemvDevice for Scoring<'_> {
     fn gemv(
         &self,
         matrix: &GpuMat,

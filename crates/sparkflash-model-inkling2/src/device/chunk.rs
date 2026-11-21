@@ -1141,7 +1141,8 @@ impl ChunkRun {
                         .cuda
                         .memset_d8_async(scratch.x, 0, rows * hidden * std::mem::size_of::<f32>())
                         .map_err(|error| error.to_string()))?;
-                    let table = weight(step.weights[0]);
+                    let embed =
+                        Embed::new(shared.kernels.embed, weight(step.weights[0]), hidden, 1)?;
                     for (row, token) in tokens.iter().enumerate() {
                         let Some(local) = (*token as usize)
                             .checked_sub(first)
@@ -1149,18 +1150,11 @@ impl ChunkRun {
                         else {
                             continue;
                         };
-                        run(shared.call(
-                            shared.kernels.embed,
-                            sparkflash_ops::calls::embed(
-                                table.0,
-                                scratch
-                                    .x
-                                    .offset(row * hidden * std::mem::size_of::<f32>())
-                                    .0,
-                                local as u32,
-                                (hidden, hidden),
-                            ),
-                        ))?;
+                        embed.row(
+                            shared,
+                            scratch.x.offset(row * embed.width() * 4),
+                            local as u32,
+                        )?;
                     }
                 }
                 (Op::Collective(Collective::EmbeddingRow), _) => {

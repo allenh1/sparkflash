@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use sparkflash_kernels::cuda_driver::{Deviceptr, RunStream, StreamEvent};
 use sparkflash_model::BackendError;
+use sparkflash_ops::roles::Launcher;
 
 use super::{
     DeviceSequence, INJECTION_SLOT, PARTIALS_SLOT, SCRATCH_SLOTS, SequenceShared,

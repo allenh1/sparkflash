@@ -37,7 +37,7 @@ use sparkflash_model::architecture::{
 use sparkflash_model::backend::BackendError;
 use sparkflash_weights::mhc::HcGeometry;
 
-use crate::calls::BLOCK;
+use crate::calls::{self, BLOCK, Call};
 use crate::indexer::{MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS};
 use crate::moe::Launch;
 use crate::parts::CATALOGUE;
@@ -220,10 +220,37 @@ pub struct SegmentRows<'a> {
     pub regions: &'a [Deviceptr],
 }
 
-/// What a role body asks of the host it runs in, for one pass.
-///
-/// Every launch goes on the host's stream for the pass, in the order the body makes it.
-pub trait DeviceCx {
+/// The launch half of a body's host: every launch on the host's stream, in the order the body
+/// makes it. A body that only launches (the embedding, a norm) asks for this alone, so a host
+/// whose passes are not a [DeviceCx] runs it too.
+pub trait Launcher {
+    /// Launches `kernel` over `launch` with `args`, pointers as device addresses.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    fn launch(
+        &self,
+        kernel: impl Into<Kernel>,
+        launch: Launch,
+        args: &[u64],
+    ) -> Result<(), BackendError>;
+
+    /// Launches a typed call of the shared token kernels ([crate::calls]).
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    fn call<const N: usize>(
+        &self,
+        kernel: impl Into<Kernel>,
+        call: Call<N>,
+    ) -> Result<(), BackendError> {
+        self.launch(kernel, (call.grid, call.block), &call.args)
+    }
+}
+
+/// What a role body asks of the host it runs in, for one pass: its launches ([Launcher]), its
+/// rows, its share, the arm's projection and its sums.
+pub trait DeviceCx: Launcher {
     /// The arm's projection: a weight [Self::project] multiplies by, in the arm's own format.
     type Linear: ?Sized;
 
@@ -235,12 +262,6 @@ pub trait DeviceCx {
 
     /// The rank's share of a sharded group, `None` at one rank.
     fn share(&self) -> Option<TpPlan>;
-
-    /// Launches `kernel` over `launch` with `args`, pointers as device addresses.
-    ///
-    /// # Errors
-    /// The driver's refusal.
-    fn launch(&self, kernel: Kernel, launch: Launch, args: &[u64]) -> Result<(), BackendError>;
 
     /// `output[rows][linear's rows] = input[rows][linear's columns] x linearᵀ` on the arm's
     /// own projection dispatch, for `rows` rows.
@@ -267,6 +288,123 @@ pub trait DeviceCx {
     /// # Errors
     /// The driver's refusal.
     fn upload(&self, to: Deviceptr, bytes: &[u8]) -> Result<(), BackendError>;
+}
+
+/// The token embedding: `q4e_embed` widening a token's BF16 row of the table to f32, `streams`
+/// copies of it a row (the residual's hyper-connection streams, one for a plain residual).
+///
+/// Which rows a rank holds (a vocabulary share), where the ids are staged and what a row the
+/// rank does not hold gets are the host's: the body launches the rows it is handed.
+#[derive(Debug, Clone, Copy)]
+pub struct Embed {
+    kernel: Bound,
+    table: Deviceptr,
+    hidden: usize,
+    width: usize,
+}
+
+impl Embed {
+    /// The embedding's kernel.
+    pub const TABLE: KernelTable<1> = KernelTable {
+        image: Image::Qwen4Exp,
+        symbols: [("q4e_embed", Precision::Bf16)],
+    };
+
+    /// `kernel` (the loaded `q4e_embed`) over `table`'s `hidden`-wide rows, `streams` copies a
+    /// row.
+    ///
+    /// # Errors
+    /// Another kernel, or no row or stream, by name.
+    pub fn new(
+        kernel: Bound,
+        table: Deviceptr,
+        hidden: usize,
+        streams: usize,
+    ) -> Result<Self, BackendError> {
+        let [(symbol, _)] = Self::TABLE.symbols;
+        if kernel.kernel().name() != symbol {
+            return Err(BackendError::new(
+                ROLE,
+                format!(
+                    "the embedding runs {symbol}, not {}",
+                    kernel.kernel().name()
+                ),
+            ));
+        }
+        if hidden == 0 || streams == 0 {
+            return Err(BackendError::new(
+                ROLE,
+                format!("an embedding of {hidden}-wide rows in {streams} streams"),
+            ));
+        }
+        Ok(Self {
+            kernel,
+            table,
+            hidden,
+            width: hidden * streams,
+        })
+    }
+
+    /// The floats a row takes in `out`.
+    #[must_use]
+    pub const fn width(&self) -> usize {
+        self.width
+    }
+
+    /// `rows` rows into `out`, row `t` the table row of the id at `tokens[t]` (`[rows]` u32 the
+    /// device reads), in one launch.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn rows<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        out: Deviceptr,
+        tokens: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        cx.call(
+            self.kernel,
+            calls::embed_rows(
+                self.table.0,
+                out.0,
+                tokens.0,
+                (self.hidden, self.width),
+                rows,
+            ),
+        )
+    }
+
+    /// Table row `row` into the row at `out`, one launch.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn row<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        out: Deviceptr,
+        row: u32,
+    ) -> Result<(), BackendError> {
+        cx.call(
+            self.kernel,
+            calls::embed(self.table.0, out.0, row, (self.hidden, self.width)),
+        )
+    }
+
+    /// Each of `rows` into the next row from `out`, a launch a row.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn each<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        out: Deviceptr,
+        rows: &[u32],
+    ) -> Result<(), BackendError> {
+        rows.iter()
+            .enumerate()
+            .try_for_each(|(at, &row)| self.row(cx, out.offset(at * self.width * 4), row))
+    }
 }
 
 /// How a branch's rows reach the streams when the mix leaves the branch.
@@ -702,6 +840,12 @@ mod tests {
     /// A pass with nothing on a device: the bodies' refusals make no launch.
     struct NoDevice;
 
+    impl Launcher for NoDevice {
+        fn launch(&self, _: impl Into<Kernel>, _: Launch, _: &[u64]) -> Result<(), BackendError> {
+            unreachable!("no body launches yet")
+        }
+    }
+
     impl DeviceCx for NoDevice {
         type Linear = ();
 
@@ -715,10 +859,6 @@ mod tests {
 
         fn share(&self) -> Option<TpPlan> {
             None
-        }
-
-        fn launch(&self, _: Kernel, _: Launch, _: &[u64]) -> Result<(), BackendError> {
-            unreachable!("no body launches yet")
         }
 
         fn project(

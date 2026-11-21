@@ -34,6 +34,7 @@ use sparkflash_ops::attention::GqaBody;
 use sparkflash_ops::calls::{self, Rope};
 use sparkflash_ops::indexer::IndexerPass;
 use sparkflash_ops::moe::{MoePlanCall, combine_grid, token};
+use sparkflash_ops::roles::Launcher;
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{

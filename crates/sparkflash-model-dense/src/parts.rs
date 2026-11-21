@@ -35,8 +35,8 @@ use sparkflash_ops::formats::{Bf16, FormatKind, Mat};
 use sparkflash_ops::moe::Launch;
 use sparkflash_ops::naming::{LayerNames, TensorNames};
 use sparkflash_ops::projection::WidePolicy;
-use sparkflash_ops::roles::DeviceCx;
 pub use sparkflash_ops::roles::SegmentRows;
+use sparkflash_ops::roles::{DeviceCx, Launcher};
 use sparkflash_ops::widen::LedgerRow;
 use sparkflash_runtime::{PartExec, PartHost, PartRegistry, RankSplit, Region};
 use sparkflash_weights::WeightSource;
@@ -238,6 +238,17 @@ impl PassCx<'_> {
     }
 }
 
+impl Launcher for PassCx<'_> {
+    fn launch(
+        &self,
+        kernel: impl Into<Kernel>,
+        launch: Launch,
+        args: &[u64],
+    ) -> Result<(), BackendError> {
+        self.shared.launch(kernel, launch, args)
+    }
+}
+
 /// The dense host as a role body's device: its own projection dispatch under the pass's policy,
 /// its row sums at any width, and the walk's one stream.
 impl DeviceCx for PassCx<'_> {
@@ -254,10 +265,6 @@ impl DeviceCx for PassCx<'_> {
     fn share(&self) -> Option<TpPlan> {
         let plan = self.shared.shard.0;
         (plan.world() > 1).then_some(plan)
-    }
-
-    fn launch(&self, kernel: Kernel, launch: Launch, args: &[u64]) -> Result<(), BackendError> {
-        self.shared.launch(kernel, launch, args)
     }
 
     fn project(

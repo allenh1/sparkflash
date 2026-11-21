@@ -53,6 +53,7 @@ use sparkflash_runtime::{
 const DRAFT_BUDGET: DraftBudget = DraftBudget::AnchorsAndDrafts;
 
 use sparkflash_kernels::cuda_driver::Deviceptr;
+use sparkflash_ops::roles::Embed;
 
 use super::batch::{BatchBuffers, MAX_BATCH};
 use super::{DENSE_ROWS, DeviceSequence, GpuBranch, SCRATCH_SLOTS, SequenceShared};
@@ -1146,19 +1147,14 @@ impl PlanHost for QwenHost {
         let config = &backend.config;
         let kernels = &*backend.kernels;
         let weights = &backend.weights;
-        let width = config.hyper_width();
+        let embed = Embed::new(
+            kernels.embed,
+            weights.embed.data(),
+            config.hidden_size,
+            config.hc_count,
+        )?;
         if window.batch {
-            for (row, &token) in ids.iter().enumerate() {
-                device.call(
-                    kernels.embed,
-                    sparkflash_ops::calls::embed(
-                        weights.embed.data().0,
-                        device.hyper.offset(row * width * 4).0,
-                        token,
-                        (config.hidden_size, width),
-                    ),
-                )?;
-            }
+            embed.each(&*device, device.hyper, ids)?;
         } else {
             // The whole chunk in one launch, grid row t widening tokens[t], on the session's
             // stream like every other launch of the forward: the default stream the loader uses
@@ -1172,20 +1168,16 @@ impl PlanHost for QwenHost {
                 .token_staging
                 .write_at(0, bytemuck::cast_slice::<u32, u8>(ids))
                 .map_err(|error| BackendError::new(DEVICE, error))?;
-            device.call(
-                kernels.embed,
-                sparkflash_ops::calls::embed_rows(
-                    weights.embed.data().0,
-                    device.hyper.0,
-                    device.token_staging.device().0,
-                    (config.hidden_size, width),
-                    ids.len(),
-                ),
+            embed.rows(
+                &*device,
+                device.hyper,
+                device.token_staging.device(),
+                ids.len(),
             )?;
             cuda.record_event_on(device.clock(), &device.tokens_staged.0)
                 .map_err(|error| BackendError::new(DEVICE, error))?;
         }
-        device.probe_finite(0, "embed", device.hyper, ids.len() * width)?;
+        device.probe_finite(0, "embed", device.hyper, ids.len() * embed.width())?;
         device.prof_mark("embed")
     }
 

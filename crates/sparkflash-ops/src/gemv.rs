@@ -21,6 +21,8 @@
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model::BackendError;
 
+use crate::roles::Launcher;
+
 /// Tokens the token GEMM's tile holds.
 pub const GEMV_MAX_BATCH: usize = 8;
 
@@ -174,35 +176,8 @@ pub struct GpuMatE4m3Tile {
 /// Columns a block-scaled E4M3 tile spans.
 pub const E4M3_TILE: usize = 128;
 
-/// The launch and scratch a tiled GEMV needs from an arm.
-pub trait GemvDevice {
-    /// Launch a kernel on the arm's stream.
-    ///
-    /// # Errors
-    /// When the device refuses the launch.
-    fn launch(
-        &self,
-        kernel: Kernel,
-        grid: (u32, u32, u32),
-        block: (u32, u32, u32),
-        args: &[u64],
-    ) -> Result<(), BackendError>;
-
-    /// Launch a typed call ([crate::calls::Call]) on the arm's stream.
-    ///
-    /// # Errors
-    /// When the device refuses the launch.
-    fn call<const N: usize>(
-        &self,
-        kernel: Kernel,
-        call: crate::calls::Call<N>,
-    ) -> Result<(), BackendError>
-    where
-        Self: Sized,
-    {
-        self.launch(kernel, call.grid, call.block, &call.args)
-    }
-
+/// The launches ([Launcher], on the arm's stream) and scratch a tiled GEMV needs from an arm.
+pub trait GemvDevice: Launcher {
     /// output = matrix input for rows rows of matrix.columns values.
     ///
     /// # Errors
@@ -351,11 +326,13 @@ pub fn gemv_e4m3(
     device.launch(
         kernel,
         (
-            tiles as u32,
-            tiled_gemv_e4m3_splits(tiles, matrix.columns) as u32,
-            1,
+            (
+                tiles as u32,
+                tiled_gemv_e4m3_splits(tiles, matrix.columns) as u32,
+                1,
+            ),
+            (256, 1, 1),
         ),
-        (256, 1, 1),
         &[
             matrix.weight.0,
             matrix.scales.0,
@@ -401,11 +378,13 @@ pub fn gemv_e4m3_tile(
     device.launch(
         kernel,
         (
-            tiles as u32,
-            tiled_gemv_e4m3_splits(tiles, matrix.columns) as u32,
-            1,
+            (
+                tiles as u32,
+                tiled_gemv_e4m3_splits(tiles, matrix.columns) as u32,
+                1,
+            ),
+            (256, 1, 1),
         ),
-        (256, 1, 1),
         &[
             matrix.weight.0,
             matrix.scales.0,

@@ -89,9 +89,10 @@ use chunk::{BandOut, band_exchange, band_mix, device_error, exchange_gather, exc
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 use packed::pack_dense;
+use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{Form as DenseForm, Layout, Packed, PackedSet, Tiled};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::Bound;
+use sparkflash_ops::roles::{Bound, Embed, Launcher};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 pub use tower::InklingVisionTower;
 
@@ -1432,6 +1433,21 @@ struct Shared {
     /// The sessions' lane memory, planned when the first session opens (the drafter loads
     /// before it, and its rings are part of a lane).
     lanes: Mutex<Option<Arc<SequenceLanes<LaneParts>>>>,
+}
+
+/// Every launch of the arm is on the context's null stream, as [Shared::launch]'s.
+impl Launcher for Shared {
+    fn launch(
+        &self,
+        kernel: impl Into<Kernel>,
+        (grid, block): Launch,
+        args: &[u64],
+    ) -> Result<(), BackendError> {
+        let kernel = kernel.into();
+        self.cuda
+            .launch(kernel, grid, block, args)
+            .map_err(|error| device_error(format!("{}: {error}", kernel.name())))
+    }
 }
 
 impl Shared {
@@ -5657,15 +5673,13 @@ impl RowRun {
                     let local = (token as usize).checked_sub(first);
                     let weight = self.weight(step.weights[0]);
                     match local {
-                        Some(row) if row < rank_vocab => run(shared.call(
-                            shared.kernels.embed,
-                            calls::embed(
-                                weight.0,
-                                self.state.scratch.x.0,
+                        Some(row) if row < rank_vocab => {
+                            Embed::new(shared.kernels.embed, weight, hidden, 1)?.row(
+                                &*shared,
+                                self.state.scratch.x,
                                 row as u32,
-                                (hidden, hidden),
-                            ),
-                        ))?,
+                            )?;
+                        }
                         _ => run(shared
                             .cuda
                             .memset_d8_async(

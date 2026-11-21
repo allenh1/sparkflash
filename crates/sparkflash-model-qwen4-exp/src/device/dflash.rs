@@ -15,7 +15,7 @@
 //! Qwen's side of the shared DFlash 2 drafter: how a session implements the launch contract
 //! and how the drafter is resolved from the cache.
 
-use sparkflash_kernels::cuda_driver::{Deviceptr, Kernel};
+use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_model::{BackendError, StepCost};
 use sparkflash_ops::dflash::{DraftDevice, GpuDflash2};
 use sparkflash_ops::gemv::{GemvDevice, GpuMat, GpuMatE4m3};
@@ -72,16 +72,6 @@ pub(super) fn load_dflash_from_env(
 }
 
 impl GemvDevice for DeviceSequence {
-    fn launch(
-        &self,
-        kernel: Kernel,
-        grid: (u32, u32, u32),
-        block: (u32, u32, u32),
-        args: &[u64],
-    ) -> Result<(), BackendError> {
-        DeviceSequence::launch(self, kernel, grid, block, args)
-    }
-
     fn gemv(
         &self,
         matrix: &GpuMat,

@@ -41,9 +41,10 @@ use sparkflash_model::ModelDescriptor;
 use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession};
 use sparkflash_ops::formats::{Bf16, FormatKind, Mat, Scales, Tensor, upload as upload_format};
 use sparkflash_ops::gemv::CudaHandle;
+use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::Bound;
+use sparkflash_ops::roles::{Bound, Embed, Launcher};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog};
 // dory_mma_wide's tile is the shared wide tile: its geometry, launch and when a projection
 // takes it are the dispatcher's.
@@ -546,6 +547,18 @@ fn profile_refusal(profile: &sparkflash_model::profile::ModelProfile) -> Result<
         );
     }
     Ok(())
+}
+
+/// Every launch of the stage is on the context's null stream, as [launch]'s.
+impl Launcher for DeviceShared {
+    fn launch(
+        &self,
+        kernel: impl Into<Kernel>,
+        (grid, block): Launch,
+        args: &[u64],
+    ) -> Result<(), BackendError> {
+        launch(&self.cuda, kernel, grid, block, args)
+    }
 }
 
 impl DeviceShared {
@@ -2202,23 +2215,11 @@ fn embed_rows(
             ));
         }
     }
-    let hidden = config.hidden_size;
-    for (offset, token) in tokens.iter().enumerate() {
-        let call = sparkflash_ops::calls::embed(
-            embed.pointer().0,
-            scratch.hidden.offset(offset * hidden * 4).0,
-            *token,
-            (hidden, hidden),
-        );
-        launch(
-            cuda,
-            shared.kernels.embed,
-            call.grid,
-            call.block,
-            &call.args,
-        )?;
-    }
-    Ok(())
+    Embed::new(shared.kernels.embed, embed.pointer(), config.hidden_size, 1)?.each(
+        shared,
+        scratch.hidden,
+        tokens,
+    )
 }
 
 /// Which part of the looped walk a pass runs.

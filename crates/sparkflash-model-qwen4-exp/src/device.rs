@@ -105,13 +105,14 @@ pub use prefill::{
 };
 use prefill::{PrefillKernels, PrefillScratch, Projection};
 use sparkflash_ops::attention::{GQA_GROUP_KERNELS, gqa_group_shared_bytes};
-use sparkflash_ops::calls::{self, Call, RmsNorm};
+use sparkflash_ops::calls::{self, RmsNorm};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
+use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{Form, PackedSet, Placement, Tiled};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::Bound;
+use sparkflash_ops::roles::{Bound, Embed, Launcher};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -4067,22 +4068,12 @@ fn pack_dense(
     Ok((set, rows))
 }
 
-impl DeviceSequence {
-    /// Launch a typed call of the shared token kernels ([sparkflash_ops::calls]).
-    fn call<const N: usize>(
-        &self,
-        kernel: impl Into<Kernel>,
-        call: Call<N>,
-    ) -> Result<(), BackendError> {
-        self.launch(kernel, call.grid, call.block, &call.args)
-    }
-
-    #[allow(clippy::too_many_arguments)]
+/// Every launch of the sequence is on its clock ([DeviceSequence::clock]).
+impl Launcher for DeviceSequence {
     fn launch(
         &self,
         kernel: impl Into<Kernel>,
-        grid: (u32, u32, u32),
-        block: (u32, u32, u32),
+        (grid, block): Launch,
         args: &[u64],
     ) -> Result<(), BackendError> {
         let kernel = kernel.into();
@@ -4100,6 +4091,18 @@ impl DeviceSequence {
             eprintln!("qwen4: {kernel:?} grid {grid:?} block {block:?}");
         }
         Ok(())
+    }
+}
+
+impl DeviceSequence {
+    fn launch(
+        &self,
+        kernel: impl Into<Kernel>,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), BackendError> {
+        Launcher::launch(self, kernel, (grid, block), args)
     }
 
     /// The stream this session's work goes on: its own, or the batch's while it is a member.
@@ -5108,17 +5111,11 @@ impl DeviceSequence {
                 self.mtp_fold_scale.to_bits() as u64,
             ],
         )?;
-        for (t, &token) in tokens.iter().enumerate() {
-            self.call(
-                kernels.embed,
-                calls::embed(
-                    weights.embed.data().0,
-                    self.mtp_embed.offset(t * hidden * 4).0,
-                    token,
-                    (hidden, hidden),
-                ),
-            )?;
-        }
+        Embed::new(kernels.embed, weights.embed.data(), hidden, 1)?.each(
+            self,
+            self.mtp_embed,
+            tokens,
+        )?;
         self.norm(
             self.mtp_embed,
             mtp.pre_norm_embedding,
@@ -5471,16 +5468,13 @@ impl DeviceSequence {
         self.token_staging
             .write_at(0, bytemuck::cast_slice::<u32, u8>(tokens))
             .map_err(|error| BackendError::new("qwen4_device", error))?;
-        self.call(
+        Embed::new(
             kernels.embed,
-            calls::embed_rows(
-                weights.embed.data().0,
-                self.hyper.0,
-                self.token_staging.device().0,
-                (config.hidden_size, width),
-                batch,
-            ),
-        )?;
+            weights.embed.data(),
+            config.hidden_size,
+            config.hc_count,
+        )?
+        .rows(self, self.hyper, self.token_staging.device(), batch)?;
         cuda.record_event_on(self.clock(), &self.tokens_staged.0)
             .map_err(|error| BackendError::new("qwen4_device", error))?;
         self.probe_finite(0, "embed", self.hyper, batch * width)?;
