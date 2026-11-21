@@ -531,7 +531,7 @@ fn global_requirements(
             vision_position: vision.position.code(),
             vision_downsample: vision.downsample.code(),
             merger_intermediate: vision.merger_intermediate,
-            positions: architecture.max_position_embeddings,
+            positions: geometry.num_position_embeddings,
             world: tp.world(),
             rank: tp.rank(),
             ..PartGeometry::new()

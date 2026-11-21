@@ -21,12 +21,12 @@
 //! pass that refused it. Every row is resolved at exactly the plan's precision, the same request
 //! the load path makes; there is no fallback to another precision.
 //!
-//! The kernel rows are step 0's. The tensor-claim pass is wired: when [ScanInputs::tensors]
-//! supplies an index, the scan compares it in both directions with [TensorClaims], the
-//! description's claim set, and pushes one row per unclaimed group and one per planned tensor the
-//! index does not match. The config-key pass is not wired yet, so [Coverage::config_keys] stays
-//! [CoverageState::NotChecked] and [ScanReport::is_clean] stays `false` even when tensors and
-//! kernels are clean.
+//! The kernel rows are step 0's. When [ScanInputs::tensors] supplies an index, the tensor-claim
+//! pass compares it in both directions with [TensorClaims], the description's claim set, and
+//! pushes one row per unclaimed group and one per planned tensor the index does not match. The
+//! config-key pass always runs: a present key no read consumed is one [ScanStatus::UnknownKey]
+//! row. A report is clean only when both checks ran and found nothing and every kernel row
+//! resolved.
 //!
 //! The scan resolves against the catalogue, not against this build's images:
 //! [ScanReport::availability] is [Availability::Catalogue] and the report prints it. A caller
@@ -124,9 +124,9 @@ impl TensorIndex {
 
 /// Whether one of the two coverage checks of the plan's section 4 has run.
 ///
-/// The tensor-claim check runs whenever [ScanInputs::tensors] supplies an index. The config-key
-/// check stays [Self::NotChecked] until the layout reader consumes the document. A check that
-/// has not run is never reported as clean.
+/// The config-key check always runs. The tensor-claim check runs whenever [ScanInputs::tensors]
+/// supplies an index; without one it stays [Self::NotChecked]. A check that has not run is never
+/// reported as clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoverageState {
     /// The check ran and every item was claimed or consumed.
@@ -377,8 +377,8 @@ impl ScanReport {
 
     /// Whether the checkpoint is clean: every part resolved and both coverage checks are clean.
     ///
-    /// The config-key check is not wired in yet, so this stays false even when the kernel rows and
-    /// the tensor claims are clean. A caller must not gate a load on [Self::is_resolved] alone.
+    /// A caller must not gate a load on [Self::is_resolved] alone: a kernel row can resolve while
+    /// the tensor index was never compared, and the config-key check can report an unread key.
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.is_resolved() && self.coverage.is_complete()
@@ -500,10 +500,19 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
         sparkflash_model::coverage::KeyCoverageState::NotChecked => CoverageState::NotChecked,
     };
     for key in keys.unknown_keys() {
+        let vision = key.path.starts_with("vision_config.");
         report.rows.push(ScanRow {
-            stack: StackKind::Language,
+            stack: if vision {
+                StackKind::Vision
+            } else {
+                StackKind::Language
+            },
             block: None,
-            part: Part::Embedding,
+            part: if vision {
+                Part::Vision
+            } else {
+                Part::Embedding
+            },
             shape: Shape::unknown(),
             format: None,
             pass: KernelPhase::Both,
@@ -543,6 +552,33 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
                 StackKind::Language,
                 requirement,
             );
+        }
+    }
+    if let Some(spec) = architecture.vision_spec() {
+        use sparkflash_model::vision_geometry::VisionFact;
+        let unstated = &spec.unstated;
+        for row in &mut report.rows {
+            if row.stack != StackKind::Vision {
+                continue;
+            }
+            let facts: Vec<VisionFact> = unstated
+                .iter()
+                .copied()
+                .filter(|fact| fact.part() == row.part)
+                .collect();
+            if facts.is_empty() {
+                continue;
+            }
+            let missing = facts
+                .iter()
+                .map(|fact| fact.name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            row.status = ScanStatus::UnknownLayout {
+                detail: format!("vision_config does not state {missing}"),
+                fix: facts[0].fix().to_owned(),
+            };
+            row.format = None;
         }
     }
     if let Some(index) = inputs.tensors {
@@ -881,25 +917,29 @@ fn part_shape(part: Part, geometry: &PartGeometry) -> Shape {
         }
         Part::DenseMlp => vec![geometry.intermediate, geometry.hidden],
         Part::Moe => vec![geometry.experts, geometry.intermediate, geometry.hidden],
-        Part::VisionPatchEmbed => vec![
-            geometry.hidden,
-            geometry.in_channels
-                * geometry.temporal_patch
-                * geometry.patch_size
-                * geometry.patch_size,
-        ],
+        Part::VisionPatchEmbed => geometry
+            .in_channels
+            .checked_mul(geometry.temporal_patch)
+            .and_then(|features| features.checked_mul(geometry.patch_size))
+            .and_then(|features| features.checked_mul(geometry.patch_size))
+            .map_or_else(Vec::new, |features| vec![geometry.hidden, features]),
+        Part::VisionPosition if geometry.positions > 0 => {
+            vec![geometry.positions, geometry.hidden]
+        }
         Part::VisionPosition => vec![geometry.head_dim / 2],
         Part::VisionNorm => vec![geometry.hidden],
         Part::VisionAttention => vec![geometry.heads, geometry.head_dim],
         Part::VisionMlp => vec![geometry.intermediate, geometry.hidden],
-        Part::VisionDownsample => vec![
-            geometry.hidden * geometry.spatial_merge * geometry.spatial_merge,
-            geometry.hidden,
-        ],
-        Part::VisionMerger => vec![
-            geometry.out_hidden,
-            geometry.hidden * geometry.spatial_merge * geometry.spatial_merge,
-        ],
+        Part::VisionDownsample => geometry
+            .hidden
+            .checked_mul(geometry.spatial_merge)
+            .and_then(|merged| merged.checked_mul(geometry.spatial_merge))
+            .map_or_else(Vec::new, |merged| vec![merged, geometry.hidden]),
+        Part::VisionMerger => geometry
+            .hidden
+            .checked_mul(geometry.spatial_merge)
+            .and_then(|merged| merged.checked_mul(geometry.spatial_merge))
+            .map_or_else(Vec::new, |merged| vec![geometry.out_hidden, merged]),
         _ => Vec::new(),
     };
     if dims.is_empty() || dims.contains(&0) {
@@ -1169,6 +1209,48 @@ mod tests {
         );
         assert_eq!(vision.shape, Shape::new([1024, 588]));
         assert!(report.render().contains("1024x588"), "{report:?}");
+    }
+
+    #[test]
+    fn an_unstated_vision_epsilon_is_unknown_layout_not_resolved() {
+        const VISION_CONFIG: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16,"vision_config":{"depth":1,"hidden_size":1024,"num_attention_heads":16,"intermediate_size":2816,"patch_size":14,"temporal_patch_size":1,"out_hidden_size":5120,"projection_intermediate_size":5120,"rope_theta":10000,"downsample_ratio":3}}"#;
+        let report = scan(ScanInputs {
+            config: VISION_CONFIG,
+            tensors: None,
+            target: Target::Sm121,
+            world: 1,
+        });
+        let norm = report
+            .rows
+            .iter()
+            .find(|row| row.part == Part::VisionNorm)
+            .expect("the norm row");
+        let ScanStatus::UnknownLayout { detail, fix } = &norm.status else {
+            panic!("an unstated epsilon must not resolve: {}", report.render());
+        };
+        assert!(detail.contains("norm epsilon"), "{detail}");
+        assert!(!fix.is_empty());
+        assert!(!report.is_resolved());
+    }
+
+    #[test]
+    fn a_grid_position_row_uses_the_learned_grid_shape() {
+        let geometry = PartGeometry {
+            hidden: 1024,
+            heads: 16,
+            head_dim: 64,
+            positions: 2304,
+            ..PartGeometry::new()
+        };
+        assert_eq!(
+            part_shape(Part::VisionPosition, &geometry),
+            Shape::new([2304, 1024])
+        );
+        let rotary = PartGeometry {
+            positions: 0,
+            ..geometry
+        };
+        assert_eq!(part_shape(Part::VisionPosition, &rotary), Shape::new([32]));
     }
 
     #[test]

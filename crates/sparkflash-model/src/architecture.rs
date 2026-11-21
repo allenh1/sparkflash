@@ -855,8 +855,8 @@ pub struct Vision {
     pub norm: Option<VisionNorm>,
     /// The block norm epsilon, when the config states it.
     pub norm_epsilon: Option<f64>,
-    /// Whether the attention projections carry a bias.
-    pub attention_bias: bool,
+    /// Whether the attention projections carry a bias, when a source states it.
+    pub attention_bias: Option<bool>,
     /// Whether queries and keys take a per-head norm, when a source states it.
     pub qk_norm: Option<bool>,
     /// The block MLP activation.
@@ -872,7 +872,7 @@ pub struct Vision {
     /// The merger's activation.
     pub merger_activation: Option<VisionActivation>,
     /// Whether the merger applies a final norm after its projection.
-    pub merger_final_norm: bool,
+    pub merger_final_norm: Option<bool>,
 }
 
 impl Architecture {
@@ -1003,7 +1003,7 @@ impl Architecture {
         let mtp = mtp(root, text, hidden_size)?;
         let tokens = tokens(root, text)?;
         let inkling = inkling(text, root, vocab_size)?;
-        record_arm_consumed(root);
+        record_quantized_layers(root);
 
         Ok(Self {
             family,
@@ -1794,13 +1794,18 @@ impl Architecture {
         parts.insert(Part::Embedding);
         parts.insert(Part::RmsNorm);
         parts.insert(Part::LmHead);
-        if self.vision.is_some() {
+        if let Some(vision) = self.vision_spec() {
             parts.insert(Part::VisionPatchEmbed);
             parts.insert(Part::VisionPosition);
             parts.insert(Part::VisionNorm);
             parts.insert(Part::VisionAttention);
             parts.insert(Part::VisionMlp);
-            parts.insert(Part::VisionDownsample);
+            if !matches!(
+                vision.downsample,
+                crate::VisionDownsample::Merge(_) | crate::VisionDownsample::None
+            ) {
+                parts.insert(Part::VisionDownsample);
+            }
             parts.insert(Part::VisionMerger);
         }
         if self.inkling.as_ref().is_some_and(|inkling| {
@@ -3077,6 +3082,44 @@ fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
     })
 }
 
+/// Whether a tensor name is inside a checkpoint's image tower.
+///
+/// The name must begin at a tower root. A substring match would let a language layer's
+/// `q_norm` or `qkv` decide the tower's arithmetic.
+fn is_tower_tensor(name: &str) -> bool {
+    [
+        "model.visual.",
+        "model.vision.",
+        "visual.",
+        "vision.",
+        "aligner.",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+}
+
+/// The block activation a vision config states, refusing a spelling this engine does not run.
+///
+/// An activation is arithmetic. The old fallback read every unknown spelling as SwiGLU, which
+/// would run the wrong body for `relu` or `quick_gelu`; an unknown name is a config error instead.
+fn vision_activation(config: &Value) -> Result<Option<VisionActivation>, ConfigError> {
+    let Some(name) = optional_string(config, "hidden_act") else {
+        return Ok(None);
+    };
+    let key = name.to_ascii_lowercase();
+    let activation = match key.as_str() {
+        "silu" | "swish" | "swiglu" => VisionActivation::SwiGlu,
+        "gelu" | "gelu_erf" | "gelu_python" => VisionActivation::GeluErf,
+        "gelu_pytorch_tanh" | "gelu_tanh" | "gelu_new" => VisionActivation::GeluTanh,
+        _ => {
+            return Err(ConfigError::Invalid(format!(
+                "vision_config.hidden_act {name:?} is not an activation this engine runs; accepted spellings are silu, gelu, gelu_pytorch_tanh"
+            )));
+        }
+    };
+    Ok(Some(activation))
+}
+
 fn vision(
     root: &Value,
     language_hidden: usize,
@@ -3090,19 +3133,6 @@ fn vision(
     // language model its own width, not the tower's block width.
     let geometry = VisionGeometry::from_value(config, language_hidden)?;
     geometry.validate()?;
-    // Producer metadata the shared description does not derive a value from. Reading it here
-    // keeps the key-coverage check honest: it is consumed by the vision reader, not left for a
-    // later stack to rediscover.
-    for key in [
-        "model_type",
-        "max_image_tokens",
-        "max_wh_ratio",
-        "image_size",
-        "deepstack_visual_indexes",
-        "projector_bias",
-    ] {
-        let _ = read_key(config, key);
-    }
     let mut norm = if optional_f64(config, "rms_norm_eps")?.is_some() {
         Some(VisionNorm::Rms)
     } else if optional_f64(config, "layer_norm_eps")?.is_some() {
@@ -3138,8 +3168,10 @@ fn vision(
     } else {
         None
     };
-    let mut merger_final_norm = false;
-    if let Some(names) = tensors {
+    let mut merger_final_norm = None;
+    let tower_names: Option<Vec<&String>> =
+        tensors.map(|names| names.iter().filter(|name| is_tower_tensor(name)).collect());
+    if let Some(names) = tower_names {
         let any = |needle: &str| names.iter().any(|name| name.contains(needle));
         if any(".norm1.bias") || any(".ln_1.bias") {
             norm = Some(VisionNorm::Layer);
@@ -3172,20 +3204,12 @@ fn vision(
         } else if any("aligner.w1") {
             downsample = Some(VisionDownsample::Unfold(geometry.spatial_merge_size.max(1)));
         }
-        merger_final_norm = any("merger.post_projection_norm")
+        merger_final_norm = (any("merger.post_projection_norm")
             || any("merger.norm.weight")
-            || any("post_layernorm.weight");
+            || any("post_layernorm.weight"))
+        .then_some(true);
     }
-    let activation = optional_string(config, "hidden_act").map(|name| {
-        let name = name.to_ascii_lowercase();
-        if name.contains("gelu") && name.contains("tanh") {
-            VisionActivation::GeluTanh
-        } else if name.contains("gelu") {
-            VisionActivation::GeluErf
-        } else {
-            VisionActivation::SwiGlu
-        }
-    });
+    let activation = vision_activation(config)?;
     Ok(Some(Vision {
         depth: geometry.depth,
         hidden_size: geometry.hidden_size,
@@ -3204,120 +3228,25 @@ fn vision(
         norm,
         norm_epsilon: optional_f64(config, "rms_norm_eps")?
             .or(optional_f64(config, "layer_norm_eps")?),
-        attention_bias: attention_bias.unwrap_or(true),
+        attention_bias,
         qk_norm,
         activation,
         activation_clamp: optional_f64(config, "swiglu_limit")?,
         position,
         downsample,
         merger_intermediate: geometry.projection_intermediate_size,
-        merger_activation: optional_string(config, "hidden_act").map(|name| {
-            let name = name.to_ascii_lowercase();
-            if name.contains("gelu") && name.contains("tanh") {
-                VisionActivation::GeluTanh
-            } else if name.contains("gelu") {
-                VisionActivation::GeluErf
-            } else {
-                VisionActivation::SwiGlu
-            }
-        }),
+        merger_activation: activation,
         merger_final_norm,
     }))
 }
 
-/// Record the keys the arms' typed parsers consume beyond the shared walk.
+/// Record the ModelOpt layer table that is keyed by tensor prefix.
 ///
-/// The shared [Architecture] reader is deliberately smaller than the per-arm readers; a key that
-/// only an arm's typed configuration reads is still consumed by the checkpoint, not ignored. This
-/// list is the reader's acknowledgement of those keys: it is keyed by full structural path, never
-/// by a model name, and a path absent from a document records nothing present.
-fn record_arm_consumed(root: &Value) {
-    const PATHS: &[&str] = &[
-        "language_model_only",
-        "mlp_bias",
-        "mtp_config.head_dim",
-        "mtp_config.hidden_size",
-        "mtp_config.intermediate_size",
-        "mtp_config.local_layer_ids",
-        "mtp_config.markov_head_type",
-        "mtp_config.markov_rank",
-        "mtp_config.max_position_embeddings",
-        "mtp_config.num_attention_heads",
-        "mtp_config.num_key_value_heads",
-        "mtp_config.o_bias",
-        "mtp_config.q_bias",
-        "mtp_config.rms_norm_eps",
-        "mtp_config.rope_theta",
-        "mtp_config.sliding_window_size",
-        "ngpt_alpha_init",
-        "quantization_config.config_groups",
-        "quantization_config.config_groups.group_0",
-        "quantization_config.config_groups.group_0.input_activations",
-        "quantization_config.config_groups.group_0.input_activations.dynamic",
-        "quantization_config.config_groups.group_0.input_activations.group_size",
-        "quantization_config.config_groups.group_0.input_activations.num_bits",
-        "quantization_config.config_groups.group_0.input_activations.type",
-        "quantization_config.config_groups.group_0.targets",
-        "quantization_config.config_groups.group_0.weights",
-        "quantization_config.config_groups.group_0.weights.dynamic",
-        "quantization_config.config_groups.group_0.weights.group_size",
-        "quantization_config.config_groups.group_0.weights.num_bits",
-        "quantization_config.config_groups.group_0.weights.type",
-        "quantization_config.config_groups.group_1",
-        "quantization_config.config_groups.group_1.targets",
-        "quantization_config.config_groups.group_1.weights",
-        "quantization_config.config_groups.group_1.weights.dynamic",
-        "quantization_config.config_groups.group_1.weights.group_size",
-        "quantization_config.config_groups.group_1.weights.num_bits",
-        "quantization_config.config_groups.group_1.weights.type",
-        "quantization_config.group_size",
-        "quantization_config.kv_cache_quant_algo",
-        "quantization_config.modules_to_not_convert",
-        "quantization_config.quantized_layers.model.language_model.layers.1.ple.ple_embedding.ngram_embedding.quant_algo",
-        "rope_parameters.full_attention.rope_type",
-        "rope_parameters.sliding_attention.rope_type",
-        "text_config.dspark_markov_rank",
-        "text_config.dspark_noise_token_id",
-        "text_config.final_norm_pre_affine",
-        "text_config.full_attention_interval",
-        "text_config.indexer_rope_interleave",
-        "text_config.index_kpool_compress",
-        "text_config.index_share_for_mtp_iteration",
-        "text_config.linear_attn_config.full_attn_layers",
-        "text_config.linear_attn_config.kda_layers",
-        "text_config.mamba_ssm_dtype",
-        "text_config.mla_use_nope",
-        "text_config.model_type",
-        "text_config.moe_router_dtype",
-        "text_config.mtp.layer_types",
-        "text_config.mtp_use_dedicated_embeddings",
-        "text_config.mtp.mtp_use_hidden_state_from_layer",
-        "text_config.mtp.rope_theta",
-        "text_config.number_of_conv_states",
-        "text_config.num_key_value_heads",
-        "text_config.o_bias",
-        "text_config.pre_norm_pre_affine",
-        "text_config.q_bias",
-        "text_config.qk_head_dim",
-        "text_config.rope_parameters.mrope_interleaved",
-        "text_config.rope_parameters.rope_type",
-        "text_config.swa_head_dim",
-        "text_config.swa_num_attention_heads",
-        "text_config.swa_num_key_value_heads",
-        "text_config.use_gate_bias",
-        "tie_word_embeddings",
-    ];
-    for path in PATHS {
-        let mut cursor = root;
-        for name in path.split('.') {
-            let Some(child) = read_key(cursor, name) else {
-                break;
-            };
-            cursor = child;
-        }
-    }
-    // ModelOpt keys its quantized modules by their full (dotted) tensor prefix, so one object
-    // key contains the dots of several path segments. Consume that table as data.
+/// The table's member names are full dotted tensor prefixes, not config paths, so the ordinary
+/// key walk cannot describe them one by one. It is metadata for the producer's quantized modules,
+/// not arithmetic the shared description reads. Every other key is reported as unread until the
+/// reader that owns it actually consumes it.
+fn record_quantized_layers(root: &Value) {
     if let Some(quantization) = read_key(root, "quantization_config")
         && let Some(layers) = read_key(quantization, "quantized_layers")
     {
@@ -4022,6 +3951,58 @@ mod tests {
         assert!(geometry.validate().is_ok());
     }
 
+    /// A language decoder with one small image tower.
+    fn a_tower_document() -> Value {
+        serde_json::json!({
+            "model_type": "",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 64,
+            "max_position_embeddings": 16,
+            "vision_config": {
+                "depth": 1,
+                "hidden_size": 96,
+                "num_attention_heads": 4,
+                "intermediate_size": 192,
+                "patch_size": 16,
+                "temporal_patch_size": 2,
+                "spatial_merge_size": 2
+            }
+        })
+    }
+
+    #[test]
+    fn a_language_qk_norm_does_not_set_the_vision_qk_norm() {
+        let config = a_tower_document().to_string();
+        let names = vec![
+            "model.layers.0.self_attn.q_norm.weight".to_owned(),
+            "model.layers.0.self_attn.k_norm.weight".to_owned(),
+        ];
+        let architecture = Architecture::from_json_with_tensor_names(&config, Some(&names))
+            .expect("the tower parses");
+        assert_eq!(
+            architecture.vision.expect("the tower").qk_norm,
+            None,
+            "a language tensor must not decide the tower's arithmetic"
+        );
+    }
+
+    #[test]
+    fn an_unknown_vision_activation_is_refused_by_name() {
+        let mut document = a_tower_document();
+        document["vision_config"]["hidden_act"] = serde_json::json!("relu");
+        let error = Architecture::from_json(&document.to_string())
+            .expect_err("relu is not a body this engine runs");
+        assert!(
+            matches!(&error, ConfigError::Invalid(message) if message.contains("relu")),
+            "{error}"
+        );
+    }
+
     #[test]
     fn a_modelopt_producer_name_does_not_hide_the_expert_format() {
         // The carried Qwen document is the released snapshot's own: the producer is in
@@ -4539,13 +4520,13 @@ mod tests {
     #[test]
     fn the_released_parses_are_pinned_and_switch_nothing_on() {
         let pinned = [
-            0x1ece_5044_22e8_6e6e_u64,
+            0xcfee_3f63_89f5_a81f_u64,
             0xbf31_362c_fd8a_5fc0,
-            0x0dab_25c8_bb73_8e5a,
-            0xa645_4ea2_74d4_d0ba,
-            0x7be1_06f7_5383_22d1,
-            0x56aa_e934_eaf3_8472,
-            0x677e_44dc_27a7_370b,
+            0x6241_ff28_ad8b_822a,
+            0xcec4_a3b3_c0e6_d5d7,
+            0xdae6_a46b_130a_8966,
+            0xd361_73f8_3e9a_17b7,
+            0x9303_7a9e_3df6_1248,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");

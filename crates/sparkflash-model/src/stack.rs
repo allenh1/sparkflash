@@ -30,7 +30,7 @@ use std::fmt;
 use crate::architecture::{Architecture, AttentionKind, Ffn, Layer, WeightFormat};
 use crate::compose::LayerStep;
 use crate::parts::Part;
-use crate::vision_geometry::VisionDownsample;
+use crate::vision_geometry::{VisionDownsample, VisionFact};
 
 /// Which stack of a model description a block belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -224,7 +224,9 @@ impl Architecture {
         let spec = self.vision_spec()?;
         let geometry = &spec.geometry;
         let head_dim = geometry.hidden_size.checked_div(geometry.num_heads)?;
-        let position_shape = if spec.position.has_grid() {
+        let position_shape = if spec.unstated.contains(&VisionFact::Position) {
+            Shape::unknown()
+        } else if spec.position.has_grid() {
             Shape::new([geometry.num_position_embeddings, geometry.hidden_size])
         } else {
             Shape::new([head_dim / 2])

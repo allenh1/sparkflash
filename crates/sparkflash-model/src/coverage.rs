@@ -495,17 +495,101 @@ mod tests {
         ),
     ];
 
-    /// Keys present in a carried config that no shared-reader parse consumes yet.
+    /// Keys present in a carried config that this description reader does not consume.
     ///
-    /// This is the honest residual, not a permission list: the test below fails when a key here
-    /// stops being unread (remove it) or when a key outside this list becomes unread (teach the
-    /// reader or record the new owner). The owner column says where the read must land:
-    /// `model crate parser` (its typed parser already reads it), `description work` (the shared
-    /// reader must learn it), `truly unread` (a duplicate declaration nothing needs), or
-    ///
-    /// The zero-key milestone is reached when this table is empty.
+    /// This is the honest residual, not a permission list. A key is here because a real parse
+    /// reported it unread; the test below fails when one stops being unread (remove it) or when a
+    /// key outside this list becomes unread (teach the reader or pin the new owner). The owner
+    /// column says where the read belongs: `model crate parser` (a model crate's typed parser
+    /// reads it), `vision reader` (the vision description must learn it), or `description work`
+    /// (the shared reader must learn it). A path in this table makes the config-key check dirty;
+    /// it never makes it clean.
     #[rustfmt::skip]
-    const REMAINING: &[(&str, &str, &str)] = &[];
+    const REMAINING: &[(&str, &str, &str)] = &[
+        ("DeepSeek-V4.1-Flash", "text_config.dspark_markov_rank", "model crate parser"),
+        ("DeepSeek-V4.1-Flash", "text_config.dspark_noise_token_id", "model crate parser"),
+        ("DeepSeek-V4.1-Flash", "text_config.model_type", "model crate parser"),
+        ("DeepSeek-V4.1-Flash", "text_config.num_key_value_heads", "model crate parser"),
+        ("DeepSeek-V4.1-Flash", "vision_config.max_image_tokens", "vision reader"),
+        ("DeepSeek-V4.1-Flash", "vision_config.max_wh_ratio", "vision reader"),
+        ("DeepSeek-V4.1-Flash", "vision_config.model_type", "vision reader"),
+        ("Dory1.0-4B-BF16", "mlp_bias", "model crate parser"),
+        ("Dory1.0-4B-BF16", "ngpt_alpha_init", "model crate parser"),
+        ("Dory1.0-4B-BF16", "rope_parameters.full_attention.rope_type", "model crate parser"),
+        ("Dory1.0-4B-BF16", "rope_parameters.sliding_attention.rope_type", "model crate parser"),
+        ("GLM-5.3-Flash", "quantization_config.modules_to_not_convert", "description work"),
+        ("GLM-5.3-Flash", "text_config.index_kpool_compress", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.index_share_for_mtp_iteration", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.indexer_rope_interleave", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.linear_attn_config.full_attn_layers", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.linear_attn_config.kda_layers", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.mla_use_nope", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.model_type", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.moe_router_dtype", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.num_key_value_heads", "model crate parser"),
+        ("GLM-5.3-Flash", "text_config.qk_head_dim", "model crate parser"),
+        ("GLM-5.3-Flash", "tie_word_embeddings", "model crate parser"),
+        ("GLM-5.3-Flash", "vision_config.image_size", "vision reader"),
+        ("GLM-5.3-Flash", "vision_config.model_type", "vision reader"),
+        ("Inkling-2-Small", "mtp_config.head_dim", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.hidden_size", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.intermediate_size", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.local_layer_ids", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.markov_head_type", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.markov_rank", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.max_position_embeddings", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.num_attention_heads", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.num_key_value_heads", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.o_bias", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.q_bias", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.rms_norm_eps", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.rope_theta", "model crate parser"),
+        ("Inkling-2-Small", "mtp_config.sliding_window_size", "model crate parser"),
+        ("Inkling-2-Small", "text_config.final_norm_pre_affine", "model crate parser"),
+        ("Inkling-2-Small", "text_config.o_bias", "model crate parser"),
+        ("Inkling-2-Small", "text_config.pre_norm_pre_affine", "model crate parser"),
+        ("Inkling-2-Small", "text_config.q_bias", "model crate parser"),
+        ("Inkling-2-Small", "text_config.swa_head_dim", "model crate parser"),
+        ("Inkling-2-Small", "text_config.swa_num_attention_heads", "model crate parser"),
+        ("Inkling-2-Small", "text_config.swa_num_key_value_heads", "model crate parser"),
+        ("Inkling-2-Small", "text_config.use_gate_bias", "model crate parser"),
+        ("Inkling-2-Small", "vision_config.projector_bias", "vision reader"),
+        ("Qwen3.8-Flash-Next-NVFP4", "language_model_only", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.dynamic", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.group_size", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.num_bits", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.type", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.targets", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.dynamic", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.group_size", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.num_bits", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.type", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.targets", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.dynamic", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.group_size", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.num_bits", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.type", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.group_size", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.kv_cache_quant_algo", "description work"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.full_attention_interval", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mamba_ssm_dtype", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.model_type", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.layer_types", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.mtp_use_hidden_state_from_layer", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.rope_theta", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.number_of_conv_states", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.rope_parameters.mrope_interleaved", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "text_config.rope_parameters.rope_type", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "tie_word_embeddings", "model crate parser"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.deepstack_visual_indexes", "vision reader"),
+        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.model_type", "vision reader"),
+    ];
 
     /// Qwen's installed snapshot is a newer document than the carried fixture: it has a third
     /// quantization group, input-activation groups, and an ignore list, and it has dropped the

@@ -409,11 +409,16 @@ fn both_qwen_arms_resolve_their_own_dense_prefill_body() {
 fn a_boot_check_proves_both_passes_for_the_deepseek_arm() {
     let plan = EnginePlan::from_json(DEEPSEEK, Target::Sm121, 4, 0).expect("DeepSeek TP4");
     let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
+    let served = sparkflash_ops::parts::serving_language(Target::Sm121);
+    let language = plan
+        .requirements()
+        .filter(|requirement| !is_vision(requirement.part))
+        .count();
     let resolved = resolver
-        .boot_check(&plan)
+        .boot_check_serving(&plan, &served)
         .unwrap_or_else(|errors| panic!("boot check: {errors:?}"));
     assert!(!resolved.is_empty());
-    assert_eq!(resolved.len(), 2 * plan.requirements().count());
+    assert_eq!(resolved.len(), 2 * language);
 }
 
 #[test]

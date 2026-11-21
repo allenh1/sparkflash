@@ -170,6 +170,72 @@ impl VisionPosition {
     }
 }
 
+/// One arithmetic fact the config and the index both leave unstated.
+///
+/// The stack still names the component, but the scan must not resolve it: the kernel's
+/// arithmetic depends on this fact, and a catalogue entry that happens to share the default
+/// would make an unproven tower look proven. Each fact names the part it belongs to and the
+/// declaration that would settle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionFact {
+    /// The block norm kind (RMSNorm or LayerNorm).
+    Norm,
+    /// The block norm epsilon.
+    NormEpsilon,
+    /// Whether the attention projections carry a bias.
+    AttentionBias,
+    /// Whether queries and keys take a per-head norm.
+    QkNorm,
+    /// The block MLP activation.
+    Activation,
+    /// The position scheme.
+    Position,
+    /// The downsample or unfold before the merger.
+    Downsample,
+    /// The merger's activation.
+    MergerActivation,
+    /// Whether the merger applies a final norm.
+    MergerFinalNorm,
+}
+
+impl VisionFact {
+    /// The part this fact sizes.
+    #[must_use]
+    pub const fn part(self) -> crate::Part {
+        match self {
+            Self::Norm | Self::NormEpsilon => crate::Part::VisionNorm,
+            Self::AttentionBias | Self::QkNorm => crate::Part::VisionAttention,
+            Self::Activation => crate::Part::VisionMlp,
+            Self::Position => crate::Part::VisionPosition,
+            Self::Downsample | Self::MergerActivation | Self::MergerFinalNorm => {
+                crate::Part::VisionMerger
+            }
+        }
+    }
+
+    /// What the checkpoint has not stated.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Norm => "the block norm kind",
+            Self::NormEpsilon => "the block norm epsilon",
+            Self::AttentionBias => "whether the attention projections carry a bias",
+            Self::QkNorm => "whether queries and keys take a per-head norm",
+            Self::Activation => "the block MLP activation",
+            Self::Position => "the position scheme",
+            Self::Downsample => "the downsample or unfold before the merger",
+            Self::MergerActivation => "the merger activation",
+            Self::MergerFinalNorm => "whether the merger applies a final norm",
+        }
+    }
+
+    /// What would settle the fact.
+    #[must_use]
+    pub const fn fix(self) -> &'static str {
+        "state the field in vision_config, or supply the tensor index so its names can prove it"
+    }
+}
+
 /// How a vision tower folds a merge cell before the merger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisionDownsample {
@@ -262,6 +328,9 @@ pub struct VisionTowerSpec {
     pub merger_activation: VisionActivation,
     /// Whether the merger applies a final norm after its projection.
     pub merger_final_norm: bool,
+    /// The facts neither the config nor the index stated. A component carrying one is not
+    /// resolvable, even when the default below happens to match a catalogue entry.
+    pub unstated: Vec<VisionFact>,
 }
 
 impl VisionTowerSpec {
@@ -269,6 +338,34 @@ impl VisionTowerSpec {
     #[must_use]
     pub fn from_vision(vision: &crate::architecture::Vision) -> Self {
         let geometry = VisionGeometry::from_vision(vision);
+        let mut unstated = Vec::new();
+        if vision.norm.is_none() {
+            unstated.push(VisionFact::Norm);
+        }
+        if vision.norm_epsilon.is_none() {
+            unstated.push(VisionFact::NormEpsilon);
+        }
+        if vision.attention_bias.is_none() {
+            unstated.push(VisionFact::AttentionBias);
+        }
+        if vision.qk_norm.is_none() {
+            unstated.push(VisionFact::QkNorm);
+        }
+        if vision.activation.is_none() {
+            unstated.push(VisionFact::Activation);
+        }
+        if vision.position.is_none() {
+            unstated.push(VisionFact::Position);
+        }
+        if vision.downsample.is_none() {
+            unstated.push(VisionFact::Downsample);
+        }
+        if vision.merger_activation.is_none() {
+            unstated.push(VisionFact::MergerActivation);
+        }
+        if vision.merger_final_norm.is_none() {
+            unstated.push(VisionFact::MergerFinalNorm);
+        }
         let norm = vision.norm.unwrap_or(VisionNorm::Rms);
         let activation = vision.activation.unwrap_or(match norm {
             VisionNorm::Rms => VisionActivation::SwiGlu,
@@ -298,7 +395,7 @@ impl VisionTowerSpec {
             geometry,
             norm,
             norm_epsilon: vision.norm_epsilon.unwrap_or(1e-6),
-            attention_bias: vision.attention_bias,
+            attention_bias: vision.attention_bias.unwrap_or(true),
             qk_norm: vision.qk_norm.unwrap_or(false),
             activation,
             activation_clamp: vision.activation_clamp,
@@ -313,8 +410,15 @@ impl VisionTowerSpec {
                 } else {
                     activation
                 }),
-            merger_final_norm: vision.merger_final_norm,
+            merger_final_norm: vision.merger_final_norm.unwrap_or(false),
+            unstated,
         }
+    }
+
+    /// The arithmetic facts neither the config nor the index stated.
+    #[must_use]
+    pub fn unstated(&self) -> &[VisionFact] {
+        &self.unstated
     }
 
     /// The features one patch contributes to the patch projection.
