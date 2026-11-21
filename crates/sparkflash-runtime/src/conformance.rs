@@ -1405,7 +1405,7 @@ macro_rules! conformance {
             #[test]
             #[ignore = "boots the arm's fixture; set SPARKFLASH_BITS_RECORD=<dir>"]
             fn bits_equal_the_record() {
-                match $crate::record::check_record::<$arm>() {
+                match $crate::record::check_record::<$arm>(ARM) {
                     Ok(report) => println!("record: {}: {report}", ARM),
                     Err(error) => panic!("record: {}: {}", ARM, error.message()),
                 }

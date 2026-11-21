@@ -44,9 +44,13 @@ const TOKENS: usize = 6;
 /// A short prompt, under a window of eight rows.
 const SHORT: [u32; 5] = [7, 9, 11, 13, 15];
 
-/// A long prompt: more rows than a short-prompt path takes, in two chunks.
-fn long() -> Vec<u32> {
-    (0..40u32).map(|at| (at * 7 + 3) % 50 + 2).collect()
+/// A long prompt: more rows than a short-prompt path takes (40, or what the fixture's context
+/// leaves after the run's tokens), in two chunks.
+fn long<W: Walk>(walk: &W) -> Vec<u32> {
+    let rows = 40
+        .min(walk.limits().context.saturating_sub(TOKENS + 1))
+        .max(SHORT.len());
+    (0..rows as u32).map(|at| (at * 7 + 3) % 50 + 2).collect()
 }
 
 /// The sampled run's sampling: seeded, so its draws repeat.
@@ -162,6 +166,7 @@ fn script<A: ArmFixture>(
         let Fixture {
             walk, group, keep, ..
         } = fixture;
+        let prompt = long(&walk);
         let tokens = crate::conformance::group_tokens(walk, group, &SHORT, TOKENS)?;
         lines.push(format!("group short {tokens:?}"));
         drop(keep);
@@ -169,13 +174,15 @@ fn script<A: ArmFixture>(
         let Fixture {
             walk, group, keep, ..
         } = again;
-        let tokens = crate::conformance::group_tokens(walk, group, &long(), TOKENS)?;
+        let tokens = crate::conformance::group_tokens(walk, group, &prompt, TOKENS)?;
         lines.push(format!("group long {tokens:?}"));
         drop(keep);
         return Ok(lines);
     }
     let walk = &fixture.walk;
-    for (name, prompt) in [("short", SHORT.to_vec()), ("long", long())] {
+    let prompt = long(walk);
+    lines.push(format!("long prompt {} rows", prompt.len()));
+    for (name, prompt) in [("short", SHORT.to_vec()), ("long", prompt.clone())] {
         for feed in [Feed::Whole, Feed::Halves, Feed::Tokens] {
             let line = direct(walk, &prompt, feed, None)?;
             lines.push(format!("{name} {feed:?} greedy{line}"));
@@ -185,27 +192,29 @@ fn script<A: ArmFixture>(
     }
     let four = crate::conformance::four_tokens::<A>(TOKENS)?;
     lines.push(format!("four {four:?}"));
-    let drafted = crate::conformance::drafted_tokens::<A>(&long(), TOKENS)?;
+    let drafted = crate::conformance::drafted_tokens::<A>(&prompt, TOKENS)?;
     lines.push(format!("drafted long {drafted:?}"));
     Ok(lines)
 }
 
-/// The record's file for arm `A` at `world` under `directory`.
-fn file<A: ArmFixture>(directory: &Path, world: usize) -> PathBuf {
-    let arm: String = std::any::type_name::<A::Walk>()
+/// The record's file for the arm named `arm` at `world` under `directory`. The name is the one
+/// the arm's generated checks state ([`crate::conformance!`]'s `ARM`), not its walk's type: a
+/// walk that moves keeps its record.
+fn file(directory: &Path, arm: &str, world: usize) -> PathBuf {
+    let arm: String = arm
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     directory.join(format!("{arm}-tp{world}.txt"))
 }
 
-/// The arm's script at every world, written to the record directory the first time and compared
-/// with it after.
+/// The script of the arm named `arm` at every world, written to the record directory the first
+/// time and compared with it after.
 ///
 /// # Errors
 /// A world whose lines differ from the record (the first differing line named), a script run
 /// the arm fails, or a record file that cannot be read or written.
-pub fn check_record<A: ArmFixture>() -> Result<String, BackendError> {
+pub fn check_record<A: ArmFixture>(arm: &str) -> Result<String, BackendError> {
     let Some(directory) = std::env::var_os(RECORD_DIR).map(PathBuf::from) else {
         return Ok(format!(
             "SKIP: set {RECORD_DIR}=<dir> to record this arm's bits or compare them with the record"
@@ -222,7 +231,7 @@ pub fn check_record<A: ArmFixture>() -> Result<String, BackendError> {
             }
             Err(error) => return Err(error),
         };
-        let path = file::<A>(&directory, world);
+        let path = file(&directory, arm, world);
         let text = lines.join("\n") + "\n";
         if path.is_file() {
             let kept = std::fs::read_to_string(&path).map_err(|error| failed(error.to_string()))?;
