@@ -440,7 +440,49 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
         rows: Vec::new(),
         error: None,
     };
-    let plan = match EnginePlan::from_json(inputs.config, inputs.target, inputs.world, 0) {
+    let names: Option<Vec<String>> = inputs.tensors.map(|index| {
+        index
+            .tensors
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .collect()
+    });
+    let (architecture, keys) = match Architecture::from_json_with_coverage_and_tensor_names(
+        inputs.config,
+        names.as_deref(),
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            report.error = Some(error.to_string());
+            return report;
+        }
+    };
+    report.coverage.config_keys = match keys.state() {
+        sparkflash_model::coverage::KeyCoverageState::Clean => CoverageState::Clean,
+        sparkflash_model::coverage::KeyCoverageState::Dirty => CoverageState::Dirty,
+        sparkflash_model::coverage::KeyCoverageState::NotChecked => CoverageState::NotChecked,
+    };
+    for key in keys.unknown_keys() {
+        report.rows.push(ScanRow {
+            stack: StackKind::Language,
+            block: None,
+            part: Part::Embedding,
+            shape: Shape::unknown(),
+            format: None,
+            pass: KernelPhase::Both,
+            target: inputs.target,
+            status: ScanStatus::UnknownKey {
+                key: key.path.clone(),
+                fix: key.fix.clone(),
+            },
+        });
+    }
+    let plan = match EnginePlan::for_architecture(
+        architecture,
+        inputs.target,
+        inputs.world,
+        0,
+    ) {
         Ok(plan) => plan,
         Err(error) => {
             report.error = Some(error.to_string());
@@ -649,7 +691,7 @@ mod tests {
         assert!(report.rows.iter().all(|row| row.pass == KernelPhase::Both));
         assert_eq!(report.availability, Availability::Catalogue);
         assert_eq!(report.coverage.tensors, CoverageState::NotChecked);
-        assert_eq!(report.coverage.config_keys, CoverageState::NotChecked);
+        assert_eq!(report.coverage.config_keys, CoverageState::Clean);
         assert!(!report.is_clean(), "step 0 cannot call a checkpoint clean");
         let text = report.render();
         assert!(text.contains("coverage: tensors not checked"), "{text}");
@@ -667,7 +709,7 @@ mod tests {
             "language  0      gqa_attention      1x128            BF16     both     resolved\n",
             "language  0      dense_mlp          256x5120         BF16     both     resolved\n",
             "5 rows, 5 resolved, 0 unresolved\n",
-            "coverage: tensors not checked; config keys not checked\n",
+            "coverage: tensors not checked; config keys clean\n",
             "clean: no\n",
         );
         assert_eq!(scan(inputs(Target::Sm121)).render(), expected);

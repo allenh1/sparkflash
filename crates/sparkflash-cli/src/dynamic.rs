@@ -43,7 +43,11 @@ pub(crate) fn unsupported_parts(architecture: &Architecture) -> Vec<Part> {
     architecture
         .parts()
         .iter()
-        .filter(|part| !matches!(part, Part::Mtp | Part::Vision) && !DYNAMIC_PARTS.contains(part))
+        .filter(|part| {
+            !matches!(part, Part::Mtp)
+                && !sparkflash_ops::parts::is_vision_part(*part)
+                && !DYNAMIC_PARTS.contains(part)
+        })
         .collect()
 }
 
