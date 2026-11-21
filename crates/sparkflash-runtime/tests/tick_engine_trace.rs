@@ -512,3 +512,36 @@ fn a_config_with_more_chunks_than_the_pass_holds_is_refused() {
         "the refusal names the chunks: {error}"
     );
 }
+
+/// A handle's next prompt ends its last request, so a one-lane engine has the lane for it and
+/// the prompt continues what the lane holds. The handle need not park between turns.
+#[test]
+fn a_one_lane_engine_continues_a_turn_the_handle_did_not_park() {
+    let (done, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let hooks = Arc::new(AtomicUsize::new(0));
+        let engine =
+            sparkflash_runtime::TickServe::start(ReplayWalk::new_with_hooks(16, 64, hooks), 1)
+                .expect("the serving engine starts");
+        let mut lane = engine.open().expect("a handle");
+        let prompt: Vec<u32> = (0..20).map(|index| (index * 31 + 38) % 251).collect();
+        let mut held = prompt.clone();
+        let mut step = lane.prefill(&prompt).expect("the prompt");
+        for _ in 0..4 {
+            let token = step.next_token.expect("a token");
+            held.push(token);
+            step = lane.decode(token).expect("a step");
+        }
+        let mut next = held.clone();
+        next.extend([9, 10]);
+        lane.prefill(&next).expect("the continued turn");
+        done.send(lane.cached_tokens()).expect("the test waits");
+    });
+    let cached = wait
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the continued turn returns on a one-lane engine");
+    assert_eq!(
+        cached, 24,
+        "the turn continued the lane's prompt and its four fed tokens"
+    );
+}

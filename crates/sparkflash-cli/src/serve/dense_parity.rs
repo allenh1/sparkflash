@@ -46,6 +46,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
@@ -1325,9 +1326,32 @@ fn a_kept_gated_deltanet_lane_continues_and_goes_back_to_its_prompts_state() {
     kept_lane(&hybrid());
 }
 
+/// Ends the test process when a conversation outlives its limit, so a lane that never answers
+/// fails the run by name instead of stalling it. Dropping it ends the watch.
+struct Deadline {
+    _done: mpsc::Sender<()>,
+}
+
+impl Deadline {
+    fn new(what: &'static str, limit: Duration) -> Self {
+        let (done, wait) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Err(mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(limit) {
+                eprintln!(
+                    "{what} still runs after {} s: a lane never answered",
+                    limit.as_secs()
+                );
+                std::process::exit(101);
+            }
+        });
+        Self { _done: done }
+    }
+}
+
 /// A kept lane continues its conversation as a cold prompt would, and a prompt that parts from
 /// the reply goes back to the end of the last prompt, again as a cold prompt would.
 fn kept_lane(fixture: &Fixture) {
+    let _deadline = Deadline::new("the kept-lane conversation", Duration::from_secs(300));
     let Some((_, _, _, mut backend)) = open(fixture, "kept lane") else {
         return;
     };

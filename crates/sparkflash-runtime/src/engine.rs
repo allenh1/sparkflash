@@ -2184,15 +2184,24 @@ fn serve<W>(
                     tokens,
                     images,
                     sampling,
-                } => match engine.admit(&tokens, &images, sampling) {
-                    Ok(id) => {
-                        requests[job.handle] = Some(id);
-                        waiting.insert(id, job.reply);
+                } => {
+                    // A prompt on a handle ends the handle's last request, as a park does. Its
+                    // lane keeps the history, so the prompt may continue it; left open, the old
+                    // request would hold its lane for good, and a one-lane engine would wait
+                    // for it forever.
+                    if let Some(id) = requests[job.handle].take() {
+                        engine.finish(id);
                     }
-                    Err(error) => {
-                        let _ = job.reply.send(Err(error));
+                    match engine.admit(&tokens, &images, sampling) {
+                        Ok(id) => {
+                            requests[job.handle] = Some(id);
+                            waiting.insert(id, job.reply);
+                        }
+                        Err(error) => {
+                            let _ = job.reply.send(Err(error));
+                        }
                     }
-                },
+                }
                 Work::Decode { token } => {
                     let Some(id) = requests[job.handle] else {
                         let _ = job.reply.send(Err(BackendError::new(
