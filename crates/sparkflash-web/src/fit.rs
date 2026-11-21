@@ -45,7 +45,7 @@ use sparkflash_model::{
 };
 use sparkflash_ops::parts::serving_language;
 use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
-use sparkflash_ops::{CoverageState, ScanInputs, ScanReport, TensorIndex, scan};
+use sparkflash_ops::{CoverageState, ScanInputs, ScanReport, ScanStatus, TensorIndex, scan};
 
 use crate::config::{
     DEFAULT_WEIGHTS_ID, DYNAMIC_ENGINE_ID, MODEL_PROFILES, ModelProfile, profile_for_model_type,
@@ -118,7 +118,7 @@ pub struct ScanView {
     pub target: String,
     /// The tensor-parallel width.
     pub world: usize,
-    /// Whether every row resolved and neither coverage check reports a gap.
+    /// Whether every row resolved and both coverage checks ran and found nothing.
     pub clean: bool,
     /// Whether the console may offer conversion for this report.
     pub offers_convert: bool,
@@ -193,15 +193,11 @@ impl ScanView {
 
 /// Whether a report contains a gap the console must refuse for.
 ///
-/// A coverage check that has not run is not a gap: step 0 leaves both checks
-/// [CoverageState::NotChecked] until their passes land, and a clean kernel scan must still be
-/// offerable while that is true. A check that ran and found something ([CoverageState::Dirty])
-/// is a gap.
+/// A coverage check that has not run is not clean: [ScanReport::is_clean] requires both checks
+/// to have run and found nothing. This is deliberately stricter than "rows resolved", because a
+/// row can resolve while the checkpoint's tensors were never compared.
 fn report_has_gaps(report: &ScanReport) -> bool {
-    report.error.is_some()
-        || report.rows.iter().any(|row| !row.status.is_resolved())
-        || matches!(report.coverage.tensors, CoverageState::Dirty)
-        || matches!(report.coverage.config_keys, CoverageState::Dirty)
+    !report.is_clean()
 }
 
 /// The scan of `config` at every target and tensor-parallel width, in target then width order.
@@ -329,6 +325,11 @@ pub struct Evidence<'a> {
     pub declared: Option<&'a Value>,
     /// The checkpoint's stored weights, when known.
     pub weights: Option<WeightBytes>,
+    /// The checkpoint's tensor index, when its safetensors headers were read.
+    ///
+    /// Without it the scan's tensor check stays "not checked", the report is not clean, and the
+    /// console offers neither conversion nor serving.
+    pub tensors: Option<&'a TensorIndex>,
     /// What the caller found the checkpoint lacks, which blocks every width: access to a gated
     /// repository, safetensors shards.
     pub missing: &'a [String],
@@ -491,7 +492,9 @@ fn scan_gaps(config: &str, architecture: &Architecture, world: usize) -> Result<
     // tower reports its row on the page, but it is not an engine gap for this gate. The full
     // plan's vision constraint is still the catalogue's and the page's.
     let served = serving_language(Target::Sm121);
-    for row in report.unresolved().filter(|row| served.contains(row.part)) {
+    for row in report.unresolved().filter(|row| {
+        served.contains(row.part) && !matches!(row.status, ScanStatus::UnknownKey { .. })
+    }) {
         let reason = format!(
             "{} at {} on {} ({}): {}",
             row.part.name(),
@@ -507,9 +510,9 @@ fn scan_gaps(config: &str, architecture: &Architecture, world: usize) -> Result<
     if report.coverage.tensors == CoverageState::Dirty {
         gaps.push("the tensor coverage check (an indexed tensor no part claimed)".to_owned());
     }
-    if report.coverage.config_keys == CoverageState::Dirty {
-        gaps.push("the config-key coverage check (a key nothing consumed)".to_owned());
-    }
+    // The config-key check is a description-completeness report, not a device-arm refusal: an
+    // arm's typed parser may consume a key the shared description does not. The scan still
+    // renders it dirty, and neither convert nor serve is offered for a dirty report.
     if gaps.is_empty() { Ok(()) } else { Err(gaps) }
 }
 
@@ -665,7 +668,7 @@ pub fn judge(evidence: &Evidence<'_>, cluster: &Cluster) -> Fit {
         missing,
         configurations,
         scans: evidence.config.map_or_else(Vec::new, |config| {
-            scan_views(config, None, SCAN_TARGETS, &WORLDS)
+            scan_views(config, evidence.tensors, SCAN_TARGETS, &WORLDS)
         }),
     };
     fit.summary = summary(&fit);
@@ -1356,9 +1359,31 @@ mod tests {
 
     const SCAN_CLEAN: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16}"#;
 
+    /// The index that would make [SCAN_CLEAN] tensor-clean: every tensor the shared plan claims.
+    fn clean_index(config: &str, world: usize) -> TensorIndex {
+        let architecture = architecture(config).expect("the config parses");
+        let tp = TpPlan::for_architecture(&architecture, world, 0).expect("the tp plan");
+        let claims = sparkflash_ops::tensor_plan::TensorClaims::from_checkpoint(&architecture, tp)
+            .expect("the checkpoint plan");
+        TensorIndex::new(
+            claims
+                .specs()
+                .iter()
+                .map(|spec| {
+                    sparkflash_ops::TensorEntry::new(
+                        spec.name.clone(),
+                        spec.shape.clone(),
+                        spec.dtype.name(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     fn a_clean_scan_offers_convert_and_serve() {
-        let views = scan_views(SCAN_CLEAN, None, &[Target::Sm121], &[1]);
+        let index = clean_index(SCAN_CLEAN, 1);
+        let views = scan_views(SCAN_CLEAN, Some(&index), &[Target::Sm121], &[1]);
         assert_eq!(views.len(), 1);
         let view = &views[0];
         assert!(view.clean, "{}", view.plain);
@@ -1371,6 +1396,17 @@ mod tests {
             "{}",
             view.plain
         );
+    }
+
+    #[test]
+    fn a_scan_whose_tensors_were_not_checked_is_not_clean() {
+        let views = scan_views(SCAN_CLEAN, None, &[Target::Sm121], &[1]);
+        let view = &views[0];
+        assert!(!view.clean, "{}", view.plain);
+        assert!(!view.offers_convert);
+        assert!(!view.offers_serve);
+        assert!(view.plain.contains("coverage: tensors not checked"));
+        assert!(view.plain.ends_with("clean: no\n"));
     }
 
     #[test]

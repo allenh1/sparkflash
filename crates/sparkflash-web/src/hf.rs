@@ -38,6 +38,7 @@ pub use sparkflash_weights::hub::{default_cache_dir, is_model_id, repo_folder, r
 use sparkflash_weights::hub::{folder_id, snapshot_of};
 
 use sparkflash_model::Architecture;
+use sparkflash_ops::TensorIndex;
 use sparkflash_ops::parts::{
     host_reference_missing, host_reference_quantization_refusal, host_reference_rope_refusal,
     host_reference_storage_quantization_refusal,
@@ -296,6 +297,9 @@ pub fn fit_cached(model: &CachedModel, cluster: &Cluster) -> Fit {
             bytes,
             measured: true,
         });
+    let tensors = sparkflash_weights::tensor_index::read_local(snapshot)
+        .ok()
+        .map(|index| TensorIndex::from_reader(&index));
     let lacks: Vec<String> = if model.complete && document.is_some() && weights.is_none() {
         vec![NO_SAFETENSORS.to_owned()]
     } else {
@@ -306,6 +310,7 @@ pub fn fit_cached(model: &CachedModel, cluster: &Cluster) -> Fit {
             config: document,
             declared: declared.as_ref(),
             weights,
+            tensors: tensors.as_ref(),
             missing: &lacks,
         },
         cluster,
@@ -504,11 +509,25 @@ impl HubHit {
                 bytes,
                 measured: false,
             });
+        // A search judges many hits and reads only the fields the Hub already returned; an
+        // explicit inspection reads the shard headers, so its scan can compare tensors without
+        // downloading a weight.
+        let tensors = if fetch_any {
+            self.sha
+                .as_deref()
+                .and_then(|revision| {
+                    sparkflash_weights::tensor_index::read_hub(&self.id, revision).ok()
+                })
+                .map(|index| TensorIndex::from_reader(&index))
+        } else {
+            None
+        };
         let fit = fit::judge(
             &Evidence {
                 config: text.as_deref(),
                 declared: self.config.as_ref(),
                 weights,
+                tensors: tensors.as_ref(),
                 missing: &lacks,
             },
             cluster,

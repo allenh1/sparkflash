@@ -16,18 +16,19 @@
 //!
 //! The preview reads the checkpoint's own `config.json` (the operator's `--config`, the local
 //! Hugging Face cache, and only then the Hub) through [Architecture], then reads the registrations
-//! this tree already has: `ARMS`, `MODELS`, `CATALOGUE`, `WAIVERS` and `DEFAULTS`. Nothing is
-//! copied into a second table here.
+//! this tree already has: `ARMS`, `MODELS`, `DEFAULTS` and the kernel catalogue behind the scan.
+//! Nothing is copied into a second table here.
 //!
-//! The output answers four questions in order:
+//! The output answers three questions in order:
 //!
-//! * which `CATALOGUE` parts the architecture already names, and which are absent;
-//! * which named parts have no tensor-core body in a pass and no phase-3a `WAIVERS` line, so a
-//!   `PartExec` (a body of their own) has to be written;
+//! * the one `ScanReport` per target and TP, including every unresolved part, unread config key
+//!   and unclaimed tensor with its fix;
 //! * the stored format of each weight class;
 //! * the fit at TP 1, 2 and 4 and the stored-bytes-per-token floor from `sparkflash-ops`.
 //!
-//! It opens no device and needs no checkpoint: the configuration is enough.
+//! It opens no device. When a local snapshot or the Hub can supply safetensors headers, those
+//! headers are read without weights so the tensor check runs; otherwise the report says
+//! `tensors not checked` and is not clean.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -60,6 +61,8 @@ struct Input {
     unmodelled: Vec<String>,
     /// The document as read, which `--emit` copies into the crate.
     text: String,
+    /// The checkpoint's tensor index, when local safetensors headers or the Hub supplied one.
+    tensors: Option<sparkflash_ops::TensorIndex>,
 }
 
 /// Parse the arguments after `onboard`.
@@ -145,7 +148,12 @@ fn load(id: Option<&str>, config: Option<&Path>) -> Result<Input, String> {
     if let Some(path) = config {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        return from_text(id, &text, format!("--config {}", path.display()));
+        let mut input = from_text(id, &text, format!("--config {}", path.display()))?;
+        input.tensors = path
+            .parent()
+            .and_then(|directory| sparkflash_weights::tensor_index::read_local(directory).ok())
+            .map(|index| sparkflash_ops::TensorIndex::from_reader(&index));
+        return Ok(input);
     }
     let Some(id) = id else {
         return Err("no model id and no --config".to_owned());
@@ -160,16 +168,24 @@ fn load(id: Option<&str>, config: Option<&Path>) -> Result<Input, String> {
         let architecture = Architecture::from_checkpoint_dir(&directory)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let unmodelled = unmodelled(&text);
+        let tensors = sparkflash_weights::tensor_index::read_local(&directory)
+            .ok()
+            .map(|index| sparkflash_ops::TensorIndex::from_reader(&index));
         return Ok(Input {
             id: Some(id.to_owned()),
             source: format!("hub cache {}", directory.display()),
             architecture,
             unmodelled,
             text,
+            tensors,
         });
     }
     let text = fetch(id)?;
-    from_text(Some(id), &text, format!("the Hub ({id})"))
+    let mut input = from_text(Some(id), &text, format!("the Hub ({id})"))?;
+    input.tensors = sparkflash_weights::tensor_index::read_hub(id, "main")
+        .ok()
+        .map(|index| sparkflash_ops::TensorIndex::from_reader(&index));
+    Ok(input)
 }
 
 /// Parse a document that was read locally or fetched.
@@ -182,6 +198,7 @@ fn from_text(id: Option<&str>, text: &str, source: String) -> Result<Input, Stri
         unmodelled: unmodelled(text),
         architecture,
         text: text.to_owned(),
+        tensors: None,
     })
 }
 
@@ -374,7 +391,7 @@ fn render_formats(out: &mut String, architecture: &Architecture, input: &Input, 
 fn scan_section(input: &Input) -> String {
     sparkflash_web::fit::scan_plain(
         &input.text,
-        None,
+        input.tensors.as_ref(),
         sparkflash_web::fit::SCAN_TARGETS,
         &WORLDS,
     )
