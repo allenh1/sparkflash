@@ -43,6 +43,7 @@ use sparkflash_model::{
     Architecture, MEMORY_FLOOR_BYTES, NODE_MEMORY_BUDGET_BYTES, Target, TpPlan,
     canonical_model_type, gib,
 };
+use sparkflash_ops::parts::serving_language;
 use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
 use sparkflash_ops::{CoverageState, ScanInputs, ScanReport, TensorIndex, scan};
 
@@ -486,7 +487,11 @@ fn scan_gaps(config: &str, architecture: &Architecture, world: usize) -> Result<
     }
     let mut gaps = Vec::new();
     let mut seen = BTreeSet::new();
-    for row in report.unresolved() {
+    // The pack this gate describes is the language process: Qwen's and GLM's packs do not stage
+    // a vision tower, so its row is reported by the page but is not an engine gap for this gate.
+    // The full plan's vision constraint is still the catalogue's and the page's.
+    let served = serving_language(Target::Sm121);
+    for row in report.unresolved().filter(|row| served.contains(row.part)) {
         let reason = format!(
             "{} at {} on {} ({}): {}",
             row.part.name(),
@@ -1365,8 +1370,8 @@ mod tests {
             "hidden_size": 2560,
             "intermediate_size": 16,
             "num_hidden_layers": 1,
-            "num_attention_heads": 1,
-            "num_key_value_heads": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
             "head_dim": 16,
             "vocab_size": 256,
             "max_position_embeddings": 128,
