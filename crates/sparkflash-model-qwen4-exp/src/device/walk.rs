@@ -828,47 +828,97 @@ mod tests {
         fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
             // Measured on one host through sparkflash_runtime::local_group (2026-11-21): rank 0's
             // upload refuses the split, rightly, so the check skips with that reason.
-            if world > 1 {
-                return Err(BackendError::new(
-                    "group",
-                    "the tiny FP8 fixture's 128-wide projections are one 128x128 scale tile, \
-                     which TP 2 and TP 4 would split; the arm refuses that split",
-                ));
-            }
+            one_rank(world)?;
             // The Qwen3.5/3.6 spelling, not `tiny`: its family is not the canonical Qwen3.8
             // target, so the hub cache's released DFlash 2 drafter (2,560 wide) is not loaded
             // into a 128-wide fixture and refused. The tiny MTP stage still exercises the round.
-            let config = Qwen4ExpConfig::tiny_qwen35_moe(crate::config::DenseQuant::Fp8Block);
-            let directory = tempfile::tempdir()
-                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
-            crate::write_synthetic_checkpoint(directory.path(), &config, 7)
-                .map_err(|error| BackendError::new("fixture", error))?;
-            let backend = crate::device::Qwen4ExpDeviceBackend::open(
-                directory.path(),
-                config.max_position_embeddings,
-            )?;
-            let walk = backend.walk_arm(4)?;
-            let tp = sparkflash_model::TpPlan::new(1, 0)
-                .map_err(|error| BackendError::new("fixture", error.detail))?;
-            let tensors = sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served_and_mtp(
-                &config.architecture,
-                tp,
-            )
-            .map_err(|error| BackendError::new("fixture", error.to_string()))?;
-            let (bytes, floor) = sparkflash_runtime::token_bytes(
-                tensors.rank_bytes(),
-                tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts),
-                config.num_experts,
-                config.num_experts_per_tok,
-            );
-            Ok(Fixture::new(
-                walk,
+            open_fixture(
+                Qwen4ExpConfig::tiny_qwen35_moe(crate::config::DenseQuant::Fp8Block),
                 "the Qwen3.5-MoE tiny synthetic checkpoint",
-                bytes,
-                floor,
-                FormatRule::classes(&config.architecture.quantization),
-                Some(Box::new(directory)),
-            ))
+            )
+        }
+    }
+
+    /// Both tiny fixtures are one rank.
+    fn one_rank(world: usize) -> Result<(), BackendError> {
+        if world > 1 {
+            return Err(BackendError::new(
+                "group",
+                "the tiny FP8 fixture's 128-wide projections are one 128x128 scale tile, \
+                 which TP 2 and TP 4 would split; the arm refuses that split",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The tiny checkpoint `config` describes, opened through the arm's own TP=1 constructor.
+    fn open_fixture(
+        config: Qwen4ExpConfig,
+        what: &'static str,
+    ) -> Result<Fixture<QwenWalk>, BackendError> {
+        let directory = tempfile::tempdir()
+            .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+        crate::write_synthetic_checkpoint(directory.path(), &config, 7)
+            .map_err(|error| BackendError::new("fixture", error))?;
+        let backend = crate::device::Qwen4ExpDeviceBackend::open(
+            directory.path(),
+            config.max_position_embeddings,
+        )?;
+        let walk = backend.walk_arm(4)?;
+        let tp = sparkflash_model::TpPlan::new(1, 0)
+            .map_err(|error| BackendError::new("fixture", error.detail))?;
+        let tensors = sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served_and_mtp(
+            &config.architecture,
+            tp,
+        )
+        .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+        let (bytes, floor) = sparkflash_runtime::token_bytes(
+            tensors.rank_bytes(),
+            tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts),
+            config.num_experts,
+            config.num_experts_per_tok,
+        );
+        Ok(Fixture::new(
+            walk,
+            what,
+            bytes,
+            floor,
+            FormatRule::classes(&config.architecture.quantization),
+            Some(Box::new(directory)),
+        ))
+    }
+
+    /// The Qwen3.8 shape the Qwen3.5 fixture lacks: hyper-connections, the per-layer embedding,
+    /// the QSA indexer and the MTP stage, at the FP8 experts' 128-wide tiles. Its bits are
+    /// recorded so a change to those paths is checked against the code before it.
+    ///
+    /// Its family is the canonical Qwen3.8 one, so a released DFlash 2 drafter in the hub cache
+    /// would be loaded and refused at this width: record it with `HF_HUB_CACHE` pointing at an
+    /// empty directory.
+    struct Qwen38Fixture;
+
+    impl sparkflash_runtime::ArmFixture for Qwen38Fixture {
+        type Walk = QwenWalk;
+
+        fn fixture(world: usize) -> Result<Fixture<QwenWalk>, BackendError> {
+            one_rank(world)?;
+            open_fixture(
+                Qwen4ExpConfig::tiny_fp8(),
+                "the Qwen3.8 tiny synthetic checkpoint (hyper-connections, PLE, QSA, MTP)",
+            )
+        }
+
+        fn tick_engine() -> bool {
+            true
+        }
+    }
+
+    #[test]
+    #[ignore = "boots the Qwen3.8 fixture; set SPARKFLASH_BITS_RECORD=<dir>"]
+    fn qwen38_bits_equal_the_record() {
+        match sparkflash_runtime::record::check_record::<Qwen38Fixture>("Qwen38Fixture") {
+            Ok(report) => println!("record: Qwen38Fixture: {report}"),
+            Err(error) => panic!("record: Qwen38Fixture: {}", error.message()),
         }
     }
 
