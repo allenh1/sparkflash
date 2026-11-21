@@ -12,18 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Qwen4-Exp arm as a [Walk].
+//! The Qwen4-Exp arm as the runtime's planned walk: [PlanWalk] over [QwenHost].
 //!
-//! The shared runtime owns the prompt parts, history, resume, rewind, lane pool and ledger.
-//! This file supplies the arm's arithmetic: a prompt chunk runs through the arm's existing
-//! prefill forwards (whose chunking stays [super::prefill::PrefillPlan]'s), a token pass runs
-//! through the existing batch (one row a member, or a member's token and its drafts), and the
-//! head is the arm's own sampler. The few-row tensor-core bodies are untouched.
+//! The shared runtime owns the prompt parts, history, resume, rewind, lane pool and ledger,
+//! and [sparkflash_runtime::walk_rows] owns the layer loop. This file supplies the arm's
+//! arithmetic as a host: a layer is its PLE block (where it has one), its attention (Gated
+//! DeltaNet or sparse) and its experts, each a part inside the widened residual's frames, and
+//! every part, frame and head runs the arm's existing kernels in the order the old loops ran
+//! them.
 //!
-//! A prompt chunk is split by the prefill plan exactly as the old prompt loop split it, so a
-//! prompt's chunk boundaries and therefore its bits do not move. The token pass keeps the
-//! arm's speculative decode: a sequence whose last verify already holds the token answers from
-//! it, and one that does not batches its token and drafts through the same kernels as before.
+//! A prompt pass is split into the prefill plan's forwards ([PlanHost::windows]), so a prompt's
+//! chunk boundaries and therefore its bits do not move. A token or verify pass is one window
+//! over every member's rows in the batch's combined buffers ([BatchBuffers]): the stages that
+//! read a layer's weights run once over every row, and the stages that touch a sequence's own
+//! state run once a member. A verify settles each member inside its window, as the batch did;
+//! a sequence's held answers reach the runtime only through [Draft::Held].
 //!
 //! Qwen serves through this walk: `Qwen4ExpDeviceBackend::enable_fusion` and
 //! `enable_group_fusion` start the tick engine ([sparkflash_runtime::TickServe]) over it, alone
@@ -31,15 +34,17 @@
 //! chooses when a chunk or a step runs; the rows and the shape are the runtime's, which is what
 //! keeps the arm's chunk boundaries and its verify width.
 
-use std::sync::{Arc, Mutex};
+use std::cell::{Cell, RefCell};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
+use sparkflash_model::TpPlan;
+use sparkflash_model::backend::{BackendError, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
-    ChunkPolicy, ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, HeadInput,
-    HeadRow, Hidden, LaneState, Limits, Pass, PassKind, PassMask, Region, Residual, Segment,
-    Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities, check_checkpoint,
-    check_rewind,
+    ChunkPolicy, ComputeDeclaration, Draft, DraftBudget, Drafter, ExpertUnionWall, Limits,
+    OutputConstraint, PartExec, PartHost, Pass, PassKind, PassMask, PlanBranch, PlanHost, PlanLane,
+    PlanPart, PlanPass, PlanRows, PlanSeq, PlanWalk, PlanWindow, RankSplit, Region, Segment,
+    Segments, StateKind, StepWall, Walk, WalkCapabilities, check_rewind,
 };
 
 /// The verify budget: every member's anchor and its whole depth. The batch buffers hold that
@@ -50,7 +55,7 @@ const DRAFT_BUDGET: DraftBudget = DraftBudget::AnchorsAndDrafts;
 use sparkflash_kernels::cuda_driver::Deviceptr;
 
 use super::batch::{BatchBuffers, MAX_BATCH};
-use super::{DENSE_ROWS, DeviceSequence, SequenceShared};
+use super::{DENSE_ROWS, DeviceSequence, GpuBranch, SCRATCH_SLOTS, SequenceShared};
 
 /// A shared walk's cost at TP=1 on a GB10-class node, from the block drafter's own step cost
 /// ([super::DFLASH2_STEP_COST]: 59 ms a step and 8.4 ms a verified draft): about 10 new experts
@@ -65,259 +70,1267 @@ pub(super) const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
     top_k: 0,
 };
 
-/// What a Qwen pass hands its head.
-///
-/// A token or verify pass resolves each member's step inside its batch (the sampler's record,
-/// the choice and the draft verdict are the batch's), so the head has only to hand the steps
-/// over. A prompt chunk leaves no step: its last row waits on the sequence as the deferred head
-/// and the head folds it into logits.
-pub(super) struct QwenHidden {
-    /// The pass's residual rows: one a member for a token or verify pass, the chunk's rows for
-    /// a prompt.
-    rows: usize,
-    /// The steps the batch resolved, in segment order; empty after a prompt chunk.
-    steps: Vec<StepOutput>,
+/// The error code of every refusal of the walk.
+const DEVICE: &str = "qwen4_device";
+
+/// The arm's walk: the runtime's planned walk over [QwenHost].
+pub(super) type QwenWalk = PlanWalk<QwenHost>;
+
+/// A sequence's handle, shared by its lane and the window that walks it.
+type Handle = Arc<Mutex<DeviceSequence>>;
+
+fn lock(device: &Mutex<DeviceSequence>) -> Result<MutexGuard<'_, DeviceSequence>, BackendError> {
+    device
+        .lock()
+        .map_err(|_| BackendError::new(DEVICE, "a sequence's state is poisoned"))
 }
 
-impl Residual for QwenHidden {
-    fn rows(&self) -> usize {
-        self.rows
+/// A sequence's device state, as a planned walk's lane.
+///
+/// The sequence sits behind a lock so a window's frames, which see only the scratch, and its
+/// parts, which see the segments, reach the sequence whose buffers the rows sit in. The walk
+/// takes the locks one at a time, as the old loops called one sequence at a time.
+pub(super) struct QwenLane {
+    device: Handle,
+    /// Whether the sequence's next drafts are proposed: a verify proposes them with the answer
+    /// it settled; a prompt's or a plain token row's head chooses on the host, and the round
+    /// proposes once it opens on the chosen token ([QwenDrafter::open_round]).
+    drafted: bool,
+    /// The step the last verify settled for this sequence, until [QwenDrafter::verify] hands it
+    /// over.
+    settled: Option<StepOutput>,
+}
+
+impl QwenLane {
+    fn lock(&self) -> Result<MutexGuard<'_, DeviceSequence>, BackendError> {
+        lock(&self.device)
     }
 }
 
-/// The Qwen arm, exposed to the shared runtime as a [Walk].
-pub(super) struct QwenWalk {
-    shared: Arc<SequenceShared>,
-    layout: StateLayout,
-    limits: Limits,
-    /// The token pass's combined row buffers, made on first use and reused. Joining a batch
-    /// then costs no allocation.
-    batch: Mutex<Option<BatchBuffers>>,
-    /// The most members one token pass may hold: the driver's concurrency.
-    members: usize,
-    /// The arm's draft source, behind the runtime's round contract.
-    drafter: QwenDrafter,
+impl PlanLane for QwenLane {
+    const DEVICE: &'static str = DEVICE;
+
+    fn save(&mut self, at: usize) -> Result<(), BackendError> {
+        let mut device = self.lock()?;
+        if device.rewind_point() == Some(at) {
+            return Ok(());
+        }
+        device.keep_point()
+    }
+
+    fn restore(&mut self, to: usize) -> Result<(), BackendError> {
+        self.lock()?.rewind_state(to)
+    }
+
+    fn clear(&mut self) -> Result<(), BackendError> {
+        self.lock()?.clear_state()
+    }
+
+    fn room(&self, positions: usize, reset: bool) -> bool {
+        self.lock()
+            .is_ok_and(|device| device.room(positions, reset))
+    }
+
+    /// The adapter sets a request's sampling once, and a kept sequence carries the last one's
+    /// counts: a request reports its own speculation, not the session's lifetime.
+    fn requested(&mut self) {
+        if let Ok(mut device) = self.lock() {
+            device.spec.reset();
+        }
+    }
 }
 
-impl QwenWalk {
-    /// A walk over `shared`'s weights, serving sequences of up to `context_limit` tokens, with
+/// Runs `body` on `seq`'s device with the walk's sampler and sampling in place of the
+/// sequence's own: one sampler a sequence, whichever of the walk or the sequence's settle draws.
+fn with_sampler<R>(
+    seq: &mut PlanSeq<QwenLane>,
+    body: impl FnOnce(&mut DeviceSequence) -> Result<R, BackendError>,
+) -> Result<R, BackendError> {
+    let mut device = lock(&seq.lane.device)?;
+    std::mem::swap(&mut device.sampler, &mut seq.sampler);
+    device.sampling = seq.sampling;
+    let answer = body(&mut device);
+    std::mem::swap(&mut device.sampler, &mut seq.sampler);
+    answer
+}
+
+/// A branch's frame: where a part's input comes from and where its output lands.
+pub(super) enum QwenFrame {
+    /// The PLE block reads the residual and adds into it itself.
+    Landed,
+    /// Layer `0`'s attention, between its attention hyper-connection and the inject.
+    Attention(usize),
+    /// Layer `0`'s experts, between its MLP hyper-connection and the drafter's capture.
+    Ffn(usize),
+}
+
+/// The parts' host: what a pass hands a Qwen part.
+pub(super) struct QwenParts;
+
+impl PartHost for QwenParts {
+    type Pass<'a> = QwenPass<'a>;
+    type Open<'a> = ();
+    type Handle = PlanPart<QwenParts>;
+}
+
+/// One pass over one Qwen part.
+pub(super) struct QwenPass<'a> {
+    host: &'a QwenHost,
+    scratch: &'a QwenScratch,
+    layer: usize,
+}
+
+impl QwenPass<'_> {
+    fn layer(&self) -> &super::GpuLayer {
+        &self.host.shared.weights.layers[self.layer]
+    }
+}
+
+/// The per-layer embedding: the layer's n-gram rows of each sequence's own history, convolved
+/// and added back into the widened residual.
+struct PlePart;
+
+/// A Gated DeltaNet attention.
+struct GdnPart;
+
+/// A sparse (QSA) or full attention; the QSA indexer is folded in, as its projection sits in
+/// the same grouped launch as q, k and v.
+struct QsaPart;
+
+/// The routed and shared experts, with the TP sum and the inject they end in.
+struct MoePart;
+
+impl PartExec<QwenParts> for PlePart {
+    fn state(&self) -> &[Region] {
+        // The arm's one recurrent region holds the PLE windows ([QwenHost::extra_state]).
+        &[]
+    }
+
+    fn split(&self, _plan: &TpPlan) -> RankSplit {
+        RankSplit::Replicated
+    }
+
+    fn rows(&self, pass: &mut QwenPass<'_>) -> Result<(), BackendError> {
+        let window = pass.scratch.window()?;
+        let mut lead = lock(&window.lead)?;
+        lead.own_rows = window.shares.filter(|_| pass.layer >= window.parallel_from);
+        let stride = lead.snapshot_stride as u64;
+        lead.ple_step(
+            pass.layer,
+            pass.layer(),
+            &window.tokens,
+            window.rows,
+            window.shares,
+            0,
+            0,
+            stride,
+        )
+    }
+
+    fn token(&self, pass: &mut QwenPass<'_>) -> Result<(), BackendError> {
+        let window = pass.scratch.window()?;
+        let index = pass.layer;
+        for (member, handle) in window.members.iter().enumerate() {
+            let width = window.widths[member];
+            // A member's rows but the last save their windows: the state after its last row is
+            // the state the next step would build anyway, so it is not worth a region.
+            let verify = width - 1;
+            let at = window.offsets[member];
+            let mut session = lock(handle)?;
+            let (_, ple_slot) = session.snapshot_slots(index);
+            let ple_snapshot = match (verify > 0, ple_slot) {
+                (true, Some(offset)) => session.snapshot.offset(offset * 4).0,
+                _ => 0,
+            };
+            let stride = session.snapshot_stride as u64;
+            session.ple_step(
+                index,
+                pass.layer(),
+                &window.tokens[at..at + width],
+                width,
+                None,
+                ple_snapshot,
+                verify,
+                stride,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl PartExec<QwenParts> for GdnPart {
+    fn state(&self) -> &[Region] {
+        &[]
+    }
+
+    fn split(&self, _plan: &TpPlan) -> RankSplit {
+        RankSplit::Summed
+    }
+
+    fn rows(&self, pass: &mut QwenPass<'_>) -> Result<(), BackendError> {
+        attend_rows(pass)
+    }
+
+    fn token(&self, pass: &mut QwenPass<'_>) -> Result<(), BackendError> {
+        let window = pass.scratch.window()?;
+        let (index, layer) = (pass.layer, pass.layer());
+        let (mixed, _) = pass.scratch.entered.get();
+        let total = window.rows;
+        {
+            let lead = lock(&window.lead)?;
+            lead.linear_project(&layer.branch, mixed, lead.linear_b, lead.linear_a, total)?;
+        }
+        for (member, handle) in window.members.iter().enumerate() {
+            let width = window.widths[member];
+            let session = lock(handle)?;
+            let (conv_slot, _) = session.snapshot_slots(index);
+            let conv_snapshot = match (width > 1, conv_slot) {
+                (true, Some(offset)) => session.snapshot.offset(offset * 4).0,
+                _ => 0,
+            };
+            // A verify keeps the rows a rejected draft would give back, and the replay that
+            // commits the kept ones reads them from the session's own inputs.
+            let (conv_out, b_out, a_out) = match (width > 1, session.gdn_replay[index]) {
+                (true, Some(inputs)) => session.replay_slices(inputs),
+                _ => (session.linear_conv, session.linear_b, session.linear_a),
+            };
+            if width > 1 {
+                session.stash_gate_inputs(b_out, a_out, width)?;
+            }
+            session.linear_state(
+                index,
+                &layer.branch,
+                conv_out,
+                b_out,
+                a_out,
+                width,
+                session.chunk_path(width),
+                width - 1,
+                conv_snapshot,
+                session.snapshot_stride as u64,
+            )?;
+        }
+        lock(&window.lead)?.linear_output(index, &layer.branch, total)
+    }
+}
+
+impl PartExec<QwenParts> for QsaPart {
+    fn state(&self) -> &[Region] {
+        &[]
+    }
+
+    fn split(&self, _plan: &TpPlan) -> RankSplit {
+        RankSplit::Summed
+    }
+
+    fn rows(&self, pass: &mut QwenPass<'_>) -> Result<(), BackendError> {
+        attend_rows(pass)
+    }
+
+    fn token(&self, pass: &mut QwenPass<'_>) -> Result<(), BackendError> {
+        let window = pass.scratch.window()?;
+        let (index, layer) = (pass.layer, pass.layer());
+        let (mixed, _) = pass.scratch.entered.get();
+        let total = window.rows;
+        lock(&window.lead)?.sparse_project(&layer.branch, mixed, total)?;
+        for (member, handle) in window.members.iter().enumerate() {
+            let session = lock(handle)?;
+            session.sparse_attend(
+                &layer.branch,
+                index,
+                session.position,
+                window.widths[member],
+            )?;
+        }
+        lock(&window.lead)?.sparse_output(&layer.branch, index, total)
+    }
+}
+
+/// A prompt forward's attention: the arm's own block over the whole window, from the window's
+/// first position.
+fn attend_rows(pass: &QwenPass<'_>) -> Result<(), BackendError> {
+    let window = pass.scratch.window()?;
+    let (mixed, _) = pass.scratch.entered.get();
+    let lead = lock(&window.lead)?;
+    let stride = lead.snapshot_stride as u64;
+    lead.attend(
+        pass.layer,
+        pass.layer(),
+        mixed,
+        window.position,
+        window.rows,
+        window.chunk,
+        0,
+        0,
+        stride,
+    )
+}
+
+impl PartExec<QwenParts> for MoePart {
+    fn state(&self) -> &[Region] {
+        &[]
+    }
+
+    fn split(&self, _plan: &TpPlan) -> RankSplit {
+        RankSplit::Summed
+    }
+
+    fn rows(&self, pass: &mut QwenPass<'_>) -> Result<(), BackendError> {
+        let window = pass.scratch.window()?;
+        let (mixed, injection) = pass.scratch.entered.get();
+        let lead = lock(&window.lead)?;
+        lead.mlp(
+            &pass.layer().moe,
+            mixed,
+            lead.hyper,
+            injection,
+            pass.layer,
+            window.chunk,
+            window.rows,
+        )
+    }
+
+    fn token(&self, pass: &mut QwenPass<'_>) -> Result<(), BackendError> {
+        let window = pass.scratch.window()?;
+        let (mixed, injection) = pass.scratch.entered.get();
+        let lead = lock(&window.lead)?;
+        // The routed experts do not share between different tokens, but the router, the shared
+        // expert and both hyper-connections read their weights once for every row. On the
+        // chunk path the routed experts are the chunk's MMA, whose rows are computed alone.
+        let chunk = lead.chunk_path(window.rows);
+        lead.mlp(
+            &pass.layer().moe,
+            mixed,
+            lead.hyper,
+            injection,
+            pass.layer,
+            chunk,
+            window.rows,
+        )
+    }
+}
+
+/// One window of a walk, as its begin set it up.
+struct Window {
+    /// The sequence whose buffers the window's rows sit in: the prompt's, or the batch's first
+    /// member, whose scratch is the batch's combined rows.
+    lead: Handle,
+    /// Whether the window is a token or verify pass's batch.
+    batch: bool,
+    /// The window's rows and their ids.
+    rows: usize,
+    tokens: Vec<u32>,
+    /// A prompt forward's first position, its kernel path and its sequence-parallel layout: the
+    /// rank's share of the rows, the first layer it splits from (the one after the last PLE
+    /// block) and the first it runs as overlapped halves (the layer count when it does not).
+    position: usize,
+    chunk: bool,
+    shares: Option<(usize, usize)>,
+    /// The prompt's rows this pass takes after a prompt forward ([PlanWindow::after]).
+    after: usize,
+    parallel_from: usize,
+    overlap_from: usize,
+    /// A batch's members in row order (the first is the lead), each one's rows and first row,
+    /// and what each one's verify settles against.
+    members: Vec<Handle>,
+    widths: Vec<usize>,
+    offsets: Vec<usize>,
+    saved: Vec<[Deviceptr; SCRATCH_SLOTS]>,
+    positions: Vec<usize>,
+    hashers: Vec<Arc<Vec<Option<crate::ngram::PleHasher>>>>,
+    drafts: Vec<Vec<u32>>,
+    confidence: Vec<Vec<f32>>,
+}
+
+/// What the head of the last walk reads.
+enum Head {
+    /// No head row waits.
+    None,
+    /// A prompt's last forward deferred its head to this sequence ([DeviceSequence::deferred_logits]).
+    Deferred(Handle),
+    /// A token pass's logits, every row's, already read back.
+    Rows(Vec<f32>),
+}
+
+/// One walk's buffers: the batch's combined rows, made on the first token pass and reused, and
+/// what a window's frames and parts and the head read.
+pub(super) struct QwenScratch {
+    batch: RefCell<Option<BatchBuffers>>,
+    window: RefCell<Option<Window>>,
+    /// The input a frame's entry left and the injection weights its exit reads.
+    entered: Cell<(Deviceptr, Deviceptr)>,
+    head: RefCell<Head>,
+}
+
+impl QwenScratch {
+    fn window(&self) -> Result<std::cell::Ref<'_, Window>, BackendError> {
+        let window = self
+            .window
+            .try_borrow()
+            .map_err(|_| BackendError::new(DEVICE, "the walk's window is being changed"))?;
+        std::cell::Ref::filter_map(window, Option::as_ref)
+            .map_err(|_| BackendError::new(DEVICE, "a Qwen part ran outside a window"))
+    }
+
+    /// Hands a batch window's members back to their own streams and scratch.
+    fn exit(&self, window: &Window) -> Result<(), BackendError> {
+        if !window.batch {
+            return Ok(());
+        }
+        let batch = self.batch.borrow();
+        let batch = batch
+            .as_ref()
+            .ok_or_else(|| BackendError::new(DEVICE, "a batch window has no batch buffers"))?;
+        let mut guards = window
+            .members
+            .iter()
+            .map(|handle| lock(handle))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut members: Vec<&mut DeviceSequence> =
+            guards.iter_mut().map(|guard| &mut **guard).collect();
+        batch.exit(&mut members, &window.saved)
+    }
+}
+
+/// The Qwen arm as a planned walk's host: its layers' parts and frames over the arm's kernels.
+pub(super) struct QwenHost {
+    shared: Arc<SequenceShared>,
+    context: usize,
+    limits: Limits,
+    /// Whether the arm drafts at all with the joint switch as set.
+    joint: bool,
+    branches: Vec<Vec<PlanBranch<QwenParts, QwenFrame>>>,
+}
+
+impl QwenHost {
+    /// The host over `shared`'s weights, serving sequences of up to `context_limit` tokens, with
     /// room for `capacity` members in one token pass.
+    ///
+    /// # Errors
+    /// A joint-rounds switch the runtime refuses.
     pub(super) fn new(
         shared: Arc<SequenceShared>,
         context_limit: usize,
         capacity: usize,
     ) -> Result<Self, BackendError> {
-        let layout = layout_of(&shared.config);
         let limits = walk_limits(shared.prefill.chunk, context_limit, capacity);
-        let members = limits.members;
-        let joint = sparkflash_runtime::joint_rounds()
-            .map_err(|error| BackendError::new("qwen4_device", error))?;
-        let wall =
-            JOINT_WALL.with_experts(shared.config.num_experts, shared.config.num_experts_per_tok);
-        let drafter = QwenDrafter {
-            depth: shared.verify_rows.saturating_sub(1),
-            wall,
-            joint,
+        let joint =
+            sparkflash_runtime::joint_rounds().map_err(|error| BackendError::new(DEVICE, error))?;
+        let mut slot = 0;
+        let mut branch = |frame: QwenFrame, part: PlanPart<QwenParts>, summed: bool| {
+            slot += 1;
+            PlanBranch {
+                frame,
+                part,
+                summed,
+                slot: slot - 1,
+            }
         };
+        let branches = shared
+            .weights
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| {
+                let mut branches = Vec::with_capacity(3);
+                if layer.ple.is_some() {
+                    branches.push(branch(QwenFrame::Landed, Box::new(PlePart), false));
+                }
+                let attention: PlanPart<QwenParts> = match layer.branch {
+                    GpuBranch::Linear { .. } => Box::new(GdnPart),
+                    GpuBranch::Sparse { .. } => Box::new(QsaPart),
+                };
+                branches.push(branch(QwenFrame::Attention(index), attention, true));
+                branches.push(branch(QwenFrame::Ffn(index), Box::new(MoePart), true));
+                branches
+            })
+            .collect();
         Ok(Self {
             shared,
-            layout,
+            context: context_limit,
             limits,
-            batch: Mutex::new(None),
-            members,
-            drafter,
+            joint,
+            branches,
         })
     }
 
-    fn batch(
+    /// The walk over this host, with room for `capacity` members in one token pass.
+    ///
+    /// # Errors
+    /// As [Self::new].
+    pub(super) fn walk(
+        shared: Arc<SequenceShared>,
+        context_limit: usize,
+        capacity: usize,
+    ) -> Result<QwenWalk, BackendError> {
+        let host = Self::new(shared, context_limit, capacity)?;
+        PlanWalk::new(Arc::new(host), capacity)
+    }
+
+    /// A prompt forward's window over `seq`: the prelude [DeviceSequence::forward_batch] runs
+    /// before its layers.
+    fn begin_prompt(
         &self,
-        members: &mut [&mut DeviceSequence],
-        drafts: &[Vec<u32>],
-        confidence: &[Vec<f32>],
+        scratch: &QwenScratch,
+        seq: &mut PlanSeq<QwenLane>,
         tokens: &[u32],
-    ) -> Result<Vec<StepOutput>, BackendError> {
-        let mut batch = self
-            .batch
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_batch", "the batch buffers are poisoned"))?;
+        after: usize,
+    ) -> Result<Window, BackendError> {
+        seq.lane.drafted = false;
+        let mut device = seq.lane.lock()?;
+        // A proposal from the previous round anchors on the old end, which this prompt may
+        // replace; the fusion's begin_prompt cleared the same three lists. The prompt's head
+        // drafts afresh once its round opens.
+        device.spec_drafts.clear();
+        device.spec_confidence.clear();
+        device.spec_served.clear();
+        device.consumed.extend_from_slice(tokens);
+        let batch = tokens.len();
+        device.probe_rows = batch;
+        // This forward is one named coverage input, and the monitor probe when it is a decode
+        // step, when either switch names a path; off, `begin` is an `Option` check
+        // (docs/NUMERICS.md §5).
+        device.begin_numerics(tokens, batch);
+        // A wide chunk takes the tensor cores, and with the decode steps there every forward
+        // does.
+        let chunk = device.chunk_path(batch);
+        // A sharded chunk splits its hyper-connections over the ranks from the layer after the
+        // last PLE block on: a PLE block convolves each row with the rows before it, which a rank
+        // holding only its own share would not have.
+        device.own_rows = None;
+        device.window = 0;
+        let shares = device.sequence_parallel(batch, chunk);
+        let layers = &self.shared.weights.layers;
+        let parallel_from = layers
+            .iter()
+            .rposition(|layer| layer.ple.is_some())
+            .map_or(0, |last| last + 1);
+        // From there on, a chunk whose halves split into whole pieces runs them overlapped.
+        let overlap_from = if shares.is_some() && device.overlaps(batch) {
+            parallel_from
+        } else {
+            layers.len()
+        };
+        if super::prof::enabled() {
+            super::prof::begin();
+        }
+        *scratch.head.borrow_mut() = Head::None;
+        Ok(Window {
+            lead: Arc::clone(&seq.lane.device),
+            batch: false,
+            rows: batch,
+            tokens: tokens.to_vec(),
+            position: device.position,
+            chunk,
+            shares,
+            after,
+            parallel_from,
+            overlap_from,
+            members: Vec::new(),
+            widths: Vec::new(),
+            offsets: Vec::new(),
+            saved: Vec::new(),
+            positions: Vec::new(),
+            hashers: Vec::new(),
+            drafts: Vec::new(),
+            confidence: Vec::new(),
+        })
+    }
+
+    /// A token or verify pass's window: every member's rows in the batch's combined buffers.
+    fn begin_batch(
+        &self,
+        scratch: &QwenScratch,
+        segments: &mut PlanRows<'_, '_, QwenLane>,
+        verify: bool,
+    ) -> Result<Window, BackendError> {
+        let mut widths = Vec::with_capacity(segments.len());
+        let mut tokens = Vec::new();
+        let mut drafts = Vec::with_capacity(segments.len());
+        let mut confidence = Vec::with_capacity(segments.len());
+        for (seq, rows) in segments.iter_mut() {
+            let mut device = lock(&seq.lane.device)?;
+            let (anchor, rest) = rows.split_first().ok_or_else(|| {
+                BackendError::new(DEVICE, "a token pass holds a segment with no rows")
+            })?;
+            if verify {
+                // The drafter's own confidence in these leading drafts, as the old fusion's round
+                // passed it to the batch: a policy calibrated on it must not be fed zeroes.
+                confidence.push(
+                    device
+                        .spec_confidence
+                        .iter()
+                        .take(rest.len())
+                        .copied()
+                        .collect(),
+                );
+            } else {
+                if !rest.is_empty() {
+                    return Err(BackendError::new(
+                        DEVICE,
+                        "a token pass holds one row a segment",
+                    ));
+                }
+                // A held answer is the drafter's to hand over (Draft::Held): walking its lane
+                // would change the pass's row count, which picks the token kernels' split.
+                if !device.spec_queue.is_empty() {
+                    return Err(BackendError::new(
+                        DEVICE,
+                        "a token pass holds a sequence whose last verify holds its answer; \
+                         held answers come through the drafter's round, not a token row",
+                    ));
+                }
+                device.consumed.push(*anchor);
+                seq.lane.drafted = false;
+                // A proposal waiting for this row is not verified by a plain token row.
+                device.spec_drafts.clear();
+                device.spec_confidence.clear();
+                confidence.push(Vec::new());
+            }
+            drafts.push(rest.to_vec());
+            widths.push(rows.len());
+            tokens.extend_from_slice(rows);
+        }
+        let mut batch = scratch.batch.borrow_mut();
         if batch.is_none() {
-            let score_stride = members.first().map_or(0, |session| session.score_stride);
-            let rows = (self.members.max(members.len()) * self.shared.verify_rows.max(1)).max(1);
+            let score_stride = lock(&segments[0].0.lane.device)?.score_stride;
+            let rows =
+                (self.limits.members.max(segments.len()) * self.shared.verify_rows.max(1)).max(1);
             *batch = Some(BatchBuffers::new(
                 Arc::clone(&self.shared),
                 score_stride,
                 rows,
             )?);
         }
-        let allocation = batch.as_mut().expect("the buffers were just made");
-        let steps = allocation.step(members, drafts, confidence, tokens)?;
-        if steps.len() != members.len() {
-            return Err(BackendError::new(
-                "qwen4_batch",
-                format!(
-                    "a fused step of {} member(s) answered {} step(s)",
-                    members.len(),
-                    steps.len()
-                ),
-            ));
+        let buffers = batch.as_ref().expect("the buffers were just made");
+        let members: Vec<Handle> = segments
+            .iter()
+            .map(|(seq, _)| Arc::clone(&seq.lane.device))
+            .collect();
+        let mut offsets = Vec::with_capacity(widths.len());
+        let mut at = 0usize;
+        for width in &widths {
+            offsets.push(at);
+            at += width;
         }
-        Ok(steps)
+        let (saved, positions, hashers) = {
+            let mut guards = members
+                .iter()
+                .map(|handle| lock(handle))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut sessions: Vec<&mut DeviceSequence> =
+                guards.iter_mut().map(|guard| &mut **guard).collect();
+            let saved = buffers.enter(&mut sessions, &widths)?;
+            // A verify gives back the rows the model did not agree with, so each member's n-gram
+            // windows are its own to restore: the state from before this step, and the rows it
+            // kept.
+            let positions = sessions.iter().map(|session| session.position).collect();
+            let hashers = sessions
+                .iter()
+                .map(|session| Arc::new(session.ple_hashers.clone()))
+                .collect();
+            let lead = &mut *sessions[0];
+            lead.probe_rows = at;
+            // A batch never runs sequence-parallel; a forward that failed part-way may have
+            // left its share set.
+            lead.own_rows = None;
+            (saved, positions, hashers)
+        };
+        if super::prof::enabled() {
+            super::prof::begin();
+        }
+        *scratch.head.borrow_mut() = Head::None;
+        Ok(Window {
+            lead: Arc::clone(&members[0]),
+            batch: true,
+            rows: at,
+            tokens,
+            position: 0,
+            chunk: false,
+            shares: None,
+            after: 0,
+            parallel_from: 0,
+            overlap_from: self.shared.weights.layers.len(),
+            members,
+            widths,
+            offsets,
+            saved,
+            positions,
+            hashers,
+            drafts,
+            confidence,
+        })
     }
 
-    /// A prompt chunk: the prefill plan's forwards, each on the arm's own prompt path.
-    ///
-    /// `prompt_end` is the pass's [Pass::prompt_end]: the rows of the prompt still to come.
-    /// The drafter's commit window reaches the prompt's true end, as the old prompt loop's did,
-    /// so a non-final pass does not stop the window at the chunk boundary.
-    ///
-    /// Only the prompt's last forward heads a row. The old loop passed `logit_rows=0` on every
-    /// chunk but the last, which skipped each earlier chunk's head-row gather (a collective in a
-    /// TP group); `usize::MAX` defers the last one's head to [Walk::head].
-    fn prompt_chunk(
+    /// A prompt forward's tail ([DeviceSequence::forward_batch]'s, then the old prompt loop's):
+    /// the overlapped layers, the deferred head of the prompt's last forward, and the drafter's
+    /// commits or the MTP's pass over the forward.
+    fn finish_prompt(
         &self,
-        seq: &mut DeviceSequence,
-        rows: &[u32],
-        prompt_end: Option<usize>,
+        scratch: &QwenScratch,
+        window: &Window,
+        pass: PlanPass,
+        last: bool,
     ) -> Result<(), BackendError> {
-        // A proposal from the previous round anchors on the old end, which this prompt may
-        // replace; the fusion's begin_prompt cleared the same three lists. The final chunk's
-        // head drafts afresh.
-        seq.spec_drafts.clear();
-        seq.spec_confidence.clear();
-        seq.spec_served.clear();
-        seq.consumed.extend_from_slice(rows);
-        let end = seq.position + rows.len() + prompt_end.unwrap_or(0);
-        let last_pass = prompt_end.is_none_or(|after| after == 0);
-        for range in self.shared.prefill.forwards(rows.len()) {
-            let start = seq.position;
-            let last = last_pass && range.end == rows.len();
-            let chunk = &rows[range];
-            let logit_rows = if last { usize::MAX } else { 0 };
-            seq.forward_batch(chunk, logit_rows, 0)?;
-            if seq.drafting() {
-                let commits: Vec<_> = seq.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
+        let mut device = lock(&window.lead)?;
+        let layers = &self.shared.weights.layers;
+        let batch = window.rows;
+        if window.overlap_from < layers.len() {
+            device.overlapped_layers(
+                &layers[window.overlap_from..],
+                window.overlap_from,
+                window.chunk,
+                batch,
+            )?;
+        } else if device.own_rows.is_some() {
+            device.gather_features()?;
+        }
+        // Only the prompt's last forward heads a row: it asks for the last row's widened
+        // residual here and runs the mixer, the language head and the read-back when the
+        // runtime heads the finished prompt. An earlier forward skips the head-row gather (a
+        // collective in a TP group) altogether.
+        let last = last && pass.prompt_end.is_none_or(|after| after == 0);
+        let head = if last {
+            Some(device.head_rows(batch, 1)?)
+        } else {
+            None
+        };
+        device.own_rows = None;
+        device.window = 0;
+        if let Some(head) = head {
+            device.pending_head = Some(head);
+        }
+        let start = device.position;
+        super::prof::report(start + batch - 1, batch);
+        device.position += batch;
+        device.finish_numerics();
+        if device.drafting() {
+            // The drafter's commit window reaches the prompt's true end, as the old prompt
+            // loop's did, so a non-final pass does not stop the window at the chunk boundary.
+            let end = start + batch + window.after + pass.prompt_end.unwrap_or(0);
+            let commits: Vec<_> = device
+                .backend
+                .dflash
+                .as_ref()
+                .map_or_else(Vec::new, |draft| {
                     draft
                         .config
-                        .window_commits((start, chunk.len()), end, DENSE_ROWS)
+                        .window_commits((start, batch), end, DENSE_ROWS)
                         .collect()
                 });
-                for (row, rows, position) in commits {
-                    seq.dflash_commit(row, rows, position)?;
-                }
-            } else if seq.spec_enabled {
-                seq.assemble_mtp_rows(chunk.len())?;
-                seq.mtp_pass(chunk, start, false)?;
-                seq.stash_last_hyper(chunk.len())?;
+            for (row, rows, position) in commits {
+                device.dflash_commit(row, rows, position)?;
             }
+        } else if device.spec_enabled {
+            device.assemble_mtp_rows(batch)?;
+            device.mtp_pass(&window.tokens, start, false)?;
+            device.stash_last_hyper(batch)?;
+        }
+        if last {
+            // The point is the prompt's end, before any draft past it, exactly as the old
+            // prompt head took it: the MTP stash the drafts rewrite is part of the point, so
+            // saving after them would restore a different state.
+            device.keep_point()?;
+            *scratch.head.borrow_mut() = Head::Deferred(Arc::clone(&window.lead));
         }
         Ok(())
     }
 
-    /// One token a sequence, with the arm's drafts where it has them.
-    fn token_pass(
+    /// A token or verify pass's tail ([BatchBuffers]' step's): the mixer and the language head
+    /// over every row, read back; then a verify settles each member on its rows, and a token
+    /// row leaves its logits to the head.
+    fn finish_batch(
         &self,
-        segments: &mut [Segment<'_, DeviceSequence>],
-    ) -> Result<QwenHidden, BackendError> {
-        let mut steps: Vec<Option<StepOutput>> = (0..segments.len()).map(|_| None).collect();
-        let mut forward: Vec<usize> = Vec::new();
-        for index in 0..segments.len() {
-            let segment = &mut segments[index];
-            let token = segment.rows.first().copied().ok_or_else(|| {
-                BackendError::new("qwen4_device", "a token pass holds a segment with no rows")
-            })?;
-            if segment.rows.len() != 1 {
-                return Err(BackendError::new(
-                    "qwen4_device",
-                    "a token pass holds one row a segment",
-                ));
+        scratch: &QwenScratch,
+        window: &Window,
+        segments: &mut PlanRows<'_, '_, QwenLane>,
+        verify: bool,
+    ) -> Result<(), BackendError> {
+        let total = window.rows;
+        let logits = {
+            let lead = lock(&window.lead)?;
+            let weights = &self.shared.weights;
+            let (mixed, _) = lead.hyper(&weights.mixer, lead.hyper, false, total)?;
+            lead.gemv(&weights.lm_head, mixed, lead.logits, total)?;
+            lead.probe_finite(
+                48,
+                "logits",
+                lead.logits,
+                self.shared.config.vocab_size * total,
+            )?;
+            lead.prof_mark("lm_head")?;
+            let logits = lead.read_logits(total)?;
+            lead.prof_mark("logits_dtoh")?;
+            super::prof::report(lead.position, total);
+            logits
+        };
+        let vocab = self.shared.config.vocab_size;
+        for (member, (seq, rows)) in segments.iter_mut().enumerate() {
+            let at = window.offsets[member];
+            let width = window.widths[member];
+            let position = window.positions[member];
+            if verify {
+                let step = with_sampler(seq, |device| {
+                    device.position += width;
+                    device.resolve_verify(
+                        rows,
+                        &logits[at * vocab..(at + width) * vocab],
+                        position,
+                        &window.drafts[member],
+                        &window.confidence[member],
+                        &window.hashers[member],
+                    )
+                })?;
+                seq.lane.settled = Some(step);
+                seq.lane.drafted = true;
+                continue;
             }
-            if let Some(step) = segment.seq.feed(token)? {
-                steps[index] = Some(step);
-            } else {
-                forward.push(index);
+            // A plain token row is [DeviceSequence::resolve_verify] with no drafts, whose
+            // choice is the head's: nothing is agreed with and nothing is given back.
+            let mut device = seq.lane.lock()?;
+            device.position = position + 1;
+            device.spec_served.clear();
+            device.spec.observe(&[], 0, 1);
+            if device.drafting() {
+                // The drafter's rings take the row, and the next block is proposed once the
+                // round opens on the answer.
+                device.dflash_commit(0, 1, position)?;
+            } else if device.spec_enabled {
+                // The MTP's next chain starts from this row.
+                device.stash_last_hyper(1)?;
             }
         }
-        if !forward.is_empty() {
-            let mut drafts = Vec::with_capacity(forward.len());
-            let mut confidence = Vec::with_capacity(forward.len());
-            let mut tokens = Vec::with_capacity(forward.len());
-            for &index in &forward {
-                let seq = &mut *segments[index].seq;
-                let draft = std::mem::take(&mut seq.spec_drafts);
-                let sure = std::mem::take(&mut seq.spec_confidence);
-                tokens.push(segments[index].rows[0]);
-                drafts.push(draft);
-                confidence.push(sure);
-            }
-            let mut needs = vec![false; segments.len()];
-            for &index in &forward {
-                needs[index] = true;
-            }
-            let mut members: Vec<&mut DeviceSequence> = Vec::with_capacity(forward.len());
-            for (index, segment) in segments.iter_mut().enumerate() {
-                if needs[index] {
-                    members.push(&mut *segment.seq);
-                }
-            }
-            let resolved = self.batch(&mut members, &drafts, &confidence, &tokens)?;
-            for (&index, step) in forward.iter().zip(resolved) {
-                steps[index] = Some(step);
-            }
+        if !verify {
+            *scratch.head.borrow_mut() = Head::Rows(logits);
         }
-        let steps = steps
-            .into_iter()
-            .map(|step| {
-                step.ok_or_else(|| {
-                    BackendError::new("qwen4_device", "a token pass left a member without a step")
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(QwenHidden {
-            rows: segments.len(),
-            steps,
-        })
+        Ok(())
     }
 
-    /// A verify pass: every segment's anchor token and drafts, one batch.
-    fn verify_pass(
+    /// The head rows `first..first + count` of the last walk, as logits: a prompt's deferred
+    /// row, or a token pass's rows.
+    fn head_logits(
         &self,
-        segments: &mut [Segment<'_, DeviceSequence>],
-    ) -> Result<QwenHidden, BackendError> {
-        let mut drafts = Vec::with_capacity(segments.len());
-        let mut confidence = Vec::with_capacity(segments.len());
-        let mut tokens = Vec::with_capacity(segments.len());
-        for segment in segments.iter() {
-            let (anchor, rest) = segment.rows.split_first().ok_or_else(|| {
-                BackendError::new("qwen4_device", "a verify segment holds no rows")
-            })?;
-            tokens.push(*anchor);
-            drafts.push(rest.to_vec());
-            // The drafter's own confidence in these leading drafts, as the old fusion's round
-            // passed it to the batch: a policy calibrated on it must not be fed zeroes.
-            confidence.push(
-                segment
-                    .seq
-                    .spec_confidence
-                    .iter()
-                    .take(rest.len())
-                    .copied()
-                    .collect(),
-            );
+        scratch: &QwenScratch,
+        first: usize,
+        count: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let vocab = self.shared.config.vocab_size;
+        match &*scratch.head.borrow() {
+            Head::Deferred(handle) => {
+                if count != 1 {
+                    return Err(BackendError::new(
+                        DEVICE,
+                        format!("a prompt heads its last row alone, not {count} rows"),
+                    ));
+                }
+                lock(handle)?.deferred_logits()
+            }
+            Head::Rows(logits) => logits
+                .get(first * vocab..(first + count) * vocab)
+                .map(<[f32]>::to_vec)
+                .ok_or_else(|| {
+                    BackendError::new(
+                        DEVICE,
+                        format!(
+                            "the last token pass holds no head rows {first}..{}",
+                            first + count
+                        ),
+                    )
+                }),
+            Head::None => Err(BackendError::new(DEVICE, "the last walk left no head row")),
         }
-        let mut members: Vec<&mut DeviceSequence> = segments
-            .iter_mut()
-            .map(|segment| &mut *segment.seq)
-            .collect::<Vec<_>>();
-        let steps = self.batch(&mut members, &drafts, &confidence, &tokens)?;
-        Ok(QwenHidden {
-            rows: segments.len(),
-            steps,
-        })
     }
 }
 
-/// The arm's state, as the runtime needs to see it.
-fn layout_of(config: &crate::Qwen4ExpConfig) -> StateLayout {
+impl PlanHost for QwenHost {
+    type Parts = QwenParts;
+    type Frame = QwenFrame;
+    type Lane = QwenLane;
+    type Drafter = QwenDrafter;
+    type Scratch = QwenScratch;
+    type Mode = ();
+
+    const DEVICE: &'static str = DEVICE;
+    /// The head reads every row back for the host's pick, and the arm's sessions have always
+    /// answered a greedy step's logits.
+    const KEEPS_LOGITS: bool = true;
+    const CAPABILITIES: WalkCapabilities = WalkCapabilities {
+        passes: PassMask::TOKEN_ROWS
+            .union(PassMask::BULK)
+            .union(PassMask::VERIFY),
+        segments: Segments::Many,
+        state: StateKind::Both,
+        // The four rows the arm states in `sparkflash_model::ARM_LEDGERS`; a test holds them
+        // equal so the walk and the table cannot drift.
+        compute: ComputeDeclaration {
+            prompt: State::Native("prompt chunks on the wide tile and the grouped expert MMAs"),
+            token: State::Native("few-row twins of the tile at every row count"),
+            stored: State::Native("NVFP4 weights with BF16 activation pairs"),
+            rewind: State::Native("a prompt that goes back to the last prompt's end"),
+        },
+    };
+
+    fn layers(&self) -> usize {
+        self.branches.len()
+    }
+
+    fn branches(&self, layer: usize) -> &[PlanBranch<QwenParts, QwenFrame>] {
+        &self.branches[layer]
+    }
+
+    fn vocab(&self) -> usize {
+        self.shared.config.vocab_size
+    }
+
+    fn pass_rows(&self) -> usize {
+        self.limits.rows
+    }
+
+    fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    fn scratch(_this: &Arc<Self>, _rows: usize) -> Result<QwenScratch, BackendError> {
+        Ok(QwenScratch {
+            batch: RefCell::new(None),
+            window: RefCell::new(None),
+            entered: Cell::new((Deviceptr(0), Deviceptr(0))),
+            head: RefCell::new(Head::None),
+        })
+    }
+
+    fn lane(this: &Arc<Self>) -> Result<QwenLane, BackendError> {
+        let mut device = DeviceSequence::allocate(Arc::clone(&this.shared), this.context)?;
+        // Without joint rounds the arm drafts nothing, exactly as the fusion's own policy did: a
+        // member would otherwise run the MTP's prompt pass and then throw every chain away.
+        device.spec_enabled &= this.joint;
+        Ok(QwenLane {
+            device: Arc::new(Mutex::new(device)),
+            drafted: false,
+            settled: None,
+        })
+    }
+
+    fn drafter(this: &Arc<Self>) -> Result<QwenDrafter, BackendError> {
+        let config = &this.shared.config;
+        Ok(QwenDrafter {
+            depth: this.shared.verify_rows.saturating_sub(1),
+            wall: JOINT_WALL.with_experts(config.num_experts, config.num_experts_per_tok),
+            joint: this.joint,
+        })
+    }
+
+    fn mode(&self, _pass: PlanPass, _rows: usize) {}
+
+    /// A prompt chunk runs as the prefill plan's forwards, each a window; a token or verify
+    /// pass is one batch.
+    fn windows(
+        &self,
+        pass: PlanPass,
+        segments: &PlanRows<'_, '_, QwenLane>,
+    ) -> Result<Vec<usize>, BackendError> {
+        let rows: usize = segments.iter().map(|(_, ids)| ids.len()).sum();
+        match pass.kind {
+            PassKind::Bulk { .. } => {
+                if segments.len() != 1 {
+                    return Err(BackendError::new(
+                        DEVICE,
+                        "a bulk prompt pass holds one segment",
+                    ));
+                }
+                Ok(self
+                    .shared
+                    .prefill
+                    .forwards(rows)
+                    .into_iter()
+                    .map(|range| range.len())
+                    .collect())
+            }
+            PassKind::TokenRows | PassKind::Verify { .. } => Ok(vec![rows]),
+            PassKind::Paired { .. } => Err(BackendError::new(
+                DEVICE,
+                "the Qwen arm does not pair several prompts in one pass",
+            )),
+        }
+    }
+
+    fn begin_window(
+        &self,
+        scratch: &QwenScratch,
+        segments: &mut PlanRows<'_, '_, QwenLane>,
+        window: &PlanWindow,
+    ) -> Result<(), BackendError> {
+        // A window a fault left is handed back first.
+        self.abandon_window(scratch);
+        let after = window.after.first().copied().unwrap_or(0);
+        let window = match window.pass.kind {
+            PassKind::Bulk { .. } => {
+                let (seq, tokens) = segments
+                    .first_mut()
+                    .ok_or_else(|| BackendError::new(DEVICE, "a prompt window holds no rows"))?;
+                self.begin_prompt(scratch, seq, tokens, after)?
+            }
+            PassKind::TokenRows => self.begin_batch(scratch, segments, false)?,
+            PassKind::Verify { .. } => self.begin_batch(scratch, segments, true)?,
+            PassKind::Paired { .. } => {
+                return Err(BackendError::new(
+                    DEVICE,
+                    "the Qwen arm does not pair several prompts in one pass",
+                ));
+            }
+        };
+        *scratch.window.borrow_mut() = Some(window);
+        Ok(())
+    }
+
+    fn walked_layers(&self, scratch: &QwenScratch) -> usize {
+        scratch
+            .window()
+            .map_or(self.layers(), |window| window.overlap_from)
+    }
+
+    fn finish(
+        &self,
+        scratch: &QwenScratch,
+        segments: &mut PlanRows<'_, '_, QwenLane>,
+        pass: PlanPass,
+        last: bool,
+    ) -> Result<(), BackendError> {
+        let window = scratch
+            .window
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| BackendError::new(DEVICE, "a window finished that never began"))?;
+        if !window.batch {
+            return self.finish_prompt(scratch, &window, pass, last);
+        }
+        let verify = matches!(pass.kind, PassKind::Verify { .. });
+        // The members are settled first: a draft the model agreed with is kept by giving the
+        // rest of the chain's state back, and that needs each member's scratch still pointed at
+        // its rows. The exit runs whatever the settle returned.
+        let settled = self.finish_batch(scratch, &window, segments, verify);
+        let exited = scratch.exit(&window);
+        settled.and(exited)
+    }
+
+    fn abandon_window(&self, scratch: &QwenScratch) {
+        let left = scratch.window.borrow_mut().take();
+        if let Some(window) = left {
+            if let Ok(mut device) = lock(&window.lead) {
+                device.own_rows = None;
+                device.window = 0;
+            }
+            let _ = scratch.exit(&window);
+        }
+    }
+
+    /// The arm's caches as the lane memory lays them out: no branch part declares its own.
+    fn regions(&self) -> Vec<Region> {
+        regions_of(&self.shared.config)
+    }
+
+    fn ends(&self, token: u32) -> bool {
+        self.shared.config.eos_token_ids.contains(&token)
+    }
+
+    fn back(&self, lane: &mut QwenLane, reach: usize) -> Result<(), BackendError> {
+        lane.lock()?.back(reach)
+    }
+
+    fn embed(&self, scratch: &QwenScratch, ids: &[u32]) -> Result<(), BackendError> {
+        let window = scratch.window()?;
+        let device = lock(&window.lead)?;
+        let backend = Arc::clone(&self.shared);
+        let config = &backend.config;
+        let kernels = &*backend.kernels;
+        let weights = &backend.weights;
+        let width = config.hyper_width();
+        if window.batch {
+            for (row, &token) in ids.iter().enumerate() {
+                device.call(
+                    kernels.embed,
+                    sparkflash_ops::calls::embed(
+                        weights.embed.data().0,
+                        device.hyper.offset(row * width * 4).0,
+                        token,
+                        (config.hidden_size, width),
+                    ),
+                )?;
+            }
+        } else {
+            // The whole chunk in one launch, grid row t widening tokens[t], on the session's
+            // stream like every other launch of the forward: the default stream the loader uses
+            // is not ordered against it, so an embed left there raced the layers that read its
+            // rows. The ids are read in place from the slab, which is rewritten only once the
+            // last embed ran.
+            let cuda = &backend.cuda;
+            cuda.host_wait(&device.tokens_staged.0)
+                .map_err(|error| BackendError::new(DEVICE, error))?;
+            device
+                .token_staging
+                .write_at(0, bytemuck::cast_slice::<u32, u8>(ids))
+                .map_err(|error| BackendError::new(DEVICE, error))?;
+            device.call(
+                kernels.embed,
+                sparkflash_ops::calls::embed_rows(
+                    weights.embed.data().0,
+                    device.hyper.0,
+                    device.token_staging.device().0,
+                    (config.hidden_size, width),
+                    ids.len(),
+                ),
+            )?;
+            cuda.record_event_on(device.clock(), &device.tokens_staged.0)
+                .map_err(|error| BackendError::new(DEVICE, error))?;
+        }
+        device.probe_finite(0, "embed", device.hyper, ids.len() * width)?;
+        device.prof_mark("embed")
+    }
+
+    fn enter(
+        &self,
+        scratch: &QwenScratch,
+        frame: &QwenFrame,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        let (index, ffn) = match frame {
+            QwenFrame::Landed => return Ok(()),
+            QwenFrame::Attention(index) => (*index, false),
+            QwenFrame::Ffn(index) => (*index, true),
+        };
+        let window = scratch.window()?;
+        let mut device = lock(&window.lead)?;
+        let layer = &self.shared.weights.layers[index];
+        let block = if ffn {
+            &layer.mlp_hyper
+        } else {
+            &layer.attn_hyper
+        };
+        let entered = if window.batch {
+            let (mixed, injection) = device.hyper(block, device.hyper, true, rows)?;
+            // The attention's exit injects with the sequence's own weights buffer; the experts'
+            // body reads the ones this hyper-connection answers.
+            let injection = match (ffn, injection) {
+                (_, Some(injection)) => injection,
+                (false, None) => Deviceptr(0),
+                (true, None) => {
+                    return Err(BackendError::new(
+                        DEVICE,
+                        "the MLP hyper-connection injects",
+                    ));
+                }
+            };
+            (mixed, injection)
+        } else {
+            if !ffn {
+                device.own_rows = window.shares.filter(|_| index >= window.parallel_from);
+            }
+            device.branch_input(block, rows)?
+        };
+        if ffn {
+            device.probe_finite(
+                index,
+                "mixed",
+                entered.0,
+                rows * self.shared.config.hidden_size,
+            )?;
+            device.prof_mark("hyper_mlp")?;
+        } else {
+            device.prof_mark("hyper_attn")?;
+        }
+        scratch.entered.set(entered);
+        Ok(())
+    }
+
+    fn pass<'a>(
+        &'a self,
+        scratch: &'a QwenScratch,
+        _segments: &'a [(&'a mut PlanSeq<QwenLane>, &'a [u32])],
+        layer: usize,
+        _slot: usize,
+        _rows: usize,
+        _mode: (),
+    ) -> QwenPass<'a> {
+        QwenPass {
+            host: self,
+            scratch,
+            layer,
+        }
+    }
+
+    fn leave(
+        &self,
+        scratch: &QwenScratch,
+        frame: &QwenFrame,
+        _next: Option<&QwenFrame>,
+        _summed: bool,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        let width = self.shared.config.hyper_width();
+        let window = scratch.window()?;
+        match frame {
+            QwenFrame::Landed => Ok(()),
+            QwenFrame::Attention(index) => {
+                let device = lock(&window.lead)?;
+                device.inject_branch(device.hyper, device.injection, rows)?;
+                device.probe_finite(*index, "after_attn", device.hyper, rows * width)?;
+                device.prof_mark("attn_inject")
+            }
+            QwenFrame::Ffn(index) => {
+                {
+                    let device = lock(&window.lead)?;
+                    device.probe_finite(*index, "after_mlp", device.hyper, rows * width)?;
+                    if !window.batch {
+                        device.capture_features(*index, rows)?;
+                    }
+                }
+                // The drafter reads a few layers' widened rows; a member's own slice is the rows
+                // its next block anchors on.
+                if window.batch {
+                    for (member, handle) in window.members.iter().enumerate() {
+                        lock(handle)?.capture_features(*index, window.widths[member])?;
+                    }
+                }
+                lock(&window.lead)?.prof_mark("inject_mlp")
+            }
+        }
+    }
+
+    fn residual(&self, _scratch: &QwenScratch, _rows: usize) -> Result<Vec<f32>, BackendError> {
+        Err(BackendError::new(
+            DEVICE,
+            "the Qwen walk keeps no layer trace: its residual is widened per stream",
+        ))
+    }
+
+    fn logits(
+        &self,
+        scratch: &QwenScratch,
+        first: usize,
+        count: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        self.head_logits(scratch, first, count)
+    }
+
+    /// The host sampler's argmax of every row: the logits are read back whatever the pick, so
+    /// the greedy pick is the sampler's own on the host.
+    fn choices(
+        &self,
+        scratch: &QwenScratch,
+        first: usize,
+        count: usize,
+    ) -> Result<Vec<u32>, BackendError> {
+        let logits = self.head_logits(scratch, first, count)?;
+        Ok(logits
+            .chunks(self.shared.config.vocab_size)
+            .map(sparkflash_model::argmax)
+            .collect())
+    }
+}
+
+/// The arm's state, as the runtime needs to see it: the QSA (and MTP) caches are positional, and
+/// the Gated DeltaNet windows and recurrence with the PLE windows are one recurrent region.
+fn regions_of(config: &crate::Qwen4ExpConfig) -> Vec<Region> {
     let sparse = config
         .layer_types
         .iter()
@@ -357,7 +1370,7 @@ fn layout_of(config: &crate::Qwen4ExpConfig) -> StateLayout {
             bytes: conv + recurrent + ple,
         });
     }
-    StateLayout::new(regions)
+    regions
 }
 
 /// The pass width the runtime's [ChunkPolicy] can return for the arm's own prefill chunk.
@@ -413,20 +1426,42 @@ impl Drafter<QwenWalk> for QwenDrafter {
         &self.wall
     }
 
-    fn open_round(&self, seq: &mut DeviceSequence, token: u32) -> Result<Draft, BackendError> {
-        seq.backend
-            .cuda
-            .make_current()
-            .map_err(|error| BackendError::new("qwen4_device", error))?;
-        if let Some(step) = seq.feed(token)? {
+    /// The member's held answer, or its next chain. A sequence whose last step was a prompt's
+    /// head or a plain token row proposes the chain here, on the token it was fed, from the
+    /// same state the head left: a verify proposed its own already.
+    fn open_round(&self, seq: &mut PlanSeq<QwenLane>, token: u32) -> Result<Draft, BackendError> {
+        let drafted = seq.lane.drafted;
+        let (held, chain, drafts) = with_sampler(seq, |device| {
+            device
+                .backend
+                .cuda
+                .make_current()
+                .map_err(|error| BackendError::new(DEVICE, error))?;
+            if let Some(step) = device.feed(token)? {
+                return Ok((Some(step), Vec::new(), Vec::new()));
+            }
+            if !drafted {
+                let position = device.position;
+                if device.drafting() {
+                    device.dflash_propose(token, position)?;
+                } else if device.spec_enabled {
+                    device.draft_chain(token, position)?;
+                }
+            }
+            let mut chain = device
+                .spec
+                .chain(&device.spec_confidence, device.spec_drafts.len());
+            chain.truncate(device.spec_drafts.len());
+            // The confidence stays on the sequence: the verify hands it back to the batch,
+            // which records the round's calibration. Taking it here would make every verify
+            // look like a drafter that offers no probabilities.
+            let drafts = std::mem::take(&mut device.spec_drafts);
+            Ok((None, chain, drafts))
+        })?;
+        if let Some(step) = held {
             return Ok(Draft::Held(step));
         }
-        let mut chain = seq.spec.chain(&seq.spec_confidence, seq.spec_drafts.len());
-        chain.truncate(seq.spec_drafts.len());
-        let drafts = std::mem::take(&mut seq.spec_drafts);
-        // The confidence stays on the sequence: [QwenWalk::verify_pass] hands it back to the
-        // batch, which records the round's calibration. Taking it here would make every verify
-        // look like a drafter that offers no probabilities.
+        seq.lane.drafted = true;
         if !self.joint {
             return Ok(Draft::Chain {
                 confidence: Vec::new(),
@@ -439,33 +1474,39 @@ impl Drafter<QwenWalk> for QwenDrafter {
         })
     }
 
+    /// One verify pass of the walk over every member's anchor and drafts; each member's step is
+    /// settled inside the pass, while its rows are still the batch's.
     fn verify(
         &self,
         walk: &QwenWalk,
-        segments: &mut [Segment<'_, DeviceSequence>],
+        segments: &mut [Segment<'_, PlanSeq<QwenLane>>],
         _depths: &[usize],
     ) -> Result<Vec<Self::Rows>, BackendError> {
-        let members = segments.len();
-        let steps = walk.verify_pass(segments)?.steps;
-        if steps.len() != members {
-            return Err(BackendError::new(
-                "qwen4_device",
-                format!(
-                    "a verify of {members} member(s) answered {} step(s)",
-                    steps.len()
-                ),
-            ));
-        }
-        Ok(steps)
+        let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
+        walk.walk(
+            segments,
+            Pass::verify(rows, OutputConstraint::new(&[], rows)),
+        )?;
+        segments
+            .iter_mut()
+            .map(|segment| {
+                segment.seq.lane.settled.take().ok_or_else(|| {
+                    BackendError::new(DEVICE, "a verify left a member without a step")
+                })
+            })
+            .collect()
     }
 
+    /// [DeviceSequence::resolve_verify] already settled the round inside the batch; the history
+    /// keeps the rows the sequence kept.
     fn settle(
         &self,
-        _seq: &mut DeviceSequence,
+        seq: &mut PlanSeq<QwenLane>,
         _chunk: &[u32],
         rows: Self::Rows,
     ) -> Result<StepOutput, BackendError> {
-        // DeviceSequence::resolve_verify already settled the round inside the batch.
+        let position = seq.lane.lock()?.position;
+        seq.keep(position)?;
         Ok(rows)
     }
 
@@ -476,237 +1517,52 @@ impl Drafter<QwenWalk> for QwenDrafter {
         DRAFT_BUDGET.rows(seqs, self.depth)
     }
 
-    fn ready(&self, seq: &DeviceSequence, token: u32) -> bool {
-        seq.spec_queue
-            .first()
-            .is_some_and(|pending| pending.token == token)
+    fn ready(&self, seq: &PlanSeq<QwenLane>, token: u32) -> bool {
+        seq.lane.lock().is_ok_and(|device| {
+            device
+                .spec_queue
+                .first()
+                .is_some_and(|pending| pending.token == token)
+        })
     }
 
-    fn give_back(&self, seq: &mut DeviceSequence, to: usize) -> Result<(), BackendError> {
-        let count = seq.consumed.len().saturating_sub(to);
-        if count == 0 {
-            return Ok(());
-        }
-        let served = seq.spec_served.len();
-        if count > served {
-            return Err(BackendError::new(
-                "qwen4_device",
-                format!("{count} answers to give back, and the last verify served {served}"),
-            ));
-        }
-        let pending = seq
-            .spec_served
-            .drain(served - count..)
-            .next()
-            .expect("the served answers were just counted");
-        seq.spec_queue.clear();
-        seq.unwind(&pending)?;
-        seq.consumed.truncate(seq.consumed.len() - count);
-        let history = seq.sampler.history().len();
-        seq.sampler.truncate(history - count);
-        Ok(())
+    fn give_back(&self, seq: &mut PlanSeq<QwenLane>, to: usize) -> Result<(), BackendError> {
+        let position = with_sampler(seq, |device| {
+            let count = device.consumed.len().saturating_sub(to);
+            if count == 0 {
+                return Ok(device.position);
+            }
+            let served = device.spec_served.len();
+            if count > served {
+                return Err(BackendError::new(
+                    DEVICE,
+                    format!("{count} answers to give back, and the last verify served {served}"),
+                ));
+            }
+            let pending = device
+                .spec_served
+                .drain(served - count..)
+                .next()
+                .expect("the served answers were just counted");
+            device.spec_queue.clear();
+            device.unwind(&pending)?;
+            let consumed = device.consumed.len() - count;
+            device.consumed.truncate(consumed);
+            let history = device.sampler.history().len();
+            device.sampler.truncate(history - count);
+            Ok(device.position)
+        })?;
+        seq.keep(position)
     }
 
-    fn speculation(&self, seq: &DeviceSequence) -> Speculation {
-        seq.spec.stats()
+    fn speculation(&self, seq: &PlanSeq<QwenLane>) -> Speculation {
+        seq.lane
+            .lock()
+            .map_or_else(|_| Speculation::default(), |device| device.spec.stats())
     }
 
     fn describe(&self) -> String {
         "DFlash 2 or MTP".to_owned()
-    }
-}
-
-impl Walk for QwenWalk {
-    type Seq = DeviceSequence;
-    type Hidden = QwenHidden;
-    type Drafter = QwenDrafter;
-    type Vision = sparkflash_runtime::NoVision;
-
-    const CAPABILITIES: WalkCapabilities = WalkCapabilities {
-        passes: PassMask::TOKEN_ROWS
-            .union(PassMask::BULK)
-            .union(PassMask::VERIFY),
-        segments: Segments::Many,
-        state: StateKind::Both,
-        // The four rows the arm states in `sparkflash_model::ARM_LEDGERS`; a test holds them
-        // equal so the walk and the table cannot drift.
-        compute: ComputeDeclaration {
-            prompt: State::Native("prompt chunks on the wide tile and the grouped expert MMAs"),
-            token: State::Native("few-row twins of the tile at every row count"),
-            stored: State::Native("NVFP4 weights with BF16 activation pairs"),
-            rewind: State::Native("a prompt that goes back to the last prompt's end"),
-        },
-    };
-
-    fn layout(&self) -> &StateLayout {
-        &self.layout
-    }
-
-    fn open(&self) -> Result<Self::Seq, BackendError> {
-        let mut seq = DeviceSequence::allocate(Arc::clone(&self.shared), self.limits.context)?;
-        // Without joint rounds the arm drafts nothing, exactly as the fusion's own policy did: a
-        // member would otherwise run the MTP's prompt pass and then throw every chain away.
-        seq.spec_enabled &= self.drafter.joint;
-        Ok(seq)
-    }
-
-    fn limits(&self) -> Limits {
-        self.limits
-    }
-
-    fn drafter(&self) -> &Self::Drafter {
-        &self.drafter
-    }
-
-    /// A token pass holds at most the batch's four members, though a prompt pass holds a whole
-    /// prefill chunk.
-    fn max_segments(&self) -> usize {
-        self.members
-    }
-
-    fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
-        seq.set_sampling(sampling);
-    }
-
-    fn walk(
-        &self,
-        segments: &mut [Segment<'_, Self::Seq>],
-        pass: Pass<'_>,
-    ) -> Result<QwenHidden, BackendError> {
-        let hidden = match pass.kind {
-            PassKind::TokenRows => self.token_pass(segments)?,
-            PassKind::Verify { .. } => self.verify_pass(segments)?,
-            PassKind::Bulk { .. } => {
-                if segments.len() != 1 {
-                    return Err(BackendError::new(
-                        "qwen4_device",
-                        "a bulk prompt pass holds one segment",
-                    ));
-                }
-                let segment = &mut segments[0];
-                let rows = segment.rows.len();
-                let (seq, tokens) = (&mut *segment.seq, segment.rows);
-                self.prompt_chunk(seq, tokens, pass.prompt_end)?;
-                QwenHidden {
-                    rows,
-                    steps: Vec::new(),
-                }
-            }
-            PassKind::Paired { .. } => {
-                return Err(BackendError::new(
-                    "qwen4_device",
-                    "the Qwen arm does not pair several prompts in one pass",
-                ));
-            }
-        };
-        if let Some(hook) = pass.hook {
-            hook.after_layers(&Hidden::new(hidden.rows))?;
-        }
-        Ok(hidden)
-    }
-
-    fn head(
-        &self,
-        hidden: &mut QwenHidden,
-        rows: &mut [HeadRow<'_, Self::Seq>],
-    ) -> Result<Vec<StepOutput>, BackendError> {
-        if !hidden.steps.is_empty() {
-            let steps = std::mem::take(&mut hidden.steps);
-            if steps.len() != rows.len() {
-                return Err(BackendError::new(
-                    "qwen4_device",
-                    format!(
-                        "the head was asked for {} row(s) and {} step(s) are pending",
-                        rows.len(),
-                        steps.len()
-                    ),
-                ));
-            }
-            return Ok(steps);
-        }
-        // A prompt head: the last chunk's deferred row, folded into logits here and chosen with
-        // the prompt in the sampler.
-        let logits = match rows.first_mut() {
-            Some(row) => row.seq.deferred_logits()?,
-            None => Vec::new(),
-        };
-        if logits.is_empty() {
-            return Err(BackendError::new(
-                "qwen4_device",
-                "the head has no prompt logits",
-            ));
-        }
-        let mut steps = Vec::with_capacity(rows.len());
-        for row in rows.iter_mut() {
-            let token = match &row.input {
-                HeadInput::Prompt(tokens) => {
-                    // Not [HeadInput::record]: that resets the sampler first, and this arm has
-                    // always recorded a prompt onto whatever [Walk::set_sampling] left.
-                    row.seq.sampler.record_prompt(tokens);
-                    let position = row.seq.position;
-                    // The point is the prompt's end, before any draft past it, exactly as the
-                    // old prompt loop took it: the MTP stash the drafts rewrite is part of the
-                    // point, so saving after them would restore a different state.
-                    row.seq.keep_point()?;
-                    let next = row.seq.next(&logits);
-                    if row.seq.drafting() {
-                        if let Some(token) = next {
-                            row.seq.dflash_propose(token, position)?;
-                        }
-                    } else if row.seq.spec_enabled
-                        && let Some(token) = next
-                    {
-                        row.seq.draft_chain(token, position)?;
-                    }
-                    next
-                }
-                HeadInput::Token(token) => {
-                    row.seq.sampler.record(*token);
-                    let next = row.seq.next(&logits);
-                    if row.seq.spec_enabled
-                        && let Some(token) = next
-                    {
-                        let position = row.seq.position;
-                        row.seq.draft_chain(token, position)?;
-                    }
-                    next
-                }
-                HeadInput::Verify { rows, row: index } => {
-                    row.seq
-                        .sampler
-                        .record(rows.get(*index).copied().unwrap_or_default());
-                    row.seq.next(&logits)
-                }
-            };
-            steps.push(StepOutput {
-                next_token: token,
-                logits: logits.clone(),
-                draft: Vec::new(),
-            });
-        }
-        Ok(steps)
-    }
-}
-
-impl LaneState for DeviceSequence {
-    fn position(&self) -> usize {
-        self.position
-    }
-
-    fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
-        if self.rewind_point() == Some(at) {
-            return Ok(());
-        }
-        check_checkpoint("qwen4_device", at, self.position)?;
-        self.keep_point()
-    }
-
-    fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
-        self.rewind_state(to)
-    }
-
-    fn room(&self, positions: usize, reset: bool) -> bool {
-        DeviceSequence::room(self, positions, reset)
     }
 }
 
@@ -810,14 +1666,20 @@ fn fresh_hashers(
 mod tests {
     use super::*;
     use sparkflash_runtime::testing::ArmProfile;
-    use sparkflash_runtime::{ChunkPolicy, Fixture, FormatRule, WalkFixture};
+    use sparkflash_runtime::{ArmFixture, Fixture, FormatRule, StateLayout};
 
     use crate::config::Qwen4ExpConfig;
     use crate::device::prefill::{DEFAULT_PREFILL_CHUNK, PrefillPlan};
 
     /// The Qwen fixture: the synthetic tiny checkpoint, opened through the arm's own TP=1
     /// constructor. It is a real checkpoint in the released storage formats, not a served image.
-    impl WalkFixture for QwenWalk {
+    /// A marker with the walk's old name, which the record and the generated checks state: the
+    /// walk is the runtime's type.
+    struct QwenWalk;
+
+    impl ArmFixture for QwenWalk {
+        type Walk = PlanWalk<QwenHost>;
+
         /// Qwen's single-process path serves on the tick engine, so its generated checks drive
         /// that engine exactly as dense's and GLM's do. Its TP leg skips because the fixture is
         /// one rank.
@@ -825,7 +1687,7 @@ mod tests {
             true
         }
 
-        fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
+        fn fixture(world: usize) -> Result<Fixture<PlanWalk<QwenHost>>, BackendError> {
             // Measured on one host through sparkflash_runtime::local_group (2026-11-21): rank 0's
             // upload refuses the split, rightly, so the check skips with that reason.
             one_rank(world)?;
@@ -855,9 +1717,9 @@ mod tests {
     fn open_fixture(
         config: Qwen4ExpConfig,
         what: &'static str,
-    ) -> Result<Fixture<QwenWalk>, BackendError> {
-        let directory = tempfile::tempdir()
-            .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+    ) -> Result<Fixture<PlanWalk<QwenHost>>, BackendError> {
+        let directory =
+            tempfile::tempdir().map_err(|error| BackendError::new("fixture", error.to_string()))?;
         crate::write_synthetic_checkpoint(directory.path(), &config, 7)
             .map_err(|error| BackendError::new("fixture", error))?;
         let backend = crate::device::Qwen4ExpDeviceBackend::open(
@@ -898,9 +1760,9 @@ mod tests {
     struct Qwen38Fixture;
 
     impl sparkflash_runtime::ArmFixture for Qwen38Fixture {
-        type Walk = QwenWalk;
+        type Walk = PlanWalk<QwenHost>;
 
-        fn fixture(world: usize) -> Result<Fixture<QwenWalk>, BackendError> {
+        fn fixture(world: usize) -> Result<Fixture<PlanWalk<QwenHost>>, BackendError> {
             one_rank(world)?;
             open_fixture(
                 Qwen4ExpConfig::tiny_fp8(),
@@ -945,7 +1807,7 @@ mod tests {
     /// recurrence is not, so the runtime must checkpoint and truncate.
     #[test]
     fn the_layout_is_positional_attention_and_recurrent_gated_deltanet() {
-        let layout = layout_of(&Qwen4ExpConfig::tiny());
+        let layout = StateLayout::new(regions_of(&Qwen4ExpConfig::tiny()));
         assert_eq!(layout.kind(), StateKind::Both);
         assert!(layout.bytes_per_row() > 0, "the KV cache is positional");
         assert!(layout.needs_checkpoint(), "the recurrence needs a point");
@@ -980,7 +1842,7 @@ mod tests {
     /// The walk takes the passes the generated checks read: a prompt chunk and many segments.
     #[test]
     fn the_capabilities_support_every_generated_check() {
-        let caps = <QwenWalk as Walk>::CAPABILITIES;
+        let caps = <PlanWalk<QwenHost> as Walk>::CAPABILITIES;
         assert!(caps.passes.contains(PassMask::BULK));
         assert!(caps.passes.contains(PassMask::TOKEN_ROWS));
         assert_eq!(caps.segments, Segments::Many);
@@ -988,8 +1850,10 @@ mod tests {
         assert_eq!(pass_rows(DEFAULT_PREFILL_CHUNK), 4_096);
         let walk_batch = super::super::batch::MAX_BATCH;
         assert_eq!(walk_batch, 4);
-        sparkflash_runtime::check_claims::<QwenWalk>(sparkflash_runtime::CONFORMANCE_CHECKS)
-            .expect("every generated check is supported");
+        sparkflash_runtime::check_claims::<PlanWalk<QwenHost>>(
+            sparkflash_runtime::CONFORMANCE_CHECKS,
+        )
+        .expect("every generated check is supported");
     }
 
     /// The prefill plan's forwards inside the passes the profile states: a 4,096-row pass and
@@ -1011,22 +1875,26 @@ mod tests {
     }
 
     /// What the arm states for the generated profile and round tests: the prefill plan's chunk
-    /// as the pass width and the batch's verify width as the member cap, as [QwenWalk::new]
+    /// as the pass width and the batch's verify width as the member cap, as [QwenHost::new]
     /// states its limits; the MTP verify's depth under the arm's budget and wall; and the
     /// chunks the default plan's and the token-kernel plan's prompts run in.
     fn stated() -> ArmProfile {
         let members = super::super::batch::MAX_BATCH;
         let limits = walk_limits(DEFAULT_PREFILL_CHUNK, 65_536, members);
-        ArmProfile::new("Qwen", layout_of(&Qwen4ExpConfig::tiny()), limits)
-            .with_code("qwen4_shape")
-            .drafting(super::super::MTP_VERIFY_ROWS - 1, DRAFT_BUDGET)
-            .with_wall(JOINT_WALL)
-            .prompt(limits, 5_000, &[4_096, 904])
-            .prompt(
-                walk_limits(super::super::TOKEN_PREFILL_CHUNK, 65_536, members),
-                600,
-                &[256, 256, 88],
-            )
+        ArmProfile::new(
+            "Qwen",
+            StateLayout::new(regions_of(&Qwen4ExpConfig::tiny())),
+            limits,
+        )
+        .with_code("qwen4_shape")
+        .drafting(super::super::MTP_VERIFY_ROWS - 1, DRAFT_BUDGET)
+        .with_wall(JOINT_WALL)
+        .prompt(limits, 5_000, &[4_096, 904])
+        .prompt(
+            walk_limits(super::super::TOKEN_PREFILL_CHUNK, 65_536, members),
+            600,
+            &[256, 256, 88],
+        )
     }
 
     sparkflash_runtime::conformance!(QwenWalk, profile: stated(), rounds);

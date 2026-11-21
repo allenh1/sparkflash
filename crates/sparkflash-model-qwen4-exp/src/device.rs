@@ -2557,7 +2557,7 @@ impl sparkflash_runtime::WalkArm for Qwen4ExpDeviceBackend {
         &self,
         capacity: usize,
     ) -> Result<impl sparkflash_runtime::Walk<Seq: Send> + Send + Sync, BackendError> {
-        walk::QwenWalk::new(Arc::clone(&self.shared), self.context_limit, capacity)
+        walk::QwenHost::walk(Arc::clone(&self.shared), self.context_limit, capacity)
     }
 
     /// The arm serves text.
@@ -3335,7 +3335,7 @@ impl Qwen4ExpDeviceBackend {
     /// A configuration the walk cannot honour, or a token pass whose buffers have no room.
     #[cfg(test)]
     fn walk_arm(&self, capacity: usize) -> Result<walk::QwenWalk, BackendError> {
-        walk::QwenWalk::new(Arc::clone(&self.shared), self.context_limit, capacity)
+        walk::QwenHost::walk(Arc::clone(&self.shared), self.context_limit, capacity)
     }
 
     /// Whether this backend steps its sessions together.

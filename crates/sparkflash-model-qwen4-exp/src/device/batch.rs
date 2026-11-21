@@ -29,10 +29,10 @@
 use std::sync::Arc;
 
 use sparkflash_kernels::cuda_driver::{Deviceptr, RunStream, StreamEvent};
-use sparkflash_model::{BackendError, StepOutput};
+use sparkflash_model::BackendError;
 
 use super::{
-    DeviceSequence, GpuBranch, INJECTION_SLOT, PARTIALS_SLOT, SCRATCH_SLOTS, SequenceShared,
+    DeviceSequence, INJECTION_SLOT, PARTIALS_SLOT, SCRATCH_SLOTS, SequenceShared,
     fill_plain_injection, zero_split_tickets,
 };
 
@@ -125,28 +125,21 @@ impl BatchBuffers {
         })
     }
 
-    /// Step `members` on their next tokens, in member order, and return every member's step.
+    /// Take `members` over for one step of `rows[m]` rows each, in member order, and answer
+    /// each member's own scratch pointers for [Self::exit].
     ///
-    /// `drafts[m]` are member `m`'s speculative drafts for this step: its rows are its own token
-    /// followed by them, and [DeviceSequence::resolve_verify] folds the logits back into the token
-    /// the model chose, the drafts it agreed with and the state those rows left. A member with no
-    /// drafts is one row and the same call.
-    ///
-    /// One row a member: member `r`'s launches read and write row `r` of the combined scratch, and
-    /// the row-independent stages run once over all of them. A member whose stream had earlier work
-    /// is ordered behind it, and every member is ordered behind the step before its own stream is
-    /// handed back.
+    /// Member `m` owns the rows that start at the sum of the row counts before it: its launches
+    /// read and write those rows of the combined scratch, and the row-independent stages run
+    /// once over all of them. A member whose stream had earlier work is ordered behind it, and
+    /// every launch until the exit is on the batch's stream.
     ///
     /// # Errors
     /// A member or row count the batch cannot take, or the driver's failure code.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn step(
-        &mut self,
+    pub(super) fn enter(
+        &self,
         members: &mut [&mut DeviceSequence],
-        drafts: &[Vec<u32>],
-        confidence: &[Vec<f32>],
-        tokens: &[u32],
-    ) -> Result<Vec<StepOutput>, BackendError> {
+        rows: &[usize],
+    ) -> Result<Vec<[Deviceptr; SCRATCH_SLOTS]>, BackendError> {
         let count = members.len();
         if count == 0 || count > MAX_BATCH {
             return Err(BackendError::new(
@@ -154,25 +147,8 @@ impl BatchBuffers {
                 format!("a batch steps 1..={MAX_BATCH} sessions, got {count}"),
             ));
         }
-        if drafts.len() != count || confidence.len() != count || tokens.len() != count {
-            return Err(BackendError::new(
-                "qwen4_batch",
-                format!(
-                    "a batch of {count} sessions was given {} token(s), {} draft list(s) and {} confidence list(s)",
-                    tokens.len(),
-                    drafts.len(),
-                    confidence.len()
-                ),
-            ));
-        }
-        let mut rows = Vec::with_capacity(count);
-        let mut total = 0usize;
-        for member in drafts {
-            let width = member.len() + 1;
-            rows.push(width);
-            total += width;
-        }
-        if total > self.rows {
+        let total: usize = rows.iter().sum();
+        if rows.len() != count || total > self.rows {
             return Err(BackendError::new(
                 "qwen4_batch",
                 format!(
@@ -205,59 +181,34 @@ impl BatchBuffers {
         // A member owns the rows its tokens occupy, so its scratch starts at the sum of the row
         // counts before it, not at its index: a verify's two rows are two rows of the combined
         // buffer whichever member they belong to.
-        let mut offsets = Vec::with_capacity(count);
         let mut at = 0usize;
-        for width in &rows {
-            offsets.push(at);
-            at += width;
-        }
-        for (member, start) in members.iter_mut().zip(&offsets) {
+        for (member, width) in members.iter_mut().zip(rows) {
             let own = member.scratch_pointers();
             let mut pointers = own;
             for (index, slot) in pointers.iter_mut().enumerate() {
-                *slot = self.combined[index].offset(start * self.strides[index] * 4);
+                *slot = self.combined[index].offset(at * self.strides[index] * 4);
             }
             saved.push(own);
             member.set_scratch_pointers(pointers);
             member.batch_stream = Some(self.stream.alias());
+            at += width;
         }
-        // A verify gives back the rows the model did not agree with, so each member's n-gram
-        // windows are its own to restore: the state from before this step, and the rows it kept.
-        let positions: Vec<usize> = members.iter().map(|member| member.position).collect();
-        let hashers: Vec<_> = members
-            .iter()
-            .map(|member| std::sync::Arc::new(member.ple_hashers.clone()))
-            .collect();
-        let mut flat = Vec::with_capacity(total);
-        for (member, token) in tokens.iter().enumerate() {
-            flat.push(*token);
-            flat.extend_from_slice(&drafts[member]);
-        }
-        let (lead, rest) = members.split_first_mut().expect("a batch is never empty");
-        let outcome = lead.forward_rows(rest, &rows, &flat);
-        // The exit runs whatever the step returned: a fault in the middle of the layer stack must
-        // not leave a member launching on a stream that is about to be idle, or reading another
-        // member's rows. The members are folded back into steps first: a draft the model agreed
-        // with is kept by giving the rest of the chain's state back, and that needs the member's
-        // own scratch still pointed at its rows.
-        let folded = outcome.and_then(|logits| {
-            let vocab = self.shared.config.vocab_size;
-            let mut steps = Vec::with_capacity(count);
-            let mut at = 0usize;
-            for (member, width) in rows.iter().copied().enumerate() {
-                let step = members[member].resolve_verify(
-                    &flat[at..at + width],
-                    &logits[at * vocab..(at + width) * vocab],
-                    positions[member],
-                    &drafts[member],
-                    &confidence[member],
-                    &hashers[member],
-                )?;
-                at += width;
-                steps.push(step);
-            }
-            Ok(steps)
-        });
+        Ok(saved)
+    }
+
+    /// Hand `members` back after a step: every member's stream is ordered behind the step, and
+    /// its scratch pointers are the `saved` ones [Self::enter] answered. A fault in the middle
+    /// of the layer stack exits too, so no member launches on a stream about to be idle or
+    /// reads another member's rows.
+    ///
+    /// # Errors
+    /// The driver's failure code.
+    pub(super) fn exit(
+        &self,
+        members: &mut [&mut DeviceSequence],
+        saved: &[[Deviceptr; SCRATCH_SLOTS]],
+    ) -> Result<(), BackendError> {
+        let cuda = &self.shared.cuda;
         cuda.record_event_on(&self.stream, &self.done)
             .map_err(|error| BackendError::new("qwen4_batch", error))?;
         for (row, member) in members.iter_mut().enumerate() {
@@ -266,7 +217,7 @@ impl BatchBuffers {
             member.set_scratch_pointers(saved[row]);
             member.batch_stream = None;
         }
-        folded
+        Ok(())
     }
 }
 
@@ -286,213 +237,6 @@ impl Drop for BatchBuffers {
 }
 
 impl DeviceSequence {
-    /// One forward for every member of a batch: `self` is the lead (member 0) and `rest` are the
-    /// others, each with `rows[m]` rows of the concatenated `tokens`.
-    ///
-    /// A decode step gives every member one row; a speculative verify gives a member the token it is
-    /// checking plus the drafts after it, so a two-member batch verifying two drafts each is a
-    /// six-row pass. Rows keep member order: member `m` owns the slice that starts at the sum of the
-    /// row counts before it, which is what lets a per-member stage run on that member's own caches,
-    /// positions and recurrent state while the row-independent stages cover all of them.
-    ///
-    /// The stages that read a layer's weights - the hyper-connections, the query and key
-    /// projections, the routed and shared experts, the output projections and the head - run once
-    /// over every row; the stages that touch one sequence's own state - the PLE block's n-gram
-    /// windows and convolution, the KV append, the indexer, the attention and the Gated DeltaNet
-    /// convolution and recurrence - run once per member on its own slice.
-    ///
-    /// A member with more than one row is a speculative verify: its rows but the last have their
-    /// convolution windows saved into its own snapshot, so the ones the model did not agree with
-    /// can be given back by [DeviceSequence::restore_states].
-    ///
-    /// Returns every row's logits, concatenated in row order.
-    ///
-    /// # Errors
-    /// The driver's failure code for a launch or a read-back.
-    pub(super) fn forward_rows(
-        &mut self,
-        rest: &mut [&mut Self],
-        rows: &[usize],
-        tokens: &[u32],
-    ) -> Result<Vec<f32>, BackendError> {
-        let count = rows.len();
-        debug_assert_eq!(count, rest.len() + 1);
-        debug_assert_eq!(rows.iter().sum::<usize>(), tokens.len());
-        let total = tokens.len();
-        // Every member's lane backs the rows its slice writes, before anything is queued.
-        self.back(self.position + rows[0])?;
-        for (member, width) in rest.iter_mut().zip(&rows[1..]) {
-            member.back(member.position + width)?;
-        }
-        // Where each member's rows start, in the combined scratch and in the token list.
-        let mut offsets = Vec::with_capacity(count);
-        let mut running = 0usize;
-        for width in rows {
-            offsets.push(running);
-            running += width;
-        }
-        // The weights and kernels out of a handle of their own: a layer's PLE block takes the
-        // session mutably, and the layer loop is reading the weights it sits in.
-        let backend = Arc::clone(&self.backend);
-        let config = Arc::clone(&backend.config);
-        let kernels = &*backend.kernels;
-        let weights = &backend.weights;
-        let width = config.hyper_width();
-        self.probe_rows = total;
-        // A batch never runs sequence-parallel; a forward that failed part-way may have left
-        // its share set.
-        self.own_rows = None;
-        if super::prof::enabled() {
-            super::prof::begin();
-        }
-        for (row, &token) in tokens.iter().enumerate() {
-            self.call(
-                kernels.embed,
-                sparkflash_ops::calls::embed(
-                    weights.embed.data().0,
-                    self.hyper.offset(row * width * 4).0,
-                    token,
-                    (config.hidden_size, width),
-                ),
-            )?;
-        }
-        self.probe_finite(0, "embed", self.hyper, total * width)?;
-        self.prof_mark("embed")?;
-        for (index, layer) in weights.layers.iter().enumerate() {
-            for (member, width_rows) in rows.iter().copied().enumerate() {
-                // A member's rows but the last save their windows: the state after its last row is
-                // the state the next step would build anyway, so it is not worth a region.
-                let verify = width_rows - 1;
-                let at = offsets[member];
-                let chunk = &tokens[at..at + width_rows];
-                if member == 0 {
-                    let (_, ple_slot) = self.snapshot_slots(index);
-                    let ple_snapshot = match (verify > 0, ple_slot) {
-                        (true, Some(offset)) => self.snapshot.offset(offset * 4).0,
-                        _ => 0,
-                    };
-                    let stride = self.snapshot_stride as u64;
-                    self.ple_step(
-                        index,
-                        layer,
-                        chunk,
-                        width_rows,
-                        None,
-                        ple_snapshot,
-                        verify,
-                        stride,
-                    )?;
-                } else {
-                    let session = &mut *rest[member - 1];
-                    let (_, ple_slot) = session.snapshot_slots(index);
-                    let ple_snapshot = match (verify > 0, ple_slot) {
-                        (true, Some(offset)) => session.snapshot.offset(offset * 4).0,
-                        _ => 0,
-                    };
-                    let stride = session.snapshot_stride as u64;
-                    session.ple_step(
-                        index,
-                        layer,
-                        chunk,
-                        width_rows,
-                        None,
-                        ple_snapshot,
-                        verify,
-                        stride,
-                    )?;
-                }
-            }
-            let (mixed, _) = self.hyper(&layer.attn_hyper, self.hyper, true, total)?;
-            self.prof_mark("hyper_attn")?;
-            match &layer.branch {
-                GpuBranch::Linear { .. } => {
-                    self.linear_project(&layer.branch, mixed, self.linear_b, self.linear_a, total)?;
-                    for (member, width_rows) in rows.iter().copied().enumerate() {
-                        let session: &Self = if member == 0 { self } else { rest[member - 1] };
-                        let (conv_slot, _) = session.snapshot_slots(index);
-                        let conv_snapshot = match (width_rows > 1, conv_slot) {
-                            (true, Some(offset)) => session.snapshot.offset(offset * 4).0,
-                            _ => 0,
-                        };
-                        // A verify keeps the rows a rejected draft would give back, and the replay
-                        // that commits the kept ones reads them from the session's own inputs.
-                        let (conv_out, b_out, a_out) =
-                            match (width_rows > 1, session.gdn_replay[index]) {
-                                (true, Some(inputs)) => session.replay_slices(inputs),
-                                _ => (session.linear_conv, session.linear_b, session.linear_a),
-                            };
-                        if width_rows > 1 {
-                            session.stash_gate_inputs(b_out, a_out, width_rows)?;
-                        }
-                        session.linear_state(
-                            index,
-                            &layer.branch,
-                            conv_out,
-                            b_out,
-                            a_out,
-                            width_rows,
-                            session.chunk_path(width_rows),
-                            width_rows - 1,
-                            conv_snapshot,
-                            session.snapshot_stride as u64,
-                        )?;
-                    }
-                    self.linear_output(index, &layer.branch, total)?;
-                }
-                GpuBranch::Sparse { .. } => {
-                    self.sparse_project(&layer.branch, mixed, total)?;
-                    for (member, width_rows) in rows.iter().copied().enumerate() {
-                        let session: &Self = if member == 0 { self } else { rest[member - 1] };
-                        session.sparse_attend(
-                            &layer.branch,
-                            index,
-                            session.position,
-                            width_rows,
-                        )?;
-                    }
-                    self.sparse_output(&layer.branch, index, total)?;
-                }
-            }
-            self.inject_branch(self.hyper, self.injection, total)?;
-            self.probe_finite(index, "after_attn", self.hyper, total * width)?;
-            self.prof_mark("attn_inject")?;
-            let (mixed, injection) = self.hyper(&layer.mlp_hyper, self.hyper, true, total)?;
-            let injection = injection.expect("the MLP hyper-connection injects");
-            self.probe_finite(index, "mixed", mixed, total * config.hidden_size)?;
-            self.prof_mark("hyper_mlp")?;
-            // The routed experts do not share between different tokens, but the router, the shared
-            // expert and both hyper-connections read their weights once for every row. On the
-            // chunk path the routed experts are the chunk's MMA, whose rows are computed alone.
-            let chunk = self.chunk_path(total);
-            self.mlp(
-                &layer.moe, mixed, self.hyper, injection, index, chunk, total,
-            )?;
-            self.probe_finite(index, "after_mlp", self.hyper, total * width)?;
-            // The drafter reads a few layers' widened rows; a member's own slice is the rows its
-            // next block anchors on.
-            for (member, width_rows) in rows.iter().copied().enumerate() {
-                let session: &Self = if member == 0 { self } else { rest[member - 1] };
-                session.capture_features(index, width_rows)?;
-            }
-            self.prof_mark("inject_mlp")?;
-        }
-        let (mixed, _) = self.hyper(&weights.mixer, self.hyper, false, total)?;
-        self.gemv(&weights.lm_head, mixed, self.logits, total)?;
-        self.probe_finite(48, "logits", self.logits, config.vocab_size * total)?;
-        self.prof_mark("lm_head")?;
-        let logits = self.read_logits(total)?;
-        self.prof_mark("logits_dtoh")?;
-        super::prof::report(self.position, total);
-        for (member, width_rows) in rows.iter().copied().enumerate() {
-            if member == 0 {
-                self.position += width_rows;
-            } else {
-                rest[member - 1].position += width_rows;
-            }
-        }
-        Ok(logits)
-    }
-
     /// Copy this member's gate and decay rows out of the combined projections into the verify
     /// inputs the recurrent replay reads, for a member whose rows are a speculative verify.
     ///
@@ -502,7 +246,7 @@ impl DeviceSequence {
     ///
     /// # Errors
     /// The driver's failure code for the copies.
-    fn stash_gate_inputs(
+    pub(super) fn stash_gate_inputs(
         &self,
         b_out: Deviceptr,
         a_out: Deviceptr,
