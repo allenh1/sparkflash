@@ -328,11 +328,7 @@ impl WalkArm for Rank<'_> {
     }
 
     fn wire(&self) -> impl GroupWire {
-        InklingWire {
-            context: self.context,
-            check: self.device.span_check(),
-            serves_images: self.images,
-        }
+        InklingWire::new(self.context, self.device.span_check(), self.images)
     }
 
     /// The backend holds its exchange alone and in a group, so it refuses neither place.
@@ -473,6 +469,18 @@ pub struct InklingWire {
     /// Whether this group's rank 0 holds the tower. A text-only group would fail rank 0's encode
     /// after the request frame, so an image must be refused before it ([Rank]).
     serves_images: bool,
+}
+
+impl InklingWire {
+    /// The wire of a group over `context` positions whose spans `check` admits; `serves_images`
+    /// when the group's rank 0 holds the tower.
+    pub(crate) fn new(context: usize, check: SpanCheck, serves_images: bool) -> Self {
+        Self {
+            context,
+            check,
+            serves_images,
+        }
+    }
 }
 
 impl GroupWire for InklingWire {

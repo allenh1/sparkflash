@@ -1035,8 +1035,88 @@ mod tests {
     };
     use super::*;
 
-    /// The Inkling fixture: the tiny host fixture the device tests share, opened through the
-    /// arm's own TP=1 constructor.
+    /// The Inkling fixture at `world` ranks: a [`sparkflash_runtime::local_group`] whose ranks
+    /// open the tiny host fixture's converted rank files, as served ranks open theirs, and
+    /// exchange over the host TCP leg on loopback (the leg `SPARK_COMM_REDUCE=tcp` serves). The
+    /// group is text only, as a worker's wire is. The TP check reads its tokens only, so the
+    /// fixture states no byte counts.
+    fn group_fixture(world: usize) -> Result<Fixture<InklingWalk>, BackendError> {
+        use sparkflash_comm::tcp::TcpConfig;
+
+        const CONTEXT: usize = 16;
+        // The four-expert fixture, as at TP 1: every axis a four-rank plan shards divides.
+        let config = crate::config::Inkling2Config::tiny_world();
+        // A served rank opens its converted file, so each rank here does too.
+        let directory =
+            tempfile::tempdir().map_err(|error| BackendError::new("fixture", error.to_string()))?;
+        let source = crate::fixture::tiny_source(&config);
+        let mut files = Vec::with_capacity(world);
+        for rank in 0..world {
+            let layout = sparkflash_weights::tp::TpLayout {
+                rank,
+                world_size: world,
+            };
+            let written =
+                crate::convert::convert_rank(&source, &config, layout, directory.path(), "tiny")
+                    .map_err(|error| {
+                        BackendError::new("fixture", format!("rank {rank}: {error}"))
+                    })?;
+            files.push(written.path);
+        }
+        let check = crate::vision::SpanCheck::new(config.vision.clone(), false);
+        // Each rank binds `base_port + rank` on loopback; a port the system just handed out is
+        // free, and the ones above it nearly always are.
+        let base_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .map_err(|error| BackendError::new("fixture", error.to_string()))?
+            .port();
+        let open = move |rank: usize| {
+            let failed =
+                |error: String| BackendError::new("fixture", format!("rank {rank}: {error}"));
+            let tp =
+                sparkflash_model::TpPlan::new(world, rank).map_err(|error| failed(error.detail))?;
+            let mut tcp = TcpConfig::loopback4(rank, base_port);
+            tcp.world_size = world;
+            let layout = sparkflash_weights::tp::TpLayout {
+                rank,
+                world_size: world,
+            };
+            let file = crate::convert::RankFileSource::open(&files[rank], &config, layout)
+                .map_err(failed)?;
+            let exchange = crate::collective::TcpExchange::connect(&tcp).map_err(failed)?;
+            crate::device::InklingDeviceBackend::open_rank_file(
+                crate::descriptor(),
+                config.clone(),
+                &file,
+                CONTEXT,
+                tp,
+                Box::new(exchange),
+            )
+            .map_err(failed)?
+            .walk_arm()
+        };
+        let wire = move || -> Box<dyn sparkflash_runtime::GroupWire> {
+            Box::new(crate::group::InklingWire::new(
+                CONTEXT,
+                check.clone(),
+                false,
+            ))
+        };
+        let (walk, group, workers) = sparkflash_runtime::local_group(world, open, wire)?;
+        let keep: Box<dyn std::any::Any> = Box::new((workers, directory));
+        Ok(Fixture::new(
+            walk,
+            format!("the Inkling-2 four-expert tiny synthetic checkpoint at TP {world}"),
+            0,
+            0,
+            Vec::new(),
+            Some(keep),
+        )
+        .in_group(group))
+    }
+
+    /// The Inkling fixture: the four-expert tiny host fixture the device tests share, opened
+    /// through the arm's own TP=1 constructor.
     impl WalkFixture for InklingWalk {
         /// Inkling's single-process path serves on the tick engine, so its generated checks drive
         /// that engine exactly as dense's, GLM's and Qwen's do. Its TP leg skips because the
@@ -1047,12 +1127,11 @@ mod tests {
 
         fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
             if world > 1 {
-                return Err(BackendError::new(
-                    "group",
-                    "the Inkling fixture is one rank; TP 2 and TP 4 need a group",
-                ));
+                return group_fixture(world);
             }
-            let config = crate::config::Inkling2Config::tiny();
+            // The four-expert variant of the tiny release: every axis TP 2 and TP 4 shard
+            // divides, so the TP check reads the same weights at every world.
+            let config = crate::config::Inkling2Config::tiny_world();
             let source = Arc::new(crate::fixture::tiny_source(&config));
             let backend = crate::device::InklingDeviceBackend::open(
                 crate::descriptor(),
@@ -1067,7 +1146,7 @@ mod tests {
             let bytes = backend.weight_bytes() as u64;
             Ok(Fixture::new(
                 walk,
-                "the Inkling-2 tiny synthetic checkpoint",
+                "the Inkling-2 four-expert tiny synthetic checkpoint",
                 bytes,
                 bytes,
                 FormatRule::classes(&config.architecture.quantization),

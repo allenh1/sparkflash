@@ -987,6 +987,11 @@ pub struct DenseDeviceBackend {
     fused: Option<Serving>,
 }
 
+/// The arm's group wire at `context`: it serves text.
+pub(crate) fn wire(context: usize) -> TextWire {
+    TextWire::new("dense", "shared dense device", context)
+}
+
 /// What the runtime serves this backend by ([sparkflash_runtime::serve] and its group forms).
 impl WalkArm for DenseDeviceBackend {
     fn walk(&self, capacity: usize) -> Result<impl Walk<Seq: Send> + Send + Sync, BackendError> {
@@ -995,7 +1000,7 @@ impl WalkArm for DenseDeviceBackend {
 
     /// The arm serves text.
     fn wire(&self) -> impl GroupWire {
-        TextWire::new("dense", "shared dense device", self.shared.context)
+        wire(self.shared.context)
     }
 
     /// A rank of an [Self::open_rank] group holds the sums its peers step through, so it steps

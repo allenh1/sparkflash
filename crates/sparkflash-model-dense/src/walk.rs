@@ -450,6 +450,51 @@ mod tests {
         }
     }
 
+    /// The dense fixture at `world` ranks: a [`sparkflash_runtime::local_group`] whose ranks sum
+    /// over one in-process bus on the exact f32 wire, the host leg a served group's TCP sums
+    /// take. Each rank opens its own share of the checkpoint. The TP check reads its tokens only,
+    /// so the fixture states no byte counts.
+    fn group_fixture(
+        world: usize,
+        path: std::path::PathBuf,
+        architecture: sparkflash_model::Architecture,
+        descriptor: sparkflash_model::ModelDescriptor,
+        from: String,
+    ) -> Result<Fixture<DenseWalk>, BackendError> {
+        use sparkflash_weights::tp::{LocalBus, LocalRank, TpLayout, TpRuntime, Wire};
+
+        let context = architecture.max_position_embeddings;
+        let bus = Arc::new(LocalBus::new(world).with_wire(Wire::F32));
+        let open = move |rank: usize| {
+            let failed =
+                |error: String| BackendError::new("fixture", format!("rank {rank}: {error}"));
+            let source = sparkflash_weights::safetensors::open_checkpoint(&path)
+                .map_err(|error| failed(error.to_string()))?;
+            let local = LocalRank {
+                rank,
+                bus: Arc::clone(&bus),
+            };
+            let layout = TpLayout {
+                rank,
+                world_size: world,
+            };
+            let tp = TpRuntime::new(layout, Box::new(local))
+                .map_err(|error| failed(error.to_string()))?;
+            crate::DenseDeviceBackend::open_rank(
+                descriptor.clone(),
+                &architecture,
+                &source,
+                context,
+                tp,
+            )
+            .map_err(failed)?
+            .walk_arm(64)
+        };
+        let (walk, group, workers) =
+            sparkflash_runtime::local_group(world, open, move || Box::new(crate::wire(context)))?;
+        Ok(Fixture::new(walk, from, 0, 0, Vec::new(), Some(workers)).in_group(group))
+    }
+
     /// The dense fixture: the checkpoint `scripts/dense-synthetic-checkpoint.py` writes. When
     /// `SPARKFLASH_CONFORMANCE_CHECKPOINT` is unset the fixture writes it into the same cache
     /// directory `scripts/onboard-gate.sh dense` uses and names the path; a named path that is
@@ -457,12 +502,6 @@ mod tests {
     /// missing fixture is never a skipped check.
     impl WalkFixture for DenseWalk {
         fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
-            if world > 1 {
-                return Err(BackendError::new(
-                    "group",
-                    "the dense fixture is one rank; TP 2 and TP 4 need a group",
-                ));
-            }
             let path = match std::env::var_os("SPARKFLASH_CONFORMANCE_CHECKPOINT") {
                 Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
                 _ => {
@@ -515,6 +554,10 @@ mod tests {
                 architecture.max_position_embeddings,
                 sparkflash_model::Capabilities::ALL,
             );
+            let from = format!("the dense synthetic checkpoint at {}", path.display());
+            if world > 1 {
+                return group_fixture(world, path, architecture, descriptor, from);
+            }
             let backend = crate::DenseDeviceBackend::open(
                 descriptor,
                 &architecture,
@@ -526,7 +569,7 @@ mod tests {
             let bytes = backend.weight_bytes() as u64;
             Ok(Fixture::new(
                 walk,
-                format!("the dense synthetic checkpoint at {}", path.display()),
+                from,
                 bytes,
                 bytes,
                 FormatRule::classes(&architecture.quantization),

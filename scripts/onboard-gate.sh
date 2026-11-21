@@ -30,7 +30,9 @@
 #   Qwen      the synthetic tiny checkpoint the arm writes
 #   Inkling   the tiny source fixture the device tests share
 # A check with no fixture on this host prints NEEDS-FIXTURE and fails the gate; it never passes
-# silently. TP 1 = TP 2 = TP 4 prints SKIP with the reason when there is no group.
+# silently. TP 1 = TP 2 = TP 4 runs each arm's TP 2 and TP 4 as an in-process group on this one
+# host (sparkflash_runtime::local_group); an arm whose fixture cannot split prints SKIP with the
+# reason. A served group on one host is scripts/one-host-group.sh.
 #
 # This host has no GPU, so the default is --dry-run: the script prints the exact commands it would
 # run and touches nothing. Pass --apply on the serving host to execute them.

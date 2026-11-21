@@ -54,7 +54,7 @@ pub mod walk;
 pub use chunk::{CHUNK_SIZES, ChunkPolicy, quantise};
 pub use conformance::{
     CONFORMANCE_CHECKS, CheckOutcome, ConformanceCheck, Fixture, FormatRule, WalkFixture,
-    check_claims, checks_for, run_check, run_generated, token_bytes,
+    check_claims, checks_for, local_group, run_check, run_generated, token_bytes,
 };
 pub use engine::{
     Kept as TickKept, PROMPT_PARTS_ENV, RequestId, TickConfig, TickEngine, TickEvent, TickServe,

@@ -826,10 +826,13 @@ mod tests {
         }
 
         fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
+            // Measured on one host through sparkflash_runtime::local_group (2026-11-21): rank 0's
+            // upload refuses the split, rightly, so the check skips with that reason.
             if world > 1 {
                 return Err(BackendError::new(
                     "group",
-                    "the Qwen fixture is one rank; TP 2 and TP 4 need a group",
+                    "the tiny FP8 fixture's 128-wide projections are one 128x128 scale tile, \
+                     which TP 2 and TP 4 would split; the arm refuses that split",
                 ));
             }
             // The Qwen3.5/3.6 spelling, not `tiny`: its family is not the canonical Qwen3.8

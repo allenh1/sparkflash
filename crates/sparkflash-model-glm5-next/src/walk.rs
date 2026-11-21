@@ -868,19 +868,74 @@ mod tests {
 
     /// The GLM fixture: the synthetic `small` checkpoint, opened through the arm's own TP=1
     /// constructor. It is a real checkpoint in the released storage formats, not a served image.
+    /// The GLM fixture at `world` ranks: a [`sparkflash_runtime::local_group`] whose ranks open
+    /// the synthetic checkpoint through the arm's group constructor, as a served group's ranks
+    /// do, and sum over one in-process bus on the exact f32 wire. The TP check reads its tokens
+    /// only, so the fixture states no byte counts.
+    fn group_fixture(
+        world: usize,
+        config: crate::Glm5NextConfig,
+        directory: tempfile::TempDir,
+    ) -> Result<Fixture<GlmWalk>, BackendError> {
+        use sparkflash_weights::tp::{
+            BitGatherHandle, LocalBus, LocalRank, TpLayout, TpRuntime, Wire,
+        };
+
+        let checkpoint = directory.path().to_path_buf();
+        let context = config.max_position_embeddings;
+        let bus = Arc::new(LocalBus::new(world).with_wire(Wire::F32));
+        let open = move |rank: usize| {
+            let failed =
+                |error: String| BackendError::new("fixture", format!("rank {rank}: {error}"));
+            let local = || LocalRank {
+                rank,
+                bus: Arc::clone(&bus),
+            };
+            let layout = TpLayout {
+                rank,
+                world_size: world,
+            };
+            let tp = TpRuntime::new(layout, Box::new(local()))
+                .map_err(|error| failed(error.to_string()))?;
+            let cuda = sparkflash_kernels::cuda_driver::Cuda::load()
+                .map_err(|error| failed(format!("CUDA: {error}")))?;
+            crate::Glm5NextDeviceBackend::open(
+                Arc::new(crate::device::CudaHandle::new(cuda)),
+                config.clone(),
+                &checkpoint,
+                layout,
+                tp,
+                BitGatherHandle::new(Box::new(local())),
+                context,
+            )?
+            .walk_arm()
+        };
+        let wire = move || -> Box<dyn sparkflash_runtime::GroupWire> {
+            Box::new(sparkflash_runtime::TextWire::new("glm", "GLM", context))
+        };
+        let (walk, group, workers) = sparkflash_runtime::local_group(world, open, wire)?;
+        let keep: Box<dyn std::any::Any> = Box::new((workers, directory));
+        Ok(Fixture::new(
+            walk,
+            format!("the GLM-5.3 synthetic small checkpoint at TP {world}"),
+            0,
+            0,
+            Vec::new(),
+            Some(keep),
+        )
+        .in_group(group))
+    }
+
     impl WalkFixture for GlmWalk {
         fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
-            if world > 1 {
-                return Err(BackendError::new(
-                    "group",
-                    "the GLM fixture is one rank; TP 2 and TP 4 need a four-rank group",
-                ));
-            }
             let config = crate::Glm5NextConfig::small();
             let directory = tempfile::tempdir()
                 .map_err(|error| BackendError::new("fixture", error.to_string()))?;
             crate::checkpoint::write_synthetic_checkpoint(directory.path(), &config, 7, 1)
                 .map_err(|error| BackendError::new("fixture", error))?;
+            if world > 1 {
+                return group_fixture(world, config, directory);
+            }
             let cuda = sparkflash_kernels::cuda_driver::Cuda::load()
                 .map_err(|error| BackendError::new("fixture", format!("CUDA: {error}")))?;
             let backend = crate::Glm5NextDeviceBackend::open_single_rank(

@@ -37,10 +37,12 @@
 //! [`WalkCapabilities`]; [`check_claims`] enforces that without booting anything.
 
 use std::any::Any;
+use std::time::Duration;
 
 use sparkflash_model::architecture::{Quantization, WeightFormat};
 use sparkflash_model::backend::{BackendError, StepOutput};
 
+use crate::group::{GroupWire, TickGroup};
 use crate::layout::StateKind;
 use crate::runtime::{Runtime, RuntimeSlot};
 use crate::walk::{Drafter, HeadRow, Pass, PassMask, Residual, Segment, Segments, Walk};
@@ -232,6 +234,9 @@ pub struct Fixture<W: Walk> {
     pub formats: Vec<FormatRule>,
     /// Files, sources or a device handle the walk borrows from, kept alive beside it.
     pub keep: Option<Box<dyn Any>>,
+    /// The tick group rank 0's walk steps with, when the fixture is a group's ([`local_group`]):
+    /// the checks then drive it as the group's rank 0.
+    pub group: Option<TickGroup>,
 }
 
 impl<W: Walk> Fixture<W> {
@@ -252,8 +257,111 @@ impl<W: Walk> Fixture<W> {
             floor_bytes_per_token,
             formats,
             keep,
+            group: None,
         }
     }
+
+    /// The same fixture as rank 0 of `group`, the tick group its peers mirror.
+    #[must_use]
+    pub fn in_group(mut self, group: TickGroup) -> Self {
+        self.group = Some(group);
+        self
+    }
+}
+
+/// How long a rank of a [`local_group`] has to open its walk and join rank 0.
+const LOCAL_GROUP_WAIT: Duration = Duration::from_secs(300);
+
+/// A tensor-parallel group of `world` ranks in this one process, for an arm's
+/// [`WalkFixture::fixture`] at TP 2 and TP 4.
+///
+/// `open(rank)` opens rank `rank`'s walk over the arm's in-process collective; every rank runs
+/// it at once, rank 0 on the calling thread and each worker on a thread of its own. The workers
+/// mirror rank 0's frames over one lane with the arm's wire, through a control hub on a loopback
+/// port, exactly as a served group's workers do over the network, and end when rank 0's group
+/// is dropped. Answers rank 0's walk, the group it steps with and the workers to keep alive
+/// (the fixture's `keep`).
+///
+/// # Errors
+/// A rank that does not open (its error, by rank), or a control channel that does not form.
+pub fn local_group<W, O, G>(
+    world: usize,
+    open: O,
+    wire: G,
+) -> Result<(W, TickGroup, Box<dyn Any>), BackendError>
+where
+    W: Walk,
+    O: Fn(usize) -> Result<W, BackendError> + Send + Sync + 'static,
+    G: Fn() -> Box<dyn GroupWire> + Send + Sync + 'static,
+{
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
+
+    // Only a world the group cannot have is code `group`, which the TP check reports as a named
+    // skip; a rank that fails to open or join is a failure of the check, never a skip.
+    if world < 2 {
+        return Err(BackendError::new(
+            "group",
+            format!("a local group has two ranks or more, not {world}"),
+        ));
+    }
+    let failed = |what: String| BackendError::new("conformance", what);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| failed(format!("a loopback control port: {error}")))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| failed(format!("the control port's address: {error}")))?;
+    let open = Arc::new(open);
+    let wire = Arc::new(wire);
+    let (opened, errors) = mpsc::channel::<String>();
+    let mut workers = Vec::with_capacity(world - 1);
+    for rank in 1..world {
+        let (open, wire, opened) = (Arc::clone(&open), Arc::clone(&wire), opened.clone());
+        let worker = std::thread::Builder::new()
+            .name(format!("local-rank-{rank}"))
+            .spawn(move || {
+                let fail = |error: String| {
+                    let _ = opened.send(format!("rank {rank}: {error}"));
+                };
+                let walk = match open(rank) {
+                    Ok(walk) => walk,
+                    Err(error) => return fail(error.to_string()),
+                };
+                let runtime = match Runtime::new(walk, 0) {
+                    Ok(runtime) => runtime,
+                    Err(error) => return fail(error.to_string()),
+                };
+                let rank_id = u32::try_from(rank).unwrap_or(u32::MAX);
+                let mut control =
+                    match Tp4ControlWorker::connect(address, rank_id, world, LOCAL_GROUP_WAIT) {
+                        Ok(control) => control,
+                        Err(error) => return fail(error.to_string()),
+                    };
+                if let Err(error) = control.handshake() {
+                    return fail(error.to_string());
+                }
+                let wire = wire();
+                // The mirror ends when rank 0's group closes the control channel.
+                let _ = crate::mirror_tick_lanes(&mut control, &runtime, &*wire, 1);
+            })
+            .map_err(|error| failed(format!("rank {rank}'s thread: {error}")))?;
+        workers.push(worker);
+    }
+    drop(opened);
+    let with_workers = |error: String| {
+        let mut detail = error;
+        for worker in errors.try_iter() {
+            detail.push_str("; ");
+            detail.push_str(&worker);
+        }
+        failed(detail)
+    };
+    let walk = open(0).map_err(|error| with_workers(format!("rank 0: {error}")))?;
+    let hub = Tp4ControlHub::start_with_listener(listener, world, LOCAL_GROUP_WAIT)
+        .map_err(|error| with_workers(format!("the control hub: {error}")))?;
+    let group = TickGroup::new(Arc::new(Mutex::new(hub)), wire());
+    Ok((walk, group, Box::new(workers)))
 }
 
 /// The fixture contract: the arm supplies a walk the generated checks can boot with no server.
@@ -581,19 +689,37 @@ fn tp_within_exactness<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
         let fixture = match W::fixture(world) {
             Ok(fixture) => fixture,
             Err(error) if error.code() == "group" => {
+                let agreed = if compared.len() > 1 {
+                    format!("world(s) {compared:?} agree; ")
+                } else {
+                    String::new()
+                };
                 return Ok(CheckOutcome::Skipped(format!(
-                    "TP {world}: {}",
+                    "{agreed}TP {world}: {}",
                     error.message()
                 )));
             }
             Err(error) => return Err(error),
         };
+        let Fixture {
+            walk, group, keep, ..
+        } = fixture;
         let tokens = if W::tick_engine() {
-            engine_run(fixture.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
+            group_run(walk, group, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
+        } else if group.is_some() {
+            return Err(BackendError::new(
+                "conformance",
+                format!(
+                    "TP {world}: a group's fixture steps on the tick engine; {} says it does not",
+                    std::any::type_name::<W>()
+                ),
+            ));
         } else {
-            let runtime = Runtime::new(fixture.walk, 0)?;
+            let runtime = Runtime::new(walk, 0)?;
             runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
         };
+        // The workers end once rank 0's engine and group are gone.
+        drop(keep);
         if tokens != baseline {
             return Err(disagreement(
                 &format!("TP 1 = TP {world}"),
@@ -604,7 +730,14 @@ fn tp_within_exactness<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
         }
         compared.push(world);
     }
-    println!("conformance: TP within exactness: world(s) {compared:?} agree");
+    let distinct = baseline
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    println!(
+        "conformance: TP within exactness: world(s) {compared:?} agree on {} tokens ({distinct} distinct)",
+        baseline.len()
+    );
     Ok(CheckOutcome::Passed)
 }
 
@@ -881,7 +1014,20 @@ fn engine_run<W: Walk>(
     prompt: &[u32],
     tokens: usize,
 ) -> Result<Vec<Option<u32>>, BackendError> {
+    group_run(walk, None, prompt, tokens)
+}
+
+/// [`engine_run`] on rank 0 of `group`, when the fixture is a group's.
+fn group_run<W: Walk>(
+    walk: W,
+    group: Option<TickGroup>,
+    prompt: &[u32],
+    tokens: usize,
+) -> Result<Vec<Option<u32>>, BackendError> {
     let mut engine = crate::TickEngine::new(walk, 1)?;
+    if let Some(group) = group {
+        engine = engine.with_group(group);
+    }
     let (id, first) = engine_turn(&mut engine, prompt)?;
     engine_decode(&mut engine, id, first, tokens)
 }
@@ -1305,18 +1451,21 @@ mod tests {
     }
 
     impl WalkFixture for TickToy {
+        /// One rank, or a [`local_group`] of toys: the toy sums nothing, so its group checks
+        /// the frames and the mirror, not a collective.
         fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
-            if world > 1 {
-                return Err(BackendError::new("group", "the tick toy is one rank"));
+            let fixture = |walk, keep| {
+                Fixture::new(walk, "the tick engine's CPU toy", 4, 4, Vec::new(), keep)
+            };
+            if world == 1 {
+                return Ok(fixture(Self::new(), None));
             }
-            Ok(Fixture::new(
-                Self::new(),
-                "the tick engine's CPU toy",
-                4,
-                4,
-                Vec::new(),
-                None,
-            ))
+            let (walk, group, workers) = local_group(
+                world,
+                |_| Ok(Self::new()),
+                || Box::new(crate::TextWire::new("toy", "the tick toy", 1_024)),
+            )?;
+            Ok(fixture(walk, Some(workers)).in_group(group))
         }
 
         fn tick_engine() -> bool {
@@ -1338,8 +1487,12 @@ mod tests {
             assert_eq!(outcome, CheckOutcome::Passed, "{}", check.name());
         }
         let tp = run_check::<TickToy>(ConformanceCheck::TpWithinExactness)
-            .expect("the TP check skips, it does not fail");
-        assert!(matches!(&tp, CheckOutcome::Skipped(reason) if reason.contains("one rank")));
+            .unwrap_or_else(|error| panic!("TP: {}", error.message()));
+        assert_eq!(
+            tp,
+            CheckOutcome::Passed,
+            "TP 2 and TP 4 run as local groups"
+        );
     }
 
     #[test]
