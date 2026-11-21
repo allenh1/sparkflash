@@ -76,8 +76,9 @@ use sparkflash_kernels::images::{
 use sparkflash_kernels::lane_memory::{Layout, SequenceLane, SequenceLanes};
 use sparkflash_model::architecture::{Activation, AttentionKind, Ffn, WeightFormat};
 use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+use sparkflash_model::compose::{LayerStep, StepRole};
 use sparkflash_model::ledger::State;
-use sparkflash_model::{Architecture, Capabilities, ModelDescriptor, TpAxis, TpPlan};
+use sparkflash_model::{Architecture, Capabilities, ModelDescriptor, Part, TpAxis, TpPlan};
 use sparkflash_ops::OpPlan;
 use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
 use sparkflash_ops::dflash::{DraftUploader, Part as Run};
@@ -103,13 +104,16 @@ use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 use sparkflash_runtime::{
-    ChunkPolicy, GroupEngine, GroupWire, Limits, Place, Serving, TextWire, Walk, WalkArm,
+    ChunkPolicy, GroupEngine, GroupWire, Limits, PartBody, Place, RankSplit, Region, Serving,
+    TextWire, Walk, WalkArm,
 };
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, TensorSpec, WeightSource};
 
+pub mod parts;
 mod walk;
 
+pub use parts::{Dense, DensePart, DenseParts, OpenCx, PassCx, ScratchSlot, SegmentRows};
 pub use walk::DenseWalk;
 
 /// The dense arm's sequence, as the runtime drives it. The runtime owns the prompt parts, the
@@ -373,30 +377,76 @@ impl Shape {
     }
 }
 
-/// One layer's device weights.
-#[derive(Debug, Clone)]
+/// One layer on the device: its shape and its branches in forward order, the token mixer's and
+/// then the feed-forward's. Each branch's part is built from the layer's step
+/// ([Architecture::steps]) by the constructor the registry holds for the part's kind
+/// ([DenseParts]).
 struct Layer {
     shape: Shape,
-    input_norm: Deviceptr,
-    mixer: Mixer,
-    /// The attention's output projection, or the linear attention's `out_proj`.
-    o: Proj,
-    post_norm: Deviceptr,
-    ffn: LayerFfn,
+    branches: Vec<Branch>,
 }
 
-/// A layer's token mixer on the device.
+/// One branch of a layer: the RMSNorm of the residual, the part over the normed rows, the group's
+/// sum of its output where the part leaves a rank's partial, and the residual add.
+struct Branch {
+    /// The norm's gains.
+    norm: Deviceptr,
+    part: DensePart,
+    /// Whether the part's output rows are a rank's partial ([RankSplit::Summed]).
+    summed: bool,
+    /// Which of a sequence's region lists is this part's ([LaneParts::regions]).
+    slot: usize,
+}
+
+/// Every branch of `layers`, in walk order: the order of [Branch::slot].
+fn branches(layers: &[Layer]) -> impl Iterator<Item = &Branch> {
+    layers.iter().flat_map(|layer| &layer.branches)
+}
+
+/// The branches a layer's step runs, in forward order, or the part the dense walk has no place
+/// for: it runs a token mixer and a feed-forward a layer.
+fn step_branches(step: &LayerStep) -> Result<Vec<(StepRole, Part)>, String> {
+    step.roles()
+        .into_iter()
+        .map(|(role, part)| match role {
+            StepRole::Attention | StepRole::Ffn => Ok((role, part)),
+            StepRole::Compression | StepRole::Indexer | StepRole::Residual | StepRole::Side => {
+                Err(format!(
+                    "layer {}'s part {} is a {role:?} step, and the dense walk runs a layer's \
+                     token mixer and its feed-forward",
+                    step.index,
+                    part.name()
+                ))
+            }
+        })
+        .collect()
+}
+
+/// Grouped-query attention on the device ([Part::GqaAttention]): its projections, its q/k norms
+/// and its output projection.
 #[derive(Debug, Clone)]
-enum Mixer {
-    /// Grouped-query attention's projections and its q/k norms.
-    Gqa {
-        q: Proj,
-        k: Proj,
-        v: Proj,
-        q_norm: Option<Deviceptr>,
-        k_norm: Option<Deviceptr>,
-    },
-    Gdn(GdnLayer),
+struct Gqa {
+    shape: Shape,
+    q: Proj,
+    k: Proj,
+    v: Proj,
+    q_norm: Option<Deviceptr>,
+    k_norm: Option<Deviceptr>,
+    /// The attention's output projection.
+    o: Proj,
+    /// The keys' cache and the values', a `[capacity][kv_width]` BF16 run each.
+    state: [Region; 2],
+}
+
+/// A Gated DeltaNet layer on the device ([Part::GdnScan]): its weights and the linear
+/// attention's `out_proj`.
+#[derive(Debug, Clone)]
+struct Gdn {
+    shape: Shape,
+    weights: GdnLayer,
+    o: Proj,
+    /// The conv history and the delta-rule state.
+    state: [Region; 2],
 }
 
 /// A Gated DeltaNet layer's weights: the fused q/k/v projection, the output gate's, the beta and
@@ -412,42 +462,6 @@ struct GdnLayer {
     a_log: Deviceptr,
     dt_bias: Deviceptr,
     norm: Deviceptr,
-}
-
-impl Layer {
-    /// Every BF16 projection the layer's GEMVs read.
-    fn bf16_projections(&self) -> Vec<Mat<Bf16>> {
-        let mut projections = vec![self.o.clone()];
-        match &self.mixer {
-            Mixer::Gqa { q, k, v, .. } => projections.extend([q.clone(), k.clone(), v.clone()]),
-            Mixer::Gdn(gdn) => {
-                projections.extend([gdn.qkv.clone(), gdn.z.clone(), gdn.b.clone(), gdn.a.clone()])
-            }
-        }
-        let mlp = |mlp: &Mlp| [mlp.gate.clone(), mlp.up.clone(), mlp.down.clone()];
-        match &self.ffn {
-            LayerFfn::Dense(dense) => projections.extend(mlp(dense)),
-            LayerFfn::Routed {
-                router,
-                shared,
-                shared_gate,
-                ..
-            } => {
-                projections.push(router.clone());
-                if let Some(shared) = shared {
-                    projections.extend(mlp(shared));
-                }
-                projections.extend(shared_gate.clone());
-            }
-        }
-        projections
-            .into_iter()
-            .filter_map(|projection| match projection {
-                Proj::Bf16(mat) => Some(mat),
-                Proj::Fp8(_) | Proj::NvFp4(_) => None,
-            })
-            .collect()
-    }
 }
 
 /// One projection's weights on the device: BF16, or E4M3 codes under one BF16 inverse scale a
@@ -516,28 +530,32 @@ struct Mlp {
     down: Proj,
 }
 
-/// A layer's MLP on the device.
-// A layer's tuple is one entry in a table of a few dozen; boxing the routed form would only move
-// the allocation.
-#[allow(clippy::large_enum_variant)]
+/// A layer's dense SwiGLU MLP on the device ([Part::DenseMlp]).
 #[derive(Debug, Clone)]
-enum LayerFfn {
-    Dense(Mlp),
-    Routed {
-        /// The router, `[experts][hidden]`.
-        router: Proj,
-        /// The selection's correction bias, f32 an expert, when selection adds one.
-        bias: Option<Deviceptr>,
-        /// The NVFP4 experts' three per-tensor scales an expert (gate, up, down), when they
-        /// are stored that way.
-        scales: Option<Deviceptr>,
-        /// Six addresses an expert, the token passes' table: gate, its scale grid (unread for
-        /// BF16), up, its grid, down, its grid.
-        table: Deviceptr,
-        shared: Option<Mlp>,
-        /// The shared expert's sigmoid gate, one BF16 `[hidden]` row.
-        shared_gate: Option<Proj>,
-    },
+struct DenseMlp {
+    mlp: Mlp,
+    /// The layer's `swiglu_limit`, when the release sets one.
+    clamp: Option<f32>,
+}
+
+/// A layer's routed experts on the device ([Part::Moe]): the router, the experts' table, the
+/// shared expert and its gate.
+#[derive(Debug, Clone)]
+struct RoutedExperts {
+    shape: Shape,
+    /// The router, `[experts][hidden]`.
+    router: Proj,
+    /// The selection's correction bias, f32 an expert, when selection adds one.
+    bias: Option<Deviceptr>,
+    /// The NVFP4 experts' three per-tensor scales an expert (gate, up, down), when they
+    /// are stored that way.
+    scales: Option<Deviceptr>,
+    /// Six addresses an expert, the token passes' table: gate, its scale grid (unread for
+    /// BF16), up, its grid, down, its grid.
+    table: Deviceptr,
+    shared: Option<Mlp>,
+    /// The shared expert's sigmoid gate, one BF16 `[hidden]` row.
+    shared_gate: Option<Proj>,
 }
 
 /// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
@@ -930,9 +948,13 @@ struct Shared {
     context: usize,
     /// The sequences' key/value caches' lanes, for sequences of `context` positions.
     lanes: Arc<SequenceLanes<LaneParts>>,
-    /// The recurrent regions of a sequence, in layer order: each Gated DeltaNet layer's conv
-    /// history and delta-rule state, in bytes. Its rewind point copies these.
+    /// The recurrent regions of a sequence in bytes, in walk order: each Gated DeltaNet layer's
+    /// conv history and delta-rule state, and whatever a plugged-in part declares
+    /// ([Region::Recurrent]). Its rewind point copies these.
     linear_sizes: Vec<usize>,
+    /// The scratch the parts' constructors reserved ([OpenCx::scratch]), in f32 a row each: every
+    /// walk's scratch holds one buffer of [CHUNK_ROWS] rows for each.
+    scratch: Vec<usize>,
     /// Every weight allocation, freed once.
     owned: Vec<Deviceptr>,
     weight_bytes: usize,
@@ -1023,7 +1045,29 @@ impl DenseDeviceBackend {
         source: &dyn WeightSource,
         context: usize,
     ) -> Result<Self, String> {
-        Self::open_at(descriptor, architecture, source, context, None)
+        Self::open_with(
+            descriptor,
+            architecture,
+            source,
+            context,
+            &Dense::catalogue(),
+        )
+    }
+
+    /// [Self::open] with the executors `parts` holds in place of the catalogue's
+    /// ([Dense::catalogue]): a family with a part of its own registers its constructor there,
+    /// and the walk runs it wherever a layer's step names its kind.
+    ///
+    /// # Errors
+    /// As [Self::open], or a step whose part has no executor in `parts`, by the part's name.
+    pub fn open_with(
+        descriptor: ModelDescriptor,
+        architecture: &Architecture,
+        source: &dyn WeightSource,
+        context: usize,
+        parts: &DenseParts,
+    ) -> Result<Self, String> {
+        Self::open_at(descriptor, architecture, source, context, None, parts)
     }
 
     /// [Self::open] for one rank of a tensor-parallel group over `tp`: the rank's share of each
@@ -1044,7 +1088,30 @@ impl DenseDeviceBackend {
         context: usize,
         tp: TpRuntime,
     ) -> Result<Self, String> {
-        Self::open_at(descriptor, architecture, source, context, Some(tp))
+        Self::open_rank_with(
+            descriptor,
+            architecture,
+            source,
+            context,
+            tp,
+            &Dense::catalogue(),
+        )
+    }
+
+    /// [Self::open_rank] with the executors `parts` holds, as [Self::open_with]. Every rank of
+    /// the group opens with the same registry.
+    ///
+    /// # Errors
+    /// As [Self::open_rank] and [Self::open_with].
+    pub fn open_rank_with(
+        descriptor: ModelDescriptor,
+        architecture: &Architecture,
+        source: &dyn WeightSource,
+        context: usize,
+        tp: TpRuntime,
+        parts: &DenseParts,
+    ) -> Result<Self, String> {
+        Self::open_at(descriptor, architecture, source, context, Some(tp), parts)
     }
 
     fn open_at(
@@ -1053,9 +1120,24 @@ impl DenseDeviceBackend {
         source: &dyn WeightSource,
         context: usize,
         tp: Option<TpRuntime>,
+        parts: &DenseParts,
     ) -> Result<Self, String> {
         if let Some(refusal) = sparkflash_ops::parts::dense_device_refusal(architecture) {
             return Err(format!("the shared dense device arm refuses it: {refusal}"));
+        }
+        // Every part a step names has an executor before anything is loaded: a part with none is
+        // refused by name, not skipped.
+        let steps = architecture.steps();
+        for step in &steps {
+            let kinds = step_branches(step)?;
+            parts
+                .require(kinds.into_iter().map(|(_, part)| part))
+                .map_err(|error| {
+                    format!(
+                        "the shared dense device arm cannot run layer {}: {error}",
+                        step.index
+                    )
+                })?;
         }
         sparkflash_ops::parts::dense_device_images()?;
         let window = architecture.max_position_embeddings;
@@ -1091,27 +1173,38 @@ impl DenseDeviceBackend {
         let uploaded = upload(
             &cuda,
             architecture,
-            &names,
+            (&names, &steps),
             source,
             formats,
-            &shapes,
+            (&shapes, shard),
+            parts,
             &mut owned,
         );
-        let (embed, head, norm, layers, weight_bytes, mut ledger_rows, widen, labels) =
-            match uploaded {
-                Ok(uploaded) => uploaded,
-                Err(error) => {
-                    let references: Vec<&Deviceptr> = owned.iter().collect();
-                    cuda.free_buffers(&references);
-                    return Err(error);
-                }
-            };
+        let Uploaded {
+            embed,
+            head,
+            norm,
+            layers,
+            bytes: weight_bytes,
+            rows: mut ledger_rows,
+            widen,
+            labels,
+            packable,
+            scratch,
+        } = match uploaded {
+            Ok(uploaded) => uploaded,
+            Err(error) => {
+                let references: Vec<&Deviceptr> = owned.iter().collect();
+                cuda.free_buffers(&references);
+                return Err(error);
+            }
+        };
         // The token GEMVs read a packed copy of every BF16 projection; the wide tiles keep the
         // BF16 rows, so the copy sits beside them. Each packed copy is a `Mat<Bf16>` too, with
         // the form's word layout as its scales, so the uploader checks the row geometry.
         let mut packed = PackedSet::new(Form::from_env()?, Placement::Beside);
         let matrices: Vec<_> = std::iter::once(head.clone())
-            .chain(layers.iter().flat_map(Layer::bf16_projections))
+            .chain(packable)
             .map(|mat| (mat.data(), mat.rows(), mat.columns()))
             .collect();
         let packed_bytes = match packed.pack(&cuda, &kernels.packed.raw(), &matrices, 0) {
@@ -1230,6 +1323,7 @@ impl DenseDeviceBackend {
                 context,
                 lanes,
                 linear_sizes,
+                scratch,
                 owned,
                 weight_bytes,
                 packed,
@@ -1465,26 +1559,36 @@ fn linear_scan(architecture: &Architecture, shard: Shard) -> Result<Option<ScanP
     }
 }
 
-/// Each Gated DeltaNet layer's recurrent regions in bytes, in layer order: its conv history, then
-/// its delta-rule state.
+/// Every recurrent region the parts declare, in bytes and in walk order: a Gated DeltaNet
+/// layer's conv history, then its delta-rule state.
 fn linear_sizes(layers: &[Layer]) -> Vec<usize> {
-    layers
-        .iter()
-        .filter_map(|layer| layer.shape.linear)
-        .flat_map(|linear| [linear.geometry.conv_bytes(), linear.geometry.state_bytes()])
+    branches(layers)
+        .flat_map(|branch| branch.part.state())
+        .filter_map(|region| match *region {
+            Region::Recurrent { bytes, .. } => Some(bytes),
+            Region::Positional { .. } => None,
+        })
         .collect()
 }
 
-type Uploaded = (
-    Mat<Bf16>,
-    Mat<Bf16>,
-    Deviceptr,
-    Vec<Layer>,
-    usize,
-    Vec<LedgerRow>,
-    WidenLog,
-    Vec<(u64, String)>,
-);
+/// What [upload] leaves on the device.
+struct Uploaded {
+    embed: Mat<Bf16>,
+    head: Mat<Bf16>,
+    norm: Deviceptr,
+    layers: Vec<Layer>,
+    /// The device bytes the weights claimed.
+    bytes: usize,
+    /// The boot format ledger's rows.
+    rows: Vec<LedgerRow>,
+    widen: WidenLog,
+    /// Each uploaded matrix's device address and its checkpoint name.
+    labels: Vec<(u64, String)>,
+    /// The BF16 projections the token GEMVs read a packed copy of, in upload order.
+    packable: Vec<Mat<Bf16>>,
+    /// The parts' scratch reservations ([Shared::scratch]).
+    scratch: Vec<usize>,
+}
 
 /// The typed matrix of a stored BF16 tensor this arm reads: [upload] checks the container's
 /// stored dtype and the scale count of the format (none, or the packed word layout).
@@ -1664,6 +1768,9 @@ struct Uploads<'a> {
     /// The one widening this load path takes (a BF16 router bias read at f32), recorded with its
     /// reason so boot can accept it.
     widen: WidenLog,
+    /// The BF16 projections the token GEMVs read a packed copy of, as each part's constructor
+    /// names them.
+    packable: Vec<Mat<Bf16>>,
 }
 
 impl Uploads<'_> {
@@ -1671,6 +1778,16 @@ impl Uploads<'_> {
         self.owned.push(pointer);
         self.bytes += bytes;
         pointer
+    }
+
+    /// Names the BF16 ones of `projections` for a packed copy, in this order.
+    fn pack(&mut self, projections: &[&Proj]) {
+        for projection in projections {
+            match projection {
+                Proj::Bf16(mat) => self.packable.push(mat.clone()),
+                Proj::Fp8(_) | Proj::NvFp4(_) => {}
+            }
+        }
     }
 
     /// One ledger row for a typed matrix, with the bytes one token reads from it.
@@ -1904,118 +2021,180 @@ impl Uploads<'_> {
         Ok(self.keep(mat.pointer, mat.rows * width * 2))
     }
 
-    /// A layer's token mixer and its output projection: grouped-query attention's projections and
-    /// q/k norms, or a Gated DeltaNet's projections, conv, decay vectors and gated norm.
-    fn mixer(
+    /// A grouped-query attention layer: its projections, its q/k norms and its output projection.
+    fn gqa(
         &mut self,
         index: usize,
         names: &AttentionNames,
         (shape, whole): (&Shape, &Shape),
         hidden: usize,
-    ) -> Result<(Mixer, Proj), String> {
+    ) -> Result<Gqa, String> {
         let cut = shape.cut;
-        match (names, shape.linear) {
-            (
-                AttentionNames::Gqa {
-                    q,
-                    k,
-                    v,
-                    o,
-                    q_norm,
-                    k_norm,
-                    ..
+        let (
+            AttentionNames::Gqa {
+                q,
+                k,
+                v,
+                o,
+                q_norm,
+                k_norm,
+                ..
+            },
+            None,
+        ) = (names, shape.linear)
+        else {
+            return Err(format!("layer {index} names another token mixer's tensors"));
+        };
+        // A query head's rows are its query and, when gated, its gate, interleaved.
+        let query_head = shape.query_rows() / shape.heads.max(1);
+        let head_dim = shape.head_dim;
+        let kv = [Run::Rows(cut.kv_heads * head_dim, shape.kv_width())];
+        let q = self.proj_runs(
+            q,
+            (whole.query_rows(), hidden),
+            &[Run::Rows(cut.heads * query_head, shape.query_rows())],
+        )?;
+        let k = self.proj_runs(k, (whole.kv_width(), hidden), &kv)?;
+        let v = self.proj_runs(v, (whole.kv_width(), hidden), &kv)?;
+        let q_norm = q_norm
+            .as_deref()
+            .map(|name| self.vector(name, shape.head_dim))
+            .transpose()?;
+        let k_norm = k_norm
+            .as_deref()
+            .map(|name| self.vector(name, shape.head_dim))
+            .transpose()?;
+        let o = self.proj_runs(
+            o,
+            (hidden, whole.query_width()),
+            &[Run::Columns(cut.heads * head_dim, shape.query_width())],
+        )?;
+        self.pack(&[&o, &q, &k, &v]);
+        // Keys and values, BF16 a value.
+        let cache = Region::Positional {
+            name: "kv",
+            bytes_per_row: shape.kv_width() * 2,
+        };
+        Ok(Gqa {
+            shape: *shape,
+            q,
+            k,
+            v,
+            q_norm,
+            k_norm,
+            o,
+            state: [cache, cache],
+        })
+    }
+
+    /// A Gated DeltaNet layer: its projections, conv, decay vectors, gated norm and `out_proj`.
+    fn gdn(
+        &mut self,
+        index: usize,
+        names: &AttentionNames,
+        (shape, whole): (&Shape, &Shape),
+        hidden: usize,
+    ) -> Result<Gdn, String> {
+        let cut = shape.cut;
+        let (AttentionNames::Gdn(names), Some(linear)) = (names, shape.linear) else {
+            return Err(format!("layer {index} names another token mixer's tensors"));
+        };
+        let geometry = linear.geometry;
+        let GdnNames {
+            qkv,
+            z,
+            b,
+            a,
+            out,
+            conv,
+            a_log,
+            dt_bias,
+            norm,
+        } = names;
+        let Some(all) = whole.linear.map(|linear| linear.geometry) else {
+            return Err(format!(
+                "layer {index} is a Gated DeltaNet at one rank only"
+            ));
+        };
+        let heads = geometry.heads;
+        let (key_dim, value_dim) = (geometry.key_dim, geometry.value_dim);
+        let key_width = all.key_heads * key_dim;
+        // The fused projection's rows (and the conv's channels) are every query, every
+        // key, then every value: a rank's share is a run of each.
+        let qkv_runs = [
+            Run::Rows(cut.key_heads * key_dim, geometry.key_heads * key_dim),
+            Run::Rows(
+                key_width + cut.key_heads * key_dim,
+                geometry.key_heads * key_dim,
+            ),
+            Run::Rows(
+                2 * key_width + cut.value_heads * value_dim,
+                geometry.value_width(),
+            ),
+        ];
+        let values = [Run::Rows(
+            cut.value_heads * value_dim,
+            geometry.value_width(),
+        )];
+        let value_heads = [Run::Rows(cut.value_heads, heads)];
+        let weights = GdnLayer {
+            qkv: self.proj_runs(qkv, (all.conv_width(), hidden), &qkv_runs)?,
+            z: self.proj_runs(z, (all.value_width(), hidden), &values)?,
+            b: self.proj_runs(b, (all.heads, hidden), &value_heads)?,
+            a: self.proj_runs(a, (all.heads, hidden), &value_heads)?,
+            conv: self.conv(conv, (all.conv_width(), geometry.taps), &qkv_runs)?,
+            a_log: self.vector_runs(a_log, (all.heads, 1), &value_heads)?,
+            dt_bias: self.vector_runs(dt_bias, (all.heads, 1), &value_heads)?,
+            norm: self.vector(norm, value_dim)?,
+        };
+        let o = self.proj_runs(
+            out,
+            (hidden, all.value_width()),
+            &[Run::Columns(
+                cut.value_heads * value_dim,
+                geometry.value_width(),
+            )],
+        )?;
+        self.pack(&[&o, &weights.qkv, &weights.z, &weights.b, &weights.a]);
+        Ok(Gdn {
+            shape: *shape,
+            weights,
+            o,
+            state: [
+                Region::Recurrent {
+                    name: "gated-deltanet",
+                    bytes: geometry.conv_bytes(),
                 },
-                None,
-            ) => {
-                // A query head's rows are its query and, when gated, its gate, interleaved.
-                let query_head = shape.query_rows() / shape.heads.max(1);
-                let head_dim = shape.head_dim;
-                let kv = [Run::Rows(cut.kv_heads * head_dim, shape.kv_width())];
-                let mixer = Mixer::Gqa {
-                    q: self.proj_runs(
-                        q,
-                        (whole.query_rows(), hidden),
-                        &[Run::Rows(cut.heads * query_head, shape.query_rows())],
-                    )?,
-                    k: self.proj_runs(k, (whole.kv_width(), hidden), &kv)?,
-                    v: self.proj_runs(v, (whole.kv_width(), hidden), &kv)?,
-                    q_norm: q_norm
-                        .as_deref()
-                        .map(|name| self.vector(name, shape.head_dim))
-                        .transpose()?,
-                    k_norm: k_norm
-                        .as_deref()
-                        .map(|name| self.vector(name, shape.head_dim))
-                        .transpose()?,
-                };
-                let o = self.proj_runs(
-                    o,
-                    (hidden, whole.query_width()),
-                    &[Run::Columns(cut.heads * head_dim, shape.query_width())],
-                )?;
-                Ok((mixer, o))
-            }
-            (AttentionNames::Gdn(names), Some(linear)) => {
-                let geometry = linear.geometry;
-                let GdnNames {
-                    qkv,
-                    z,
-                    b,
-                    a,
-                    out,
-                    conv,
-                    a_log,
-                    dt_bias,
-                    norm,
-                } = names;
-                let Some(all) = whole.linear.map(|linear| linear.geometry) else {
-                    return Err(format!(
-                        "layer {index} is a Gated DeltaNet at one rank only"
-                    ));
-                };
-                let heads = geometry.heads;
-                let (key_dim, value_dim) = (geometry.key_dim, geometry.value_dim);
-                let key_width = all.key_heads * key_dim;
-                // The fused projection's rows (and the conv's channels) are every query, every
-                // key, then every value: a rank's share is a run of each.
-                let qkv_runs = [
-                    Run::Rows(cut.key_heads * key_dim, geometry.key_heads * key_dim),
-                    Run::Rows(
-                        key_width + cut.key_heads * key_dim,
-                        geometry.key_heads * key_dim,
-                    ),
-                    Run::Rows(
-                        2 * key_width + cut.value_heads * value_dim,
-                        geometry.value_width(),
-                    ),
-                ];
-                let values = [Run::Rows(
-                    cut.value_heads * value_dim,
-                    geometry.value_width(),
-                )];
-                let value_heads = [Run::Rows(cut.value_heads, heads)];
-                let mixer = Mixer::Gdn(GdnLayer {
-                    qkv: self.proj_runs(qkv, (all.conv_width(), hidden), &qkv_runs)?,
-                    z: self.proj_runs(z, (all.value_width(), hidden), &values)?,
-                    b: self.proj_runs(b, (all.heads, hidden), &value_heads)?,
-                    a: self.proj_runs(a, (all.heads, hidden), &value_heads)?,
-                    conv: self.conv(conv, (all.conv_width(), geometry.taps), &qkv_runs)?,
-                    a_log: self.vector_runs(a_log, (all.heads, 1), &value_heads)?,
-                    dt_bias: self.vector_runs(dt_bias, (all.heads, 1), &value_heads)?,
-                    norm: self.vector(norm, value_dim)?,
-                });
-                let out = self.proj_runs(
-                    out,
-                    (hidden, all.value_width()),
-                    &[Run::Columns(
-                        cut.value_heads * value_dim,
-                        geometry.value_width(),
-                    )],
-                )?;
-                Ok((mixer, out))
-            }
-            _ => Err(format!("layer {index} names another token mixer's tensors")),
-        }
+                Region::Recurrent {
+                    name: "gated-deltanet",
+                    bytes: geometry.state_bytes(),
+                },
+            ],
+        })
+    }
+
+    /// A layer's dense SwiGLU MLP.
+    fn dense_mlp(
+        &mut self,
+        index: usize,
+        names: &FfnNames,
+        (shape, whole): (&Shape, &Shape),
+        hidden: usize,
+    ) -> Result<DenseMlp, String> {
+        let (None, FfnNames::Dense(names)) = (&shape.routed, names) else {
+            return Err(format!("layer {index} names a routed MLP's tensors"));
+        };
+        let mlp = self.mlp(
+            names,
+            whole.intermediate,
+            (shape.cut.intermediate, shape.intermediate),
+            hidden,
+        )?;
+        self.pack(&[&mlp.gate, &mlp.up, &mlp.down]);
+        Ok(DenseMlp {
+            mlp,
+            clamp: shape.clamp,
+        })
     }
 
     /// A depthwise conv's BF16 `[width][taps]` filter, which a release stores as `[width][1][taps]`
@@ -2045,9 +2224,11 @@ impl Uploads<'_> {
         index: usize,
         names: &FfnNames,
         (shape, whole): (&Shape, &Shape),
-        routed: &Routed,
         hidden: usize,
-    ) -> Result<LayerFfn, String> {
+    ) -> Result<RoutedExperts, String> {
+        let Some(routed) = &shape.routed else {
+            return Err(format!("layer {index} is not a routed layer"));
+        };
         let Some(all) = whole.routed else {
             return Err(format!("layer {index} routes at one rank only"));
         };
@@ -2158,7 +2339,15 @@ impl Uploads<'_> {
                 "layer {index} names a shared-expert gate without a shared expert"
             ));
         }
-        Ok(LayerFfn::Routed {
+        self.pack(&[&router]);
+        if let Some(shared) = &shared {
+            self.pack(&[&shared.gate, &shared.up, &shared.down]);
+        }
+        if let Some(gate) = &shared_gate {
+            self.pack(&[gate]);
+        }
+        Ok(RoutedExperts {
+            shape: *shape,
             router,
             bias,
             scales,
@@ -2171,27 +2360,41 @@ impl Uploads<'_> {
 
 /// Uploads every tensor `names` resolves, each checked at its architecture shape (BF16, or a
 /// projection's block-scaled E4M3 under `formats`); every allocation lands in `owned` as it is
-/// made, so a failure part way frees what was uploaded.
+/// made, so a failure part way frees what was uploaded. Each layer's branches are the parts its
+/// step names, built by `parts`' constructors in forward order.
 #[allow(clippy::too_many_arguments)]
-fn upload(
-    cuda: &Cuda,
-    architecture: &Architecture,
-    names: &TensorNames,
-    source: &dyn WeightSource,
+fn upload<'a>(
+    cuda: &'a Cuda,
+    architecture: &'a Architecture,
+    (names, steps): (&'a TensorNames, &[LayerStep]),
+    source: &'a dyn WeightSource,
     formats: Formats,
-    shapes: &[Shape],
-    owned: &mut Vec<Deviceptr>,
+    (shapes, shard): (&'a [Shape], Shard),
+    parts: &DenseParts,
+    owned: &'a mut Vec<Deviceptr>,
 ) -> Result<Uploaded, String> {
-    let mut up = Uploads {
-        uploader: DraftUploader::new(cuda, source),
-        source,
-        formats,
-        owned,
-        bytes: 0,
-        labels: Vec::new(),
-        rows: Vec::new(),
-        widen: WidenLog::new(),
+    let mut open = OpenCx {
+        up: Uploads {
+            uploader: DraftUploader::new(cuda, source),
+            source,
+            formats,
+            owned,
+            bytes: 0,
+            labels: Vec::new(),
+            rows: Vec::new(),
+            widen: WidenLog::new(),
+            packable: Vec::new(),
+        },
+        cuda,
+        architecture,
+        names,
+        shapes,
+        plan: shard.0,
+        index: 0,
+        whole: None,
+        scratch: Vec::new(),
     };
+    let up = &mut open.up;
     let hidden = architecture.hidden_size;
     let vocab = architecture.vocab_size;
     let embed = up.mat(&names.embed, vocab, hidden)?;
@@ -2213,32 +2416,58 @@ fn upload(
             shapes.len()
         ));
     }
+    if steps.len() != shapes.len() {
+        return Err(format!(
+            "the architecture walks {} layers and declares {}",
+            steps.len(),
+            shapes.len()
+        ));
+    }
+    let mut slot = 0usize;
     for (index, (layer_names, shape)) in names.layers.iter().zip(shapes).enumerate() {
-        let whole = Shape::of(architecture, index, Shard::whole())?;
-        let pair = (shape, &whole);
-        let (mixer, o) = up.mixer(index, &layer_names.attention, pair, hidden)?;
-        let ffn = match (&shape.routed, &layer_names.ffn) {
-            (None, FfnNames::Dense(names)) => LayerFfn::Dense(up.mlp(
-                names,
-                whole.intermediate,
-                (shape.cut.intermediate, shape.intermediate),
-                hidden,
-            )?),
-            (None, _) => return Err(format!("layer {index} names a routed MLP's tensors")),
-            (Some(routed), names) => up.routed(index, names, pair, routed, hidden)?,
-        };
+        open.index = index;
+        open.whole = Some(Shape::of(architecture, index, Shard::whole())?);
+        // The parts first, in forward order, then the norms each reads its input through.
+        let mut built = Vec::new();
+        for (role, kind) in step_branches(&steps[index])? {
+            let part = parts
+                .build(kind, &mut open)
+                .map_err(|error| format!("layer {index}'s part {}: {error}", kind.name()))?;
+            built.push((role, part));
+        }
+        let input_norm = open.up.vector(&layer_names.input_norm, hidden)?;
+        let post_norm = open.up.vector(&layer_names.post_norm, hidden)?;
+        let mut branches = Vec::with_capacity(built.len());
+        for (role, part) in built {
+            branches.push(Branch {
+                norm: match role {
+                    StepRole::Attention => input_norm,
+                    _ => post_norm,
+                },
+                summed: part.split(&open.plan) == RankSplit::Summed,
+                part,
+                slot,
+            });
+            slot += 1;
+        }
         layers.push(Layer {
             shape: *shape,
-            input_norm: up.vector(&layer_names.input_norm, hidden)?,
-            mixer,
-            o,
-            post_norm: up.vector(&layer_names.post_norm, hidden)?,
-            ffn,
+            branches,
         });
     }
-    Ok((
-        embed, head, norm, layers, up.bytes, up.rows, up.widen, up.labels,
-    ))
+    let OpenCx { up, scratch, .. } = open;
+    Ok(Uploaded {
+        embed,
+        head,
+        norm,
+        layers,
+        bytes: up.bytes,
+        rows: up.rows,
+        widen: up.widen,
+        labels: up.labels,
+        packable: up.packable,
+        scratch,
+    })
 }
 
 /// Refuses a tensor that is not BF16 at `shape`.
@@ -2254,6 +2483,13 @@ fn bf16(source: &dyn WeightSource, name: &str, shape: &[usize]) -> Result<(), St
 }
 
 impl Shared {
+    /// The state every part of the walk declares, in walk order: what a sequence's lane holds.
+    pub(crate) fn state(&self) -> Vec<Region> {
+        branches(&self.layers)
+            .flat_map(|branch| branch.part.state().iter().copied())
+            .collect()
+    }
+
     /// A branch's `rows` partial rows at `partial` summed over the group, in place: nothing at one
     /// rank.
     fn sum(&self, partial: Deviceptr, rows: usize) -> Result<(), BackendError> {
@@ -2279,30 +2515,26 @@ impl Shared {
     /// A grouped-query attention layer over the normed rows in `b.normed`, into `b.attended`: the
     /// row-wise projections and norms over every row, the rotary, cache appends and attention a
     /// segment at a time.
-    fn attend(
-        &self,
-        index: usize,
-        layer: &Layer,
-        b: &Buffers,
-        segments: &[(&mut Sequence, &[u32])],
-        rows: usize,
-        policy: Option<WidePolicy>,
-    ) -> Result<(), BackendError> {
-        let Mixer::Gqa {
+    fn attend(&self, part: &Gqa, cx: &PassCx<'_>) -> Result<(), BackendError> {
+        let &PassCx {
+            b,
+            segments,
+            rows,
+            policy,
+            index,
+            slot,
+            ..
+        } = cx;
+        let Gqa {
             q,
             k,
             v,
             q_norm,
             k_norm,
-        } = &layer.mixer
-        else {
-            return Err(BackendError::new(
-                DEVICE,
-                format!("layer {index} is not an attention layer"),
-            ));
-        };
+            ..
+        } = part;
         let kernels = self.kernels;
-        let shape = layer.shape;
+        let shape = part.shape;
         let (query_width, kv_width) = (shape.query_width(), shape.kv_width());
         let projected_query = if shape.gated { b.interleaved } else { b.query };
         self.project(q, b, b.normed.0, projected_query.0, rows, policy)?;
@@ -2352,7 +2584,7 @@ impl Shared {
                     self.call(kernels.rope, rope.call())?;
                 }
             }
-            let Cache::Kv(keys, values) = sequence.caches[index] else {
+            let &[keys, values] = sequence.regions[slot].as_slice() else {
                 return Err(BackendError::new(
                     DEVICE,
                     format!("layer {index}'s lane part holds no key/value cache"),
@@ -2400,19 +2632,19 @@ impl Shared {
     /// and its history advanced past them; the prep over every row; a segment at a time, the scan
     /// from its state, in place; and the gated norm over every row. Every row count takes these
     /// kernels, so a row's bits do not depend on what it shares a walk with.
-    #[allow(clippy::too_many_arguments)]
-    fn linear(
-        &self,
-        index: usize,
-        layer: &Layer,
-        gdn: &GdnLayer,
-        b: &Buffers,
-        segments: &[(&mut Sequence, &[u32])],
-        rows: usize,
-        policy: Option<WidePolicy>,
-    ) -> Result<(), BackendError> {
+    fn linear(&self, part: &Gdn, cx: &PassCx<'_>) -> Result<(), BackendError> {
+        let &PassCx {
+            b,
+            segments,
+            rows,
+            policy,
+            index,
+            slot,
+            ..
+        } = cx;
+        let gdn = &part.weights;
         let refuse = |message: String| Err(BackendError::new(DEVICE, message));
-        let (Some(kernels), Some(linear)) = (self.kernels.gdn, layer.shape.linear) else {
+        let (Some(kernels), Some(linear)) = (self.kernels.gdn, part.shape.linear) else {
             return refuse(format!("layer {index} has no Gated DeltaNet kernels"));
         };
         let geometry = linear.geometry;
@@ -2424,7 +2656,7 @@ impl Shared {
         self.project(&gdn.a, b, b.normed.0, b.gdn_a.0, rows, policy)?;
         let mut first = 0usize;
         for (sequence, tokens) in segments {
-            let Cache::Linear { conv: history, .. } = sequence.caches[index] else {
+            let &[history, _] = sequence.regions[slot].as_slice() else {
                 return refuse(format!(
                     "layer {index}'s lane part holds no recurrent state"
                 ));
@@ -2465,7 +2697,7 @@ impl Shared {
         let qk_row = geometry.key_heads * gdn_qk_row(geometry.key_dim) * 4;
         let mut first = 0usize;
         for (sequence, tokens) in segments {
-            let Cache::Linear { state, .. } = sequence.caches[index] else {
+            let &[_, state] = sequence.regions[slot].as_slice() else {
                 return refuse(format!(
                     "layer {index}'s lane part holds no recurrent state"
                 ));
@@ -2727,16 +2959,14 @@ impl Shared {
     /// A routed layer's MLP over `rows` into `b.projected`: the router on the row GEMV (so a
     /// prompt row picks the experts its decode row would), `q4e_route`, the shared plan's runs,
     /// the BF16 token passes, the shared expert and its gate, and the combine.
-    fn routed(
-        &self,
-        layer: &Layer,
-        b: &Buffers,
-        rows: usize,
-        policy: Option<WidePolicy>,
-    ) -> Result<(), BackendError> {
+    fn routed(&self, part: &RoutedExperts, cx: &PassCx<'_>) -> Result<(), BackendError> {
+        let &PassCx {
+            b, rows, policy, ..
+        } = cx;
         let (
             Some(routed),
-            LayerFfn::Routed {
+            RoutedExperts {
+                shape,
                 router,
                 bias,
                 scales,
@@ -2745,7 +2975,7 @@ impl Shared {
                 shared_gate,
             },
             Some(kernels),
-        ) = (&layer.shape.routed, &layer.ffn, self.kernels.moe)
+        ) = (&part.shape.routed, part, self.kernels.moe)
         else {
             return Err(BackendError::new(
                 DEVICE,
@@ -2795,7 +3025,7 @@ impl Shared {
             intermediate as u64,
         ]);
         let grid = token::gate_up_grid(intermediate, top_k, rows);
-        match layer.shape.clamp {
+        match shape.clamp {
             None => self.launch(kernels.gate_up, grid, &gate_up)?,
             Some(limit) => {
                 let Some(clamped_kernel) = kernels.gate_up_clamped else {
@@ -2828,7 +3058,7 @@ impl Shared {
         ]);
         self.launch(kernels.down, token::down_grid(hidden, top_k, rows), &down)?;
         match shared {
-            Some(mlp) => self.mlp(mlp, layer.shape.clamp, b, b.shared_out, rows, policy)?,
+            Some(mlp) => self.mlp(mlp, shape.clamp, b, b.shared_out, rows, policy)?,
             // The combine always adds a shared row; a layer without one adds zeros.
             None => self
                 .cuda
@@ -2914,43 +3144,38 @@ impl GemvDevice for Tiled<'_> {
 /// layer's key and value caches, a `[capacity][kv_width]` BF16 run each backed only as far as the
 /// sequence has reached, and a Gated DeltaNet layer's conv history and delta-rule state, f32 the
 /// lane backs whole. With a rewind point the lane also holds its [Checkpoint] arena.
+///
+/// The lane is laid out from what each part declares
+/// ([sparkflash_runtime::PartExec::state]), in walk order: a positional region is `capacity`
+/// rows of its row, a recurrent region its bytes.
 #[derive(Debug)]
 struct LaneParts {
-    caches: Vec<LanePart>,
+    /// Each part's regions' offsets in the lane, by [Branch::slot].
+    regions: Vec<Vec<usize>>,
     arena: Option<usize>,
-}
-
-/// One layer's offsets in the lane.
-#[derive(Debug, Clone, Copy)]
-enum LanePart {
-    /// The keys and the values.
-    Kv([usize; 2]),
-    /// The conv history and the delta-rule state.
-    Linear([usize; 2]),
 }
 
 impl LaneParts {
     fn plan(layout: &mut Layout, layers: &[Layer], capacity: usize, rewind: bool) -> Self {
-        let caches = layers
-            .iter()
-            .map(|layer| match layer.shape.linear {
-                Some(linear) => LanePart::Linear([
-                    layout.part(linear.geometry.conv_bytes(), 0, 0),
-                    layout.part(linear.geometry.state_bytes(), 0, 0),
-                ]),
-                None => {
-                    let row = layer.shape.kv_width() * 2;
-                    LanePart::Kv([
-                        layout.part(capacity * row, row, 0),
-                        layout.part(capacity * row, row, 0),
-                    ])
-                }
+        let regions = branches(layers)
+            .map(|branch| {
+                branch
+                    .part
+                    .state()
+                    .iter()
+                    .map(|region| match *region {
+                        Region::Positional { bytes_per_row, .. } => {
+                            layout.part(capacity * bytes_per_row, bytes_per_row, 0)
+                        }
+                        Region::Recurrent { bytes, .. } => layout.part(bytes, 0, 0),
+                    })
+                    .collect()
             })
             .collect();
         let sizes = linear_sizes(layers);
         let arena = (rewind && !sizes.is_empty())
             .then(|| layout.part(Checkpoint::arena_bytes(&sizes), 0, 0));
-        Self { caches, arena }
+        Self { regions, arena }
     }
 }
 
@@ -3002,12 +3227,14 @@ struct Buffers {
     gdn_a: Deviceptr,
     gdn_qk: Deviceptr,
     gdn_decay: Deviceptr,
+    /// The parts' reserved scratch, by [ScratchSlot]: `[rows][floats]` f32 each.
+    extra: Vec<Deviceptr>,
     logit_rows: usize,
 }
 
 impl Buffers {
-    fn all(&self) -> [&Deviceptr; 33] {
-        [
+    fn all(&self) -> Vec<&Deviceptr> {
+        let mut all = vec![
             &self.tokens,
             &self.x,
             &self.normed,
@@ -3041,7 +3268,9 @@ impl Buffers {
             &self.gdn_qk,
             &self.gdn_decay,
             &self.picks,
-        ]
+        ];
+        all.extend(&self.extra);
+        all
     }
 }
 
@@ -3127,9 +3356,11 @@ impl Scratch {
             rows * linear(|geometry| 2 * geometry.heads),
             rows,
         ];
-        let mut pointers = Vec::with_capacity(floats.len());
+        let fixed = floats.len();
+        let reserved = shared.scratch.iter().map(|floats| rows * floats);
+        let mut pointers = Vec::with_capacity(fixed + shared.scratch.len());
         let mut total = 0usize;
-        for count in floats {
+        for count in floats.into_iter().chain(reserved) {
             match shared.cuda.alloc(count.max(1) * 4, &mut total) {
                 Ok(pointer) => pointers.push(pointer),
                 Err(error) => {
@@ -3174,6 +3405,7 @@ impl Scratch {
             gdn_qk: p(30),
             gdn_decay: p(31),
             picks: p(32),
+            extra: pointers[fixed..].to_vec(),
             logit_rows,
         };
         // The counters start at zero; every tiled launch leaves them so.
@@ -3200,8 +3432,10 @@ impl Scratch {
 pub struct Sequence {
     shared: Arc<Shared>,
     lane: SequenceLane<LaneParts>,
-    /// Each layer's caches in the lane.
-    caches: Vec<Cache>,
+    /// Each part's regions in the lane, by [Branch::slot], in the order the part declares them.
+    regions: Vec<Vec<Deviceptr>>,
+    /// The recurrent ones among them, in walk order, as [Shared::linear_sizes] counts them.
+    recurrent: Vec<Deviceptr>,
     /// The Gated DeltaNet layers' rewind point, when a layer is one and the sequence keeps one.
     checkpoint: Option<Checkpoint>,
     /// The ids whose rows the caches hold, in position order: the last prompt and every token
@@ -3222,16 +3456,15 @@ impl Sequence {
         let lane = SequenceLane::reserve(&shared.cuda, &shared.lanes)?;
         let base = lane.base();
         let parts = shared.lanes.parts();
-        let caches = parts
-            .caches
+        let regions: Vec<Vec<Deviceptr>> = parts
+            .regions
             .iter()
-            .map(|part| match *part {
-                LanePart::Kv([keys, values]) => Cache::Kv(base.offset(keys), base.offset(values)),
-                LanePart::Linear([conv, state]) => Cache::Linear {
-                    conv: base.offset(conv),
-                    state: base.offset(state),
-                },
-            })
+            .map(|part| part.iter().map(|offset| base.offset(*offset)).collect())
+            .collect();
+        let recurrent = branches(&shared.layers)
+            .flat_map(|branch| branch.part.state().iter().zip(&regions[branch.slot]))
+            .filter(|(region, _)| !region.is_positional())
+            .map(|(_, pointer)| *pointer)
             .collect();
         let checkpoint = parts
             .arena
@@ -3239,7 +3472,8 @@ impl Sequence {
         Ok(Self {
             shared,
             lane,
-            caches,
+            regions,
+            recurrent,
             checkpoint,
             history: Vec::new(),
             sampler: Sampler::new(),
@@ -3251,17 +3485,10 @@ impl Sequence {
         self.history.len()
     }
 
-    /// The Gated DeltaNet layers' live regions in layer order, as [Shared::linear_sizes] counts
-    /// them: each layer's conv history, then its state.
+    /// The live recurrent regions in walk order, as [Shared::linear_sizes] counts them: each
+    /// Gated DeltaNet layer's conv history, then its state.
     fn linear_regions(&self) -> Vec<Deviceptr> {
-        self.caches
-            .iter()
-            .filter_map(|cache| match *cache {
-                Cache::Linear { conv, state } => Some([conv, state]),
-                Cache::Kv(..) => None,
-            })
-            .flatten()
-            .collect()
+        self.recurrent.clone()
     }
 
     /// Sets the recurrent state to the empty sequence's: zero, as a fresh lane's chunks map. A
@@ -3270,28 +3497,27 @@ impl Sequence {
         if let Some(checkpoint) = self.checkpoint.as_mut() {
             checkpoint.forget();
         }
-        let Some(kernels) = self.shared.kernels.gdn else {
-            return Ok(());
-        };
-        if self.lane.span().backed() == 0 {
+        if self.recurrent.is_empty() || self.lane.span().backed() == 0 {
             return Ok(());
         }
-        let regions = self.linear_regions();
-        for (region, bytes) in regions.iter().zip(&self.shared.linear_sizes) {
-            self.shared
-                .call(kernels.zero, calls::zero(region.0, bytes / 4))?;
+        for (region, bytes) in self.recurrent.iter().zip(&self.shared.linear_sizes) {
+            match self.shared.kernels.gdn {
+                Some(kernels) => self
+                    .shared
+                    .call(kernels.zero, calls::zero(region.0, bytes / 4))?,
+                // A plugged-in part's recurrent state on a checkpoint with no Gated DeltaNet
+                // layer: the scan image's zero is not loaded, so the driver clears it.
+                None => self
+                    .shared
+                    .cuda
+                    .memset_d8_async(*region, 0, *bytes)
+                    .map_err(|error| {
+                        BackendError::new(DEVICE, format!("the recurrent state: {error}"))
+                    })?,
+            }
         }
         Ok(())
     }
-}
-
-/// One layer's caches in a sequence's lane.
-#[derive(Debug, Clone, Copy)]
-enum Cache {
-    /// An attention layer's BF16 keys and values, `[capacity][kv_width]` each.
-    Kv(Deviceptr, Deviceptr),
-    /// A Gated DeltaNet layer's conv history and delta-rule state.
-    Linear { conv: Deviceptr, state: Deviceptr },
 }
 
 /// One walk over the segments' rows, laid out one after another: each sequence's ids at its own
@@ -3301,11 +3527,16 @@ enum Cache {
 /// would alone wherever the projections take the same kernel: a fused step passes no wide policy,
 /// and a row GEMV row is the same sum at any batch.
 ///
+/// Each layer is its branches in forward order ([Layer::branches]): the norm, the part's `body`
+/// (its prompt body or its token body, [PartBody]) from the normed rows in `b.normed` into
+/// `b.projected`, the group's sum where the part leaves a partial, and the residual add.
+///
 /// The residual of every row is left in `b.x`; each sequence's history takes its ids.
 fn walk(
     shared: &Shared,
     b: &Buffers,
     segments: &mut [(&mut Sequence, &[u32])],
+    body: PartBody,
     policy: Option<WidePolicy>,
     mut trace: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<(), BackendError> {
@@ -3354,29 +3585,27 @@ fn walk(
         ),
     )?;
     for (index, layer) in shared.layers.iter().enumerate() {
-        shared.norm(
-            RmsNorm::new(b.x.0, layer.input_norm.0, b.normed.0, hidden, shared.eps),
-            rows,
-        )?;
-        match &layer.mixer {
-            Mixer::Gqa { .. } => shared.attend(index, layer, b, segments, rows, policy)?,
-            Mixer::Gdn(gdn) => shared.linear(index, layer, gdn, b, segments, rows, policy)?,
-        }
-        shared.project(&layer.o, b, b.attended.0, b.projected.0, rows, policy)?;
-        shared.sum(b.projected, rows)?;
-        shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
-        shared.norm(
-            RmsNorm::new(b.x.0, layer.post_norm.0, b.normed.0, hidden, shared.eps),
-            rows,
-        )?;
-        match &layer.ffn {
-            LayerFfn::Dense(mlp) => {
-                shared.mlp(mlp, layer.shape.clamp, b, b.projected, rows, policy)?;
+        for branch in &layer.branches {
+            shared.norm(
+                RmsNorm::new(b.x.0, branch.norm.0, b.normed.0, hidden, shared.eps),
+                rows,
+            )?;
+            let mut pass = PassCx {
+                shared,
+                b,
+                segments: &*segments,
+                index,
+                slot: branch.slot,
+                rows,
+                policy,
+            };
+            // One dynamic call a part a pass, where the walk matched the layer's two enums.
+            body.run::<Dense, _>(&*branch.part, &mut pass)?;
+            if branch.summed {
+                shared.sum(b.projected, rows)?;
             }
-            LayerFfn::Routed { .. } => shared.routed(layer, b, rows, policy)?,
+            shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
         }
-        shared.sum(b.projected, rows)?;
-        shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
         if let Some(trace) = trace.as_deref_mut() {
             let mut bytes = vec![0u8; rows * hidden * 4];
             shared.cuda.copy_dtoh(&mut bytes, &b.x).map_err(device)?;
@@ -3496,7 +3725,7 @@ fn step(
         .zip(tokens.chunks(1))
         .map(|((sequence, _), token)| (&mut **sequence, token))
         .collect();
-    walk(shared, b, &mut segments, None, trace)?;
+    walk(shared, b, &mut segments, PartBody::Token, None, trace)?;
     let logits = head(shared, b, 0, segments.len())?;
     Ok(segments
         .iter_mut()
@@ -3569,6 +3798,7 @@ impl DenseDeviceSession {
                 &shared,
                 b,
                 &mut [(&mut self.sequence, chunk)],
+                PartBody::Rows,
                 shared.policy,
                 self.trace.as_mut(),
             )?;
@@ -3610,6 +3840,7 @@ impl ModelSession for DenseDeviceSession {
                 &shared,
                 &scratch.buffers,
                 &mut [(&mut *sequence, chunk)],
+                PartBody::Rows,
                 shared.policy,
                 trace.as_mut(),
             )?;

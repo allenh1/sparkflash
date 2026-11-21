@@ -431,6 +431,53 @@ Everything else is read from one registration or refused by the compiler:
   numerics reference through `scripts/numerics.py`, the registry's authority. It prints the exact
   commands (dry run by default) and states that the generated conformance runner is still a stub.
 
+### A family with one part of its own
+
+The shared dense arm (`sparkflash-model-dense`) runs a list of parts. It builds the list from
+`Architecture::steps()`: for every layer the token mixer, then the feed-forward. Each part is a
+`sparkflash_runtime::PartExec`, made by the constructor a `PartRegistry` holds for the step's part
+kind. `Dense::catalogue()` registers the four the arm has: grouped-query attention, the Gated
+DeltaNet scan, the dense SwiGLU MLP and the routed experts. The walk matches no enum.
+
+A family whose layer needs a part the arm lacks writes three things.
+
+1. **The part.** `impl PartExec<Dense> for ItsPart`, four required methods and no defaults:
+   `state` (the regions it adds to a sequence's lane, positional or recurrent), `split`
+   (`RankSplit::Summed` when a rank leaves a partial the group sums, `Replicated` when every rank
+   computes the whole rows), `rows` (the prompt body) and `token` (the token body). A body reads
+   the normed rows at `pass.input()` and leaves the branch's rows at `pass.output()`. A part whose
+   token body is its prompt body says so in one line, `self.rows(pass)`.
+2. **The registration line.**
+
+   ```rust
+   let mut parts = Dense::catalogue();
+   parts.replace(Part::DenseMlp, |open: &mut OpenCx<'_>| ItsPart::open(open))?;
+   let backend =
+       DenseDeviceBackend::open_with(descriptor, &architecture, &source, context, &parts)?;
+   ```
+
+   `register` adds a kind the registry does not hold and refuses one it does; `replace` takes a
+   kind over. The constructor uploads this rank's share through `OpenCx` (`source`, `plan`,
+   `keep`, `record`, `pack`, `scratch`, and the four catalogue constructors, which a part may
+   wrap).
+3. **Its kernel.** The constructor loads it through `open.cuda()` and the body launches it with
+   `pass.launch`, on the walk's stream.
+
+It no longer writes a walk, a `match` arm in one, the norm before the part, the group's sum and
+the residual add after it, the sequence's lane memory, its rewind point, the sampler, the lanes or
+anything about serving. The arm lays out each lane from what the parts' `state` declares.
+
+A step whose part kind has no registered executor is refused when the arm opens, by the part's
+name, before a kernel image or a tensor is read. The walk never skips a part.
+`crates/sparkflash-model-dense/tests/part_plugin.rs` is the worked example: a part defined
+outside the crate, registered, and run over a prompt and two token steps.
+
+Two limits remain. The dense walk runs a step's attention and feed-forward roles and refuses the
+others by name. And a part kind must be one `Architecture::steps()` names:
+`sparkflash_ops::parts::dense_device_refusal`, the arm's layer shapes and
+`sparkflash_ops::naming::resolve` still describe the four catalogue kinds only, so a kind with a
+new name also needs its `Part` entry and those three to accept its layer.
+
 ## 7. The dynamic Hugging Face path (no new arm)
 
 A checkpoint does not need a new `PackArm` to convert or serve. `sparkflash serve --model

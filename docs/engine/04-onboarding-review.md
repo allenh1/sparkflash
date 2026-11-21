@@ -2418,8 +2418,12 @@ Three findings, each with the change it implies.
    a chunk's rows yet) and Inkling's group with images. Both need a group.
 5. **Dory onto `Walk`.** It is the only served model with no reuse at TP 1 and the only one whose
    ledger is written by hand.
-6. **The part plug-in** (mechanism 2). Open the dense walk's two enums into `PartExec` and move
-   the dense arm onto it; a family with one new part then writes that part.
+6. **The part plug-in** (mechanism 2). Done for the dense arm: `sparkflash_runtime::part` holds
+   `PartExec`, `PartHost` and `PartRegistry`; the dense walk runs a list of parts built from
+   `Architecture::steps()` through `Dense::catalogue()`, and `Mixer` and `LayerFfn` are gone. A
+   part kind with no executor is refused by name at open. Left: `dense_device_refusal`, the
+   arm's layer shapes and `naming::resolve` still close the set of kinds a checkpoint may name,
+   and `PlanWalk` does not exist, so the released arms keep their own walks.
 7. **Phase 6, continued as shared halves**: the bulk chunk loop, then `decode`'s plan, each with
    the tick-trace A/B on the cluster.
 
