@@ -85,7 +85,7 @@ mod walk;
 
 pub use walk::{InklingDrafter, InklingSequence, InklingWalk};
 
-use chunk::{BandOut, band_exchange, band_mix, exchange_gather, exchange_sum};
+use chunk::{BandOut, band_exchange, band_mix, device_error, exchange_gather, exchange_sum};
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 use packed::pack_dense;
@@ -4290,7 +4290,6 @@ struct State {
     summaries: Deviceptr,
     summaries_bytes: usize,
     summary_rows: usize,
-    blocks: usize,
     scratch: Scratch,
     position: usize,
 }
@@ -4306,6 +4305,8 @@ struct LaneView {
     values: Vec<Deviceptr>,
     tables: Vec<Option<KeyTables>>,
     conv: Vec<[Deviceptr; 4]>,
+    summaries: Deviceptr,
+    summary_rows: usize,
     scratch: Scratch,
     position: usize,
 }
@@ -4318,6 +4319,8 @@ impl State {
             values: self.values.clone(),
             tables: self.tables.clone(),
             conv: self.conv.clone(),
+            summaries: self.summaries,
+            summary_rows: self.summary_rows,
             scratch: self.scratch.clone(),
             position: self.position,
         }
@@ -4393,7 +4396,6 @@ impl State {
             summaries,
             summaries_bytes,
             summary_rows: summaries_rows,
-            blocks: 0,
             scratch,
             position: 0,
         })
@@ -4418,7 +4420,6 @@ impl State {
         shared
             .cuda
             .memset_d8_async(self.summaries, 0, self.summaries_bytes)?;
-        self.blocks = 0;
         self.position = 0;
         Ok(())
     }
@@ -5674,73 +5675,84 @@ impl InklingDeviceSession {
         BackendError::new(DEVICE, error.to_string())
     }
 
-    fn weight(&self, index: usize) -> Deviceptr {
-        self.shared.weights.get(index).pointer
-    }
-
-    /// One all-reduce of a residual-width f32 vector, in place.
-    ///
-    /// Every collective this arm performs over the hidden stream is a sum of partial sums, so the
-    /// exchange is the same staged round-trip whatever produced the partial: a download, the
-    /// transport's sum, an upload.
-    fn all_reduce(
-        &self,
-        shared: &Shared,
-        pointer: Deviceptr,
-        elements: usize,
-    ) -> Result<(), BackendError> {
-        exchange_sum(shared, pointer, elements)
-    }
-
-    /// The root-mean-square of one f32 buffer, for the trace. A debug read: it synchronises.
-    fn rms(
-        &self,
-        shared: &Shared,
-        label: &str,
-        pointer: Deviceptr,
-        elements: usize,
-    ) -> Result<(), BackendError> {
-        if !trace_on() {
-            return Ok(());
-        }
-        let mut bytes = vec![0u8; elements * 4];
-        shared
-            .cuda
-            .copy_dtoh(&mut bytes, &pointer)
-            .map_err(Self::fail)?;
-        let values: Vec<f32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| f32::from_le_bytes(*word))
-            .collect();
-        let rms = (values.iter().map(|value| value * value).sum::<f32>() / elements as f32).sqrt();
-        eprintln!("[inkling] {label} rms={rms:.5} first={:.5}", values[0]);
-        Ok(())
-    }
-
-    /// One token: the whole schedule, in the plan's order.
+    /// One token: the whole row schedule, in the plan's order ([RowRun]).
     fn step(&mut self, token: u32) -> Result<Vec<f32>, BackendError> {
-        let shared = Arc::clone(&self.shared);
+        let taps = self.drafter.as_ref().map(DraftState::sink);
+        let mut run = RowRun::begin(&self.shared, self.state.view(), token, taps)?;
+        run.embed()?;
+        for (index, steps) in run.layer_steps().into_iter().enumerate() {
+            run.steps(index, 0, steps)?;
+        }
+        let logits = run.finish()?;
+        self.state.position += 1;
+        Ok(logits)
+    }
+}
+
+/// One token's walk of the row schedule, run as stages: [Self::begin] checks the token,
+/// [Self::embed] runs the prologue, [Self::steps] any run of a layer's steps in order, and
+/// [Self::finish] the epilogue, answering the row's logits. The walk runs in the sequence's own
+/// one-row arena and reads it through its [LaneView], so it borrows nothing between stages; the
+/// caller moves the position on.
+struct RowRun {
+    shared: Arc<Shared>,
+    state: LaneView,
+    token: u32,
+    /// The sequence's drafter taps, when it drafts with DSpark.
+    taps: Option<TapSink>,
+    /// The block-summary stack is this token's stream at each block boundary, not a history:
+    /// the previous token's summaries are a different residual chain, so each walk starts it
+    /// empty.
+    blocks: usize,
+    /// The layer step the walk runs next.
+    cursor: usize,
+    /// The convolution the layer ran last, whose output the next residual add reads.
+    previous_conv: Option<ConvSlot>,
+}
+
+impl RowRun {
+    /// Opens `token`'s walk over `state`, once the token is checked against the vocabulary.
+    fn begin(
+        shared: &Arc<Shared>,
+        state: LaneView,
+        token: u32,
+        taps: Option<TapSink>,
+    ) -> Result<Self, BackendError> {
         let config = &shared.config;
-        let plan = &shared.plan;
         if token as usize >= config.vocab_size {
-            return Err(Self::fail(format!(
+            return Err(device_error(format!(
                 "token {token} is outside the vocabulary {}",
                 config.vocab_size
             )));
         }
-        let position = self.state.position;
-        // The block-summary stack is this token's stream at each block boundary, not a history:
-        // the previous token's summaries are a different residual chain.
-        self.state.blocks = 0;
-        let hidden = shared.hidden();
-        let kv_width = shared.kv_width();
-        let heads = shared.heads();
-        let head_dim = config.head_dim;
-        let groups = heads / plan.rank_kv_heads().max(1);
-        let run = |result: Result<(), String>| result.map_err(Self::fail);
+        Ok(Self {
+            shared: Arc::clone(shared),
+            state,
+            token,
+            taps,
+            blocks: 0,
+            cursor: 0,
+            previous_conv: None,
+        })
+    }
 
+    /// The layers the row schedule walks, and each one's steps.
+    fn layer_steps(&self) -> Vec<usize> {
+        self.shared
+            .plan
+            .layers()
+            .iter()
+            .map(|layer| layer.steps.len())
+            .collect()
+    }
+
+    /// The prologue: the token's embedding, gathered across the ranks and normed.
+    fn embed(&mut self) -> Result<(), BackendError> {
+        let shared = Arc::clone(&self.shared);
+        let plan = &shared.plan;
+        let hidden = shared.hidden();
+        let run = |result: Result<(), String>| result.map_err(device_error);
+        let token = self.token;
         for step in plan.prologue() {
             match (step.op, step.target) {
                 (Op::Embed, _) => {
@@ -5790,490 +5802,513 @@ impl InklingDeviceSession {
                 }
                 (Op::Collective(_), _) | (Op::SummaryPush, _) => {}
                 (op, target) => {
-                    return Err(Self::fail(format!(
+                    return Err(device_error(format!(
                         "the schedule's prologue {op:?} at {target:?} has no device dispatch"
                     )));
                 }
             }
         }
 
-        let taps = self.drafter.as_ref().map(DraftState::sink);
-        for (index, schedule) in plan.layers().iter().enumerate() {
-            let layer = schedule.index;
-            if let Some((sink, slot)) = taps.and_then(|sink| Some((sink, sink.slot(layer)?))) {
-                sink.capture(&shared, self.state.scratch.x, 1, slot)?;
-            }
+        Ok(())
+    }
+
+    /// Steps `from..to` of layer `index`'s row schedule, the layer's drafter tap first when
+    /// `from` is its first step. The layer's own cursor carries between the calls, so a step that
+    /// went on past `to` is not run again by the next call.
+    fn steps(&mut self, index: usize, from: usize, to: usize) -> Result<(), BackendError> {
+        let (mut cursor, mut previous_conv) = if from == 0 {
+            (0, None)
+        } else {
+            (self.cursor.max(from), self.previous_conv)
+        };
+        let shared = Arc::clone(&self.shared);
+        let config = &shared.config;
+        let plan = &shared.plan;
+        let hidden = shared.hidden();
+        let run = |result: Result<(), String>| result.map_err(device_error);
+        let position = self.state.position;
+        let kv_width = shared.kv_width();
+        let heads = shared.heads();
+        let head_dim = config.head_dim;
+        let groups = heads / plan.rank_kv_heads().max(1);
+        let taps = self.taps;
+        let schedule = plan
+            .layers()
+            .get(index)
+            .ok_or_else(|| device_error(format!("the row schedule has no layer {index}")))?;
+        let to = to.min(schedule.steps.len());
+        let layer = schedule.index;
+        if from == 0
+            && let Some((sink, slot)) = taps.and_then(|sink| Some((sink, sink.slot(layer)?)))
+        {
+            sink.capture(&shared, self.state.scratch.x, 1, slot)?;
+        }
+        if from == 0 && trace_on() {
+            eprintln!(
+                "[inkling] layer {layer} sliding={} blocks={}",
+                schedule.sliding, self.blocks
+            );
+        }
+        let sliding = schedule.sliding;
+        let cache_rows = schedule.kv_rows;
+        let clips = shared.clip[index];
+        while cursor < to {
+            let step = &schedule.steps[cursor];
             if trace_on() {
-                eprintln!(
-                    "[inkling] layer {layer} sliding={} blocks={}",
-                    schedule.sliding, self.state.blocks
-                );
+                eprintln!("[inkling]   {}/{:?}", step.op.name(), step.target);
             }
-            let sliding = schedule.sliding;
-            let cache_rows = schedule.kv_rows;
-            let clips = shared.clip[index];
-            let mut previous_conv: Option<ConvSlot> = None;
-            let mut cursor = 0usize;
-            while cursor < schedule.steps.len() {
-                let step = &schedule.steps[cursor];
-                if trace_on() {
-                    eprintln!("[inkling]   {}/{:?}", step.op.name(), step.target);
+            match (step.op, step.target) {
+                (Op::BlockResidual, Target::Input(ResidualInput::Attention)) => {
+                    let queries = self.weight(step.weights[0]);
+                    run(shared.block_residual(
+                        self.state.summaries,
+                        self.state.scratch.x,
+                        queries,
+                        self.state.scratch.rows,
+                        self.state.scratch.residual_stats,
+                        self.blocks,
+                        if sliding { 1 } else { 3 },
+                        1,
+                        0,
+                    ))?;
                 }
-                match (step.op, step.target) {
-                    (Op::BlockResidual, Target::Input(ResidualInput::Attention)) => {
-                        let queries = self.weight(step.weights[0]);
-                        run(shared.block_residual(
-                            self.state.summaries,
-                            self.state.scratch.x,
-                            queries,
-                            self.state.scratch.rows,
-                            self.state.scratch.residual_stats,
-                            self.state.blocks,
-                            if sliding { 1 } else { 3 },
-                            1,
-                            0,
-                        ))?;
-                    }
-                    (Op::SummaryPush, _) => {
-                        if self.state.blocks >= self.state.summary_rows {
-                            return Err(Self::fail(format!(
-                                "layer {layer}: the summary stack is full ({} rows) and the \
+                (Op::SummaryPush, _) => {
+                    if self.blocks >= self.state.summary_rows {
+                        return Err(device_error(format!(
+                            "layer {layer}: the summary stack is full ({} rows) and the \
                                  plan pushes another",
-                                self.state.summary_rows
-                            )));
-                        }
-                        let destination = self
-                            .state
-                            .summaries
-                            .offset(self.state.blocks * hidden * std::mem::size_of::<f32>());
-                        run(shared
-                            .cuda
-                            .copy_dtod(
-                                &destination,
-                                &self.state.scratch.x,
-                                hidden * std::mem::size_of::<f32>(),
-                            )
-                            .map_err(|error| error.to_string()))?;
-                        self.state.blocks += 1;
-                        // At a boundary the sublayer output *is* the stream: there is no additive
-                        // residual and the pre-attention stream is now a summary.
-                        run(shared
-                            .cuda
-                            .copy_dtod(
-                                &self.state.scratch.x,
-                                &self.state.scratch.delta,
-                                hidden * std::mem::size_of::<f32>(),
-                            )
-                            .map_err(|error| error.to_string()))?;
-                    }
-                    (Op::RmsNorm, Target::Norm(role)) => {
-                        let weight = self.weight(step.weights[0]);
-                        let (source, destination) = match (role, sliding) {
-                            (NormRole::Stream, _) => {
-                                (self.state.scratch.x, self.state.scratch.normed)
-                            }
-                            (NormRole::Attention, _) => {
-                                (self.state.scratch.rows, self.state.scratch.normed)
-                            }
-                            (NormRole::Query, false) => {
-                                (self.state.scratch.rows, self.state.scratch.normed)
-                            }
-                            (NormRole::Key, false) => (
-                                self.state.scratch.rows.offset(hidden * 4),
-                                self.state.scratch.normed.offset(hidden * 4),
-                            ),
-                            (NormRole::Value, false) => (
-                                self.state.scratch.rows.offset(2 * hidden * 4),
-                                self.state.scratch.normed.offset(2 * hidden * 4),
-                            ),
-                            (NormRole::Mlp, _) => {
-                                (self.state.scratch.rows, self.state.scratch.normed)
-                            }
-                            (other, _) => {
-                                return Err(Self::fail(format!(
-                                    "layer {layer}: norm role {other:?} is not an input norm"
-                                )));
-                            }
-                        };
-                        run(shared.rmsnorm(source, weight, destination, 1, hidden))?;
-                        if trace_on() && layer == 0 && matches!(role, NormRole::Mlp) {
-                            self.rms(&shared, "row mlp_norm", destination, hidden)?;
-                        }
-                    }
-                    (Op::Gemv, Target::Project(projection)) => {
-                        let normed = self.state.scratch.normed;
-                        let io = |projection: Projection| match projection {
-                            Projection::Query => {
-                                Ok((normed, self.state.scratch.q, heads * head_dim, hidden))
-                            }
-                            Projection::Gate => {
-                                Ok((normed, self.state.scratch.gate, heads * head_dim, hidden))
-                            }
-                            Projection::Key => Ok((
-                                if sliding {
-                                    normed
-                                } else {
-                                    normed.offset(hidden * 4)
-                                },
-                                self.state.scratch.k,
-                                kv_width,
-                                hidden,
-                            )),
-                            Projection::Value => Ok((
-                                if sliding {
-                                    normed
-                                } else {
-                                    normed.offset(2 * hidden * 4)
-                                },
-                                self.state.scratch.v,
-                                kv_width,
-                                hidden,
-                            )),
-                            Projection::Relative => {
-                                Ok((normed, self.state.scratch.rel, heads * config.d_rel, hidden))
-                            }
-                            Projection::Sink => {
-                                Ok((normed, self.state.scratch.sink, heads, hidden))
-                            }
-                            Projection::AttentionOut => Ok((
-                                self.state.scratch.attn,
-                                self.state.scratch.delta,
-                                hidden,
-                                heads * head_dim,
-                            )),
-                            Projection::Router => Ok((
-                                normed,
-                                self.state.scratch.router_logits,
-                                config.n_routed_experts,
-                                hidden,
-                            )),
-                            Projection::Head => Err(Self::fail("the head is a global step")),
-                        };
-                        let (input, out, rows, columns) = io(projection)?;
-                        // The projections that follow over the same input go out with this one,
-                        // up to four a launch: a sliding layer's six attention projections all
-                        // read the one normed row, so they are two launches rather than six. A
-                        // fused row's sum is its own launch's bits (Shared::gemv_fused).
-                        let mut parts = [(Deviceptr(0), Deviceptr(0), 0usize); GEMV_FUSED];
-                        parts[0] = (self.weight(step.weights[0]), out, rows);
-                        let mut fused = 1;
-                        while fused < GEMV_FUSED {
-                            let Some(next) = schedule.steps.get(cursor + fused) else {
-                                break;
-                            };
-                            let (Op::Gemv, Target::Project(following)) = (next.op, next.target)
-                            else {
-                                break;
-                            };
-                            let (next_input, next_out, next_rows, next_columns) = io(following)?;
-                            if next_input.0 != input.0 || next_columns != columns {
-                                break;
-                            }
-                            parts[fused] = (self.weight(next.weights[0]), next_out, next_rows);
-                            fused += 1;
-                        }
-                        if fused > 1 {
-                            run(shared.gemv_fused(&parts[..fused], input, columns, 1))?;
-                            cursor += fused;
-                            continue;
-                        }
-                        run(shared.gemv(parts[0].0, input, out, rows, columns))?;
-                        if layer == 0 && matches!(projection, Projection::AttentionOut) {
-                            self.rms(&shared, "attention_out", out, rows)?;
-                        }
-                    }
-                    (Op::ShortConv, Target::Conv(slot)) => {
-                        let taps = self.weight(step.weights[0]);
-                        let (input, out, channels, state) = match slot {
-                            ConvSlot::Key => (
-                                self.state.scratch.k,
-                                self.state.scratch.k_next,
-                                kv_width,
-                                self.state.conv[layer][0],
-                            ),
-                            ConvSlot::Value => (
-                                self.state.scratch.v,
-                                self.state.scratch.v_next,
-                                kv_width,
-                                self.state.conv[layer][1],
-                            ),
-                            ConvSlot::Attention => (
-                                self.state.scratch.delta,
-                                self.state.scratch.delta,
-                                hidden,
-                                self.state.conv[layer][2],
-                            ),
-                            ConvSlot::Mlp => (
-                                self.state.scratch.mixed,
-                                self.state.scratch.mixed,
-                                hidden,
-                                self.state.conv[layer][3],
-                            ),
-                        };
-                        run(shared.launch(
-                            shared.kernels.short_conv,
-                            (flat(channels), 1, 1),
-                            (ELEMENT_BLOCK, 1, 1),
-                            &[
-                                input.0,
-                                taps.0,
-                                state.0,
-                                out.0,
-                                channels as u64,
-                                shared.kernel_width() as u64,
-                            ],
-                        ))?;
-                        previous_conv = Some(slot);
-                    }
-                    (Op::ShortConvDynamic, Target::Conv(slot)) => {
-                        let static_taps = self.weight(step.weights[0]);
-                        let projection = self.weight(step.weights[1]);
-                        let (input, out, state, source) = match slot {
-                            ConvSlot::Key => (
-                                self.state.scratch.k,
-                                self.state.scratch.k_next,
-                                self.state.conv[layer][0],
-                                self.state.scratch.normed.offset(hidden * 4),
-                            ),
-                            ConvSlot::Value => (
-                                self.state.scratch.v,
-                                self.state.scratch.v_next,
-                                self.state.conv[layer][1],
-                                self.state.scratch.normed.offset(2 * hidden * 4),
-                            ),
-                            other => {
-                                return Err(Self::fail(format!(
-                                    "layer {layer}: a dynamic convolution has no {other:?} slot"
-                                )));
-                            }
-                        };
-                        // The dynamic taps are a projection of this slot's input, one kernel width
-                        // a key/value head.
-                        let taps = plan.rank_kv_heads() * shared.kernel_width();
-                        run(shared.gemv(
-                            projection,
-                            source,
-                            self.state.scratch.taps,
-                            taps,
-                            hidden,
-                        ))?;
-                        run(shared.launch(
-                            shared.kernels.short_conv_dynamic,
-                            (flat(kv_width), 1, 1),
-                            (ELEMENT_BLOCK, 1, 1),
-                            &[
-                                input.0,
-                                static_taps.0,
-                                self.state.scratch.taps.0,
-                                state.0,
-                                out.0,
-                                kv_width as u64,
-                                shared.kernel_width() as u64,
-                                head_dim as u64,
-                            ],
-                        ))?;
-                        previous_conv = Some(slot);
-                    }
-                    (Op::Widen, _) => {
-                        run(shared.launch(
-                            shared.kernels.widen,
-                            (flat(heads * head_dim), 1, 1),
-                            (ELEMENT_BLOCK, 1, 1),
-                            &[
-                                self.state.scratch.attn_bf16.0,
-                                self.state.scratch.attn.0,
-                                (heads * head_dim) as u64,
-                            ],
-                        ))?;
-                    }
-                    (Op::KvStore, _) => {
-                        if trace_on() {
-                            let rank = plan.tp().rank();
-                            let read = |pointer: Deviceptr, count: usize| -> Vec<f32> {
-                                let mut bytes = vec![0u8; count * 4];
-                                let _ = shared.cuda.copy_dtoh(&mut bytes, &pointer);
-                                from_bytes(&bytes)
-                            };
-                            let q = read(self.state.scratch.q, 2);
-                            let k = read(self.state.scratch.k_next, 2);
-                            let v = read(self.state.scratch.v_next, 2);
-                            let gate = read(self.state.scratch.gate, 1);
-                            let sink = read(self.state.scratch.sink, 1);
-                            let rel = read(self.state.scratch.rel, 1);
-                            eprintln!(
-                                "[inkling] device rank {rank} layer {layer} q={:.6} {:.6} g={:.6}                                  s={:.6} r={:.6} k={:.6} {:.6} v={:.6} {:.6}",
-                                q[0], q[1], gate[0], sink[0], rel[0], k[0], k[1], v[0], v[1]
-                            );
-                        }
-                        // A ring cache indexes by the position modulo its length; the attention
-                        // body is given the absolute position and maps it itself.
-                        let slot_position = position % cache_rows.max(1);
-                        run(shared.launch(
-                            shared.kernels.kv_store,
-                            (flat(kv_width), 1, 1),
-                            (ELEMENT_BLOCK, 1, 1),
-                            &[
-                                self.state.scratch.k_next.0,
-                                self.state.scratch.v_next.0,
-                                self.state.keys[index].0,
-                                self.state.values[index].0,
-                                1,
-                                slot_position as u64,
-                                kv_width as u64,
-                                // The single-row walk wraps the slot here; a chunk passes the
-                                // ring length and lets the entry wrap each of its rows.
-                                0,
-                            ],
-                        ))?;
-                    }
-                    (Op::Attention, _) => {
-                        let bank = self.weight(step.weights[0]);
-                        let scratch = &self.state.scratch;
-                        run(shared.attention_rows(
-                            scratch,
-                            index,
-                            scratch.q,
-                            scratch.gate,
-                            self.state.keys[index],
-                            self.state.values[index],
-                            self.state.tables[index],
-                            scratch.rel,
-                            bank,
-                            scratch.sink,
-                            clips,
-                            scratch.attn_bf16,
-                            Deviceptr(0),
-                            1,
-                            position,
-                            plan.rank_kv_heads(),
-                            groups,
-                            if sliding { schedule.window } else { 0 },
-                            // A sliding layer's cache is its window and is read as a ring; a
-                            // full layer's is the context and is addressed absolutely.
-                            if sliding { cache_rows } else { 0 },
-                            schedule.rel_extent,
-                            schedule.tau.at(position),
-                        ))?;
-                    }
-                    (Op::ResidualAdd, _) => {
-                        if layer == 0 {
-                            self.rms(&shared, "mixed", self.state.scratch.mixed, hidden)?;
-                        }
-                        let delta = match previous_conv {
-                            Some(ConvSlot::Mlp) => self.state.scratch.mixed,
-                            _ => self.state.scratch.delta,
-                        };
-                        run(shared.launch(
-                            shared.kernels.residual_add,
-                            (flat(hidden), 1, 1),
-                            (ELEMENT_BLOCK, 1, 1),
-                            &[
-                                self.state.scratch.x.0,
-                                delta.0,
-                                self.state.scratch.x.0,
-                                1,
-                                hidden as u64,
-                            ],
-                        ))?;
-                        previous_conv = None;
-                    }
-                    (Op::BlockResidual, Target::Input(ResidualInput::Mlp)) => {
-                        let queries = self.weight(step.weights[0]);
-                        run(shared.block_residual(
-                            self.state.summaries,
-                            self.state.scratch.x,
-                            queries,
-                            self.state.scratch.rows,
-                            self.state.scratch.residual_stats,
-                            self.state.blocks,
-                            1,
-                            1,
-                            0,
-                        ))?;
-                    }
-                    (Op::Router, _) => {
-                        let bias = self.weight(step.weights[0]);
-                        if trace_on() && layer == 0 {
-                            self.rms(
-                                &shared,
-                                "row router_logits",
-                                self.state.scratch.router_logits,
-                                config.n_routed_experts,
-                            )?;
-                        }
-                        run(shared.launch(
-                            shared.kernels.router,
-                            (1, 1, 1),
-                            (ROUTER_BLOCK, 1, 1),
-                            &[
-                                self.state.scratch.router_logits.0,
-                                bias.0,
-                                self.state.scratch.indices.0,
-                                self.state.scratch.shares.0,
-                                config.n_routed_experts as u64,
-                                config.num_experts_per_tok as u64,
-                                bits(config.route_scale as f32),
-                            ],
-                        ))?;
-                    }
-                    (Op::ExpertGateUp, Target::Band(BandOp::GateUp)) => {
-                        let activation = &schedule.steps[cursor + 1];
-                        let down = &schedule.steps[cursor + 2];
-                        self.run_band(&shared, index, step, activation, down)?;
-                        // The band's three launches and its local mix; the all-reduce that
-                        // follows them is the next step and stays the walk's.
-                        cursor += 4;
-                        continue;
-                    }
-                    (Op::Collective(Collective::AttentionDelta), _) => {
-                        // The output projection sharded the heads, its contraction axis, so the
-                        // dense result is a partial sum of every element of the layer's attention
-                        // output. The convolution that follows reads a complete row.
-                        self.all_reduce(&shared, self.state.scratch.delta, hidden)?;
-                        if trace_on() {
-                            let label = format!("attn_proj layer {layer}");
-                            self.rms(&shared, &label, self.state.scratch.delta, hidden)?;
-                        }
-                    }
-                    (Op::Collective(Collective::ExpertDelta), _) => {
-                        // Each rank mixed its own experts and zeroed the slots it does not own,
-                        // so the sum over ranks is the layer's whole expert contribution; under
-                        // the row split each rank mixed its own rows, which the gather joins.
-                        band_exchange(&shared, &self.state.scratch, 1)?;
-                    }
-                    (Op::Collective(_), _) => {}
-                    (op, target) => {
-                        return Err(Self::fail(format!(
-                            "layer {layer}: the schedule's {op:?} at {target:?} has no device \
-                             dispatch"
+                            self.state.summary_rows
                         )));
                     }
+                    let destination = self
+                        .state
+                        .summaries
+                        .offset(self.blocks * hidden * std::mem::size_of::<f32>());
+                    run(shared
+                        .cuda
+                        .copy_dtod(
+                            &destination,
+                            &self.state.scratch.x,
+                            hidden * std::mem::size_of::<f32>(),
+                        )
+                        .map_err(|error| error.to_string()))?;
+                    self.blocks += 1;
+                    // At a boundary the sublayer output *is* the stream: there is no additive
+                    // residual and the pre-attention stream is now a summary.
+                    run(shared
+                        .cuda
+                        .copy_dtod(
+                            &self.state.scratch.x,
+                            &self.state.scratch.delta,
+                            hidden * std::mem::size_of::<f32>(),
+                        )
+                        .map_err(|error| error.to_string()))?;
                 }
-                cursor += 1;
+                (Op::RmsNorm, Target::Norm(role)) => {
+                    let weight = self.weight(step.weights[0]);
+                    let (source, destination) = match (role, sliding) {
+                        (NormRole::Stream, _) => (self.state.scratch.x, self.state.scratch.normed),
+                        (NormRole::Attention, _) => {
+                            (self.state.scratch.rows, self.state.scratch.normed)
+                        }
+                        (NormRole::Query, false) => {
+                            (self.state.scratch.rows, self.state.scratch.normed)
+                        }
+                        (NormRole::Key, false) => (
+                            self.state.scratch.rows.offset(hidden * 4),
+                            self.state.scratch.normed.offset(hidden * 4),
+                        ),
+                        (NormRole::Value, false) => (
+                            self.state.scratch.rows.offset(2 * hidden * 4),
+                            self.state.scratch.normed.offset(2 * hidden * 4),
+                        ),
+                        (NormRole::Mlp, _) => (self.state.scratch.rows, self.state.scratch.normed),
+                        (other, _) => {
+                            return Err(device_error(format!(
+                                "layer {layer}: norm role {other:?} is not an input norm"
+                            )));
+                        }
+                    };
+                    run(shared.rmsnorm(source, weight, destination, 1, hidden))?;
+                    if trace_on() && layer == 0 && matches!(role, NormRole::Mlp) {
+                        self.rms(&shared, "row mlp_norm", destination, hidden)?;
+                    }
+                }
+                (Op::Gemv, Target::Project(projection)) => {
+                    let normed = self.state.scratch.normed;
+                    let io = |projection: Projection| match projection {
+                        Projection::Query => {
+                            Ok((normed, self.state.scratch.q, heads * head_dim, hidden))
+                        }
+                        Projection::Gate => {
+                            Ok((normed, self.state.scratch.gate, heads * head_dim, hidden))
+                        }
+                        Projection::Key => Ok((
+                            if sliding {
+                                normed
+                            } else {
+                                normed.offset(hidden * 4)
+                            },
+                            self.state.scratch.k,
+                            kv_width,
+                            hidden,
+                        )),
+                        Projection::Value => Ok((
+                            if sliding {
+                                normed
+                            } else {
+                                normed.offset(2 * hidden * 4)
+                            },
+                            self.state.scratch.v,
+                            kv_width,
+                            hidden,
+                        )),
+                        Projection::Relative => {
+                            Ok((normed, self.state.scratch.rel, heads * config.d_rel, hidden))
+                        }
+                        Projection::Sink => Ok((normed, self.state.scratch.sink, heads, hidden)),
+                        Projection::AttentionOut => Ok((
+                            self.state.scratch.attn,
+                            self.state.scratch.delta,
+                            hidden,
+                            heads * head_dim,
+                        )),
+                        Projection::Router => Ok((
+                            normed,
+                            self.state.scratch.router_logits,
+                            config.n_routed_experts,
+                            hidden,
+                        )),
+                        Projection::Head => Err(device_error("the head is a global step")),
+                    };
+                    let (input, out, rows, columns) = io(projection)?;
+                    // The projections that follow over the same input go out with this one,
+                    // up to four a launch: a sliding layer's six attention projections all
+                    // read the one normed row, so they are two launches rather than six. A
+                    // fused row's sum is its own launch's bits (Shared::gemv_fused).
+                    let mut parts = [(Deviceptr(0), Deviceptr(0), 0usize); GEMV_FUSED];
+                    parts[0] = (self.weight(step.weights[0]), out, rows);
+                    let mut fused = 1;
+                    while fused < GEMV_FUSED {
+                        let Some(next) = schedule.steps.get(cursor + fused) else {
+                            break;
+                        };
+                        let (Op::Gemv, Target::Project(following)) = (next.op, next.target) else {
+                            break;
+                        };
+                        let (next_input, next_out, next_rows, next_columns) = io(following)?;
+                        if next_input.0 != input.0 || next_columns != columns {
+                            break;
+                        }
+                        parts[fused] = (self.weight(next.weights[0]), next_out, next_rows);
+                        fused += 1;
+                    }
+                    if fused > 1 {
+                        run(shared.gemv_fused(&parts[..fused], input, columns, 1))?;
+                        cursor += fused;
+                        continue;
+                    }
+                    run(shared.gemv(parts[0].0, input, out, rows, columns))?;
+                    if layer == 0 && matches!(projection, Projection::AttentionOut) {
+                        self.rms(&shared, "attention_out", out, rows)?;
+                    }
+                }
+                (Op::ShortConv, Target::Conv(slot)) => {
+                    let taps = self.weight(step.weights[0]);
+                    let (input, out, channels, state) = match slot {
+                        ConvSlot::Key => (
+                            self.state.scratch.k,
+                            self.state.scratch.k_next,
+                            kv_width,
+                            self.state.conv[layer][0],
+                        ),
+                        ConvSlot::Value => (
+                            self.state.scratch.v,
+                            self.state.scratch.v_next,
+                            kv_width,
+                            self.state.conv[layer][1],
+                        ),
+                        ConvSlot::Attention => (
+                            self.state.scratch.delta,
+                            self.state.scratch.delta,
+                            hidden,
+                            self.state.conv[layer][2],
+                        ),
+                        ConvSlot::Mlp => (
+                            self.state.scratch.mixed,
+                            self.state.scratch.mixed,
+                            hidden,
+                            self.state.conv[layer][3],
+                        ),
+                    };
+                    run(shared.launch(
+                        shared.kernels.short_conv,
+                        (flat(channels), 1, 1),
+                        (ELEMENT_BLOCK, 1, 1),
+                        &[
+                            input.0,
+                            taps.0,
+                            state.0,
+                            out.0,
+                            channels as u64,
+                            shared.kernel_width() as u64,
+                        ],
+                    ))?;
+                    previous_conv = Some(slot);
+                }
+                (Op::ShortConvDynamic, Target::Conv(slot)) => {
+                    let static_taps = self.weight(step.weights[0]);
+                    let projection = self.weight(step.weights[1]);
+                    let (input, out, state, source) = match slot {
+                        ConvSlot::Key => (
+                            self.state.scratch.k,
+                            self.state.scratch.k_next,
+                            self.state.conv[layer][0],
+                            self.state.scratch.normed.offset(hidden * 4),
+                        ),
+                        ConvSlot::Value => (
+                            self.state.scratch.v,
+                            self.state.scratch.v_next,
+                            self.state.conv[layer][1],
+                            self.state.scratch.normed.offset(2 * hidden * 4),
+                        ),
+                        other => {
+                            return Err(device_error(format!(
+                                "layer {layer}: a dynamic convolution has no {other:?} slot"
+                            )));
+                        }
+                    };
+                    // The dynamic taps are a projection of this slot's input, one kernel width
+                    // a key/value head.
+                    let taps = plan.rank_kv_heads() * shared.kernel_width();
+                    run(shared.gemv(projection, source, self.state.scratch.taps, taps, hidden))?;
+                    run(shared.launch(
+                        shared.kernels.short_conv_dynamic,
+                        (flat(kv_width), 1, 1),
+                        (ELEMENT_BLOCK, 1, 1),
+                        &[
+                            input.0,
+                            static_taps.0,
+                            self.state.scratch.taps.0,
+                            state.0,
+                            out.0,
+                            kv_width as u64,
+                            shared.kernel_width() as u64,
+                            head_dim as u64,
+                        ],
+                    ))?;
+                    previous_conv = Some(slot);
+                }
+                (Op::Widen, _) => {
+                    run(shared.launch(
+                        shared.kernels.widen,
+                        (flat(heads * head_dim), 1, 1),
+                        (ELEMENT_BLOCK, 1, 1),
+                        &[
+                            self.state.scratch.attn_bf16.0,
+                            self.state.scratch.attn.0,
+                            (heads * head_dim) as u64,
+                        ],
+                    ))?;
+                }
+                (Op::KvStore, _) => {
+                    if trace_on() {
+                        let rank = plan.tp().rank();
+                        let read = |pointer: Deviceptr, count: usize| -> Vec<f32> {
+                            let mut bytes = vec![0u8; count * 4];
+                            let _ = shared.cuda.copy_dtoh(&mut bytes, &pointer);
+                            from_bytes(&bytes)
+                        };
+                        let q = read(self.state.scratch.q, 2);
+                        let k = read(self.state.scratch.k_next, 2);
+                        let v = read(self.state.scratch.v_next, 2);
+                        let gate = read(self.state.scratch.gate, 1);
+                        let sink = read(self.state.scratch.sink, 1);
+                        let rel = read(self.state.scratch.rel, 1);
+                        eprintln!(
+                            "[inkling] device rank {rank} layer {layer} q={:.6} {:.6} g={:.6}                                  s={:.6} r={:.6} k={:.6} {:.6} v={:.6} {:.6}",
+                            q[0], q[1], gate[0], sink[0], rel[0], k[0], k[1], v[0], v[1]
+                        );
+                    }
+                    // A ring cache indexes by the position modulo its length; the attention
+                    // body is given the absolute position and maps it itself.
+                    let slot_position = position % cache_rows.max(1);
+                    run(shared.launch(
+                        shared.kernels.kv_store,
+                        (flat(kv_width), 1, 1),
+                        (ELEMENT_BLOCK, 1, 1),
+                        &[
+                            self.state.scratch.k_next.0,
+                            self.state.scratch.v_next.0,
+                            self.state.keys[index].0,
+                            self.state.values[index].0,
+                            1,
+                            slot_position as u64,
+                            kv_width as u64,
+                            // The single-row walk wraps the slot here; a chunk passes the
+                            // ring length and lets the entry wrap each of its rows.
+                            0,
+                        ],
+                    ))?;
+                }
+                (Op::Attention, _) => {
+                    let bank = self.weight(step.weights[0]);
+                    let scratch = &self.state.scratch;
+                    run(shared.attention_rows(
+                        scratch,
+                        index,
+                        scratch.q,
+                        scratch.gate,
+                        self.state.keys[index],
+                        self.state.values[index],
+                        self.state.tables[index],
+                        scratch.rel,
+                        bank,
+                        scratch.sink,
+                        clips,
+                        scratch.attn_bf16,
+                        Deviceptr(0),
+                        1,
+                        position,
+                        plan.rank_kv_heads(),
+                        groups,
+                        if sliding { schedule.window } else { 0 },
+                        // A sliding layer's cache is its window and is read as a ring; a
+                        // full layer's is the context and is addressed absolutely.
+                        if sliding { cache_rows } else { 0 },
+                        schedule.rel_extent,
+                        schedule.tau.at(position),
+                    ))?;
+                }
+                (Op::ResidualAdd, _) => {
+                    if layer == 0 {
+                        self.rms(&shared, "mixed", self.state.scratch.mixed, hidden)?;
+                    }
+                    let delta = match previous_conv {
+                        Some(ConvSlot::Mlp) => self.state.scratch.mixed,
+                        _ => self.state.scratch.delta,
+                    };
+                    run(shared.launch(
+                        shared.kernels.residual_add,
+                        (flat(hidden), 1, 1),
+                        (ELEMENT_BLOCK, 1, 1),
+                        &[
+                            self.state.scratch.x.0,
+                            delta.0,
+                            self.state.scratch.x.0,
+                            1,
+                            hidden as u64,
+                        ],
+                    ))?;
+                    previous_conv = None;
+                }
+                (Op::BlockResidual, Target::Input(ResidualInput::Mlp)) => {
+                    let queries = self.weight(step.weights[0]);
+                    run(shared.block_residual(
+                        self.state.summaries,
+                        self.state.scratch.x,
+                        queries,
+                        self.state.scratch.rows,
+                        self.state.scratch.residual_stats,
+                        self.blocks,
+                        1,
+                        1,
+                        0,
+                    ))?;
+                }
+                (Op::Router, _) => {
+                    let bias = self.weight(step.weights[0]);
+                    if trace_on() && layer == 0 {
+                        self.rms(
+                            &shared,
+                            "row router_logits",
+                            self.state.scratch.router_logits,
+                            config.n_routed_experts,
+                        )?;
+                    }
+                    run(shared.launch(
+                        shared.kernels.router,
+                        (1, 1, 1),
+                        (ROUTER_BLOCK, 1, 1),
+                        &[
+                            self.state.scratch.router_logits.0,
+                            bias.0,
+                            self.state.scratch.indices.0,
+                            self.state.scratch.shares.0,
+                            config.n_routed_experts as u64,
+                            config.num_experts_per_tok as u64,
+                            bits(config.route_scale as f32),
+                        ],
+                    ))?;
+                }
+                (Op::ExpertGateUp, Target::Band(BandOp::GateUp)) => {
+                    let activation = &schedule.steps[cursor + 1];
+                    let down = &schedule.steps[cursor + 2];
+                    self.run_band(&shared, index, step, activation, down)?;
+                    // The band's three launches and its local mix; the all-reduce that
+                    // follows them is the next step and stays the walk's.
+                    cursor += 4;
+                    continue;
+                }
+                (Op::Collective(Collective::AttentionDelta), _) => {
+                    // The output projection sharded the heads, its contraction axis, so the
+                    // dense result is a partial sum of every element of the layer's attention
+                    // output. The convolution that follows reads a complete row.
+                    self.all_reduce(&shared, self.state.scratch.delta, hidden)?;
+                    if trace_on() {
+                        let label = format!("attn_proj layer {layer}");
+                        self.rms(&shared, &label, self.state.scratch.delta, hidden)?;
+                    }
+                }
+                (Op::Collective(Collective::ExpertDelta), _) => {
+                    // Each rank mixed its own experts and zeroed the slots it does not own,
+                    // so the sum over ranks is the layer's whole expert contribution; under
+                    // the row split each rank mixed its own rows, which the gather joins.
+                    band_exchange(&shared, &self.state.scratch, 1)?;
+                }
+                (Op::Collective(_), _) => {}
+                (op, target) => {
+                    return Err(device_error(format!(
+                        "layer {layer}: the schedule's {op:?} at {target:?} has no device \
+                             dispatch"
+                    )));
+                }
             }
-            if trace_on() {
-                let mut probe = vec![0u8; hidden * 4];
-                shared
-                    .cuda
-                    .copy_dtoh(&mut probe, &self.state.scratch.x)
-                    .map_err(Self::fail)?;
-                let values: Vec<f32> = probe
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|word| f32::from_le_bytes(*word))
-                    .collect();
-                let rms =
-                    (values.iter().map(|value| value * value).sum::<f32>() / hidden as f32).sqrt();
-                eprintln!(
-                    "[inkling] row rank {} layer {layer} x0={:.5} x1={:.5} rms={rms:.5}",
-                    plan.tp().rank(),
-                    values[0],
-                    values[1]
-                );
-            }
+            cursor += 1;
         }
+        if to == schedule.steps.len() && trace_on() {
+            let mut probe = vec![0u8; hidden * 4];
+            shared
+                .cuda
+                .copy_dtoh(&mut probe, &self.state.scratch.x)
+                .map_err(device_error)?;
+            let values: Vec<f32> = probe
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word))
+                .collect();
+            let rms =
+                (values.iter().map(|value| value * value).sum::<f32>() / hidden as f32).sqrt();
+            eprintln!(
+                "[inkling] row rank {} layer {layer} x0={:.5} x1={:.5} rms={rms:.5}",
+                plan.tp().rank(),
+                values[0],
+                values[1]
+            );
+        }
+        self.cursor = cursor;
+        self.previous_conv = previous_conv;
+        Ok(())
+    }
 
+    /// The epilogue and the row's logits read back.
+    fn finish(self) -> Result<Vec<f32>, BackendError> {
+        let shared = Arc::clone(&self.shared);
+        let config = &shared.config;
+        let plan = &shared.plan;
+        let hidden = shared.hidden();
+        let run = |result: Result<(), String>| result.map_err(device_error);
         for step in plan.epilogue() {
             match (step.op, step.target) {
                 (Op::BlockResidual, Target::Input(ResidualInput::Output)) => {
@@ -6284,7 +6319,7 @@ impl InklingDeviceSession {
                         queries,
                         self.state.scratch.final_row,
                         self.state.scratch.residual_stats,
-                        self.state.blocks,
+                        self.blocks,
                         1,
                         1,
                         0,
@@ -6300,7 +6335,7 @@ impl InklingDeviceSession {
                         1,
                         hidden,
                     ))?;
-                    if let Some(sink) = taps {
+                    if let Some(sink) = self.taps {
                         sink.capture(&shared, self.state.scratch.final_row, 1, FINAL_TAP)?;
                     }
                 }
@@ -6350,31 +6385,75 @@ impl InklingDeviceSession {
                     ))?;
                 }
                 (op, target) => {
-                    return Err(Self::fail(format!(
+                    return Err(device_error(format!(
                         "the schedule's epilogue {op:?} at {target:?} has no device dispatch"
                     )));
                 }
             }
         }
 
-        self.state.position += 1;
-        shared.cuda.synchronize().map_err(Self::fail)?;
+        shared.cuda.synchronize().map_err(device_error)?;
         // A doorbell round that was given up leaves its fold on whatever was in the slots; the
         // logits are not read back over one.
-        shared.exchange.check_device().map_err(Self::fail)?;
+        shared.exchange.check_device().map_err(device_error)?;
         let padded = plan.rank_vocab() * shared.exchange.world();
         let unpadded = config.unpadded_vocab_size.min(padded).max(1);
         let mut bytes = vec![0u8; unpadded * 2];
         shared
             .cuda
             .copy_dtoh(&mut bytes, &self.state.scratch.logits_bf16)
-            .map_err(Self::fail)?;
+            .map_err(device_error)?;
         Ok(bytes
             .as_chunks::<2>()
             .0
             .iter()
             .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair)))
             .collect())
+    }
+
+    fn weight(&self, index: usize) -> Deviceptr {
+        self.shared.weights.get(index).pointer
+    }
+
+    /// One all-reduce of a residual-width f32 vector, in place.
+    ///
+    /// Every collective this arm performs over the hidden stream is a sum of partial sums, so the
+    /// exchange is the same staged round-trip whatever produced the partial: a download, the
+    /// transport's sum, an upload.
+    fn all_reduce(
+        &self,
+        shared: &Shared,
+        pointer: Deviceptr,
+        elements: usize,
+    ) -> Result<(), BackendError> {
+        exchange_sum(shared, pointer, elements)
+    }
+
+    /// The root-mean-square of one f32 buffer, for the trace. A debug read: it synchronises.
+    fn rms(
+        &self,
+        shared: &Shared,
+        label: &str,
+        pointer: Deviceptr,
+        elements: usize,
+    ) -> Result<(), BackendError> {
+        if !trace_on() {
+            return Ok(());
+        }
+        let mut bytes = vec![0u8; elements * 4];
+        shared
+            .cuda
+            .copy_dtoh(&mut bytes, &pointer)
+            .map_err(device_error)?;
+        let values: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect();
+        let rms = (values.iter().map(|value| value * value).sum::<f32>() / elements as f32).sqrt();
+        eprintln!("[inkling] {label} rms={rms:.5} first={:.5}", values[0]);
+        Ok(())
     }
 
     /// The routed band: each selected expert's three launches, then the weighted mix.
@@ -6403,11 +6482,11 @@ impl InklingDeviceSession {
         shared
             .cuda
             .copy_dtoh(&mut index_bytes, &self.state.scratch.indices)
-            .map_err(Self::fail)?;
+            .map_err(device_error)?;
         shared
             .cuda
             .copy_dtoh(&mut share_bytes, &self.state.scratch.shares)
-            .map_err(Self::fail)?;
+            .map_err(device_error)?;
         let selected: Vec<usize> = index_bytes
             .as_chunks::<4>()
             .0
@@ -6453,7 +6532,7 @@ impl InklingDeviceSession {
                             2 * intermediate,
                             hidden,
                         )
-                        .map_err(Self::fail)?;
+                        .map_err(device_error)?;
                 }
                 ExpertBody::NvFp4 | ExpertBody::MxFp8 => {
                     let scale_offset =
@@ -6484,7 +6563,7 @@ impl InklingDeviceSession {
                                 0,
                             ],
                         )
-                        .map_err(Self::fail)?;
+                        .map_err(device_error)?;
                 }
             }
             if trace_on() && layer == 0 && self.state.position == 0 {
@@ -6505,7 +6584,7 @@ impl InklingDeviceSession {
                         bits(config.mlp_up_softcap as f32),
                     ],
                 )
-                .map_err(Self::fail)?;
+                .map_err(device_error)?;
             let down_offset = local * codes_bytes(hidden, intermediate, schedule.experts);
             let partial = partials.offset(slot * hidden * 4);
             match schedule.experts {
@@ -6518,7 +6597,7 @@ impl InklingDeviceSession {
                             hidden,
                             intermediate,
                         )
-                        .map_err(Self::fail)?;
+                        .map_err(device_error)?;
                 }
                 ExpertBody::NvFp4 | ExpertBody::MxFp8 => {
                     let scale_offset = local * scales_bytes(hidden, intermediate, schedule.experts);
@@ -6548,7 +6627,7 @@ impl InklingDeviceSession {
                                 0,
                             ],
                         )
-                        .map_err(Self::fail)?;
+                        .map_err(device_error)?;
                 }
             }
             if trace_on() && layer == 0 && self.state.position == 0 {
@@ -6564,7 +6643,7 @@ impl InklingDeviceSession {
         shared
             .cuda
             .copy_htod(&self.state.scratch.scales, &scale_bytes)
-            .map_err(Self::fail)?;
+            .map_err(device_error)?;
         band_mix(shared, &self.state.scratch, 1)?;
         if trace_on() && layer == 0 {
             eprintln!("[inkling] row router layer 0 slots {selected:?} shares {shares:?}");
