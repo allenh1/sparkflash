@@ -31,7 +31,7 @@
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_model::BackendError;
 use sparkflash_ops::attention::GqaBody;
-use sparkflash_ops::calls::{self, Rope};
+use sparkflash_ops::calls::{self, RmsNorm, Rope};
 use sparkflash_ops::indexer::IndexerPass;
 use sparkflash_ops::moe::{MoePlanCall, combine_grid, token};
 use sparkflash_ops::roles::Launcher;
@@ -230,26 +230,19 @@ impl DeviceSequence {
         }
         // The indexer's query is the leading slice of the wider per-token index
         // row, so it is normed with an explicit source stride, then rotated in place.
-        self.launch(
-            kernels.rmsnorm_rows,
-            (
-                (idx_q_width / config.indexer_head_dim).max(1) as u32,
-                batch as u32,
-                1,
-            ),
-            (256, 1, 1),
-            &[
+        kernels.norm.strided(
+            self,
+            RmsNorm::new(
                 self.index_row.0,
                 index_q_norm.0,
                 self.index_query.0,
-                idx_q_width as u64,
-                config.indexer_head_dim as u64,
-                (config.rms_norm_eps as f32).to_bits() as u64,
-                1,
-                1,
-                idx_row_width as u64,
-                idx_q_width as u64,
-            ],
+                idx_q_width,
+                config.rms_norm_eps as f32,
+            )
+            .zero_centred(true)
+            .groups(config.indexer_head_dim, true),
+            batch,
+            (idx_row_width, idx_q_width),
         )?;
         self.call(
             kernels.rope,

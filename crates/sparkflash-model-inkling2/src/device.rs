@@ -92,7 +92,7 @@ use packed::pack_dense;
 use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{Form as DenseForm, Layout, Packed, PackedSet, Tiled};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::{Bound, Embed, Launcher};
+use sparkflash_ops::roles::{Bound, Embed, Launcher, Norm};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 pub use tower::InklingVisionTower;
 
@@ -791,7 +791,7 @@ fn from_bytes(bytes: &[u8]) -> Vec<f32> {
 /// Every kernel the walk launches, loaded by the name the plan records.
 struct Kernels {
     embed: Bound,
-    rmsnorm: Bound,
+    norm: Norm,
     gemv: Bound,
     /// A decode row's run of projections over one input, up to [GEMV_FUSED] in one launch.
     gemv4: Bound,
@@ -866,8 +866,6 @@ struct Kernels {
     /// The shared routed-expert plan (kernels/moe_plan_sm121.cu): the chunk's slots sorted by
     /// this rank's expert into the items the MMA passes walk.
     moe_plan: Bound,
-    /// The stride-carrying row RMSNorm both passes use at a chunk's width.
-    rmsnorm_rows: Bound,
     /// The per-row attention: a chunk's rows against the prefix the step has stored.
     attention_prefill: Bound,
     /// The split walk: each key's clip gain and value scale, the scores of a pass, and the
@@ -1055,7 +1053,15 @@ impl Kernels {
             )?,
             moe_plan: load(Image::MoePlan, moe_plan, "moe_plan", Precision::Bf16)?,
             embed: load(Image::Qwen4Exp, token, "q4e_embed", Precision::Bf16)?,
-            rmsnorm: load(Image::Qwen4Exp, token, "q4e_rmsnorm", Precision::Bf16)?,
+            norm: Norm::new(
+                load(Image::Qwen4Exp, token, "q4e_rmsnorm", Precision::Bf16)?,
+                Some(load(
+                    Image::Qwen4Exp,
+                    token,
+                    "q4e_rmsnorm_rows",
+                    Precision::Bf16,
+                )?),
+            )?,
             gemv: load(Image::Qwen4Exp, token, "q4e_gemv_bf16", Precision::Bf16)?,
             gemv4: load(Image::Qwen4Exp, token, "q4e_gemv4_bf16", Precision::Bf16)?,
             packed: sparkflash_ops::packed::Kernels::load(cuda)?,
@@ -1187,7 +1193,6 @@ impl Kernels {
             )?,
             widen: load(Image::Inkling, inkling, "inkling_widen_f32", Precision::F32)?,
             gemm: load(Image::Qwen4Exp, token, "q4e_gemm_bf16", Precision::Bf16)?,
-            rmsnorm_rows: load(Image::Qwen4Exp, token, "q4e_rmsnorm_rows", Precision::Bf16)?,
             attention_prefill: load(
                 Image::Inkling,
                 inkling,
@@ -1777,7 +1782,10 @@ impl Shared {
             width,
             self.config.architecture.norm_epsilon as f32,
         );
-        self.call(self.kernels.rmsnorm, norm.call(rows))
+        self.kernels
+            .norm
+            .run(self, norm, rows)
+            .map_err(|error| error.to_string())
     }
 
     /// The block-attention residual over the summary stack plus the current stream.
@@ -1972,10 +1980,10 @@ impl Shared {
             width,
             self.config.architecture.norm_epsilon as f32,
         );
-        self.call(
-            self.kernels.rmsnorm_rows,
-            norm.rows_call(rows, src_stride, dst_stride),
-        )
+        self.kernels
+            .norm
+            .strided(self, norm, rows, (src_stride, dst_stride))
+            .map_err(|error| error.to_string())
     }
 
     /// The static short convolution over a chunk, reading `lead` rows of history in front of the

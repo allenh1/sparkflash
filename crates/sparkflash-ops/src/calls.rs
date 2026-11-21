@@ -240,12 +240,18 @@ impl RmsNorm {
     }
 
     /// `q4e_rmsnorm_rows` over `rows` rows, `src_stride` floats apart in the input and
-    /// `dst_stride` in the output: a block a row.
+    /// `dst_stride` in the output: a block a row's group.
     #[must_use]
     pub const fn rows_call(&self, rows: usize, src_stride: usize, dst_stride: usize) -> Call<10> {
         let head = self.head();
+        // A row whole (or no group at all) is one block; a per-head norm a block a head.
+        let groups = if self.group > 0 && self.width / self.group > 1 {
+            self.width / self.group
+        } else {
+            1
+        };
         Call {
-            grid: (1, rows as u32, 1),
+            grid: (groups as u32, rows as u32, 1),
             block: (BLOCK, 1, 1),
             args: [
                 head[0],

@@ -119,7 +119,7 @@ use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
 use sparkflash_ops::roles;
-use sparkflash_ops::roles::{Bound, Embed, Launcher};
+use sparkflash_ops::roles::{Bound, Embed, Launcher, LayerNorm, Norm};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{host_sum, reduce_scatter, reduce_two_shot, takes_two_shots};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -506,8 +506,7 @@ struct Kernels {
     mhc_in: Bound,
     mhc_post: Bound,
     sum_slots: Bound,
-    rmsnorm: Bound,
-    rmsnorm_rows: Bound,
+    norm: Norm,
     conv: Bound,
     kda_decay: Bound,
     recur: Bound,
@@ -522,7 +521,7 @@ struct Kernels {
     kda_scan: Bound,
     kda_gate: Bound,
     copy_flat: Bound,
-    layer_norm: Bound,
+    layer_norm: LayerNorm,
     pool: Bound,
     index_scores: Bound,
     pick: Bound,
@@ -731,8 +730,10 @@ impl Kernels {
             mhc_in: decode("q4e_mhc_in", Precision::Bf16)?,
             mhc_post: decode("q4e_mhc_post", Precision::Bf16)?,
             sum_slots: token("q4e_sum_slots", Precision::Bf16)?,
-            rmsnorm: token("q4e_rmsnorm", Precision::Bf16)?,
-            rmsnorm_rows: token("q4e_rmsnorm_rows", Precision::Bf16)?,
+            norm: Norm::new(
+                token("q4e_rmsnorm", Precision::Bf16)?,
+                Some(token("q4e_rmsnorm_rows", Precision::Bf16)?),
+            )?,
             conv: token("q4e_gdn_conv", Precision::Bf16)?,
             kda_decay: token("q4e_kda_decay", Precision::Bf16)?,
             recur,
@@ -742,7 +743,7 @@ impl Kernels {
             kda_scan: scan("q4p_kda_scan", Precision::Bf16)?,
             kda_gate: scan("q4p_gdn_gate", Precision::Bf16)?,
             copy_flat: token("q4e_copy_flat", Precision::F32)?,
-            layer_norm: decode("q4e_layer_norm", Precision::Bf16)?,
+            layer_norm: LayerNorm::new(decode("q4e_layer_norm", Precision::Bf16)?)?,
             pool: decode("q4e_glm_pool", Precision::Bf16)?,
             index_scores: decode("q4e_glm_index_scores", Precision::Bf16)?,
             pick: decode("q4e_glm_pick", Precision::Bf16)?,
@@ -4905,10 +4906,9 @@ impl DeviceRank {
             (s.dsa_fused, dsa.q_a_norm, q_lora),
             (latent, dsa.kv_a_norm, kv_lora),
         ] {
-            self.call(
-                self.kernels.rmsnorm.kernel(),
-                RmsNorm::new(part.0, norm.0, part.0, width, eps).call(rows),
-            )?;
+            self.kernels
+                .norm
+                .run(self, RmsNorm::new(part.0, norm.0, part.0, width, eps), rows)?;
         }
         // The latent, not its expansion: attention reads it in latent space, and kv_b's rows are
         // the absorbed operands it reads instead ([Self::dsa_attend]).
@@ -5254,18 +5254,14 @@ impl DeviceRank {
                 return Err(other_kind());
             };
             let cached = floats(run.position * dim);
-            self.launch(
-                self.kernels.layer_norm.kernel(),
-                (run.len as u32, 1, 1),
-                BLOCK,
-                &[
-                    s.index_fused.offset(floats(run.first * dim)).0,
-                    indexer.k_norm_weight.0,
-                    indexer.k_norm_bias.0,
-                    index_keys.offset(cached).0,
-                    dim as u64,
-                    float(INDEX_KEY_NORM_EPS),
-                ],
+            self.kernels.layer_norm.run(
+                self,
+                s.index_fused.offset(floats(run.first * dim)),
+                (indexer.k_norm_weight, indexer.k_norm_bias),
+                index_keys.offset(cached),
+                dim,
+                INDEX_KEY_NORM_EPS,
+                run.len,
             )?;
             self.launch(
                 self.kernels.copy_flat.kernel(),
@@ -6721,16 +6717,16 @@ impl DeviceRank {
             ],
         )?;
         let normed = row(s.head_normed, hidden);
-        self.call(
-            self.kernels.rmsnorm.kernel(),
+        self.kernels.norm.run(
+            self,
             RmsNorm::new(
                 row(s.head, hidden).0,
                 self.norm.0,
                 normed.0,
                 hidden,
                 config.rms_norm_eps as f32,
-            )
-            .call(count),
+            ),
+            count,
         )?;
         // The LM head and the MTP layer's caches read every row's normed hidden.
         if let Some(share) = share {
@@ -6989,10 +6985,9 @@ impl DeviceRank {
             hidden,
             self.config.rms_norm_eps as f32,
         );
-        self.call(
-            self.kernels.rmsnorm_rows.kernel(),
-            norm.rows_call(rows, src_stride, dst_stride),
-        )
+        self.kernels
+            .norm
+            .strided(self, norm, rows, (src_stride, dst_stride))
     }
 
     /// `rows` hiddens, one after another from `from`, normed into the hidden halves of the MTP

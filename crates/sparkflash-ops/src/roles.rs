@@ -322,15 +322,7 @@ impl Embed {
         streams: usize,
     ) -> Result<Self, BackendError> {
         let [(symbol, _)] = Self::TABLE.symbols;
-        if kernel.kernel().name() != symbol {
-            return Err(BackendError::new(
-                ROLE,
-                format!(
-                    "the embedding runs {symbol}, not {}",
-                    kernel.kernel().name()
-                ),
-            ));
-        }
+        runs(kernel, symbol, "the embedding")?;
         if hidden == 0 || streams == 0 {
             return Err(BackendError::new(
                 ROLE,
@@ -404,6 +396,193 @@ impl Embed {
         rows.iter()
             .enumerate()
             .try_for_each(|(at, &row)| self.row(cx, out.offset(at * self.width * 4), row))
+    }
+}
+
+/// Whether `kernel` is `symbol`, the kernel `role` runs.
+fn runs(kernel: Bound, symbol: &str, role: &str) -> Result<(), BackendError> {
+    let name = kernel.kernel().name();
+    if name == symbol {
+        Ok(())
+    } else {
+        Err(BackendError::new(
+            ROLE,
+            format!("{role} runs {symbol}, not {name}"),
+        ))
+    }
+}
+
+/// RMSNorm: `q4e_rmsnorm` over contiguous rows, a block a group, and `q4e_rmsnorm_rows` over
+/// rows a stride apart, a block a row's group. The plan ([calls::RmsNorm]) carries the buffers,
+/// the epsilon and the flags: zero-centred gains, and per-head groups each taking the same gains.
+#[derive(Clone, Copy, Debug)]
+pub struct Norm {
+    contiguous: Bound,
+    strided: Option<Bound>,
+}
+
+impl Norm {
+    /// The contiguous norm and the strided one.
+    pub const TABLE: KernelTable<2> = KernelTable {
+        image: Image::Qwen4Exp,
+        symbols: [
+            ("q4e_rmsnorm", Precision::Bf16),
+            ("q4e_rmsnorm_rows", Precision::Bf16),
+        ],
+    };
+
+    /// `contiguous` (the loaded `q4e_rmsnorm`) and, when the arm loads it, `strided`
+    /// (`q4e_rmsnorm_rows`).
+    ///
+    /// # Errors
+    /// Another kernel in either place, by name.
+    pub fn new(contiguous: Bound, strided: Option<Bound>) -> Result<Self, String> {
+        let [(rows, _), (rows_strided, _)] = Self::TABLE.symbols;
+        runs(contiguous, rows, "the norm").map_err(|error| error.to_string())?;
+        if let Some(strided) = strided {
+            runs(strided, rows_strided, "the strided norm").map_err(|error| error.to_string())?;
+        }
+        Ok(Self {
+            contiguous,
+            strided,
+        })
+    }
+
+    /// The contiguous norm's kernel.
+    #[must_use]
+    pub const fn contiguous(&self) -> Bound {
+        self.contiguous
+    }
+
+    /// `plan` over `rows` contiguous rows, one launch.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        plan: calls::RmsNorm,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        cx.call(self.contiguous, plan.call(rows))
+    }
+
+    /// `plan` over `rows` rows, `src_stride` floats apart in the input and `dst_stride` in the
+    /// output, one launch.
+    ///
+    /// # Errors
+    /// An arm that loaded no strided norm, by name, or the driver's refusal.
+    pub fn strided<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        plan: calls::RmsNorm,
+        rows: usize,
+        (src_stride, dst_stride): (usize, usize),
+    ) -> Result<(), BackendError> {
+        let Some(strided) = self.strided else {
+            return Err(BackendError::new(
+                ROLE,
+                "this arm loaded no q4e_rmsnorm_rows for a strided norm",
+            ));
+        };
+        cx.call(strided, plan.rows_call(rows, src_stride, dst_stride))
+    }
+}
+
+/// LayerNorm with gains and biases (`q4e_layer_norm`): a block a row, `width` floats a row.
+#[derive(Clone, Copy, Debug)]
+pub struct LayerNorm {
+    kernel: Bound,
+}
+
+impl LayerNorm {
+    /// The layer norm's kernel.
+    pub const TABLE: KernelTable<1> = KernelTable {
+        image: Image::GlmDecode,
+        symbols: [("q4e_layer_norm", Precision::Bf16)],
+    };
+
+    /// `kernel`, the loaded `q4e_layer_norm`.
+    ///
+    /// # Errors
+    /// Another kernel, by name.
+    pub fn new(kernel: Bound) -> Result<Self, String> {
+        let [(symbol, _)] = Self::TABLE.symbols;
+        runs(kernel, symbol, "the layer norm").map_err(|error| error.to_string())?;
+        Ok(Self { kernel })
+    }
+
+    /// `rows` rows of `width` floats from `input`, normed by `(gains, biases)` (BF16) at `eps`
+    /// into `output`, one launch.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        input: Deviceptr,
+        (gains, biases): (Deviceptr, Deviceptr),
+        output: Deviceptr,
+        width: usize,
+        eps: f32,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        cx.launch(
+            self.kernel,
+            ((rows as u32, 1, 1), (BLOCK, 1, 1)),
+            &[
+                input.0,
+                gains.0,
+                biases.0,
+                output.0,
+                width as u64,
+                u64::from(eps.to_bits()),
+            ],
+        )
+    }
+}
+
+/// nGPT's norm (`dory_justnorm`): every row of `width` floats scaled to unit length in place, a
+/// block a row.
+#[derive(Clone, Copy, Debug)]
+pub struct NgptNorm {
+    kernel: Bound,
+}
+
+impl NgptNorm {
+    /// The nGPT norm's kernel.
+    pub const TABLE: KernelTable<1> = KernelTable {
+        image: Image::Dory,
+        symbols: [("dory_justnorm", Precision::Bf16)],
+    };
+
+    /// `kernel`, the loaded `dory_justnorm`.
+    ///
+    /// # Errors
+    /// Another kernel, by name.
+    pub fn new(kernel: Bound) -> Result<Self, String> {
+        let [(symbol, _)] = Self::TABLE.symbols;
+        runs(kernel, symbol, "the nGPT norm").map_err(|error| error.to_string())?;
+        Ok(Self { kernel })
+    }
+
+    /// `rows` rows of `width` floats at `values`, each to unit length in place, one launch.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn run<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        values: Deviceptr,
+        width: usize,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        cx.launch(
+            self.kernel,
+            ((1, rows as u32, 1), (BLOCK, 1, 1)),
+            &[values.0, width as u64],
+        )
     }
 }
 

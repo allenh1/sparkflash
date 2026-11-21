@@ -99,7 +99,7 @@ use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
-use sparkflash_ops::roles::{Bound, Launcher, ManifoldMixer};
+use sparkflash_ops::roles::{Bound, Launcher, ManifoldMixer, Norm};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
@@ -645,7 +645,7 @@ struct Kernels {
     embed: Bound,
     gemv: Bound,
     packed: PackedKernels,
-    rmsnorm: Bound,
+    norm: Norm,
     rope: Bound,
     swiglu: Bound,
     swiglu_clamped: Bound,
@@ -842,7 +842,7 @@ impl Kernels {
             embed: token("q4e_embed", Precision::Bf16)?,
             gemv: token("q4e_gemv_bf16", Precision::Bf16)?,
             packed,
-            rmsnorm: token("q4e_rmsnorm", Precision::Bf16)?,
+            norm: Norm::new(token("q4e_rmsnorm", Precision::Bf16)?, None)?,
             rope: token("q4e_rope", Precision::Bf16)?,
             swiglu: token("q4e_swiglu", Precision::Bf16)?,
             swiglu_clamped: token("q4e_swiglu_clamped", Precision::Bf16)?,
@@ -2907,10 +2907,9 @@ impl Shared {
     }
 
     fn norm(&self, plan: RmsNorm, rows: usize) -> Result<(), BackendError> {
-        self.call(
-            self.kernels.rmsnorm,
-            plan.zero_centred(self.zero_centred).call(rows),
-        )
+        self.kernels
+            .norm
+            .run(self, plan.zero_centred(self.zero_centred), rows)
     }
 
     /// `output = down(silu(gate(normed)) * up(normed))` over `rows`, in the MLP scratch, the gate

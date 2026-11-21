@@ -112,7 +112,7 @@ use sparkflash_ops::gemv::gemv_e4m3_tile;
 use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{Form, PackedSet, Placement, Tiled};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::{Bound, Embed, Launcher};
+use sparkflash_ops::roles::{Bound, Embed, Launcher, Norm};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -599,7 +599,7 @@ struct Kernels {
     gemm_bf16: Bound,
     gemm_reduce: Bound,
     shared_gate_up: Bound,
-    rmsnorm: Bound,
+    norm: Norm,
     zero: Bound,
     add: Bound,
     hyper_down: Bound,
@@ -642,7 +642,6 @@ struct Kernels {
     ple_gate: Bound,
     ple_conv: Bound,
     deinterleave: Bound,
-    rmsnorm_rows: Bound,
     copy_flat: Bound,
     /// Narrow a f32 projection row into the BF16 KV cache, flat or one row at a time.
     cache_bf16: Bound,
@@ -740,7 +739,10 @@ impl Kernels {
             gemm_bf16: token("q4e_gemm_bf16", Precision::Bf16)?,
             gemm_reduce: token("q4e_gemm_reduce", Precision::Bf16)?,
             shared_gate_up: token("q4e_shared_gate_up", Precision::Bf16)?,
-            rmsnorm: token("q4e_rmsnorm", Precision::Bf16)?,
+            norm: Norm::new(
+                token("q4e_rmsnorm", Precision::Bf16)?,
+                Some(token("q4e_rmsnorm_rows", Precision::Bf16)?),
+            )?,
             zero: token("q4e_zero", Precision::Bf16)?,
             add: token("q4e_add", Precision::Bf16)?,
             hyper_down: token("q4e_hyper_down", Precision::Bf16)?,
@@ -813,7 +815,6 @@ impl Kernels {
             ple_gate: token("q4e_ple_gate", Precision::Bf16)?,
             ple_conv: token("q4e_ple_conv", Precision::Bf16)?,
             deinterleave: token("q4e_deinterleave", Precision::Bf16)?,
-            rmsnorm_rows: token("q4e_rmsnorm_rows", Precision::Bf16)?,
             copy_flat: token("q4e_copy_flat", Precision::F32)?,
             cache_bf16: attn("q4e_cache_bf16", Precision::Bf16)?,
             cache_rows_bf16: attn("q4e_cache_rows_bf16", Precision::Bf16)?,
@@ -3309,7 +3310,7 @@ impl Qwen4ExpDeviceBackend {
         self.shared
             .cuda
             .launch(
-                self.shared.kernels.rmsnorm.kernel(),
+                self.shared.kernels.norm.contiguous().kernel(),
                 norm.grid,
                 norm.block,
                 &norm.args,
@@ -4779,7 +4780,7 @@ impl DeviceSequence {
         )
         .zero_centred(zero_centred)
         .groups(group, weight_per_group);
-        self.call(self.backend.kernels.rmsnorm, norm.call(batch))
+        self.backend.kernels.norm.run(self, norm, batch)
     }
 
     fn hyper(
@@ -7004,8 +7005,13 @@ pub fn device_self_test() -> Result<(), BackendError> {
     .zero_centred(true)
     .groups(width, true)
     .call(1);
-    cuda.launch(kernels.rmsnorm.kernel(), norm.grid, norm.block, &norm.args)
-        .map_err(|error| BackendError::new("qwen4_device", error))?;
+    cuda.launch(
+        kernels.norm.contiguous().kernel(),
+        norm.grid,
+        norm.block,
+        &norm.args,
+    )
+    .map_err(|error| BackendError::new("qwen4_device", error))?;
     let mut bytes = vec![0u8; width * 4];
     cuda.copy_dtoh(&mut bytes, &device_output)
         .map_err(|error| BackendError::new("qwen4_device", error))?;

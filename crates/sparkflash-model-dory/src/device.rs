@@ -44,7 +44,7 @@ use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement};
 use sparkflash_ops::plan::Precision;
-use sparkflash_ops::roles::{Bound, Embed, Launcher};
+use sparkflash_ops::roles::{Bound, Embed, Launcher, NgptNorm};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog};
 // dory_mma_wide's tile is the shared wide tile: its geometry, launch and when a projection
 // takes it are the dispatcher's.
@@ -327,7 +327,7 @@ struct Kernels {
     mlp_epilogue: Bound,
     slerp: Bound,
     loop_combine: Bound,
-    justnorm: Bound,
+    justnorm: NgptNorm,
     logit_scale: Bound,
     packed: packed::Kernels,
 }
@@ -714,7 +714,7 @@ impl Kernels {
             mlp_epilogue: dory("dory_mlp_epilogue")?,
             slerp: dory("dory_slerp")?,
             loop_combine: dory("dory_loop_combine")?,
-            justnorm: dory("dory_justnorm")?,
+            justnorm: NgptNorm::new(dory("dory_justnorm")?)?,
             logit_scale: dory("dory_logit_scale")?,
             packed: packed::Kernels::load(cuda)?,
         })
@@ -1845,13 +1845,10 @@ impl StageCore {
                 &args,
             )?;
         }
-        launch(
-            cuda,
-            shared.kernels.justnorm,
-            (1, count as u32, 1),
-            (256, 1, 1),
-            &[scratch.attention.0, q_width as u64],
-        )?;
+        shared
+            .kernels
+            .justnorm
+            .run(shared, scratch.attention, q_width, count)?;
         gemv_batch(
             cuda,
             &shared.kernels,
@@ -1969,13 +1966,10 @@ impl StageCore {
                 ring as u64,
             ],
         )?;
-        launch(
-            cuda,
-            shared.kernels.justnorm,
-            (1, batch as u32, 1),
-            (256, 1, 1),
-            &[self.scratch.attention.0, q_width as u64],
-        )?;
+        shared
+            .kernels
+            .justnorm
+            .run(shared, self.scratch.attention, q_width, batch)?;
         gemv_batch(
             cuda,
             &shared.kernels,
@@ -2358,13 +2352,10 @@ fn edge(
             ],
         ),
         Edge::LoopEnd => {
-            launch(
-                cuda,
-                shared.kernels.justnorm,
-                (1, rows as u32, 1),
-                (256, 1, 1),
-                &[scratch.hidden.0, hidden as u64],
-            )?;
+            shared
+                .kernels
+                .justnorm
+                .run(shared, scratch.hidden, hidden, rows)?;
             copy(cuda, scratch.state, scratch.hidden, bytes)
         }
         Edge::Suffix => copy(cuda, scratch.hidden, scratch.state, bytes),
