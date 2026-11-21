@@ -138,6 +138,21 @@ impl<L> PlanSeq<L> {
     pub fn position(&self) -> usize {
         self.history.len()
     }
+
+    /// Keeps the first `rows` ids of the history and gives the rest back: a drafter's settle,
+    /// once its lane kept the leading run of a verify the walk took whole. The sampler's history
+    /// is the round's own and stays.
+    ///
+    /// # Errors
+    /// More rows than the history holds.
+    pub fn keep(&mut self, rows: usize) -> Result<(), BackendError>
+    where
+        L: PlanLane,
+    {
+        check_rewind(L::DEVICE, rows, self.history.len())?;
+        self.history.truncate(rows);
+        Ok(())
+    }
 }
 
 impl<L: PlanLane> LaneState for PlanSeq<L> {
@@ -169,6 +184,24 @@ impl<L: PlanLane> LaneState for PlanSeq<L> {
 
 /// The segments of one walk: each sequence and the ids it takes, rows laid one after another.
 pub type PlanRows<'a, 'b, L> = [(&'a mut PlanSeq<L>, &'b [u32])];
+
+/// One window of a pass, as [`PlanHost::begin_window`] sees it before the window runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanWindow {
+    /// The pass the window is part of.
+    pub pass: PlanPass,
+    /// The window's place among the pass's windows, from zero.
+    pub number: usize,
+    /// The pass's windows.
+    pub windows: usize,
+    /// The pass row of the window's first row.
+    pub first: usize,
+    /// The window's rows.
+    pub rows: usize,
+    /// For each of the window's segments, in order, the rows of its sequence this pass takes
+    /// after the window.
+    pub after: Vec<usize>,
+}
 
 /// The device a [`PlanWalk`] drives. Every method is required.
 ///
@@ -248,6 +281,35 @@ pub trait PlanHost: Send + Sync + Sized + 'static {
     ) -> Result<Vec<usize>, BackendError> {
         let _ = pass;
         Ok(vec![segments.iter().map(|(_, ids)| ids.len()).sum()])
+    }
+
+    /// The host's start of a window, before its embed: what the window's rows need set up before
+    /// any layer runs, over the window's segments (their histories do not hold the window's ids
+    /// yet). Nothing by default.
+    ///
+    /// # Errors
+    /// A window the host refuses, or a device failure.
+    fn begin_window(
+        &self,
+        scratch: &Self::Scratch,
+        segments: &mut PlanRows<'_, '_, Self::Lane>,
+        window: &PlanWindow,
+    ) -> Result<(), BackendError> {
+        let _ = (scratch, segments, window);
+        Ok(())
+    }
+
+    /// A window that [`Self::begin_window`] began failed before its [`Self::finish`] ended it:
+    /// the host puts back what the begin set up. Nothing by default.
+    fn abandon_window(&self, scratch: &Self::Scratch) {
+        let _ = scratch;
+    }
+
+    /// The regions a sequence's lane holds, in walk order: the walk's layout. The state every
+    /// part declares by default ([`plan_state`]); a host whose lane its own cache plan lays out
+    /// states that plan's.
+    fn regions(&self) -> Vec<Region> {
+        plan_state(self)
     }
 
     /// The host's tail after a window's layers, over the window's segments (their histories do
@@ -459,7 +521,9 @@ pub fn plan_state<H: PlanHost>(host: &H) -> Vec<Region> {
 /// embeds its ids and runs every layer's branches in run order: the host's entry, the part's
 /// `body`, the host's exit (the group's combine where the part leaves a partial, then the
 /// landing); then the host's tail ([`PlanHost::finish`]), and each sequence's history takes the
-/// window's ids. The residual of the last window's rows is left in the host's buffer. Each
+/// window's ids. The host begins each window ([`PlanHost::begin_window`]) before its embed, and
+/// puts back one that fails before its tail ([`PlanHost::abandon_window`]). The residual of the
+/// last window's rows is left in the host's buffer. Each
 /// window takes `mode`, or the host's [`PlanHost::mode`] for it when `None`. With `trace`, each
 /// layer's residual rows are appended to the layer's entry.
 ///
@@ -517,8 +581,10 @@ pub fn walk_rows<H: PlanHost>(
     let mut start = 0;
     for (number, &count) in windows.iter().enumerate() {
         let end = start + count;
-        // The window's slice of each segment it reaches, in row order.
+        // The window's slice of each segment it reaches, in row order, and the segment's rows
+        // after it.
         let mut window: Vec<(&mut PlanSeq<H::Lane>, &[u32])> = Vec::new();
+        let mut after = Vec::new();
         let mut at = 0;
         for (sequence, tokens) in segments.iter_mut() {
             let (low, high) = (at, at + tokens.len());
@@ -526,6 +592,7 @@ pub fn walk_rows<H: PlanHost>(
             let (from, to) = (low.max(start), high.min(end));
             if from < to {
                 window.push((&mut **sequence, &tokens[from - low..to - low]));
+                after.push(high - to);
             }
         }
         let ids: Vec<u32> = window
@@ -533,28 +600,44 @@ pub fn walk_rows<H: PlanHost>(
             .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
         let mode = mode.unwrap_or_else(|| host.mode(pass, count));
-        host.embed(scratch, &ids)?;
-        for index in 0..layers {
-            for (at, branch) in host.branches(index).iter().enumerate() {
-                host.enter(scratch, &branch.frame, count)?;
-                let mut part = host.pass(scratch, &window, index, branch.slot, count, mode);
-                // One dynamic call a part a pass.
-                body.run::<H::Parts, _>(&*branch.part, &mut part)?;
-                drop(part);
-                host.leave(
-                    scratch,
-                    &branch.frame,
-                    next(index, at),
-                    branch.summed,
-                    count,
-                )?;
+        let planned = PlanWindow {
+            pass,
+            number,
+            windows: windows.len(),
+            first: start,
+            rows: count,
+            after,
+        };
+        host.begin_window(scratch, &mut window, &planned)?;
+        let mut run = || {
+            host.embed(scratch, &ids)?;
+            for index in 0..layers {
+                for (at, branch) in host.branches(index).iter().enumerate() {
+                    host.enter(scratch, &branch.frame, count)?;
+                    let mut part = host.pass(scratch, &window, index, branch.slot, count, mode);
+                    // One dynamic call a part a pass.
+                    body.run::<H::Parts, _>(&*branch.part, &mut part)?;
+                    drop(part);
+                    host.leave(
+                        scratch,
+                        &branch.frame,
+                        next(index, at),
+                        branch.summed,
+                        count,
+                    )?;
+                }
+                if let Some(trace) = trace.as_deref_mut() {
+                    let residual = host.residual(scratch, count)?;
+                    trace[index].extend(residual);
+                }
             }
-            if let Some(trace) = trace.as_deref_mut() {
-                let residual = host.residual(scratch, count)?;
-                trace[index].extend(residual);
-            }
+            host.finish(scratch, &mut window, pass, number + 1 == windows.len())
+        };
+        let ran = run();
+        if ran.is_err() {
+            host.abandon_window(scratch);
         }
-        host.finish(scratch, &mut window, pass, number + 1 == windows.len())?;
+        ran?;
         for (sequence, tokens) in &mut window {
             sequence.history.extend_from_slice(tokens);
         }
@@ -580,7 +663,7 @@ impl<H: PlanHost> PlanWalk<H> {
     pub fn new(host: Arc<H>, capacity: usize) -> Result<Self, BackendError> {
         let rows = capacity.clamp(1, host.pass_rows());
         let scratch = H::scratch(&host, rows)?;
-        let layout = StateLayout::new(plan_state(&*host));
+        let layout = StateLayout::new(host.regions());
         let limits = host.limits();
         let drafter = H::drafter(&host)?;
         Ok(Self {
