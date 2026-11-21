@@ -71,7 +71,8 @@ impl LayerStep {
     }
 
     /// Build a step from a parsed layer, reading only its typed fields.
-    fn from_layer(layer: &Layer) -> Self {
+    #[must_use]
+    pub fn from_layer(layer: &Layer) -> Self {
         let attention = match &layer.attention.kind {
             AttentionKind::Mla { .. } => Part::MlaAttention,
             AttentionKind::Gqa { .. } | AttentionKind::Inkling { .. } => Part::GqaAttention,

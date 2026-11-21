@@ -236,8 +236,10 @@ fn a_missing_tensor_is_named() {
     assert!(error.contains(gone), "{error}");
 }
 
+/// An attention the convention does not spell is left to the family's own part (its prefix is
+/// named, its tensors are not), and the tensor plan, which must size every tensor, refuses it.
 #[test]
-fn a_family_the_convention_does_not_spell_is_refused() {
+fn a_mixer_the_convention_does_not_spell_is_the_familys() {
     let mut document: serde_json::Value = serde_json::from_str(
         r#"{"model_type": "acme_latent", "hidden_size": 64, "intermediate_size": 128,
             "num_hidden_layers": 1, "num_attention_heads": 4, "vocab_size": 32,
@@ -246,10 +248,23 @@ fn a_family_the_convention_does_not_spell_is_refused() {
     .expect("json");
     document["max_position_embeddings"] = serde_json::json!(128);
     let architecture = Architecture::from_json(&document.to_string()).expect("an MLA document");
-    let error = NamingDialect::canonical(&architecture)
+    let names = NamingDialect::canonical(&architecture)
         .names(&architecture)
-        .expect_err("MLA has no shared spelling");
-    assert!(error.contains("shared naming"), "{error}");
+        .expect("the layer's prefix is named");
+    let AttentionNames::Own { root } = &names.layers[0].attention else {
+        panic!(
+            "MLA has no shared spelling: {:?}",
+            names.layers[0].attention
+        );
+    };
+    assert_eq!(root, "model.layers.0.self_attn");
+    assert!(
+        !names
+            .walk()
+            .iter()
+            .any(|name| name.starts_with(root.as_str())),
+        "the walk names none of the family's tensors"
+    );
     assert!(
         ArchitectureTensorPlan::served(&architecture, TpPlan::new(1, 0).expect("one rank"))
             .is_err()

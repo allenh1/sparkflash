@@ -72,6 +72,8 @@ impl TensorNames {
                     out.extend(k_norm.iter().cloned());
                 }
                 AttentionNames::Gdn(gdn) => out.extend(gdn.all().into_iter().map(str::to_owned)),
+                // The family's part checks its own tensors when it opens.
+                AttentionNames::Own { .. } => {}
             }
             out.push(layer.post_norm.clone());
             match &layer.ffn {
@@ -135,6 +137,12 @@ pub enum AttentionNames {
     },
     /// Gated DeltaNet.
     Gdn(GdnNames),
+    /// A mixer the convention does not spell tensor by tensor (MLA, KDA, Inkling's): the part a
+    /// family registers for it reads its own tensors under `root` (`<layer>.self_attn`).
+    Own {
+        /// The layer's attention prefix.
+        root: String,
+    },
 }
 
 /// A Gated DeltaNet block's tensors.
@@ -426,8 +434,8 @@ impl NamingDialect {
     /// Every tensor `architecture` reads, in this dialect.
     ///
     /// # Errors
-    /// A layer the convention does not name: a hyper-connection, a side lookup (Engram or PLE),
-    /// or an attention family other than GQA and Gated DeltaNet.
+    /// A layer the convention does not name: a hyper-connection or a side lookup (Engram or PLE).
+    /// An attention family other than GQA and Gated DeltaNet is [AttentionNames::Own].
     pub fn names(&self, architecture: &Architecture) -> Result<TensorNames, String> {
         let mut layers = Vec::with_capacity(architecture.layers.len());
         for layer in &architecture.layers {
@@ -471,15 +479,13 @@ impl NamingDialect {
                         norm: format!("{a}.norm.weight"),
                     })
                 }
-                // Every kind is named, no wildcard: a new kind leads the compiler here.
-                other @ (AttentionKind::Mla { .. }
+                // Every kind is named, no wildcard: a new kind leads the compiler here. A kind
+                // the convention does not spell is the family's part's to read.
+                AttentionKind::Mla { .. }
                 | AttentionKind::Inkling { .. }
-                | AttentionKind::Kda(_)) => {
-                    return Err(format!(
-                        "layer {} uses {other:?}, which the shared naming does not spell",
-                        layer.index
-                    ));
-                }
+                | AttentionKind::Kda(_) => AttentionNames::Own {
+                    root: format!("{p}.self_attn"),
+                },
             };
             let ffn = match &layer.ffn {
                 Ffn::Dense(_) => FfnNames::Dense(ExpertNames::under(&format!("{p}.mlp"))),

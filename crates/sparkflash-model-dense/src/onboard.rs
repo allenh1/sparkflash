@@ -63,7 +63,8 @@ pub struct Survey {
     pub unhosted: BTreeSet<(StepRole, Part)>,
     /// Capabilities the shared walk does not host yet (a draft head, an image tower).
     pub capabilities: Vec<&'static str>,
-    /// Why the shared dense host refuses the checkpoint as it stands, if it does.
+    /// Why the shared dense host refuses the checkpoint once the family registers its own
+    /// parts, if it still does: what the parts alone do not settle.
     pub refusal: Option<String>,
     /// Declarations the shared description does not model ([Architecture::unmodelled_features]).
     pub unmodelled: Vec<String>,
@@ -88,7 +89,6 @@ impl Survey {
 pub fn survey(architecture: &Architecture, unmodelled: Vec<String>) -> Survey {
     let registry = Dense::catalogue();
     let mut survey = Survey {
-        refusal: sparkflash_ops::parts::dense_device_refusal(architecture),
         unmodelled,
         ..Survey::default()
     };
@@ -103,6 +103,8 @@ pub fn survey(architecture: &Architecture, unmodelled: Vec<String>) -> Survey {
             survey.unhosted.insert((role, part));
         }
     });
+    let own: Vec<Part> = survey.own.iter().copied().collect();
+    survey.refusal = sparkflash_ops::parts::dense_device_refusal_hosting(architecture, &own);
     if architecture.mtp.is_some() {
         survey
             .capabilities
@@ -138,9 +140,11 @@ fn camel(name: &str) -> String {
         .collect()
 }
 
-/// The edits outside the crate a family still makes, as the review's recount lists them.
+/// The edits outside the crate `family` still makes, as the review's recount lists them.
 #[must_use]
-pub fn outside_edits(krate: &str) -> Vec<String> {
+pub fn outside_edits(family: &str) -> Vec<String> {
+    let krate = crate_name(family);
+    let library = krate.replace('-', "_");
     vec![
         format!(
             "Cargo.toml: \"crates/{krate}\" in [workspace] members (cargo refuses a crate under \
@@ -153,10 +157,11 @@ pub fn outside_edits(krate: &str) -> Vec<String> {
          descriptor.rs) and an ARMS entry (crates/sparkflash-model/src/arms.rs); the tests there \
          fail on a descriptor with no arm, an arm with no ledger, or a selector with no descriptor"
             .to_owned(),
-        "crates/sparkflash-cli/src/serve/dynamic.rs: the dynamic route opens Dense::catalogue(); \
-         a family with parts of its own opens its registry there (there is no registration point \
-         yet)"
-            .to_owned(),
+        format!(
+            "crates/sparkflash-cli: {krate} as a dependency, and one DENSE_FAMILIES row in \
+             src/serve/dynamic.rs, (\"{family}\", {library}::parts), so the dynamic route opens \
+             the dense arm with the family's parts"
+        ),
     ]
 }
 
@@ -234,10 +239,13 @@ pub fn emit(
         let _ = writeln!(report, "  describe first: {declaration}");
     }
     if let Some(refusal) = &survey.refusal {
-        let _ = writeln!(report, "  the dense host refuses it today: {refusal}");
+        let _ = writeln!(
+            report,
+            "  with its parts registered, the dense host still refuses it: {refusal}"
+        );
     }
     let _ = writeln!(report, "the edits outside the crate:");
-    for edit in outside_edits(&krate) {
+    for edit in outside_edits(family) {
         let _ = writeln!(report, "  {edit}");
     }
     Ok(report)
@@ -302,7 +310,7 @@ fn lib_rs(id: &str, family: &str, survey: &Survey) -> String {
     if let Some(refusal) = &survey.refusal {
         let _ = writeln!(
             out,
-            "//! The dense host refuses the checkpoint today: {refusal}."
+            "//! With these parts registered, the dense host still refuses the checkpoint: {refusal}."
         );
     }
     let _ = write!(
@@ -488,6 +496,10 @@ mod tests {
             .replace("\"head_dim\": 64,", "\"kv_lora_rank\": 64, \"qk_nope_head_dim\": 32, \"qk_rope_head_dim\": 32, \"v_head_dim\": 64,");
         let (architecture, survey) = surveyed(&text);
         assert!(survey.own.contains(&Part::MlaAttention), "{survey:?}");
+        assert_eq!(
+            survey.refusal, None,
+            "the family's MLA part settles the dense gate"
+        );
         let dir = std::env::temp_dir().join(format!("sparkflash-onboard-{}", std::process::id()));
         let report = emit("made/up", &text, &architecture, &survey, &dir).expect("written");
         assert!(report.contains("MlaAttentionPart"), "{report}");

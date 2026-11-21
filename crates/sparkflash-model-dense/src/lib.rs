@@ -113,7 +113,9 @@ pub mod onboard;
 pub mod parts;
 mod walk;
 
-pub use parts::{Dense, DensePart, DenseParts, OpenCx, PassCx, ScratchSlot, SegmentRows};
+pub use parts::{
+    Dense, DenseFamily, DensePart, DenseParts, OpenCx, PassCx, ScratchSlot, SegmentRows,
+};
 pub use walk::DenseWalk;
 
 /// The dense arm's sequence, as the runtime drives it. The runtime owns the prompt parts, the
@@ -226,13 +228,21 @@ struct Routed {
 
 impl Shape {
     /// Layer `index`'s shape as `shard`'s rank holds it, every sharded count and width its
-    /// share, and where each share starts.
-    fn of(architecture: &Architecture, index: usize, shard: Shard) -> Result<Self, String> {
+    /// share, and where each share starts. A mixer whose part is the family's own (`own`) has
+    /// no attention shape here: the part sizes and splits what it reads.
+    fn of(
+        architecture: &Architecture,
+        index: usize,
+        shard: Shard,
+        own: &[sparkflash_model::Part],
+    ) -> Result<Self, String> {
         let layer = &architecture.layers[index];
         let attention = &layer.attention;
         let what = |axis: &str| format!("layer {index}'s {axis}");
         let mut cut = Cut::default();
+        let mixer_owned = own.contains(&LayerStep::from_layer(layer).attention);
         let (heads, kv_heads, head_dim, gated, linear) = match &attention.kind {
+            _ if mixer_owned => (0, 0, 0, false, None),
             AttentionKind::Gqa {
                 kv_heads,
                 output_gate,
@@ -1097,7 +1107,10 @@ impl DenseDeviceBackend {
         tp: Option<TpRuntime>,
         parts: &DenseParts,
     ) -> Result<Self, String> {
-        if let Some(refusal) = sparkflash_ops::parts::dense_device_refusal(architecture) {
+        let own = Dense::own(parts);
+        if let Some(refusal) =
+            sparkflash_ops::parts::dense_device_refusal_hosting(architecture, &own)
+        {
             return Err(format!("the shared dense device arm refuses it: {refusal}"));
         }
         // Every part a step names has an executor before anything is loaded: a part with none is
@@ -1133,7 +1146,7 @@ impl DenseDeviceBackend {
             None => Shard::whole(),
         };
         let shapes = (0..architecture.layers.len())
-            .map(|index| Shape::of(architecture, index, shard))
+            .map(|index| Shape::of(architecture, index, shard, &own))
             .collect::<Result<Vec<_>, _>>()?;
         let cuda = CudaHandle::new(Cuda::load()?);
         sparkflash_kernels::cuda_driver::enable_forward_async_launches();
@@ -2398,10 +2411,11 @@ fn upload<'a>(
             shapes.len()
         ));
     }
+    let own = Dense::own(parts);
     let mut slot = 0usize;
     for (index, (layer_names, shape)) in names.layers.iter().zip(shapes).enumerate() {
         open.index = index;
-        open.whole = Some(Shape::of(architecture, index, Shard::whole())?);
+        open.whole = Some(Shape::of(architecture, index, Shard::whole(), &own)?);
         // The parts first, in forward order, then the norms each reads its input through.
         let mut built = Vec::new();
         for (role, kind) in sparkflash_runtime::plan_roles(&steps[index])? {

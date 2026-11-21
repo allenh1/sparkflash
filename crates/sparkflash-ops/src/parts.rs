@@ -2728,6 +2728,18 @@ const DORY_QWEN_SYMBOLS: &[&str] = &["q4e_embed", "q4e_gemv4_bf16", "q4e_gemv_bf
 /// # Errors
 /// Why no device arm serves the checkpoint, so the host reference is its executor.
 pub fn dynamic_device_arm(architecture: &Architecture) -> Result<&'static str, String> {
+    dynamic_device_arm_hosting(architecture, &[])
+}
+
+/// [dynamic_device_arm] for a family that registers executors of its own for the parts in
+/// `own`, which the shared dense arm then takes as [dense_device_refusal_hosting] says.
+///
+/// # Errors
+/// As [dynamic_device_arm].
+pub fn dynamic_device_arm_hosting(
+    architecture: &Architecture,
+    own: &[Part],
+) -> Result<&'static str, String> {
     let family = sparkflash_model::canonical_model_type(&architecture.family);
     if family == "dory" {
         // The released BF16 checkpoint has a Dory device arm: its custom kernels live in the
@@ -2765,7 +2777,7 @@ pub fn dynamic_device_arm(architecture: &Architecture) -> Result<&'static str, S
     if family != "qwen3_5_moe" {
         // A family no pack transcribes is the shared dense arm's when it is the dense
         // grouped-query decoder that arm executes and this build carries its kernels.
-        if let Some(refusal) = dense_device_refusal(architecture) {
+        if let Some(refusal) = dense_device_refusal_hosting(architecture, own) {
             return Err(format!(
                 "this build has no device arm for the {family} family: {refusal}"
             ));
@@ -2923,8 +2935,35 @@ pub fn dense_device_images() -> Result<(), String> {
 /// that checkpoint's executor.
 #[must_use]
 pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
+    dense_device_refusal_hosting(architecture, &[])
+}
+
+/// [dense_device_refusal] for a family that registers executors of its own for the parts in
+/// `own` (a token mixer no catalogue part runs, such as an MLA). A layer whose mixer is one of
+/// them is the family's to execute: the arm's attention rules (its kinds, head groups, rotary,
+/// window and output tiles) do not apply to it, and the host reference's part list does not
+/// name it. Every other rule holds: a compression, an indexer, a side lookup or a widened
+/// residual is still refused, since the shared walk runs a layer's mixer and feed-forward only.
+#[must_use]
+pub fn dense_device_refusal_hosting(architecture: &Architecture, own: &[Part]) -> Option<String> {
     use sparkflash_model::architecture::{Activation, AttentionKind, Ffn, Residual};
-    if let Some(refusal) = host_reference_structure_refusal(architecture) {
+    let owned: Vec<bool> = architecture
+        .steps()
+        .iter()
+        .map(|step| own.contains(&step.attention))
+        .collect();
+    let owned = |index: usize| owned.get(index).copied().unwrap_or(false);
+    let missing: Vec<String> = host_reference_missing(architecture)
+        .into_iter()
+        .filter(|part| !own.contains(part))
+        .map(|part| part.to_string())
+        .collect();
+    if !missing.is_empty() {
+        return Some(host_reference_missing_refusal(&missing));
+    }
+    if let Some(refusal) = rope_refusal_where(architecture, &|index| !owned(index))
+        .or_else(|| host_reference_ffn_refusal(architecture))
+    {
         return Some(refusal);
     }
     let dense_format = architecture.quantization.dense_format;
@@ -2969,7 +3008,9 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
     for layer in &architecture.layers {
         let index = layer.index;
         let attention = &layer.attention;
+        let mixer_owned = owned(index);
         let kv_heads = match &attention.kind {
+            _ if mixer_owned => None,
             AttentionKind::Gqa { kv_heads, .. } => Some(*kv_heads),
             AttentionKind::Gdn(gdn) => {
                 if let Some((first, geometry)) = first_gdn
@@ -2994,10 +3035,16 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
             }
         };
         let declared = [
-            (attention.window.is_some(), "a sliding window"),
+            (
+                !mixer_owned && attention.window.is_some(),
+                "a sliding window",
+            ),
             (attention.compression.is_some(), "a compressed cache"),
             (attention.indexer.is_some(), "a sparse indexer"),
-            (attention.rope.mrope_section.is_some(), "an mRoPE section"),
+            (
+                !mixer_owned && attention.rope.mrope_section.is_some(),
+                "an mRoPE section",
+            ),
             (!layer.sides.is_empty(), "a side table"),
             (
                 !matches!(layer.residual, Residual::Plain),
@@ -3016,6 +3063,8 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
         }
         // The output projection's columns: the attended heads, or the linear attention's values.
         let query_width = match &attention.kind {
+            // The family's part reads its own output projection.
+            _ if mixer_owned => 0,
             AttentionKind::Gdn(gdn) => gdn.value_heads * gdn.value_dim,
             AttentionKind::Gqa { .. }
             | AttentionKind::Mla { .. }
@@ -3251,12 +3300,17 @@ pub fn host_reference_structure_refusal(architecture: &Architecture) -> Option<S
     let missing = host_reference_missing(architecture);
     if !missing.is_empty() {
         let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
-        return Some(format!(
-            "the checkpoint names parts the dynamic host path does not execute: {}",
-            names.join(", ")
-        ));
+        return Some(host_reference_missing_refusal(&names));
     }
     host_reference_rope_refusal(architecture).or_else(|| host_reference_ffn_refusal(architecture))
+}
+
+/// The refusal that names the parts the host reference does not execute.
+fn host_reference_missing_refusal(names: &[String]) -> String {
+    format!(
+        "the checkpoint names parts the dynamic host path does not execute: {}",
+        names.join(", ")
+    )
 }
 
 /// The first layer whose MLP or routing rule the host reference does not apply.
@@ -3307,7 +3361,19 @@ pub fn host_reference_ffn_refusal(architecture: &Architecture) -> Option<String>
 /// the first request inside `HostSession::forward`.
 #[must_use]
 pub fn host_reference_rope_refusal(architecture: &Architecture) -> Option<String> {
-    for layer in &architecture.layers {
+    rope_refusal_where(architecture, &|_| true)
+}
+
+/// [host_reference_rope_refusal] over the layers `checked` takes.
+fn rope_refusal_where(
+    architecture: &Architecture,
+    checked: &dyn Fn(usize) -> bool,
+) -> Option<String> {
+    for layer in architecture
+        .layers
+        .iter()
+        .filter(|layer| checked(layer.index))
+    {
         let rope = &layer.attention.rope;
         // The forward skips a layer whose rotation is narrower than one pair (GLM's NoPE MLA).
         // Its scaling rule is inert there, so a yarn declaration on such a layer is not a

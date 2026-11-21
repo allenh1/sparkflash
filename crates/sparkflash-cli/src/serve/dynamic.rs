@@ -43,6 +43,7 @@ use sparkflash_model::{
     Architecture, Arm as _, Capabilities, ModelBackend, ModelDescriptor, ModelProfile, PromptCodec,
     Target,
 };
+use sparkflash_model_dense::{Dense, DenseFamily, DenseParts};
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::plan::KernelPhase;
 use sparkflash_ops::resolver::{Availability, KernelResolver};
@@ -347,6 +348,20 @@ fn codec(
     ))
 }
 
+/// The families the shared dense arm serves with parts of their own, by `config.json`'s
+/// `model_type`: each one's crate registry (its `parts()`). A family crate adds its row here.
+const DENSE_FAMILIES: &[DenseFamily] = &[];
+
+/// The executors the dense arm opens `architecture` with: its family's registry, or the
+/// catalogue's.
+fn dense_parts(architecture: &Architecture) -> DenseParts {
+    let family = sparkflash_model::canonical_model_type(&architecture.family);
+    DENSE_FAMILIES
+        .iter()
+        .find(|(name, _)| *name == family)
+        .map_or_else(Dense::catalogue, |(_, parts)| parts())
+}
+
 /// Whether a checkpoint family is served by a released device arm (rather than the host
 /// reference), and therefore judged by the kernel catalogue: a typed pack that takes the
 /// checkpoint ([pack::typed_for_checkpoint]; a Qwen3.5-MoE checkpoint is one when the device arm
@@ -412,7 +427,10 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
         // The host reference is the executor for a novel family. The CUDA catalogue answers a
         // different question (whether a kernel image carries the part) and used to over-accept a
         // catalogue-shaped MLA while refusing a host-runnable GQA at another hidden width.
-        let parts = crate::dynamic::unsupported_parts(&checkpoint.architecture);
+        // A part the family registers runs on the dense arm, not the host reference.
+        let own = Dense::own(&dense_parts(&checkpoint.architecture));
+        let mut parts = crate::dynamic::unsupported_parts(&checkpoint.architecture);
+        parts.retain(|part| !own.contains(part));
         if parts.is_empty() {
             Vec::new()
         } else {
@@ -602,25 +620,31 @@ fn serve_novel(
     let reason = if wanted == DenseDevice::Off {
         format!("{DENSE_DEVICE_ENV}=0")
     } else {
-        let opened = sparkflash_ops::parts::dynamic_device_arm(&checkpoint.architecture)
-            .and_then(|arm| {
-                if arm == sparkflash_ops::parts::DENSE_DEVICE_ARM {
-                    Ok(())
-                } else {
-                    Err(format!("{arm} is not this path's"))
-                }
-            })
-            .and_then(|()| {
-                let source =
-                    sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
-                        .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?;
-                sparkflash_model_dense::DenseDeviceBackend::open(
-                    descriptor.clone(),
-                    &checkpoint.architecture,
-                    &source,
-                    context,
-                )
-            });
+        let parts = dense_parts(&checkpoint.architecture);
+        let own = Dense::own(&parts);
+        let opened =
+            sparkflash_ops::parts::dynamic_device_arm_hosting(&checkpoint.architecture, &own)
+                .and_then(|arm| {
+                    if arm == sparkflash_ops::parts::DENSE_DEVICE_ARM {
+                        Ok(())
+                    } else {
+                        Err(format!("{arm} is not this path's"))
+                    }
+                })
+                .and_then(|()| {
+                    let source =
+                        sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
+                            .map_err(|error| {
+                                format!("{}: {error}", checkpoint.directory.display())
+                            })?;
+                    sparkflash_model_dense::DenseDeviceBackend::open_with(
+                        descriptor.clone(),
+                        &checkpoint.architecture,
+                        &source,
+                        context,
+                        &parts,
+                    )
+                });
         match opened {
             Ok(mut backend) => {
                 let lanes = dense_lanes(
@@ -706,8 +730,10 @@ fn serve_dense_group(
              device arm's group takes none of it"
         ));
     }
-    let arm =
-        sparkflash_ops::parts::dynamic_device_arm(&checkpoint.architecture).map_err(|reason| {
+    let parts = dense_parts(&checkpoint.architecture);
+    let own = Dense::own(&parts);
+    let arm = sparkflash_ops::parts::dynamic_device_arm_hosting(&checkpoint.architecture, &own)
+        .map_err(|reason| {
             format!(
                 "--model {model}: a --tp4-rank group needs the shared dense device arm: {reason}"
             )
@@ -741,12 +767,13 @@ fn serve_dense_group(
     let label = tp.label();
     let source = sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
         .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?;
-    let mut backend = sparkflash_model_dense::DenseDeviceBackend::open_rank(
+    let mut backend = sparkflash_model_dense::DenseDeviceBackend::open_rank_with(
         descriptor.clone(),
         &checkpoint.architecture,
         &source,
         context,
         tp,
+        &parts,
     )
     .map_err(|error| format!("--model {model} rank {}: {error}", tp4.rank))?;
     eprintln!(

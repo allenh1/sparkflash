@@ -58,11 +58,16 @@ pub type DensePart = Box<dyn PartExec<Dense> + Send + Sync>;
 /// The executors a dense backend builds its walk from, by part kind.
 pub type DenseParts = PartRegistry<Dense>;
 
+/// A family the dense arm serves with parts of its own: its `config.json` `model_type`, and its
+/// crate's registry (the catalogue plus the family's parts).
+pub type DenseFamily = (&'static str, fn() -> DenseParts);
+
 impl Dense {
     /// The catalogue parts' executors: every part the arm runs without a model crate.
     #[must_use]
     pub fn catalogue() -> DenseParts {
         let mut parts = DenseParts::new();
+        // The order and the kinds are [CATALOGUE_KINDS]'s.
         let registered = [
             parts.register(Part::GqaAttention, |open: &mut OpenCx<'_>| open.gqa()),
             parts.register(Part::GdnScan, |open: &mut OpenCx<'_>| open.gdn()),
@@ -75,7 +80,22 @@ impl Dense {
         );
         parts
     }
+
+    /// The kinds `parts` holds an executor for that the catalogue does not: the family's own
+    /// parts, whose layers the arm's own shape rules do not describe. A catalogue kind a family
+    /// replaces is not one of them, since its layers keep the catalogue part's shape.
+    #[must_use]
+    pub fn own(parts: &DenseParts) -> Vec<Part> {
+        parts
+            .kinds()
+            .filter(|kind| !CATALOGUE_KINDS.contains(kind))
+            .collect()
+    }
 }
+
+/// The part kinds [Dense::catalogue] registers.
+pub const CATALOGUE_KINDS: [Part; 4] =
+    [Part::GqaAttention, Part::GdnScan, Part::DenseMlp, Part::Moe];
 
 /// One pass of the walk over one part: `rows` normed rows in, the branch's rows out.
 ///
