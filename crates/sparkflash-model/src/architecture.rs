@@ -829,7 +829,46 @@ impl Architecture {
                  layers would parse as dense MLPs)"
             ));
         }
-        if let Some(config) = object(root, "quantization_config") {
+        if text.get("engram_layer_head_vocab_sizes").is_some() {
+            found.push(
+                "engram_layer_head_vocab_sizes (per-head hashed Engram tables; this build's Engram \
+                 part looks up one compressed-vocabulary table a layer)"
+                    .to_owned(),
+            );
+        }
+        // Switches that change a layer's arithmetic and that no field of [Layer] carries. Each is
+        // named only when the document turns it on.
+        for (field, what) in [
+            (
+                "sandwich_norm",
+                "a norm after each sublayer as well as before is not modelled",
+            ),
+            ("learnable_sink", "learned attention sinks are not modelled"),
+            (
+                "enable_ihc",
+                "the iHC residual mix is not the hyper-connection this parser reads",
+            ),
+            (
+                "use_compressed_indexer",
+                "the compressed indexer stage before the fine indexer is not modelled",
+            ),
+            ("gated_mla", "the gate on MLA's output is not modelled"),
+            ("qk_norm", "per-head query/key norms are not modelled"),
+        ] {
+            if optional_bool(text, field).ok().flatten() == Some(true) {
+                found.push(format!("{field} ({what})"));
+            }
+        }
+        if text.get("d_rel").is_none()
+            && let Some(sliding) = text.get("swa_num_attention_heads").and_then(Value::as_u64)
+            && text.get("num_attention_heads").and_then(Value::as_u64) != Some(sliding)
+        {
+            found.push(format!(
+                "swa_num_attention_heads {sliding} (sliding layers with heads and widths of their \
+                 own are read as the full layers' shape)"
+            ));
+        }
+        if let Some(config) = quantization_config(root) {
             let declared = optional_string(config, "quant_method")
                 .filter(|name| !names_the_producer(name))
                 .or_else(|| optional_string(config, "quant_algo"));
@@ -2075,6 +2114,9 @@ fn default_rope_theta(text: &Value) -> f64 {
 }
 
 fn engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
+    if text.get("engram_vocab_size").is_some_and(Value::is_array) {
+        return hashed_engram_geometry(text);
+    }
     Ok(EngramGeometry {
         tables: usize_list(text.get("engram_num_embeddings"))?,
         max_ngram: optional_usize(text, "engram_max_ngram_size")?.unwrap_or(0),
@@ -2083,6 +2125,69 @@ fn engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
         vocab_size: optional_usize(text, "engram_vocab_size")?.unwrap_or(0),
         compressed_vocab: optional_usize(text, "engram_compressed_vocab_size")?.unwrap_or(0),
         pad_id: optional_usize(text, "engram_pad_token_id")?.unwrap_or(0) as u32,
+    })
+}
+
+/// The per-head spelling of an Engram declaration (Hy4-flash's): one nominal vocabulary per
+/// n-gram order (`engram_vocab_size` as a list), and for each Engram layer one table per order and
+/// hash head, its row count a prime (`engram_layer_head_vocab_sizes`, keyed by layer id). Each
+/// order's `engram_n_embed_per_ngram` columns are split over its `engram_n_head_per_ngram` heads.
+///
+/// The geometry is read so a plan can size the tables: a layer's rows are the sum of its heads'
+/// rows, its heads are every order's heads, and `vocab_size` is zero because the document names
+/// no single vocabulary the keys are drawn from. The per-head hashing itself is a different
+/// lookup from the compressed-vocabulary one this build's Engram part runs, which
+/// [Architecture::unmodelled_features] names.
+fn hashed_engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
+    let orders = usize_list(text.get("engram_vocab_size"))?.len();
+    let heads_per_order = optional_usize(text, "engram_n_head_per_ngram")?.unwrap_or(0);
+    let width = optional_usize(text, "engram_n_embed_per_ngram")?.unwrap_or(0);
+    if heads_per_order == 0 || !width.is_multiple_of(heads_per_order) {
+        return Err(invalid(format!(
+            "engram_n_embed_per_ngram {width} does not split over engram_n_head_per_ngram \
+             {heads_per_order} heads"
+        )));
+    }
+    let per_layer = object(text, "engram_layer_head_vocab_sizes");
+    let mut tables = Vec::new();
+    for layer in usize_list(text.get("engram_layer_ids"))? {
+        let Some(sizes) = per_layer.and_then(|map| map.get(layer.to_string())) else {
+            return Err(invalid(format!(
+                "engram_layer_head_vocab_sizes names no tables for Engram layer {layer}"
+            )));
+        };
+        let sizes = sizes
+            .as_array()
+            .ok_or_else(|| invalid(format!("Engram layer {layer}'s tables are not a list")))?;
+        if sizes.len() != orders {
+            return Err(invalid(format!(
+                "Engram layer {layer} has {} table lists, and engram_vocab_size names {orders} \
+                 n-gram orders",
+                sizes.len()
+            )));
+        }
+        let mut rows = 0usize;
+        for order in sizes {
+            let heads = usize_list(Some(order))?;
+            if heads.len() != heads_per_order {
+                return Err(invalid(format!(
+                    "Engram layer {layer} lists {} head tables for an order of \
+                     {heads_per_order} heads",
+                    heads.len()
+                )));
+            }
+            rows += heads.iter().sum::<usize>();
+        }
+        tables.push(rows);
+    }
+    Ok(EngramGeometry {
+        tables,
+        max_ngram: optional_usize(text, "engram_max_ngram_size")?.unwrap_or(0),
+        heads: heads_per_order * orders,
+        head_dim: width / heads_per_order,
+        vocab_size: 0,
+        compressed_vocab: 0,
+        pad_id: optional_usize(text, "engram_pad_id")?.unwrap_or(0) as u32,
     })
 }
 
@@ -2360,8 +2465,16 @@ fn modelopt_mtp_expert(config: &Value) -> Option<DeclaredFormat> {
     expert
 }
 
+/// The document's `quantization_config`: at the top level, or inside `text_config` where a
+/// multimodal release (Hy4-flash) keeps it with the language model's other fields.
+fn quantization_config(root: &Value) -> Option<&Value> {
+    object(root, "quantization_config").or_else(|| {
+        object(root, "text_config").and_then(|text| object(text, "quantization_config"))
+    })
+}
+
 fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
-    let Some(config) = object(root, "quantization_config") else {
+    let Some(config) = quantization_config(root) else {
         return Ok(Quantization::default());
     };
     let block = usize_list(config.get("weight_block_size"))?
@@ -3727,5 +3840,63 @@ mod tests {
         let without_patch = without_out.replace("\"patch_size\": 16,", "");
         let error = Architecture::from_json(&without_patch).expect_err("a missing patch side");
         assert!(error.to_string().contains("patch_size"), "{error}");
+    }
+
+    /// A multimodal release that nests its language model (Hy4-flash's shape, with made-up small
+    /// numbers): the quantization block inside `text_config` is read, the per-head Engram spelling
+    /// sizes its tables, and the switches the parser does not model are named.
+    #[test]
+    fn a_nested_release_reads_its_quantization_and_names_its_unmodelled_switches() {
+        let text = r#"{
+            "model_type": "made_up_nested",
+            "architectures": ["MadeUpForConditionalGeneration"],
+            "text_config": {
+                "hidden_size": 256, "vocab_size": 512, "num_hidden_layers": 2,
+                "num_attention_heads": 4, "num_key_value_heads": 4, "head_dim": 64,
+                "intermediate_size": 512, "max_position_embeddings": 1024,
+                "swa_num_attention_heads": 8, "sandwich_norm": true, "learnable_sink": true,
+                "qk_norm": false,
+                "engram_layer_ids": [1], "engram_max_ngram_size": 3,
+                "engram_vocab_size": [1000, 1000],
+                "engram_n_embed_per_ngram": 64, "engram_n_head_per_ngram": 2,
+                "engram_pad_id": 3,
+                "engram_layer_head_vocab_sizes": {"1": [[11, 13], [17, 19]]},
+                "quantization_config": {
+                    "quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+                    "weight_block_size": [128, 128]
+                }
+            }
+        }"#;
+        let architecture = Architecture::from_json(text).expect("the nested release parses");
+        assert!(
+            matches!(
+                architecture.quantization.dense_format,
+                WeightFormat::Fp8Tile { .. }
+            ),
+            "{:?}",
+            architecture.quantization.dense_format
+        );
+        let Some(Side::Engram(engram)) = architecture.layers[1].sides.first() else {
+            panic!("layer 1 has no Engram side");
+        };
+        assert_eq!(engram.tables, vec![11 + 13 + 17 + 19]);
+        assert_eq!((engram.heads, engram.head_dim, engram.pad_id), (4, 32, 3));
+        let root: Value = serde_json::from_str(text).expect("json");
+        let named = Architecture::unmodelled_features(&root).join("; ");
+        for field in [
+            "engram_layer_head_vocab_sizes",
+            "sandwich_norm",
+            "learnable_sink",
+            "swa_num_attention_heads 8",
+        ] {
+            assert!(named.contains(field), "{field} is not named: {named}");
+        }
+        assert!(
+            !named.contains("qk_norm"),
+            "a switch left off is named: {named}"
+        );
+        let ragged = text.replace("[[11, 13], [17, 19]]", "[[11, 13]]");
+        let error = Architecture::from_json(&ragged).expect_err("a missing order");
+        assert!(error.to_string().contains("2 n-gram orders"), "{error}");
     }
 }
