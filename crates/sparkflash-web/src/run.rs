@@ -15,7 +15,7 @@
 //! `sparkflash --web` startup: load the TOML, start mDNS, sample telemetry, bind the router.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use clap::Parser;
 
 use crate::api::{WebState, WebStateInit, router};
 use crate::commands::local_hostname;
-use crate::config::{DEFAULT_CONFIG_PATH, DEFAULT_MODEL_ID, SparkConfig};
+use crate::config::{DEFAULT_MODEL_ID, LEGACY_CONFIG_PATH, SparkConfig};
 use crate::discovery::{CommandSshProbe, DiscoveredNode, MdnsDiscovery, NodeDiscovery};
 use crate::jobs::JobManager;
 use crate::stats::{StatsStore, TelemetrySource, now_ms};
@@ -37,9 +37,10 @@ use crate::stats::{StatsStore, TelemetrySource, now_ms};
     about = "Lead-node web control plane for a SparkFlash four-node cluster"
 )]
 struct WebArgs {
-    /// The TOML file to load and save. Defaults to ./sparkflash.toml.
-    #[arg(long, env = "SPARKFLASH_CONFIG", default_value = DEFAULT_CONFIG_PATH)]
-    config: PathBuf,
+    /// The TOML file to load and save. Defaults to ~/.cache/sparkflash/sparkflash.toml, which
+    /// every checkout on the node shares.
+    #[arg(long, env = "SPARKFLASH_CONFIG")]
+    config: Option<PathBuf>,
     /// Override web.bind from the TOML.
     #[arg(long, env = "SPARKFLASH_WEB_BIND")]
     bind: Option<String>,
@@ -71,8 +72,18 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
         )
         .try_init();
 
-    let exists = cli.config.exists();
-    let (mut config, load_error) = match SparkConfig::load(&cli.config) {
+    let config_path = match cli.config.clone() {
+        Some(path) => path,
+        None => match crate::config::default_config_path(Path::new(LEGACY_CONFIG_PATH)) {
+            Ok(path) => path,
+            Err(message) => {
+                eprintln!("sparkflash web: {message}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let exists = config_path.exists();
+    let (mut config, load_error) = match SparkConfig::load(&config_path) {
         Ok(config) => (config, None),
         Err(error) => {
             let note = if exists {
@@ -102,11 +113,11 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             "sparkflash web: using the cached model {} ({})",
             model.id, model.revision
         );
-        if exists && let Err(error) = config.save(&cli.config) {
+        if exists && let Err(error) = config.save(&config_path) {
             eprintln!(
                 "sparkflash web: using {} in memory, but cannot save it to {}: {}",
                 model.id,
-                cli.config.display(),
+                config_path.display(),
                 error.message
             );
         }
@@ -158,11 +169,12 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(serve(cli, config, load_error, exists, bind))
+    runtime.block_on(serve(cli, config_path, config, load_error, exists, bind))
 }
 
 async fn serve(
     cli: WebArgs,
+    config_path: PathBuf,
     config: SparkConfig,
     load_error: Option<String>,
     exists: bool,
@@ -203,7 +215,7 @@ async fn serve(
     let jobs = Arc::new(JobManager::new());
     let state = WebState::new(WebStateInit {
         config: config.clone(),
-        config_path: cli.config.clone(),
+        config_path: config_path.clone(),
         load_error,
         exists,
         discovery: Arc::clone(&mdns),
@@ -254,7 +266,7 @@ async fn serve(
     println!("sparkflash web: control plane on http://{bound}");
     println!(
         "sparkflash web: config {} ({})",
-        cli.config.display(),
+        config_path.display(),
         if exists { "loaded" } else { "not created yet" }
     );
     println!(

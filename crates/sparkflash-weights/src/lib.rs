@@ -32,6 +32,7 @@
 
 pub mod config;
 pub mod dtype;
+pub mod home;
 pub mod hub;
 pub mod linalg;
 pub mod linear_attention;

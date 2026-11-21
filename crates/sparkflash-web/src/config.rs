@@ -133,8 +133,13 @@ pub const GROUP_LANES: usize = sparkflash_model::GROUP_LANES;
 /// rows are a launch's grid rows.
 pub const MAX_PREFILL_CHUNK: usize = 65_535;
 
-/// The default config path, relative to the lead node's working directory.
-pub const DEFAULT_CONFIG_PATH: &str = "sparkflash.toml";
+/// The default config path: the node's shared cache, so every checkout runs against the same
+/// environment ([sparkflash_weights::home]).
+pub const DEFAULT_CONFIG_PATH: &str = sparkflash_weights::home::CONFIG_FILE;
+
+/// Where the control plane kept its file before it moved to [DEFAULT_CONFIG_PATH]: the working
+/// directory. A file still there is refused unless it is the shared one, never silently passed over.
+pub const LEGACY_CONFIG_PATH: &str = "sparkflash.toml";
 
 /// One checkpoint family this build knows how to run, and the selector pair that runs it.
 ///
@@ -324,7 +329,7 @@ impl Default for ModelConfig {
             checkpoint: String::new(),
             hub_cache: String::new(),
             tokenizer: String::new(),
-            converted_dir: "~/sparkflash/converted".to_owned(),
+            converted_dir: sparkflash_weights::home::CONVERTED_DIR.to_owned(),
             cubins: "target/cubins".to_owned(),
             context_tokens: None,
         }
@@ -1076,10 +1081,15 @@ impl SparkConfig {
 
     /// Saves the configuration atomically: write a sibling temp file, then rename.
     ///
+    /// A `path` that is a link saves to the file it names, so a checkout's link to the shared
+    /// file stays a link instead of being replaced by a copy.
+    ///
     /// # Errors
     /// Returns [`ConfigError`] when validation, directory creation, writing or renaming fails.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
         let text = self.to_toml()?;
+        let resolved = std::fs::canonicalize(path).ok();
+        let path = resolved.as_deref().unwrap_or(path);
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1501,33 +1511,30 @@ impl SparkConfig {
             .join(self.conversion_scope())
     }
 
-    /// The per-checkpoint child under `model.converted_dir`.
+    /// The per-checkpoint child under `model.converted_dir`
+    /// ([sparkflash_weights::home::converted_scope], which `sparkflash convert` names its default
+    /// output with too).
     #[must_use]
     pub fn conversion_scope(&self) -> String {
-        let mut scope = if crate::hf::is_model_id(&self.model.id) {
+        let name = if crate::hf::is_model_id(&self.model.id) {
             crate::hf::repo_folder(&self.model.id)
         } else {
-            sanitize_scope(&self.model.id)
+            self.model.id.clone()
         };
-        if scope.is_empty() {
-            scope.push_str("model");
-        }
         // Always identify the resolved checkpoint path, not the spelling in the file. A command
         // built from `resolved()` has `model.checkpoint` filled in, while the node check uses
-        // the unresolved config; both must name the same directory. Hashing the resolved path
-        // also gives a re-download or a same-basename explicit checkpoint its own directory.
-        if let Ok(checkpoint) = self.resolve_checkpoint() {
-            let marker = short_hash(&checkpoint.to_string_lossy());
-            let suffix = format!("--{marker}");
-            if !marker.is_empty()
-                && !scope
-                    .to_ascii_lowercase()
-                    .ends_with(&suffix.to_ascii_lowercase())
-            {
-                scope.push_str(&suffix);
+        // the unresolved config; both must name the same directory.
+        match self.resolve_checkpoint() {
+            Ok(checkpoint) => sparkflash_weights::home::converted_scope(&name, &checkpoint),
+            Err(_) => {
+                let scope = sparkflash_weights::home::sanitize_scope(&name);
+                if scope.is_empty() {
+                    "model".to_owned()
+                } else {
+                    scope
+                }
             }
         }
-        scope
     }
 
     /// The kernel cubin directory.
@@ -1789,41 +1796,33 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(digest)
 }
 
-/// Make a model id or directory name safe as one path component.
-/// A stable short digest for a path used as one converted-weights directory component.
-fn short_hash(value: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
+/// `~` expanded against this node's home, as every node expands the paths the file names.
+pub use sparkflash_weights::home::expand_home;
 
-fn sanitize_scope(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    let mut last_was_dash = false;
-    for character in value.trim().chars() {
-        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-            result.push(character);
-            last_was_dash = false;
-        } else if !last_was_dash {
-            result.push('-');
-            last_was_dash = true;
+/// The file the control plane loads when no `--config` names one: [DEFAULT_CONFIG_PATH].
+///
+/// # Errors
+/// `legacy` (the working directory's `sparkflash.toml`) exists and is not the shared file itself
+/// (or a link to it): the old file would otherwise be passed over without a word.
+pub fn default_config_path(legacy: &Path) -> Result<PathBuf, String> {
+    let shared = expand_home(DEFAULT_CONFIG_PATH);
+    if legacy.exists() {
+        let same = matches!(
+            (std::fs::canonicalize(legacy), std::fs::canonicalize(&shared)),
+            (Ok(left), Ok(right)) if left == right
+        );
+        if !same {
+            return Err(format!(
+                "{} is the configuration's old home; the shared one is {} so every checkout \
+                 runs against the same environment. Move it there (or link it there), or pass \
+                 --config {}",
+                legacy.display(),
+                shared.display(),
+                legacy.display()
+            ));
         }
     }
-    result.trim_matches(['-', '.']).to_owned()
-}
-
-/// `path` with a leading `~/` (or a bare `~`) replaced by `$HOME`.
-#[must_use]
-pub fn expand_home(path: &str) -> PathBuf {
-    let home = || std::env::var_os("HOME").map(PathBuf::from);
-    if path == "~" {
-        return home().unwrap_or_else(|| PathBuf::from(path));
-    }
-    match (path.strip_prefix("~/"), home()) {
-        (Some(rest), Some(home)) => home.join(rest),
-        _ => PathBuf::from(path),
-    }
+    Ok(shared)
 }
 
 /// Resolves `path` against `root` unless it is already absolute.
@@ -2288,8 +2287,8 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME is set for tests");
         let mut config = SparkConfig::default();
         config.paths.repo_root = "/srv/sparkflash".to_owned();
-        let converted =
-            Path::new(&home).join("sparkflash/converted/models--deepseek-ai--DeepSeek-V4.1-Flash");
+        let converted = Path::new(&home)
+            .join(".cache/sparkflash/converted/models--deepseek-ai--DeepSeek-V4.1-Flash");
         assert_eq!(config.converted_path(), converted);
         assert_eq!(
             config.cubins_path(),
@@ -2316,6 +2315,40 @@ mod tests {
         assert_eq!(config.binary_path(), cwd.join("target/release/sparkflash"));
         assert_eq!(expand_home("~"), PathBuf::from(&home));
         assert_eq!(expand_home("~other/x"), PathBuf::from("~other/x"));
+    }
+
+    #[test]
+    fn a_stray_working_directory_file_is_refused_not_passed_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = dir.path().join("sparkflash.toml");
+        let shared = default_config_path(&legacy).expect("no old file, the shared one");
+        assert!(
+            shared.ends_with(".cache/sparkflash/sparkflash.toml"),
+            "{}",
+            shared.display()
+        );
+        std::fs::write(&legacy, "").expect("old file");
+        let error = default_config_path(&legacy).expect_err("an old file is refused");
+        assert!(error.contains("--config"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_link_keeps_the_link() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("shared.toml");
+        let link = dir.path().join("sparkflash.toml");
+        let config = SparkConfig::default();
+        config.save(&shared).expect("save the shared file");
+        std::os::unix::fs::symlink(&shared, &link).expect("link");
+        config.save(&link).expect("save through the link");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link")
+                .file_type()
+                .is_symlink()
+        );
+        SparkConfig::load(&shared).expect("the shared file reads back");
     }
 
     #[test]

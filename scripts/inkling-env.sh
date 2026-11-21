@@ -14,7 +14,8 @@
 #
 # The site settings the Inkling launch scripts share; sourced, not run.
 #
-# A site file (INKLING_SITE, default ~/inkling-bin/site.env) sets what differs between clusters;
+# A site file (INKLING_SITE, default ~/.cache/sparkflash/site.env, which every checkout on the
+# node shares) sets what differs between clusters;
 # the defaults below are placeholders (TEST-NET addresses) so nothing here names a real host.
 #
 #   INKLING_NODES       the four hosts in rank order, space-separated (rank 0 is this host)
@@ -47,7 +48,7 @@
 # The deployed site file that still sets SPARKFLASH_INKLING_VISION changes in the deploy that
 # carries the rename, and that deploy waits for the owner's go-ahead. This script does not edit
 # the deployed file.
-SITE=${INKLING_SITE:-$HOME/inkling-bin/site.env}
+SITE=${INKLING_SITE:-$HOME/.cache/sparkflash/site.env}
 # shellcheck disable=SC1090
 [ -f "$SITE" ] && source "$SITE"
 INKLING_HOME=${INKLING_HOME:-$HOME}

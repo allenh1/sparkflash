@@ -15,8 +15,10 @@
 # SparkFlash lead-node configuration.
 #
 # `sparkflash --web` (or `cargo run --bin sparkflash -- --web`) starts the console and its Setup
-# page writes sparkflash.toml for you, with these values. This copy documents every field: copy it
-# to sparkflash.toml beside the checkout (or pass --config PATH) to write one by hand.
+# page writes ~/.cache/sparkflash/sparkflash.toml for you, with these values. That file is shared
+# by every checkout on the node, so a second checkout runs against the same environment. This copy
+# documents every field: copy it there (or pass --config PATH) to write one by hand. A
+# sparkflash.toml left in the working directory is refused unless it is a link to the shared file.
 # `sparkflash --web` loads the file, the web form saves it atomically, and every launcher and
 # converter command is derived from it.
 #
@@ -42,8 +44,8 @@ hub_cache = ""
 tokenizer = ""
 # Root for converted weights. The console adds a child named after the model repository and a
 # hash of the resolved checkpoint path, so switching models cannot reuse another checkpoint's rank
-# files.
-converted_dir = "~/sparkflash/converted"
+# files. The default is the node's shared cache, which every checkout on the node reads.
+converted_dir = "~/.cache/sparkflash/converted"
 # The cubin directory built by scripts/build-cubins.sh.
 cubins = "target/cubins"
 

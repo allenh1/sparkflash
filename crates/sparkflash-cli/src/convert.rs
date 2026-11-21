@@ -355,9 +355,9 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
 /// The output directory a conversion gets when the operator names none.
 ///
 /// Writing beside the checkpoint used to put rank files inside the Hugging Face cache (and, for a
-/// snapshot, inside the read-only revision directory). The default is a sibling in the current
-/// working directory, named after the repository (or the checkpoint directory for an explicit
-/// path), so a cache is never modified by a conversion.
+/// snapshot, inside the read-only revision directory). The default is the directory the console
+/// names for the same checkpoint under the node's shared converted root
+/// ([sparkflash_weights::home::converted_dir]), so a cache is never modified by a conversion.
 fn default_output_dir(checkpoint: &Path) -> PathBuf {
     let checkpoint_name = checkpoint.file_name().map_or_else(
         || "checkpoint".to_owned(),
@@ -378,9 +378,7 @@ fn default_output_dir(checkpoint: &Path) -> PathBuf {
             }),
         _ => checkpoint_name,
     };
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(format!("{scope}-converted"))
+    sparkflash_weights::home::converted_dir(&scope, checkpoint)
 }
 
 /// The checkpoint a `--model ORG/REPO` selects, through the one hub resolver.

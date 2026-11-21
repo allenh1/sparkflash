@@ -175,8 +175,13 @@ conversion and the combined bar from those values.
 
 ## Configuration
 
-The file is the source of truth. The web form edits the same typed document and writes it
-atomically (a sibling temp file, then rename). See
+The file is the source of truth: `~/.cache/sparkflash/sparkflash.toml` unless `--config` (or
+`SPARKFLASH_CONFIG`) names another. Every checkout on the node shares it, so a second checkout
+runs against the same environment; a `sparkflash.toml` in the working directory is refused unless
+it is a link to the shared file, never silently passed over. The web form edits the same typed
+document and writes it atomically (a sibling temp file, then rename), through a link to the file
+it names. The converted rank files default to `~/.cache/sparkflash/converted` the same way
+(`model.converted_dir`, and `sparkflash convert` with no `--output-dir`). See
 [`sparkflash.toml.example`](../sparkflash.toml.example) for every field with comments.
 
 | Section | What it controls |
