@@ -111,6 +111,7 @@ pub mod resolver;
 pub mod roles;
 pub mod sampler;
 pub mod scan;
+pub mod scan_report;
 pub mod slot_pack;
 pub mod tensor_plan;
 
@@ -135,7 +136,10 @@ pub use plan::{
     ComputeClass, DType, KernelId, KernelPhase, KernelSymbol, Launch, Layout, Matrix, OpKind,
     OpPlan, Operand, PartGeometry, Precision, PrecisionMask, RowBand, ShapeConstraint, StreamId,
 };
-pub use resolver::{Availability, KernelResolver, PlanContext, ResolveError, ResolvedKernel};
+pub use resolver::{
+    Availability, KernelResolver, PlanContext, ResolveCause, ResolveError, ResolvedKernel,
+};
+pub use scan_report::{ScanInputs, ScanReport, ScanRow, ScanStatus, TensorEntry, TensorIndex};
 pub use slot_pack::{PackSlot, SlotPack};
 pub use tensor_plan::{ArchitectureTensorPlan, Role as TensorRole};
 pub use widen::{

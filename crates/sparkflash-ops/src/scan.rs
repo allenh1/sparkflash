@@ -24,6 +24,13 @@ use crate::plan::{
 };
 use crate::resolver::{Availability, PlanContext};
 
+// The model scan report (milestone 1) lives in `scan_report` and is re-exported here so callers
+// that reach the scan through this module's path spell one name. The linear-attention scans above
+// keep their existing names.
+pub use crate::scan_report::{
+    ScanInputs, ScanReport, ScanRow, ScanStatus, TensorEntry, TensorIndex, scan,
+};
+
 /// The GDN scan symbols for one key/value head template, most specific first.
 ///
 /// The scan image instantiates the shared body at the three pairs in the catalogue's

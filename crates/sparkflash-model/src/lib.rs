@@ -53,6 +53,7 @@ pub mod sampler;
 pub mod settings;
 pub mod spec;
 pub mod speculation;
+pub mod stack;
 pub mod telemetry;
 pub mod tp_plan;
 pub mod vision;
@@ -98,6 +99,7 @@ pub use prompt_ranks::{MergedAlternative, MergedPosition};
 pub use sampler::{Sampler, SamplerMark, argmax};
 pub use spec::{Pending, Queue, Speculator, kept_to_end, lookup_draft, verdict};
 pub use speculation::{DepthPolicy, StepCost};
+pub use stack::{Block, PartInstance, Shape, Stack, StackKind};
 pub use tp_plan::{Split, TpAxis, TpPlan, TpPlanError};
 pub use vision::{
     ImageGrid, ImageSpan, PreparedImage, SpanRow, VisionCodec, VisionError, VisionOptions,

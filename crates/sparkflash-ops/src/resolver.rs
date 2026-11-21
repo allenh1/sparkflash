@@ -145,6 +145,25 @@ impl ResolvedKernel {
     }
 }
 
+/// Why a part did not resolve, without the per-candidate prose.
+///
+/// The scan needs to tell a missing part kind from a kernel that is not built for this shape or
+/// target, and parsing [ResolveError::reasons] cannot do that reliably. The prose stays for the
+/// display a user reads; this is the classification a caller can match on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveCause {
+    /// The catalogue has no entry for the part on any target.
+    NoCatalogueEntry,
+    /// The catalogue has an entry on this target, but none accepted the shape, format, pass or
+    /// availability policy.
+    ShapeOrFormatRefused,
+    /// The catalogue has entries for the part, but only on other targets.
+    OtherTargetOnly {
+        /// The targets that do have an entry, in catalogue order.
+        targets: Vec<Target>,
+    },
+}
+
 /// A part no implementation could serve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveError {
@@ -158,6 +177,8 @@ pub struct ResolveError {
     pub phase: KernelPhase,
     /// Why each candidate was refused, or that there were no candidates.
     pub reasons: Vec<String>,
+    /// The classification of the refusal, independent of the prose in [Self::reasons].
+    pub cause: ResolveCause,
 }
 
 impl fmt::Display for ResolveError {
@@ -285,8 +306,29 @@ impl PlanContext {
             precision: requirement.precision,
             phase,
             reasons,
+            cause: cause_for(requirement.part, self.target),
         }))
     }
+}
+
+/// Classify a refusal from the catalogue, without reading the candidate prose.
+fn cause_for(part: Part, target: Target) -> ResolveCause {
+    let mut targets = Vec::new();
+    let mut any = false;
+    for entry in CATALOGUE.iter().filter(|entry| entry.part == part) {
+        any = true;
+        if entry.target == target {
+            return ResolveCause::ShapeOrFormatRefused;
+        }
+        if !targets.contains(&entry.target) {
+            targets.push(entry.target);
+        }
+    }
+    if !any {
+        return ResolveCause::NoCatalogueEntry;
+    }
+    targets.sort_unstable();
+    ResolveCause::OtherTargetOnly { targets }
 }
 
 /// Resolves execution-plan parts to loadable catalogue entries.
@@ -380,6 +422,7 @@ impl KernelResolver {
                 precision: requirement.precision,
                 phase,
                 reasons: Vec::new(),
+                cause: cause_for(requirement.part, self.target),
             });
         }
         let mut reasons = Vec::new();
@@ -409,6 +452,7 @@ impl KernelResolver {
             precision: requirement.precision,
             phase,
             reasons,
+            cause: cause_for(requirement.part, self.target),
         })
     }
 
@@ -736,6 +780,7 @@ mod tests {
                 .any(|reason| reason.contains("does not equal 576")),
             "{error}"
         );
+        assert_eq!(error.cause, ResolveCause::ShapeOrFormatRefused);
     }
 
     #[test]
@@ -778,5 +823,35 @@ mod tests {
             ))
             .expect_err("sm120 is empty");
         assert!(error.reasons.is_empty());
+        assert_eq!(
+            error.cause,
+            ResolveCause::OtherTargetOnly {
+                targets: vec![Target::Sm121]
+            }
+        );
+    }
+
+    #[test]
+    fn a_recorded_cause_does_not_change_the_display() {
+        let error = ResolveError {
+            part: Part::Moe,
+            target: Target::Sm121,
+            precision: Precision::NvFp4,
+            phase: KernelPhase::Decode,
+            reasons: vec!["first".to_owned(), "second".to_owned()],
+            cause: ResolveCause::ShapeOrFormatRefused,
+        };
+        assert_eq!(
+            error.to_string(),
+            "moe on sm121 at nvfp4 in the decode pass: first; second"
+        );
+        let empty = ResolveError {
+            reasons: Vec::new(),
+            ..error
+        };
+        assert_eq!(
+            empty.to_string(),
+            "moe on sm121 at nvfp4 in the decode pass: no catalogue entry"
+        );
     }
 }
