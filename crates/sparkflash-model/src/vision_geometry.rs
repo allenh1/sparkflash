@@ -232,7 +232,9 @@ impl VisionFact {
     /// What would settle the fact.
     #[must_use]
     pub const fn fix(self) -> &'static str {
-        "state the field in vision_config, or supply the tensor index so its names can prove it"
+        "state the field in vision_config, supply the tensor index so its names can prove it, \
+         or add the stack part fact to a layout under models/layouts/ (or \
+         ~/.cache/sparkflash/layouts/)"
     }
 }
 

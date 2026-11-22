@@ -131,7 +131,6 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                 "vision_mlp",
                 "vision_norm",
                 "vision_patch_embed",
-                "vision_position",
             ],
         },
         Snapshot {
@@ -216,6 +215,48 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                     snapshot.repo,
                     report.render()
                 );
+                if snapshot.repo == "zai-org/GLM-5.3-Flash" {
+                    let unknown: Vec<&str> = report
+                        .rows
+                        .iter()
+                        .filter_map(|row| match &row.status {
+                            ScanStatus::UnknownLayout { detail, .. } => Some(detail.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(
+                        unknown.is_empty(),
+                        "{}: the layout left wiring unknown: {unknown:?}\n{}",
+                        snapshot.repo,
+                        report.render()
+                    );
+                    for row in report
+                        .rows
+                        .iter()
+                        .filter(|row| row.stack == sparkflash_model::StackKind::Vision)
+                    {
+                        assert!(
+                            !row.shape.is_unknown() && row.format.is_some(),
+                            "{}: vision part {} has no stored shape or format\n{}",
+                            snapshot.repo,
+                            row.part.name(),
+                            report.render()
+                        );
+                        assert!(
+                            matches!(
+                                row.status,
+                                ScanStatus::Resolved
+                                    | ScanStatus::NotBuilt { .. }
+                                    | ScanStatus::NoPartKind { .. }
+                            ),
+                            "{}: vision part {} has status {}\n{}",
+                            snapshot.repo,
+                            row.part.name(),
+                            row.status.name(),
+                            report.render()
+                        );
+                    }
+                }
             }
             SnapshotExpectation::Unclaimed(expected) => {
                 let expected: Vec<(String, usize)> = expected

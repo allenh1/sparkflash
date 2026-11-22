@@ -609,9 +609,72 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
         }
     }
     if let Some(index) = inputs.tensors {
+        apply_layout_vision(&mut report, architecture, index);
         apply_tensor_coverage(&mut report, architecture, inputs.world, index);
     }
     report
+}
+
+/// Fill a vision row's shape and stored format from the layout and the tensor index.
+///
+/// The config states the tower's components; the index is the only source for their stored
+/// shape and dtype. A component with no tensor of its own (a rotary position scheme) takes the
+/// tower's stored format from its sibling tensors, and its shape stays the geometry the spec
+/// states.
+fn apply_layout_vision(report: &mut ScanReport, architecture: &Architecture, index: &TensorIndex) {
+    let Ok(Some(layout)) = sparkflash_model::layout::matching(architecture) else {
+        return;
+    };
+    let Ok(tensors) = layout.tensors(architecture) else {
+        return;
+    };
+    let by_name: std::collections::BTreeMap<&str, &TensorEntry> = index
+        .tensors
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry))
+        .collect();
+    let tower_format = tensors
+        .iter()
+        .filter(|tensor| tensor.stack == StackKind::Vision)
+        .find_map(|tensor| by_name.get(tensor.name.as_str()))
+        .and_then(|entry| stored_format(&entry.dtype, architecture));
+    for row in &mut report.rows {
+        if row.stack != StackKind::Vision {
+            continue;
+        }
+        let tensor = tensors
+            .iter()
+            .find(|tensor| tensor.stack == StackKind::Vision && tensor.part == row.part)
+            .and_then(|tensor| by_name.get(tensor.name.as_str()));
+        match tensor {
+            Some(entry) => {
+                row.shape = Shape::new(entry.shape.clone());
+                if let Some(format) = stored_format(&entry.dtype, architecture) {
+                    row.format = Some(format);
+                }
+            }
+            None => {
+                row.format = tower_format;
+            }
+        }
+    }
+}
+
+/// The stored weight format a dtype word names, from the checkpoint's quantization block.
+fn stored_format(dtype: &str, architecture: &Architecture) -> Option<WeightFormat> {
+    match dtype.to_ascii_uppercase().as_str() {
+        "BF16" | "BFLOAT16" => Some(WeightFormat::Bf16),
+        "F32" | "FLOAT32" => None,
+        "F8_E4M3" | "F8E4M3" | "FP8" => match architecture.quantization.dense_format {
+            format @ WeightFormat::Fp8Tile { .. } => Some(format),
+            _ => Some(WeightFormat::Bf16),
+        },
+        "F4_E2M1" | "F4E2M1" | "I8" => match architecture.quantization.expert_format {
+            format @ (WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. }) => Some(format),
+            _ => Some(WeightFormat::NvFp4 { group_size: 16 }),
+        },
+        _ => None,
+    }
 }
 
 /// Take the patch kernel's frame count from the stored patch projection.

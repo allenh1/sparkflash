@@ -268,6 +268,20 @@ pass, target.
 1. **The scan tells the truth.** 5.1's stacks and the two coverage checks, 5.7's report. First
    visible result: loading GLM with its vision tower fails with the list of tower parts that have
    no kernel. Bit-equal. Independent of everything below, so it can start now.
+
+   The step is split into three deliveries:
+
+   * **1a. The scan (delivered).** The report, the vision stack, the tensor index and the
+     config-key coverage. It exposed the gaps the next two deliveries close.
+   * **1b. The layouts (this work).** The layout-file format, its reader, and the worked
+     GLM-5.3-Flash layout: GLM's tensor plan, config keys and vision wiring move out of Rust
+     into data. Acceptance is the layout plan equalling the retired planner at TP 1, 2 and 4,
+     and the real checkpoint scanning with no unknown-layout or unclaimed-tensor row. Only the
+     layout changes here; no execution, output bits or kernels move.
+   * **1c. The gate (held).** The serve gate and the off switch wait until DeepSeek and Inkling
+     scan clean with vision on. Those two checkpoints still describe tower facts no layout
+     states and leave `model.visual.*` tensors unclaimed; a gate now would refuse them for
+     reasons the scan cannot yet fix. The gate is not merged early.
 2. **The base reads a description.** 5.2 steps 1 and 2 on DeepSeek alone. DeepSeek bit-equal,
    same tick trace, same speed. This is the step that decides whether the plan holds; if it
    cannot be done for free, stop here.
@@ -280,7 +294,7 @@ pass, target.
 7. **Demonstration:** a model the owner picks, onboarded with zero Rust unless it has a new part
    kind.
 
-Work that can run in parallel from the start: milestone 1, the layout-file format (5.1), the
+Work that can run in parallel from the start: the scan and the layouts (1a and 1b), the
 reference-capture and drift scripts (5.6), and the chat-template engine (5.3). Milestones 2 and 3
 are one line of work in one crate and should have one owner at a time.
 

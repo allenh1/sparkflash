@@ -14,10 +14,11 @@
 
 //! The tensor plan of an [Architecture] at one tensor-parallel rank.
 //!
-//! The Qwen, GLM and DeepSeek arms all read the same released `config.json` through
-//! [Architecture]. This module turns that walk into names, shapes and rank slices, so a released
-//! index's tensor count and byte total are checked against the shared vocabulary rather than a
-//! second family parser. The family-specific names live here, not in a model crate.
+//! The arms all read the same released `config.json` through [Architecture]. This module turns
+//! that walk into names, shapes and rank slices, so a released index's tensor count and byte
+//! total are checked against the shared vocabulary rather than a second family parser. A
+//! checkpoint with a layout takes its names from `sparkflash_model::layout`; the planners here
+//! are the structural fallback and the test oracle for the worked layout.
 //!
 //! [ArchitectureTensorPlan::served] is what a rank uploads, [ArchitectureTensorPlan::checkpoint]
 //! adds the unserved vision tower, and [ArchitectureTensorPlan::rank_spec_at] is the rank-local
@@ -28,9 +29,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sparkflash_model::architecture::{
-    Architecture, AttentionKind, DenseMlp, Ffn, Kda, Layer, Moe, PleGeometry, Residual, ScaleDType,
-    Side, WeightFormat,
+    Architecture, AttentionKind, Ffn, Layer, Moe, PleGeometry, Residual, ScaleDType, Side,
+    WeightFormat,
 };
+#[cfg(test)]
+use sparkflash_model::architecture::{DenseMlp, Kda};
+use sparkflash_model::layout::{LayoutDtype, LayoutTensor, TensorSplit};
 use sparkflash_model::{TpAxis, TpPlan};
 use sparkflash_weights::rng::is_prime;
 use sparkflash_weights::{DType, TensorPlan, TensorSpec};
@@ -213,9 +217,11 @@ impl ArchitectureTensorPlan {
         } else {
             experts
         };
+        if builder.read_layout(architecture)? {
+            return Ok(builder.finish());
+        }
         match architecture.family.as_str() {
             "qwen4_exp" | "qwen3_5_moe" => builder.qwen(architecture, mtp)?,
-            "glm5_next" => builder.glm(architecture, mtp)?,
             _ => {
                 // A family no pack transcribes is planned in the canonical spelling; a caller
                 // holding the checkpoint plans its own spelling through [Self::named].
@@ -392,6 +398,145 @@ impl Builder {
             rank: self.rank,
             runs: self.runs,
             tp: self.tp,
+        }
+    }
+
+    /// Build the checkpoint's tensors from its layout, when one describes it.
+    ///
+    /// Returns false when no layout matches, so a checkpoint with no file still runs the
+    /// structural reader. A layout that matches but describes no tensor is a refusal: a file
+    /// exists to say what the structural reader could not.
+    fn read_layout(&mut self, arch: &Architecture) -> Result<bool, PlanError> {
+        let layout = sparkflash_model::layout::matching(arch)
+            .map_err(|error| PlanError::Invalid(error.to_string()))?;
+        let Some(layout) = layout else {
+            return Ok(false);
+        };
+        let tensors = layout
+            .tensors(arch)
+            .map_err(|error| PlanError::Invalid(error.to_string()))?;
+        if tensors.is_empty() {
+            return Err(PlanError::Invalid(format!(
+                "layout {} describes no tensor for this checkpoint",
+                layout.id
+            )));
+        }
+        for tensor in tensors {
+            if tensor.stack == sparkflash_model::StackKind::Vision && !self.vision {
+                continue;
+            }
+            if tensor.stack == sparkflash_model::StackKind::Draft && !self.mtp {
+                continue;
+            }
+            self.layout_tensor(&tensor)?;
+        }
+        Ok(true)
+    }
+
+    fn layout_tensor(&mut self, tensor: &LayoutTensor) -> Result<(), PlanError> {
+        let role = tensor_role(&tensor.role).ok_or_else(|| {
+            PlanError::Invalid(format!(
+                "tensor {} names unknown role {:?}",
+                tensor.name, tensor.role
+            ))
+        })?;
+        match tensor.dtype {
+            LayoutDtype::Dense => {
+                let [rows, columns] = two(&tensor.name, &tensor.shape)?;
+                let split = match tensor.split {
+                    TensorSplit::Whole => LinearSplit::Whole,
+                    TensorSplit::Rows => LinearSplit::Rows,
+                    TensorSplit::Columns => LinearSplit::Columns,
+                    TensorSplit::KvRows => LinearSplit::KvRows,
+                    other => {
+                        return Err(PlanError::Invalid(format!(
+                            "tensor {} is a dense projection with split {other:?}",
+                            tensor.name
+                        )));
+                    }
+                };
+                let prefix = tensor.name.strip_suffix(".weight").ok_or_else(|| {
+                    PlanError::Invalid(format!(
+                        "dense tensor {} does not end in .weight",
+                        tensor.name
+                    ))
+                })?;
+                self.dense_linear(prefix, rows, columns, self.dense_format, role, split)?;
+            }
+            LayoutDtype::Expert => {
+                let format = ExpertFormat::of(self.expert_format);
+                let (width, hidden, rows) = match tensor.split {
+                    TensorSplit::ExpertRows => {
+                        let [width, hidden] = two(&tensor.name, &tensor.shape)?;
+                        (width, hidden, true)
+                    }
+                    TensorSplit::ExpertColumns => {
+                        let [hidden, width] = two(&tensor.name, &tensor.shape)?;
+                        (width, hidden, false)
+                    }
+                    other => {
+                        return Err(PlanError::Invalid(format!(
+                            "expert tensor {} has split {other:?}",
+                            tensor.name
+                        )));
+                    }
+                };
+                let prefix = tensor.name.strip_suffix(".weight").ok_or_else(|| {
+                    PlanError::Invalid(format!(
+                        "expert tensor {} does not end in .weight",
+                        tensor.name
+                    ))
+                })?;
+                self.expert(prefix, width, hidden, format, rows, role)?;
+            }
+            LayoutDtype::Bf16 | LayoutDtype::F32 => {
+                let dtype = if tensor.dtype == LayoutDtype::Bf16 {
+                    DType::BF16
+                } else {
+                    DType::F32
+                };
+                self.layout_split(&tensor.name, dtype, &tensor.shape, tensor.split, role)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn layout_split(
+        &mut self,
+        name: &str,
+        dtype: DType,
+        shape: &[usize],
+        split: TensorSplit,
+        role: Role,
+    ) -> Result<(), PlanError> {
+        match split {
+            TensorSplit::Whole => {
+                self.whole(name.to_owned(), dtype, shape.to_vec(), role);
+                Ok(())
+            }
+            TensorSplit::Rows => {
+                let [a, b] = two(name, shape)?;
+                self.rows(name.to_owned(), dtype, [a, b], role)
+            }
+            TensorSplit::Columns => {
+                let [a, b] = two(name, shape)?;
+                self.columns(name.to_owned(), dtype, [a, b], role)
+            }
+            TensorSplit::KvRows => {
+                let [a, b] = two(name, shape)?;
+                self.kv_rows(name.to_owned(), dtype, [a, b], role)
+            }
+            TensorSplit::Vector => {
+                let [a] = one(name, shape)?;
+                self.row_vector(name.to_owned(), dtype, a, role)
+            }
+            TensorSplit::Conv => {
+                let [width, _, taps] = three(name, shape)?;
+                self.conv_rows(name.to_owned(), dtype, width, taps, role)
+            }
+            TensorSplit::ExpertRows | TensorSplit::ExpertColumns => Err(PlanError::Invalid(
+                format!("tensor {name} has an expert split but no expert dtype"),
+            )),
         }
     }
 
@@ -1739,7 +1884,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm(&mut self, arch: &Architecture, include_mtp: bool) -> Result<(), PlanError> {
+    #[cfg(test)]
+    fn oracle(&mut self, arch: &Architecture, include_mtp: bool) -> Result<(), PlanError> {
         let hidden = arch.hidden_size;
         self.whole(
             format!("{LM_PREFIX}.embed_tokens.weight"),
@@ -1771,11 +1917,11 @@ impl Builder {
             }
             let hyper = hyper_of(layer)?;
             for branch in ["attn", "ffn"] {
-                self.glm_hyper(&format!("{prefix}.hc_{branch}"), hyper, hidden)?;
+                self.oracle_hyper(&format!("{prefix}.hc_{branch}"), hyper, hidden)?;
             }
             match &layer.attention.kind {
                 AttentionKind::Kda(kda) => {
-                    self.glm_kda(&format!("{prefix}.self_attn"), kda, hidden, Role::Attention)?;
+                    self.oracle_kda(&format!("{prefix}.self_attn"), kda, hidden, Role::Attention)?;
                 }
                 AttentionKind::Mla { .. } => {
                     let indexer = layer
@@ -1783,7 +1929,7 @@ impl Builder {
                         .indexer
                         .as_ref()
                         .is_some_and(|indexer| !indexer.reuse);
-                    self.glm_dsa(
+                    self.oracle_dsa(
                         &format!("{prefix}.self_attn"),
                         layer,
                         hidden,
@@ -1793,7 +1939,7 @@ impl Builder {
                     )?;
                 }
                 AttentionKind::Gqa { kv_heads, .. } => {
-                    self.glm_gqa(
+                    self.oracle_gqa(
                         &format!("{prefix}.self_attn"),
                         layer,
                         *kv_heads,
@@ -1810,9 +1956,9 @@ impl Builder {
             }
             match &layer.ffn {
                 Ffn::Dense(dense) => {
-                    self.glm_dense_mlp(&format!("{prefix}.mlp"), dense, hidden, Role::DenseMlp)?;
+                    self.oracle_dense_mlp(&format!("{prefix}.mlp"), dense, hidden, Role::DenseMlp)?;
                 }
-                Ffn::Moe(moe) => self.glm_moe(
+                Ffn::Moe(moe) => self.oracle_moe(
                     &format!("{prefix}.mlp"),
                     moe,
                     hidden,
@@ -1823,15 +1969,16 @@ impl Builder {
             }
         }
         if include_mtp && self.mtp {
-            self.glm_mtp(arch, hidden)?;
+            self.oracle_mtp(arch, hidden)?;
         }
         if self.vision {
-            self.glm_vision(arch)?;
+            self.oracle_vision(arch)?;
         }
         Ok(())
     }
 
-    fn glm_hyper(
+    #[cfg(test)]
+    fn oracle_hyper(
         &mut self,
         prefix: &str,
         hyper: &sparkflash_model::architecture::HyperConnection,
@@ -1855,7 +2002,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_kda(
+    #[cfg(test)]
+    fn oracle_kda(
         &mut self,
         prefix: &str,
         kda: &Kda,
@@ -1915,7 +2063,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_gqa(
+    #[cfg(test)]
+    fn oracle_gqa(
         &mut self,
         prefix: &str,
         layer: &Layer,
@@ -1955,7 +2104,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_dsa(
+    #[cfg(test)]
+    fn oracle_dsa(
         &mut self,
         prefix: &str,
         layer: &Layer,
@@ -2081,7 +2231,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_dense_mlp(
+    #[cfg(test)]
+    fn oracle_dense_mlp(
         &mut self,
         prefix: &str,
         dense: &DenseMlp,
@@ -2110,7 +2261,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_moe(
+    #[cfg(test)]
+    fn oracle_moe(
         &mut self,
         prefix: &str,
         moe: &Moe,
@@ -2169,7 +2321,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_mtp(&mut self, arch: &Architecture, hidden: usize) -> Result<(), PlanError> {
+    #[cfg(test)]
+    fn oracle_mtp(&mut self, arch: &Architecture, hidden: usize) -> Result<(), PlanError> {
         let Some(mtp) = &arch.mtp else { return Ok(()) };
         if mtp.stages == 0 {
             return Ok(());
@@ -2204,7 +2357,7 @@ impl Builder {
                 Role::Mtp,
             );
         }
-        self.glm_dsa(
+        self.oracle_dsa(
             &format!("{prefix}.self_attn"),
             reference,
             hidden,
@@ -2220,7 +2373,7 @@ impl Builder {
                 "the GLM MTP stage needs a MoE layer".to_owned(),
             ));
         };
-        self.glm_moe(
+        self.oracle_moe(
             &format!("{prefix}.mlp"),
             moe,
             hidden,
@@ -2230,7 +2383,8 @@ impl Builder {
         )
     }
 
-    fn glm_vision(&mut self, arch: &Architecture) -> Result<(), PlanError> {
+    #[cfg(test)]
+    fn oracle_vision(&mut self, arch: &Architecture) -> Result<(), PlanError> {
         let Some(vision) = &arch.vision else {
             return Ok(());
         };
@@ -2301,11 +2455,10 @@ impl Builder {
 
 /// The tensors a model description takes, as one comparable set.
 ///
-/// This is the seam between the scan and the description. Today the set is
-/// [ArchitectureTensorPlan::checkpoint]'s names, because that is the one shared plan a released
-/// checkpoint is checked against. The layout reader's stack tensor roles will replace it there
-/// and nowhere else: the scan compares [TensorClaims] with an index and never learns how the
-/// claims were built.
+/// This is the seam between the scan and the description. The set is
+/// [ArchitectureTensorPlan::checkpoint]'s names, which a matching layout supplies when one
+/// exists. The scan compares [TensorClaims] with an index and never learns how the claims were
+/// built.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TensorClaims {
     specs: Vec<TensorSpec>,
@@ -2665,6 +2818,7 @@ fn qwen_expert_format(format: WeightFormat) -> ExpertFormat {
     }
 }
 
+#[cfg(test)]
 fn hyper_of(layer: &Layer) -> Result<&sparkflash_model::architecture::HyperConnection, PlanError> {
     match &layer.residual {
         Residual::Hyper(hyper) => Ok(hyper),
@@ -2690,4 +2844,125 @@ fn ple_padded_rows(ple: &PleGeometry) -> u64 {
     }
     let divisor = ple.vocab_multiple.max(ple.split_parts as u64).max(1);
     offset.div_ceil(divisor) * divisor
+}
+
+fn tensor_role(name: &str) -> Option<Role> {
+    Some(match name {
+        "embedding" => Role::Embedding,
+        "lm_head" => Role::LmHead,
+        "norm" => Role::Norm,
+        "hyper" => Role::Hyper,
+        "router" => Role::Router,
+        "shared_expert" => Role::SharedExpert,
+        "experts" => Role::Experts,
+        "attention" => Role::Attention,
+        "indexer" => Role::Indexer,
+        "dense_mlp" => Role::DenseMlp,
+        "ple_aux" => Role::PleAux,
+        "ple_table" => Role::PleTable,
+        "mtp" => Role::Mtp,
+        "vision" => Role::Vision,
+        _ => return None,
+    })
+}
+
+fn one(name: &str, shape: &[usize]) -> Result<[usize; 1], PlanError> {
+    shape
+        .try_into()
+        .map_err(|_| PlanError::Invalid(format!("tensor {name} is a vector with shape {shape:?}")))
+}
+
+fn two(name: &str, shape: &[usize]) -> Result<[usize; 2], PlanError> {
+    shape
+        .try_into()
+        .map_err(|_| PlanError::Invalid(format!("tensor {name} is not a matrix: shape {shape:?}")))
+}
+
+fn three(name: &str, shape: &[usize]) -> Result<[usize; 3], PlanError> {
+    shape.try_into().map_err(|_| {
+        PlanError::Invalid(format!(
+            "tensor {name} is not a 3-D convolution: shape {shape:?}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod layout_equality {
+    use super::*;
+
+    fn reference(arch: &Architecture, tp: TpPlan) -> ArchitectureTensorPlan {
+        let mut builder = Builder::new(tp, true, true, true);
+        let dense = arch.quantization.dense_format;
+        let experts = arch.quantization.expert_format;
+        builder.dense_format = dense;
+        builder.expert_format = if matches!(experts, WeightFormat::Bf16)
+            && matches!(dense, WeightFormat::Fp8Tile { .. })
+        {
+            dense
+        } else {
+            experts
+        };
+        builder.oracle(arch, true).expect("the reference planner");
+        builder.finish()
+    }
+
+    type PlanRow = (String, Vec<usize>, Vec<usize>, Option<RankRun>, String);
+
+    fn table(plan: &ArchitectureTensorPlan) -> BTreeMap<String, PlanRow> {
+        let mut out = BTreeMap::new();
+        for index in 0..plan.len() {
+            let spec = plan.spec_at(index);
+            out.insert(
+                spec.name.clone(),
+                (
+                    format!("{:?}", spec.dtype),
+                    spec.shape.clone(),
+                    plan.rank_spec_at(index).shape.clone(),
+                    plan.rank_run_at(index),
+                    format!("{:?}", plan.plan().role(index)),
+                ),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn the_worked_layout_reproduces_the_family_planner() {
+        let text = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+        let architecture = Architecture::from_json(text).expect("the carried config");
+        for world in [1usize, 2, 4] {
+            let tp = TpPlan::for_architecture(&architecture, world, 0).expect("a TP plan");
+            let expected = reference(&architecture, tp);
+            let actual = ArchitectureTensorPlan::checkpoint(&architecture, tp)
+                .expect("the layout checkpoint plan");
+            let want = table(&expected);
+            let have = table(&actual);
+            let missing: Vec<&String> = want
+                .keys()
+                .filter(|name| !have.contains_key(*name))
+                .collect();
+            let extra: Vec<&String> = have
+                .keys()
+                .filter(|name| !want.contains_key(*name))
+                .collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "TP{world}: missing {missing:?}, extra {extra:?}"
+            );
+            for (name, expected) in &want {
+                let actual = &have[name];
+                assert_eq!(
+                    expected.0, actual.0,
+                    "TP{world}: {name} stored dtype differs"
+                );
+                assert_eq!(
+                    expected.1, actual.1,
+                    "TP{world}: {name} logical shape differs"
+                );
+                assert_eq!(expected.2, actual.2, "TP{world}: {name} rank shape differs");
+                assert_eq!(expected.3, actual.3, "TP{world}: {name} rank run differs");
+                assert_eq!(expected.4, actual.4, "TP{world}: {name} role differs");
+            }
+        }
+    }
 }

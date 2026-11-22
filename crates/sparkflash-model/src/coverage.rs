@@ -47,8 +47,8 @@ impl UnknownKey {
     #[must_use]
     pub fn fix(path: &str) -> String {
         format!(
-            "read {path} in the checkpoint parser, or add its key name to the ignorable \
-             list with a written reason in sparkflash-model/src/coverage.rs"
+            "state {path} in the checkpoint's layout keys entry with the fact it sets, or add \
+             it to that layout's ignorable list with a written reason"
         )
     }
 }
@@ -59,7 +59,7 @@ pub struct IgnoredKey {
     /// The full path from the document root.
     pub path: String,
     /// Why the key can be ignored.
-    pub reason: &'static str,
+    pub reason: String,
 }
 
 /// The result of the config-key coverage check for one parse.
@@ -125,6 +125,21 @@ impl ConfigCoverage {
     #[must_use]
     pub fn ignored_keys(&self) -> &[IgnoredKey] {
         &self.ignored
+    }
+
+    /// Mark a path as read by a source other than the structural parser, such as a layout.
+    pub(crate) fn claim_path(&mut self, path: &str) {
+        self.read.insert(path.to_owned());
+        self.unknown.retain(|unknown| unknown.path != path);
+    }
+
+    /// Mark a path as read and ignorable with a reason from the matching layout.
+    pub(crate) fn ignore_path(&mut self, path: &str, reason: &str) {
+        self.claim_path(path);
+        self.ignored.push(IgnoredKey {
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+        });
     }
 
     /// Whether the check ran and every key was read or ignorably listed.
@@ -299,7 +314,7 @@ fn collect(
                         // block is ignored whole, not one member at a time.
                         ignored.push(IgnoredKey {
                             path: full.clone(),
-                            reason,
+                            reason: reason.to_owned(),
                         });
                         continue;
                     }
@@ -521,20 +536,6 @@ mod tests {
         ("Dory1.0-4B-BF16", "ngpt_alpha_init", "model crate parser"),
         ("Dory1.0-4B-BF16", "rope_parameters.full_attention.rope_type", "model crate parser"),
         ("Dory1.0-4B-BF16", "rope_parameters.sliding_attention.rope_type", "model crate parser"),
-        ("GLM-5.3-Flash", "quantization_config.modules_to_not_convert", "description work"),
-        ("GLM-5.3-Flash", "text_config.index_kpool_compress", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.index_share_for_mtp_iteration", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.indexer_rope_interleave", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.linear_attn_config.full_attn_layers", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.linear_attn_config.kda_layers", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.mla_use_nope", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.model_type", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.moe_router_dtype", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.num_key_value_heads", "model crate parser"),
-        ("GLM-5.3-Flash", "text_config.qk_head_dim", "model crate parser"),
-        ("GLM-5.3-Flash", "tie_word_embeddings", "model crate parser"),
-        ("GLM-5.3-Flash", "vision_config.image_size", "vision reader"),
-        ("GLM-5.3-Flash", "vision_config.model_type", "vision reader"),
         ("Inkling-2-Small", "mtp_config.head_dim", "model crate parser"),
         ("Inkling-2-Small", "mtp_config.hidden_size", "model crate parser"),
         ("Inkling-2-Small", "mtp_config.intermediate_size", "model crate parser"),

@@ -144,7 +144,7 @@ pub use scan_report::{
     scan,
 };
 pub use slot_pack::{PackSlot, SlotPack};
-pub use tensor_plan::{ArchitectureTensorPlan, Role as TensorRole};
+pub use tensor_plan::{ArchitectureTensorPlan, RankRun, Role as TensorRole};
 pub use widen::{
     BytesPerToken, FormatLedger, LedgerRow, WidenError, WidenLog, WidenRecord,
     bytes_per_token_floor, stored_bytes_floor, widen,
