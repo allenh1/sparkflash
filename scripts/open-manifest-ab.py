@@ -217,6 +217,8 @@ def launch(args, out):
     env["SPARKFLASH_LAUNCH_TRACE"] = os.path.join(out, "launch-r{rank}.trace")
     env["SPARKFLASH_OPEN_MANIFEST"] = os.path.join(out, "manifest-r{rank}.jsonl")
     env["SPARKFLASH_LOG_ROOT"] = os.path.join(out, "logs")
+    # The eight-lane phase must reach eight real lanes, not queue behind the arm's default.
+    env.setdefault("SPARKFLASH_LANES", "8")
     command = ["bash", args.site_script, "launch"]
     print("LAUNCH", " ".join(command))
     print("  SPARKFLASH_BIN=" + args.build)
