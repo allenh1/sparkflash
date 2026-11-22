@@ -659,6 +659,7 @@ function fitDetail(model) {
           '<td><ul class="fit-why">' + why + "</ul></td></tr>";
       }).join("") + "</tbody></table></div>");
   }
+  if (fit?.scans?.length) parts.push(scanReports(fit, model));
   const actions = [];
   if (model.supported) {
     actions.push('<button type="button" class="btn btn-sm btn-primary" data-browse-act="use" data-browse-id="' +
@@ -672,6 +673,54 @@ function fitDetail(model) {
     '" target="_blank" rel="noopener noreferrer">Open on Hugging Face</a>');
   parts.push('<div class="fit-actions">' + actions.join("") + "</div></div>");
   return parts.join("");
+}
+
+// The one scan report, per target and width. A clean report offers conversion and serving; a
+// report with a gap offers neither and prints each unresolved row as a work item.
+function scanReports(fit, model) {
+  const reports = fit.scans.map((scan) => {
+    const status = scan.error ? "scan failed" : scan.clean ? "clean" :
+      scan.work_items.length ? scan.work_items.length + " gap" +
+        (scan.work_items.length === 1 ? "" : "s") : "not clean";
+    const rows = scan.rows.length
+      ? '<div class="table-wrap"><table class="scan-table"><thead><tr><th>Stack</th><th>Block</th>' +
+        "<th>Operation</th><th>Shape</th><th>Format</th><th>Pass</th><th>Status</th><th>Fix</th>" +
+        "</tr></thead><tbody>" + scan.rows.map((row) =>
+          "<tr><td>" + esc(row.stack) + "</td><td>" + esc(row.block ?? "global") + "</td><td>" +
+          esc(row.operation) + "</td><td>" + esc(row.shape) + "</td><td>" + esc(row.format) +
+          "</td><td>" + esc(row.pass) + "</td><td>" +
+          (row.fix ? '<span class="scan-gap">' + esc(row.status) +
+            (row.subject ? ": " + esc(row.subject) : "") + "</span>" : esc(row.status)) +
+          "</td><td>" + esc(row.fix || "—") + "</td></tr>").join("") + "</tbody></table></div>"
+      : '<p class="dim">The scan produced no rows.</p>';
+    const work = scan.work_items.length
+      ? '<p class="fit-missing-head">Work items</p><ul class="scan-work">' + scan.work_items.map((item) =>
+          "<li><code>" + esc(item.operation) + "</code> at shape " + esc(item.shape) + ", format " +
+          esc(item.format) + ", " + esc(item.pass) + " pass, target " + esc(item.target) + " — " +
+          esc(item.status) + (item.subject ? ": " + esc(item.subject) : "") + ". " + esc(item.fix) +
+          "</li>").join("") + "</ul>"
+      : "";
+    const actions = scan.offers_convert || scan.offers_serve
+      ? '<div class="fit-actions">' + (scan.offers_convert
+          ? '<button type="button" class="btn btn-sm btn-primary" data-browse-act="convert" data-browse-id="' +
+            esc(model.id) + '" data-browse-target="' + esc(scan.target) + '" data-browse-world="' + scan.world +
+            '">Convert and serve</button>'
+          : "") + (scan.offers_serve
+          ? '<button type="button" class="btn btn-sm" data-browse-act="serve" data-browse-id="' +
+            esc(model.id) + '" data-browse-target="' + esc(scan.target) + '" data-browse-world="' + scan.world +
+            '">Serve this checkpoint</button>'
+          : "") + "</div>"
+      : "";
+    return '<details class="scan-report" data-scan="' + esc(scan.target) + "-tp" + scan.world + '">' +
+      '<summary><span class="fit-chip ' + (scan.clean ? "runs" : "missing") + '">' + esc(status) +
+      "</span> " + esc(scan.target) + " TP" + scan.world + "</summary>" +
+      (scan.error ? '<p class="scan-error">' + esc(scan.error) + "</p>" : "") + rows + work + actions +
+      '<pre class="scan-plain">' + esc(scan.plain) + "</pre></details>";
+  }).join("");
+  const plain = fit.scans.map((scan) => scan.plain).join("\n");
+  return '<div class="scan-reports"><p class="fit-missing-head">Scan report (each target, TP 1, 2 and 4)</p>' +
+    reports + '<details class="scan-plain-view"><summary>Plain view</summary><pre class="scan-plain">' +
+    esc(plain) + "</pre></details></div>";
 }
 
 // GiB to one decimal, as the server's reasons print them: 113.7 GiB, 8 GiB, 1404 GiB.
@@ -721,9 +770,22 @@ function replaceBrowsedModel(model) {
   paintModelResults();
 }
 
-function browseAction(act, id) {
+function browseAction(act, id, target, world) {
   const model = browsedModel(id);
   if (!model) return;
+  if (act === "convert" || act === "serve") {
+    const scan = (model.fit?.scans || []).find((entry) =>
+      entry.world === Number(world) && entry.target === target);
+    if (!scan || !scan.clean) {
+      toast(id + " has a gap at " + target + " TP" + world + "; fix the work items before converting or serving.", true);
+      return;
+    }
+    chooseBrowsedModel(model);
+    S.guideOpen[act === "convert" ? "convert" : "launch"] = true;
+    if (location.hash === "#setup") showTab("setup");
+    else location.hash = "setup";
+    return;
+  }
   if (!model.supported) {
     toast(id + " is not a model this build can serve: " + (model.fit?.summary || "it has no device engine") + ".", true);
     return;
@@ -2795,7 +2857,7 @@ function bindEvents() {
   $("model-results").addEventListener("click", (event) => {
     const action = event.target.closest("[data-browse-act]");
     if (action) {
-      browseAction(action.dataset.browseAct, action.dataset.browseId);
+      browseAction(action.dataset.browseAct, action.dataset.browseId, action.dataset.browseTarget, action.dataset.browseWorld);
       return;
     }
     const button = event.target.closest("[data-model-id]");

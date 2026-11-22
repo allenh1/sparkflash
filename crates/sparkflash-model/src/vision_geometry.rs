@@ -36,6 +36,435 @@ use crate::config::ConfigError;
 /// can share the type without either losing information: GLM-5.3-Flash names no position grid or
 /// RoPE base, and Qwen3.8-Flash-Next names no merger width, so each leaves the other's field at
 /// its declared default.
+/// The normalization a vision block applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionNorm {
+    /// RMSNorm: one learned scale, no bias.
+    Rms,
+    /// LayerNorm: a learned scale and bias.
+    Layer,
+}
+
+impl VisionNorm {
+    /// The stable name the scan prints.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Rms => "rms_norm",
+            Self::Layer => "layer_norm",
+        }
+    }
+
+    /// The encoding the plan carries.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Rms => 1,
+            Self::Layer => 2,
+        }
+    }
+}
+
+/// The gated or ordinary activation of a vision block or merger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionActivation {
+    /// SwiGLU: SiLU on the gate times the up projection.
+    SwiGlu,
+    /// The erf GELU used by the CLIP-style towers.
+    GeluErf,
+    /// The tanh-approximate GELU Qwen's tower names.
+    GeluTanh,
+}
+
+impl VisionActivation {
+    /// The stable name the scan prints.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SwiGlu => "swiglu",
+            Self::GeluErf => "gelu_erf",
+            Self::GeluTanh => "gelu_tanh",
+        }
+    }
+
+    /// The encoding a [crate::stack::PartInstance]'s geometry carries.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::SwiGlu => 1,
+            Self::GeluErf => 2,
+            Self::GeluTanh => 3,
+        }
+    }
+
+    /// The activation a code names, if any.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::SwiGlu),
+            2 => Some(Self::GeluErf),
+            3 => Some(Self::GeluTanh),
+            _ => None,
+        }
+    }
+}
+
+/// How a vision tower positions its patches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionPosition {
+    /// 2D rotary, with no learned grid.
+    Rotary,
+    /// A learned square grid, with no rotary.
+    LearnedGrid,
+    /// A learned grid and 2D rotary together.
+    RotaryAndGrid,
+    /// The checkpoint states neither.
+    None,
+}
+
+impl VisionPosition {
+    /// The stable name the scan prints.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Rotary => "2d_rotary",
+            Self::LearnedGrid => "learned_grid",
+            Self::RotaryAndGrid => "2d_rotary+learned_grid",
+            Self::None => "none",
+        }
+    }
+
+    /// The encoding the plan carries.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Rotary => 1,
+            Self::LearnedGrid => 2,
+            Self::RotaryAndGrid => 3,
+        }
+    }
+
+    /// The position scheme a code names, if any.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::Rotary),
+            2 => Some(Self::LearnedGrid),
+            3 => Some(Self::RotaryAndGrid),
+            _ => None,
+        }
+    }
+
+    /// Whether the scheme has a learned grid.
+    #[must_use]
+    pub const fn has_grid(self) -> bool {
+        matches!(self, Self::LearnedGrid | Self::RotaryAndGrid)
+    }
+
+    /// Whether the scheme has a rotary.
+    #[must_use]
+    pub const fn has_rotary(self) -> bool {
+        matches!(self, Self::Rotary | Self::RotaryAndGrid)
+    }
+}
+
+/// One arithmetic fact the config and the index both leave unstated.
+///
+/// The stack still names the component, but the scan must not resolve it: the kernel's
+/// arithmetic depends on this fact, and a catalogue entry that happens to share the default
+/// would make an unproven tower look proven. Each fact names the part it belongs to and the
+/// declaration that would settle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionFact {
+    /// The block norm kind (RMSNorm or LayerNorm).
+    Norm,
+    /// The block norm epsilon.
+    NormEpsilon,
+    /// Whether the attention projections carry a bias.
+    AttentionBias,
+    /// Whether queries and keys take a per-head norm.
+    QkNorm,
+    /// The block MLP activation.
+    Activation,
+    /// The position scheme.
+    Position,
+    /// The downsample or unfold before the merger.
+    Downsample,
+    /// The merger's activation.
+    MergerActivation,
+    /// Whether the merger applies a final norm.
+    MergerFinalNorm,
+}
+
+impl VisionFact {
+    /// The part this fact sizes.
+    #[must_use]
+    pub const fn part(self) -> crate::Part {
+        match self {
+            Self::Norm | Self::NormEpsilon => crate::Part::VisionNorm,
+            Self::AttentionBias | Self::QkNorm => crate::Part::VisionAttention,
+            Self::Activation => crate::Part::VisionMlp,
+            Self::Position => crate::Part::VisionPosition,
+            Self::Downsample | Self::MergerActivation | Self::MergerFinalNorm => {
+                crate::Part::VisionMerger
+            }
+        }
+    }
+
+    /// What the checkpoint has not stated.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Norm => "the block norm kind",
+            Self::NormEpsilon => "the block norm epsilon",
+            Self::AttentionBias => "whether the attention projections carry a bias",
+            Self::QkNorm => "whether queries and keys take a per-head norm",
+            Self::Activation => "the block MLP activation",
+            Self::Position => "the position scheme",
+            Self::Downsample => "the downsample or unfold before the merger",
+            Self::MergerActivation => "the merger activation",
+            Self::MergerFinalNorm => "whether the merger applies a final norm",
+        }
+    }
+
+    /// What would settle the fact.
+    #[must_use]
+    pub const fn fix(self) -> &'static str {
+        "state the field in vision_config, or supply the tensor index so its names can prove it"
+    }
+}
+
+/// How a vision tower folds a merge cell before the merger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionDownsample {
+    /// No downsample: the merger reads the block rows directly.
+    None,
+    /// The shared 3x3 (or NxN) unfold kernel.
+    Unfold(usize),
+    /// A reshape of a merge cell, with no kernel of its own.
+    Merge(usize),
+    /// A learned convolution over the merge cell.
+    Conv(usize),
+}
+
+impl VisionDownsample {
+    /// The factor per side.
+    #[must_use]
+    pub const fn factor(self) -> usize {
+        match self {
+            Self::None => 1,
+            Self::Unfold(factor) | Self::Merge(factor) | Self::Conv(factor) => factor,
+        }
+    }
+
+    /// The stable name the scan prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unfold(_) => "unfold",
+            Self::Merge(_) => "merge",
+            Self::Conv(_) => "conv",
+        }
+    }
+
+    /// The encoding the plan carries.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Unfold(_) => 1,
+            Self::Merge(_) => 2,
+            Self::Conv(_) => 3,
+        }
+    }
+
+    /// The downsampling a code names, if any.
+    #[must_use]
+    pub const fn from_code(code: u8, factor: usize) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::Unfold(factor)),
+            2 => Some(Self::Merge(factor)),
+            3 => Some(Self::Conv(factor)),
+            _ => None,
+        }
+    }
+}
+
+/// One vision tower as a stack of parts: geometry plus the components the config and index state.
+///
+/// This is the description piece the scan resolves. [VisionGeometry] stays the compact shape
+/// summary the arms already consume; this type adds the components a config may leave implicit
+/// (norm kind and epsilon, activation and clamp, attention bias, query/key norms, position scheme,
+/// downsample and merger) and the place the tensor index fills them when it is supplied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisionTowerSpec {
+    /// The tower's geometric summary.
+    pub geometry: VisionGeometry,
+    /// The block norm kind.
+    pub norm: VisionNorm,
+    /// The block norm epsilon.
+    pub norm_epsilon: f64,
+    /// Whether the qkv and output projections carry a bias.
+    pub attention_bias: bool,
+    /// Whether queries and keys take a per-head norm.
+    pub qk_norm: bool,
+    /// The block MLP activation.
+    pub activation: VisionActivation,
+    /// The frames one stored patch projection embeds, when the tensor index states it.
+    ///
+    /// A config's `temporal_patch_size` is the processor's frame count; a tower may fold the
+    /// second frame into the stored weight (Inkling's does). The index's patch-projection input
+    /// width is the only proof of which one the kernel will see.
+    pub patch_temporal: Option<usize>,
+    /// The softcap on the block MLP's gate and up projections, when one is declared.
+    pub activation_clamp: Option<f64>,
+    /// The position scheme.
+    pub position: VisionPosition,
+    /// The rotary base, when the scheme has rotary.
+    pub rope_theta: f64,
+    /// The downsample or unfold before the merger.
+    pub downsample: VisionDownsample,
+    /// The merger MLP's width, or zero when the merger has no hidden layer.
+    pub merger_intermediate: usize,
+    /// The merger's activation.
+    pub merger_activation: VisionActivation,
+    /// Whether the merger applies a final norm after its projection.
+    pub merger_final_norm: bool,
+    /// The facts neither the config nor the index stated. A component carrying one is not
+    /// resolvable, even when the default below happens to match a catalogue entry.
+    pub unstated: Vec<VisionFact>,
+}
+
+impl VisionTowerSpec {
+    /// The structural spec of a tower the architecture parser already read.
+    #[must_use]
+    pub fn from_vision(vision: &crate::architecture::Vision) -> Self {
+        let geometry = VisionGeometry::from_vision(vision);
+        let mut unstated = Vec::new();
+        if vision.norm.is_none() {
+            unstated.push(VisionFact::Norm);
+        }
+        if vision.norm_epsilon.is_none() {
+            unstated.push(VisionFact::NormEpsilon);
+        }
+        if vision.attention_bias.is_none() {
+            unstated.push(VisionFact::AttentionBias);
+        }
+        if vision.qk_norm.is_none() {
+            unstated.push(VisionFact::QkNorm);
+        }
+        if vision.activation.is_none() {
+            unstated.push(VisionFact::Activation);
+        }
+        if vision.position.is_none() {
+            unstated.push(VisionFact::Position);
+        }
+        if vision.downsample.is_none() {
+            unstated.push(VisionFact::Downsample);
+        }
+        if vision.merger_activation.is_none() {
+            unstated.push(VisionFact::MergerActivation);
+        }
+        if vision.merger_final_norm.is_none() {
+            unstated.push(VisionFact::MergerFinalNorm);
+        }
+        let norm = vision.norm.unwrap_or(VisionNorm::Rms);
+        let activation = vision.activation.unwrap_or(match norm {
+            VisionNorm::Rms => VisionActivation::SwiGlu,
+            VisionNorm::Layer => VisionActivation::GeluErf,
+        });
+        let position = vision
+            .position
+            .unwrap_or(if geometry.num_position_embeddings > 0 {
+                VisionPosition::RotaryAndGrid
+            } else {
+                VisionPosition::Rotary
+            });
+        let rope_theta = geometry.rope_theta;
+        let downsample = vision.downsample.unwrap_or(VisionDownsample::None);
+        let merger_intermediate = if vision.merger_intermediate > 0 {
+            vision.merger_intermediate
+        } else {
+            match downsample {
+                VisionDownsample::Unfold(_) => geometry.out_hidden_size,
+                VisionDownsample::Merge(_) => geometry
+                    .hidden_size
+                    .saturating_mul(downsample.factor())
+                    .saturating_mul(downsample.factor()),
+                VisionDownsample::None | VisionDownsample::Conv(_) => 0,
+            }
+        };
+        Self {
+            geometry,
+            norm,
+            norm_epsilon: vision.norm_epsilon.unwrap_or(1e-6),
+            attention_bias: vision.attention_bias.unwrap_or(true),
+            qk_norm: vision.qk_norm.unwrap_or(false),
+            activation,
+            activation_clamp: vision.activation_clamp,
+            patch_temporal: vision.patch_temporal,
+            position,
+            rope_theta,
+            downsample,
+            merger_intermediate,
+            // A plain merger does not inherit the block's activation: Qwen's block is
+            // tanh-GELU while its merger is erf-GELU. The CLIP-family default is the erf body;
+            // a gated merger is proved by its tensor names in the architecture reader.
+            merger_activation: vision
+                .merger_activation
+                .unwrap_or(VisionActivation::GeluErf),
+            merger_final_norm: vision.merger_final_norm.unwrap_or(false),
+            unstated,
+        }
+    }
+
+    /// The arithmetic facts neither the config nor the index stated.
+    #[must_use]
+    pub fn unstated(&self) -> &[VisionFact] {
+        &self.unstated
+    }
+
+    /// The features one patch contributes to the patch projection.
+    ///
+    /// A tower whose processor stacks a temporal pair states the pair in the stored weight; a
+    /// tower whose patchify kernel takes one frame (Inkling's) states the single-frame width even
+    /// though its config names a temporal pair, because the second frame is a duplicate the kernel
+    /// never sees.
+    #[must_use]
+    pub fn patch_features(&self) -> usize {
+        self.geometry
+            .in_channels
+            .saturating_mul(self.patch_temporal_size())
+            .saturating_mul(self.geometry.patch_size)
+            .saturating_mul(self.geometry.patch_size)
+    }
+
+    /// The frames one patch projection embeds.
+    ///
+    /// The stored weight decides when the index proved its input width; otherwise the config's
+    /// processor frame count is the only statement. A merger and a position grid say nothing
+    /// about the patch kernel, so they are not evidence either way.
+    #[must_use]
+    pub fn patch_temporal_size(&self) -> usize {
+        self.patch_temporal
+            .unwrap_or_else(|| self.geometry.temporal_patch_size.max(1))
+    }
+
+    /// The width a merge cell contributes before the merger.
+    #[must_use]
+    pub fn merged_width(&self) -> usize {
+        self.geometry
+            .hidden_size
+            .saturating_mul(self.downsample.factor())
+            .saturating_mul(self.downsample.factor())
+    }
+}
+
+/// One ViT's geometry, as both released checkpoints describe theirs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisionGeometry {
     /// Transformer blocks.
@@ -85,7 +514,7 @@ impl VisionGeometry {
         language_hidden: usize,
     ) -> Result<Self, ConfigError> {
         let number = |name: &str| -> Result<Option<usize>, ConfigError> {
-            match config.get(name) {
+            match crate::coverage::read_key(config, name) {
                 None | Some(serde_json::Value::Null) => Ok(None),
                 Some(value) => value
                     .as_u64()
@@ -97,7 +526,7 @@ impl VisionGeometry {
             }
         };
         let float = |name: &str| -> Result<Option<f64>, ConfigError> {
-            match config.get(name) {
+            match crate::coverage::read_key(config, name) {
                 None | Some(serde_json::Value::Null) => Ok(None),
                 Some(value) => value.as_f64().map(Some).ok_or_else(|| {
                     ConfigError::Invalid(format!("vision_config.{name} is not a number"))
@@ -200,7 +629,10 @@ impl VisionGeometry {
     /// The elements one patch contributes before the first projection.
     #[must_use]
     pub fn patch_dim(&self) -> usize {
-        self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
+        self.in_channels
+            .saturating_mul(self.temporal_patch_size)
+            .saturating_mul(self.patch_size)
+            .saturating_mul(self.patch_size)
     }
 
     /// The side of the learned position grid, when the tower has one.
@@ -247,8 +679,9 @@ impl VisionGeometry {
                 self.hidden_size, self.num_heads
             )));
         }
+        let side = self.position_side();
         if self.num_position_embeddings > 0
-            && self.position_side().pow(2) != self.num_position_embeddings
+            && side.checked_mul(side) != Some(self.num_position_embeddings)
         {
             return Err(ConfigError::Invalid(format!(
                 "the vision tower's {} position embeddings are not a square grid",

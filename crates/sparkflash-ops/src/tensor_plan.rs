@@ -25,6 +25,8 @@
 //! intermediate widths divide evenly, an FP8 expert is a run of whole `block_n`-wide tiles (D91),
 //! and an NVFP4 expert is padded to the 64-column MMA tile above TP1.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use sparkflash_model::architecture::{
     Architecture, AttentionKind, DenseMlp, Ffn, Kda, Layer, Moe, PleGeometry, Residual, ScaleDType,
     Side, WeightFormat,
@@ -35,6 +37,7 @@ use sparkflash_weights::{DType, TensorPlan, TensorSpec};
 
 use crate::engine_plan::PlanError;
 use crate::naming::{AttentionNames, ExpertNames, FfnNames, NamingDialect, TensorNames};
+use crate::scan_report::{TensorEntry, TensorIndex};
 
 /// The prefix every language-model tensor carries in the released checkpoints.
 pub const LM_PREFIX: &str = "model.language_model";
@@ -1615,8 +1618,11 @@ impl Builder {
         };
         let width = vision.hidden_size;
         let prefix = VISION_PREFIX;
-        let patch =
-            vision.in_channels * vision.temporal_patch_size * vision.patch_size * vision.patch_size;
+        let frames = vision
+            .patch_temporal
+            .unwrap_or(vision.temporal_patch_size)
+            .max(1);
+        let patch = vision.in_channels * frames * vision.patch_size * vision.patch_size;
         self.whole(
             format!("{prefix}.patch_embed.proj.weight"),
             DType::BF16,
@@ -2247,7 +2253,10 @@ impl Builder {
             vec![
                 width,
                 vision.in_channels,
-                vision.temporal_patch_size,
+                vision
+                    .patch_temporal
+                    .unwrap_or(vision.temporal_patch_size)
+                    .max(1),
                 vision.patch_size,
                 vision.patch_size,
             ]
@@ -2283,6 +2292,331 @@ impl Builder {
         push!("merger.up_proj.weight", vec![projection, out]);
         push!("merger.down_proj.weight", vec![out, projection]);
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Tensor coverage: the claim set and the checkpoint index
+// ---------------------------------------------------------------------------------
+
+/// The tensors a model description takes, as one comparable set.
+///
+/// This is the seam between the scan and the description. Today the set is
+/// [ArchitectureTensorPlan::checkpoint]'s names, because that is the one shared plan a released
+/// checkpoint is checked against. The layout reader's stack tensor roles will replace it there
+/// and nowhere else: the scan compares [TensorClaims] with an index and never learns how the
+/// claims were built.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TensorClaims {
+    specs: Vec<TensorSpec>,
+}
+
+impl TensorClaims {
+    /// The claim set of the shared checkpoint plan.
+    ///
+    /// # Errors
+    /// As [ArchitectureTensorPlan::checkpoint].
+    pub fn from_checkpoint(architecture: &Architecture, tp: TpPlan) -> Result<Self, PlanError> {
+        let plan = ArchitectureTensorPlan::checkpoint(architecture, tp)?;
+        Ok(Self::from_specs(plan.specs().to_vec()))
+    }
+
+    /// A claim set over the given specs, in the given order.
+    #[must_use]
+    pub fn from_specs(specs: Vec<TensorSpec>) -> Self {
+        Self { specs }
+    }
+
+    /// Every claimed tensor, in construction order.
+    #[must_use]
+    pub fn specs(&self) -> &[TensorSpec] {
+        &self.specs
+    }
+
+    /// The number of claimed tensors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.specs.len()
+    }
+
+    /// Whether the description claims no tensor at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.specs.is_empty()
+    }
+
+    /// Whether the description claims `name`.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.specs.iter().any(|spec| spec.name == name)
+    }
+}
+
+/// One planned tensor the index does not match: absent, or stored at another shape or dtype.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorDisagreement {
+    /// The planned tensor's name.
+    pub tensor: String,
+    /// The dtype the plan expects, as [DType::name].
+    pub expected_dtype: String,
+    /// The logical shape the plan expects.
+    pub expected_shape: Vec<usize>,
+    /// The dtype the checkpoint stores, when the name is present.
+    pub found_dtype: Option<String>,
+    /// The shape the checkpoint stores, when the name is present.
+    pub found_shape: Option<Vec<usize>>,
+    /// Why the two do not agree, in one sentence.
+    pub reason: String,
+}
+
+/// A set of unclaimed tensors that shares a prefix: one row for a large group, one row a tensor
+/// for a small one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorGroup {
+    /// The exact common prefix, without a trailing dot.
+    pub prefix: String,
+    /// The names the group covers, in name order.
+    pub names: Vec<String>,
+}
+
+/// Groups smaller than this are emitted tensor by tensor; a larger one is one row naming its
+/// prefix and count.
+const SMALL_UNCLAIMED_GROUP: usize = 8;
+
+impl TensorGroup {
+    /// How many tensors the group covers.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.names.len()
+    }
+
+    /// The label the report prints: the exact tensor name for a single row, or the exact prefix,
+    /// a `*` and the count for a group.
+    #[must_use]
+    pub fn label(&self) -> String {
+        if self.names.len() == 1 {
+            self.prefix.clone()
+        } else {
+            format!("{}.* ({} tensors)", self.prefix, self.names.len())
+        }
+    }
+}
+
+/// The result of checking a description's claims against a checkpoint index, in both directions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TensorCoverage {
+    /// How many planned tensors the index holds at the planned dtype and shape.
+    pub matched: usize,
+    /// Planned tensors the index does not match, in claim order.
+    pub disagreements: Vec<TensorDisagreement>,
+    /// Index tensors no planned part takes, grouped by common prefix.
+    pub unclaimed: Vec<TensorGroup>,
+}
+
+impl TensorCoverage {
+    /// Whether every planned tensor matched and every indexed tensor was claimed.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.disagreements.is_empty() && self.unclaimed.is_empty()
+    }
+
+    /// How many indexed tensors no part took.
+    #[must_use]
+    pub fn unclaimed_count(&self) -> usize {
+        self.unclaimed.iter().map(TensorGroup::count).sum()
+    }
+}
+
+/// Compare a description's claims with a checkpoint index, in both directions.
+///
+/// A planned tensor must be in the index at the planned dtype and shape; a container's reshape
+/// (a stacked expert block, a convolution's unit axis) and NVFP4's `U8` packing are accepted by
+/// [TensorSpec::is_stored_as], exactly as the loader accepts them. Every indexed tensor the claim
+/// set does not name is unclaimed.
+#[must_use]
+pub fn compare_tensor_claims(claims: &TensorClaims, index: &TensorIndex) -> TensorCoverage {
+    let mut by_name: BTreeMap<&str, &TensorEntry> = BTreeMap::new();
+    for entry in &index.tensors {
+        by_name.entry(entry.name.as_str()).or_insert(entry);
+    }
+    let mut coverage = TensorCoverage::default();
+    for spec in claims.specs() {
+        let Some(entry) = by_name.get(spec.name.as_str()) else {
+            coverage.disagreements.push(TensorDisagreement {
+                tensor: spec.name.clone(),
+                expected_dtype: spec.dtype.name().to_owned(),
+                expected_shape: spec.shape.clone(),
+                found_dtype: None,
+                found_shape: None,
+                reason: "the index has no tensor with this name".to_owned(),
+            });
+            continue;
+        };
+        match entry.logical_spec() {
+            Ok(found) if stored_as_plan(spec, &found) => coverage.matched += 1,
+            Ok(found) => {
+                let reason = if found.dtype != spec.dtype {
+                    format!(
+                        "the index stores {} where the plan expects {}",
+                        found.dtype.name(),
+                        spec.dtype.name()
+                    )
+                } else {
+                    format!(
+                        "the index stores shape {} where the plan expects {}",
+                        shape_text(&found.shape),
+                        shape_text(&spec.shape)
+                    )
+                };
+                coverage.disagreements.push(TensorDisagreement {
+                    tensor: spec.name.clone(),
+                    expected_dtype: spec.dtype.name().to_owned(),
+                    expected_shape: spec.shape.clone(),
+                    found_dtype: Some(entry.dtype.clone()),
+                    found_shape: Some(entry.shape.clone()),
+                    reason,
+                });
+            }
+            Err(error) => coverage.disagreements.push(TensorDisagreement {
+                tensor: spec.name.clone(),
+                expected_dtype: spec.dtype.name().to_owned(),
+                expected_shape: spec.shape.clone(),
+                found_dtype: Some(entry.dtype.clone()),
+                found_shape: Some(entry.shape.clone()),
+                reason: error.to_string(),
+            }),
+        }
+    }
+    let claimed: BTreeSet<&str> = claims
+        .specs()
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect();
+    let unclaimed: Vec<TensorEntry> = index
+        .tensors
+        .iter()
+        .filter(|entry| !claimed.contains(entry.name.as_str()))
+        .cloned()
+        .collect();
+    coverage.unclaimed = group_unclaimed(&unclaimed);
+    coverage
+}
+
+/// Whether a checkpoint descriptor holds a planned tensor: [TensorSpec::is_stored_as], or a
+/// stored collapse of the plan's last axis into a trailing run of dimensions.
+///
+/// A patch embedding is the case that needs the second rule: the plan keeps the arithmetic's
+/// `[width, in * frames * patch * patch]` matrix, while a released shard stores the same values
+/// as `[width, in, frames, patch, patch]`. The first axis and the total width must agree, so a
+/// reshape that moves the row axis or changes the element count is still a different tensor.
+fn stored_as_plan(spec: &TensorSpec, found: &TensorSpec) -> bool {
+    if spec.is_stored_as(found) {
+        return true;
+    }
+    if spec.dtype != found.dtype {
+        return false;
+    }
+    let [rows, columns] = spec.shape.as_slice() else {
+        return false;
+    };
+    let Some((first, rest)) = found.shape.split_first() else {
+        return false;
+    };
+    found.shape.len() > 2
+        && first == rows
+        && rest.iter().map(|&dim| dim as u128).product::<u128>() == *columns as u128
+}
+
+/// Group unclaimed tensors by the prefix their names share.
+///
+/// The grouping key is the tower root for a tower (`vision`, `visual`, `audio`, `aligner`,
+/// or `model.visual` / `model.audio`) and the first two dotted components otherwise. A group of
+/// [SMALL_UNCLAIMED_GROUP] tensors or fewer is emitted one row per tensor, so a single stray
+/// tensor is named exactly; a larger group is one row naming the exact common prefix and its
+/// count. Nothing here knows a model or a family: the prefix comes from the names.
+#[must_use]
+pub fn group_unclaimed(entries: &[TensorEntry]) -> Vec<TensorGroup> {
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for entry in entries {
+        grouped
+            .entry(group_key(&entry.name))
+            .or_default()
+            .push(entry.name.clone());
+    }
+    let mut groups = Vec::new();
+    for (key, mut names) in grouped {
+        names.sort();
+        names.dedup();
+        if names.len() <= SMALL_UNCLAIMED_GROUP {
+            for name in names {
+                groups.push(TensorGroup {
+                    prefix: name.clone(),
+                    names: vec![name],
+                });
+            }
+            continue;
+        }
+        let prefix = common_prefix(&names).unwrap_or(key);
+        groups.push(TensorGroup { prefix, names });
+    }
+    groups.sort_by(|left, right| left.prefix.cmp(&right.prefix));
+    groups
+}
+
+/// Whether a tensor belongs to a tower rather than the language backbone. The scan uses this
+/// only to report a checkpoint whose shared plan could not be built: its tower tensors are
+/// still unclaimed, while the tensors the missing plan would have claimed are the plan error's
+/// subject, not tens of thousands of rows.
+#[must_use]
+pub fn is_tower_tensor(name: &str) -> bool {
+    name.starts_with("aligner.")
+        || name
+            .split('.')
+            .any(|part| matches!(part, "vision" | "visual" | "audio"))
+}
+
+/// The grouping key of one tensor name.
+fn group_key(name: &str) -> String {
+    let parts: Vec<&str> = name.split('.').collect();
+    let tower = |part: &str| matches!(part, "vision" | "visual" | "audio" | "aligner");
+    match parts.as_slice() {
+        [] => name.to_owned(),
+        [only] => (*only).to_owned(),
+        [first, second, ..] if tower(first) => (*first).to_owned(),
+        [first, second, ..] if first == &"model" && tower(second) => format!("{first}.{second}"),
+        [first, second, ..] => format!("{first}.{second}"),
+    }
+}
+
+/// The longest dotted-component prefix every name shares.
+fn common_prefix(names: &[String]) -> Option<String> {
+    let first: Vec<&str> = names.first()?.split('.').collect();
+    let mut length = first.len();
+    for name in &names[1..] {
+        let parts: Vec<&str> = name.split('.').collect();
+        let mut shared = 0;
+        while shared < length && shared < parts.len() && first[shared] == parts[shared] {
+            shared += 1;
+        }
+        length = shared;
+        if length == 0 {
+            return Some(String::new());
+        }
+    }
+    Some(first[..length].join("."))
+}
+
+/// A shape in the report's `128x5120` spelling.
+#[must_use]
+pub fn shape_text(shape: &[usize]) -> String {
+    if shape.is_empty() {
+        "scalar".to_owned()
+    } else {
+        shape
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("x")
     }
 }
 

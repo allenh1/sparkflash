@@ -16,18 +16,19 @@
 //!
 //! The preview reads the checkpoint's own `config.json` (the operator's `--config`, the local
 //! Hugging Face cache, and only then the Hub) through [Architecture], then reads the registrations
-//! this tree already has: `ARMS`, `MODELS`, `CATALOGUE`, `WAIVERS` and `DEFAULTS`. Nothing is
-//! copied into a second table here.
+//! this tree already has: `ARMS`, `MODELS`, `DEFAULTS` and the kernel catalogue behind the scan.
+//! Nothing is copied into a second table here.
 //!
-//! The output answers four questions in order:
+//! The output answers three questions in order:
 //!
-//! * which `CATALOGUE` parts the architecture already names, and which are absent;
-//! * which named parts have no tensor-core body in a pass and no phase-3a `WAIVERS` line, so a
-//!   `PartExec` (a body of their own) has to be written;
+//! * the one `ScanReport` per target and TP, including every unresolved part, unread config key
+//!   and unclaimed tensor with its fix;
 //! * the stored format of each weight class;
 //! * the fit at TP 1, 2 and 4 and the stored-bytes-per-token floor from `sparkflash-ops`.
 //!
-//! It opens no device and needs no checkpoint: the configuration is enough.
+//! It opens no device. When a local snapshot or the Hub can supply safetensors headers, those
+//! headers are read without weights so the tensor check runs; otherwise the report says
+//! `tensors not checked` and is not clean.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -39,7 +40,6 @@ use sparkflash_model::{
     ARMS, Architecture, DEFAULTS, MEMORY_FLOOR_BYTES, NODE_MEMORY_BUDGET_BYTES, Part, Target,
     canonical_model_type, find_model_by_type, gib,
 };
-use sparkflash_ops::parts::carried;
 use sparkflash_ops::{EnginePlan, bytes_per_token_floor, stored_bytes_floor};
 
 /// The device target the catalogue is read at. The phase-8 preview is a build-time question, so it
@@ -61,6 +61,8 @@ struct Input {
     unmodelled: Vec<String>,
     /// The document as read, which `--emit` copies into the crate.
     text: String,
+    /// The checkpoint's tensor index, when local safetensors headers or the Hub supplied one.
+    tensors: Option<sparkflash_ops::TensorIndex>,
 }
 
 /// Parse the arguments after `onboard`.
@@ -146,7 +148,18 @@ fn load(id: Option<&str>, config: Option<&Path>) -> Result<Input, String> {
     if let Some(path) = config {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        return from_text(id, &text, format!("--config {}", path.display()));
+        let mut input = from_text(id, &text, format!("--config {}", path.display()))?;
+        input.tensors =
+            path.parent().and_then(
+                |directory| match sparkflash_weights::tensor_index::read_local(directory) {
+                    Ok(index) => Some(sparkflash_ops::TensorIndex::from_reader(&index)),
+                    Err(error) => {
+                        eprintln!("sparkflash onboard: tensor index: {error}");
+                        None
+                    }
+                },
+            );
+        return Ok(input);
     }
     let Some(id) = id else {
         return Err("no model id and no --config".to_owned());
@@ -161,16 +174,32 @@ fn load(id: Option<&str>, config: Option<&Path>) -> Result<Input, String> {
         let architecture = Architecture::from_checkpoint_dir(&directory)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let unmodelled = unmodelled(&text);
+        let tensors = match sparkflash_weights::tensor_index::read_local(&directory) {
+            Ok(index) => Some(sparkflash_ops::TensorIndex::from_reader(&index)),
+            Err(error) => {
+                eprintln!("sparkflash onboard: tensor index: {error}");
+                None
+            }
+        };
         return Ok(Input {
             id: Some(id.to_owned()),
             source: format!("hub cache {}", directory.display()),
             architecture,
             unmodelled,
             text,
+            tensors,
         });
     }
     let text = fetch(id)?;
-    from_text(Some(id), &text, format!("the Hub ({id})"))
+    let mut input = from_text(Some(id), &text, format!("the Hub ({id})"))?;
+    input.tensors = match sparkflash_weights::tensor_index::read_hub(id, "main") {
+        Ok(index) => Some(sparkflash_ops::TensorIndex::from_reader(&index)),
+        Err(error) => {
+            eprintln!("sparkflash onboard: tensor index: {error}");
+            None
+        }
+    };
+    Ok(input)
 }
 
 /// Parse a document that was read locally or fetched.
@@ -183,6 +212,7 @@ fn from_text(id: Option<&str>, text: &str, source: String) -> Result<Input, Stri
         unmodelled: unmodelled(text),
         architecture,
         text: text.to_owned(),
+        tensors: None,
     })
 }
 
@@ -302,7 +332,8 @@ fn render(input: &Input) -> String {
     let _ = writeln!(out, "serving defaults (DEFAULTS): {defaults}");
 
     render_formats(&mut out, architecture, input, arm.is_some());
-    render_parts(&mut out, architecture);
+    render_tensor_core(&mut out, architecture);
+    render_scan(&mut out, input);
     render_fit(&mut out, architecture, arm.map(|arm| arm.default_context()));
     out
 }
@@ -371,59 +402,27 @@ fn render_formats(out: &mut String, architecture: &Architecture, input: &Input, 
     }
 }
 
-/// Which named parts the catalogue carries, which it lacks, and which need a tensor-core body.
-fn render_parts(out: &mut String, architecture: &Architecture) {
-    let available = carried(TARGET);
-    let needed = architecture.parts();
-    let missing = architecture.missing(&available);
-    let _ = writeln!(out, "parts CATALOGUE has ({}):", TARGET);
-    let present: Vec<&str> = needed
-        .iter()
-        .filter(|part| available.contains(*part))
-        .map(Part::name)
-        .collect();
-    let _ = writeln!(
-        out,
-        "  {}",
-        if present.is_empty() {
-            "none".to_owned()
-        } else {
-            present.join(", ")
-        }
-    );
-    let _ = writeln!(out, "parts CATALOGUE lacks ({TARGET}):");
-    let _ = writeln!(
-        out,
-        "  {}",
-        if missing.is_empty() {
-            "none".to_owned()
-        } else {
-            missing
-                .iter()
-                .map(|part| part.name())
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    );
+/// The tensor-core section `onboard` has always printed; the shared op library formats it.
+fn render_tensor_core(out: &mut String, architecture: &Architecture) {
+    out.push_str(&sparkflash_ops::parts::tensor_core_gap_report(
+        architecture,
+        TARGET,
+    ));
+}
 
-    let gaps = sparkflash_ops::parts::tensor_core_gaps(architecture, TARGET);
-    let (waived, needing) = (gaps.waived, gaps.needing);
-    let _ = writeln!(out, "parts with tensor-core gaps:");
-    if waived.is_empty() {
-        let _ = writeln!(out, "  none");
-    } else {
-        for line in &waived {
-            let _ = writeln!(out, "  waived {line}");
-        }
-    }
-    let _ = writeln!(out, "parts with no tensor-core body or waiver:");
-    if needing.is_empty() {
-        let _ = writeln!(out, "  none");
-    } else {
-        for line in &needing {
-            let _ = writeln!(out, "  {line}");
-        }
-    }
+/// The one scan report, in the same plain text the console's plain view prints.
+fn scan_section(input: &Input) -> String {
+    sparkflash_web::fit::scan_plain(
+        &input.text,
+        input.tensors.as_ref(),
+        sparkflash_web::fit::SCAN_TARGETS,
+        &WORLDS,
+    )
+}
+
+/// Write the shared scan report; there is no second formatter here.
+fn render_scan(out: &mut String, input: &Input) {
+    out.push_str(&scan_section(input));
 }
 
 /// The fit at each world and the stored-bytes-per-token floor.
@@ -513,56 +512,60 @@ mod tests {
         "../../sparkflash-model-dory/config/nvidia_nemotron_labs_dory1_0_4b_bf16.hf.json"
     );
 
-    fn preview() -> String {
-        let input = from_text(
+    fn dory() -> Input {
+        from_text(
             Some("nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"),
             DORY,
             "test fixture".to_owned(),
         )
-        .expect("the released Dory document parses");
-        render(&input)
+        .expect("the released Dory document parses")
+    }
+
+    fn preview() -> String {
+        render(&dory())
     }
 
     #[test]
-    fn the_preview_names_the_parts_the_catalogue_has_and_lacks() {
+    fn the_preview_prints_the_scan_report_for_every_target_and_width() {
         let text = preview();
-        assert!(text.contains("parts CATALOGUE has (sm121):"));
-        assert!(text.contains("parts CATALOGUE lacks (sm121):"));
-        assert!(text.contains("embedding"), "no embedding in:\n{text}");
-        assert!(
-            text.contains("gqa_attention"),
-            "no gqa_attention in:\n{text}"
-        );
-        assert!(text.contains("dense_mlp"), "no dense_mlp in:\n{text}");
-        assert!(text.contains("lm_head"), "no lm_head in:\n{text}");
-        assert!(text.contains("parts with no tensor-core body or waiver:"));
-        assert!(text.contains("parts with tensor-core gaps:"));
-        assert!(
-            text.contains("waived lm_head bf16 decode"),
-            "the head's waived gap is not named:\n{text}"
-        );
-    }
-
-    #[test]
-    fn the_preview_names_every_missing_part() {
-        let input = from_text(None, DORY, "test fixture".to_owned())
-            .expect("the released Dory document parses");
-        let text = render(&input);
-        let missing = input.architecture.missing(&carried(TARGET));
-        if missing.is_empty() {
-            assert!(
-                text.contains("parts CATALOGUE lacks (sm121):\n  none"),
-                "empty missing list is not printed as none:\n{text}"
-            );
-        } else {
-            for part in missing {
+        for target in ["sm100", "sm120", "sm121"] {
+            for world in WORLDS {
                 assert!(
-                    text.contains(part.name()),
-                    "missing part {} is not named:\n{text}",
-                    part.name()
+                    text.contains(&format!("scan report: {target} TP{world},")),
+                    "no {target} TP{world} report in:\n{text}"
                 );
             }
         }
+        assert!(
+            text.contains("coverage: tensors"),
+            "no coverage in:\n{text}"
+        );
+        assert!(
+            text.contains("tensor-core coverage at sm121:"),
+            "no tensor-core section in:\n{text}"
+        );
+        assert!(text.contains("clean: "), "no clean line in:\n{text}");
+        assert!(
+            !text.contains("parts CATALOGUE has"),
+            "the old gap section is still printed:\n{text}"
+        );
+    }
+
+    #[test]
+    fn onboard_and_the_console_plain_view_render_identical_text() {
+        let input = dory();
+        let text = render(&input);
+        let console = sparkflash_web::fit::scan_plain(
+            &input.text,
+            None,
+            sparkflash_web::fit::SCAN_TARGETS,
+            &WORLDS,
+        );
+        assert_eq!(scan_section(&input), console);
+        assert!(
+            text.contains(&console),
+            "onboard does not print the console's plain view verbatim:\n{text}"
+        );
     }
 
     #[test]

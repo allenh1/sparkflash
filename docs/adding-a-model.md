@@ -31,9 +31,10 @@ sparkflash onboard ORG/REPO [--config FILE] [--emit DIR]
 
 Before any code is written it prints:
 
-- the parts `Architecture::parts()` reads from the config, and which ones the kernel catalogue
-  (`sparkflash_ops::parts::CATALOGUE`) already has;
-- the parts with no tensor-core body in a pass and no `WAIVERS` line;
+- the one `ScanReport` per target and TP: every part the stack names, whether a kernel resolves
+  for both passes, and every unread config key or unclaimed tensor with its fix;
+- which matrix-product parts have only a row body or no tensor-core body for a pass, and whether
+  a `WAIVERS` line covers the gap, so a `PartExec` or a waiver is the next edit;
 - the stored format of each weight class, read from `quantization_config` at the top level or
   under `text_config`;
 - the config switches the parser does not model yet (`Architecture::unmodelled_features`), which
@@ -41,7 +42,9 @@ Before any code is written it prints:
 - the fit at TP 1, 2 and 4, and the stored bytes-per-token floor.
 
 `--config FILE` reads the document from disk; otherwise it uses the hub cache and only then the
-Hub. `--emit DIR` adds the last step:
+Hub. The tensor check reads safetensors headers (local, or ranged Hub reads) without weights; when
+no header is available the report says `tensors not checked` and is not clean. `--emit DIR` adds
+the last step:
 
 - a family whose every part the dense host registers (`Dense::catalogue()`) needs no crate: it
   prints the `sparkflash serve --checkpoint DIR` command and succeeds;

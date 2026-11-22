@@ -174,11 +174,25 @@ fn unregister_model_type(text: &str) -> String {
     value.to_string()
 }
 
+fn is_vision(part: Part) -> bool {
+    matches!(
+        part,
+        Part::Vision
+            | Part::VisionPatchEmbed
+            | Part::VisionPosition
+            | Part::VisionNorm
+            | Part::VisionAttention
+            | Part::VisionMlp
+            | Part::VisionDownsample
+            | Part::VisionMerger
+    )
+}
+
 fn resolve_for(document: &Released, world: usize, phase: KernelPhase) -> Vec<ResolvedKernel> {
     let plan = plan_for(document, world);
     let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
     plan.requirements()
-        .filter(|requirement| requirement.part != Part::Vision)
+        .filter(|requirement| !is_vision(requirement.part))
         .map(|requirement| {
             resolver
                 .resolve_for(requirement, phase)
@@ -238,7 +252,7 @@ fn every_released_config_resolves_at_every_supported_world() {
             let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
             let mut resolved = Vec::new();
             for requirement in plan.requirements() {
-                if requirement.part == Part::Vision && skip_vision(document.name) {
+                if is_vision(requirement.part) {
                     continue;
                 }
                 resolved.push(
@@ -262,7 +276,7 @@ fn deepseek_moe_refuses_tp1_and_tp2_with_the_intermediate_width() {
         let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
         let failures = resolver.failures(&plan);
         assert!(!failures.is_empty(), "TP{world} must refuse");
-        for failure in &failures {
+        for failure in failures.iter().filter(|failure| !is_vision(failure.part)) {
             assert_eq!(
                 failure.part,
                 Part::Moe,
@@ -395,21 +409,31 @@ fn both_qwen_arms_resolve_their_own_dense_prefill_body() {
 fn a_boot_check_proves_both_passes_for_the_deepseek_arm() {
     let plan = EnginePlan::from_json(DEEPSEEK, Target::Sm121, 4, 0).expect("DeepSeek TP4");
     let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
+    let served = sparkflash_ops::parts::serving_language(Target::Sm121);
+    let language = plan
+        .requirements()
+        .filter(|requirement| !is_vision(requirement.part))
+        .count();
     let resolved = resolver
-        .boot_check(&plan)
+        .boot_check_serving(&plan, &served)
         .unwrap_or_else(|errors| panic!("boot check: {errors:?}"));
     assert!(!resolved.is_empty());
-    assert_eq!(resolved.len(), 2 * plan.requirements().count());
+    assert_eq!(resolved.len(), 2 * language);
 }
 
 #[test]
 fn the_glm_fp8_arm_boot_checks_both_passes() {
     let plan = EnginePlan::from_json(GLM, Target::Sm121, 4, 0).expect("GLM FP8 TP4");
     let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
+    let served = sparkflash_ops::parts::serving_language(Target::Sm121);
+    let language = plan
+        .requirements()
+        .filter(|requirement| !is_vision(requirement.part))
+        .count();
     let resolved = resolver
-        .boot_check(&plan)
+        .boot_check_serving(&plan, &served)
         .unwrap_or_else(|errors| panic!("GLM boot check: {errors:?}"));
-    assert_eq!(resolved.len(), 2 * plan.requirements().count());
+    assert_eq!(resolved.len(), 2 * language);
 }
 
 /// A Qwen FP8 serve boots both passes at every rank width the release serves, not only at TP1.
@@ -425,7 +449,7 @@ fn the_qwen_fp8_arm_boot_checks_both_passes_at_tp4() {
         for phase in [KernelPhase::Prefill, KernelPhase::Decode] {
             for requirement in plan
                 .requirements()
-                .filter(|requirement| requirement.part != Part::Vision)
+                .filter(|requirement| !is_vision(requirement.part))
             {
                 let resolved = resolver
                     .resolve_for(requirement, phase)
@@ -621,7 +645,10 @@ fn every_released_document_boot_checks_or_is_an_explicit_refusal() {
     for document in released() {
         let world = document.worlds.first().copied().unwrap_or(4);
         let plan = plan_for(&document, world);
-        let result = resolver.boot_check(&plan);
+        let result = resolver.boot_check_serving(
+            &plan,
+            &sparkflash_ops::parts::serving_language(Target::Sm121),
+        );
         if document.worlds.is_empty() {
             let errors = result.expect_err("a BF16 document has no routed-expert body");
             assert!(
@@ -659,29 +686,6 @@ fn every_released_document_boot_checks_or_is_an_explicit_refusal() {
                     errors.len()
                 );
             }
-            if skip_vision(document.name) {
-                assert!(
-                    errors.iter().any(|error| error.part == Part::Vision
-                        && error.to_string().contains("vision patch 16")),
-                    "{}: the 16-patch tower is still a catalogue refusal, even for a BF16 document: {errors:?}",
-                    document.name
-                );
-            }
-        } else if skip_vision(document.name) {
-            let errors = result.expect_err("the 16-patch vision tower is refused");
-            assert!(
-                !errors.is_empty(),
-                "{}: the refusal names no part",
-                document.name
-            );
-            for error in &errors {
-                assert_eq!(error.part, Part::Vision, "{}: {error}", document.name);
-                assert!(
-                    error.to_string().contains("vision patch 16"),
-                    "{}: {error}",
-                    document.name
-                );
-            }
         } else {
             result.unwrap_or_else(|errors| panic!("{}: {errors:?}", document.name));
         }
@@ -703,21 +707,22 @@ fn the_serving_boot_check_skips_the_unloaded_vision_tower() {
                     .boot_check(&plan)
                     .expect_err("the catalogue still refuses the 16-patch tower");
                 assert!(
-                    errors.iter().all(|error| error.part == Part::Vision),
+                    errors.iter().all(|error| is_vision(error.part)),
                     "{} TP{world}: the language parts resolve: {errors:?}",
                     document.name
                 );
                 assert!(
                     errors
                         .iter()
-                        .any(|error| error.to_string().contains("vision patch 16")),
-                    "{} TP{world}: the refusal names the patch: {errors:?}",
+                        .any(|error| error.part == Part::VisionPatchEmbed
+                            && error.to_string().contains("1152")),
+                    "{} TP{world}: the refusal names the tower width: {errors:?}",
                     document.name
                 );
             }
             let language = plan
                 .requirements()
-                .filter(|requirement| requirement.part != Part::Vision)
+                .filter(|requirement| !is_vision(requirement.part))
                 .count();
             let resolved = resolver
                 .boot_check_serving(&plan, &served)
@@ -775,7 +780,7 @@ fn the_catalogue_picks_the_image_by_shape_precision_and_pass() {
     );
     assert!(
         qwen.requirements()
-            .filter(|requirement| requirement.part != Part::Vision)
+            .filter(|requirement| !is_vision(requirement.part))
             .all(
                 |requirement| resolver.resolve(requirement).expect("part").image != Image::Deepseek
             ),
@@ -1051,12 +1056,14 @@ fn the_released_qwen_vision_patch_is_refused() {
     let failures = KernelResolver::new(Target::Sm121, Availability::Catalogue).failures(&plan);
     let failure = failures
         .iter()
-        .find(|failure| failure.part == Part::Vision)
+        .find(|failure| is_vision(failure.part))
         .unwrap_or_else(|| panic!("no vision failure: {failures:?}"));
     let message = failure.to_string();
     assert!(message.contains("vision"), "{message}");
-    assert!(message.contains("deepseek_ptx"), "{message}");
-    assert!(message.contains("vision patch"), "{message}");
+    assert!(
+        message.contains("hidden 1152 does not equal 1024"),
+        "{message}"
+    );
 }
 
 #[test]

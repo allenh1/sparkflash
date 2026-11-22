@@ -184,7 +184,7 @@ fn a_checkpoint_names_its_pack_from_its_own_config() {
         sparkflash_model::Target::Sm121,
     )
     .into_iter()
-    .filter(|part| *part != sparkflash_model::Part::Vision)
+    .filter(|part| !sparkflash_ops::parts::is_vision_part(*part))
     .collect();
     match parsed {
         Ok(parsed) => {
@@ -1196,7 +1196,7 @@ fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
             sparkflash_model::Target::Sm121,
         )
         .into_iter()
-        .filter(|part| *part != sparkflash_model::Part::Vision)
+        .filter(|part| !sparkflash_ops::parts::is_vision_part(*part))
         .collect();
         if missing.is_empty() {
             let options =

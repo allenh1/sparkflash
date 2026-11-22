@@ -25,6 +25,9 @@ description = "Generic tensor storage formats, safetensors container, weight sou
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Range reads of safetensors headers from the Hub (src/tensor_index.rs). The scan sends a public
+# repository id and standard HTTP headers only; no token or local path is included.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -38,6 +38,7 @@ pub use sparkflash_weights::hub::{default_cache_dir, is_model_id, repo_folder, r
 use sparkflash_weights::hub::{folder_id, snapshot_of};
 
 use sparkflash_model::Architecture;
+use sparkflash_ops::TensorIndex;
 use sparkflash_ops::parts::{
     host_reference_missing, host_reference_quantization_refusal, host_reference_rope_refusal,
     host_reference_storage_quantization_refusal,
@@ -301,11 +302,19 @@ pub fn fit_cached(model: &CachedModel, cluster: &Cluster) -> Fit {
     } else {
         Vec::new()
     };
+    let tensors = match sparkflash_weights::tensor_index::read_local(snapshot) {
+        Ok(index) => Some(TensorIndex::from_reader(&index)),
+        Err(error) => {
+            eprintln!("sparkflash web: tensor index for {}: {error}", model.id);
+            None
+        }
+    };
     fit::judge(
         &Evidence {
             config: document,
             declared: declared.as_ref(),
             weights,
+            tensors: tensors.as_ref(),
             missing: &lacks,
         },
         cluster,
@@ -504,11 +513,31 @@ impl HubHit {
                 bytes,
                 measured: false,
             });
+        // A search judges many hits and reads only the fields the Hub already returned; an
+        // explicit inspection reads the shard headers, so its scan can compare tensors without
+        // downloading a weight.
+        let tensors = if fetch_any {
+            match self
+                .sha
+                .as_deref()
+                .map(|revision| sparkflash_weights::tensor_index::read_hub(&self.id, revision))
+            {
+                Some(Ok(index)) => Some(TensorIndex::from_reader(&index)),
+                Some(Err(error)) => {
+                    eprintln!("sparkflash web: tensor index for {}: {error}", self.id);
+                    None
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let fit = fit::judge(
             &Evidence {
                 config: text.as_deref(),
                 declared: self.config.as_ref(),
                 weights,
+                tensors: tensors.as_ref(),
                 missing: &lacks,
             },
             cluster,

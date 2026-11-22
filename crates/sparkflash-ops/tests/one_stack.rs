@@ -162,6 +162,79 @@ fn the_language_stack_walk_matches_the_scan_and_the_plan_order() {
     }
 }
 
+#[test]
+fn the_vision_stack_parts_match_the_plan_and_the_declared_set() {
+    use sparkflash_model::stack::StackKind;
+    use sparkflash_model::{Architecture, Part, Target};
+    use sparkflash_ops::parts::is_vision_part;
+    use sparkflash_ops::{ScanInputs, ScanStatus, scan};
+
+    for (name, config) in [
+        (
+            "deepseek",
+            include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            ),
+        ),
+        (
+            "glm",
+            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+        ),
+        (
+            "inkling",
+            include_str!("../../sparkflash-model-inkling2/config/inkling2_small.hf.json"),
+        ),
+        (
+            "qwen",
+            include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json"),
+        ),
+    ] {
+        let architecture = Architecture::from_json(config).expect("the config parses");
+        let stack = architecture
+            .stacks()
+            .into_iter()
+            .find(|stack| stack.kind == StackKind::Vision)
+            .expect("a vision stack");
+        let mut declared: Vec<Part> = architecture
+            .parts()
+            .iter()
+            .filter(|part| is_vision_part(*part))
+            .collect();
+        let mut from_stack: Vec<Part> = stack.parts().map(|instance| instance.part).collect();
+        let plan =
+            sparkflash_ops::EnginePlan::from_json(config, Target::Sm121, 1, 0).expect("the plan");
+        let mut from_plan: Vec<Part> = plan
+            .globals()
+            .iter()
+            .filter(|requirement| is_vision_part(requirement.part))
+            .map(|requirement| requirement.part)
+            .collect();
+        declared.sort();
+        from_stack.sort();
+        from_plan.sort();
+        assert_eq!(declared, from_stack, "{name}: parts() and the stack");
+        assert_eq!(declared, from_plan, "{name}: parts() and the plan");
+
+        let report = scan(ScanInputs {
+            config,
+            tensors: None,
+            target: Target::Sm121,
+            world: 1,
+        });
+        let mut from_scan: Vec<Part> = report
+            .rows
+            .iter()
+            .filter(|row| {
+                row.stack == StackKind::Vision
+                    && !matches!(row.status, ScanStatus::UnknownKey { .. })
+            })
+            .map(|row| row.part)
+            .collect();
+        from_scan.sort();
+        assert_eq!(declared, from_scan, "{name}: parts() and the scan");
+    }
+}
+
 fn model_families() -> Vec<String> {
     let mut families: Vec<String> = std::fs::read_dir(workspace_root().join("crates"))
         .expect("the workspace has a crates directory")
@@ -234,15 +307,37 @@ fn the_scan_agrees_with_the_plan_on_every_released_config() {
             path.display(),
             report.error
         );
-        assert_eq!(report.rows.len(), plan.requirements().count());
+        let kernel_rows: Vec<_> = report
+            .rows
+            .iter()
+            .filter(|row| {
+                !matches!(
+                    row.status,
+                    sparkflash_ops::scan::ScanStatus::UnknownKey { .. }
+                        | sparkflash_ops::scan::ScanStatus::UnclaimedTensor { .. }
+                )
+            })
+            .collect();
+        assert_eq!(kernel_rows.len(), plan.requirements().count());
         let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
-        for (row, requirement) in report.rows.iter().zip(plan.requirements()) {
+        for (row, requirement) in kernel_rows.into_iter().zip(plan.requirements()) {
             let resolved = resolver
                 .resolve_for(requirement, KernelPhase::Prefill)
                 .is_ok()
                 && resolver
                     .resolve_for(requirement, KernelPhase::Decode)
                     .is_ok();
+            // The scan refuses a vision component whose arithmetic the config and index left
+            // unstated, even when the catalogue's concrete default would resolve. That is the
+            // scan's stricter contract, not a disagreement about the kernel.
+            if row.stack == sparkflash_model::stack::StackKind::Vision
+                && matches!(
+                    row.status,
+                    sparkflash_ops::scan::ScanStatus::UnknownLayout { .. }
+                )
+            {
+                continue;
+            }
             assert_eq!(
                 row.status.is_resolved(),
                 resolved,
@@ -385,4 +480,77 @@ fn the_deepseek_forward_is_out_of_the_cli_and_the_cli_is_below_34k_lines() {
             .is_file(),
         "the DeepSeek device forward crate is missing"
     );
+}
+
+#[test]
+fn each_released_vision_tower_is_a_stack_of_named_components() {
+    use sparkflash_model::stack::StackKind;
+    use sparkflash_model::{Part, Target};
+    use sparkflash_ops::scan::{ScanInputs, scan};
+
+    const DEEPSEEK: &str =
+        include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
+    const INKLING: &str =
+        include_str!("../../sparkflash-model-inkling2/config/inkling2_small.hf.json");
+    const GLM: &str = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const QWEN: &str =
+        include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
+
+    for (name, config, rows, resolved) in [
+        ("deepseek", DEEPSEEK, 7, false),
+        ("inkling", INKLING, 6, false),
+        ("glm", GLM, 7, false),
+        ("qwen", QWEN, 6, false),
+    ] {
+        let report = scan(ScanInputs {
+            config,
+            tensors: None,
+            target: Target::Sm121,
+            world: 1,
+        });
+        assert!(report.error.is_none(), "{name}: {:?}", report.error);
+        let vision: Vec<_> = report
+            .rows
+            .iter()
+            .filter(|row| {
+                row.stack == StackKind::Vision
+                    && !matches!(
+                        row.status,
+                        sparkflash_ops::scan::ScanStatus::UnknownKey { .. }
+                    )
+            })
+            .collect();
+        assert_eq!(
+            vision.len(),
+            rows,
+            "{name}: {}\n{}",
+            vision.len(),
+            report.render()
+        );
+        for row in &vision {
+            assert!(
+                row.status.is_resolved() || row.status.fix().is_some(),
+                "{name}: {} has no fix: {}",
+                row.part,
+                report.render()
+            );
+        }
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .filter(|row| row.stack == StackKind::Vision)
+                .all(|row| row.status.is_resolved()),
+            resolved,
+            "{name}:\n{}",
+            report.render()
+        );
+    }
+
+    // The old opaque part is only the stack's name; it has no catalogue entry of its own.
+    assert_eq!(
+        sparkflash_ops::parts::kernels(Part::Vision, Target::Sm121).count(),
+        0
+    );
+    assert!(sparkflash_ops::parts::kernels(Part::VisionPatchEmbed, Target::Sm121).count() > 0);
 }

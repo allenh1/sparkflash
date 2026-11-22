@@ -1973,7 +1973,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("Qwen FP8 TP{world}: {error}"));
             assert!(
                 plan.requirements()
-                    .any(|requirement| requirement.part == sparkflash_model::Part::Vision),
+                    .any(|requirement| sparkflash_ops::parts::is_vision_part(requirement.part)),
                 "the released document still plans the tower"
             );
             assert_eq!(
@@ -1996,13 +1996,13 @@ mod tests {
             assert!(
                 errors
                     .iter()
-                    .all(|error| error.part == sparkflash_model::Part::Vision),
+                    .all(|error| sparkflash_ops::parts::is_vision_part(error.part)),
                 "TP{world}: language parts must boot: {errors:?}"
             );
             assert!(
                 errors
                     .iter()
-                    .any(|error| error.to_string().contains("vision patch 16")),
+                    .any(|error| error.to_string().contains("1152")),
                 "TP{world}: {errors:?}"
             );
         }

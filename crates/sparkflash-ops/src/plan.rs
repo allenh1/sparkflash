@@ -835,6 +835,26 @@ pub struct PartGeometry {
     /// replace this with [GroupedFp8Body::Bf16Activation] or
     /// [GroupedFp8Body::SplitActivation] itself.
     pub grouped_fp8_body: Option<GroupedFp8Body>,
+    /// Image channels a vision patch embeds.
+    pub in_channels: usize,
+    /// Frames one vision patch covers.
+    pub temporal_patch: usize,
+    /// A vision norm's epsilon, as f64 bits; zero means unknown.
+    pub norm_epsilon_bits: u64,
+    /// A vision norm's kind, encoded by VisionNorm::code.
+    pub vision_norm: u8,
+    /// A vision block's activation, encoded by VisionActivation::code.
+    pub vision_activation: u8,
+    /// Whether a vision attention's projections carry a bias.
+    pub attention_bias: bool,
+    /// Whether vision queries and keys take a per-head norm; None means unknown.
+    pub qk_norm: Option<bool>,
+    /// A vision tower's position scheme, encoded by VisionPosition::code.
+    pub vision_position: u8,
+    /// A vision tower's downsample, encoded by VisionDownsample::code.
+    pub vision_downsample: u8,
+    /// A vision merger MLP's width.
+    pub merger_intermediate: usize,
     /// The tensors parallel world.
     pub world: usize,
     /// This rank in that world.
@@ -876,6 +896,16 @@ impl PartGeometry {
             shared: 0,
             grouped_min_tokens: 0,
             grouped_fp8_body: None,
+            in_channels: 0,
+            temporal_patch: 0,
+            norm_epsilon_bits: 0,
+            vision_norm: 0,
+            vision_activation: 0,
+            attention_bias: false,
+            qk_norm: None,
+            vision_position: 0,
+            vision_downsample: 0,
+            merger_intermediate: 0,
             world: 0,
             rank: 0,
         }
@@ -943,6 +973,30 @@ pub struct ShapeConstraint {
     pub groups_max: Option<usize>,
     /// Vision patch sides this implementation accepts; empty means any.
     pub patch_sizes: &'static [usize],
+    /// Image channels that must equal this, when named.
+    pub in_channels_equals: Option<usize>,
+    /// The exact vision norm kind code, when named.
+    pub vision_norm: Option<u8>,
+    /// The exact spatial merge factor, when named.
+    pub spatial_merge_equals: Option<usize>,
+    /// Frames per patch that must equal this, when named.
+    pub temporal_patch_equals: Option<usize>,
+    /// The exact norm epsilon (as f64 bits) this implementation hardcodes, when named.
+    pub norm_epsilon_bits: Option<u64>,
+    /// The vision activation code this implementation carries, when named.
+    pub vision_activation: Option<u8>,
+    /// Whether the vision attention must carry a bias, when named.
+    pub attention_bias: Option<bool>,
+    /// Whether the vision attention must carry q/k norms, when named.
+    pub qk_norm: Option<bool>,
+    /// The vision position code this implementation carries, when named.
+    pub vision_position: Option<u8>,
+    /// The vision downsample code this implementation carries, when named.
+    pub vision_downsample: Option<u8>,
+    /// The exact merger MLP width, when named.
+    pub merger_intermediate_equals: Option<usize>,
+    /// The exact width a vision merger hands the language model, when named.
+    pub out_hidden_equals: Option<usize>,
     /// The `(key, value)` head-width template pairs this implementation accepts; empty means any.
     pub head_pairs: &'static [(usize, usize)],
     /// The routed-expert `(hidden, experts, top-k)` shapes this implementation is published at;
@@ -984,6 +1038,18 @@ impl ShapeConstraint {
         groups_min: None,
         groups_max: None,
         patch_sizes: &[],
+        in_channels_equals: None,
+        vision_norm: None,
+        spatial_merge_equals: None,
+        temporal_patch_equals: None,
+        norm_epsilon_bits: None,
+        vision_activation: None,
+        attention_bias: None,
+        qk_norm: None,
+        vision_position: None,
+        vision_downsample: None,
+        merger_intermediate_equals: None,
+        out_hidden_equals: None,
         head_pairs: &[],
         routed_shapes: &[],
         world_equals: None,
@@ -1169,6 +1235,90 @@ impl ShapeConstraint {
         self
     }
 
+    /// Require an exact image channel count.
+    #[must_use]
+    pub const fn in_channels_equals(mut self, channels: usize) -> Self {
+        self.in_channels_equals = Some(channels);
+        self
+    }
+
+    /// Require an exact temporal patch size.
+    #[must_use]
+    pub const fn temporal_patch_equals(mut self, frames: usize) -> Self {
+        self.temporal_patch_equals = Some(frames);
+        self
+    }
+
+    /// Require an exact vision norm epsilon, compared as f64 bits.
+    #[must_use]
+    pub const fn norm_epsilon_bits(mut self, bits: u64) -> Self {
+        self.norm_epsilon_bits = Some(bits);
+        self
+    }
+
+    /// Require a vision norm kind code.
+    #[must_use]
+    pub const fn vision_norm(mut self, code: u8) -> Self {
+        self.vision_norm = Some(code);
+        self
+    }
+
+    /// Require an exact spatial merge factor.
+    #[must_use]
+    pub const fn spatial_merge_equals(mut self, merge: usize) -> Self {
+        self.spatial_merge_equals = Some(merge);
+        self
+    }
+
+    /// Require a vision activation code.
+    #[must_use]
+    pub const fn vision_activation(mut self, code: u8) -> Self {
+        self.vision_activation = Some(code);
+        self
+    }
+
+    /// Require a vision attention bias.
+    #[must_use]
+    pub const fn attention_bias(mut self, bias: bool) -> Self {
+        self.attention_bias = Some(bias);
+        self
+    }
+
+    /// Require a vision q/k norm.
+    #[must_use]
+    pub const fn qk_norm(mut self, norm: bool) -> Self {
+        self.qk_norm = Some(norm);
+        self
+    }
+
+    /// Require a vision position scheme code.
+    #[must_use]
+    pub const fn vision_position(mut self, code: u8) -> Self {
+        self.vision_position = Some(code);
+        self
+    }
+
+    /// Require a vision downsample code.
+    #[must_use]
+    pub const fn vision_downsample(mut self, code: u8) -> Self {
+        self.vision_downsample = Some(code);
+        self
+    }
+
+    /// Require an exact merger MLP width.
+    #[must_use]
+    pub const fn merger_intermediate_equals(mut self, width: usize) -> Self {
+        self.merger_intermediate_equals = Some(width);
+        self
+    }
+
+    /// Require an exact merger output width.
+    #[must_use]
+    pub const fn out_hidden_equals(mut self, width: usize) -> Self {
+        self.out_hidden_equals = Some(width);
+        self
+    }
+
     /// Require an exact tensor-parallel world.
     #[must_use]
     pub const fn world_equals(mut self, world: usize) -> Self {
@@ -1292,6 +1442,102 @@ impl ShapeConstraint {
                     geometry.patch_size, self.patch_sizes
                 ));
             }
+        }
+        if let Some(channels) = self.in_channels_equals
+            && geometry.in_channels != channels
+        {
+            return Err(format!(
+                "image channels {} do not equal the kernel's {channels}",
+                geometry.in_channels
+            ));
+        }
+        if let Some(frames) = self.temporal_patch_equals
+            && geometry.temporal_patch != frames
+        {
+            return Err(format!(
+                "temporal patch {} does not equal the kernel's {frames}",
+                geometry.temporal_patch
+            ));
+        }
+        if let Some(bits) = self.norm_epsilon_bits
+            && geometry.norm_epsilon_bits != bits
+        {
+            return Err(format!(
+                "norm epsilon bits {:#x} do not equal the kernel's {bits:#x}",
+                geometry.norm_epsilon_bits
+            ));
+        }
+        if let Some(code) = self.vision_norm
+            && geometry.vision_norm != code
+        {
+            return Err(format!(
+                "vision norm {} does not equal the kernel's {code}",
+                geometry.vision_norm
+            ));
+        }
+        if let Some(merge) = self.spatial_merge_equals
+            && geometry.spatial_merge != merge
+        {
+            return Err(format!(
+                "spatial merge {} does not equal the kernel's {merge}",
+                geometry.spatial_merge
+            ));
+        }
+        if let Some(code) = self.vision_activation
+            && geometry.vision_activation != code
+        {
+            return Err(format!(
+                "vision activation {} does not equal the kernel's {code}",
+                geometry.vision_activation
+            ));
+        }
+        if let Some(bias) = self.attention_bias
+            && geometry.attention_bias != bias
+        {
+            return Err(format!(
+                "attention bias {} does not equal the kernel's {bias}",
+                geometry.attention_bias
+            ));
+        }
+        if let Some(norm) = self.qk_norm
+            && geometry.qk_norm != Some(norm)
+        {
+            return Err(format!(
+                "q/k norm {:?} does not equal the kernel's {norm}",
+                geometry.qk_norm
+            ));
+        }
+        if let Some(code) = self.vision_position
+            && geometry.vision_position != code
+        {
+            return Err(format!(
+                "vision position {} does not equal the kernel's {code}",
+                geometry.vision_position
+            ));
+        }
+        if let Some(code) = self.vision_downsample
+            && geometry.vision_downsample != code
+        {
+            return Err(format!(
+                "vision downsample {} does not equal the kernel's {code}",
+                geometry.vision_downsample
+            ));
+        }
+        if let Some(width) = self.merger_intermediate_equals
+            && geometry.merger_intermediate != width
+        {
+            return Err(format!(
+                "merger intermediate {} does not equal the kernel's {width}",
+                geometry.merger_intermediate
+            ));
+        }
+        if let Some(width) = self.out_hidden_equals
+            && geometry.out_hidden != width
+        {
+            return Err(format!(
+                "merger output {} does not equal the kernel's {width}",
+                geometry.out_hidden
+            ));
         }
         if !self.head_pairs.is_empty() {
             if geometry.head_dim == 0 || geometry.v_head == 0 {

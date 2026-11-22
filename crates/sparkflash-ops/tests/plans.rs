@@ -1272,15 +1272,15 @@ fn glm_prefill_row_bodies_resolve_in_the_prefill_pass() {
 /// asks for 16 is refused, naming the patch, even when the 16 symbol is requested by name.
 #[test]
 fn an_unimplemented_vision_patch_is_refused() {
-    let qwen = requirement(&arm(QWEN, 1), Part::Vision);
+    let qwen = requirement(&arm(QWEN, 1), Part::VisionPatchEmbed);
     assert_eq!(qwen.geometry.patch_size, 16);
     let error = CTX
         .resolve(&qwen, KernelPhase::Prefill, &["opt_vision_patchify_16"])
-        .expect_err("no orchestrated 16-patch tower is claimed");
+        .expect_err("no 16-patch tower component is claimed at this width");
     assert!(
         error
             .to_string()
-            .contains("vision patch 16 is not one of [14]"),
+            .contains("hidden 1152 does not equal 1024"),
         "{error}"
     );
 }

@@ -232,6 +232,7 @@ fn a_text_only_qwen_checkpoint_serves_through_the_qwen_arm() {
     // dynamic host fallback (and its HOST_REFERENCE_PARTS gate) must not be the refusal.
     assert!(
         lines.contains("cannot open Qwen3.8-Flash-Next at")
+            || lines.contains("Qwen3.8-Flash-Next cannot execute")
             || lines.contains("Qwen rank ")
             || lines.contains("parts this build does not carry for sm121"),
         "the refusal did not reach the Qwen pack gate: {lines}"
