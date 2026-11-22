@@ -2914,26 +2914,6 @@ mod layout_equality {
         out
     }
 
-    fn table(
-        plan: &ArchitectureTensorPlan,
-    ) -> BTreeMap<String, (String, Vec<usize>, Vec<usize>, Option<RankRun>, String)> {
-        let mut out = BTreeMap::new();
-        for index in 0..plan.len() {
-            let spec = plan.spec_at(index);
-            out.insert(
-                spec.name.clone(),
-                (
-                    format!("{:?}", spec.dtype),
-                    spec.shape.clone(),
-                    plan.rank_spec_at(index).shape.clone(),
-                    plan.rank_run_at(index),
-                    format!("{:?}", plan.plan().role(index)),
-                ),
-            );
-        }
-        out
-    }
-
     #[test]
     fn the_glm_layout_reproduces_the_family_planner() {
         let text = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
