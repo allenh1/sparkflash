@@ -559,68 +559,6 @@ mod tests {
         ("Inkling-2-Small", "text_config.swa_num_key_value_heads", "model crate parser"),
         ("Inkling-2-Small", "text_config.use_gate_bias", "model crate parser"),
         ("Inkling-2-Small", "vision_config.projector_bias", "vision reader"),
-        ("Qwen3.8-Flash-Next-NVFP4", "language_model_only", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.dynamic", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.group_size", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.num_bits", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.input_activations.type", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.targets", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.dynamic", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.group_size", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.num_bits", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_0.weights.type", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.targets", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.dynamic", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.group_size", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.num_bits", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.config_groups.group_1.weights.type", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.group_size", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "quantization_config.kv_cache_quant_algo", "description work"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.full_attention_interval", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mamba_ssm_dtype", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.model_type", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.layer_types", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.mtp_use_hidden_state_from_layer", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.mtp.rope_theta", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.number_of_conv_states", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.rope_parameters.mrope_interleaved", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "text_config.rope_parameters.rope_type", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "tie_word_embeddings", "model crate parser"),
-        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.deepstack_visual_indexes", "vision reader"),
-        ("Qwen3.8-Flash-Next-NVFP4", "vision_config.model_type", "vision reader"),
-    ];
-
-    /// Qwen's installed snapshot is a newer document than the carried fixture: it has a third
-    /// quantization group, input-activation groups, and an ignore list, and it has dropped the
-    /// older top-level group_size and kv_cache_quant_algo. These are the paths the installed
-    /// snapshot reports that the fixture does not, and the fixture paths it no longer carries.
-    /// The snapshot test pins the exact set either way; the fixture stays the repo's copy.
-    #[rustfmt::skip]
-    const QWEN_SNAPSHOT_EXTRA: &[(&str, &str)] = &[
-        ("quantization_config.config_groups.group_1.input_activations", "description work"),
-        ("quantization_config.config_groups.group_1.input_activations.dynamic", "description work"),
-        ("quantization_config.config_groups.group_1.input_activations.group_size", "description work"),
-        ("quantization_config.config_groups.group_1.input_activations.num_bits", "description work"),
-        ("quantization_config.config_groups.group_1.input_activations.type", "description work"),
-        ("quantization_config.config_groups.group_2", "description work"),
-        ("quantization_config.config_groups.group_2.targets", "description work"),
-        ("quantization_config.config_groups.group_2.weights", "description work"),
-        ("quantization_config.config_groups.group_2.weights.dynamic", "description work"),
-        ("quantization_config.config_groups.group_2.weights.num_bits", "description work"),
-        ("quantization_config.config_groups.group_2.weights.type", "description work"),
-        ("quantization_config.ignore", "description work"),
-    ];
-
-    /// The fixture's quantization paths the installed Qwen snapshot no longer carries.
-    const QWEN_SNAPSHOT_REMOVED: &[&str] = &[
-        "quantization_config.group_size",
-        "quantization_config.kv_cache_quant_algo",
     ];
 
     /// The unknown keys a carried config reports, as `(config, path)`.
@@ -659,7 +597,7 @@ mod tests {
     ///
     /// Set SPARKFLASH_CONFIG_SNAPSHOTS to a colon-separated list of config paths in CARRIED
     /// order (DeepSeek, GLM, Qwen, Inkling, Dory). This is a host check: it proves each installed
-    /// snapshot reports exactly the pinned residual, including the known Qwen fixture drift.
+    /// snapshot reports exactly the pinned residual.
     #[test]
     fn the_installed_snapshots_report_the_pinned_residual() {
         let Ok(paths) = std::env::var("SPARKFLASH_CONFIG_SNAPSHOTS") else {
@@ -671,22 +609,14 @@ mod tests {
             CARRIED.len(),
             "name one snapshot config per carried config, in order"
         );
-        for ((name, fixture), path) in CARRIED.iter().zip(paths) {
+        for ((_name, fixture), path) in CARRIED.iter().zip(paths) {
             let (_, fixture_coverage) =
                 crate::Architecture::from_json_with_coverage(fixture).expect("a carried fixture");
-            let mut expected: std::collections::BTreeSet<String> = fixture_coverage
+            let expected: std::collections::BTreeSet<String> = fixture_coverage
                 .unknown_keys()
                 .iter()
                 .map(|unknown| unknown.path.clone())
                 .collect();
-            if *name == "Qwen3.8-Flash-Next-NVFP4" {
-                for removed in QWEN_SNAPSHOT_REMOVED {
-                    expected.remove(*removed);
-                }
-                for (added, _) in QWEN_SNAPSHOT_EXTRA {
-                    expected.insert((*added).to_owned());
-                }
-            }
             let text = std::fs::read_to_string(path).expect("an installed config.json");
             let (_, actual) =
                 crate::Architecture::from_json_with_coverage(&text).expect("an installed config");

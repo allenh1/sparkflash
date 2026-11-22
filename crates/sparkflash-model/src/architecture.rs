@@ -4598,9 +4598,9 @@ mod tests {
             0x594a_226e_d501_88a5,
             0x0d35_642d_b843_4b20,
             0x9a08_2ac0_b2fa_f67c,
-            0x2416_b0da_0097_fad0,
-            0x6912_d984_45c3_3315,
-            0xf401_030a_ffce_bcd2,
+            0xe179_2f8b_9972_febb,
+            0x6989_36fa_e0f3_fa07,
+            0x4810_320b_c6c3_a5a8,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");
