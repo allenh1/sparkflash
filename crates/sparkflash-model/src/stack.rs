@@ -25,12 +25,83 @@
 //! the layout reader. Nothing here names a model or reads a family string: the description is
 //! built from the checkpoint's typed fields.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::architecture::{Architecture, AttentionKind, Ffn, Layer, WeightFormat};
+use crate::architecture::{
+    Architecture, AttentionKind, Ffn, Layer, Residual, Score, Side, WeightFormat,
+};
 use crate::compose::LayerStep;
 use crate::parts::Part;
 use crate::vision_geometry::{VisionDownsample, VisionFact};
+
+/// A value a part instance carries as a fact.
+///
+/// Facts are the values a backend opens from: a model-wide geometry value lands on the part that
+/// consumes it, and a per-layer selection lands on that layer's part. They are deliberately
+/// data, not a family configuration: a backend reads the fact by name and never re-parses the
+/// checkpoint.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FactValue {
+    /// A boolean switch.
+    Bool(bool),
+    /// A signed integer.
+    Integer(i64),
+    /// A floating-point value.
+    Float(f64),
+    /// A string (a score function, a dtype name, an encoder side).
+    Text(String),
+    /// A list of integers (a layer list, a per-layer ratio array).
+    Integers(Vec<i64>),
+    /// An explicit null, used where the checkpoint stores one.
+    Null,
+}
+
+impl FactValue {
+    /// The value as an integer, when it is one.
+    #[must_use]
+    pub const fn as_integer(&self) -> Option<i64> {
+        match self {
+            Self::Integer(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// The value as a float, widening an integer.
+    #[must_use]
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Self::Integer(value) => Some(*value as f64),
+            Self::Float(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// The value as a string.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// One checkpoint tensor a part instance claims, with the rank split the loader applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorClaim {
+    /// The exact checkpoint tensor name.
+    pub name: String,
+    /// The logical stored shape.
+    pub shape: Vec<usize>,
+    /// The stored element class, as the layout spells it.
+    pub dtype: String,
+    /// The rank split (`whole`, `rows`, `columns`, `kv_rows`, `vector`, `conv`, `expert_rows`,
+    /// `expert_columns`, `expert_axis`, `tiles` or `tile_rows`).
+    pub split: String,
+    /// The tile width a `tiles` or `tile_rows` split cuts on.
+    pub tile: Option<usize>,
+}
 
 /// Which stack of a model description a block belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -120,7 +191,7 @@ impl fmt::Display for Shape {
 
 /// One instance of a part in a block: what it is, the shape it runs at, how its weights are
 /// stored, and the tensor names it takes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PartInstance {
     /// The part kind.
     pub part: Part,
@@ -134,6 +205,10 @@ pub struct PartInstance {
     pub format: Option<WeightFormat>,
     /// The checkpoint tensor names this instance takes, in the layout's order.
     pub tensors: Vec<String>,
+    /// The tensors this instance claims, with the rank split each takes.
+    pub claims: Vec<TensorClaim>,
+    /// The facts this instance carries, by the name a backend reads.
+    pub facts: BTreeMap<String, FactValue>,
 }
 
 impl PartInstance {
@@ -145,6 +220,8 @@ impl PartInstance {
             shape,
             format,
             tensors: Vec::new(),
+            claims: Vec::new(),
+            facts: BTreeMap::new(),
         }
     }
 
@@ -154,10 +231,24 @@ impl PartInstance {
         self.tensors = tensors;
         self
     }
+
+    /// The instance with the tensor claims it takes.
+    #[must_use]
+    pub fn with_claims(mut self, claims: Vec<TensorClaim>) -> Self {
+        self.claims = claims;
+        self
+    }
+
+    /// The instance with one fact.
+    #[must_use]
+    pub fn with_fact(mut self, name: impl Into<String>, value: FactValue) -> Self {
+        self.facts.insert(name.into(), value);
+        self
+    }
 }
 
 /// One block: the ordered part instances it runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     /// The block's index in its stack.
     pub index: usize,
@@ -166,7 +257,7 @@ pub struct Block {
 }
 
 /// One stack of a model description.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Stack {
     /// Which stack this is.
     pub kind: StackKind,
@@ -304,17 +395,242 @@ impl Architecture {
 
     fn language_block(&self, layer: &Layer) -> Block {
         let step = LayerStep::from_layer(layer);
+        let facts = self.layer_facts(layer);
         let parts = step
             .roles()
             .into_iter()
             .map(|(_, part)| {
-                PartInstance::new(part, self.part_shape(part, layer), self.stored_format(part))
+                let mut instance =
+                    PartInstance::new(part, self.part_shape(part, layer), self.stored_format(part));
+                instance.facts = facts.clone();
+                instance
             })
             .collect();
         Block {
             index: layer.index,
             parts,
         }
+    }
+
+    /// The facts one decoder layer carries, attached to every part instance of its block.
+    ///
+    /// A fact is put on every instance of the block, not on a single designated part, so a
+    /// backend can read it from the part it is already holding. The values come from the typed
+    /// architecture: the compression ratio and ownership from the attention, the index and
+    /// candidate sources from the indexer, the Engram rows from the side, and the encoder split
+    /// from the last layer that owns the compressed KV. No family string or layer literal is
+    /// consulted.
+    fn layer_facts(&self, layer: &Layer) -> BTreeMap<String, FactValue> {
+        let mut facts = BTreeMap::new();
+        let attention = &layer.attention;
+        if let Some(compression) = &attention.compression {
+            facts.insert(
+                "compress_ratio".to_owned(),
+                FactValue::Integer(compression.ratio as i64),
+            );
+            facts.insert(
+                "kv_source".to_owned(),
+                FactValue::Bool(compression.owns_keys),
+            );
+        } else {
+            facts.insert("compress_ratio".to_owned(), FactValue::Integer(0));
+            facts.insert("kv_source".to_owned(), FactValue::Bool(false));
+        }
+        if let Some(indexer) = &attention.indexer {
+            facts.insert("index_source".to_owned(), FactValue::Bool(true));
+            facts.insert(
+                "index_heads".to_owned(),
+                FactValue::Integer(indexer.heads as i64),
+            );
+            facts.insert(
+                "index_head_dim".to_owned(),
+                FactValue::Integer(indexer.head_dim as i64),
+            );
+            facts.insert(
+                "index_topk".to_owned(),
+                FactValue::Integer(indexer.topk as i64),
+            );
+            if let Some(pool) = &indexer.candidate_pool {
+                facts.insert(
+                    "candidate_source_layer".to_owned(),
+                    FactValue::Integer(pool.source_layer as i64),
+                );
+                facts.insert(
+                    "candidate_topk_blocks".to_owned(),
+                    FactValue::Integer(pool.blocks as i64),
+                );
+                facts.insert(
+                    "candidate_block_size".to_owned(),
+                    FactValue::Integer(pool.block_size as i64),
+                );
+                facts.insert(
+                    "candidate_source".to_owned(),
+                    FactValue::Bool(
+                        indexer
+                            .candidate_pool
+                            .is_some_and(|pool| pool.source_layer == layer.index),
+                    ),
+                );
+            }
+        } else {
+            facts.insert("index_source".to_owned(), FactValue::Bool(false));
+            facts.insert("candidate_source".to_owned(), FactValue::Bool(false));
+        }
+        if let Some(window) = attention.window {
+            facts.insert("window_size".to_owned(), FactValue::Integer(window as i64));
+        }
+        facts.insert(
+            "rope_head_dim".to_owned(),
+            FactValue::Integer(attention.rope.rotated_dims as i64),
+        );
+        facts.insert(
+            "rope_theta".to_owned(),
+            FactValue::Float(attention.rope.theta),
+        );
+        let last_encoder = self
+            .layers
+            .iter()
+            .filter(|other| {
+                other
+                    .attention
+                    .compression
+                    .as_ref()
+                    .is_some_and(|compression| compression.owns_keys)
+            })
+            .map(|other| other.index)
+            .max()
+            .unwrap_or_else(|| self.layers.len().saturating_sub(1) / 2);
+        facts.insert(
+            "encoder_last_layer".to_owned(),
+            FactValue::Integer(last_encoder as i64),
+        );
+        facts.insert(
+            "encoder_side".to_owned(),
+            FactValue::Text(
+                if layer.index <= last_encoder {
+                    "encoder"
+                } else {
+                    "decoder"
+                }
+                .to_owned(),
+            ),
+        );
+        for side in &layer.sides {
+            if let Side::Engram(engram) = side {
+                let position = self
+                    .layers
+                    .iter()
+                    .filter(|other| {
+                        other
+                            .sides
+                            .iter()
+                            .any(|side| matches!(side, Side::Engram(_)))
+                    })
+                    .position(|other| other.index == layer.index)
+                    .unwrap_or(0);
+                facts.insert("engram_member".to_owned(), FactValue::Bool(true));
+                facts.insert(
+                    "engram_position".to_owned(),
+                    FactValue::Integer(position as i64),
+                );
+                facts.insert(
+                    "engram_rows".to_owned(),
+                    FactValue::Integer(engram.tables.get(position).copied().unwrap_or(0) as i64),
+                );
+                facts.insert(
+                    "engram_num_embeddings".to_owned(),
+                    FactValue::Integers(engram.tables.iter().map(|rows| *rows as i64).collect()),
+                );
+                facts.insert(
+                    "engram_max_ngram_size".to_owned(),
+                    FactValue::Integer(engram.max_ngram as i64),
+                );
+                facts.insert(
+                    "engram_n_heads".to_owned(),
+                    FactValue::Integer(engram.heads as i64),
+                );
+                facts.insert(
+                    "engram_head_dim".to_owned(),
+                    FactValue::Integer(engram.head_dim as i64),
+                );
+                facts.insert(
+                    "engram_vocab_size".to_owned(),
+                    FactValue::Integer(engram.vocab_size as i64),
+                );
+                facts.insert(
+                    "engram_compressed_vocab_size".to_owned(),
+                    FactValue::Integer(engram.compressed_vocab as i64),
+                );
+                facts.insert(
+                    "engram_pad_id".to_owned(),
+                    FactValue::Integer(i64::from(engram.pad_id)),
+                );
+            }
+        }
+        if !layer
+            .sides
+            .iter()
+            .any(|side| matches!(side, Side::Engram(_)))
+        {
+            facts.insert("engram_member".to_owned(), FactValue::Bool(false));
+        }
+        if let Some(mtp) = &self.mtp {
+            facts.insert(
+                "tap_layers".to_owned(),
+                FactValue::Integers(
+                    mtp.target_layers
+                        .iter()
+                        .map(|layer| *layer as i64)
+                        .collect(),
+                ),
+            );
+        }
+        if let Residual::Hyper(hyper) = &layer.residual {
+            facts.insert(
+                "hc_mult".to_owned(),
+                FactValue::Integer(hyper.streams as i64),
+            );
+            facts.insert(
+                "hc_sinkhorn_iters".to_owned(),
+                FactValue::Integer(hyper.sinkhorn_iters as i64),
+            );
+            facts.insert("hc_eps".to_owned(), FactValue::Float(hyper.epsilon));
+        }
+        if let Ffn::Moe(moe) = &layer.ffn {
+            facts.insert(
+                "n_routed_experts".to_owned(),
+                FactValue::Integer(moe.routed_experts as i64),
+            );
+            facts.insert(
+                "n_shared_experts".to_owned(),
+                FactValue::Integer(moe.shared_experts as i64),
+            );
+            facts.insert(
+                "n_activated_experts".to_owned(),
+                FactValue::Integer(moe.active_experts as i64),
+            );
+            facts.insert(
+                "score_func".to_owned(),
+                FactValue::Text(
+                    match moe.score {
+                        Score::Softmax => "softmax",
+                        Score::Sigmoid => "sigmoid",
+                        Score::SqrtSoftPlus => "sqrtsoftplus",
+                    }
+                    .to_owned(),
+                ),
+            );
+            facts.insert(
+                "route_scale".to_owned(),
+                FactValue::Float(moe.routed_scaling),
+            );
+            facts.insert("norm_topk_prob".to_owned(), FactValue::Bool(moe.norm_topk));
+            facts.insert(
+                "swiglu_limit".to_owned(),
+                moe.clamp.map_or(FactValue::Null, FactValue::Float),
+            );
+        }
+        facts
     }
 
     /// The shape the config alone states for one decoder part.

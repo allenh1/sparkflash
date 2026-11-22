@@ -123,7 +123,6 @@ impl NormPlan {
             NormKind::RmsNorm => &["rmsnorm_sm121", "opt_rmsnorm_bf16", "q4e_rmsnorm"] as &[_],
             NormKind::LayerNorm => &["q4e_layer_norm"],
             NormKind::HyperConnection => &[
-                "mega_mhc_fused_bf16_sm121",
                 "opt_mhc_seam",
                 "opt_mhc_post",
                 "q4e_hyper_mix",

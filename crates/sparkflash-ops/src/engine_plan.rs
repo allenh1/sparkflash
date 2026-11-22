@@ -40,7 +40,8 @@ use sparkflash_model::architecture::{
 use sparkflash_model::layout::LayoutDtype;
 use sparkflash_model::stack::StackKind;
 use sparkflash_model::{
-    Architecture, ConfigError, ModelBackend, Part, StepRole, Target, TpAxis, TpPlan, TpPlanError,
+    Architecture, ConfigError, FactValue, ModelBackend, Part, Stack, StepRole, Target, TpAxis,
+    TpPlan, TpPlanError,
 };
 use sparkflash_weights::weights::WeightSource;
 use thiserror::Error;
@@ -149,6 +150,42 @@ pub enum PlanError {
     Io(String),
 }
 
+/// One tensor a part instance claims at this rank, with the split applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanTensor {
+    /// The exact checkpoint tensor name.
+    pub name: String,
+    /// The stored logical shape.
+    pub shape: Vec<usize>,
+    /// The stored format, as the checkpoint's loader names it (`BF16`, `F8_E4M3`, ...).
+    pub format: String,
+    /// The rank-local shape.
+    pub rank_shape: Vec<usize>,
+    /// The bytes this rank holds.
+    pub shard_bytes: usize,
+    /// The part that claims it.
+    pub part: Part,
+    /// The decoder block that claims it, when it belongs to one.
+    pub block: Option<usize>,
+    /// The layout's rank split.
+    pub split: String,
+    /// Whether this rank binds it on the device (`resident`) or a host seam reads it.
+    pub placement: String,
+}
+
+/// The catalogue's DeepSeek symbols, grouped by the part that launches them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartSymbols {
+    /// The part kind.
+    pub part: Part,
+    /// The decoder block, when the part is one layer's.
+    pub block: Option<usize>,
+    /// The image the symbols belong to.
+    pub image: &'static str,
+    /// The symbol names, in catalogue order.
+    pub symbols: Vec<&'static str>,
+}
+
 /// The model-independent execution plan of one model at one target and world size.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnginePlan {
@@ -159,6 +196,10 @@ pub struct EnginePlan {
     formats: PartFormats,
     globals: Vec<PartRequirement>,
     layers: Vec<LayerExecution>,
+    model_facts: BTreeMap<String, FactValue>,
+    stacks: Vec<Stack>,
+    tensors: Vec<PlanTensor>,
+    symbols: Vec<PartSymbols>,
 }
 
 impl EnginePlan {
@@ -284,6 +325,10 @@ impl EnginePlan {
                 requirements,
             });
         }
+        let model_facts = model_facts(&architecture);
+        let stacks = plan_stacks(&architecture);
+        let tensors = plan_tensors(&architecture, &tp, &stacks);
+        let symbols = part_symbols(&architecture);
         Ok(Self {
             architecture,
             target,
@@ -292,6 +337,10 @@ impl EnginePlan {
             formats,
             globals,
             layers,
+            model_facts,
+            stacks,
+            tensors,
+            symbols,
         })
     }
 
@@ -391,6 +440,30 @@ impl EnginePlan {
     #[must_use]
     pub fn stored_format(&self, part: Part, block: Option<usize>) -> Option<WeightFormat> {
         self.formats.get(&(part, block)).copied()
+    }
+
+    /// The model-wide facts the plan carries, named as the open manifest names them.
+    #[must_use]
+    pub fn model_facts(&self) -> &BTreeMap<String, FactValue> {
+        &self.model_facts
+    }
+
+    /// The description's stacks, with each part instance's facts and tensor claims.
+    #[must_use]
+    pub fn stacks(&self) -> &[Stack] {
+        &self.stacks
+    }
+
+    /// Every tensor a part instance claims at this rank.
+    #[must_use]
+    pub fn tensors(&self) -> &[PlanTensor] {
+        &self.tensors
+    }
+
+    /// The catalogue's DeepSeek symbols, grouped by part.
+    #[must_use]
+    pub fn symbols(&self) -> &[PartSymbols] {
+        &self.symbols
     }
 
     /// The parts outside the decoder layers: embedding, final norm, head, MTP, vision.
@@ -541,6 +614,519 @@ fn stored_formats(architecture: &Architecture) -> PartFormats {
         .collect()
 }
 
+/// The model-wide facts the open manifest names, read from the typed architecture and the
+/// layout's config vars.
+///
+/// The names are the baseline manifest's names, not a second vocabulary: a value the forward
+/// reads at open is carried here once, on the plan, so a backend never re-parses the checkpoint.
+fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
+    let mut facts = BTreeMap::new();
+    let first = architecture.layers.first();
+    let first_moe = architecture
+        .layers
+        .iter()
+        .find_map(|layer| match &layer.ffn {
+            sparkflash_model::architecture::Ffn::Moe(moe) => Some(moe),
+            sparkflash_model::architecture::Ffn::Dense(_) => None,
+        });
+    let first_hyper = architecture
+        .layers
+        .iter()
+        .find_map(|layer| match &layer.residual {
+            sparkflash_model::architecture::Residual::Hyper(hyper) => Some(hyper),
+            _ => None,
+        });
+    let first_mla = architecture
+        .layers
+        .iter()
+        .find_map(|layer| match &layer.attention.kind {
+            sparkflash_model::architecture::AttentionKind::Mla {
+                q_lora_rank,
+                groups,
+                ..
+            } => Some((*q_lora_rank, *groups)),
+            _ => None,
+        });
+    let mut put = |name: &str, value: FactValue| {
+        facts.insert(name.to_owned(), value);
+    };
+    put(
+        "vocab_size",
+        FactValue::Integer(architecture.vocab_size as i64),
+    );
+    put("dim", FactValue::Integer(architecture.hidden_size as i64));
+    put(
+        "n_layers",
+        FactValue::Integer(architecture.layers.len() as i64),
+    );
+    put("norm_eps", FactValue::Float(architecture.norm_epsilon));
+    put(
+        "image_token_id",
+        architecture
+            .tokens
+            .image_token_id
+            .map_or(FactValue::Null, |id| FactValue::Integer(i64::from(id))),
+    );
+    put(
+        "dtype",
+        FactValue::Text(
+            architecture
+                .quantization
+                .method
+                .clone()
+                .unwrap_or_else(|| "bf16".to_owned()),
+        ),
+    );
+    put(
+        "expert_dtype",
+        FactValue::Text(
+            architecture
+                .quantization
+                .expert
+                .clone()
+                .unwrap_or_else(|| "bf16".to_owned()),
+        ),
+    );
+    if let Some(attention) = first.map(|layer| &layer.attention) {
+        put("n_heads", FactValue::Integer(attention.heads as i64));
+        put("head_dim", FactValue::Integer(attention.head_dim as i64));
+        put(
+            "rope_head_dim",
+            FactValue::Integer(attention.rope.rotated_dims as i64),
+        );
+        put("rope_theta", FactValue::Float(attention.rope.theta));
+        put(
+            "window_size",
+            attention
+                .window
+                .map_or(FactValue::Null, |window| FactValue::Integer(window as i64)),
+        );
+    }
+    if let Some(scaling) = architecture
+        .layers
+        .iter()
+        .find_map(|layer| layer.attention.rope.scaling.as_ref())
+    {
+        put(
+            "original_seq_len",
+            FactValue::Integer(scaling.original_seq_len as i64),
+        );
+        put("rope_factor", FactValue::Float(scaling.factor));
+        put("beta_fast", FactValue::Float(scaling.beta_fast));
+        put("beta_slow", FactValue::Float(scaling.beta_slow));
+    }
+    if let Some((q_lora, groups)) = first_mla {
+        put(
+            "q_lora_rank",
+            q_lora.map_or(FactValue::Null, |rank| FactValue::Integer(rank as i64)),
+        );
+        if let Some(groups) = groups {
+            put("o_groups", FactValue::Integer(groups.groups as i64));
+            put("o_lora_rank", FactValue::Integer(groups.rank as i64));
+        }
+    }
+    if let Some(moe) = first_moe {
+        put("moe_inter_dim", FactValue::Integer(moe.intermediate as i64));
+        put(
+            "n_routed_experts",
+            FactValue::Integer(moe.routed_experts as i64),
+        );
+        put(
+            "n_shared_experts",
+            FactValue::Integer(moe.shared_experts as i64),
+        );
+        put(
+            "n_activated_experts",
+            FactValue::Integer(moe.active_experts as i64),
+        );
+        put(
+            "score_func",
+            FactValue::Text(
+                match moe.score {
+                    sparkflash_model::architecture::Score::Softmax => "softmax",
+                    sparkflash_model::architecture::Score::Sigmoid => "sigmoid",
+                    sparkflash_model::architecture::Score::SqrtSoftPlus => "sqrtsoftplus",
+                }
+                .to_owned(),
+            ),
+        );
+        put("route_scale", FactValue::Float(moe.routed_scaling));
+        put("norm_topk_prob", FactValue::Bool(moe.norm_topk));
+        put(
+            "swiglu_limit",
+            moe.clamp.map_or(FactValue::Null, FactValue::Float),
+        );
+    }
+    if let Some(hyper) = first_hyper {
+        put("hc_mult", FactValue::Integer(hyper.streams as i64));
+        put(
+            "hc_sinkhorn_iters",
+            FactValue::Integer(hyper.sinkhorn_iters as i64),
+        );
+        put("hc_eps", FactValue::Float(hyper.epsilon));
+    }
+    let kv_sources: Vec<i64> = architecture
+        .layers
+        .iter()
+        .filter(|layer| {
+            layer
+                .attention
+                .compression
+                .as_ref()
+                .is_some_and(|compression| compression.owns_keys)
+        })
+        .map(|layer| layer.index as i64)
+        .collect();
+    let index_sources: Vec<i64> = architecture
+        .layers
+        .iter()
+        .filter(|layer| layer.attention.indexer.is_some())
+        .map(|layer| layer.index as i64)
+        .collect();
+    put("kv_source_layers", FactValue::Integers(kv_sources));
+    put("index_source_layers", FactValue::Integers(index_sources));
+    let pool = architecture
+        .layers
+        .iter()
+        .find_map(|layer| layer.attention.indexer.as_ref()?.candidate_pool.as_ref());
+    put(
+        "candidate_source_layer",
+        pool.map_or(FactValue::Integer(0), |pool| {
+            FactValue::Integer(pool.source_layer as i64)
+        }),
+    );
+    put(
+        "candidate_topk_blocks",
+        pool.map_or(FactValue::Integer(0), |pool| {
+            FactValue::Integer(pool.blocks as i64)
+        }),
+    );
+    put(
+        "candidate_block_size",
+        pool.map_or(FactValue::Integer(0), |pool| {
+            FactValue::Integer(pool.block_size as i64)
+        }),
+    );
+    let indexer = architecture
+        .layers
+        .iter()
+        .find_map(|layer| layer.attention.indexer.as_ref());
+    if let Some(indexer) = indexer {
+        put("index_n_heads", FactValue::Integer(indexer.heads as i64));
+        put(
+            "index_head_dim",
+            FactValue::Integer(indexer.head_dim as i64),
+        );
+        put("index_topk", FactValue::Integer(indexer.topk as i64));
+    }
+    let compressed = architecture.layers.iter().find_map(|layer| {
+        layer
+            .attention
+            .compression
+            .as_ref()
+            .filter(|compression| compression.ratio > 0)
+            .map(|_| layer.attention.rope.theta)
+    });
+    put(
+        "compress_rope_theta",
+        compressed.map_or(FactValue::Null, FactValue::Float),
+    );
+    let mut ratios = Vec::with_capacity(architecture.layers.len());
+    for layer in &architecture.layers {
+        ratios.push(
+            layer
+                .attention
+                .compression
+                .as_ref()
+                .map_or(0, |compression| compression.ratio) as i64,
+        );
+    }
+    if let Some(mtp) = &architecture.mtp {
+        ratios.extend(std::iter::repeat_n(0, mtp.stages));
+        put("n_mtp_layers", FactValue::Integer(mtp.stages as i64));
+        put(
+            "dspark_block_size",
+            mtp.block_size
+                .map_or(FactValue::Null, |size| FactValue::Integer(size as i64)),
+        );
+        put(
+            "dspark_target_layer_ids",
+            FactValue::Integers(
+                mtp.target_layers
+                    .iter()
+                    .map(|layer| *layer as i64)
+                    .collect(),
+            ),
+        );
+        put(
+            "dspark_n_routed_experts",
+            mtp.routed_experts
+                .map_or(FactValue::Null, |count| FactValue::Integer(count as i64)),
+        );
+        put(
+            "dspark_n_activated_experts",
+            mtp.active_experts
+                .map_or(FactValue::Null, |count| FactValue::Integer(count as i64)),
+        );
+    }
+    put("compress_ratios", FactValue::Integers(ratios));
+    let engram_layers: Vec<i64> = architecture
+        .layers
+        .iter()
+        .filter(|layer| {
+            layer
+                .sides
+                .iter()
+                .any(|side| matches!(side, sparkflash_model::architecture::Side::Engram(_)))
+        })
+        .map(|layer| layer.index as i64)
+        .collect();
+    put("engram_layer_ids", FactValue::Integers(engram_layers));
+    if let Some(engram) = architecture.layers.iter().find_map(|layer| {
+        layer.sides.iter().find_map(|side| match side {
+            sparkflash_model::architecture::Side::Engram(engram) => Some(engram),
+            sparkflash_model::architecture::Side::Ple(_) => None,
+        })
+    }) {
+        put(
+            "engram_num_embeddings",
+            FactValue::Integers(engram.tables.iter().map(|rows| *rows as i64).collect()),
+        );
+        put(
+            "engram_max_ngram_size",
+            FactValue::Integer(engram.max_ngram as i64),
+        );
+        put(
+            "engram_pad_id",
+            FactValue::Integer(i64::from(engram.pad_id)),
+        );
+        put(
+            "engram_compressed_vocab_size",
+            FactValue::Integer(engram.compressed_vocab as i64),
+        );
+        put("engram_n_heads", FactValue::Integer(engram.heads as i64));
+        put(
+            "engram_head_dim",
+            FactValue::Integer(engram.head_dim as i64),
+        );
+        put(
+            "engram_vocab_size",
+            FactValue::Integer(engram.vocab_size as i64),
+        );
+    }
+    put(
+        "dspark_markov_rank",
+        FactValue::Integer(
+            architecture
+                .layout_vars
+                .get("markov_rank")
+                .copied()
+                .unwrap_or(0),
+        ),
+    );
+    put(
+        "dspark_noise_token_id",
+        FactValue::Integer(
+            architecture
+                .layout_vars
+                .get("noise_token")
+                .copied()
+                .unwrap_or(0),
+        ),
+    );
+    // The layout states the producer's ModelArgs default (model.py:67-68); the release stores
+    // no key for it, so the fallback is the one the reference constructor uses.
+    put(
+        "gate_temp",
+        FactValue::Float(
+            architecture
+                .layout_vars
+                .get("gate_temp")
+                .copied()
+                .unwrap_or(1) as f64,
+        ),
+    );
+    if let Some(vision) = &architecture.vision {
+        put("vision_n_layers", FactValue::Integer(vision.depth as i64));
+        put("vision_dim", FactValue::Integer(vision.hidden_size as i64));
+        put("vision_n_heads", FactValue::Integer(vision.heads as i64));
+        put(
+            "vision_inter_dim",
+            FactValue::Integer(vision.intermediate as i64),
+        );
+        put(
+            "vision_patch_size",
+            FactValue::Integer(vision.patch_size as i64),
+        );
+        put(
+            "vision_downsample_ratio",
+            FactValue::Integer(vision.spatial_merge as i64),
+        );
+        put(
+            "vision_max_n_token",
+            FactValue::Integer(
+                architecture
+                    .layout_vars
+                    .get("vision_max_tokens")
+                    .copied()
+                    .unwrap_or(0),
+            ),
+        );
+        put(
+            "vision_min_pixels",
+            FactValue::Integer(vision.min_pixels as i64),
+        );
+        // The released document stores `null`; the plan says so rather than inventing a cap.
+        put("vision_max_wh_ratio", FactValue::Null);
+        put("vision_rope_theta", FactValue::Float(vision.rope_theta));
+    }
+    facts
+}
+
+/// The description's stacks, preferring the layout's expanded claims when a layout matches.
+fn plan_stacks(architecture: &Architecture) -> Vec<Stack> {
+    if let Ok(Some(layout)) = sparkflash_model::layout::matching(architecture)
+        && let Ok(stacks) = layout.stacks(architecture)
+    {
+        return stacks;
+    }
+    architecture.stacks()
+}
+
+/// Whether the four-rank device bind loads this tensor (the baseline manifest's `resident`
+/// placement). The predicate mirrors the arm's bind: attention projections, expert and shared
+/// matrices with their scale grids, the router, the tail, the norms and the hyper-connections.
+fn device_bound(name: &str, part: Part) -> bool {
+    if name.starts_with("mtp.") {
+        return false;
+    }
+    match part {
+        Part::Csa2Compression | Part::Engram | Part::Ple => false,
+        Part::SparseIndexer => name.ends_with(".wq_b.weight"),
+        Part::MlaAttention => {
+            name.ends_with(".wq_a.weight")
+                || name.ends_with(".wq_b.weight")
+                || name.ends_with(".wkv.weight")
+                || name.ends_with(".wo_a.weight")
+                || name.ends_with(".wo_b.weight")
+                || name.ends_with(".q_norm.weight")
+                || name.ends_with(".kv_norm.weight")
+        }
+        Part::Moe => true,
+        Part::RmsNorm | Part::LayerNorm | Part::HyperConnection | Part::ManifoldHyperConnection => {
+            true
+        }
+        Part::Embedding | Part::LmHead => true,
+        _ => false,
+    }
+}
+
+/// Every tensor the description claims at this rank, with the layout's split and the device
+/// placement the baseline names.
+fn plan_tensors(architecture: &Architecture, tp: &TpPlan, stacks: &[Stack]) -> Vec<PlanTensor> {
+    use crate::tensor_plan::ArchitectureTensorPlan;
+    let Ok(plan) = ArchitectureTensorPlan::served_and_mtp(architecture, *tp) else {
+        return Vec::new();
+    };
+    let mut claims = BTreeMap::new();
+    for stack in stacks {
+        for block in &stack.blocks {
+            for instance in &block.parts {
+                for claim in &instance.claims {
+                    claims.insert(
+                        claim.name.clone(),
+                        (instance.part, Some(block.index), claim.split.clone()),
+                    );
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(plan.len());
+    for index in 0..plan.len() {
+        let spec = plan.spec_at(index);
+        let rank = plan.rank_spec_at(index);
+        let global = match spec.name.as_str() {
+            "embed.weight" => Some(Part::Embedding),
+            "head.weight" => Some(Part::LmHead),
+            "norm.weight" => Some(Part::RmsNorm),
+            _ => None,
+        };
+        let (part, block, split) = claims
+            .get(&spec.name)
+            .cloned()
+            .unwrap_or_else(|| (global.unwrap_or(Part::Collective), None, "whole".to_owned()));
+        let elements = rank
+            .shape
+            .iter()
+            .fold(1usize, |product, dim| product.saturating_mul(*dim));
+        // The checkpoint stores a 4-bit expert packed two values per byte: the manifest and
+        // the loader see I8 with the last axis halved, while the plan's arithmetic sees the
+        // logical E2M1 shape. Carry the stored form and keep the byte count the same.
+        let (format, shape, rank_shape) = if spec.dtype == sparkflash_weights::DType::F4E2M1 {
+            let mut shape = spec.shape.clone();
+            let mut rank_shape = rank.shape.clone();
+            if let Some(last) = shape.last_mut() {
+                *last /= 2;
+            }
+            if let Some(last) = rank_shape.last_mut() {
+                *last /= 2;
+            }
+            ("I8".to_owned(), shape, rank_shape)
+        } else {
+            (
+                spec.dtype.name().to_owned(),
+                spec.shape.clone(),
+                rank.shape.clone(),
+            )
+        };
+        out.push(PlanTensor {
+            name: spec.name.clone(),
+            shape,
+            format,
+            rank_shape,
+            shard_bytes: spec.dtype.storage_bytes(elements),
+            part,
+            block,
+            split,
+            placement: if device_bound(&spec.name, part) {
+                "resident".to_owned()
+            } else {
+                "host".to_owned()
+            },
+        });
+    }
+    out
+}
+
+/// The DeepSeek image's symbols for each part instance the plan executes, grouped by part.
+fn part_symbols(architecture: &Architecture) -> Vec<PartSymbols> {
+    if !architecture.family.starts_with("deepseek") {
+        return Vec::new();
+    }
+    crate::parts::CATALOGUE
+        .iter()
+        .filter(|entry| {
+            entry.image == sparkflash_kernels::images::Image::Deepseek
+                && !entry.symbols.is_empty()
+                && !matches!(
+                    entry.part,
+                    Part::Vision
+                        | Part::VisionPatchEmbed
+                        | Part::VisionPosition
+                        | Part::VisionNorm
+                        | Part::VisionAttention
+                        | Part::VisionMlp
+                        | Part::VisionDownsample
+                )
+        })
+        .map(|entry| PartSymbols {
+            part: entry.part,
+            block: None,
+            image: "deepseek",
+            symbols: entry.symbols.iter().map(|symbol| symbol.name).collect(),
+        })
+        .collect()
+}
 fn layout_format(dtype: LayoutDtype, architecture: &Architecture) -> Option<WeightFormat> {
     let quantization = &architecture.quantization;
     match dtype {

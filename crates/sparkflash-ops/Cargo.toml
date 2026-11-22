@@ -36,6 +36,7 @@ rdma = ["sparkflash-kernels/rdma"]
 
 [dev-dependencies]
 sparkflash-model-deepseek-v41 = { workspace = true }
+flate2 = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }

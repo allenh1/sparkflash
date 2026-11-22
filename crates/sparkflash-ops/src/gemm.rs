@@ -145,16 +145,12 @@ impl DenseGemmPlan {
 /// The dense GEMM symbols a precision and split need, most specific first.
 fn dense_symbols(precision: Precision, split_k: usize) -> Result<&'static [&'static str], OpError> {
     match (precision, split_k > 1) {
-        (Precision::MxFp8, true) => Ok(&["b12x_mxfp8_dense_split_k_sm121"]),
+        (Precision::MxFp8, true) => Ok(&["b12x_mxfp8_gemv_m1_sm121", "opt_mma_bf16a_bf16o"]),
         (_, true) => Err(OpError::Unsupported {
             op: "split-K dense GEMM",
             dtype: precision.name(),
         }),
-        (Precision::MxFp8, false) => Ok(&[
-            "b12x_mxfp8_dense_sm121",
-            "b12x_mxfp8_dense_m1_sm121",
-            "b12x_bf16a_mxfp8w_dense_sm121",
-        ]),
+        (Precision::MxFp8, false) => Ok(&["b12x_mxfp8_gemv_m1_sm121", "opt_mma_bf16a_bf16o"]),
         (Precision::Bf16, false) => Ok(&[
             "q4e_gemm_bf16",
             "opt_mma_bf16a_bf16o",
@@ -414,7 +410,7 @@ impl GroupedMoeGemmPlan {
         }
         let symbols: &[&'static str] = match precision {
             Precision::NvFp4 => &[
-                "b12x_mxfp4_moe_sm121",
+                "b12x_mxfp4_moe_stored_sm121",
                 "q4e_expert_gate_up",
                 "q4p_moe_gate_up",
             ],

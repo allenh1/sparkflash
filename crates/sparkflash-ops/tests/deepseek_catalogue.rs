@@ -37,7 +37,40 @@ use sparkflash_ops::CATALOGUE;
 ///
 /// A line is a promise with a citation, not a shortcut: the test fails if the reason is empty or
 /// if the symbol is no longer named by the forward, so the table cannot go stale.
-const ALLOWED_UNCATALOGUED: &[(&str, &str)] = &[];
+const ALLOWED_UNCATALOGUED: &[(&str, &str)] = &[
+    (
+        "b12x_mxfp4_moe_sm121",
+        "the forward's dense expert fallback; the baseline workload's routed path loads the stored form (b12x_mxfp4_moe_stored_sm121), and the manifest records what was loaded",
+    ),
+    (
+        "b12x_mxfp8_dense_sm121",
+        "the forward's non-split dense fallback; the baseline binds the split/tile form and the manifest records only loaded symbols",
+    ),
+    (
+        "b12x_mxfp8_wo_a_sm121",
+        "the forward's untiled wo_a fallback; the baseline loads b12x_bf16a_mxfp8w_wo_a_sm121",
+    ),
+    (
+        "flash_mla_csa2_sm121",
+        "the forward's non-sequence CSA2 fallback; the baseline loads the seq entry",
+    ),
+    (
+        "lm_head_reduce_sm121",
+        "the forward's uncertified head reduce; the baseline loads the certified head",
+    ),
+    (
+        "opt_draft_markov_seqs",
+        "the forward's non-MMA Markov fallback; the baseline loads opt_draft_markov_seqs_mma",
+    ),
+    (
+        "opt_mma_fp8_rowscale_f32o",
+        "the forward's per-row-scale MMA fallback; the baseline loads opt_mma_bf16a_fp8row_f32o",
+    ),
+    (
+        "opt_ref_select_pre",
+        "the forward's pre-selection probe; the baseline selection uses opt_ref_select_fast",
+    ),
+];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

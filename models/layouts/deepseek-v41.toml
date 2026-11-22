@@ -58,6 +58,18 @@ compress_ratios = { key = "text_config.compress_ratios", array = true }
 # config.json text_config.dspark_markov_rank: the Markov head's rank (model.py:1117).
 markov_rank = { key = "text_config.dspark_markov_rank" }
 
+# config.json text_config.dspark_noise_token_id: the draft slot's seed token. model.py:75
+# reads it in ModelArgs; the shared plan carries it as a draft fact.
+noise_token = { key = "text_config.dspark_noise_token_id" }
+
+# config.json vision_config.max_image_tokens: the image processor's token budget. The shared
+# vision geometry has no field for it, so the layout carries it as a tower fact.
+vision_max_tokens = { key = "vision_config.max_image_tokens" }
+
+# model.py:67-68: the producer's ModelArgs default, absent from the release's config.json.
+# The plan carries the value the reference constructor uses.
+gate_temp = { key = "text_config.gate_temp", default = 1.0 }
+
 # config.json text_config.dspark_target_layer_ids: model.py:1113 sizes main_proj's input by the
 # number of entries, not by a written count.
 mtp_targets = { key = "text_config.dspark_target_layer_ids", length = true }
@@ -192,7 +204,7 @@ part = "embedding"
 role = "embedding"
 dtype = "bf16"
 shape = ["vocab", "hidden"]
-split = "whole"
+split = "rows"
 
 [[tensor]]
 name = "norm.weight"
@@ -208,7 +220,7 @@ part = "lm_head"
 role = "lm_head"
 dtype = "bf16"
 shape = ["vocab", "hidden"]
-split = "whole"
+split = "rows"
 
 # model.py:933-934: one RMSNorm before each branch.
 [[tensor]]
@@ -352,7 +364,7 @@ part = "mla_attention"
 role = "attention"
 dtype = "f8e4m3"
 shape = ["heads * head_dim", "q_lora"]
-split = "whole"
+split = "rows"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
 
@@ -392,7 +404,7 @@ part = "mla_attention"
 role = "attention"
 dtype = "f8e4m3"
 shape = ["o_groups * o_lora", "heads * head_dim / o_groups"]
-split = "whole"
+split = "rows"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
 
@@ -412,7 +424,7 @@ part = "mla_attention"
 role = "attention"
 dtype = "f8e4m3"
 shape = ["hidden", "o_groups * o_lora"]
-split = "whole"
+split = "columns"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
 
@@ -466,7 +478,7 @@ part = "moe"
 role = "shared_expert"
 dtype = "f8e4m3"
 shape = ["shared_width", "hidden"]
-split = "whole"
+split = "rows"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
 
@@ -476,7 +488,7 @@ part = "moe"
 role = "shared_expert"
 dtype = "f8e8m0"
 shape = ["(shared_width) / quant_block[0]", "(hidden) / quant_block[0]"]
-split = "whole"
+split = "rows"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
 
@@ -486,7 +498,7 @@ part = "moe"
 role = "shared_expert"
 dtype = "f8e4m3"
 shape = ["hidden", "shared_width"]
-split = "whole"
+split = "columns"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
 
@@ -496,7 +508,7 @@ part = "moe"
 role = "shared_expert"
 dtype = "f8e8m0"
 shape = ["(hidden) / quant_block[0]", "(shared_width) / quant_block[0]"]
-split = "whole"
+split = "columns"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
 
@@ -506,7 +518,7 @@ part = "moe"
 role = "shared_expert"
 dtype = "f8e4m3"
 shape = ["shared_width", "hidden"]
-split = "whole"
+split = "rows"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
 
@@ -516,7 +528,7 @@ part = "moe"
 role = "shared_expert"
 dtype = "f8e8m0"
 shape = ["(shared_width) / quant_block[0]", "(hidden) / quant_block[0]"]
-split = "whole"
+split = "rows"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
 

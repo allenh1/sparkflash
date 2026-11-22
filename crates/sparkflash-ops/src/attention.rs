@@ -392,9 +392,9 @@ fn validate_inputs(
 const fn symbols_for(kind: AttentionKind, precision: Precision) -> &'static [&'static str] {
     match kind {
         AttentionKind::Mla => match precision {
-            Precision::MxFp8 => &["flash_mla_csa2_sm121", "opt_bulk_attn"],
+            Precision::MxFp8 => &["flash_mla_csa2_seq_sm121", "opt_bulk_attn"],
             Precision::Bf16 => &[
-                "flash_mla_csa2_sm121",
+                "flash_mla_csa2_seq_sm121",
                 "opt_bulk_attn",
                 "glm_prefill_mla_attend",
             ],
@@ -410,7 +410,7 @@ const fn symbols_for(kind: AttentionKind, precision: Precision) -> &'static [&'s
         AttentionKind::Sparse { .. } => {
             &["flash_mla_csa2_seq_sm121", "q4e_qsa_pick", "q4e_glm_pick"]
         }
-        AttentionKind::Csa2 { .. } => &["flash_mla_csa2_ring_sm121"],
+        AttentionKind::Csa2 { .. } => &["opt_pool_rows", "compressed_append_sm121"],
     }
 }
 

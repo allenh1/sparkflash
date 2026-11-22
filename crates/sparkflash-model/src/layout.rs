@@ -314,7 +314,7 @@ pub struct LayoutDescription {
     pub facts: BTreeMap<String, LayoutValue>,
     /// The tensors the layout describes, in declaration order.
     pub tensors: Vec<LayoutTensor>,
-    /// The stacks, with each part instance's tensor names attached.
+    /// The stacks, with each part instance's facts and tensor claims attached.
     pub stacks: Vec<Stack>,
 }
 
@@ -881,6 +881,19 @@ impl Layout {
             tensors,
             stacks,
         })
+    }
+
+    /// The stacks this layout describes for `architecture`, with each part instance's claims.
+    ///
+    /// This is [Self::apply]'s stack half without the config document: the caller already holds a
+    /// parsed [Architecture], so only the tensor declarations are expanded. Every instance also
+    /// carries the per-layer facts [Architecture::stacks] attached.
+    ///
+    /// # Errors
+    /// As [Self::tensors].
+    pub fn stacks(&self, architecture: &Architecture) -> Result<Vec<Stack>, LayoutError> {
+        let tensors = self.tensors(architecture)?;
+        self.describe_stacks(architecture, &tensors)
     }
 
     /// Read the layout's keys and wiring facts, without building its tensors.
@@ -1968,10 +1981,42 @@ impl Layout {
                         .filter(|other| other.block == Some(index) && other.part == tensor.part)
                         .map(|other| other.name.clone())
                         .collect();
-                    parts.push(
-                        PartInstance::new(tensor.part, Shape::new(tensor.shape.clone()), None)
-                            .with_tensors(names),
+                    let mut facts = BTreeMap::new();
+                    if let Some(mtp) = &architecture.mtp {
+                        facts.insert(
+                            "tap_layers".to_owned(),
+                            crate::stack::FactValue::Integers(
+                                mtp.target_layers
+                                    .iter()
+                                    .map(|layer| *layer as i64)
+                                    .collect(),
+                            ),
+                        );
+                        if let Some(block_size) = mtp.block_size {
+                            facts.insert(
+                                "dspark_block_size".to_owned(),
+                                crate::stack::FactValue::Integer(block_size as i64),
+                            );
+                        }
+                    }
+                    facts.insert(
+                        "stage".to_owned(),
+                        crate::stack::FactValue::Integer(stage as i64),
                     );
+                    if let Some(ratio) = architecture
+                        .layout_vars
+                        .get(&format!("compress_ratios[{index}]"))
+                    {
+                        facts.insert(
+                            "compress_ratio".to_owned(),
+                            crate::stack::FactValue::Integer(*ratio),
+                        );
+                    }
+                    let mut instance =
+                        PartInstance::new(tensor.part, Shape::new(tensor.shape.clone()), None)
+                            .with_tensors(names);
+                    instance.facts = facts;
+                    parts.push(instance);
                 }
                 if !parts.is_empty() {
                     blocks.push(Block { index, parts });
@@ -1987,6 +2032,26 @@ impl Layout {
                 continue;
             };
             for block in &mut stack.blocks {
+                // A layout may claim a part the shared walk folds into another step (the block's
+                // norms are global parts rather than steps). The tensors still need an instance to
+                // sit on, so one is added here and the block keeps its declaration order below.
+                let mut present: BTreeSet<Part> =
+                    block.parts.iter().map(|instance| instance.part).collect();
+                let layer_facts = block
+                    .parts
+                    .first()
+                    .map(|instance| instance.facts.clone())
+                    .unwrap_or_default();
+                for tensor in tensors.iter().filter(|tensor| {
+                    tensor.stack == stack.kind && tensor.block == Some(block.index)
+                }) {
+                    if present.insert(tensor.part) {
+                        let mut instance =
+                            PartInstance::new(tensor.part, Shape::new(tensor.shape.clone()), None);
+                        instance.facts = layer_facts.clone();
+                        block.parts.push(instance);
+                    }
+                }
                 block.parts.sort_by_key(|instance| {
                     declaration
                         .order
@@ -2291,16 +2356,53 @@ fn insert(vars: &mut BTreeMap<String, i64>, name: &str, value: usize) {
     vars.insert(name.to_owned(), i64::try_from(value).unwrap_or(i64::MAX));
 }
 
+fn split_name(split: TensorSplit) -> &'static str {
+    match split {
+        TensorSplit::Whole => "whole",
+        TensorSplit::Rows => "rows",
+        TensorSplit::Columns => "columns",
+        TensorSplit::KvRows => "kv_rows",
+        TensorSplit::Vector => "vector",
+        TensorSplit::Conv => "conv",
+        TensorSplit::ExpertRows => "expert_rows",
+        TensorSplit::ExpertColumns => "expert_columns",
+        TensorSplit::ExpertAxis => "expert_axis",
+        TensorSplit::Tiles => "tiles",
+        TensorSplit::TileRows => "tile_rows",
+    }
+}
+
 fn attach_tensors(block: &mut Block, tensors: &[LayoutTensor], stack: StackKind) {
     for instance in &mut block.parts {
-        instance.tensors = tensors
+        let claimed: Vec<&LayoutTensor> = tensors
             .iter()
             .filter(|tensor| {
                 tensor.stack == stack
                     && tensor.part == instance.part
                     && tensor.block == Some(block.index)
             })
-            .map(|tensor| tensor.name.clone())
+            .collect();
+        instance.tensors = claimed.iter().map(|tensor| tensor.name.clone()).collect();
+        instance.claims = claimed
+            .iter()
+            .map(|tensor| crate::stack::TensorClaim {
+                name: tensor.name.clone(),
+                shape: tensor.shape.clone(),
+                dtype: match tensor.dtype {
+                    LayoutDtype::Bf16 => "bf16",
+                    LayoutDtype::F32 => "f32",
+                    LayoutDtype::Dense => "dense",
+                    LayoutDtype::Expert => "expert",
+                    LayoutDtype::F8E4M3 => "f8e4m3",
+                    LayoutDtype::F8E8M0 => "f8e8m0",
+                    LayoutDtype::F4E2M1 => "f4e2m1",
+                    LayoutDtype::U8 => "u8",
+                    LayoutDtype::I64 => "i64",
+                }
+                .to_owned(),
+                split: split_name(tensor.split).to_owned(),
+                tile: tensor.tile,
+            })
             .collect();
     }
 }

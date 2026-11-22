@@ -125,13 +125,13 @@ fn a_dense_gemm_names_one_kernel_and_allocates_nothing_at_launch() {
     assert_eq!(plan.launch().stream, StreamId(3));
     assert_eq!(
         plan.kernel(),
-        expected(Target::Sm121, Image::Deepseek, "b12x_mxfp8_dense_sm121")
+        expected(Target::Sm121, Image::Deepseek, "b12x_mxfp8_gemv_m1_sm121")
     );
     assert_eq!(plan.kernel().target, Target::Sm121);
 }
 
 #[test]
-fn a_split_k_gemm_reserves_its_partials_and_names_the_split_kernel() {
+fn a_split_k_gemm_reserves_its_partials_and_names_the_tensor_core_body() {
     let requirement = synthetic(Part::DenseGemm, 5120, 128, 64, Precision::MxFp8);
     let plan = DenseGemmPlan::new(
         CTX,
@@ -147,11 +147,7 @@ fn a_split_k_gemm_reserves_its_partials_and_names_the_split_kernel() {
     assert_eq!(plan.workspace_floats(), 5 * 64 * 128);
     assert_eq!(
         plan.kernel(),
-        expected(
-            Target::Sm121,
-            Image::Deepseek,
-            "b12x_mxfp8_dense_split_k_sm121"
-        )
+        expected(Target::Sm121, Image::Deepseek, "b12x_mxfp8_gemv_m1_sm121")
     );
 }
 
@@ -178,7 +174,7 @@ fn the_generic_mxfp8_body_resolves_at_2560_and_5120() {
         let plan = dense(&requirement, 8, 2560, 1);
         assert_eq!(
             plan.kernel(),
-            expected(Target::Sm121, Image::Deepseek, "b12x_mxfp8_dense_sm121"),
+            expected(Target::Sm121, Image::Deepseek, "b12x_mxfp8_gemv_m1_sm121"),
             "hidden {hidden}"
         );
         assert_eq!(plan.geometry.hidden, hidden);
@@ -531,7 +527,7 @@ fn attention_resolves_the_arm_the_requirement_describes() {
     .expect("DeepSeek MLA");
     assert_eq!(
         mla.kernel(),
-        expected(Target::Sm121, Image::Deepseek, "flash_mla_csa2_sm121")
+        expected(Target::Sm121, Image::Deepseek, "flash_mla_csa2_seq_sm121")
     );
 
     let glm = requirement(&arm(GLM, 4), Part::MlaAttention);
@@ -603,7 +599,7 @@ fn attention_resolves_the_arm_the_requirement_describes() {
     .expect("CSA2");
     assert_eq!(
         csa2.kernel(),
-        expected(Target::Sm121, Image::Deepseek, "flash_mla_csa2_ring_sm121")
+        expected(Target::Sm121, Image::Deepseek, "opt_pool_rows")
     );
 
     let decode = SplitKvDecodePlan::new(CTX, mla_or_deepseek(), 4).expect("split-KV decode");
@@ -660,7 +656,7 @@ fn norm_rope_activation_and_quantize_resolve_their_own_parts() {
     .expect("DeepSeek hyper-connection");
     assert_eq!(
         norm.kernel(),
-        expected(Target::Sm121, Image::Deepseek, "mega_mhc_fused_bf16_sm121")
+        expected(Target::Sm121, Image::Deepseek, "opt_mhc_seam")
     );
 
     let qwen = arm(QWEN, 1);

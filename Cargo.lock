@@ -2653,6 +2653,7 @@ dependencies = [
 name = "sparkflash-ops"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "half",
  "serde",
  "serde_json",
