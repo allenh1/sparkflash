@@ -1622,12 +1622,6 @@ fn cache_paths() -> Result<Vec<PathBuf>, LayoutError> {
     Ok(paths)
 }
 
-/// The path under a cache root, for a test that does not read this node's home.
-#[must_use]
-pub fn cache_path(root: &Path, file: &str) -> PathBuf {
-    root.join(file)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
