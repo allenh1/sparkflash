@@ -525,13 +525,6 @@ mod tests {
     /// it never makes it clean.
     #[rustfmt::skip]
     const REMAINING: &[(&str, &str, &str)] = &[
-        ("DeepSeek-V4.1-Flash", "text_config.dspark_markov_rank", "model crate parser"),
-        ("DeepSeek-V4.1-Flash", "text_config.dspark_noise_token_id", "model crate parser"),
-        ("DeepSeek-V4.1-Flash", "text_config.model_type", "model crate parser"),
-        ("DeepSeek-V4.1-Flash", "text_config.num_key_value_heads", "model crate parser"),
-        ("DeepSeek-V4.1-Flash", "vision_config.max_image_tokens", "vision reader"),
-        ("DeepSeek-V4.1-Flash", "vision_config.max_wh_ratio", "vision reader"),
-        ("DeepSeek-V4.1-Flash", "vision_config.model_type", "vision reader"),
         ("Dory1.0-4B-BF16", "mlp_bias", "model crate parser"),
         ("Dory1.0-4B-BF16", "ngpt_alpha_init", "model crate parser"),
         ("Dory1.0-4B-BF16", "rope_parameters.full_attention.rope_type", "model crate parser"),
