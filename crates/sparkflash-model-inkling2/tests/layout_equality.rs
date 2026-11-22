@@ -81,10 +81,6 @@ fn layout_rows(config: &Inkling2Config, tp: TpPlan) -> BTreeMap<String, Row> {
     rows
 }
 
-fn is_stacked_expert(name: &str) -> bool {
-    name.contains(".mlp.experts.")
-}
-
 #[test]
 fn the_layout_reproduces_the_arms_language_and_vision_plan() {
     let config = Inkling2Config::from_json(CONFIG, Some(QUANT)).expect("the released config");
@@ -93,24 +89,11 @@ fn the_layout_reproduces_the_arms_language_and_vision_plan() {
         let arm = arm_rows(&config, tp);
         let layout = layout_rows(&config, tp);
 
-        // The one construct the layout format cannot express is a stacked routed-expert tensor
-        // (an expert axis and a 3-D shape). Every other arm tensor must be in the layout plan.
         let missing: Vec<&String> = arm
             .keys()
             .filter(|name| !layout.contains_key(*name))
-            .filter(|name| !is_stacked_expert(name))
             .collect();
         assert!(missing.is_empty(), "TP{world}: the layout misses {missing:?}");
-        let experts: Vec<&String> = arm
-            .keys()
-            .filter(|name| !layout.contains_key(*name))
-            .filter(|name| is_stacked_expert(name))
-            .collect();
-        assert_eq!(
-            experts.len(),
-            352,
-            "TP{world}: the only tensors the format cannot express are the 352 stacked experts: {experts:?}"
-        );
 
         let extra: Vec<&String> = layout
             .keys()
