@@ -2397,6 +2397,73 @@ model_types = ["synthetic"]
         assert!(error.contains("width"), "{error}");
     }
     #[test]
+    fn a_quantized_match_selects_the_release_method() {
+        let fp8 = SOURCE.replace(
+            "model_types = [\"synthetic\"]",
+            "model_types = [\"synthetic\"]\nquantization = [\"fp8\"]",
+        );
+        let nvfp4 = SOURCE.replace("id = \"one\"", "id = \"two\"").replace(
+            "model_types = [\"synthetic\"]",
+            "model_types = [\"synthetic\"]\nquantization = [\"nvfp4\"]",
+        );
+        let set = LayoutSet::from_sources(&[
+            ("fp8.toml".to_owned(), fp8),
+            ("nvfp4.toml".to_owned(), nvfp4),
+        ])
+        .expect("two quantized layouts");
+        let architecture = Architecture::from_json(
+            r#"{"model_type":"synthetic","hidden_size":8,"vocab_size":8,"num_hidden_layers":0,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":8,"quantization_config":{"quant_method":"fp8","weight_block_size":[128,128]}}"#,
+        )
+        .expect("an FP8 config");
+        assert_eq!(
+            set.select(&architecture)
+                .expect("a selection")
+                .expect("one")
+                .id,
+            "one"
+        );
+    }
+
+    #[test]
+    fn a_tiles_declaration_keeps_its_width_and_an_expert_axis_parses() {
+        let source = r#"
+schema = 1
+id = "tiles"
+[match]
+model_types = ["synthetic"]
+
+[[tensor]]
+name = "model.embed.weight"
+part = "embedding"
+role = "embedding"
+dtype = "f8e4m3"
+shape = ["vocab", "hidden"]
+split = "tiles"
+tile = 8
+"#;
+        let layout = Layout::parse("tiles.toml", source).expect("a layout");
+        let architecture = Architecture::from_json(
+            r#"{"model_type":"synthetic","hidden_size":8,"vocab_size":8,"num_hidden_layers":0,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":8}"#,
+        )
+        .expect("a config");
+        let tensors = layout.tensors(&architecture).expect("a description");
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].split, TensorSplit::Tiles);
+        assert_eq!(tensors[0].tile, Some(8));
+
+        let expert = Layout::parse(
+            "expert.toml",
+            &source
+                .replace("split = \"tiles\"\ntile = 8", "split = \"expert_axis\"")
+                .replace("dtype = \"f8e4m3\"", "dtype = \"u8\"")
+                .replace("shape = [\"vocab\", \"hidden\"]", "shape = [4, \"hidden\"]"),
+        )
+        .expect("an expert-axis layout");
+        let tensors = expert.tensors(&architecture).expect("a description");
+        assert_eq!(tensors[0].split, TensorSplit::ExpertAxis);
+    }
+
+    #[test]
     fn a_tensor_template_carries_its_stored_but_unloaded_reason() {
         let source = r#"
 schema = 1
