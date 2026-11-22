@@ -507,7 +507,7 @@ fn bind_in_arena(
         Some(&census),
         None,
     )?;
-    Ok(DeviceBind {
+    let bind = DeviceBind {
         attention,
         mhc_seam,
         moe,
@@ -517,7 +517,12 @@ fn bind_in_arena(
         manifest_lines,
         #[cfg(feature = "cuda")]
         plan_index: PlanIndex::from_plan(&setup.plan),
-    })
+    };
+    // The manifest names what this bind actually bound. Recording at the one function that writes
+    // the bind evidence covers every opener; recording only in the chain CLI missed the serving
+    // epoch, which opens through device_chain and wrote no tensor records at all.
+    crate::open_manifest::record_tensors(&setup.plan, &bind.bound_names(), rank, world);
+    Ok(bind)
 }
 
 /// Streams the rank arena and binds every device-served tensor set: attention projections, routed
