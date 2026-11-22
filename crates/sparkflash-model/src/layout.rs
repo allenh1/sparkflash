@@ -506,10 +506,7 @@ impl Layout {
         if raw.id.is_empty() {
             return Err(LayoutError::invalid(origin, "id is empty"));
         }
-        if raw.matcher.architectures.is_empty()
-            && raw.matcher.model_types.is_empty()
-            && raw.matcher.quantization.is_empty()
-        {
+        if raw.matcher.architectures.is_empty() && raw.matcher.model_types.is_empty() {
             return Err(LayoutError::invalid(
                 origin,
                 "match names no architectures or model_types",
@@ -1408,36 +1405,32 @@ impl Layout {
                     }
                 }
                 Repeat::PleShards => {
-                    let found =
-                        architecture
-                            .layers
-                            .iter()
-                            .enumerate()
-                            .find_map(|(index, layer)| {
-                                layer.sides.iter().find_map(|side| match side {
-                                    Side::Ple(ple) => Some((index, layer, ple)),
-                                    Side::Engram(_) => None,
-                                })
-                            });
-                    let Some((index, layer, ple)) = found else {
-                        continue;
-                    };
-                    for shard in 0..ple.split_parts {
-                        let mut vars = self.layer_vars(architecture, layer, index);
-                        vars.insert("shard".to_owned(), shard as i64);
-                        self.push_tensor(
-                            &mut tensors,
-                            declaration,
-                            part,
-                            &vars,
-                            Placement {
-                                block: Some(index),
-                                expert: None,
-                                stage: None,
-                                shard: Some(shard),
-                                stack: StackKind::Language,
-                            },
-                        )?;
+                    for (index, layer) in architecture.layers.iter().enumerate() {
+                        if !when_matches(&declaration.when, layer, index) {
+                            continue;
+                        }
+                        for side in &layer.sides {
+                            let Side::Ple(ple) = side else {
+                                continue;
+                            };
+                            for shard in 0..ple.split_parts {
+                                let mut vars = self.layer_vars(architecture, layer, index);
+                                vars.insert("shard".to_owned(), shard as i64);
+                                self.push_tensor(
+                                    &mut tensors,
+                                    declaration,
+                                    part,
+                                    &vars,
+                                    Placement {
+                                        block: Some(index),
+                                        expert: None,
+                                        stage: None,
+                                        shard: Some(shard),
+                                        stack: StackKind::Language,
+                                    },
+                                )?;
+                            }
+                        }
                     }
                 }
                 Repeat::VisionBlocks => {
