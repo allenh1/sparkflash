@@ -4595,7 +4595,9 @@ mod tests {
     fn the_released_parses_are_pinned_and_switch_nothing_on() {
         let pinned = [
             0xe0a4_6a91_5f2e_aeb5_u64,
-            0x594a_226e_d501_88a5,
+            // Dory's layout supplies layout_vars (the attention and MLP widths), so its
+            // parse carries those four facts and does not hash at the field's default.
+            0xd4f9_c4d2_70fa_cf05,
             0x0d35_642d_b843_4b20,
             0x9a08_2ac0_b2fa_f67c,
             0x2416_b0da_0097_fad0,
