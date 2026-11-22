@@ -2903,7 +2903,26 @@ mod layout_equality {
             let expected = reference(&architecture, tp);
             let actual = ArchitectureTensorPlan::checkpoint(&architecture, tp)
                 .expect("the layout checkpoint plan");
-            assert_eq!(actual.len(), expected.len(), "TP{world}: tensor count");
+            if actual.len() != expected.len() {
+                let have: BTreeSet<&str> = (0..actual.len())
+                    .map(|index| actual.spec_at(index).name.as_str())
+                    .collect();
+                let want: BTreeSet<&str> = (0..expected.len())
+                    .map(|index| expected.spec_at(index).name.as_str())
+                    .collect();
+                let mut missing: Vec<&&str> = want.difference(&have).collect();
+                let mut extra: Vec<&&str> = have.difference(&want).collect();
+                missing.sort();
+                extra.sort();
+                println!(
+                    "TP{world}: {} expected, {} layout; missing {:?}; extra {:?}",
+                    expected.len(),
+                    actual.len(),
+                    &missing[..missing.len().min(20)],
+                    &extra[..extra.len().min(20)]
+                );
+                panic!("TP{world}: tensor count");
+            }
             let mut differences = Vec::new();
             for index in 0..expected.len() {
                 let want = expected.spec_at(index);
