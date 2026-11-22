@@ -270,6 +270,12 @@ ignore = "the producer's training-time load-balancing loss coefficient; inferenc
 path = "text_config.use_cache"
 ignore = "a producer output switch for returning the KV cache; serving always keeps the cache"
 
+[[keys]]
+# config.json vision_config.initializer_range: the producer's training-time initialization range
+# for the tower; no shared tensor shape or arithmetic derives from it.
+path = "vision_config.initializer_range"
+ignore = "the tower's training-time initialization range; no shared tensor shape derives from it"
+
 [stacks.language]
 order = [
   "embedding",

@@ -1155,8 +1155,20 @@ mod tests {
 
     #[test]
     fn carried_facts_are_printed_by_name_without_making_the_scan_dirty() {
-        let mut report = scan(inputs(Target::Sm121));
-        assert!(!report.is_clean());
+        let mut report = ScanReport {
+            target: Target::Sm121,
+            world: 1,
+            availability: Availability::Catalogue,
+            coverage: Coverage {
+                tensors: CoverageState::Clean,
+                config_keys: CoverageState::Clean,
+                indexed_tensors: Some(0),
+            },
+            rows: Vec::new(),
+            error: None,
+            carried_facts: Vec::new(),
+        };
+        assert!(report.is_clean(), "the baseline scan is clean");
         report.carried_facts = vec![
             "language.mlp_bias".to_owned(),
             "language.ngpt.alpha_init".to_owned(),
@@ -1169,8 +1181,8 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(!report.is_clean(), "carried facts never fail the load");
-        assert!(text.contains("clean: no"), "{text}");
+        assert!(report.is_clean(), "carried facts never fail the load");
+        assert!(text.contains("clean: yes"), "{text}");
     }
 
     #[test]

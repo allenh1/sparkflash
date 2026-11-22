@@ -569,6 +569,11 @@ const fn tc_wide(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
     )
 }
 
+/// Dory's four-matrix wide body: each output width is a whole 32-column MMA step.
+const fn tc_wide4(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    tc_wide(name, precisions).with_shape(ShapeConstraint::ANY.output_multiple(32))
+}
+
 /// A tensor-core body for one token row, in the token pass.
 const fn tc_one(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
     KernelSymbol::decode(
@@ -1269,7 +1274,7 @@ pub const CATALOGUE: &[PartKernel] = &[
         Image::Dory,
         &[
             tc_wide("dory_mma_wide", &[Precision::Bf16]),
-            tc_wide("dory_mma_wide4", &[Precision::Bf16]),
+            tc_wide4("dory_mma_wide4", &[Precision::Bf16]),
         ],
         false,
     ),
@@ -2268,7 +2273,7 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             sym("dory_mlp_epilogue", &[Precision::Bf16]),
             tc_wide("dory_mma_wide", &[Precision::Bf16]),
-            tc_wide("dory_mma_wide4", &[Precision::Bf16]),
+            tc_wide4("dory_mma_wide4", &[Precision::Bf16]),
         ],
         false,
     ),
@@ -4267,6 +4272,30 @@ mod tests {
                 })
                 .is_ok()
         );
+        let wide4 = entry
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "dory_mma_wide4")
+            .expect("the four-matrix body");
+        assert!(
+            wide4
+                .shape
+                .accepts(&PartGeometry {
+                    hidden: 2560,
+                    output: 2560,
+                    ..PartGeometry::new()
+                })
+                .is_ok()
+        );
+        let refused = wide4
+            .shape
+            .accepts(&PartGeometry {
+                hidden: 2560,
+                output: 2559,
+                ..PartGeometry::new()
+            })
+            .expect_err("a 2559-column output is not a 32-column step");
+        assert!(refused.contains("multiple of 32"), "{refused}");
     }
 
     /// Dory's served shape resolves every part its arm launches through the catalogue.

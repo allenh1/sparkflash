@@ -83,6 +83,7 @@ impl DenseGemmPlan {
         let symbols = dense_symbols(precision, split_k)?;
         let mut geometry = requirement.geometry;
         geometry.hidden = k;
+        geometry.output = output.rows;
         geometry.rows = output.rows;
         geometry.intermediate = output.columns;
         let resolved = context

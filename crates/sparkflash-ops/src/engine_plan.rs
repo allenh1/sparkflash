@@ -714,6 +714,7 @@ fn geometry_for(
             Ffn::Dense(dense) => {
                 geometry.intermediate =
                     split(tp, dense.intermediate, TpAxis::Intermediate, 16)?.padded;
+                geometry.output = geometry.intermediate;
             }
             _ => {
                 return Err(PlanError::Invalid(
