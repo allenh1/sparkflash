@@ -992,7 +992,6 @@ impl Qwen4ExpConfig {
                 "intermediate_size": self.vision_intermediate_size.unwrap_or(4304),
                 "out_hidden_size": self.vision_out_hidden_size.unwrap_or(2560),
                 "num_position_embeddings": self.vision_num_position_embeddings.unwrap_or(2304),
-                "rope_theta": self.vision_rope_theta.unwrap_or(10_000.0),
                 "hidden_act": self
                     .architecture
                     .vision
@@ -1000,6 +999,19 @@ impl Qwen4ExpConfig {
                     .and_then(|vision| vision.activation)
                     .map(|activation| activation.name()),
             });
+            // Write the RoPE base only when the description has a position scheme that uses it.
+            // A config that omitted the base must round-trip as omitted, not acquire the arm's
+            // default and turn into a stated fact on the next parse.
+            if self
+                .architecture
+                .vision
+                .as_ref()
+                .and_then(|vision| vision.position)
+                .is_some()
+            {
+                root["vision_config"]["rope_theta"] =
+                    serde_json::json!(self.vision_rope_theta.unwrap_or(10_000.0));
+            }
         }
         serde_json::to_string_pretty(&root).expect("a config of plain scalars always renders")
     }
