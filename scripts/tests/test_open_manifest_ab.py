@@ -76,6 +76,75 @@ class OpenManifestAbTest(unittest.TestCase):
         os.makedirs(new)
         self.assertFalse(ab.compare(old, new, 0.05))
 
+    def test_the_replay_workload_parses_the_served_stats(self):
+        import http.server
+        import json
+        import threading
+        import types
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                body = json.dumps({"data": [{"id": "mock-model"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                request = json.loads(self.rfile.read(length))
+                self.assert_request(request)
+                body = json.dumps(
+                    {
+                        "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+                        "x_deepseek_spark_stats": {
+                            "timing": {
+                                "prefill_tok_per_s": 100.0,
+                                "decode_tok_per_s": 10.0,
+                                "ttft_ms": 5.0,
+                            },
+                            "dspark_speculative": {
+                                "draft_tokens_accepted": 2,
+                                "draft_tokens_proposed": 4,
+                            },
+                        },
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def assert_request(self, request):
+                if request.get("temperature") != 0.0:
+                    raise AssertionError("the replay workload must be greedy")
+                if request.get("model") != "mock-model":
+                    raise AssertionError("the workload must use the served model id")
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        ab.served_model.cache_clear()
+        args = types.SimpleNamespace(
+            url="http://127.0.0.1:%d" % server.server_port,
+            max_tokens=4,
+            bulk_tokens=8,
+            draft_tokens=8,
+            request_timeout=5,
+        )
+        speeds = ab.run_workload(args)
+        self.assertGreater(speeds["decode_1"], 0)
+        self.assertGreater(speeds["decode_8"], 0)
+        self.assertGreater(speeds["prefill"], 0)
+        self.assertAlmostEqual(speeds["draft_accept"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()
