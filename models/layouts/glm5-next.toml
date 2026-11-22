@@ -617,6 +617,38 @@ repeat = "experts"
 when = { ffn = "moe" }
 
 # The MTP stage: the checkpoint stores it as layer num_hidden_layers, taking the first
+
+# The MTP stage repeats the selected MoE layer's experts at layer num_hidden_layers.
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "expert"
+shape = ["moe_intermediate", "hidden"]
+split = "expert_rows"
+repeat = "mtp_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "expert"
+shape = ["moe_intermediate", "hidden"]
+split = "expert_rows"
+repeat = "mtp_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "expert"
+shape = ["hidden", "moe_intermediate"]
+split = "expert_columns"
+repeat = "mtp_experts"
+when = { ffn = "moe" }
+
 # sparse-MLA layer's attention and the first MoE layer's experts.
 [[tensor]]
 name = "model.language_model.layers.{layer}.enorm.weight"

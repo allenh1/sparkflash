@@ -160,6 +160,8 @@ pub enum Repeat {
     Layers,
     /// One per routed expert of each selected MoE layer.
     Experts,
+    /// One per routed expert of the MTP stage's selected MoE layer.
+    MtpExperts,
     /// One per vision block.
     VisionBlocks,
     /// The MTP stage, using the first selected layer's wiring.
@@ -536,6 +538,7 @@ impl Layout {
                 "once" => Repeat::Once,
                 "layers" => Repeat::Layers,
                 "experts" => Repeat::Experts,
+                "mtp_experts" => Repeat::MtpExperts,
                 "vision_blocks" => Repeat::VisionBlocks,
                 "mtp" => Repeat::Mtp,
                 other => {
@@ -562,7 +565,7 @@ impl Layout {
                 }
             };
             if matches!(split, TensorSplit::ExpertRows | TensorSplit::ExpertColumns)
-                && repeat != Repeat::Experts
+                && !matches!(repeat, Repeat::Experts | Repeat::MtpExperts)
             {
                 return Err(LayoutError::invalid(
                     origin,
@@ -836,6 +839,52 @@ impl Layout {
                                 StackKind::Language,
                             )?;
                         }
+                    }
+                }
+                Repeat::MtpExperts => {
+                    let Some(mtp) = &architecture.mtp else {
+                        continue;
+                    };
+                    if mtp.stages == 0 {
+                        continue;
+                    }
+                    let reference = architecture
+                        .layers
+                        .iter()
+                        .find(|layer| when_matches(&declaration.when, layer))
+                        .ok_or_else(|| {
+                            LayoutError::refused(
+                                &self.id,
+                                format!(
+                                    "tensor {:?} repeats over MTP experts, but no layer matches \
+                                     its selector",
+                                    declaration.name
+                                ),
+                            )
+                        })?;
+                    let Ffn::Moe(moe) = &reference.ffn else {
+                        return Err(LayoutError::refused(
+                            &self.id,
+                            format!(
+                                "tensor {:?} repeats over MTP experts, but its reference layer is \
+                                 not MoE",
+                                declaration.name
+                            ),
+                        ));
+                    };
+                    let index = architecture.layers.len();
+                    for expert in 0..moe.routed_experts {
+                        let mut vars = self.layer_vars(architecture, reference, index);
+                        vars.insert("expert".to_owned(), expert as i64);
+                        self.push_tensor(
+                            &mut tensors,
+                            declaration,
+                            part,
+                            &vars,
+                            Some(index),
+                            Some(expert),
+                            StackKind::Draft,
+                        )?;
                     }
                 }
                 Repeat::VisionBlocks => {
