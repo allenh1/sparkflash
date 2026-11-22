@@ -51,6 +51,10 @@ engram_rows = { key = "text_config.engram_num_embeddings", array = true }
 kv_source_ids = { key = "text_config.kv_source_layer_ids", array = true }
 index_source_ids = { key = "text_config.index_source_layer_ids", array = true }
 
+# config.json text_config.compress_ratios: one ratio per layer. The compressor gate is stored
+# only where the ratio exceeds one, so the threshold selects those layers from the array.
+compress_ratios = { key = "text_config.compress_ratios", array = true }
+
 # config.json text_config.dspark_markov_rank: the Markov head's rank (model.py:1117).
 markov_rank = { key = "text_config.dspark_markov_rank" }
 
@@ -604,10 +608,18 @@ repeat = "listed_layers"
 layers = "kv_source_ids"
 when = { attention = "mla", ffn = "moe" }
 
-# compressor.wgate exists only where compress_ratios[layer] > 1. The config lists no such
-# layer array and the when selectors cannot filter on a compress ratio, so these three stored
-# tensors are deliberately not declared; the format gap is recorded in the PR rather than
-# worked around with literal layer numbers.
+# compressor.wgate exists only where compress_ratios[layer] > 1, so the array threshold
+# selects the gated layers from the same config array that states the ratios.
+[[tensor]]
+name = "layers.{layer}.attn.compressor.wgate.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "listed_layers"
+layers = "kv_source_ids"
+when = { attention = "mla", ffn = "moe", array = "compress_ratios", gt = 1 }
 
 # model.py:488-530 and config index_source_layer_ids: the indexer layers. The listed repeat
 # walks the config array. Only a layer that owns the compressed KV publishes its own index

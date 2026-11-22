@@ -4594,7 +4594,9 @@ mod tests {
     #[test]
     fn the_released_parses_are_pinned_and_switch_nothing_on() {
         let pinned = [
-            0x0015_f435_9a0c_13fd_u64,
+            // DeepSeek's layout resolves the Engram, compressor, indexer, target and scale-grid
+            // arrays into layout_vars, so its parse carries those entries.
+            0x7466_227f_9307_995b,
             // Dory's layout supplies layout_vars (the attention and MLP widths), so its
             // parse carries those four facts and does not hash at the field's default.
             0xd4f9_c4d2_70fa_cf05,

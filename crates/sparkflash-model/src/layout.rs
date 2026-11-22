@@ -224,6 +224,10 @@ pub struct When {
     pub residual: Option<String>,
     /// A side the layer carries: ple or engram.
     pub side: Option<String>,
+    /// An array var whose entry at the layer index must exceed `gt`.
+    pub array: Option<String>,
+    /// The threshold the array entry must exceed.
+    pub gt: Option<i64>,
 }
 
 /// A resolved tensor of one checkpoint.
@@ -513,6 +517,10 @@ struct RawWhen {
     residual: Option<String>,
     #[serde(default)]
     side: Option<String>,
+    #[serde(default)]
+    array: Option<String>,
+    #[serde(default)]
+    gt: Option<i64>,
 }
 impl Layout {
     /// Parse one layout file.
@@ -729,6 +737,8 @@ impl Layout {
                 layers: when.layers,
                 residual: when.residual,
                 side: when.side,
+                array: when.array,
+                gt: when.gt,
             });
             if let Some(attention) = &when.attention
                 && !matches!(
@@ -750,6 +760,28 @@ impl Layout {
                 return Err(LayoutError::invalid(
                     origin,
                     format!("tensor {:?}: unknown side selector {side:?}", tensor.name),
+                ));
+            }
+            if when.array.is_some() != when.gt.is_some() {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!(
+                        "tensor {:?}: an array selector needs both array and gt",
+                        tensor.name
+                    ),
+                ));
+            }
+            if let Some(array) = &when.array
+                && !raw.vars.get(array).is_some_and(|value| {
+                    matches!(fact_value(value.clone()), FactValue::Array { .. })
+                })
+            {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!(
+                        "tensor {:?}: when array {array:?} is not an [vars] entry with array = true",
+                        tensor.name
+                    ),
                 ));
             }
             if let Some(residual) = &when.residual
@@ -1270,7 +1302,8 @@ impl Layout {
                 }
                 Repeat::Layers => {
                     for (index, layer) in architecture.layers.iter().enumerate() {
-                        if !when_matches(&declaration.when, layer, index) {
+                        if !when_matches(&declaration.when, layer, index, &architecture.layout_vars)
+                        {
                             continue;
                         }
                         let vars = self.layer_vars(architecture, layer, index);
@@ -1346,7 +1379,8 @@ impl Layout {
                                 ),
                             )
                         })?;
-                        if !when_matches(&declaration.when, layer, index) {
+                        if !when_matches(&declaration.when, layer, index, &architecture.layout_vars)
+                        {
                             continue;
                         }
                         let mut vars = self.layer_vars(architecture, layer, index);
@@ -1368,7 +1402,8 @@ impl Layout {
                 }
                 Repeat::Experts => {
                     for (index, layer) in architecture.layers.iter().enumerate() {
-                        if !when_matches(&declaration.when, layer, index) {
+                        if !when_matches(&declaration.when, layer, index, &architecture.layout_vars)
+                        {
                             continue;
                         }
                         let Ffn::Moe(moe) = &layer.ffn else {
@@ -1410,7 +1445,14 @@ impl Layout {
                         .layers
                         .iter()
                         .enumerate()
-                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .find(|(index, layer)| {
+                            when_matches(
+                                &declaration.when,
+                                layer,
+                                *index,
+                                &architecture.layout_vars,
+                            )
+                        })
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -1466,7 +1508,14 @@ impl Layout {
                         .layers
                         .iter()
                         .enumerate()
-                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .find(|(index, layer)| {
+                            when_matches(
+                                &declaration.when,
+                                layer,
+                                *index,
+                                &architecture.layout_vars,
+                            )
+                        })
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -1504,7 +1553,14 @@ impl Layout {
                         .layers
                         .iter()
                         .enumerate()
-                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .find(|(index, layer)| {
+                            when_matches(
+                                &declaration.when,
+                                layer,
+                                *index,
+                                &architecture.layout_vars,
+                            )
+                        })
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -1551,7 +1607,7 @@ impl Layout {
                         .layers
                         .iter()
                         .enumerate()
-                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index, &architecture.layout_vars))
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -1603,7 +1659,8 @@ impl Layout {
                 }
                 Repeat::PleShards => {
                     for (index, layer) in architecture.layers.iter().enumerate() {
-                        if !when_matches(&declaration.when, layer, index) {
+                        if !when_matches(&declaration.when, layer, index, &architecture.layout_vars)
+                        {
                             continue;
                         }
                         for side in &layer.sides {
@@ -2253,7 +2310,15 @@ fn read_path<'a>(
     Ok(Some(value))
 }
 
-fn when_matches(when: &When, layer: &Layer, index: usize) -> bool {
+fn when_matches(when: &When, layer: &Layer, index: usize, vars: &BTreeMap<String, i64>) -> bool {
+    if let Some(array) = &when.array {
+        let Some(value) = vars.get(&format!("{array}[{index}]")) else {
+            return false;
+        };
+        if *value <= when.gt.unwrap_or(0) {
+            return false;
+        }
+    }
     if !when.layers.is_empty() && !when.layers.contains(&index) {
         return false;
     }
@@ -2943,6 +3008,53 @@ layers = "ids"
         assert_eq!(tensors[0].shape, vec![11, 3]);
         assert_eq!(tensors[1].name, "layers.1.engram.weight");
         assert_eq!(tensors[1].shape, vec![13, 3]);
+    }
+
+    #[test]
+    fn an_array_threshold_keeps_only_the_layers_above_it() {
+        let source = r#"
+schema = 1
+id = "threshold"
+[match]
+model_types = ["synthetic"]
+
+[vars]
+ids = { key = "ids", array = true }
+ratios = { key = "ratios", array = true }
+
+[[tensor]]
+name = "layers.{layer}.gate.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "listed_layers"
+layers = "ids"
+when = { array = "ratios", gt = 1 }
+"#;
+        let root = serde_json::json!({
+            "model_type": "synthetic",
+            "hidden_size": 8,
+            "vocab_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "intermediate_size": 16,
+            "hidden_act": "silu",
+            "ids": [0, 1],
+            "ratios": [1, 2]
+        });
+        let mut architecture = Architecture::from_json(&root.to_string()).expect("a config");
+        let layout = Layout::parse("threshold.toml", source).expect("a layout");
+        let mut coverage = ConfigCoverage::not_checked();
+        layout
+            .read(&mut architecture, &root, &mut coverage)
+            .expect("the array vars");
+        let tensors = layout.tensors(&architecture).expect("a description");
+        let names: Vec<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
+        assert_eq!(names, ["layers.1.gate.weight"]);
     }
 
     #[test]

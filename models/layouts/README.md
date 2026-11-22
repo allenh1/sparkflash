@@ -91,7 +91,8 @@ split = "rows"                   # whole, rows, columns, kv_rows, vector, conv,
 tile = 128                       # the block width a tiles or tile_rows split cuts on
 repeat = "layers"                # once, layers, listed_layers, experts, mtp, mtp_experts,
                                  # mtp_stages, mtp_stage_experts, ple_shards or vision_blocks
-when = { attention = "kda" }     # attention, ffn, indexer, layers, residual or side
+when = { attention = "kda" }     # attention, ffn, indexer, layers, residual, side,
+                                 # or array + gt (an array entry above a threshold)
 unloaded = "the producer keeps a duplicate for its converter"
 ```
 
@@ -99,7 +100,9 @@ unloaded = "the producer keeps a duplicate for its converter"
 `layers.{2 * layer + 1}.weight`. The reader refuses an expression it cannot evaluate and names
 the expression and the unknown fact. `repeat = "listed_layers"` with `layers = "ids"` walks
 the layer indices a config array lists; the position in that list is the `list` fact, so
-`rows[list]` selects the row count of the same entry. `dtype = "dense"`
+`rows[list]` selects the row count of the same entry. `when = { array = "ratios", gt = 1 }`
+keeps only the layers whose entry in that array exceeds the threshold, so a component stored
+only above a stated ratio needs no literal layer list. `dtype = "dense"`
 takes the checkpoint's dense format and adds its scale tensor; `dtype = "expert"` does the
 same for a routed expert. `match.quantization` narrows a file to a release whose parsed
 quantization method is one of the strings, so an FP8 and an NVFP4 checkpoint of the same model
