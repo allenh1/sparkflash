@@ -506,7 +506,14 @@ impl Builder {
                     LayoutDtype::I64 => DType::I64,
                     LayoutDtype::Dense | LayoutDtype::Expert => unreachable!(),
                 };
-                self.layout_split(&tensor.name, dtype, &tensor.shape, tensor.split, role)?;
+                self.layout_split(
+                    &tensor.name,
+                    dtype,
+                    &tensor.shape,
+                    tensor.split,
+                    tensor.tile,
+                    role,
+                )?;
             }
         }
         Ok(())
@@ -518,6 +525,7 @@ impl Builder {
         dtype: DType,
         shape: &[usize],
         split: TensorSplit,
+        tile: Option<usize>,
         role: Role,
     ) -> Result<(), PlanError> {
         match split {
@@ -544,6 +552,25 @@ impl Builder {
             TensorSplit::Conv => {
                 let [width, _, taps] = three(name, shape)?;
                 self.conv_rows(name.to_owned(), dtype, width, taps, role)
+            }
+            TensorSplit::Tiles => {
+                let [rows, columns] = two(name, shape)?;
+                let tile = tile.ok_or_else(|| {
+                    PlanError::Invalid(format!("tensor {name} has a tiles split but no tile width"))
+                })?;
+                let split = self
+                    .tp
+                    .split_tiles(columns, tile, TpAxis::Intermediate)
+                    .map_err(|error| PlanError::Invalid(error.to_string()))?;
+                self.push(
+                    name.to_owned(),
+                    dtype,
+                    vec![rows, columns],
+                    vec![rows, split.padded],
+                    Some(RankRun::tiled(split)),
+                    role,
+                );
+                Ok(())
             }
             TensorSplit::ExpertAxis => {
                 if shape.is_empty() {

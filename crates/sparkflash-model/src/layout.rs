@@ -65,6 +65,8 @@ pub struct Layout {
     pub architectures: Vec<String>,
     /// The root model_type values this layout describes.
     pub model_types: Vec<String>,
+    /// The quantization methods this layout describes.
+    pub quantizations: Vec<String>,
     /// Key declarations, in file order.
     pub keys: Vec<KeyDecl>,
     /// Stack declarations, keyed by stack name.
@@ -144,6 +146,8 @@ pub struct TensorDecl {
     pub shape: Vec<String>,
     /// The rank split: whole, rows, columns, kv_rows, vector, conv, expert_rows or expert_columns.
     pub split: String,
+    /// The tile width a `tiles` split cuts on.
+    pub tile: Option<usize>,
     /// How many instances the template describes.
     pub repeat: Repeat,
     /// Which layers or experts the template selects.
@@ -160,6 +164,7 @@ struct Placement {
     block: Option<usize>,
     expert: Option<usize>,
     stage: Option<usize>,
+    shard: Option<usize>,
     stack: StackKind,
 }
 
@@ -176,6 +181,8 @@ pub enum Repeat {
     MtpExperts,
     /// One per MTP stage.
     MtpStages,
+    /// One per stored shard of a layer's n-gram PLE table.
+    PleShards,
     /// One per routed expert of every MTP stage.
     MtpStageExperts,
     /// One per vision block.
@@ -218,6 +225,8 @@ pub struct LayoutTensor {
     pub stack: StackKind,
     /// The block index, when the tensor belongs to one block.
     pub block: Option<usize>,
+    /// The tile width a `tiles` split cuts on.
+    pub tile: Option<usize>,
     /// Why the tensor is stored but never loaded, when it is.
     pub unloaded: Option<String>,
 }
@@ -266,6 +275,8 @@ pub enum TensorSplit {
     ExpertColumns,
     /// A stacked expert tensor split on its expert axis (axis 0).
     ExpertAxis,
+    /// Columns split into whole `tile`-wide blocks.
+    Tiles,
 }
 
 /// A layout selected and applied to one checkpoint.
@@ -397,6 +408,8 @@ struct RawMatch {
     architectures: Vec<String>,
     #[serde(default)]
     model_types: Vec<String>,
+    #[serde(default)]
+    quantization: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -442,6 +455,8 @@ struct RawTensor {
     dtype: String,
     shape: Vec<RawDim>,
     split: String,
+    #[serde(default)]
+    tile: Option<usize>,
     #[serde(default)]
     repeat: Option<String>,
     #[serde(default)]
@@ -491,7 +506,10 @@ impl Layout {
         if raw.id.is_empty() {
             return Err(LayoutError::invalid(origin, "id is empty"));
         }
-        if raw.matcher.architectures.is_empty() && raw.matcher.model_types.is_empty() {
+        if raw.matcher.architectures.is_empty()
+            && raw.matcher.model_types.is_empty()
+            && raw.matcher.quantization.is_empty()
+        {
             return Err(LayoutError::invalid(
                 origin,
                 "match names no architectures or model_types",
@@ -582,6 +600,7 @@ impl Layout {
                 "experts" => Repeat::Experts,
                 "mtp_experts" => Repeat::MtpExperts,
                 "mtp_stages" => Repeat::MtpStages,
+                "ple_shards" => Repeat::PleShards,
                 "mtp_stage_experts" => Repeat::MtpStageExperts,
                 "vision_blocks" => Repeat::VisionBlocks,
                 "mtp" => Repeat::Mtp,
@@ -602,6 +621,7 @@ impl Layout {
                 "expert_rows" => TensorSplit::ExpertRows,
                 "expert_columns" => TensorSplit::ExpertColumns,
                 "expert_axis" => TensorSplit::ExpertAxis,
+                "tiles" => TensorSplit::Tiles,
                 other => {
                     return Err(LayoutError::invalid(
                         origin,
@@ -703,6 +723,7 @@ impl Layout {
                 dtype: tensor.dtype,
                 shape,
                 split: tensor.split,
+                tile: tensor.tile,
                 repeat,
                 when,
                 stack: tensor.stack,
@@ -719,6 +740,7 @@ impl Layout {
             replaces: raw.replaces,
             architectures: raw.matcher.architectures,
             model_types: raw.matcher.model_types,
+            quantizations: raw.matcher.quantization,
             keys,
             stacks,
             vars,
@@ -732,10 +754,22 @@ impl Layout {
     /// This is the only comparison against a family string outside this module.
     #[must_use]
     pub fn matches(&self, architecture: &Architecture) -> bool {
-        self.architectures
-            .iter()
-            .any(|name| architecture.architectures.iter().any(|have| have == name))
-            || self.model_types.contains(&architecture.family)
+        let quantized = self.quantizations.is_empty()
+            || architecture
+                .quantization
+                .method
+                .as_deref()
+                .is_some_and(|method| {
+                    self.quantizations
+                        .iter()
+                        .any(|name| method.eq_ignore_ascii_case(name))
+                });
+        quantized
+            && (self
+                .architectures
+                .iter()
+                .any(|name| architecture.architectures.iter().any(|have| have == name))
+                || self.model_types.contains(&architecture.family))
     }
 
     /// Read the layout's keys into coverage, apply its wiring facts to architecture, and return
@@ -1087,7 +1121,9 @@ impl Layout {
                     | Repeat::MtpExperts
                     | Repeat::MtpStages
                     | Repeat::MtpStageExperts => StackKind::Draft,
-                    Repeat::Once | Repeat::Layers | Repeat::Experts => stack_of_part(part),
+                    Repeat::Once | Repeat::Layers | Repeat::Experts | Repeat::PleShards => {
+                        stack_of_part(part)
+                    }
                 },
             };
             if stack == StackKind::Vision && architecture.vision.is_none() {
@@ -1108,6 +1144,7 @@ impl Layout {
                             block: (stack == StackKind::Vision).then_some(0),
                             expert: None,
                             stage: None,
+                            shard: None,
                             stack,
                         },
                     )?;
@@ -1127,6 +1164,7 @@ impl Layout {
                                 block: Some(index),
                                 expert: None,
                                 stage: None,
+                                shard: None,
                                 stack: StackKind::Language,
                             },
                         )?;
@@ -1158,6 +1196,7 @@ impl Layout {
                                     block: Some(index),
                                     expert: Some(expert),
                                     stage: None,
+                                    shard: None,
                                     stack: StackKind::Language,
                                 },
                             )?;
@@ -1214,6 +1253,7 @@ impl Layout {
                                 block: Some(index),
                                 expert: Some(expert),
                                 stage: Some(0),
+                                shard: None,
                                 stack: StackKind::Draft,
                             },
                         )?;
@@ -1253,6 +1293,7 @@ impl Layout {
                             block: Some(index),
                             expert: None,
                             stage: Some(0),
+                            shard: None,
                             stack: StackKind::Draft,
                         },
                     )?;
@@ -1298,9 +1339,10 @@ impl Layout {
                             part,
                             &vars,
                             Placement {
-                                block: Some(stage),
+                                block: Some(architecture.layers.len() + stage),
                                 expert: None,
                                 stage: Some(stage),
+                                shard: None,
                                 stack: StackKind::Draft,
                             },
                         )?;
@@ -1355,13 +1397,47 @@ impl Layout {
                                 part,
                                 &vars,
                                 Placement {
-                                    block: Some(stage),
+                                    block: Some(architecture.layers.len() + stage),
                                     expert: Some(expert),
                                     stage: Some(stage),
+                                    shard: None,
                                     stack: StackKind::Draft,
                                 },
                             )?;
                         }
+                    }
+                }
+                Repeat::PleShards => {
+                    let found =
+                        architecture
+                            .layers
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, layer)| {
+                                layer.sides.iter().find_map(|side| match side {
+                                    Side::Ple(ple) => Some((index, layer, ple)),
+                                    Side::Engram(_) => None,
+                                })
+                            });
+                    let Some((index, layer, ple)) = found else {
+                        continue;
+                    };
+                    for shard in 0..ple.split_parts {
+                        let mut vars = self.layer_vars(architecture, layer, index);
+                        vars.insert("shard".to_owned(), shard as i64);
+                        self.push_tensor(
+                            &mut tensors,
+                            declaration,
+                            part,
+                            &vars,
+                            Placement {
+                                block: Some(index),
+                                expert: None,
+                                stage: None,
+                                shard: Some(shard),
+                                stack: StackKind::Language,
+                            },
+                        )?;
                     }
                 }
                 Repeat::VisionBlocks => {
@@ -1380,6 +1456,7 @@ impl Layout {
                                 block: Some(block),
                                 expert: None,
                                 stage: None,
+                                shard: None,
                                 stack: StackKind::Vision,
                             },
                         )?;
@@ -1412,6 +1489,9 @@ impl Layout {
         }
         if let Some(stage) = stage {
             name = name.replace("{stage}", &stage.to_string());
+        }
+        if let Some(shard) = placement.shard {
+            name = name.replace("{shard}", &shard.to_string());
         }
         if name.contains('{') {
             return Err(LayoutError::refused(
@@ -1456,6 +1536,8 @@ impl Layout {
             "conv" => TensorSplit::Conv,
             "expert_rows" => TensorSplit::ExpertRows,
             "expert_columns" => TensorSplit::ExpertColumns,
+            "expert_axis" => TensorSplit::ExpertAxis,
+            "tiles" => TensorSplit::Tiles,
             other => {
                 return Err(LayoutError::refused(
                     &self.id,
@@ -1472,6 +1554,7 @@ impl Layout {
             split,
             stack,
             block,
+            tile: declaration.tile,
             unloaded: declaration.unloaded.clone(),
         });
         Ok(())
@@ -1488,28 +1571,33 @@ impl Layout {
             .filter(|tensor| tensor.stack == StackKind::Draft)
             .collect();
         if !draft.is_empty() {
-            let mut parts = Vec::new();
-            let mut seen = BTreeSet::new();
-            for tensor in &draft {
-                if !seen.insert(tensor.part) {
-                    continue;
+            let stages = architecture.mtp.as_ref().map_or(1, |mtp| mtp.stages.max(1));
+            let mut blocks = Vec::new();
+            for stage in 0..stages {
+                let index = architecture.layers.len() + stage;
+                let mut parts = Vec::new();
+                let mut seen = BTreeSet::new();
+                for tensor in draft.iter().filter(|tensor| tensor.block == Some(index)) {
+                    if !seen.insert(tensor.part) {
+                        continue;
+                    }
+                    let names: Vec<String> = draft
+                        .iter()
+                        .filter(|other| other.block == Some(index) && other.part == tensor.part)
+                        .map(|other| other.name.clone())
+                        .collect();
+                    parts.push(
+                        PartInstance::new(tensor.part, Shape::new(tensor.shape.clone()), None)
+                            .with_tensors(names),
+                    );
                 }
-                let names: Vec<String> = draft
-                    .iter()
-                    .filter(|other| other.part == tensor.part)
-                    .map(|other| other.name.clone())
-                    .collect();
-                parts.push(
-                    PartInstance::new(tensor.part, Shape::new(tensor.shape.clone()), None)
-                        .with_tensors(names),
-                );
+                if !parts.is_empty() {
+                    blocks.push(Block { index, parts });
+                }
             }
             stacks.push(Stack {
                 kind: StackKind::Draft,
-                blocks: vec![Block {
-                    index: architecture.layers.len(),
-                    parts,
-                }],
+                blocks,
             });
         }
         for stack in &mut stacks {
