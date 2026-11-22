@@ -2052,9 +2052,11 @@ fn when_matches(when: &When, layer: &Layer, index: usize) -> bool {
         }
     }
     if let Some(side) = &when.side {
-        let have = layer.sides.iter().any(|held| match (side.as_str(), held) {
-            ("ple", Side::Ple(_)) | ("engram", Side::Engram(_)) => true,
-            _ => false,
+        let have = layer.sides.iter().any(|held| {
+            matches!(
+                (side.as_str(), held),
+                ("ple", Side::Ple(_)) | ("engram", Side::Engram(_))
+            )
         });
         if !have {
             return false;
