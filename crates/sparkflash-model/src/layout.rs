@@ -151,6 +151,14 @@ pub struct TensorDecl {
     pub unloaded: Option<String>,
 }
 
+/// Where one expanded tensor sits in the description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement {
+    block: Option<usize>,
+    expert: Option<usize>,
+    stack: StackKind,
+}
+
 /// How a tensor template repeats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Repeat {
@@ -463,13 +471,13 @@ impl Layout {
                     format!("key {} must name exactly one of fact or ignore", key.path),
                 ));
             }
-            if let Some(reason) = &key.ignore {
-                if reason.trim().len() < 12 {
-                    return Err(LayoutError::invalid(
-                        origin,
-                        format!("key {} needs a written ignore reason", key.path),
-                    ));
-                }
+            if let Some(reason) = &key.ignore
+                && reason.trim().len() < 12
+            {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!("key {} needs a written ignore reason", key.path),
+                ));
             }
             keys.push(KeyDecl {
                 path: key.path,
@@ -632,10 +640,7 @@ impl Layout {
         self.architectures
             .iter()
             .any(|name| architecture.architectures.iter().any(|have| have == name))
-            || self
-                .model_types
-                .iter()
-                .any(|name| architecture.family == *name)
+            || self.model_types.contains(&architecture.family)
     }
 
     /// Read the layout's keys into coverage, apply its wiring facts to architecture, and return
@@ -664,7 +669,7 @@ impl Layout {
             let Some(fact) = &key.fact else {
                 continue;
             };
-            facts.insert(fact.clone(), layout_value(&value, self, fact)?);
+            facts.insert(fact.clone(), layout_value(value, self, fact)?);
         }
         for (stack_name, stack) in &self.stacks {
             for part in &stack.parts {
@@ -790,9 +795,11 @@ impl Layout {
                         declaration,
                         part,
                         &vars,
-                        None,
-                        None,
-                        StackKind::Language,
+                        Placement {
+                            block: None,
+                            expert: None,
+                            stack: StackKind::Language,
+                        },
                     )?;
                 }
                 Repeat::Layers => {
@@ -806,9 +813,11 @@ impl Layout {
                             declaration,
                             part,
                             &vars,
-                            Some(index),
-                            None,
-                            StackKind::Language,
+                            Placement {
+                                block: Some(index),
+                                expert: None,
+                                stack: StackKind::Language,
+                            },
                         )?;
                     }
                 }
@@ -834,9 +843,11 @@ impl Layout {
                                 declaration,
                                 part,
                                 &vars,
-                                Some(index),
-                                Some(expert),
-                                StackKind::Language,
+                                Placement {
+                                    block: Some(index),
+                                    expert: Some(expert),
+                                    stack: StackKind::Language,
+                                },
                             )?;
                         }
                     }
@@ -881,9 +892,11 @@ impl Layout {
                             declaration,
                             part,
                             &vars,
-                            Some(index),
-                            Some(expert),
-                            StackKind::Draft,
+                            Placement {
+                                block: Some(index),
+                                expert: Some(expert),
+                                stack: StackKind::Draft,
+                            },
                         )?;
                     }
                 }
@@ -899,9 +912,11 @@ impl Layout {
                             declaration,
                             part,
                             &vars,
-                            Some(block),
-                            None,
-                            StackKind::Vision,
+                            Placement {
+                                block: Some(block),
+                                expert: None,
+                                stack: StackKind::Vision,
+                            },
                         )?;
                     }
                 }
@@ -934,9 +949,11 @@ impl Layout {
                         declaration,
                         part,
                         &vars,
-                        Some(index),
-                        None,
-                        StackKind::Draft,
+                        Placement {
+                            block: Some(index),
+                            expert: None,
+                            stack: StackKind::Draft,
+                        },
                     )?;
                 }
             }
@@ -950,10 +967,11 @@ impl Layout {
         declaration: &TensorDecl,
         part: Part,
         vars: &BTreeMap<String, i64>,
-        block: Option<usize>,
-        expert: Option<usize>,
-        stack: StackKind,
+        placement: Placement,
     ) -> Result<(), LayoutError> {
+        let block = placement.block;
+        let expert = placement.expert;
+        let stack = placement.stack;
         let mut name = declaration.name.clone();
         if let Some(block) = block {
             name = name.replace("{layer}", &block.to_string());
@@ -1204,13 +1222,13 @@ fn stack_kind(name: &str) -> Option<StackKind> {
 }
 
 fn fact_value(value: toml::Value) -> FactValue {
-    if let toml::Value::Table(table) = &value {
-        if let Some(toml::Value::String(key)) = table.get("key") {
-            return FactValue::Key {
-                key: key.clone(),
-                default: table.get("default").cloned(),
-            };
-        }
+    if let toml::Value::Table(table) = &value
+        && let Some(toml::Value::String(key)) = table.get("key")
+    {
+        return FactValue::Key {
+            key: key.clone(),
+            default: table.get("default").cloned(),
+        };
     }
     FactValue::Literal(value)
 }
