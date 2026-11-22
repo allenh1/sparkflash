@@ -129,12 +129,26 @@ pub enum FactValue {
         /// The fallback value.
         default: Option<toml::Value>,
     },
+    /// A config array whose entries become indexed vars, with `len` for its length.
+    Array {
+        /// The full config path.
+        key: String,
+        /// The fallback value.
+        default: Option<toml::Value>,
+    },
+    /// A config array whose length is the var's scalar value.
+    Length {
+        /// The full config path.
+        key: String,
+        /// The fallback value.
+        default: Option<toml::Value>,
+    },
 }
 
 /// One tensor name template and the rank split it takes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TensorDecl {
-    /// The name template, with {layer}, {block}, {expert} and {stage} placeholders.
+    /// The name template, with {expression} placeholders evaluated over the tensor's vars.
     pub name: String,
     /// The part kind that owns the tensor.
     pub part: String,
@@ -150,6 +164,8 @@ pub struct TensorDecl {
     pub tile: Option<usize>,
     /// How many instances the template describes.
     pub repeat: Repeat,
+    /// The array var a `listed_layers` repeat walks, when it has one.
+    pub layers: Option<String>,
     /// Which layers or experts the template selects.
     pub when: When,
     /// The stack the tensor belongs to, when the part kind alone does not say.
@@ -175,6 +191,8 @@ pub enum Repeat {
     Once,
     /// One per decoder layer.
     Layers,
+    /// One per layer a config array lists, with its position available as `list`.
+    ListedLayers,
     /// One per routed expert of each selected MoE layer.
     Experts,
     /// One per routed expert of the MTP stage's selected MoE layer.
@@ -206,6 +224,10 @@ pub struct When {
     pub residual: Option<String>,
     /// A side the layer carries: ple or engram.
     pub side: Option<String>,
+    /// An array var whose entry at the layer index must exceed `gt`.
+    pub array: Option<String>,
+    /// The threshold the array entry must exceed.
+    pub gt: Option<i64>,
 }
 
 /// A resolved tensor of one checkpoint.
@@ -464,6 +486,8 @@ struct RawTensor {
     #[serde(default)]
     repeat: Option<String>,
     #[serde(default)]
+    layers: Option<String>,
+    #[serde(default)]
     when: Option<RawWhen>,
     #[serde(default)]
     stack: Option<String>,
@@ -493,6 +517,10 @@ struct RawWhen {
     residual: Option<String>,
     #[serde(default)]
     side: Option<String>,
+    #[serde(default)]
+    array: Option<String>,
+    #[serde(default)]
+    gt: Option<i64>,
 }
 impl Layout {
     /// Parse one layout file.
@@ -600,6 +628,7 @@ impl Layout {
             let repeat = match tensor.repeat.as_deref().unwrap_or("once") {
                 "once" => Repeat::Once,
                 "layers" => Repeat::Layers,
+                "listed_layers" => Repeat::ListedLayers,
                 "experts" => Repeat::Experts,
                 "mtp_experts" => Repeat::MtpExperts,
                 "mtp_stages" => Repeat::MtpStages,
@@ -654,6 +683,16 @@ impl Layout {
                     ),
                 ));
             }
+            if matches!(repeat, Repeat::ListedLayers) != tensor.layers.is_some() {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!(
+                        "tensor {:?}: repeat = listed_layers needs a layers array var, and no other repeat \
+                         takes one",
+                        tensor.name
+                    ),
+                ));
+            }
             if matches!(split, TensorSplit::ExpertRows | TensorSplit::ExpertColumns)
                 && !matches!(
                     repeat,
@@ -698,6 +737,8 @@ impl Layout {
                 layers: when.layers,
                 residual: when.residual,
                 side: when.side,
+                array: when.array,
+                gt: when.gt,
             });
             if let Some(attention) = &when.attention
                 && !matches!(
@@ -719,6 +760,28 @@ impl Layout {
                 return Err(LayoutError::invalid(
                     origin,
                     format!("tensor {:?}: unknown side selector {side:?}", tensor.name),
+                ));
+            }
+            if when.array.is_some() != when.gt.is_some() {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!(
+                        "tensor {:?}: an array selector needs both array and gt",
+                        tensor.name
+                    ),
+                ));
+            }
+            if let Some(array) = &when.array
+                && !raw.vars.get(array).is_some_and(|value| {
+                    matches!(fact_value(value.clone()), FactValue::Array { .. })
+                })
+            {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!(
+                        "tensor {:?}: when array {array:?} is not an [vars] entry with array = true",
+                        tensor.name
+                    ),
                 ));
             }
             if let Some(residual) = &when.residual
@@ -749,6 +812,7 @@ impl Layout {
                 split: tensor.split,
                 tile: tensor.tile,
                 repeat,
+                layers: tensor.layers,
                 when,
                 stack: tensor.stack,
                 unloaded: tensor.unloaded,
@@ -863,7 +927,9 @@ impl Layout {
         for (name, fact) in &self.vars {
             let (value, key_path) = match fact {
                 FactValue::Literal(value) => (layout_toml_value(value, self, name)?, None),
-                FactValue::Key { key, default } => {
+                FactValue::Key { key, default }
+                | FactValue::Array { key, default }
+                | FactValue::Length { key, default } => {
                     let value = read_path(root, key, self)?;
                     let value = match (value, default) {
                         (Some(value), _) => layout_value(value, self, key)?,
@@ -872,7 +938,8 @@ impl Layout {
                             return Err(LayoutError::refused(
                                 &self.id,
                                 format!(
-                                    "var {name} needs {key}, but the checkpoint does not state                                      it and the layout gives no default"
+                                    "var {name} needs {key}, but the checkpoint does not state it and the layout \
+                                     gives no default"
                                 ),
                             ));
                         }
@@ -883,20 +950,65 @@ impl Layout {
             if let Some(path) = key_path {
                 coverage.claim_path(path);
             }
-            let integer = match value {
-                LayoutValue::Integer(value) => value,
-                LayoutValue::Bool(value) => i64::from(value),
-                LayoutValue::Float(value) if value.fract() == 0.0 => value as i64,
-                other => {
+            match (fact, value) {
+                (FactValue::Array { .. }, LayoutValue::Integers(values)) => {
+                    for (index, value) in values.iter().enumerate() {
+                        let path = format!("{name}[{index}]");
+                        if let Some(key) = key_path {
+                            coverage.claim_path(&format!("{key}[{index}]"));
+                        }
+                        architecture.layout_vars.insert(path, *value);
+                    }
+                    architecture
+                        .layout_vars
+                        .insert(format!("{name}.len"), values.len() as i64);
+                }
+                (FactValue::Array { .. }, other) => {
                     return Err(LayoutError::refused(
                         &self.id,
-                        format!("var {name} is {other}, not an integer shape fact"),
+                        format!("var {name} is {other}, not an integer array"),
                     ));
                 }
-            };
-            architecture.layout_vars.insert(name.clone(), integer);
+                (FactValue::Length { .. }, LayoutValue::Integers(values)) => {
+                    architecture
+                        .layout_vars
+                        .insert(name.clone(), values.len() as i64);
+                }
+                (FactValue::Length { .. }, LayoutValue::Strings(values)) => {
+                    architecture
+                        .layout_vars
+                        .insert(name.clone(), values.len() as i64);
+                }
+                (FactValue::Length { .. }, other) => {
+                    return Err(LayoutError::refused(
+                        &self.id,
+                        format!("var {name} is {other}, not an array to count"),
+                    ));
+                }
+                (_, value) => {
+                    let integer = match value {
+                        LayoutValue::Integer(value) => value,
+                        LayoutValue::Bool(value) => i64::from(value),
+                        LayoutValue::Float(value) if value.fract() == 0.0 => value as i64,
+                        other => {
+                            return Err(LayoutError::refused(
+                                &self.id,
+                                format!("var {name} is {other}, not an integer shape fact"),
+                            ));
+                        }
+                    };
+                    architecture.layout_vars.insert(name.clone(), integer);
+                }
+            }
         }
-        self.apply_facts(architecture, &facts)?;
+        let mut applied = BTreeSet::new();
+        self.apply_facts(architecture, &facts, &mut applied)?;
+        let carried: Vec<String> = facts
+            .keys()
+            .filter(|name| !applied.contains(*name))
+            .cloned()
+            .collect();
+        coverage.carry_facts(carried);
         Ok(facts)
     }
 
@@ -914,6 +1026,15 @@ impl Layout {
                 return Ok((path, value, None));
             }
             FactValue::Key { key, default } => (key.as_str(), default.as_ref()),
+            FactValue::Array { .. } | FactValue::Length { .. } => {
+                return Err(LayoutError::refused(
+                    &self.id,
+                    format!(
+                        "part {}.{}: an array or length var is not a part fact",
+                        part.part, fact.name
+                    ),
+                ));
+            }
         };
         let value = read_path(root, path, self)?;
         let value = match (value, default) {
@@ -1003,8 +1124,10 @@ impl Layout {
         &self,
         architecture: &mut Architecture,
         facts: &BTreeMap<String, LayoutValue>,
+        applied: &mut BTreeSet<String>,
     ) -> Result<(), LayoutError> {
         for (name, value) in facts {
+            applied.insert(name.clone());
             match name.as_str() {
                 "vision.position" | "vision.vision_position.position" => {
                     let Some(vision) = architecture.vision.as_mut() else {
@@ -1105,7 +1228,9 @@ impl Layout {
                     };
                     vision.merger_final_norm = Some(Self::fact_bool(value, &self.id, name)?);
                 }
-                _ => {}
+                _ => {
+                    applied.remove(name);
+                }
             }
         }
         Ok(())
@@ -1145,9 +1270,11 @@ impl Layout {
                     | Repeat::MtpExperts
                     | Repeat::MtpStages
                     | Repeat::MtpStageExperts => StackKind::Draft,
-                    Repeat::Once | Repeat::Layers | Repeat::Experts | Repeat::PleShards => {
-                        stack_of_part(part)
-                    }
+                    Repeat::Once
+                    | Repeat::Layers
+                    | Repeat::ListedLayers
+                    | Repeat::Experts
+                    | Repeat::PleShards => stack_of_part(part),
                 },
             };
             if stack == StackKind::Vision && architecture.vision.is_none() {
@@ -1175,7 +1302,8 @@ impl Layout {
                 }
                 Repeat::Layers => {
                     for (index, layer) in architecture.layers.iter().enumerate() {
-                        if !when_matches(&declaration.when, layer, index) {
+                        if !when_matches(&declaration.when, layer, index, &architecture.layout_vars)
+                        {
                             continue;
                         }
                         let vars = self.layer_vars(architecture, layer, index);
@@ -1194,9 +1322,88 @@ impl Layout {
                         )?;
                     }
                 }
+                Repeat::ListedLayers => {
+                    let key = declaration.layers.as_deref().ok_or_else(|| {
+                        LayoutError::refused(
+                            &self.id,
+                            format!(
+                                "tensor {:?} repeats over a config list but names none",
+                                declaration.name
+                            ),
+                        )
+                    })?;
+                    let count = architecture
+                        .layout_vars
+                        .get(&format!("{key}.len"))
+                        .copied()
+                        .ok_or_else(|| {
+                            LayoutError::refused(
+                                &self.id,
+                                format!(
+                                    "tensor {:?}: the config list {key} is not an array var",
+                                    declaration.name
+                                ),
+                            )
+                        })?;
+                    for position in 0..count {
+                        let layer_index = architecture
+                            .layout_vars
+                            .get(&format!("{key}[{position}]"))
+                            .copied()
+                            .ok_or_else(|| {
+                                LayoutError::refused(
+                                    &self.id,
+                                    format!(
+                                        "tensor {:?}: the config list {key} has no entry {position}",
+                                        declaration.name
+                                    ),
+                                )
+                            })?;
+                        let index = usize::try_from(layer_index).map_err(|_| {
+                            LayoutError::refused(
+                                &self.id,
+                                format!(
+                                    "tensor {:?}: {key} entry {position} is {layer_index}, not a layer index",
+                                    declaration.name
+                                ),
+                            )
+                        })?;
+                        let layer = architecture.layers.get(index).ok_or_else(|| {
+                            LayoutError::refused(
+                                &self.id,
+                                format!(
+                                    "tensor {:?}: {key} lists layer {index}, but the checkpoint has {} \
+                                     layers",
+                                    declaration.name,
+                                    architecture.layers.len()
+                                ),
+                            )
+                        })?;
+                        if !when_matches(&declaration.when, layer, index, &architecture.layout_vars)
+                        {
+                            continue;
+                        }
+                        let mut vars = self.layer_vars(architecture, layer, index);
+                        vars.insert("list".to_owned(), position);
+                        self.push_tensor(
+                            &mut tensors,
+                            declaration,
+                            part,
+                            &vars,
+                            Placement {
+                                block: Some(index),
+                                expert: None,
+                                stage: None,
+                                shard: None,
+                                stack: StackKind::Language,
+                            },
+                        )?;
+                    }
+                }
                 Repeat::Experts => {
                     for (index, layer) in architecture.layers.iter().enumerate() {
-                        if !when_matches(&declaration.when, layer, index) {
+                        if !when_matches(&declaration.when, layer, index, &architecture.layout_vars)
+                        {
                             continue;
                         }
                         let Ffn::Moe(moe) = &layer.ffn else {
@@ -1238,7 +1445,14 @@ impl Layout {
                         .layers
                         .iter()
                         .enumerate()
-                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .find(|(index, layer)| {
+                            when_matches(
+                                &declaration.when,
+                                layer,
+                                *index,
+                                &architecture.layout_vars,
+                            )
+                        })
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -1294,7 +1508,14 @@ impl Layout {
                         .layers
                         .iter()
                         .enumerate()
-                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .find(|(index, layer)| {
+                            when_matches(
+                                &declaration.when,
+                                layer,
+                                *index,
+                                &architecture.layout_vars,
+                            )
+                        })
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -1332,7 +1553,14 @@ impl Layout {
                         .layers
                         .iter()
                         .enumerate()
-                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .find(|(index, layer)| {
+                            when_matches(
+                                &declaration.when,
+                                layer,
+                                *index,
+                                &architecture.layout_vars,
+                            )
+                        })
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -1379,12 +1607,13 @@ impl Layout {
                         .layers
                         .iter()
                         .enumerate()
-                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index, &architecture.layout_vars))
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
                                 format!(
-                                    "tensor {:?} repeats over MTP stage experts, but no layer                                      matches its selector",
+                                    "tensor {:?} repeats over MTP stage experts, but no layer matches its \
+                                     selector",
                                     declaration.name
                                 ),
                             )
@@ -1393,7 +1622,8 @@ impl Layout {
                         return Err(LayoutError::refused(
                             &self.id,
                             format!(
-                                "tensor {:?} repeats over MTP stage experts, but its reference                                  layer is not MoE",
+                                "tensor {:?} repeats over MTP stage experts, but its reference layer is \
+                                 not MoE",
                                 declaration.name
                             ),
                         ));
@@ -1429,7 +1659,8 @@ impl Layout {
                 }
                 Repeat::PleShards => {
                     for (index, layer) in architecture.layers.iter().enumerate() {
-                        if !when_matches(&declaration.when, layer, index) {
+                        if !when_matches(&declaration.when, layer, index, &architecture.layout_vars)
+                        {
                             continue;
                         }
                         for side in &layer.sides {
@@ -1495,33 +1726,25 @@ impl Layout {
         let expert = placement.expert;
         let stage = placement.stage;
         let stack = placement.stack;
-        let mut name = declaration.name.clone();
+        let mut vars = vars.clone();
         if let Some(block) = block {
-            name = name.replace("{layer}", &block.to_string());
-            name = name.replace("{block}", &block.to_string());
+            vars.insert("layer".to_owned(), block as i64);
+            vars.insert("block".to_owned(), block as i64);
         }
         if let Some(expert) = expert {
-            name = name.replace("{expert}", &expert.to_string());
+            vars.insert("expert".to_owned(), expert as i64);
         }
         if let Some(stage) = stage {
-            name = name.replace("{stage}", &stage.to_string());
+            vars.insert("stage".to_owned(), stage as i64);
         }
         if let Some(shard) = placement.shard {
-            name = name.replace("{shard}", &shard.to_string());
+            vars.insert("shard".to_owned(), shard as i64);
         }
-        if name.contains('{') {
-            return Err(LayoutError::refused(
-                &self.id,
-                format!(
-                    "tensor {:?} leaves a placeholder after expansion; name the repeat it needs",
-                    name
-                ),
-            ));
-        }
+        let name = expand_name(&declaration.name, &vars, &self.id)?;
         let shape = declaration
             .shape
             .iter()
-            .map(|expression| evaluate(expression, vars))
+            .map(|expression| evaluate(expression, &vars))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|detail| {
                 LayoutError::refused(&self.id, format!("tensor {name:?} shape: {detail}"))
@@ -1653,19 +1876,48 @@ impl Layout {
         // A caller may hand the reader an Architecture without the config document that
         // populated its layout_vars. A literal or a default is still a fact of the layout.
         for (name, fact) in &self.vars {
-            if vars.contains_key(name) {
-                continue;
-            }
-            let value = match fact {
-                FactValue::Literal(value) => layout_toml_value(value, self, name).ok(),
+            match fact {
+                FactValue::Array {
+                    default: Some(default),
+                    ..
+                } if !vars.contains_key(&format!("{name}.len")) => {
+                    if let Ok(LayoutValue::Integers(values)) =
+                        layout_toml_value(default, self, name)
+                    {
+                        for (index, value) in values.iter().enumerate() {
+                            vars.insert(format!("{name}[{index}]"), *value);
+                        }
+                        vars.insert(format!("{name}.len"), values.len() as i64);
+                    }
+                }
+                FactValue::Length {
+                    default: Some(default),
+                    ..
+                } if !vars.contains_key(name) => {
+                    let count = match layout_toml_value(default, self, name) {
+                        Ok(LayoutValue::Integers(values)) => Some(values.len()),
+                        Ok(LayoutValue::Strings(values)) => Some(values.len()),
+                        _ => None,
+                    };
+                    if let Some(count) = count {
+                        vars.insert(name.clone(), count as i64);
+                    }
+                }
+                FactValue::Literal(value) if !vars.contains_key(name) => {
+                    if let Ok(LayoutValue::Integer(value)) = layout_toml_value(value, self, name) {
+                        vars.insert(name.clone(), value);
+                    }
+                }
                 FactValue::Key {
                     default: Some(default),
                     ..
-                } => layout_toml_value(default, self, name).ok(),
-                FactValue::Key { default: None, .. } => None,
-            };
-            if let Some(LayoutValue::Integer(value)) = value {
-                vars.insert(name.clone(), value);
+                } if !vars.contains_key(name) => {
+                    if let Ok(LayoutValue::Integer(value)) = layout_toml_value(default, self, name)
+                    {
+                        vars.insert(name.clone(), value);
+                    }
+                }
+                _ => {}
             }
         }
         insert(&mut vars, "hidden", architecture.hidden_size);
@@ -1935,9 +2187,22 @@ fn fact_value(value: toml::Value) -> FactValue {
     if let toml::Value::Table(table) = &value
         && let Some(toml::Value::String(key)) = table.get("key")
     {
+        let default = table.get("default").cloned();
+        if table.get("length").and_then(toml::Value::as_bool) == Some(true) {
+            return FactValue::Length {
+                key: key.clone(),
+                default,
+            };
+        }
+        if table.get("array").and_then(toml::Value::as_bool) == Some(true) {
+            return FactValue::Array {
+                key: key.clone(),
+                default,
+            };
+        }
         return FactValue::Key {
             key: key.clone(),
-            default: table.get("default").cloned(),
+            default,
         };
     }
     FactValue::Literal(value)
@@ -2045,7 +2310,15 @@ fn read_path<'a>(
     Ok(Some(value))
 }
 
-fn when_matches(when: &When, layer: &Layer, index: usize) -> bool {
+fn when_matches(when: &When, layer: &Layer, index: usize, vars: &BTreeMap<String, i64>) -> bool {
+    if let Some(array) = &when.array {
+        let Some(value) = vars.get(&format!("{array}[{index}]")) else {
+            return false;
+        };
+        if *value <= when.gt.unwrap_or(0) {
+            return false;
+        }
+    }
     if !when.layers.is_empty() && !when.layers.contains(&index) {
         return false;
     }
@@ -2102,6 +2375,36 @@ fn when_matches(when: &When, layer: &Layer, index: usize) -> bool {
         }
     }
     true
+}
+
+/// Expand a name template's `{expression}` placeholders over the facts of one instance.
+fn expand_name(
+    template: &str,
+    vars: &BTreeMap<String, i64>,
+    layout: &str,
+) -> Result<String, LayoutError> {
+    let mut name = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        name.push_str(&rest[..start]);
+        let Some(end) = rest[start + 1..].find('}') else {
+            return Err(LayoutError::refused(
+                layout,
+                format!("name template {template:?} has an unclosed placeholder"),
+            ));
+        };
+        let expression = &rest[start + 1..start + 1 + end];
+        let value = evaluate(expression, vars).map_err(|detail| {
+            LayoutError::refused(
+                layout,
+                format!("name template expression {expression:?}: {detail}"),
+            )
+        })?;
+        name.push_str(&value.to_string());
+        rest = &rest[start + 1 + end + 1..];
+    }
+    name.push_str(rest);
+    Ok(name)
 }
 
 /// Evaluate a shape expression over the facts of one instance.
@@ -2210,6 +2513,49 @@ impl Expr<'_> {
             .map_err(|_| "the expression is not UTF-8".to_owned())?;
         if let Ok(value) = token.parse::<i64>() {
             return Ok(value);
+        }
+        self.space();
+        if self.bytes.get(self.at) == Some(&b'[') {
+            self.at += 1;
+            let index = self.sum()?;
+            self.space();
+            if self.bytes.get(self.at) != Some(&b']') {
+                return Err(format!("missing ']' after {token}[...]"));
+            }
+            self.at += 1;
+            let key = format!("{token}[{index}]");
+            return self
+                .vars
+                .get(&key)
+                .copied()
+                .ok_or_else(|| format!("unknown array entry {key:?}"));
+        }
+        if token == "len" {
+            self.space();
+            if self.bytes.get(self.at) != Some(&b'(') {
+                return Err("len needs a parenthesized array var".to_owned());
+            }
+            self.at += 1;
+            self.space();
+            let start = self.at;
+            while self.at < self.bytes.len()
+                && (self.bytes[self.at].is_ascii_alphanumeric() || self.bytes[self.at] == b'_')
+            {
+                self.at += 1;
+            }
+            let name = std::str::from_utf8(&self.bytes[start..self.at])
+                .map_err(|_| "the expression is not UTF-8".to_owned())?;
+            self.space();
+            if name.is_empty() || self.bytes.get(self.at) != Some(&b')') {
+                return Err("len needs a parenthesized array var".to_owned());
+            }
+            self.at += 1;
+            let key = format!("{name}.len");
+            return self
+                .vars
+                .get(&key)
+                .copied()
+                .ok_or_else(|| format!("unknown array var {name:?}"));
         }
         self.vars
             .get(token)
@@ -2574,5 +2920,186 @@ unloaded = "the producer keeps a duplicate for its converter"
             tensors[0].unloaded.as_deref(),
             Some("the producer keeps a duplicate for its converter")
         );
+    }
+
+    #[test]
+    fn a_name_template_evaluates_its_expression_and_names_what_it_cannot() {
+        let source = r#"
+schema = 1
+id = "names"
+[match]
+model_types = ["synthetic"]
+
+[[tensor]]
+name = "layers.{2 * layer + 1}.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+"#;
+        let layout = Layout::parse("names.toml", source).expect("a layout");
+        let architecture = Architecture::from_json(
+            r#"{"model_type":"synthetic","hidden_size":8,"vocab_size":8,"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,"intermediate_size":16,"hidden_act":"silu"}"#,
+        )
+        .expect("a config");
+        let tensors = layout.tensors(&architecture).expect("a description");
+        let names: Vec<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
+        assert_eq!(names, ["layers.1.weight", "layers.3.weight"]);
+
+        let error = Layout::parse(
+            "names.toml",
+            &source.replace("2 * layer + 1", "2 * absent + 1"),
+        )
+        .expect("a layout")
+        .tensors(&architecture)
+        .expect_err("an unknown fact in a name");
+        assert!(error.to_string().contains("2 * absent + 1"), "{error}");
+        assert!(error.to_string().contains("absent"), "{error}");
+    }
+
+    #[test]
+    fn an_array_var_indexes_and_counts_and_a_listed_repeat_walks_layers() {
+        let source = r#"
+schema = 1
+id = "arrays"
+[match]
+model_types = ["synthetic"]
+
+[vars]
+ids = { key = "ids", array = true }
+rows = { key = "rows", array = true }
+targets = { key = "targets", length = true }
+
+[[tensor]]
+name = "layers.{layer}.engram.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["rows[list]", "targets"]
+split = "whole"
+repeat = "listed_layers"
+layers = "ids"
+"#;
+        let root = serde_json::json!({
+            "model_type": "synthetic",
+            "hidden_size": 8,
+            "vocab_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "intermediate_size": 16,
+            "hidden_act": "silu",
+            "ids": [0, 1],
+            "rows": [11, 13],
+            "targets": [7, 8, 9]
+        });
+        let mut architecture = Architecture::from_json(&root.to_string()).expect("a config");
+        let layout = Layout::parse("arrays.toml", source).expect("a layout");
+        let mut coverage = ConfigCoverage::not_checked();
+        layout
+            .read(&mut architecture, &root, &mut coverage)
+            .expect("the array vars");
+        let tensors = layout.tensors(&architecture).expect("a description");
+        assert_eq!(tensors.len(), 2);
+        assert_eq!(tensors[0].name, "layers.0.engram.weight");
+        assert_eq!(tensors[0].shape, vec![11, 3]);
+        assert_eq!(tensors[1].name, "layers.1.engram.weight");
+        assert_eq!(tensors[1].shape, vec![13, 3]);
+    }
+
+    #[test]
+    fn an_array_threshold_keeps_only_the_layers_above_it() {
+        let source = r#"
+schema = 1
+id = "threshold"
+[match]
+model_types = ["synthetic"]
+
+[vars]
+ids = { key = "ids", array = true }
+ratios = { key = "ratios", array = true }
+
+[[tensor]]
+name = "layers.{layer}.gate.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "listed_layers"
+layers = "ids"
+when = { array = "ratios", gt = 1 }
+"#;
+        let root = serde_json::json!({
+            "model_type": "synthetic",
+            "hidden_size": 8,
+            "vocab_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "intermediate_size": 16,
+            "hidden_act": "silu",
+            "ids": [0, 1],
+            "ratios": [1, 2]
+        });
+        let mut architecture = Architecture::from_json(&root.to_string()).expect("a config");
+        let layout = Layout::parse("threshold.toml", source).expect("a layout");
+        let mut coverage = ConfigCoverage::not_checked();
+        layout
+            .read(&mut architecture, &root, &mut coverage)
+            .expect("the array vars");
+        let tensors = layout.tensors(&architecture).expect("a description");
+        let names: Vec<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
+        assert_eq!(names, ["layers.1.gate.weight"]);
+    }
+
+    #[test]
+    fn a_carried_fact_is_reported_and_an_applied_fact_is_not() {
+        let source = r#"
+schema = 1
+id = "facts"
+[match]
+model_types = ["synthetic"]
+
+[[keys]]
+path = "mlp_bias"
+fact = "language.mlp_bias"
+
+[[keys]]
+path = "tie_word_embeddings"
+fact = "language.tie_word_embeddings"
+
+[[tensor]]
+name = "model.embed.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+"#;
+        let root = serde_json::json!({
+            "model_type": "synthetic",
+            "hidden_size": 8,
+            "vocab_size": 8,
+            "num_hidden_layers": 0,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "mlp_bias": false,
+            "tie_word_embeddings": true
+        });
+        let mut architecture = Architecture::from_json(&root.to_string()).expect("a config");
+        let layout = Layout::parse("facts.toml", source).expect("a layout");
+        let mut coverage = ConfigCoverage::not_checked();
+        layout
+            .read(&mut architecture, &root, &mut coverage)
+            .expect("the facts");
+        let carried: Vec<&str> = coverage.carried_facts().collect();
+        assert_eq!(carried, ["language.mlp_bias"]);
+        assert!(architecture.embedding_tied_to_head);
     }
 }

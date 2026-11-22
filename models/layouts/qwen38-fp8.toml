@@ -242,6 +242,34 @@ ignore = "null in the carried document; the cache precision is a serving choice,
 path = "vision_config.deepstack_visual_indexes"
 ignore = "empty in both released Qwen3.8 documents, so no deepstack tap is selected; the merger tensors are the only tower-to-language projection"
 
+# Model keys this family ignores; each is a producer or training switch the arm's typed parser
+# reads, never a shared shape fact.
+
+[[keys]]
+# config.json text_config.attention_dropout: the producer's training-time attention dropout; inference runs dropout off, and no tensor shape depends on it.
+path = "text_config.attention_dropout"
+ignore = "the producer's training-time attention dropout; inference runs dropout off, and no tensor shape depends on it"
+
+[[keys]]
+# config.json text_config.initializer_range: the producer's training-time weight initialization range; this family derives no inference geometry from it.
+path = "text_config.initializer_range"
+ignore = "the producer's training-time weight initialization range; this family derives no inference geometry from it"
+
+[[keys]]
+# config.json text_config.output_router_logits: a debug output switch on the producer's forward; serving returns logits, not router logits.
+path = "text_config.output_router_logits"
+ignore = "a debug output switch on the producer's forward; serving returns logits, not router logits"
+
+[[keys]]
+# config.json text_config.router_aux_loss_coef: the producer's training-time load-balancing loss coefficient; inference computes no loss.
+path = "text_config.router_aux_loss_coef"
+ignore = "the producer's training-time load-balancing loss coefficient; inference computes no loss"
+
+[[keys]]
+# config.json text_config.use_cache: a producer output switch for returning the KV cache; serving always keeps the cache.
+path = "text_config.use_cache"
+ignore = "a producer output switch for returning the KV cache; serving always keeps the cache"
+
 [stacks.language]
 order = [
   "embedding",

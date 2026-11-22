@@ -43,7 +43,20 @@ ignore = "the tensor index states every stored dtype"
 ```
 
 Every key is either read into a fact or listed ignorable with a written reason. A key that
-is absent from the checkpoint is skipped; it is not a fact.
+is absent from the checkpoint is skipped; it is not a fact. The shared ignore list holds only
+keys about the file's writer (`transformers_version`, `torch_dtype`, `_commit_hash`, and their
+kind). A model or training switch belongs in the layout that knows why this family ignores it;
+`initializer_range` is a fact where an arm divides by it.
+
+```toml
+[vars]
+heads = { key = "num_attention_heads" }                 # a scalar fact
+engram_rows = { key = "text_config.rows", array = true } # rows[0], rows[1], ... and len(rows)
+mtp_targets = { key = "text_config.targets", length = true } # the array's length as a scalar
+```
+
+A var may name a config array (`array = true`) or the array's length (`length = true`). An
+array var is indexed in a shape or name expression with `rows[list]`; `len(rows)` is the count.
 
 ```toml
 [stacks.vision]
@@ -61,8 +74,9 @@ value = { key = "vision_config.rms_norm_eps", default = 1e-6 } # a config key
 ```
 
 A stack's `order` is the part vocabulary, not a claim that every block has every part. A fact
-the reader does not apply yet is still carried in the description; its scan row stays `unknown
-layout` until the reader learns the field, so a source can be recorded without guessing.
+the reader does not apply yet is still carried in the description and the scan prints it by
+name in its `carried facts` line, separate from unread config keys and without failing the
+load. A source can therefore be recorded before the shared field exists.
 
 ```toml
 [[tensor]]
@@ -75,13 +89,20 @@ shape = ["kda_width", "hidden"]  # arithmetic over facts, never a repeated liter
 split = "rows"                   # whole, rows, columns, kv_rows, vector, conv,
                                  # expert_rows, expert_columns, expert_axis, tiles or tile_rows
 tile = 128                       # the block width a tiles or tile_rows split cuts on
-repeat = "layers"                # once, layers, experts, mtp, mtp_experts, mtp_stages,
-                                 # mtp_stage_experts, ple_shards or vision_blocks
-when = { attention = "kda" }     # attention, ffn, indexer, layers, residual or side
+repeat = "layers"                # once, layers, listed_layers, experts, mtp, mtp_experts,
+                                 # mtp_stages, mtp_stage_experts, ple_shards or vision_blocks
+when = { attention = "kda" }     # attention, ffn, indexer, layers, residual, side,
+                                 # or array + gt (an array entry above a threshold)
 unloaded = "the producer keeps a duplicate for its converter"
 ```
 
-`name` may use `{layer}`, `{block}`, `{expert}`, `{stage}` and `{shard}`. `dtype = "dense"`
+`name` and `shape` may use `{expression}` arithmetic over the tensor's facts, for example
+`layers.{2 * layer + 1}.weight`. The reader refuses an expression it cannot evaluate and names
+the expression and the unknown fact. `repeat = "listed_layers"` with `layers = "ids"` walks
+the layer indices a config array lists; the position in that list is the `list` fact, so
+`rows[list]` selects the row count of the same entry. `when = { array = "ratios", gt = 1 }`
+keeps only the layers whose entry in that array exceeds the threshold, so a component stored
+only above a stated ratio needs no literal layer list. `dtype = "dense"`
 takes the checkpoint's dense format and adds its scale tensor; `dtype = "expert"` does the
 same for a routed expert. `match.quantization` narrows a file to a release whose parsed
 quantization method is one of the strings, so an FP8 and an NVFP4 checkpoint of the same model
