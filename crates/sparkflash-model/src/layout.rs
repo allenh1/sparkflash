@@ -696,7 +696,8 @@ impl Layout {
         let (path, default) = match &fact.value {
             FactValue::Literal(value) => {
                 let path = format!("{stack_name}.{}.{}", part.part, fact.name);
-                return Ok((path, layout_toml_value(value, self, &path)?, None));
+                let value = layout_toml_value(value, self, &path)?;
+                return Ok((path, value, None));
             }
             FactValue::Key { key, default } => (key.as_str(), default.as_ref()),
         };
