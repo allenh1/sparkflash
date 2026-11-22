@@ -399,6 +399,81 @@ fn a_tp4_scan_row_states_the_rank_local_shape_the_stack_describes_in_full() {
 }
 
 #[test]
+fn an_inkling_row_uses_the_format_and_shape_its_claimed_tensors_state() {
+    use sparkflash_model::architecture::WeightFormat;
+    use sparkflash_model::{Architecture, Part, Target};
+    use sparkflash_ops::{ScanInputs, ScanStatus, scan};
+
+    let config = include_str!("../../sparkflash-model-inkling2/config/inkling2_small.hf.json");
+    let report = scan(ScanInputs {
+        config,
+        tensors: None,
+        target: Target::Sm121,
+        world: 4,
+    });
+    assert!(report.error.is_none(), "{report:?}");
+
+    let row = |part| {
+        report
+            .rows
+            .iter()
+            .find(|row| row.part == part && row.block == Some(0))
+            .unwrap_or_else(|| panic!("no {part} row\n{report}"))
+    };
+    let attention = row(Part::RelativeAttention);
+    assert_eq!(attention.format, Some(WeightFormat::Bf16));
+    assert!(!attention.shape.is_unknown(), "{}", report.render());
+    assert!(matches!(attention.status, ScanStatus::Resolved));
+
+    let block = row(Part::BlockAttentionResidual);
+    assert_eq!(block.format, Some(WeightFormat::F32));
+    assert!(!block.shape.is_unknown(), "{}", report.render());
+    assert!(matches!(block.status, ScanStatus::Resolved));
+
+    // The short convolution is launched with the attention but owns tensors, so it is planned
+    // as its own row rather than folded out of the report.
+    let convolution = row(Part::ShortConv);
+    assert_eq!(convolution.format, Some(WeightFormat::Bf16));
+    assert!(!convolution.shape.is_unknown(), "{}", report.render());
+    assert!(matches!(convolution.status, ScanStatus::Resolved));
+
+    let moe = |block| {
+        report
+            .rows
+            .iter()
+            .find(|row| row.part == Part::Moe && row.block == Some(block))
+            .unwrap_or_else(|| panic!("no moe row for layer {block}\n{report}"))
+    };
+    assert_eq!(moe(0).format, Some(WeightFormat::NvFp4 { group_size: 16 }));
+    assert_eq!(moe(40).format, Some(WeightFormat::MxFp8 { block: 32 }));
+
+    let mtp = report
+        .rows
+        .iter()
+        .find(|row| row.part == Part::Mtp)
+        .expect("the draft row");
+    assert_eq!(mtp.format, Some(WeightFormat::Bf16));
+    assert_eq!(mtp.shape.to_string(), "6x8");
+    assert!(matches!(mtp.status, ScanStatus::Resolved));
+
+    // The softcapped epilogue has no tensor to claim; the report says which row carries it.
+    assert!(
+        report
+            .coverage_notes
+            .iter()
+            .any(|note| note.contains("softcapped_activation") && note.contains("ffn row")),
+        "{}",
+        report.render()
+    );
+    assert!(
+        Architecture::from_json(config)
+            .expect("the config")
+            .parts()
+            .contains(Part::SoftcappedActivation)
+    );
+}
+
+#[test]
 fn the_scan_vocabulary_names_no_model_family_or_crate() {
     let families = model_families();
     assert!(families.contains(&"deepseek".to_owned()));

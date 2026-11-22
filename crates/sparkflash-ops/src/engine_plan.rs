@@ -32,9 +32,13 @@
 //! [EnginePlan::from_json] is the short form a boot path uses; [EnginePlan::from_architecture]
 //! is the form a test or a synthetic checkpoint uses when it already holds the architecture.
 
+use std::collections::BTreeMap;
+
 use sparkflash_model::architecture::{
-    AttentionKind, Ffn, Quantization, Residual, Side, WeightFormat,
+    AttentionKind, Ffn, Quantization, Residual, ScaleDType, Side, WeightFormat,
 };
+use sparkflash_model::layout::LayoutDtype;
+use sparkflash_model::stack::StackKind;
 use sparkflash_model::{
     Architecture, ConfigError, ModelBackend, Part, StepRole, Target, TpAxis, TpPlan, TpPlanError,
 };
@@ -44,6 +48,13 @@ use thiserror::Error;
 use crate::gemv::GEMV_MAX_BATCH;
 use crate::plan::{GroupedFp8Body, PartGeometry, Precision};
 use crate::resolver::PlanContext;
+
+/// One part instance's position: the part kind and its layout block, or `None` for a global.
+type PartKey = (Part, Option<usize>);
+/// The formats and claimed element counts of one part's layout tensors.
+type FormatTotals = BTreeMap<PartKey, Vec<(WeightFormat, usize)>>;
+/// The stored format of each part instance.
+type PartFormats = BTreeMap<PartKey, WeightFormat>;
 
 /// The operand precision this run uses for each class of weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,20 +81,10 @@ impl PrecisionPolicy {
         let quantization = &architecture.quantization;
         let dense = precision_of(quantization.dense_format);
         let experts = precision_of(quantization.expert_format);
-        // Inkling's drafter is its own bf16 file (mtp.safetensors); the backbone's expert format
-        // is NVFP4 and does not describe the stage, whose config names no quantisation block.
-        let mtp = if architecture.inkling.is_some() {
-            Precision::Bf16
-        } else {
-            quantization.mtp_expert_format.map_or(experts, precision_of)
-        };
-        // Inkling's attention and its drafter are bf16 arithmetic over NVFP4/MXFP8 experts;
-        // the experts' stored format does not describe either operand class.
-        let attention = if architecture.inkling.is_some() {
-            Precision::Bf16
-        } else {
-            dense
-        };
+        let mtp = quantization.mtp_expert_format.map_or(experts, precision_of);
+        // Attention defaults to the dense class. A part whose layout claims a tensor in another
+        // stored format takes that format's precision at [EnginePlan::from_architecture].
+        let attention = dense;
         Self {
             dense,
             experts,
@@ -102,6 +103,7 @@ impl PrecisionPolicy {
 pub const fn precision_of(format: WeightFormat) -> Precision {
     match format {
         WeightFormat::Bf16 => Precision::Bf16,
+        WeightFormat::F32 => Precision::F32,
         WeightFormat::Fp8Tile { .. } => Precision::Fp8E4M3,
         WeightFormat::MxFp8 { .. } => Precision::MxFp8,
         WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => Precision::NvFp4,
@@ -154,6 +156,7 @@ pub struct EnginePlan {
     target: Target,
     tp: TpPlan,
     precision: PrecisionPolicy,
+    formats: PartFormats,
     globals: Vec<PartRequirement>,
     layers: Vec<LayerExecution>,
 }
@@ -225,7 +228,11 @@ impl EnginePlan {
         // Re-derive the plan from the architecture: this is the check that the caller's
         // world/rank is valid for this model, not merely a well-formed TpPlan.
         let tp = TpPlan::for_architecture(&architecture, tp.world(), tp.rank())?;
-        let globals = global_requirements(&architecture, &tp, precision)?;
+        // The layout states each part's stored dtype. That dtype, not the part's kind, decides
+        // the operand precision: a block mixer stored in f32 and an attention stored in bf16 are
+        // both exact even beside NVFP4 experts.
+        let formats = stored_formats(&architecture);
+        let globals = global_requirements(&architecture, &tp, precision, &formats)?;
         let steps = architecture.steps();
         if steps.len() != architecture.layers.len() {
             return Err(PlanError::Invalid(format!(
@@ -236,17 +243,44 @@ impl EnginePlan {
         }
         let mut layers = Vec::with_capacity(steps.len());
         for (step, layer) in steps.iter().zip(&architecture.layers) {
+            let mut roles = step.roles();
             let mut requirements = Vec::new();
-            for (_, part) in step.roles() {
+            for (_, part) in &roles {
+                let format = format_for(&architecture, &formats, *part, Some(layer.index));
                 requirements.push(PartRequirement {
-                    part,
-                    geometry: geometry_for(part, layer, &architecture, &tp)?,
-                    precision: precision_for(part, precision),
+                    part: *part,
+                    geometry: geometry_for(*part, layer, &architecture, &tp)?,
+                    precision: format.map_or(precision.dense, precision_of),
+                });
+            }
+            // A layout may claim layer tensors for a part the forward walk folds into another
+            // step (Inkling's short convolution is launched with the attention). The part still
+            // needs a row and a body, so it is planned beside the step it belongs to.
+            for (part, block) in formats.keys() {
+                if *block != Some(layer.index) || roles.iter().any(|(_, held)| held == part) {
+                    continue;
+                }
+                // A layout also claims the layer's norms, which are shared global parts rather
+                // than steps of the block walk. Only a part the walk can place gets a row here.
+                let Ok(geometry) = geometry_for(*part, layer, &architecture, &tp) else {
+                    continue;
+                };
+                let role = if *part == Part::ShortConv {
+                    StepRole::Attention
+                } else {
+                    StepRole::Ffn
+                };
+                let format = format_for(&architecture, &formats, *part, Some(layer.index));
+                roles.push((role, *part));
+                requirements.push(PartRequirement {
+                    part: *part,
+                    geometry,
+                    precision: format.map_or(precision.dense, precision_of),
                 });
             }
             layers.push(LayerExecution {
                 index: step.index,
-                steps: step.roles(),
+                steps: roles,
                 requirements,
             });
         }
@@ -255,6 +289,7 @@ impl EnginePlan {
             target,
             tp,
             precision,
+            formats,
             globals,
             layers,
         })
@@ -348,6 +383,16 @@ impl EnginePlan {
         self.precision
     }
 
+    /// The stored format the layout claims for one part instance.
+    ///
+    /// `block` is the layout block the part belongs to, or `None` for a global part (including
+    /// the draft stage and the vision tower, whose tensors are not decoder blocks). The value is
+    /// the format the layout's stored dtypes agree on; it is never inferred from the part kind.
+    #[must_use]
+    pub fn stored_format(&self, part: Part, block: Option<usize>) -> Option<WeightFormat> {
+        self.formats.get(&(part, block)).copied()
+    }
+
     /// The parts outside the decoder layers: embedding, final norm, head, MTP, vision.
     #[must_use]
     pub fn globals(&self) -> &[PartRequirement] {
@@ -430,41 +475,130 @@ pub trait EngineBuilder {
     }
 }
 
-fn precision_for(part: Part, policy: PrecisionPolicy) -> Precision {
-    match part {
-        Part::Moe => policy.experts,
-        Part::Mtp => policy.mtp,
-        Part::MlaAttention
-        | Part::GqaAttention
-        | Part::RelativeAttention
-        | Part::GdnScan
-        | Part::KdaScan => policy.attention,
-        // The embedding, both norms and the head are stored and computed at bf16 in every
-        // released arm, including the DeepSeek FP8 checkpoint (its head is not converted).
-        Part::Embedding
-        | Part::RmsNorm
-        | Part::LayerNorm
-        | Part::LmHead
-        // Inkling's block mixer, short convolutions and softcapped epilogue are bf16/f32
-        // elementwise and reduction bodies; they are not routed-expert operands.
-        | Part::BlockAttentionResidual
-        | Part::ShortConv
-        | Part::SoftcappedActivation
-        | Part::VisionPatchEmbed
-        | Part::VisionPosition
-        | Part::VisionNorm
-        | Part::VisionAttention
-        | Part::VisionMlp
-        | Part::VisionDownsample
-        | Part::VisionMerger => Precision::Bf16,
-        _ => policy.dense,
+/// The stored format of each part's claimed tensors, by part and block.
+///
+/// The layout's dtype is the checkpoint's stored dtype; `dense` and `expert` name the release's
+/// quantisation classes. A part with several formats takes the one its claimed bytes mostly use,
+/// so a router's bf16 row does not describe the experts beside it. A scale or index tensor that
+/// names no arithmetic is skipped; an f32 part keeps f32 only when no sibling tensor states a
+/// narrower format.
+fn stored_formats(architecture: &Architecture) -> PartFormats {
+    let mut totals = FormatTotals::new();
+    let Ok(Some(layout)) = sparkflash_model::layout::matching(architecture) else {
+        return BTreeMap::new();
+    };
+    let Ok(tensors) = layout.tensors(architecture) else {
+        return BTreeMap::new();
+    };
+    for tensor in tensors {
+        let block = match tensor.stack {
+            StackKind::Draft | StackKind::Vision | StackKind::Audio => None,
+            StackKind::Language => tensor.block,
+        };
+        // A routed expert's packed dtype is a container, not its arithmetic. The checkpoint
+        // stores NVFP4 as U8 bytes with E4M3 block scales, and MXFP8 as E4M3 bytes with U8
+        // `ue8m0` scales; the wider weight tensor names which one the layer uses, while the
+        // smaller scale stream is the other dtype and loses the aggregate below.
+        let format = if tensor.part == Part::Moe {
+            match tensor.dtype {
+                LayoutDtype::Expert | LayoutDtype::U8 | LayoutDtype::F4E2M1 => {
+                    Some(architecture.quantization.expert_format)
+                }
+                LayoutDtype::F8E4M3 => Some(match architecture.quantization.expert_format {
+                    format @ WeightFormat::Fp8Tile { .. } => format,
+                    _ => WeightFormat::MxFp8 { block: 32 },
+                }),
+                _ => layout_format(tensor.dtype, architecture),
+            }
+        } else {
+            layout_format(tensor.dtype, architecture)
+        };
+        let Some(format) = format else {
+            continue;
+        };
+        let elements = tensor
+            .shape
+            .iter()
+            .fold(1usize, |product, dim| product.saturating_mul(*dim));
+        let total = totals.entry((tensor.part, block)).or_default();
+        if let Some((_, weight)) = total.iter_mut().find(|(held, _)| *held == format) {
+            *weight = weight.saturating_add(elements);
+        } else {
+            total.push((format, elements));
+        }
     }
+    // A part's format is the one its claimed bytes mostly use: a router's bf16 row beside 256
+    // NVFP4 experts does not make the block bf16. An exact tie keeps the later declaration, so a
+    // part that states two same-sized classes is reported by the last one the layout names.
+    totals
+        .into_iter()
+        .filter_map(|(key, formats)| {
+            formats
+                .into_iter()
+                .max_by_key(|(_, weight)| *weight)
+                .map(|(format, _)| (key, format))
+        })
+        .collect()
+}
+
+fn layout_format(dtype: LayoutDtype, architecture: &Architecture) -> Option<WeightFormat> {
+    let quantization = &architecture.quantization;
+    match dtype {
+        LayoutDtype::Bf16 => Some(WeightFormat::Bf16),
+        LayoutDtype::F32 => Some(WeightFormat::F32),
+        LayoutDtype::Dense => Some(quantization.dense_format),
+        LayoutDtype::Expert => Some(quantization.expert_format),
+        LayoutDtype::F8E4M3 => {
+            // An explicit E4M3 tensor keeps the tile or MX block the checkpoint's own formats
+            // name. A release that states no FP8 class still stores 128x128 bf16 scales here.
+            for format in [
+                quantization.dense_format,
+                quantization.expert_format,
+                quantization.mtp_expert_format.unwrap_or(WeightFormat::Bf16),
+            ] {
+                if matches!(
+                    format,
+                    WeightFormat::Fp8Tile { .. } | WeightFormat::MxFp8 { .. }
+                ) {
+                    return Some(format);
+                }
+            }
+            Some(WeightFormat::Fp8Tile {
+                block_m: 128,
+                block_n: 128,
+                scale_dtype: ScaleDType::Bf16,
+                dynamic_activations: false,
+            })
+        }
+        LayoutDtype::F4E2M1
+            if matches!(
+                quantization.expert_format,
+                WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. }
+            ) =>
+        {
+            Some(quantization.expert_format)
+        }
+        LayoutDtype::F8E8M0 | LayoutDtype::F4E2M1 | LayoutDtype::U8 | LayoutDtype::I64 => None,
+    }
+}
+
+fn format_for(
+    architecture: &Architecture,
+    formats: &PartFormats,
+    part: Part,
+    block: Option<usize>,
+) -> Option<WeightFormat> {
+    formats
+        .get(&(part, block))
+        .copied()
+        .or_else(|| architecture.stored_format(part))
 }
 
 fn global_requirements(
     architecture: &Architecture,
     tp: &TpPlan,
     precision: PrecisionPolicy,
+    formats: &PartFormats,
 ) -> Result<Vec<PartRequirement>, PlanError> {
     let hidden = architecture.hidden_size;
     let vocab = architecture.vocab_size;
@@ -479,7 +613,8 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: Precision::Bf16,
+            precision: format_for(architecture, formats, Part::Embedding, None)
+                .map_or(precision.dense, precision_of),
         },
         PartRequirement {
             part: Part::RmsNorm,
@@ -490,7 +625,8 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: Precision::Bf16,
+            precision: format_for(architecture, formats, Part::RmsNorm, None)
+                .map_or(precision.dense, precision_of),
         },
         PartRequirement {
             part: Part::LmHead,
@@ -502,7 +638,8 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: precision_for(Part::LmHead, precision),
+            precision: format_for(architecture, formats, Part::LmHead, None)
+                .map_or(precision.dense, precision_of),
         },
     ];
     // A non-replicated stage is not loaded by a multi-rank serve: the shared tensor plan's
@@ -525,7 +662,8 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: precision.mtp,
+            precision: format_for(architecture, formats, Part::Mtp, None)
+                .map_or(precision.mtp, precision_of),
         });
     }
     if let Some(vision) = architecture.vision_spec() {
@@ -562,7 +700,10 @@ fn global_requirements(
             globals.push(PartRequirement {
                 part,
                 geometry,
-                precision: Precision::Bf16,
+                // A vision part with no tensor of its own (a rotary-only position scheme) has
+                // no stored dtype to read; the tower's arithmetic is bf16.
+                precision: format_for(architecture, formats, part, None)
+                    .map_or(Precision::Bf16, precision_of),
             });
         };
         push(Part::VisionPatchEmbed, base);

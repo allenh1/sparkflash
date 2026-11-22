@@ -2235,7 +2235,7 @@ fn layout_format(tensors: &[&LayoutTensor], architecture: &Architecture) -> Opti
     for tensor in tensors {
         let this = match tensor.dtype {
             LayoutDtype::Bf16 => WeightFormat::Bf16,
-            LayoutDtype::F32 => continue,
+            LayoutDtype::F32 => WeightFormat::F32,
             LayoutDtype::Dense => architecture.quantization.dense_format,
             LayoutDtype::Expert => architecture.quantization.expert_format,
             LayoutDtype::F8E4M3
