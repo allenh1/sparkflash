@@ -545,6 +545,28 @@ impl Builder {
                 let [width, _, taps] = three(name, shape)?;
                 self.conv_rows(name.to_owned(), dtype, width, taps, role)
             }
+            TensorSplit::ExpertAxis => {
+                if shape.is_empty() {
+                    return Err(PlanError::Invalid(format!(
+                        "tensor {name} has an empty expert-axis shape"
+                    )));
+                }
+                let split = self
+                    .tp
+                    .split(shape[0], TpAxis::Experts, 1)
+                    .map_err(|error| PlanError::Invalid(error.to_string()))?;
+                let mut rank = shape.to_vec();
+                rank[0] = split.padded;
+                self.push(
+                    name.to_owned(),
+                    dtype,
+                    shape.to_vec(),
+                    rank,
+                    Some(RankRun::even(split)),
+                    role,
+                );
+                Ok(())
+            }
             TensorSplit::ExpertRows | TensorSplit::ExpertColumns => Err(PlanError::Invalid(
                 format!("tensor {name} has an expert split but no expert dtype"),
             )),
