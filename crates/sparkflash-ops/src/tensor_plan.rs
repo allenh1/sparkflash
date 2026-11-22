@@ -1881,7 +1881,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm(&mut self, arch: &Architecture, include_mtp: bool) -> Result<(), PlanError> {
+    #[cfg(test)]
+    fn oracle(&mut self, arch: &Architecture, include_mtp: bool) -> Result<(), PlanError> {
         let hidden = arch.hidden_size;
         self.whole(
             format!("{LM_PREFIX}.embed_tokens.weight"),
@@ -1913,11 +1914,11 @@ impl Builder {
             }
             let hyper = hyper_of(layer)?;
             for branch in ["attn", "ffn"] {
-                self.glm_hyper(&format!("{prefix}.hc_{branch}"), hyper, hidden)?;
+                self.oracle_hyper(&format!("{prefix}.hc_{branch}"), hyper, hidden)?;
             }
             match &layer.attention.kind {
                 AttentionKind::Kda(kda) => {
-                    self.glm_kda(&format!("{prefix}.self_attn"), kda, hidden, Role::Attention)?;
+                    self.oracle_kda(&format!("{prefix}.self_attn"), kda, hidden, Role::Attention)?;
                 }
                 AttentionKind::Mla { .. } => {
                     let indexer = layer
@@ -1925,7 +1926,7 @@ impl Builder {
                         .indexer
                         .as_ref()
                         .is_some_and(|indexer| !indexer.reuse);
-                    self.glm_dsa(
+                    self.oracle_dsa(
                         &format!("{prefix}.self_attn"),
                         layer,
                         hidden,
@@ -1935,7 +1936,7 @@ impl Builder {
                     )?;
                 }
                 AttentionKind::Gqa { kv_heads, .. } => {
-                    self.glm_gqa(
+                    self.oracle_gqa(
                         &format!("{prefix}.self_attn"),
                         layer,
                         *kv_heads,
@@ -1952,9 +1953,9 @@ impl Builder {
             }
             match &layer.ffn {
                 Ffn::Dense(dense) => {
-                    self.glm_dense_mlp(&format!("{prefix}.mlp"), dense, hidden, Role::DenseMlp)?;
+                    self.oracle_dense_mlp(&format!("{prefix}.mlp"), dense, hidden, Role::DenseMlp)?;
                 }
-                Ffn::Moe(moe) => self.glm_moe(
+                Ffn::Moe(moe) => self.oracle_moe(
                     &format!("{prefix}.mlp"),
                     moe,
                     hidden,
@@ -1965,15 +1966,16 @@ impl Builder {
             }
         }
         if include_mtp && self.mtp {
-            self.glm_mtp(arch, hidden)?;
+            self.oracle_mtp(arch, hidden)?;
         }
         if self.vision {
-            self.glm_vision(arch)?;
+            self.oracle_vision(arch)?;
         }
         Ok(())
     }
 
-    fn glm_hyper(
+    #[cfg(test)]
+    fn oracle_hyper(
         &mut self,
         prefix: &str,
         hyper: &sparkflash_model::architecture::HyperConnection,
@@ -1997,7 +1999,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_kda(
+    #[cfg(test)]
+    fn oracle_kda(
         &mut self,
         prefix: &str,
         kda: &Kda,
@@ -2057,7 +2060,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_gqa(
+    #[cfg(test)]
+    fn oracle_gqa(
         &mut self,
         prefix: &str,
         layer: &Layer,
@@ -2097,7 +2101,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_dsa(
+    #[cfg(test)]
+    fn oracle_dsa(
         &mut self,
         prefix: &str,
         layer: &Layer,
@@ -2223,7 +2228,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_dense_mlp(
+    #[cfg(test)]
+    fn oracle_dense_mlp(
         &mut self,
         prefix: &str,
         dense: &DenseMlp,
@@ -2252,7 +2258,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_moe(
+    #[cfg(test)]
+    fn oracle_moe(
         &mut self,
         prefix: &str,
         moe: &Moe,
@@ -2311,7 +2318,8 @@ impl Builder {
         Ok(())
     }
 
-    fn glm_mtp(&mut self, arch: &Architecture, hidden: usize) -> Result<(), PlanError> {
+    #[cfg(test)]
+    fn oracle_mtp(&mut self, arch: &Architecture, hidden: usize) -> Result<(), PlanError> {
         let Some(mtp) = &arch.mtp else { return Ok(()) };
         if mtp.stages == 0 {
             return Ok(());
@@ -2346,7 +2354,7 @@ impl Builder {
                 Role::Mtp,
             );
         }
-        self.glm_dsa(
+        self.oracle_dsa(
             &format!("{prefix}.self_attn"),
             reference,
             hidden,
@@ -2362,7 +2370,7 @@ impl Builder {
                 "the GLM MTP stage needs a MoE layer".to_owned(),
             ));
         };
-        self.glm_moe(
+        self.oracle_moe(
             &format!("{prefix}.mlp"),
             moe,
             hidden,
@@ -2372,7 +2380,8 @@ impl Builder {
         )
     }
 
-    fn glm_vision(&mut self, arch: &Architecture) -> Result<(), PlanError> {
+    #[cfg(test)]
+    fn oracle_vision(&mut self, arch: &Architecture) -> Result<(), PlanError> {
         let Some(vision) = &arch.vision else {
             return Ok(());
         };
@@ -2807,6 +2816,7 @@ fn qwen_expert_format(format: WeightFormat) -> ExpertFormat {
     }
 }
 
+#[cfg(test)]
 fn hyper_of(layer: &Layer) -> Result<&sparkflash_model::architecture::HyperConnection, PlanError> {
     match &layer.residual {
         Residual::Hyper(hyper) => Ok(hyper),
@@ -2890,7 +2900,7 @@ mod layout_equality {
         } else {
             experts
         };
-        builder.glm(arch, true).expect("the reference planner");
+        builder.oracle(arch, true).expect("the reference planner");
         builder.finish()
     }
 
