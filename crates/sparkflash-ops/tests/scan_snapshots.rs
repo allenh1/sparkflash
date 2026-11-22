@@ -37,6 +37,8 @@ struct Snapshot {
 }
 
 enum SnapshotExpectation {
+    /// Every tensor is claimed and both coverage checks are clean.
+    Clean,
     /// Every tensor is claimed, but the tower's parts do not all resolve yet.
     Gaps,
     /// These exact prefix groups are the only unclaimed tensors.
@@ -158,18 +160,10 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "thinkingmachines/Inkling-2-Small",
             revision: "885d78bfca61a7e9a498e33cfa7ad35850533b8c",
-            // The layout claims the language, vision and MTP tensors. The 352 routed-expert
-            // tensors are stacked per layer with an expert axis, which no layout declaration
-            // can express yet; they are the one unclaimed group. The tower's MLP and merger
-            // activations are carried as part facts the reader does not apply, and the
-            // learned-grid position scheme has no kernel.
-            expectation: SnapshotExpectation::Unclaimed(vec![("model.llm", 352)]),
-            vision_gaps: &[
-                "vision_attention",
-                "vision_merger",
-                "vision_mlp",
-                "vision_position",
-            ],
+            // The layout claims every indexed tensor. The tower's learned-grid position and
+            // axial-rotary attention are the only vision parts with no kernel yet.
+            expectation: SnapshotExpectation::Clean,
+            vision_gaps: &["vision_attention", "vision_position"],
         },
         Snapshot {
             repo: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
@@ -204,6 +198,22 @@ fn the_real_snapshots_report_their_interim_claim_state() {
             report.render()
         );
         match &snapshot.expectation {
+            SnapshotExpectation::Clean => {
+                let groups = unclaimed_groups(&report);
+                assert!(
+                    groups.is_empty(),
+                    "{}: unclaimed {groups:?}\n{}",
+                    snapshot.repo,
+                    report.render()
+                );
+                assert_eq!(
+                    report.coverage.tensors,
+                    CoverageState::Clean,
+                    "{}: the plan and the index must agree\n{}",
+                    snapshot.repo,
+                    report.render()
+                );
+            }
             SnapshotExpectation::Gaps => {
                 let groups = unclaimed_groups(&report);
                 assert!(
