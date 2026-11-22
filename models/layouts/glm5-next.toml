@@ -375,6 +375,16 @@ repeat = "layers"
 when = { attention = "mla" }
 
 [[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_a_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "dense"
+shape = ["q_lora", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla" }
+
+[[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.q_a_layernorm.weight"
 part = "mla_attention"
 role = "attention"
@@ -382,6 +392,16 @@ dtype = "bf16"
 shape = ["q_lora"]
 split = "whole"
 repeat = "layers"
+when = { attention = "mla" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_a_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["q_lora"]
+split = "whole"
+repeat = "mtp"
 when = { attention = "mla" }
 
 [[tensor]]
@@ -395,6 +415,16 @@ repeat = "layers"
 when = { attention = "mla" }
 
 [[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_b_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "dense"
+shape = ["heads * nope", "q_lora"]
+split = "rows"
+repeat = "mtp"
+when = { attention = "mla" }
+
+[[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.kv_a_proj_with_mqa.weight"
 part = "mla_attention"
 role = "attention"
@@ -402,6 +432,16 @@ dtype = "dense"
 shape = ["kv_lora", "hidden"]
 split = "whole"
 repeat = "layers"
+when = { attention = "mla" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.kv_a_proj_with_mqa.weight"
+part = "mtp"
+role = "mtp"
+dtype = "dense"
+shape = ["kv_lora", "hidden"]
+split = "whole"
+repeat = "mtp"
 when = { attention = "mla" }
 
 [[tensor]]
@@ -415,6 +455,16 @@ repeat = "layers"
 when = { attention = "mla" }
 
 [[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.kv_a_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["kv_lora"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla" }
+
+[[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.kv_b_proj.weight"
 part = "mla_attention"
 role = "attention"
@@ -422,6 +472,16 @@ dtype = "bf16"
 shape = ["heads * (nope + v_head)", "kv_lora"]
 split = "rows"
 repeat = "layers"
+when = { attention = "mla" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.kv_b_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["heads * (nope + v_head)", "kv_lora"]
+split = "rows"
+repeat = "mtp"
 when = { attention = "mla" }
 
 [[tensor]]
@@ -436,6 +496,17 @@ when = { attention = "mla" }
 
 # The sparse indexer (modeling line 1958-2082).
 [[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.o_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "dense"
+shape = ["hidden", "heads * v_head"]
+split = "columns"
+repeat = "mtp"
+when = { attention = "mla" }
+
+# The sparse indexer (modeling line 1958-2082).
+[[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.wq_b.weight"
 part = "sparse_indexer"
 role = "indexer"
@@ -443,6 +514,16 @@ dtype = "bf16"
 shape = ["index_heads * index_dim", "q_lora"]
 split = "whole"
 repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.wq_b.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "mtp"
 when = { attention = "mla", indexer = true }
 
 [[tensor]]
@@ -456,6 +537,16 @@ repeat = "layers"
 when = { attention = "mla", indexer = true }
 
 [[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.wk.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["index_dim", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.k_norm.weight"
 part = "sparse_indexer"
 role = "indexer"
@@ -463,6 +554,16 @@ dtype = "bf16"
 shape = ["index_dim"]
 split = "whole"
 repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.k_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "mtp"
 when = { attention = "mla", indexer = true }
 
 [[tensor]]
@@ -476,6 +577,16 @@ repeat = "layers"
 when = { attention = "mla", indexer = true }
 
 [[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.k_norm.bias"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.weights_proj.weight"
 part = "sparse_indexer"
 role = "indexer"
@@ -483,6 +594,16 @@ dtype = "bf16"
 shape = ["index_heads", "hidden"]
 split = "whole"
 repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.weights_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "mtp"
 when = { attention = "mla", indexer = true }
 
 [[tensor]]
@@ -496,6 +617,16 @@ repeat = "layers"
 when = { attention = "mla", indexer = true }
 
 [[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.index_kpool_compress_gate"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["index_dim", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.index_kpool_compress_ape"
 part = "sparse_indexer"
 role = "indexer"
@@ -503,6 +634,17 @@ dtype = "bf16"
 shape = ["index_pool", "index_dim"]
 split = "whole"
 repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+# Dense and routed feed-forward blocks.
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.index_kpool_compress_ape"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["index_pool", "index_dim"]
+split = "whole"
+repeat = "mtp"
 when = { attention = "mla", indexer = true }
 
 # Dense and routed feed-forward blocks.
@@ -547,6 +689,16 @@ repeat = "layers"
 when = { ffn = "moe" }
 
 [[tensor]]
+name = "model.language_model.layers.{layer}.mlp.gate.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["routed", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
 name = "model.language_model.layers.{layer}.mlp.gate.e_score_correction_bias"
 part = "moe"
 role = "router"
@@ -554,6 +706,16 @@ dtype = "f32"
 shape = ["routed"]
 split = "whole"
 repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.gate.e_score_correction_bias"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = ["routed"]
+split = "whole"
+repeat = "mtp"
 when = { ffn = "moe" }
 
 [[tensor]]
@@ -567,6 +729,16 @@ repeat = "layers"
 when = { ffn = "moe" }
 
 [[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_experts.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "dense"
+shape = ["shared_width", "hidden"]
+split = "rows"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
 name = "model.language_model.layers.{layer}.mlp.shared_experts.up_proj.weight"
 part = "moe"
 role = "shared_expert"
@@ -577,6 +749,16 @@ repeat = "layers"
 when = { ffn = "moe" }
 
 [[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_experts.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "dense"
+shape = ["shared_width", "hidden"]
+split = "rows"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
 name = "model.language_model.layers.{layer}.mlp.shared_experts.down_proj.weight"
 part = "moe"
 role = "shared_expert"
@@ -584,6 +766,16 @@ dtype = "dense"
 shape = ["hidden", "shared_width"]
 split = "columns"
 repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_experts.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "dense"
+shape = ["hidden", "shared_width"]
+split = "columns"
+repeat = "mtp"
 when = { ffn = "moe" }
 
 [[tensor]]
