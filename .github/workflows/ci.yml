@@ -130,6 +130,8 @@ jobs:
       CARGO_TARGET_DIR: /cache/target
     steps:
       - uses: actions/checkout@v4
+      - name: Clear stale rustdoc output
+        run: rm -rf "$CARGO_TARGET_DIR/doc"
       - name: Build docs
         env:
           RUSTDOCFLAGS: -D missing_docs
