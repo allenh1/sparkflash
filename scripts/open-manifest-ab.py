@@ -219,6 +219,9 @@ def launch(args, out):
     env["SPARKFLASH_LOG_ROOT"] = os.path.join(out, "logs")
     # The eight-lane phase must reach eight real lanes, not queue behind the arm's default.
     env.setdefault("SPARKFLASH_LANES", "8")
+    # DeepSeek carries DSpark but does not draft by default. The proof's drafting phase must
+    # actually propose drafts; five is the released dspark_block_size.
+    env.setdefault("SPARKFLASH_DRAFT_DRAFTS", "5")
     command = ["bash", args.site_script, "launch"]
     print("LAUNCH", " ".join(command))
     print("  SPARKFLASH_BIN=" + args.build)
@@ -287,7 +290,12 @@ def run_workload(args):
     )
     accepted = sum(row["accepted"] for row in draft)
     proposed = sum(row["proposed"] for row in draft)
-    speeds["draft_accept"].append((accepted / proposed) if proposed else 0.0)
+    if proposed == 0:
+        raise SystemExit(
+            "open-manifest-ab: the drafting phase proposed no drafts; "
+            "SPARKFLASH_DRAFT_DRAFTS did not reach the serving ranks"
+        )
+    speeds["draft_accept"].append(accepted / proposed)
     print("  accepted=%d proposed=%d" % (accepted, proposed))
 
     for key in ("decode_1", "decode_8", "prefill"):
