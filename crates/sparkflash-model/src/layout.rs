@@ -701,22 +701,22 @@ impl Layout {
             FactValue::Key { key, default } => (key.as_str(), default.as_ref()),
         };
         let value = read_path(root, path, self)?;
-        let value = value.as_ref().or(default.as_ref()).ok_or_else(|| {
-            LayoutError::refused(
-                &self.id,
-                format!(
-                    "part {}.{} needs {path}, but the checkpoint does not state it and the \
-                     layout gives no default",
-                    part.part, fact.name
-                ),
-            )
-        })?;
+        let value = match (value, default) {
+            (Some(value), _) => layout_value(value, self, path)?,
+            (None, Some(default)) => layout_toml_value(default, self, path)?,
+            (None, None) => {
+                return Err(LayoutError::refused(
+                    &self.id,
+                    format!(
+                        "part {}.{} needs {path}, but the checkpoint does not state it and the \
+                         layout gives no default",
+                        part.part, fact.name
+                    ),
+                ));
+            }
+        };
         let fact_path = format!("{stack_name}.{}.{}", part.part, fact.name);
-        Ok((
-            fact_path,
-            layout_toml_value(value, self, &fact_path)?,
-            Some(path.to_owned()),
-        ))
+        Ok((fact_path, value, Some(path.to_owned())))
     }
 
     fn apply_facts(
