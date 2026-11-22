@@ -235,14 +235,14 @@ jobs:
           CI_COMMIT_BEFORE_SHA: ${{ github.event.before }}
           CI_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          # The runner clones the checkout as another user, so git needs to trust it
+          # before a test reads the workspace's own HEAD.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 -m unittest discover -s scripts/tests -v
           bash scripts/identity-gate.sh --anchor
           bash scripts/identity-gate.sh --self-test
           python3 -m unittest scripts/tests/test_identity_gate.py -v
           bash scripts/numerical-gate.sh --self-test
-          # The numerics declaration check diffs a checkout the runner cloned as
-          # another user, so git needs to trust it.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 scripts/numerics.py self-test
           python3 scripts/numerics.py ci
           python3 ci/test_check_features.py
