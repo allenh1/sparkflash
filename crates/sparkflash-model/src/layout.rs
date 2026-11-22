@@ -964,43 +964,45 @@ impl Layout {
                     let Some(vision) = architecture.vision.as_mut() else {
                         continue;
                     };
-                    let name = fact_string(value, &self.id, name)?;
+                    let name = Self::fact_string(value, &self.id, name)?;
                     vision.norm = Some(match name {
                         "rms" => crate::vision_geometry::VisionNorm::Rms,
                         "layer" => crate::vision_geometry::VisionNorm::Layer,
-                        other => return Err(unknown_value(&self.id, name, other, "rms or layer")),
+                        other => {
+                            return Err(Self::unknown_value(&self.id, name, other, "rms or layer"));
+                        }
                     });
                 }
                 "vision.norm_epsilon" | "vision.vision_norm.norm_epsilon" => {
                     let Some(vision) = architecture.vision.as_mut() else {
                         continue;
                     };
-                    vision.norm_epsilon = Some(fact_float(value, &self.id, name)?);
+                    vision.norm_epsilon = Some(Self::fact_float(value, &self.id, name)?);
                 }
                 "vision.attention_bias" | "vision.vision_attention.attention_bias" => {
                     let Some(vision) = architecture.vision.as_mut() else {
                         continue;
                     };
-                    vision.attention_bias = Some(fact_bool(value, &self.id, name)?);
+                    vision.attention_bias = Some(Self::fact_bool(value, &self.id, name)?);
                 }
                 "vision.qk_norm" | "vision.vision_attention.qk_norm" => {
                     let Some(vision) = architecture.vision.as_mut() else {
                         continue;
                     };
-                    vision.qk_norm = Some(fact_bool(value, &self.id, name)?);
+                    vision.qk_norm = Some(Self::fact_bool(value, &self.id, name)?);
                 }
                 "vision.activation" | "vision.vision_mlp.activation" => {
                     let Some(vision) = architecture.vision.as_mut() else {
                         continue;
                     };
-                    let name = fact_string(value, &self.id, name)?;
-                    vision.activation = Some(vision_activation(&self.id, name)?);
+                    let name = Self::fact_string(value, &self.id, name)?;
+                    vision.activation = Some(Self::vision_activation(&self.id, name)?);
                 }
                 "vision.downsample" | "vision.vision_merger.downsample" => {
                     let Some(vision) = architecture.vision.as_mut() else {
                         continue;
                     };
-                    let name = fact_string(value, &self.id, name)?;
+                    let name = Self::fact_string(value, &self.id, name)?;
                     let factor = vision.spatial_merge.max(1);
                     vision.downsample = Some(match name {
                         "none" => crate::vision_geometry::VisionDownsample::None,
@@ -1008,7 +1010,7 @@ impl Layout {
                         "merge" => crate::vision_geometry::VisionDownsample::Merge(factor),
                         "conv" => crate::vision_geometry::VisionDownsample::Conv(factor),
                         other => {
-                            return Err(unknown_value(
+                            return Err(Self::unknown_value(
                                 &self.id,
                                 name,
                                 other,
@@ -1021,14 +1023,14 @@ impl Layout {
                     let Some(vision) = architecture.vision.as_mut() else {
                         continue;
                     };
-                    let name = fact_string(value, &self.id, name)?;
-                    vision.merger_activation = Some(vision_activation(&self.id, name)?);
+                    let name = Self::fact_string(value, &self.id, name)?;
+                    vision.merger_activation = Some(Self::vision_activation(&self.id, name)?);
                 }
                 "vision.merger_final_norm" | "vision.vision_merger.merger_final_norm" => {
                     let Some(vision) = architecture.vision.as_mut() else {
                         continue;
                     };
-                    vision.merger_final_norm = Some(fact_bool(value, &self.id, name)?);
+                    vision.merger_final_norm = Some(Self::fact_bool(value, &self.id, name)?);
                 }
                 _ => {}
             }
@@ -1738,7 +1740,7 @@ fn is_prime(value: u64) -> bool {
     if value.is_multiple_of(2) {
         return value == 2;
     }
-    let mut divisor = 3;
+    let mut divisor: u64 = 3;
     while divisor.saturating_mul(divisor) <= value {
         if value.is_multiple_of(divisor) {
             return false;
