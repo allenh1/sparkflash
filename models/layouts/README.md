@@ -27,6 +27,7 @@ replaces = "shipped-id"          # only in a cache file
 [match]
 architectures = ["ProducerClass"] # the config's root architectures entries
 model_types = ["producer_type"]   # the config's root model_type
+quantization = ["fp8"]            # optional: narrows one release of that family
 ```
 
 `match` is the only place in the tree that compares a family string.

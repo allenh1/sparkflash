@@ -30,6 +30,7 @@ use std::collections::BTreeSet;
 use sparkflash_model::{Architecture, TpPlan};
 use sparkflash_model_deepseek_v41::{ModelConfig, TensorPlan};
 use sparkflash_ops::ArchitectureTensorPlan;
+use sparkflash_ops::tensor_plan::TensorClaims;
 
 const RELEASED: &str =
     include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
@@ -108,6 +109,18 @@ fn the_layout_equals_the_arm_plan_at_tp4() {
         "the layout does not claim these arm tensors: {missing:#?}"
     );
     assert_eq!(layout.len(), arm.len() + vision + aligner);
+
+    // The three resident image delimiters are not plan members, but the index holds them: the
+    // claim set must still name them at their stored shape or the scan calls them unclaimed.
+    let claims = TensorClaims::from_checkpoint(&architecture, tp).expect("the claim set");
+    for name in ARM_OMITS {
+        let spec = claims
+            .specs()
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("the claim set omits {name}"));
+        assert_eq!(spec.shape, vec![architecture.hidden_size], "{name}");
+    }
 }
 
 /// The real snapshot the lead host holds. The test skips on a machine without it.

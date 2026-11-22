@@ -32,6 +32,8 @@ struct Snapshot {
     repo: &'static str,
     revision: &'static str,
     expectation: SnapshotExpectation,
+    /// The rank count the release is served at.
+    world: usize,
     /// The vision parts with no kernel or no stated wiring, in report order.
     vision_gaps: &'static [&'static str],
 }
@@ -52,7 +54,7 @@ fn snapshot_dir(snapshot: &Snapshot) -> Option<std::path::PathBuf> {
     path.is_dir().then_some(path)
 }
 
-fn real_report(dir: &std::path::Path) -> ScanReport {
+fn real_report(dir: &std::path::Path, world: usize) -> ScanReport {
     let config = std::fs::read_to_string(dir.join("config.json")).expect("the config");
     let index = sparkflash_weights::tensor_index::read_local(dir).expect("the headers");
     assert_eq!(index.len(), index.tensors.len());
@@ -61,7 +63,7 @@ fn real_report(dir: &std::path::Path) -> ScanReport {
         config: &config,
         tensors: Some(&tensors),
         target: Target::Sm121,
-        world: 1,
+        world,
     })
 }
 
@@ -117,6 +119,7 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "zai-org/GLM-5.3-Flash",
             revision: "3f1971b7b5f7a528c9c4ef6212c8785298a8c24a",
+            world: 4,
             expectation: SnapshotExpectation::Gaps,
             vision_gaps: &[
                 "vision_attention",
@@ -130,6 +133,7 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
             revision: "1bae0e1088993b9b82de08f59de5be5a34e42170",
+            world: 4,
             // The layout claims all 96,085 indexed tensors, including the vision tower and
             // aligner, and every row resolves on sm121 TP4.
             expectation: SnapshotExpectation::Clean,
@@ -138,6 +142,7 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "nvidia/Qwen3.8-Flash-Next-NVFP4",
             revision: "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+            world: 1,
             expectation: SnapshotExpectation::Gaps,
             vision_gaps: &[
                 "vision_attention",
@@ -151,14 +156,17 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "thinkingmachines/Inkling-2-Small",
             revision: "885d78bfca61a7e9a498e33cfa7ad35850533b8c",
+            world: 4,
             // The layout claims every indexed tensor. The tower's learned-grid position and
-            // axial-rotary attention are the only vision parts with no kernel yet.
-            expectation: SnapshotExpectation::Clean,
+            // axial-rotary attention are the only vision parts with no kernel yet, so the rows
+            // are claimed but not all resolve.
+            expectation: SnapshotExpectation::Gaps,
             vision_gaps: &["vision_attention", "vision_position"],
         },
         Snapshot {
             repo: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
             revision: "f6c832e6963ddb74f62c75813a3e8c74b1af67b1",
+            world: 1,
             // The layout names every tensor with the checkpoint's `backbone.*` spelling; the
             // arm's plan and the shared plan are equal at each rank the arm builds.
             expectation: SnapshotExpectation::Clean,
@@ -171,7 +179,7 @@ fn the_real_snapshots_report_their_interim_claim_state() {
             continue;
         };
         checked += 1;
-        let report = real_report(&dir);
+        let report = real_report(&dir, snapshot.world);
         assert!(
             report.error.is_none(),
             "{}: {}",

@@ -633,6 +633,27 @@ impl Layout {
                     ));
                 }
             };
+            if matches!(split, TensorSplit::Tiles | TensorSplit::TileRows)
+                && tensor.tile.is_none_or(|tile| tile == 0)
+            {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!(
+                        "tensor {:?}: a tile split needs a non-zero tile width",
+                        tensor.name
+                    ),
+                ));
+            }
+            if !matches!(split, TensorSplit::Tiles | TensorSplit::TileRows) && tensor.tile.is_some()
+            {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!(
+                        "tensor {:?}: tile is only meaningful on a tile split",
+                        tensor.name
+                    ),
+                ));
+            }
             if matches!(split, TensorSplit::ExpertRows | TensorSplit::ExpertColumns)
                 && !matches!(
                     repeat,
@@ -1274,7 +1295,6 @@ impl Layout {
                         .iter()
                         .enumerate()
                         .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
-                        .or_else(|| architecture.layers.first().map(|layer| (0, layer)))
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -1313,7 +1333,6 @@ impl Layout {
                         .iter()
                         .enumerate()
                         .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
-                        .or_else(|| architecture.layers.first().map(|layer| (0, layer)))
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -1328,14 +1347,12 @@ impl Layout {
                         let mut vars = self.layer_vars(architecture, reference, reference_index);
                         vars.insert("stage".to_owned(), stage as i64);
                         vars.insert("mtp_stages".to_owned(), mtp.stages as i64);
-                        vars.insert(
-                            "mtp_routed".to_owned(),
-                            mtp.routed_experts.unwrap_or(0) as i64,
-                        );
-                        vars.insert(
-                            "mtp_active".to_owned(),
-                            mtp.active_experts.unwrap_or(0) as i64,
-                        );
+                        if let Some(routed) = mtp.routed_experts {
+                            vars.insert("mtp_routed".to_owned(), routed as i64);
+                        }
+                        if let Some(active) = mtp.active_experts {
+                            vars.insert("mtp_active".to_owned(), active as i64);
+                        }
                         self.push_tensor(
                             &mut tensors,
                             declaration,
@@ -2267,6 +2284,14 @@ impl LayoutSet {
     #[must_use]
     pub fn layouts(&self) -> &[Layout] {
         &self.layouts
+    }
+
+    /// Whether any shipped or cached layout names `family`.
+    #[must_use]
+    pub fn describes_family(&self, family: &str) -> bool {
+        self.layouts
+            .iter()
+            .any(|layout| layout.model_types.iter().any(|name| name == family))
     }
 
     /// The one layout that describes architecture, if any.

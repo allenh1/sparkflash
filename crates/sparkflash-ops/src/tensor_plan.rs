@@ -416,12 +416,7 @@ impl Builder {
         let Some(layout) = layout else {
             // A family with shipped layouts but no match is a release this tree does not
             // describe, not a model to hand to the canonical fallback.
-            if set.layouts().iter().any(|layout| {
-                layout
-                    .model_types
-                    .iter()
-                    .any(|family| family == &arch.family)
-            }) {
+            if set.describes_family(&arch.family) {
                 return Err(PlanError::Invalid(format!(
                     "the tree carries layouts for family {:?}, but none matches this release's                      architectures or quantization",
                     arch.family
@@ -2576,7 +2571,42 @@ impl TensorClaims {
     /// As [ArchitectureTensorPlan::checkpoint].
     pub fn from_checkpoint(architecture: &Architecture, tp: TpPlan) -> Result<Self, PlanError> {
         let plan = ArchitectureTensorPlan::checkpoint(architecture, tp)?;
-        Ok(Self::from_specs(plan.specs().to_vec()))
+        let mut specs = plan.specs().to_vec();
+        // A stored-but-unloaded tensor is not a plan member, but the index still holds it: the
+        // claim set must name it or the scan reports it unclaimed.
+        if let Some(layout) = sparkflash_model::layout::matching(architecture)
+            .map_err(|error| PlanError::Invalid(error.to_string()))?
+        {
+            for tensor in layout
+                .tensors(architecture)
+                .map_err(|error| PlanError::Invalid(error.to_string()))?
+            {
+                if tensor.unloaded.is_none() || specs.iter().any(|spec| spec.name == tensor.name) {
+                    continue;
+                }
+                let dtype = match tensor.dtype {
+                    LayoutDtype::Bf16 => DType::BF16,
+                    LayoutDtype::F32 => DType::F32,
+                    LayoutDtype::F8E4M3 => DType::F8E4M3,
+                    LayoutDtype::F8E8M0 => DType::F8E8M0,
+                    LayoutDtype::F4E2M1 => DType::F4E2M1,
+                    LayoutDtype::U8 => DType::U8,
+                    LayoutDtype::I64 => DType::I64,
+                    LayoutDtype::Dense | LayoutDtype::Expert => {
+                        return Err(PlanError::Invalid(format!(
+                            "unloaded tensor {} names a checkpoint-derived dtype; the claim set                              needs an explicit one",
+                            tensor.name
+                        )));
+                    }
+                };
+                specs.push(TensorSpec {
+                    name: tensor.name,
+                    dtype,
+                    shape: tensor.shape,
+                });
+            }
+        }
+        Ok(Self::from_specs(specs))
     }
 
     /// A claim set over the given specs, in the given order.
