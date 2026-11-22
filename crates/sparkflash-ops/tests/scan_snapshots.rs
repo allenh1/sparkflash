@@ -39,6 +39,8 @@ struct Snapshot {
 enum SnapshotExpectation {
     /// Every tensor is claimed, but the tower's parts do not all resolve yet.
     Gaps,
+    /// Every row resolves and both coverage checks are clean.
+    Clean,
     /// These exact prefix groups are the only unclaimed tensors.
     Unclaimed(Vec<(&'static str, usize)>),
     /// The shared plan cannot be built; its tower tensors are the unclaimed ones and one
@@ -164,12 +166,9 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
             revision: "f6c832e6963ddb74f62c75813a3e8c74b1af67b1",
-            // The one shared checkpoint plan is spelled `model.layers.*`; this checkpoint is
-            // `backbone.*`. The plan cannot claim it, and no tensor is silently unclaimed.
-            expectation: SnapshotExpectation::PlanFailure {
-                vision_tensors: 0,
-                aligner_tensors: 0,
-            },
+            // The layout names every tensor with the checkpoint's `backbone.*` spelling; the
+            // arm's plan and the shared plan are equal at each rank the arm builds.
+            expectation: SnapshotExpectation::Clean,
             vision_gaps: &[],
         },
     ];
@@ -257,6 +256,35 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                         );
                     }
                 }
+            }
+            SnapshotExpectation::Clean => {
+                let groups = unclaimed_groups(&report);
+                assert!(
+                    groups.is_empty(),
+                    "{}: unclaimed {groups:?}\n{}",
+                    snapshot.repo,
+                    report.render()
+                );
+                let unknown: Vec<&str> = report
+                    .rows
+                    .iter()
+                    .filter_map(|row| match &row.status {
+                        ScanStatus::UnknownLayout { detail, .. } => Some(detail.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    unknown.is_empty(),
+                    "{}: the layout left wiring unknown: {unknown:?}\n{}",
+                    snapshot.repo,
+                    report.render()
+                );
+                assert!(
+                    report.is_clean(),
+                    "{}: not clean\n{}",
+                    snapshot.repo,
+                    report.render()
+                );
             }
             SnapshotExpectation::Unclaimed(expected) => {
                 let expected: Vec<(String, usize)> = expected
