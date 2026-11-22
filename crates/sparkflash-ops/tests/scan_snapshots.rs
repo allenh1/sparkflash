@@ -242,6 +242,19 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                             row.part.name(),
                             report.render()
                         );
+                        assert!(
+                            matches!(
+                                row.status,
+                                ScanStatus::Resolved
+                                    | ScanStatus::NotBuilt { .. }
+                                    | ScanStatus::NoPartKind { .. }
+                            ),
+                            "{}: vision part {} has status {}\n{}",
+                            snapshot.repo,
+                            row.part.name(),
+                            row.status.name(),
+                            report.render()
+                        );
                     }
                 }
             }

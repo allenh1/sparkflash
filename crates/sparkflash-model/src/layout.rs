@@ -1802,4 +1802,36 @@ model_types = ["synthetic"]
         let error = evaluate("width", &vars).expect_err("an unknown fact");
         assert!(error.contains("width"), "{error}");
     }
+    #[test]
+    fn a_tensor_template_carries_its_stored_but_unloaded_reason() {
+        let source = r#"
+schema = 1
+id = "tensor"
+[match]
+model_types = ["synthetic"]
+
+[[tensor]]
+name = "model.embed.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+unloaded = "the producer keeps a duplicate for its converter"
+"#;
+        let layout = Layout::parse("tensor.toml", source).expect("a layout");
+        let architecture = Architecture::from_json(
+            r#"{"model_type":"synthetic","hidden_size":8,"vocab_size":8,"num_hidden_layers":0,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":8}"#,
+        )
+        .expect("a config");
+        let tensors = layout.tensors(&architecture).expect("a description");
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].name, "model.embed.weight");
+        assert_eq!(tensors[0].shape, vec![8, 8]);
+        assert_eq!(tensors[0].stack, StackKind::Language);
+        assert_eq!(
+            tensors[0].unloaded.as_deref(),
+            Some("the producer keeps a duplicate for its converter")
+        );
+    }
 }
