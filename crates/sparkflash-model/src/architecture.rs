@@ -4599,7 +4599,9 @@ mod tests {
             // parse carries those four facts and does not hash at the field's default.
             0xd4f9_c4d2_70fa_cf05,
             0x0d35_642d_b843_4b20,
-            0x9a08_2ac0_b2fa_f67c,
+            // Inkling's layout learns the tower's learned-grid position, LayerNorm and
+            // erf-GELU wiring, and its [vars] resolve the MTP and convolution shape facts.
+            0x70ca_7201_09d5_77db,
             0x2416_b0da_0097_fad0,
             0x6912_d984_45c3_3315,
             0xf401_030a_ffce_bcd2,
