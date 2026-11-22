@@ -26,7 +26,8 @@ fn main() {
     let mut out = serde_json::Map::new();
     for world in [1usize, 2, 4] {
         let tp = TpPlan::for_architecture(&architecture, world, 0).expect("a TP plan");
-        let plan = ArchitectureTensorPlan::checkpoint(&architecture, tp).expect("the checkpoint plan");
+        let plan =
+            ArchitectureTensorPlan::checkpoint(&architecture, tp).expect("the checkpoint plan");
         let mut tensors = Vec::new();
         for index in 0..plan.len() {
             let spec = plan.spec_at(index);

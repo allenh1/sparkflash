@@ -603,7 +603,7 @@ impl Layout {
                 role: tensor.role,
                 dtype: tensor.dtype,
                 shape,
-                split,
+                split: tensor.split,
                 repeat,
                 when,
                 unloaded: tensor.unloaded,
@@ -696,12 +696,12 @@ impl Layout {
         let (path, default) = match &fact.value {
             FactValue::Literal(value) => {
                 let path = format!("{stack_name}.{}.{}", part.part, fact.name);
-                return Ok((path, layout_value(value, self, &path)?, None));
+                return Ok((path, layout_toml_value(value, self, &path)?, None));
             }
             FactValue::Key { key, default } => (key.as_str(), default.as_ref()),
         };
         let value = read_path(root, path, self)?;
-        let value = value.as_ref().or(default).ok_or_else(|| {
+        let value = value.as_ref().or(default.as_ref()).ok_or_else(|| {
             LayoutError::refused(
                 &self.id,
                 format!(
@@ -714,7 +714,7 @@ impl Layout {
         let fact_path = format!("{stack_name}.{}.{}", part.part, fact.name);
         Ok((
             fact_path,
-            layout_value(value, self, &fact_path)?,
+            layout_toml_value(value, self, &fact_path)?,
             Some(path.to_owned()),
         ))
     }
@@ -1163,6 +1163,43 @@ fn fact_value(value: toml::Value) -> FactValue {
         }
     }
     FactValue::Literal(value)
+}
+
+fn layout_toml_value(
+    value: &toml::Value,
+    layout: &Layout,
+    what: &str,
+) -> Result<LayoutValue, LayoutError> {
+    match value {
+        toml::Value::Boolean(value) => Ok(LayoutValue::Bool(*value)),
+        toml::Value::Integer(value) => Ok(LayoutValue::Integer(*value)),
+        toml::Value::Float(value) => Ok(LayoutValue::Float(*value)),
+        toml::Value::String(value) => Ok(LayoutValue::String(value.clone())),
+        toml::Value::Array(items) => {
+            if items.iter().all(toml::Value::is_integer) {
+                Ok(LayoutValue::Integers(
+                    items.iter().filter_map(toml::Value::as_integer).collect(),
+                ))
+            } else if items.iter().all(toml::Value::is_str) {
+                Ok(LayoutValue::Strings(
+                    items
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned)
+                        .collect(),
+                ))
+            } else {
+                Err(LayoutError::refused(
+                    &layout.id,
+                    format!("{what} is a list with mixed element kinds"),
+                ))
+            }
+        }
+        other => Err(LayoutError::refused(
+            &layout.id,
+            format!("{what} has unsupported value {other}"),
+        )),
+    }
 }
 
 fn layout_value(value: &Value, layout: &Layout, what: &str) -> Result<LayoutValue, LayoutError> {
