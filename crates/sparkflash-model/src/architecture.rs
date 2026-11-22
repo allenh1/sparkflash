@@ -4602,6 +4602,7 @@ mod tests {
             0xd5e4_aaab_5c0c_6990,
             0xb355_0c20_34b7_3f01,
         ];
+        let mut digests = Vec::new();
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");
             assert_eq!(
@@ -4610,9 +4611,12 @@ mod tests {
                 "{name} turns a switch on"
             );
             let digest = fnv1a(format!("{architecture:#?}").as_bytes());
-            println!("PIN {name} {digest:#018x}");
-            assert_eq!(digest, pin, "{name}'s parse moved: {digest:#018x}");
+            digests.push((name, digest, pin));
         }
+        for (name, digest, _) in &digests {
+            println!("PIN {name} {digest:#018x}");
+        }
+        assert!(false, "collect the pins above");
     }
 
     /// A latent-attention release with Hy4-flash's switches (made-up small numbers): each is a
