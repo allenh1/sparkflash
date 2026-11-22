@@ -1295,6 +1295,16 @@ fn known_fact(name: &str) -> bool {
     )
 }
 
+fn stack_of_part(part: Part) -> StackKind {
+    if part == Part::Mtp {
+        StackKind::Draft
+    } else if part.name().starts_with("vision_") {
+        StackKind::Vision
+    } else {
+        StackKind::Language
+    }
+}
+
 fn stack_kind(name: &str) -> Option<StackKind> {
     match name {
         "language" => Some(StackKind::Language),
