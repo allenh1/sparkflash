@@ -41,7 +41,9 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::architecture::{Architecture, AttentionKind, Ffn, Layer, Residual, Vision};
+use crate::architecture::{
+    Architecture, AttentionKind, Ffn, Layer, Residual, Vision, WeightFormat,
+};
 use crate::coverage::{ConfigCoverage, read_key};
 use crate::parts::Part;
 use crate::stack::{Block, PartInstance, Shape, Stack, StackKind};
@@ -769,11 +771,9 @@ impl Layout {
             match name.as_str() {
                 "vision.position" | "vision.vision_position.position" => {
                     let Some(vision) = architecture.vision.as_mut() else {
-                        return Err(LayoutError::refused(
-                            &self.id,
-                            "fact vision.position applies to a checkpoint with no vision_config"
-                                .to_owned(),
-                        ));
+                        // A checkpoint that matches the layout's language type but carries no
+                        // tower runs no vision stack; its vision facts are inert.
+                        continue;
                     };
                     let text = value.to_string();
                     vision.position = Some(match text.as_str() {
@@ -819,6 +819,17 @@ impl Layout {
                     ),
                 )
             })?;
+            let stack = match declaration.repeat {
+                Repeat::VisionBlocks => StackKind::Vision,
+                Repeat::Mtp | Repeat::MtpExperts => StackKind::Draft,
+                Repeat::Once | Repeat::Layers | Repeat::Experts => stack_of_part(part),
+            };
+            if stack == StackKind::Vision && architecture.vision.is_none() {
+                continue;
+            }
+            if stack == StackKind::Draft && architecture.mtp.is_none() {
+                continue;
+            }
             match declaration.repeat {
                 Repeat::Once => {
                     let vars = self.global_vars(architecture);
@@ -1120,6 +1131,19 @@ impl Layout {
                         .unwrap_or(usize::MAX)
                 });
                 attach_tensors(block, tensors, stack.kind);
+                for instance in &mut block.parts {
+                    if instance.format.is_none() {
+                        let part_tensors: Vec<&LayoutTensor> = tensors
+                            .iter()
+                            .filter(|tensor| {
+                                tensor.stack == stack.kind
+                                    && tensor.part == instance.part
+                                    && tensor.block == Some(block.index)
+                            })
+                            .collect();
+                        instance.format = layout_format(&part_tensors, architecture);
+                    }
+                }
             }
         }
         Ok(stacks)
@@ -1254,6 +1278,24 @@ impl Layout {
         insert(&mut vars, "hyper_width", streams * architecture.hidden_size);
         vars
     }
+}
+
+fn layout_format(tensors: &[&LayoutTensor], architecture: &Architecture) -> Option<WeightFormat> {
+    let mut format = None;
+    for tensor in tensors {
+        let this = match tensor.dtype {
+            LayoutDtype::Bf16 => WeightFormat::Bf16,
+            LayoutDtype::F32 => continue,
+            LayoutDtype::Dense => architecture.quantization.dense_format,
+            LayoutDtype::Expert => architecture.quantization.expert_format,
+        };
+        match format {
+            None => format = Some(this),
+            Some(previous) if previous == this => {}
+            Some(_) => return None,
+        }
+    }
+    format
 }
 
 fn insert(vars: &mut BTreeMap<String, i64>, name: &str, value: usize) {
