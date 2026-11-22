@@ -42,7 +42,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::architecture::{
-    Architecture, AttentionKind, Ffn, Layer, Residual, Vision, WeightFormat,
+    Architecture, AttentionKind, Ffn, Layer, Residual, Side, Vision, WeightFormat,
 };
 use crate::coverage::{ConfigCoverage, read_key};
 use crate::parts::Part;
