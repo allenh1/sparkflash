@@ -1,0 +1,894 @@
+# GLM-5.3-Flash layout.
+#
+# Wiring sources, in the order the layout spec gives them:
+#   * the checkpoint's own config.json (a config key is named beside the fact it sets);
+#   * the tensor index (a tensor name proves the component and its shape);
+#   * the producer reference for what neither states:
+#     transformers/models/glm5_next/modeling_glm5_next.py at the revision the
+#     checkpoint names (zai-org/GLM-5.3-Flash, revision 3f1971b7b5f7a528c9c4ef6212c8785298a8c24a).
+#     The vision tower is Glm5NextVisionModel (line 1809), whose blocks are RMSNorm
+#     (1698-1715), the attention has q/k RMSNorm and axial rotary (1610-1695), the patch
+#     embed is a 3-D convolution over temporal_patch_size frames (1728-1745), and the
+#     merger is proj -> LayerNorm -> GELU -> gated SwiGLU (1545-1570).
+#
+# Every shape below is an expression over facts the reader takes from the config or the
+# architecture; no dimension is repeated as a number.
+
+schema = 1
+id = "glm5-next-fp8"
+
+[match]
+architectures = ["Glm5NextForConditionalGeneration"]
+model_types = ["glm5_next"]
+
+# Config keys the description decodes through this layout. A key that only names the
+# producer's own type is still read here so the config-key check can account for it.
+[[keys]]
+path = "text_config.qk_head_dim"
+fact = "language.attention.head_dim"
+
+[[keys]]
+path = "text_config.mla_use_nope"
+fact = "language.attention.rope"
+
+[[keys]]
+path = "text_config.num_key_value_heads"
+fact = "language.attention.kv_heads"
+
+[[keys]]
+path = "text_config.moe_router_dtype"
+fact = "language.moe.router_dtype"
+
+[[keys]]
+path = "text_config.index_kpool_compress"
+fact = "language.indexer.pool_compress"
+
+[[keys]]
+path = "text_config.index_share_for_mtp_iteration"
+fact = "language.draft.indexer_shared"
+
+[[keys]]
+path = "text_config.indexer_rope_interleave"
+fact = "language.indexer.rope_interleave"
+
+[[keys]]
+path = "text_config.linear_attn_config.kda_layers"
+fact = "language.linear_attention.kda_layers"
+
+[[keys]]
+path = "text_config.linear_attn_config.full_attn_layers"
+fact = "language.linear_attention.full_attn_layers"
+
+[[keys]]
+path = "text_config.model_type"
+fact = "match.text_model_type"
+
+[[keys]]
+path = "tie_word_embeddings"
+fact = "language.tie_word_embeddings"
+
+[[keys]]
+path = "vision_config.image_size"
+fact = "vision.image_size"
+
+[[keys]]
+path = "vision_config.model_type"
+fact = "match.vision_model_type"
+
+# The quantizer's exclusion list names modules the producer kept out of its FP8 pass.
+# The tensor index is the authority on what was stored: each tensor's dtype below is read
+# from that index, so repeating the producer's list here would be a second, weaker copy.
+[[keys]]
+path = "quantization_config.modules_to_not_convert"
+ignore = "the producer's quantizer exclusion list; the tensor index states every stored dtype"
+
+[stacks.language]
+order = [
+  "rms_norm",
+  "hyper_connection",
+  "kda_scan",
+  "mla_attention",
+  "sparse_indexer",
+  "dense_mlp",
+  "moe",
+]
+
+[stacks.vision]
+order = [
+  "vision_patch_embed",
+  "vision_position",
+  "vision_norm",
+  "vision_attention",
+  "vision_mlp",
+  "vision_downsample",
+  "vision_merger",
+]
+
+# modeling_glm5_next.py:1824 and 1865: the tower has an axial rotary embedding and no
+# learned position table. The tensor index agrees: no position tensor is stored.
+[[stacks.vision.parts]]
+part = "vision_position"
+[[stacks.vision.parts.facts]]
+name = "position"
+value = "rotary"
+
+# The language backbone.
+[[tensor]]
+name = "model.language_model.embed_tokens.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.language_model.norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "lm_head.weight"
+part = "lm_head"
+role = "lm_head"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.input_layernorm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.post_attention_layernorm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+
+# Hyper-connections: hc_{attn,ffn}_fn is [(2 + streams) * streams, streams * hidden], its
+# base is one row per mixer, and its scale is three f32 entries (modeling line 1436).
+[[tensor]]
+name = "model.language_model.layers.{layer}.hc_attn_fn"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hyper_rows", "hyper_width"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.hc_attn_base"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = ["hyper_rows"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.hc_attn_scale"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = [3]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.hc_ffn_fn"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hyper_rows", "hyper_width"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.hc_ffn_base"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = ["hyper_rows"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.hc_ffn_scale"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = [3]
+split = "whole"
+repeat = "layers"
+
+# Kimi Delta Attention (linear_attention layers). The projections are [width, hidden], the
+# convolution is [width, 1, taps], and the two gate projections are low-rank.
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.k_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.v_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_conv1d.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", 1, "kda_conv"]
+split = "conv"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.k_conv1d.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", 1, "kda_conv"]
+split = "conv"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.v_conv1d.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", 1, "kda_conv"]
+split = "conv"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.f_a_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.f_b_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "kda_head_dim"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.g_a_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.g_b_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "kda_head_dim"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.b_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_heads", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.A_log"
+part = "kda_scan"
+role = "attention"
+dtype = "f32"
+shape = ["kda_heads"]
+split = "vector"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.dt_bias"
+part = "kda_scan"
+role = "attention"
+dtype = "f32"
+shape = ["kda_width"]
+split = "vector"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.o_norm.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.o_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "kda_width"]
+split = "columns"
+repeat = "layers"
+when = { attention = "kda" }
+
+# Sparse MLA (deepseek_sparse_attention layers).
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_a_proj.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "dense"
+shape = ["q_lora", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_a_layernorm.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_b_proj.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "dense"
+shape = ["heads * nope", "q_lora"]
+split = "rows"
+repeat = "layers"
+when = { attention = "mla" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.kv_a_proj_with_mqa.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "dense"
+shape = ["kv_lora", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.kv_a_layernorm.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.kv_b_proj.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads * (nope + v_head)", "kv_lora"]
+split = "rows"
+repeat = "layers"
+when = { attention = "mla" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.o_proj.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "dense"
+shape = ["hidden", "heads * v_head"]
+split = "columns"
+repeat = "layers"
+when = { attention = "mla" }
+
+# The sparse indexer (modeling line 1958-2082).
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.wq_b.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.wk.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.k_norm.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.k_norm.bias"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.weights_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.index_kpool_compress_gate"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.index_kpool_compress_ape"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_pool", "index_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", indexer = true }
+
+# Dense and routed feed-forward blocks.
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.gate_proj.weight"
+part = "dense_mlp"
+role = "dense_mlp"
+dtype = "dense"
+shape = ["intermediate", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "dense" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.up_proj.weight"
+part = "dense_mlp"
+role = "dense_mlp"
+dtype = "dense"
+shape = ["intermediate", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "dense" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.down_proj.weight"
+part = "dense_mlp"
+role = "dense_mlp"
+dtype = "dense"
+shape = ["hidden", "intermediate"]
+split = "columns"
+repeat = "layers"
+when = { ffn = "dense" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.gate.weight"
+part = "moe"
+role = "router"
+dtype = "bf16"
+shape = ["routed", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.gate.e_score_correction_bias"
+part = "moe"
+role = "router"
+dtype = "f32"
+shape = ["routed"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_experts.gate_proj.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "dense"
+shape = ["shared_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_experts.up_proj.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "dense"
+shape = ["shared_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_experts.down_proj.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "dense"
+shape = ["hidden", "shared_width"]
+split = "columns"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"
+part = "moe"
+role = "experts"
+dtype = "expert"
+shape = ["moe_intermediate", "hidden"]
+split = "expert_rows"
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"
+part = "moe"
+role = "experts"
+dtype = "expert"
+shape = ["moe_intermediate", "hidden"]
+split = "expert_rows"
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
+part = "moe"
+role = "experts"
+dtype = "expert"
+shape = ["hidden", "moe_intermediate"]
+split = "expert_columns"
+repeat = "experts"
+when = { ffn = "moe" }
+
+# The MTP stage: the checkpoint stores it as layer num_hidden_layers, taking the first
+# sparse-MLA layer's attention and the first MoE layer's experts.
+[[tensor]]
+name = "model.language_model.layers.{layer}.enorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.hnorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.shared_head.norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.eh_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "2 * hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.input_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.post_attention_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+# The vision tower (modeling_glm5_next.py:1525-1890).
+[[tensor]]
+name = "model.visual.patch_embed.proj.weight"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = [
+  "vision_width",
+  "vision_in_channels",
+  "vision_frames",
+  "vision_patch",
+  "vision_patch",
+]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.patch_embed.proj.bias"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm1.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm2.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.qkv.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["3 * vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.qkv.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["3 * vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.q_norm.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_head_dim"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.k_norm.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_head_dim"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.gate_proj.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.gate_proj.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.up_proj.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.up_proj.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.down_proj.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.down_proj.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.post_layernorm.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.downsample.weight"
+part = "vision_downsample"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out", "vision_width", "vision_merge", "vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.downsample.bias"
+part = "vision_downsample"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.proj.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out", "vision_out"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.post_projection_norm.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.post_projection_norm.bias"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.gate_proj.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_projection", "vision_out"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.up_proj.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_projection", "vision_out"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.down_proj.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out", "vision_projection"]
+split = "whole"

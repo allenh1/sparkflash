@@ -41,6 +41,7 @@ pub mod descriptor;
 pub mod dflash2;
 pub mod engine;
 pub mod gumbel;
+pub mod layout;
 pub mod ledger;
 pub mod numerics;
 pub mod numerics_coverage;
@@ -88,6 +89,10 @@ pub use descriptor::{
     model_max_output_tokens,
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};
+pub use layout::{
+    Layout, LayoutDescription, LayoutDtype, LayoutError, LayoutSet, LayoutTensor, LayoutValue,
+    TensorSplit,
+};
 pub use ledger::{ARM_LEDGERS, ArmLedger, State, Strategy, ledger_for_arm, ledger_for_weights};
 pub use numerics::{ConfigKey, NumericsIdentity, NumericsProfile, NumericsStatus};
 pub use parts::{Part, PartSet, Target, built, is_built};

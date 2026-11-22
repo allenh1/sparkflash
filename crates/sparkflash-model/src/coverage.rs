@@ -47,8 +47,8 @@ impl UnknownKey {
     #[must_use]
     pub fn fix(path: &str) -> String {
         format!(
-            "read {path} in the checkpoint parser, or add its key name to the ignorable \
-             list with a written reason in sparkflash-model/src/coverage.rs"
+            "state {path} in the checkpoint's layout keys entry with the fact it sets, or add \
+             it to that layout's ignorable list with a written reason"
         )
     }
 }
@@ -59,7 +59,7 @@ pub struct IgnoredKey {
     /// The full path from the document root.
     pub path: String,
     /// Why the key can be ignored.
-    pub reason: &'static str,
+    pub reason: String,
 }
 
 /// The result of the config-key coverage check for one parse.
@@ -125,6 +125,21 @@ impl ConfigCoverage {
     #[must_use]
     pub fn ignored_keys(&self) -> &[IgnoredKey] {
         &self.ignored
+    }
+
+    /// Mark a path as read by a source other than the structural parser, such as a layout.
+    pub(crate) fn claim_path(&mut self, path: &str) {
+        self.read.insert(path.to_owned());
+        self.unknown.retain(|unknown| unknown.path != path);
+    }
+
+    /// Mark a path as read and ignorable with a reason from the matching layout.
+    pub(crate) fn ignore_path(&mut self, path: &str, reason: &str) {
+        self.claim_path(path);
+        self.ignored.push(IgnoredKey {
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+        });
     }
 
     /// Whether the check ran and every key was read or ignorably listed.
@@ -299,7 +314,7 @@ fn collect(
                         // block is ignored whole, not one member at a time.
                         ignored.push(IgnoredKey {
                             path: full.clone(),
-                            reason,
+                            reason: reason.to_owned(),
                         });
                         continue;
                     }

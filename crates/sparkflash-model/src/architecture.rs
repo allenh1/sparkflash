@@ -976,8 +976,16 @@ impl Architecture {
         root: &Value,
         tensors: Option<&[String]>,
     ) -> Result<(Self, ConfigCoverage), ConfigError> {
-        let (parsed, coverage) = with_recording(root, || Self::parse(root, tensors));
-        parsed.map(|architecture| (architecture, coverage))
+        let (parsed, mut coverage) = with_recording(root, || Self::parse(root, tensors));
+        let mut architecture = parsed?;
+        if let Some(layout) = crate::layout::matching(&architecture)
+            .map_err(|error| ConfigError::Invalid(error.to_string()))?
+        {
+            layout
+                .apply(&mut architecture, root, &mut coverage)
+                .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        }
+        Ok((architecture, coverage))
     }
 
     /// The parse every entry point runs, with the active recorder recording its reads.

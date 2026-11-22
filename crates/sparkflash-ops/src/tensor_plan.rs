@@ -31,6 +31,7 @@ use sparkflash_model::architecture::{
     Architecture, AttentionKind, DenseMlp, Ffn, Kda, Layer, Moe, PleGeometry, Residual, ScaleDType,
     Side, WeightFormat,
 };
+use sparkflash_model::layout::{LayoutDtype, LayoutTensor, TensorSplit};
 use sparkflash_model::{TpAxis, TpPlan};
 use sparkflash_weights::rng::is_prime;
 use sparkflash_weights::{DType, TensorPlan, TensorSpec};
@@ -213,9 +214,11 @@ impl ArchitectureTensorPlan {
         } else {
             experts
         };
+        if builder.from_layout(architecture)? {
+            return Ok(builder.finish());
+        }
         match architecture.family.as_str() {
             "qwen4_exp" | "qwen3_5_moe" => builder.qwen(architecture, mtp)?,
-            "glm5_next" => builder.glm(architecture, mtp)?,
             _ => {
                 // A family no pack transcribes is planned in the canonical spelling; a caller
                 // holding the checkpoint plans its own spelling through [Self::named].
@@ -392,6 +395,145 @@ impl Builder {
             rank: self.rank,
             runs: self.runs,
             tp: self.tp,
+        }
+    }
+
+    /// Build the checkpoint's tensors from its layout, when one describes it.
+    ///
+    /// Returns false when no layout matches, so a checkpoint with no file still runs the
+    /// structural reader. A layout that matches but describes no tensor is a refusal: a file
+    /// exists to say what the structural reader could not.
+    fn from_layout(&mut self, arch: &Architecture) -> Result<bool, PlanError> {
+        let layout = sparkflash_model::layout::matching(arch)
+            .map_err(|error| PlanError::Invalid(error.to_string()))?;
+        let Some(layout) = layout else {
+            return Ok(false);
+        };
+        let tensors = layout
+            .tensors(arch)
+            .map_err(|error| PlanError::Invalid(error.to_string()))?;
+        if tensors.is_empty() {
+            return Err(PlanError::Invalid(format!(
+                "layout {} describes no tensor for this checkpoint",
+                layout.id
+            )));
+        }
+        for tensor in tensors {
+            if tensor.stack == sparkflash_model::StackKind::Vision && !self.vision {
+                continue;
+            }
+            if tensor.stack == sparkflash_model::StackKind::Draft && !self.mtp {
+                continue;
+            }
+            self.layout_tensor(&tensor)?;
+        }
+        Ok(true)
+    }
+
+    fn layout_tensor(&mut self, tensor: &LayoutTensor) -> Result<(), PlanError> {
+        let role = tensor_role(&tensor.role).ok_or_else(|| {
+            PlanError::Invalid(format!(
+                "tensor {} names unknown role {:?}",
+                tensor.name, tensor.role
+            ))
+        })?;
+        match tensor.dtype {
+            LayoutDtype::Dense => {
+                let [rows, columns] = two(&tensor.name, &tensor.shape)?;
+                let split = match tensor.split {
+                    TensorSplit::Whole => LinearSplit::Whole,
+                    TensorSplit::Rows => LinearSplit::Rows,
+                    TensorSplit::Columns => LinearSplit::Columns,
+                    TensorSplit::KvRows => LinearSplit::KvRows,
+                    other => {
+                        return Err(PlanError::Invalid(format!(
+                            "tensor {} is a dense projection with split {other:?}",
+                            tensor.name
+                        )));
+                    }
+                };
+                let prefix = tensor.name.strip_suffix(".weight").ok_or_else(|| {
+                    PlanError::Invalid(format!(
+                        "dense tensor {} does not end in .weight",
+                        tensor.name
+                    ))
+                })?;
+                self.dense_linear(prefix, rows, columns, self.dense_format, role, split)?;
+            }
+            LayoutDtype::Expert => {
+                let format = ExpertFormat::of(self.expert_format);
+                let (width, hidden, rows) = match tensor.split {
+                    TensorSplit::ExpertRows => {
+                        let [width, hidden] = two(&tensor.name, &tensor.shape)?;
+                        (width, hidden, true)
+                    }
+                    TensorSplit::ExpertColumns => {
+                        let [hidden, width] = two(&tensor.name, &tensor.shape)?;
+                        (width, hidden, false)
+                    }
+                    other => {
+                        return Err(PlanError::Invalid(format!(
+                            "expert tensor {} has split {other:?}",
+                            tensor.name
+                        )));
+                    }
+                };
+                let prefix = tensor.name.strip_suffix(".weight").ok_or_else(|| {
+                    PlanError::Invalid(format!(
+                        "expert tensor {} does not end in .weight",
+                        tensor.name
+                    ))
+                })?;
+                self.expert(prefix, width, hidden, format, rows, role)?;
+            }
+            LayoutDtype::Bf16 | LayoutDtype::F32 => {
+                let dtype = if tensor.dtype == LayoutDtype::Bf16 {
+                    DType::BF16
+                } else {
+                    DType::F32
+                };
+                self.layout_split(&tensor.name, dtype, &tensor.shape, tensor.split, role)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn layout_split(
+        &mut self,
+        name: &str,
+        dtype: DType,
+        shape: &[usize],
+        split: TensorSplit,
+        role: Role,
+    ) -> Result<(), PlanError> {
+        match split {
+            TensorSplit::Whole => {
+                self.whole(name.to_owned(), dtype, shape.to_vec(), role);
+                Ok(())
+            }
+            TensorSplit::Rows => {
+                let [a, b] = two(name, shape)?;
+                self.rows(name.to_owned(), dtype, [a, b], role)
+            }
+            TensorSplit::Columns => {
+                let [a, b] = two(name, shape)?;
+                self.columns(name.to_owned(), dtype, [a, b], role)
+            }
+            TensorSplit::KvRows => {
+                let [a, b] = two(name, shape)?;
+                self.kv_rows(name.to_owned(), dtype, [a, b], role)
+            }
+            TensorSplit::Vector => {
+                let [a] = one(name, shape)?;
+                self.row_vector(name.to_owned(), dtype, a, role)
+            }
+            TensorSplit::Conv => {
+                let [width, _, taps] = three(name, shape)?;
+                self.conv_rows(name.to_owned(), dtype, width, taps, role)
+            }
+            TensorSplit::ExpertRows | TensorSplit::ExpertColumns => Err(PlanError::Invalid(
+                format!("tensor {name} has an expert split but no expert dtype"),
+            )),
         }
     }
 
@@ -2690,4 +2832,44 @@ fn ple_padded_rows(ple: &PleGeometry) -> u64 {
     }
     let divisor = ple.vocab_multiple.max(ple.split_parts as u64).max(1);
     offset.div_ceil(divisor) * divisor
+}
+
+fn tensor_role(name: &str) -> Option<Role> {
+    Some(match name {
+        "embedding" => Role::Embedding,
+        "lm_head" => Role::LmHead,
+        "norm" => Role::Norm,
+        "hyper" => Role::Hyper,
+        "router" => Role::Router,
+        "shared_expert" => Role::SharedExpert,
+        "experts" => Role::Experts,
+        "attention" => Role::Attention,
+        "indexer" => Role::Indexer,
+        "dense_mlp" => Role::DenseMlp,
+        "ple_aux" => Role::PleAux,
+        "ple_table" => Role::PleTable,
+        "mtp" => Role::Mtp,
+        "vision" => Role::Vision,
+        _ => return None,
+    })
+}
+
+fn one(name: &str, shape: &[usize]) -> Result<[usize; 1], PlanError> {
+    shape
+        .try_into()
+        .map_err(|_| PlanError::Invalid(format!("tensor {name} is a vector with shape {shape:?}")))
+}
+
+fn two(name: &str, shape: &[usize]) -> Result<[usize; 2], PlanError> {
+    shape
+        .try_into()
+        .map_err(|_| PlanError::Invalid(format!("tensor {name} is not a matrix: shape {shape:?}")))
+}
+
+fn three(name: &str, shape: &[usize]) -> Result<[usize; 3], PlanError> {
+    shape.try_into().map_err(|_| {
+        PlanError::Invalid(format!(
+            "tensor {name} is not a 3-D convolution: shape {shape:?}"
+        ))
+    })
 }
