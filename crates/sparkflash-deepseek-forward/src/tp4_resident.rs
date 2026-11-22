@@ -507,7 +507,7 @@ fn bind_in_arena(
         Some(&census),
         None,
     )?;
-    Ok(DeviceBind {
+    let bind = DeviceBind {
         attention,
         mhc_seam,
         moe,
@@ -517,7 +517,9 @@ fn bind_in_arena(
         manifest_lines,
         #[cfg(feature = "cuda")]
         plan_index: PlanIndex::from_plan(&setup.plan),
-    })
+    };
+    crate::open_manifest::record_tensors(&setup.plan, &bind.bound_names(), rank, world);
+    Ok(bind)
 }
 
 /// Streams the rank arena and binds every device-served tensor set: attention projections, routed

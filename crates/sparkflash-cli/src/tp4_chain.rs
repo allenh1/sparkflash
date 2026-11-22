@@ -1121,6 +1121,7 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
                 (bind, arena_evidence, _arena_lines, Some(outcome))
             }
         };
+        eprintln!("open-manifest: recording tensors rank={} world={}", args.rank, args.world);
         sparkflash_deepseek_forward::open_manifest::record_tensors(
             &setup.plan,
             &bind.bound_names(),

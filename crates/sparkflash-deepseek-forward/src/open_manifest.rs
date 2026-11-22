@@ -59,12 +59,16 @@ pub fn record_model_config(config: &ModelConfig, rank: usize, world: usize) {
 /// Records every plan shard this rank bound: stored shape, stored format, rank slice and bytes.
 pub fn record_tensors(plan: &ResidentPlan, bound: &BTreeSet<String>, rank: usize, world: usize) {
     if !sparkflash_kernels::open_manifest::enabled() {
+        eprintln!("open-manifest: record_tensors rank={rank} skipped (disabled)");
         return;
     }
+    let shard_count = plan.shards().len();
+    let mut matched = 0usize;
     for shard in plan.shards() {
         if !bound.contains(&shard.name) {
             continue;
         }
+        matched += 1;
         sparkflash_kernels::open_manifest::record(&json!({
             "schema": SCHEMA,
             "kind": "tensor",
@@ -79,4 +83,8 @@ pub fn record_tensors(plan: &ResidentPlan, bound: &BTreeSet<String>, rank: usize
             "placement": shard.placement.as_str(),
         }));
     }
+    eprintln!(
+        "open-manifest: record_tensors rank={rank} shards={shard_count} bound={} matched={matched}",
+        bound.len()
+    );
 }
