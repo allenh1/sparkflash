@@ -126,7 +126,7 @@ mod tests {
         changed.vocab_size += 1;
         let layout = ArchitectureTensorPlan::checkpoint(&changed, tp).expect("the changed plan");
         let difference = first_difference(&reference, &layout).expect("a difference");
-        assert!(difference.contains("embed_tokens.weight"), "{difference}");
+        assert!(difference.contains("lm_head.weight"), "{difference}");
         assert!(difference.contains("shape"), "{difference}");
     }
 }

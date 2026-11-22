@@ -4592,7 +4592,7 @@ mod tests {
         let pinned = [
             0x0a9d_f00c_70fd_a130_u64,
             0xbf31_362c_fd8a_5fc0,
-            0x939f_dfa0_088a_fb13,
+            0xeebb_ad76_01e9_edcb,
             0x51eb_2882_3661_fe8f,
             0xe909_cbc5_be7c_75db,
             0xd5e4_aaab_5c0c_6990,
