@@ -4610,6 +4610,7 @@ mod tests {
                 "{name} turns a switch on"
             );
             let digest = fnv1a(format!("{architecture:#?}").as_bytes());
+            println!("PIN {name} {digest:#018x}");
             assert_eq!(digest, pin, "{name}'s parse moved: {digest:#018x}");
         }
     }
