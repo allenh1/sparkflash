@@ -204,6 +204,8 @@ pub struct When {
     pub layers: Vec<usize>,
     /// The residual kind: plain or hyper.
     pub residual: Option<String>,
+    /// A side the layer carries: ple or engram.
+    pub side: Option<String>,
 }
 
 /// A resolved tensor of one checkpoint.
@@ -487,6 +489,8 @@ struct RawWhen {
     layers: Vec<usize>,
     #[serde(default)]
     residual: Option<String>,
+    #[serde(default)]
+    side: Option<String>,
 }
 impl Layout {
     /// Parse one layout file.
@@ -679,6 +683,7 @@ impl Layout {
                 indexer: when.indexer,
                 layers: when.layers,
                 residual: when.residual,
+                side: when.side,
             });
             if let Some(attention) = &when.attention
                 && !matches!(
@@ -692,6 +697,14 @@ impl Layout {
                         "tensor {:?}: unknown attention selector {attention:?}",
                         tensor.name
                     ),
+                ));
+            }
+            if let Some(side) = &when.side
+                && !matches!(side.as_str(), "ple" | "engram")
+            {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!("tensor {:?}: unknown side selector {side:?}", tensor.name),
                 ));
             }
             if let Some(residual) = &when.residual
@@ -2038,6 +2051,15 @@ fn when_matches(when: &When, layer: &Layer, index: usize) -> bool {
             return false;
         }
     }
+    if let Some(side) = &when.side {
+        let have = layer.sides.iter().any(|held| match (side.as_str(), held) {
+            ("ple", Side::Ple(_)) | ("engram", Side::Engram(_)) => true,
+            _ => false,
+        });
+        if !have {
+            return false;
+        }
+    }
     if let Some(indexer) = when.indexer {
         let have = layer
             .attention
@@ -2454,6 +2476,32 @@ tile = 8
         .expect("an expert-axis layout");
         let tensors = expert.tensors(&architecture).expect("a description");
         assert_eq!(tensors[0].split, TensorSplit::ExpertAxis);
+    }
+
+    #[test]
+    fn a_when_side_selector_names_a_known_side() {
+        let source = r#"
+schema = 1
+id = "side"
+[match]
+model_types = ["synthetic"]
+
+[[tensor]]
+name = "model.embed.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+when = { side = "ple" }
+"#;
+        Layout::parse("side.toml", source).expect("a PLE side selector");
+        let error = Layout::parse("side.toml", &source.replace("\"ple\"", "\"ffn\""))
+            .expect_err("an unknown side");
+        assert!(
+            error.to_string().contains("unknown side selector"),
+            "{error}"
+        );
     }
 
     #[test]
