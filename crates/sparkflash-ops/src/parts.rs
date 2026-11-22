@@ -151,9 +151,15 @@ const GQA_GROUPS: &[usize] = &[1, 2, 3, 4, 6, 8, 12];
 /// here rather than pinned as an equality: a full layer legitimately carries no window.
 const INKLING_HIDDEN: usize = 4608;
 const INKLING_HEAD_DIM: usize = 128;
-const INKLING_GQA_GROUPS: &[usize] = &[6];
-const INKLING_SHORT_CONV: usize = 4;
 const INKLING_INTERMEDIATE: usize = 2304;
+
+/// The widest short-convolution kernel the body accepts.
+///
+/// `kernels/inkling_conv_sm121.cu:87` states it: "The kernel width is 4 in the released
+/// checkpoint; the entries accept 1..INKLING_MAX_KERNEL so the same body can be brought up
+/// against a different release." The body rejects `kernel < 1 || kernel > 8` at `:134`, so the
+/// catalogue must not pin the released width and refuse the widths the same body takes.
+const INKLING_MAX_KERNEL: usize = 8;
 
 /// The first row a chained block residual takes.
 ///
@@ -173,7 +179,11 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::Embedding, Image::Deepseek) => {
             ShapeConstraint::ANY.hidden_equals(5120).vocab_multiple(128)
         }
-        (Part::Embedding, Image::Qwen4Exp) => ShapeConstraint::ANY.vocab_multiple(128),
+        // q4e_embed reads the table row at the runtime hidden width and copies it to f32
+        // (`kernels/qwen4_exp_sm121.cu:318-331`); it has no vocabulary alignment. Inkling's
+        // 201,024-row table is not a multiple of the Qwen release's 128, and the same body
+        // embeds it.
+        (Part::Embedding, Image::Qwen4Exp) => ShapeConstraint::ANY,
         (Part::RmsNorm, Image::Deepseek) => {
             ShapeConstraint::ANY.hidden_equals(5120).hidden_multiple(2)
         }
@@ -181,7 +191,10 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::LmHead, Image::Deepseek) => {
             ShapeConstraint::ANY.hidden_equals(5120).vocab_multiple(128)
         }
-        (Part::LmHead, Image::Qwen4Exp) => ShapeConstraint::ANY.vocab_multiple(128),
+        // q4e_argmax_slices and q4e_argmax_prob_slices take the rank-local vocabulary width
+        // as a runtime argument (`kernels/qwen4_exp_sm121.cu:336-397`); neither rounds it to
+        // 128. The head screen is not the matrix projection, which is Part::DenseGemm.
+        (Part::LmHead, Image::Qwen4Exp) => ShapeConstraint::ANY,
         // CSA2 / grouped-output LoRA MLA: the DeepSeek latent has output groups and a rope
         // segment. The absorbed NoPE latent has neither, and is served by the GLM images.
         (Part::MlaAttention, Image::Deepseek) => ShapeConstraint::ANY
@@ -272,22 +285,35 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .top_k_equals(8)
             .max_experts(512)
             .max_top_k(64),
-        // Inkling's routed experts are 384 experts of 2,304 intermediate columns at a 4,608
-        // hidden width, top-8, with a sigmoid router. The body is a scalar dequantise, so the
-        // only fixed shape is the width it was written for.
+        // Inkling's routed experts are a scalar dequantise over runtime columns, so the
+        // intermediate width is the only geometry the body fixes; the expert count and the
+        // selected slots are the rank's and the router's.
+        // The router is the only body here with a bound of its own: it refuses more than
+        // INKLING_ROUTER_HELD * blockDim experts (32 * 128 = 4,096) and more than 64 selected
+        // experts (`kernels/inkling_moe_sm121.cu:793-808`). The expert bodies take the rank's
+        // owned run as a runtime argument (`:291-322`), so the expert count is not an equality:
+        // TP4 holds 96 of the 384 experts, and the same body runs either count. The columns are
+        // a multiple of 16 (NVFP4's block scale, `:289`).
         (Part::Moe, Image::Inkling) => ShapeConstraint::ANY
             .hidden_equals(4608)
             .intermediate_multiple(16)
-            .experts_equals(384)
-            .top_k_equals(8)
-            .max_experts(512)
+            .max_experts(4096)
             .max_top_k(64),
         // The shared dense projection. The b12x and q4p bodies are generic over the hidden and
         // intermediate widths, so this entry is not pinned to one model's 5120.
         (Part::DenseGemm, Image::Deepseek) => ShapeConstraint::ANY,
         (Part::DenseGemm, Image::Qwen4Prefill) => ShapeConstraint::ANY.hidden_equals(2560),
         (Part::DenseGemm, Image::GlmPrefill) => ShapeConstraint::ANY.hidden_equals(4096),
-        (Part::DenseGemm, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_equals(2560),
+        // q4e_gemv_bf16 / q4e_gemm_bf16 take rows and columns as runtime arguments: the GEMV
+        // walks `row < rows` over a runtime `columns` (`kernels/qwen4_exp_sm121.cu:407-456`)
+        // and the GEMM guards only `columns <= 0` and `batch > QG_TOKENS`
+        // (`:1220-1229`). Inkling runs this entry at hidden 4,608, not Qwen's 2,560.
+        (Part::DenseGemm, Image::Qwen4Exp) => ShapeConstraint::ANY,
+        // Dory's prompt projections are dory_mma_wide / dory_mma_wide4: the body takes cols,
+        // inner and tokens at run time (`kernels/dory_sm121.cu:62-67`), and the four-matrix
+        // form requires each output width to be a multiple of 32 (`:69-81`), a fact the
+        // geometry has no field for. It is the same body the Dory MLP entry names.
+        (Part::DenseGemm, Image::Dory) => ShapeConstraint::ANY,
         (Part::DenseGemm, Image::GlmDecode) => ShapeConstraint::ANY.hidden_equals(4096),
         (Part::Activation, Image::Deepseek) => ShapeConstraint::ANY.hidden_equals(5120),
         (Part::Activation, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_equals(2560),
@@ -300,14 +326,17 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // Inkling's four new arithmetic families. The relative-attention entry serves both the
         // 1,024-token sliding layers and the eight full layers, so the window is a documented
         // per-layer fact rather than an equality the full layers would fail.
+        // The group count is a runtime argument: `kernels/inkling_attn_sm121.cu:20-21` says
+        // so, and the body maps each query head to `head / (heads / kv_heads)` without a
+        // compile-time group. Pinning 6 refused the plan's own RelativeAttention geometry,
+        // which names heads and head width but leaves kv_heads unset.
         (Part::RelativeAttention, Image::Inkling) => ShapeConstraint::ANY
             .hidden_equals(INKLING_HIDDEN)
             .head_dim_equals(INKLING_HEAD_DIM)
-            .gqa_groups(INKLING_GQA_GROUPS)
             .positions(0, 1 << 21),
         (Part::ShortConv, Image::Inkling) => ShapeConstraint::ANY
             .hidden_equals(INKLING_HIDDEN)
-            .window_between(INKLING_SHORT_CONV, INKLING_SHORT_CONV),
+            .window_between(1, INKLING_MAX_KERNEL),
         (Part::BlockAttentionResidual, Image::Inkling) => ShapeConstraint::ANY
             .hidden_equals(INKLING_HIDDEN)
             .streams_between(1, 16),
@@ -1228,6 +1257,19 @@ pub const CATALOGUE: &[PartKernel] = &[
             // The K-split fold of the token GEMM: an elementwise reduction of f32 partials to
             // the BF16 epilogue, launched beside q4e_gemm_bf16.
             sym("q4e_gemm_reduce", &[Precision::Bf16, Precision::F32]),
+        ],
+        false,
+    ),
+    // Dory's prompt-chunk projections: one wide body for q, k, v, g, o, gate, up and down,
+    // beside the shared token GEMV and few-row tile the arm also launches. The arm names these
+    // launches Part::DenseGemm, so the catalogue carries that identity rather than leaving the
+    // body reachable only under the MLP part.
+    sm121(
+        Part::DenseGemm,
+        Image::Dory,
+        &[
+            tc_wide("dory_mma_wide", &[Precision::Bf16]),
+            tc_wide("dory_mma_wide4", &[Precision::Bf16]),
         ],
         false,
     ),
@@ -3977,7 +4019,7 @@ mod tests {
     }
 
     /// Inkling-2-Small's four new arithmetic families are catalogued at the geometry the
-    /// released document names, and the entries refuse a shape the body was not compiled for.
+    /// released document names, with the bounds the kernel source states.
     #[test]
     fn inkling_entries_match_the_released_geometry() {
         use crate::plan::PartGeometry;
@@ -4003,6 +4045,9 @@ mod tests {
             assert_eq!(entry.shape.hidden_equals, Some(INKLING_HIDDEN));
         }
 
+        // The attention body takes the GQA group as a runtime argument, so the entry must not
+        // pin the released group 6: the plan's RelativeAttention geometry carries heads and
+        // head width but no kv_heads, and a gqa_groups rule would refuse it.
         let attention = kernels(Part::RelativeAttention, Target::Sm121)
             .next()
             .expect("the relative-attention entry");
@@ -4016,6 +4061,29 @@ mod tests {
             ..PartGeometry::new()
         };
         assert!(attention.shape.accepts(&released).is_ok());
+        assert!(
+            attention
+                .shape
+                .accepts(&PartGeometry {
+                    kv_heads: 0,
+                    ..released
+                })
+                .is_ok(),
+            "the relative-attention entry must accept the plan's geometry, which has no kv_heads"
+        );
+        // The body maps a query head to its kv head at run time, so another group is a shape
+        // the same source runs, not a refusal.
+        assert!(
+            attention
+                .shape
+                .accepts(&PartGeometry {
+                    heads: 32,
+                    kv_heads: 4,
+                    groups: 8,
+                    ..released
+                })
+                .is_ok()
+        );
         for wrong in [
             PartGeometry {
                 hidden: 4096,
@@ -4025,10 +4093,6 @@ mod tests {
                 head_dim: 64,
                 ..released
             },
-            PartGeometry {
-                heads: 32,
-                ..released
-            },
         ] {
             assert!(
                 attention.shape.accepts(&wrong).is_err(),
@@ -4036,31 +4100,37 @@ mod tests {
             );
         }
 
-        // The short convolution is the released kernel 4, and the softcapped activation is the
-        // released 2,304-wide expert. A different width is a refusal, not a launch.
+        // The short-convolution body rejects only kernels outside 1..=8
+        // (`kernels/inkling_conv_sm121.cu:134`); the released width is 4.
         let convolution = kernels(Part::ShortConv, Target::Sm121)
             .next()
             .expect("the short-convolution entry");
-        assert!(
-            convolution
-                .shape
-                .accepts(&PartGeometry {
-                    hidden: INKLING_HIDDEN,
-                    window: 4,
-                    ..PartGeometry::new()
-                })
-                .is_ok()
-        );
-        assert!(
-            convolution
-                .shape
-                .accepts(&PartGeometry {
-                    hidden: INKLING_HIDDEN,
-                    window: 3,
-                    ..PartGeometry::new()
-                })
-                .is_err()
-        );
+        for window in [1, 4, 8] {
+            assert!(
+                convolution
+                    .shape
+                    .accepts(&PartGeometry {
+                        hidden: INKLING_HIDDEN,
+                        window,
+                        ..PartGeometry::new()
+                    })
+                    .is_ok(),
+                "the short-convolution entry refused kernel {window}"
+            );
+        }
+        for window in [0, 9] {
+            assert!(
+                convolution
+                    .shape
+                    .accepts(&PartGeometry {
+                        hidden: INKLING_HIDDEN,
+                        window,
+                        ..PartGeometry::new()
+                    })
+                    .is_err(),
+                "the short-convolution entry accepted kernel {window}"
+            );
+        }
         let activation = kernels(Part::SoftcappedActivation, Target::Sm121)
             .next()
             .expect("the softcapped activation entry");
@@ -4084,6 +4154,159 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    /// The token image's embedding, head screen and dense projection are runtime-shaped, so
+    /// the catalogue must not pin them to Qwen's 2,560 width or its 128-aligned vocabulary.
+    #[test]
+    fn qwen_token_bodies_take_the_runtime_widths_their_arms_launch() {
+        use crate::plan::PartGeometry;
+
+        let geometry = PartGeometry {
+            hidden: 4608,
+            vocab: 201024,
+            ..PartGeometry::new()
+        };
+        let embedding = kernels(Part::Embedding, Target::Sm121)
+            .find(|entry| entry.image == Image::Qwen4Exp)
+            .expect("the token embedding entry");
+        assert!(
+            embedding.shape.accepts(&geometry).is_ok(),
+            "q4e_embed is runtime-shaped: {geometry:?}"
+        );
+        let head = kernels(Part::LmHead, Target::Sm121)
+            .find(|entry| entry.image == Image::Qwen4Exp)
+            .expect("the token head entry");
+        assert!(
+            head.shape.accepts(&geometry).is_ok(),
+            "q4e_argmax_slices is runtime-shaped: {geometry:?}"
+        );
+        let dense = kernels(Part::DenseGemm, Target::Sm121)
+            .find(|entry| entry.image == Image::Qwen4Exp)
+            .expect("the token dense entry");
+        for hidden in [2560, 4608] {
+            assert!(
+                dense
+                    .shape
+                    .accepts(&PartGeometry {
+                        hidden,
+                        ..PartGeometry::new()
+                    })
+                    .is_ok(),
+                "q4e_gemv_bf16 / q4e_gemm_bf16 are runtime-shaped at {hidden}"
+            );
+        }
+    }
+
+    /// TP4 splits Inkling's routed experts over the ranks; the expert bodies take that owned
+    /// run as a runtime argument, and only the router has a bound (4,096 experts, 64 picks).
+    #[test]
+    fn inkling_moe_takes_the_rank_local_expert_run() {
+        use crate::plan::PartGeometry;
+
+        let entry = kernels(Part::Moe, Target::Sm121)
+            .find(|entry| entry.image == Image::Inkling)
+            .expect("the Inkling routed-expert entry");
+        for (experts, top_k) in [(96, 8), (384, 8)] {
+            assert!(
+                entry
+                    .shape
+                    .accepts(&PartGeometry {
+                        hidden: INKLING_HIDDEN,
+                        intermediate: INKLING_INTERMEDIATE,
+                        experts,
+                        top_k,
+                        ..PartGeometry::new()
+                    })
+                    .is_ok(),
+                "the Inkling MoE entry refused {experts} experts and top-{top_k}"
+            );
+        }
+        for (experts, top_k) in [(4097, 8), (384, 65)] {
+            assert!(
+                entry
+                    .shape
+                    .accepts(&PartGeometry {
+                        hidden: INKLING_HIDDEN,
+                        intermediate: INKLING_INTERMEDIATE,
+                        experts,
+                        top_k,
+                        ..PartGeometry::new()
+                    })
+                    .is_err(),
+                "the Inkling MoE entry accepted {experts} experts and top-{top_k}"
+            );
+        }
+    }
+
+    /// Dory's prompt projections are dory_mma_wide, which the arm names a dense projection;
+    /// the body was reachable only under the MLP part until this entry.
+    #[test]
+    fn dory_dense_projection_is_catalogued_under_its_own_part() {
+        use crate::plan::PartGeometry;
+
+        let entry = kernels(Part::DenseGemm, Target::Sm121)
+            .find(|entry| entry.image == Image::Dory)
+            .expect("the Dory dense-projection entry");
+        assert!(!entry.canonical);
+        for symbol in ["dory_mma_wide", "dory_mma_wide4"] {
+            assert!(
+                entry
+                    .symbols
+                    .iter()
+                    .any(|candidate| candidate.name == symbol),
+                "the Dory dense entry does not name {symbol}"
+            );
+        }
+        assert!(
+            entry
+                .shape
+                .accepts(&PartGeometry {
+                    hidden: 2560,
+                    ..PartGeometry::new()
+                })
+                .is_ok()
+        );
+    }
+
+    /// Dory's served shape resolves every part its arm launches through the catalogue.
+    #[test]
+    fn dory_served_shape_is_catalogued() {
+        use crate::plan::PartGeometry;
+
+        let served = PartGeometry {
+            hidden: 2560,
+            vocab: 131072,
+            positions: 262144,
+            heads: 16,
+            kv_heads: 4,
+            head_dim: 256,
+            groups: 4,
+            intermediate: 7168,
+            ..PartGeometry::new()
+        };
+        for (part, images) in [
+            (Part::Embedding, &[Image::Qwen4Exp][..]),
+            (Part::RmsNorm, &[Image::Dory][..]),
+            (Part::LmHead, &[Image::Dory][..]),
+            (Part::GqaAttention, &[Image::Dory][..]),
+            (Part::DenseMlp, &[Image::Dory][..]),
+            (
+                Part::DenseGemm,
+                &[Image::Qwen4Exp, Image::Qwen4Prefill, Image::Dory][..],
+            ),
+        ] {
+            for image in images {
+                let entry = kernels(part, Target::Sm121)
+                    .find(|entry| entry.image == *image)
+                    .unwrap_or_else(|| panic!("{part} has no {} entry", image.name()));
+                assert!(
+                    entry.shape.accepts(&served).is_ok(),
+                    "{} refuses Dory's served shape: {served:?}",
+                    image.name()
+                );
+            }
+        }
     }
 
     #[test]

@@ -171,6 +171,7 @@ fn hybrid() -> Architecture {
         vision: None,
         mtp: None,
         tokens: sparkflash_model::architecture::Tokens::default(),
+        layout_vars: std::collections::BTreeMap::new(),
     }
 }
 
@@ -350,7 +351,7 @@ fn the_released_nvfp4_checkpoint_opens_as_modelopt_stores_it() {
 
 fn released_family() -> Architecture {
     Architecture::from_json(
-        r#"{"model_type":"qwen4_exp","text_config":{"hidden_size":2560,"vocab_size":248320,"num_hidden_layers":1,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"layer_types":["linear_attention"],"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"hc_count":4,"hc_lowrank":320,"indexer_n_heads":4,"indexer_kv_heads":1,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}"#,
+        r#"{"model_type":"qwen4_exp","text_config":{"hidden_size":2560,"vocab_size":248320,"num_hidden_layers":1,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"layer_types":["linear_attention"],"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"hc_count":4,"hc_lowrank":320,"indexer_n_heads":4,"indexer_kv_heads":1,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4,"quantization_config":{"quant_method":"fp8","weight_block_size":[128,128]}}}"#,
     )
     .expect("a synthetic released family document parses")
 }
@@ -637,6 +638,7 @@ fn qwen36(fp8: bool) -> Architecture {
     ))
     .expect("the carried Qwen3.6 document parses");
     if !fp8 {
+        architecture.quantization.method = None;
         architecture.quantization.dense_format = WeightFormat::Bf16;
         architecture.quantization.expert_format = WeightFormat::Bf16;
         architecture.quantization.mtp_expert_format = None;
@@ -645,39 +647,16 @@ fn qwen36(fp8: bool) -> Architecture {
 }
 
 #[test]
-fn the_qwen36_bf16_plan_is_the_released_index() {
-    // Qwen/Qwen3.6-35B-A3B: 1,045 names and `metadata.total_size` 71,903,645,408. The plan
-    // reproduced the index's name set exactly when this was written; the count and the byte
-    // total pin it.
+fn the_qwen36_bf16_document_is_refused_without_its_quantization() {
+    // qwen36.toml describes the carried FP8 release. A document with the same family and no
+    // quantization is not a release this tree describes, so the canonical fallback must not
+    // silently plan a different name set in its place.
     let tp = TpPlan::new(1, 0).expect("one rank");
-    let plan = ArchitectureTensorPlan::checkpoint(&qwen36(false), tp).expect("the plan builds");
-    assert_eq!(plan.len(), 1_045);
-    assert_eq!(plan.storage_bytes(), 71_903_645_408);
-    let fused = plan
-        .spec("model.language_model.layers.0.mlp.experts.gate_up_proj")
-        .expect("the fused gate/up experts");
-    assert_eq!(fused.shape, vec![256, 1024, 2048]);
-    let down = plan
-        .spec("model.language_model.layers.0.mlp.experts.down_proj")
-        .expect("the fused down experts");
-    assert_eq!(down.shape, vec![256, 2048, 512]);
-    assert_eq!(
-        plan.spec("mtp.fc.weight")
-            .expect("the MTP projection")
-            .shape,
-        vec![2048, 4096]
-    );
-    for name in [
-        "model.language_model.norm.weight",
-        "model.language_model.layers.3.input_layernorm.weight",
-        "model.language_model.layers.3.post_attention_layernorm.weight",
-    ] {
-        assert_eq!(plan.spec(name).expect(name).shape, vec![2048], "{name}");
-    }
+    let error = ArchitectureTensorPlan::checkpoint(&qwen36(false), tp)
+        .expect_err("the BF16 document has no shipped layout");
     assert!(
-        plan.spec("model.language_model.layers.3.self_attn.indexer.index_qk_proj.weight")
-            .is_none(),
-        "full attention has no indexer"
+        error.to_string().contains("none matches this release"),
+        "{error}"
     );
 }
 

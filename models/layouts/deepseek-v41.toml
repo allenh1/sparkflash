@@ -1,0 +1,1721 @@
+# DeepSeek-V4.1-Flash layout.
+#
+# Wiring sources, in the order the layout spec gives them:
+#   * the checkpoint's own config.json (a key is named beside the fact it sets);
+#   * the tensor index (a tensor name proves the component, its dtype and its stored shape);
+#   * the producer's published reference for what neither states:
+#     inference/model.py and inference/vision.py from the released checkpoint
+#     (revision 1bae0e1088993b9b82de08f59de5be5a34e42170). The checkpoint ships those two
+#     files beside its weights; the line numbers below are that copy.
+#
+# Every shape is an arithmetic expression over a config fact or an architecture fact. The one
+# exception is the Engram table row counts: config.json carries them as a per-layer array and
+# the reader's vars are scalar, so each layer's count is written once on the entry selecting
+# that layer.
+#
+# Quantized classes, sourced from the tensor index and the arm's tensor.rs:
+#   * dense FP8: E4M3 codes with a 32x32 UE8M0 scale grid (model.py:759-761, tensor.rs dense());
+#   * routed/MTP experts: E2M1 codes with one UE8M0 scale per output row per 32 along K
+#     (dtype::expert_scale_shape, tensor.rs expert());
+#   * the Engram table and its wkv projection are E4M3 with the 32x32 grid
+#     (tensor.rs push_engram, model.py:344-345).
+
+schema = 1
+id = "deepseek-v41-flash"
+
+[match]
+architectures = ["DeepseekV41ForCausalLM"]
+model_types = ["deepseek_v41"]
+
+# Scalar shape facts whose config key is not one of the architecture's named fields. The
+# reader records each key as read, so no key is double-reported.
+[vars]
+# config.json text_config.o_groups / o_lora_rank: the grouped low-rank output geometry
+# (model.py:785-787: wo_a is [o_groups * o_lora, heads * head_dim / o_groups]).
+o_groups = { key = "text_config.o_groups" }
+o_lora = { key = "text_config.o_lora_rank" }
+
+# config.json text_config.engram_*: the table width, n-gram orders and per-order head count
+# (model.py:328-356 derives the fetched width from them).
+engram_heads = { key = "text_config.engram_n_heads" }
+engram_head_dim = { key = "text_config.engram_head_dim" }
+engram_ngram = { key = "text_config.engram_max_ngram_size" }
+
+# config.json text_config.engram_num_embeddings entries 0 and 1, for layers 1 and 14
+# (engram_layer_ids). Two scalars because the reader's vars are scalars.
+engram_rows_1 = 384006168
+engram_rows_14 = 384016682
+
+# config.json text_config.dspark_markov_rank: the Markov head's rank (model.py:1117).
+markov_rank = { key = "text_config.dspark_markov_rank" }
+
+# config.json text_config.dspark_target_layer_ids has three entries and model.py:1113 sizes
+# main_proj's input by their number. The reader has no array-length var, so the count is
+# written once here rather than repeated in the two main_proj shapes.
+mtp_targets = 3
+
+# Config keys the description decodes through this layout. A key the arm's typed parser reads
+# and the shared description has no use for is listed ignorable with the reason.
+[[keys]]
+# config.json text_config.model_type: the nested producer type, matched here only.
+path = "text_config.model_type"
+fact = "match.text_model_type"
+
+[[keys]]
+# config.json text_config.num_key_value_heads: the released KV-head count. The run is MLA, but
+# the shared attention description reads this field (it is the GQA-shaped fallback).
+path = "text_config.num_key_value_heads"
+fact = "language.attention.kv_heads"
+
+[[keys]]
+# config.json vision_config.model_type: the nested tower type, matched here only.
+path = "vision_config.model_type"
+fact = "match.vision_model_type"
+
+[[keys]]
+# config.json text_config.dspark_noise_token_id: the DSpark drafter's noise token. model.py:75
+# reads it in ModelArgs; the shared checkpoint plan does not plan the DSpark sampler.
+path = "text_config.dspark_noise_token_id"
+ignore = "the arm typed DSpark parser owns this token id; the shared checkpoint plan does not run DSpark sampling"
+
+[[keys]]
+# config.json text_config.dspark_markov_rank is carried in [vars]; this entry keeps it out of
+# the unknown-key report even when a checkpoint omits the DSpark stage.
+path = "text_config.dspark_markov_rank"
+ignore = "the key sizes the MTP Markov head; [vars] carries it as markov_rank"
+
+[[keys]]
+# config.json vision_config.max_image_tokens: the image processor's token budget. vision.py has
+# no tensor shaped by it; the processor reads it, not the tensor plan.
+path = "vision_config.max_image_tokens"
+ignore = "the image processor token budget; no tensor or tensor-plan dimension derives from it"
+
+[[keys]]
+# config.json vision_config.max_wh_ratio: the processor's aspect cap. The released document
+# stores null and no tensor shape derives from it.
+path = "vision_config.max_wh_ratio"
+ignore = "the image processor aspect cap (null in the released document); no tensor shape derives from it"
+
+[stacks.language]
+order = [
+  "rms_norm",
+  "hyper_connection",
+  "engram",
+  "mla_attention",
+  "csa2_compression",
+  "sparse_indexer",
+  "moe",
+]
+
+[stacks.draft]
+order = ["mtp"]
+
+[stacks.vision]
+order = [
+  "vision_patch_embed",
+  "vision_position",
+  "vision_norm",
+  "vision_attention",
+  "vision_mlp",
+  "vision_downsample",
+  "vision_merger",
+]
+
+# inference/vision.py:180-184: the tower has an axial rotary embedding and no learned position
+# table. The tensor index agrees: no position tensor is stored.
+[[stacks.vision.parts]]
+part = "vision_position"
+[[stacks.vision.parts.facts]]
+name = "position"
+value = "rotary"
+
+# inference/vision.py:28-36: RMSNorm with the constructor default epsilon 1e-6; the released
+# vision_config states no rms_norm_eps and the index proves RMS by norm1/norm2 weights.
+[[stacks.vision.parts]]
+part = "vision_norm"
+[[stacks.vision.parts.facts]]
+name = "norm_epsilon"
+value = 1e-6
+
+# inference/vision.py:65-80: SwiGLU (w1 -> chunk, F.silu(gate) * up, w2); the released
+# vision_config states no hidden_act.
+[[stacks.vision.parts]]
+part = "vision_mlp"
+[[stacks.vision.parts.facts]]
+name = "activation"
+value = "silu"
+
+# inference/vision.py:193-207: the Aligner is w2(F.gelu(w1(x))) with no final norm, and
+# aligner.w1 in the index proves the 3x3 unfold downsample (vision.py:199-205).
+[[stacks.vision.parts]]
+part = "vision_merger"
+[[stacks.vision.parts.facts]]
+name = "merger_activation"
+value = "gelu"
+[[stacks.vision.parts.facts]]
+name = "merger_final_norm"
+value = false
+[[stacks.vision.parts.facts]]
+name = "downsample"
+value = "unfold"
+
+# The language backbone. model.py:1204-1209 creates the final norm, model.py:1194-1203 the
+# embedding and head; tie_word_embeddings is false in the released config.
+
+[[tensor]]
+name = "embed.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "head.weight"
+part = "lm_head"
+role = "lm_head"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+
+# model.py:933-934: one RMSNorm before each branch.
+[[tensor]]
+name = "layers.{layer}.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+# model.py:939-945: mHC coefficients. mix_hc = (2 + hc_mult) * hc_mult and hc_dim =
+# hc_mult * dim; all six tensors are created inside set_dtype(torch.float32).
+[[tensor]]
+name = "layers.{layer}.hc_attn_fn"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = ["hyper_rows", "hyper_width"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.hc_attn_base"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = ["hyper_rows"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.hc_attn_scale"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = [3]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.hc_ffn_fn"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = ["hyper_rows", "hyper_width"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.hc_ffn_base"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = ["hyper_rows"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.hc_ffn_scale"
+part = "hyper_connection"
+role = "hyper"
+dtype = "f32"
+shape = [3]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+# model.py:639-644: q/k RMSNorms and the per-head learned attention sink.
+[[tensor]]
+name = "layers.{layer}.attn.q_norm.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.kv_norm.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.attn_sink"
+part = "mla_attention"
+role = "attention"
+dtype = "f32"
+shape = ["heads"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+# model.py:763-787: the MLA projections. wq_a/wq_b produce the low-rank query, wkv the
+# latent KV, wo_a/wo_b the grouped low-rank output; all five are dense FP8 with a 32x32 grid.
+[[tensor]]
+name = "layers.{layer}.attn.wq_a.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["q_lora", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wq_a.scale"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(q_lora) / 32", "(hidden) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wq_b.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["heads * head_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wq_b.scale"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(heads * head_dim) / 32", "(q_lora) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wkv.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wkv.scale"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(head_dim) / 32", "(hidden) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wo_a.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["o_groups * o_lora", "heads * head_dim / o_groups"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wo_a.scale"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(o_groups * o_lora) / 32", "(heads * head_dim / o_groups) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wo_b.weight"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["hidden", "o_groups * o_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wo_b.scale"
+part = "mla_attention"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(hidden) / 32", "(o_groups * o_lora) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+# model.py:798-809: the router matrix is BF16 (the index has no ffn.gate.scale) and its two
+# f32 biases are [routed]; bias_vl exists because the checkpoint has a vision tower.
+[[tensor]]
+name = "layers.{layer}.ffn.gate.weight"
+part = "moe"
+role = "router"
+dtype = "bf16"
+shape = ["routed", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.gate.bias"
+part = "moe"
+role = "router"
+dtype = "f32"
+shape = ["routed"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.gate.bias_vl"
+part = "moe"
+role = "router"
+dtype = "f32"
+shape = ["routed"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+# model.py:886-903: the one shared expert is a dense FP8 set (w1/w3 [shared_width, hidden],
+# w2 [hidden, shared_width]), not a routed expert.
+[[tensor]]
+name = "layers.{layer}.ffn.shared_experts.w1.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "f8e4m3"
+shape = ["shared_width", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.shared_experts.w1.scale"
+part = "moe"
+role = "shared_expert"
+dtype = "f8e8m0"
+shape = ["(shared_width) / 32", "(hidden) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.shared_experts.w2.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "f8e4m3"
+shape = ["hidden", "shared_width"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.shared_experts.w2.scale"
+part = "moe"
+role = "shared_expert"
+dtype = "f8e8m0"
+shape = ["(hidden) / 32", "(shared_width) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.shared_experts.w3.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "f8e4m3"
+shape = ["shared_width", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.shared_experts.w3.scale"
+part = "moe"
+role = "shared_expert"
+dtype = "f8e8m0"
+shape = ["(shared_width) / 32", "(hidden) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe" }
+
+# model.py:860-903: routed experts. The index stores w1/w3 as [inter, hidden/2] int8 FP4
+# and w2 as [hidden, inter/2]; the arithmetic shapes are [inter, hidden] and [hidden, inter].
+# The scale grid is one value per output row per 32 along K (dtype.rs). TP4 splits the
+# intermediate width: w1/w3 on their output rows, w2 on its input columns.
+[[tensor]]
+name = "layers.{layer}.ffn.experts.{expert}.w1.weight"
+part = "moe"
+role = "experts"
+dtype = "f4e2m1"
+shape = ["moe_intermediate", "hidden"]
+split = "rows"
+repeat = "experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.experts.{expert}.w1.scale"
+part = "moe"
+role = "experts"
+dtype = "f8e8m0"
+shape = ["moe_intermediate", "hidden / 32"]
+split = "rows"
+repeat = "experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.experts.{expert}.w2.weight"
+part = "moe"
+role = "experts"
+dtype = "f4e2m1"
+shape = ["hidden", "moe_intermediate"]
+split = "columns"
+repeat = "experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.experts.{expert}.w2.scale"
+part = "moe"
+role = "experts"
+dtype = "f8e8m0"
+shape = ["hidden", "moe_intermediate / 32"]
+split = "columns"
+repeat = "experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.experts.{expert}.w3.weight"
+part = "moe"
+role = "experts"
+dtype = "f4e2m1"
+shape = ["moe_intermediate", "hidden"]
+split = "rows"
+repeat = "experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "layers.{layer}.ffn.experts.{expert}.w3.scale"
+part = "moe"
+role = "experts"
+dtype = "f8e8m0"
+shape = ["moe_intermediate", "hidden / 32"]
+split = "rows"
+repeat = "experts"
+when = { attention = "mla", ffn = "moe" }
+
+# model.py:429-470 and config kv_source_layer_ids: the four layers that own a compressed KV.
+# compressor.wgate exists only where compress_ratios[layer] > 1 (layers 2, 8, 14).
+[[tensor]]
+name = "layers.2.attn.compressor.wkv.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [2] }
+
+[[tensor]]
+name = "layers.2.attn.compressor.norm.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [2] }
+
+[[tensor]]
+name = "layers.8.attn.compressor.wkv.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [8] }
+
+[[tensor]]
+name = "layers.8.attn.compressor.norm.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [8] }
+
+[[tensor]]
+name = "layers.14.attn.compressor.wkv.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.14.attn.compressor.norm.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.20.attn.compressor.wkv.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [20] }
+
+[[tensor]]
+name = "layers.20.attn.compressor.norm.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [20] }
+
+[[tensor]]
+name = "layers.2.attn.compressor.wgate.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [2] }
+
+[[tensor]]
+name = "layers.8.attn.compressor.wgate.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [8] }
+
+[[tensor]]
+name = "layers.14.attn.compressor.wgate.weight"
+part = "csa2_compression"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+# model.py:488-530 and config index_source_layer_ids: the eight indexer layers. Only the four
+# kv-source layers (2, 8, 14, 20) publish their own index keys (wk/k_norm).
+[[tensor]]
+name = "layers.2.attn.indexer.wq_b.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e4m3"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [2] }
+
+[[tensor]]
+name = "layers.2.attn.indexer.wq_b.scale"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e8m0"
+shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [2] }
+
+[[tensor]]
+name = "layers.2.attn.indexer.weights_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [2] }
+
+[[tensor]]
+name = "layers.8.attn.indexer.wq_b.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e4m3"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [8] }
+
+[[tensor]]
+name = "layers.8.attn.indexer.wq_b.scale"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e8m0"
+shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [8] }
+
+[[tensor]]
+name = "layers.8.attn.indexer.weights_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [8] }
+
+[[tensor]]
+name = "layers.14.attn.indexer.wq_b.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e4m3"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.14.attn.indexer.wq_b.scale"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e8m0"
+shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.14.attn.indexer.weights_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.20.attn.indexer.wq_b.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e4m3"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [20] }
+
+[[tensor]]
+name = "layers.20.attn.indexer.wq_b.scale"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e8m0"
+shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [20] }
+
+[[tensor]]
+name = "layers.20.attn.indexer.weights_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [20] }
+
+[[tensor]]
+name = "layers.24.attn.indexer.wq_b.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e4m3"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [24] }
+
+[[tensor]]
+name = "layers.24.attn.indexer.wq_b.scale"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e8m0"
+shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [24] }
+
+[[tensor]]
+name = "layers.24.attn.indexer.weights_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [24] }
+
+[[tensor]]
+name = "layers.28.attn.indexer.wq_b.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e4m3"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [28] }
+
+[[tensor]]
+name = "layers.28.attn.indexer.wq_b.scale"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e8m0"
+shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [28] }
+
+[[tensor]]
+name = "layers.28.attn.indexer.weights_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [28] }
+
+[[tensor]]
+name = "layers.32.attn.indexer.wq_b.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e4m3"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [32] }
+
+[[tensor]]
+name = "layers.32.attn.indexer.wq_b.scale"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e8m0"
+shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [32] }
+
+[[tensor]]
+name = "layers.32.attn.indexer.weights_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [32] }
+
+[[tensor]]
+name = "layers.36.attn.indexer.wq_b.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e4m3"
+shape = ["index_heads * index_dim", "q_lora"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [36] }
+
+[[tensor]]
+name = "layers.36.attn.indexer.wq_b.scale"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "f8e8m0"
+shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [36] }
+
+[[tensor]]
+name = "layers.36.attn.indexer.weights_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_heads", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [36] }
+
+[[tensor]]
+name = "layers.2.attn.indexer.wk.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim", "head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [2] }
+
+[[tensor]]
+name = "layers.2.attn.indexer.k_norm.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [2] }
+
+[[tensor]]
+name = "layers.8.attn.indexer.wk.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim", "head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [8] }
+
+[[tensor]]
+name = "layers.8.attn.indexer.k_norm.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [8] }
+
+[[tensor]]
+name = "layers.14.attn.indexer.wk.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim", "head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.14.attn.indexer.k_norm.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.20.attn.indexer.wk.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim", "head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [20] }
+
+[[tensor]]
+name = "layers.20.attn.indexer.k_norm.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [20] }
+
+# model.py:328-356 and config engram_layer_ids: the two Engram layers. Rows are the two
+# config engram_num_embeddings entries; the fetched width is
+# (engram_max_ngram_size - 1) * engram_n_heads * engram_head_dim (model.py:344-345).
+# The ops vocabulary has no Engram tensor role yet, so the table uses ple_table and the
+# projections use ple_aux; the part is engram.
+[[tensor]]
+name = "layers.1.engram.embed.weight"
+part = "engram"
+role = "ple_table"
+dtype = "f8e4m3"
+shape = ["engram_rows_1", "engram_head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [1] }
+
+[[tensor]]
+name = "layers.1.engram.embed.scale"
+part = "engram"
+role = "ple_table"
+dtype = "f8e8m0"
+shape = ["engram_rows_1", "engram_head_dim / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [1] }
+
+[[tensor]]
+name = "layers.1.engram.wkv.weight"
+part = "engram"
+role = "ple_aux"
+dtype = "f8e4m3"
+shape = ["hidden * (streams + 1)", "(engram_ngram - 1) * engram_heads * engram_head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [1] }
+
+[[tensor]]
+name = "layers.1.engram.wkv.scale"
+part = "engram"
+role = "ple_aux"
+dtype = "f8e8m0"
+shape = ["(hidden * (streams + 1)) / 32", "((engram_ngram - 1) * engram_heads * engram_head_dim) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [1] }
+
+[[tensor]]
+name = "layers.1.engram.q_weight"
+part = "engram"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["streams", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [1] }
+
+[[tensor]]
+name = "layers.1.engram.k_weight"
+part = "engram"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["streams", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [1] }
+
+[[tensor]]
+name = "layers.14.engram.embed.weight"
+part = "engram"
+role = "ple_table"
+dtype = "f8e4m3"
+shape = ["engram_rows_14", "engram_head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.14.engram.embed.scale"
+part = "engram"
+role = "ple_table"
+dtype = "f8e8m0"
+shape = ["engram_rows_14", "engram_head_dim / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.14.engram.wkv.weight"
+part = "engram"
+role = "ple_aux"
+dtype = "f8e4m3"
+shape = ["hidden * (streams + 1)", "(engram_ngram - 1) * engram_heads * engram_head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.14.engram.wkv.scale"
+part = "engram"
+role = "ple_aux"
+dtype = "f8e8m0"
+shape = ["(hidden * (streams + 1)) / 32", "((engram_ngram - 1) * engram_heads * engram_head_dim) / 32"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.14.engram.q_weight"
+part = "engram"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["streams", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+[[tensor]]
+name = "layers.14.engram.k_weight"
+part = "engram"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["streams", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "mla", ffn = "moe", layers = [14] }
+
+# model.py:1100-1160 and config num_nextn_predict_layers=3: three MTP stages. The gate,
+# experts and bias widths are the stage's 128 routed experts (dspark_n_routed_experts), not
+# the backbone's 384; the attention, hyper-connection and shared-expert widths follow the
+# backbone geometry the reference layer states.
+[[tensor]]
+name = "mtp.{stage}.attn_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.hc_attn_fn"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = ["hyper_rows", "hyper_width"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.hc_attn_base"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = ["hyper_rows"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.hc_attn_scale"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = [3]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.hc_ffn_fn"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = ["hyper_rows", "hyper_width"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.hc_ffn_base"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = ["hyper_rows"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.hc_ffn_scale"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = [3]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.q_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["q_lora"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.kv_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.attn_sink"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = ["heads"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wq_a.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["q_lora", "hidden"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wq_a.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["(q_lora) / 32", "(hidden) / 32"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wq_b.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["heads * head_dim", "q_lora"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wq_b.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["(heads * head_dim) / 32", "(q_lora) / 32"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wkv.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["head_dim", "hidden"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wkv.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["(head_dim) / 32", "(hidden) / 32"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wo_a.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["o_groups * o_lora", "heads * head_dim / o_groups"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wo_a.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["(o_groups * o_lora) / 32", "(heads * head_dim / o_groups) / 32"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wo_b.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["hidden", "o_groups * o_lora"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.attn.wo_b.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["(hidden) / 32", "(o_groups * o_lora) / 32"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.gate.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_routed", "hidden"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.gate.bias"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = ["mtp_routed"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.gate.bias_vl"
+part = "mtp"
+role = "mtp"
+dtype = "f32"
+shape = ["mtp_routed"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.shared_experts.w1.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["shared_width", "hidden"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.shared_experts.w1.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["(shared_width) / 32", "(hidden) / 32"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.shared_experts.w2.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["hidden", "shared_width"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.shared_experts.w2.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["(hidden) / 32", "(shared_width) / 32"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.shared_experts.w3.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["shared_width", "hidden"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.shared_experts.w3.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["(shared_width) / 32", "(hidden) / 32"]
+split = "whole"
+repeat = "mtp_stages"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.experts.{expert}.w1.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f4e2m1"
+shape = ["moe_intermediate", "hidden"]
+split = "rows"
+repeat = "mtp_stage_experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.experts.{expert}.w1.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["moe_intermediate", "hidden / 32"]
+split = "rows"
+repeat = "mtp_stage_experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.experts.{expert}.w2.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f4e2m1"
+shape = ["hidden", "moe_intermediate"]
+split = "columns"
+repeat = "mtp_stage_experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.experts.{expert}.w2.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["hidden", "moe_intermediate / 32"]
+split = "columns"
+repeat = "mtp_stage_experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.experts.{expert}.w3.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f4e2m1"
+shape = ["moe_intermediate", "hidden"]
+split = "rows"
+repeat = "mtp_stage_experts"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.{stage}.ffn.experts.{expert}.w3.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["moe_intermediate", "hidden / 32"]
+split = "rows"
+repeat = "mtp_stage_experts"
+when = { attention = "mla", ffn = "moe" }
+
+# model.py:1113-1118: stage 0 has main_proj/main_norm; the last stage (2) has the Markov
+# head and the confidence head. Both are outside the per-stage repeat, so each is declared
+# once with its stage spelled in the name.
+[[tensor]]
+name = "mtp.0.main_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["hidden", "mtp_targets * hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.0.main_proj.scale"
+part = "mtp"
+role = "mtp"
+dtype = "f8e8m0"
+shape = ["(hidden) / 32", "(mtp_targets * hidden) / 32"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.0.main_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.2.norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.2.markov_head.embed.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["vocab", "markov_rank"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.2.markov_head.head.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["vocab", "markov_rank"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", ffn = "moe" }
+
+[[tensor]]
+name = "mtp.2.confidence_head.proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = [1, "hidden + markov_rank"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "mla", ffn = "moe" }
+
+# inference/vision.py:1-207 and the released vision_config: 32 blocks, hidden 1024, 16 heads,
+# intermediate 2816, patch 14. The index proves patch_embed is [1024, 3*14*14], wqkv is
+# [3*1024, 1024], and the block MLP is [2*2816, 1024] / [1024, 2816].
+[[tensor]]
+name = "vision.patch_embed.proj.weight"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_in_channels * vision_frames * vision_patch * vision_patch"]
+split = "whole"
+
+[[tensor]]
+name = "vision.patch_embed.proj.bias"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "vision.blocks.{block}.norm1.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "vision.blocks.{block}.norm2.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "vision.blocks.{block}.attn.wqkv.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["3 * vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "vision.blocks.{block}.attn.wqkv.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["3 * vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "vision.blocks.{block}.attn.wo.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "vision.blocks.{block}.attn.wo.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "vision.blocks.{block}.mlp.w1.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["2 * vision_intermediate", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "vision.blocks.{block}.mlp.w2.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "vision.norm.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "aligner.w1.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["hidden", "vision_width * vision_merge * vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "aligner.w1.bias"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "aligner.w2.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["hidden", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "aligner.w2.bias"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# model.py:1220-1222: the three learned image delimiters. The resident image path reads them
+# directly; the language tensor plan never loads them, so they are claimed unloaded and placed
+# in the vision stack (there is no separate delimiter part kind).
+[[tensor]]
+name = "image_start"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+stack = "vision"
+unloaded = "the resident image path reads this delimiter directly; the language plan never loads it"
+
+[[tensor]]
+name = "image_end"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+stack = "vision"
+unloaded = "the resident image path reads this delimiter directly; the language plan never loads it"
+
+[[tensor]]
+name = "image_newline"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+stack = "vision"
+unloaded = "the resident image path reads this delimiter directly; the language plan never loads it"

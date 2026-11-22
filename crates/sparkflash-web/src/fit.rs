@@ -1249,7 +1249,12 @@ mod tests {
         );
         let tp4 = of(&fit, 4);
         assert_eq!(tp4.verdict, Verdict::Runs, "{tp4:#?}");
-        assert!(tp4.rank_weights_bytes.is_none());
+        // The layout describes the TP4 plan, so the fit can price one rank rather than
+        // leaving the bytes unmeasured.
+        assert!(
+            tp4.rank_weights_bytes.is_some_and(|bytes| bytes > 0),
+            "{tp4:#?}"
+        );
         assert!(!tp4.notes.is_empty());
         let tp1 = of(&fit, 1);
         assert_eq!(tp1.verdict, Verdict::Missing);

@@ -450,7 +450,16 @@ class CaptureTests(unittest.TestCase):
             reference = json.loads(out.read_text())
         self.assertEqual(reference["server"]["binary_sha256"], hashlib.sha256(b"the build").hexdigest())
         checkout = subprocess.run(
-            ["git", "-C", str(NUMERICS.REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+            [
+                "git",
+                "-C",
+                str(Path(NUMERICS.__file__).resolve().parent.parent),
+                "rev-parse",
+                "HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout.strip()
         # --repo defaults to this checkout, but the served card's build id is what the dump records.
         self.assertNotEqual(reference["server"]["commit"], checkout)

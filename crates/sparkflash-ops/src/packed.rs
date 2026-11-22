@@ -133,9 +133,13 @@ impl MatrixLayout for Tiled {
 /// The form's four kernels, all in the Qwen4Exp image beside `q4e_gemv_bf16`.
 #[derive(Debug, Clone, Copy)]
 pub struct Kernels {
+    /// The tile packer.
     pub pack: Kernel,
+    /// The tile unpacker.
     pub unpack: Kernel,
+    /// The single-row GEMV.
     pub gemv: Kernel,
+    /// The four-row GEMV.
     pub gemv4: Kernel,
 }
 

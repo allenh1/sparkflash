@@ -28,14 +28,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sparkflash_model::architecture::{
-    Architecture, AttentionKind, Ffn, Layer, Moe, PleGeometry, Residual, ScaleDType, Side,
-    WeightFormat,
-};
+use sparkflash_model::architecture::{Architecture, AttentionKind, Ffn, ScaleDType, WeightFormat};
 #[cfg(test)]
-use sparkflash_model::architecture::{DenseMlp, Kda};
+use sparkflash_model::architecture::{DenseMlp, Kda, Layer, Moe, PleGeometry, Residual, Side};
 use sparkflash_model::layout::{LayoutDtype, LayoutTensor, TensorSplit};
 use sparkflash_model::{TpAxis, TpPlan};
+#[cfg(test)]
 use sparkflash_weights::rng::is_prime;
 use sparkflash_weights::{DType, TensorPlan, TensorSpec};
 
@@ -220,17 +218,12 @@ impl ArchitectureTensorPlan {
         if builder.read_layout(architecture)? {
             return Ok(builder.finish());
         }
-        match architecture.family.as_str() {
-            "qwen4_exp" | "qwen3_5_moe" => builder.qwen(architecture, mtp)?,
-            _ => {
-                // A family no pack transcribes is planned in the canonical spelling; a caller
-                // holding the checkpoint plans its own spelling through [Self::named].
-                let names = NamingDialect::canonical(architecture)
-                    .names(architecture)
-                    .map_err(PlanError::Invalid)?;
-                builder.generic(architecture, &names)?;
-            }
-        }
+        // A family no pack transcribes is planned in the canonical spelling; a caller
+        // holding the checkpoint plans its own spelling through [Self::named].
+        let names = NamingDialect::canonical(architecture)
+            .names(architecture)
+            .map_err(PlanError::Invalid)?;
+        builder.generic(architecture, &names)?;
         Ok(builder.finish())
     }
 
@@ -392,6 +385,14 @@ impl Builder {
         }
     }
 
+    /// Whether this plan carries the MTP stage at this rank.
+    fn serves_mtp(&self, architecture: &Architecture) -> bool {
+        self.mtp
+            && (self.mtp_all_worlds
+                || self.tp.world() == 1
+                || architecture.mtp.as_ref().is_some_and(|mtp| mtp.replicated))
+    }
+
     fn finish(self) -> ArchitectureTensorPlan {
         ArchitectureTensorPlan {
             plan: self.plan,
@@ -407,9 +408,20 @@ impl Builder {
     /// structural reader. A layout that matches but describes no tensor is a refusal: a file
     /// exists to say what the structural reader could not.
     fn read_layout(&mut self, arch: &Architecture) -> Result<bool, PlanError> {
-        let layout = sparkflash_model::layout::matching(arch)
+        let set = sparkflash_model::layout::LayoutSet::load()
+            .map_err(|error| PlanError::Invalid(error.to_string()))?;
+        let layout = set
+            .select(arch)
             .map_err(|error| PlanError::Invalid(error.to_string()))?;
         let Some(layout) = layout else {
+            // A family with shipped layouts but no match is a release this tree does not
+            // describe, not a model to hand to the canonical fallback.
+            if set.describes_family(&arch.family) {
+                return Err(PlanError::Invalid(format!(
+                    "the tree carries layouts for family {:?}, but none matches this release's                      architectures or quantization",
+                    arch.family
+                )));
+            }
             return Ok(false);
         };
         let tensors = layout
@@ -425,7 +437,10 @@ impl Builder {
             if tensor.stack == sparkflash_model::StackKind::Vision && !self.vision {
                 continue;
             }
-            if tensor.stack == sparkflash_model::StackKind::Draft && !self.mtp {
+            if tensor.stack == sparkflash_model::StackKind::Draft && !self.serves_mtp(arch) {
+                continue;
+            }
+            if tensor.unloaded.is_some() {
                 continue;
             }
             self.layout_tensor(&tensor)?;
@@ -489,13 +504,31 @@ impl Builder {
                 })?;
                 self.expert(prefix, width, hidden, format, rows, role)?;
             }
-            LayoutDtype::Bf16 | LayoutDtype::F32 => {
-                let dtype = if tensor.dtype == LayoutDtype::Bf16 {
-                    DType::BF16
-                } else {
-                    DType::F32
+            LayoutDtype::Bf16
+            | LayoutDtype::F32
+            | LayoutDtype::F8E4M3
+            | LayoutDtype::F8E8M0
+            | LayoutDtype::F4E2M1
+            | LayoutDtype::U8
+            | LayoutDtype::I64 => {
+                let dtype = match tensor.dtype {
+                    LayoutDtype::Bf16 => DType::BF16,
+                    LayoutDtype::F32 => DType::F32,
+                    LayoutDtype::F8E4M3 => DType::F8E4M3,
+                    LayoutDtype::F8E8M0 => DType::F8E8M0,
+                    LayoutDtype::F4E2M1 => DType::F4E2M1,
+                    LayoutDtype::U8 => DType::U8,
+                    LayoutDtype::I64 => DType::I64,
+                    LayoutDtype::Dense | LayoutDtype::Expert => unreachable!(),
                 };
-                self.layout_split(&tensor.name, dtype, &tensor.shape, tensor.split, role)?;
+                self.layout_split(
+                    &tensor.name,
+                    dtype,
+                    &tensor.shape,
+                    tensor.split,
+                    tensor.tile,
+                    role,
+                )?;
             }
         }
         Ok(())
@@ -507,6 +540,7 @@ impl Builder {
         dtype: DType,
         shape: &[usize],
         split: TensorSplit,
+        tile: Option<usize>,
         role: Role,
     ) -> Result<(), PlanError> {
         match split {
@@ -533,6 +567,68 @@ impl Builder {
             TensorSplit::Conv => {
                 let [width, _, taps] = three(name, shape)?;
                 self.conv_rows(name.to_owned(), dtype, width, taps, role)
+            }
+            TensorSplit::Tiles => {
+                let [rows, columns] = two(name, shape)?;
+                let tile = tile.ok_or_else(|| {
+                    PlanError::Invalid(format!("tensor {name} has a tiles split but no tile width"))
+                })?;
+                let split = self
+                    .tp
+                    .split_tiles(columns, tile, TpAxis::Intermediate)
+                    .map_err(|error| PlanError::Invalid(error.to_string()))?;
+                self.push(
+                    name.to_owned(),
+                    dtype,
+                    vec![rows, columns],
+                    vec![rows, split.padded],
+                    Some(RankRun::tiled(split)),
+                    role,
+                );
+                Ok(())
+            }
+            TensorSplit::TileRows => {
+                let [rows, columns] = two(name, shape)?;
+                let tile = tile.ok_or_else(|| {
+                    PlanError::Invalid(format!(
+                        "tensor {name} has a tile_rows split but no tile width"
+                    ))
+                })?;
+                let split = self
+                    .tp
+                    .split_tiles(rows, tile, TpAxis::Heads)
+                    .map_err(|error| PlanError::Invalid(error.to_string()))?;
+                self.push(
+                    name.to_owned(),
+                    dtype,
+                    vec![rows, columns],
+                    vec![split.padded, columns],
+                    Some(RankRun::tiled(split)),
+                    role,
+                );
+                Ok(())
+            }
+            TensorSplit::ExpertAxis => {
+                if shape.is_empty() {
+                    return Err(PlanError::Invalid(format!(
+                        "tensor {name} has an empty expert-axis shape"
+                    )));
+                }
+                let split = self
+                    .tp
+                    .split(shape[0], TpAxis::Experts, 1)
+                    .map_err(|error| PlanError::Invalid(error.to_string()))?;
+                let mut rank = shape.to_vec();
+                rank[0] = split.padded;
+                self.push(
+                    name.to_owned(),
+                    dtype,
+                    shape.to_vec(),
+                    rank,
+                    Some(RankRun::even(split)),
+                    role,
+                );
+                Ok(())
             }
             TensorSplit::ExpertRows | TensorSplit::ExpertColumns => Err(PlanError::Invalid(
                 format!("tensor {name} has an expert split but no expert dtype"),
@@ -1162,6 +1258,7 @@ impl Builder {
         )
     }
 
+    #[cfg(test)]
     fn qwen(&mut self, arch: &Architecture, include_mtp: bool) -> Result<(), PlanError> {
         let hidden = arch.hidden_size;
         let Some(reference) = arch.layers.first() else {
@@ -1320,12 +1417,7 @@ impl Builder {
                 }
             }
         }
-        if include_mtp
-            && self.mtp
-            && (self.mtp_all_worlds
-                || self.tp.world() == 1
-                || arch.mtp.as_ref().is_some_and(|mtp| mtp.replicated))
-        {
+        if include_mtp && self.serves_mtp(arch) {
             self.qwen_mtp(arch, hidden, hyper_width, dense)?;
         }
         if self.vision {
@@ -1335,6 +1427,7 @@ impl Builder {
     }
 
     /// A plain-residual layer's two pre-norms.
+    #[cfg(test)]
     fn qwen_branch_norms(&mut self, prefix: &str, hidden: usize, role: Role) {
         for name in ["input_layernorm", "post_attention_layernorm"] {
             self.whole(
@@ -1350,6 +1443,7 @@ impl Builder {
     ///
     /// `stage` is the MTP role: an MTP block keeps every tensor whole, because a multi-rank
     /// serve replicates the stage rather than splitting it.
+    #[cfg(test)]
     fn qwen_moe(
         &mut self,
         prefix: &str,
@@ -1422,6 +1516,7 @@ impl Builder {
     ///
     /// A rank's share of the fused gate/up axis is two runs (its gate rows and its up rows), not
     /// one, so that tensor reports no run; the down projection's share is one run of columns.
+    #[cfg(test)]
     fn qwen_fused_experts(
         &mut self,
         prefix: &str,
@@ -1452,6 +1547,7 @@ impl Builder {
 
     /// A Gated DeltaNet branch. The three wide projections take the dense format; the decay and
     /// beta projections, the convolution and the norms stay BF16 in every release.
+    #[cfg(test)]
     fn qwen_gdn(
         &mut self,
         p: &str,
@@ -1522,6 +1618,7 @@ impl Builder {
     /// head, so it is twice the attention width. Qwen3.8's sparse layers add the QSA indexer.
     ///
     /// `stage` is the MTP role, under which every tensor stays whole.
+    #[cfg(test)]
     fn qwen_gqa(
         &mut self,
         p: &str,
@@ -1593,6 +1690,7 @@ impl Builder {
         }
         Ok(())
     }
+    #[cfg(test)]
     fn qwen_hyper(
         &mut self,
         prefix: &str,
@@ -1631,6 +1729,7 @@ impl Builder {
         }
     }
 
+    #[cfg(test)]
     fn qwen_mtp(
         &mut self,
         arch: &Architecture,
@@ -1757,6 +1856,7 @@ impl Builder {
         Ok(())
     }
 
+    #[cfg(test)]
     fn qwen_vision(&mut self, arch: &Architecture) -> Result<(), PlanError> {
         let Some(vision) = &arch.vision else {
             return Ok(());
@@ -1968,7 +2068,7 @@ impl Builder {
                 )?,
             }
         }
-        if include_mtp && self.mtp {
+        if include_mtp && self.serves_mtp(arch) {
             self.oracle_mtp(arch, hidden)?;
         }
         if self.vision {
@@ -2471,7 +2571,42 @@ impl TensorClaims {
     /// As [ArchitectureTensorPlan::checkpoint].
     pub fn from_checkpoint(architecture: &Architecture, tp: TpPlan) -> Result<Self, PlanError> {
         let plan = ArchitectureTensorPlan::checkpoint(architecture, tp)?;
-        Ok(Self::from_specs(plan.specs().to_vec()))
+        let mut specs = plan.specs().to_vec();
+        // A stored-but-unloaded tensor is not a plan member, but the index still holds it: the
+        // claim set must name it or the scan reports it unclaimed.
+        if let Some(layout) = sparkflash_model::layout::matching(architecture)
+            .map_err(|error| PlanError::Invalid(error.to_string()))?
+        {
+            for tensor in layout
+                .tensors(architecture)
+                .map_err(|error| PlanError::Invalid(error.to_string()))?
+            {
+                if tensor.unloaded.is_none() || specs.iter().any(|spec| spec.name == tensor.name) {
+                    continue;
+                }
+                let dtype = match tensor.dtype {
+                    LayoutDtype::Bf16 => DType::BF16,
+                    LayoutDtype::F32 => DType::F32,
+                    LayoutDtype::F8E4M3 => DType::F8E4M3,
+                    LayoutDtype::F8E8M0 => DType::F8E8M0,
+                    LayoutDtype::F4E2M1 => DType::F4E2M1,
+                    LayoutDtype::U8 => DType::U8,
+                    LayoutDtype::I64 => DType::I64,
+                    LayoutDtype::Dense | LayoutDtype::Expert => {
+                        return Err(PlanError::Invalid(format!(
+                            "unloaded tensor {} names a checkpoint-derived dtype; the claim set                              needs an explicit one",
+                            tensor.name
+                        )));
+                    }
+                };
+                specs.push(TensorSpec {
+                    name: tensor.name,
+                    dtype,
+                    shape: tensor.shape,
+                });
+            }
+        }
+        Ok(Self::from_specs(specs))
     }
 
     /// A claim set over the given specs, in the given order.
@@ -2780,6 +2915,7 @@ fn stem(name: &str) -> Result<&str, PlanError> {
         .ok_or_else(|| PlanError::Invalid(format!("{name} is not a weight the plan can scale")))
 }
 
+#[cfg(test)]
 fn hyper_or_plain(layer: &Layer) -> Option<&sparkflash_model::architecture::HyperConnection> {
     match &layer.residual {
         Residual::Hyper(hyper) => Some(hyper),
@@ -2790,6 +2926,7 @@ fn hyper_or_plain(layer: &Layer) -> Option<&sparkflash_model::architecture::Hype
 /// Qwen's official FP8 releases store one BF16 inverse scale a 128x128 tile, for the dense
 /// projections and the experts alike, whatever scale dtype the quantization table names for the
 /// same arithmetic.
+#[cfg(test)]
 fn qwen_dense_format(format: WeightFormat) -> WeightFormat {
     match format {
         WeightFormat::Fp8Tile {
@@ -2808,6 +2945,7 @@ fn qwen_dense_format(format: WeightFormat) -> WeightFormat {
 }
 
 /// The routed experts' stored format, with Qwen's BF16 tile scale.
+#[cfg(test)]
 fn qwen_expert_format(format: WeightFormat) -> ExpertFormat {
     match ExpertFormat::of(format) {
         ExpertFormat::Fp8 { block, .. } => ExpertFormat::Fp8 {
@@ -2829,6 +2967,7 @@ fn hyper_of(layer: &Layer) -> Result<&sparkflash_model::architecture::HyperConne
     }
 }
 
+#[cfg(test)]
 fn ple_padded_rows(ple: &PleGeometry) -> u64 {
     let heads = ple.ngram_size.saturating_sub(1) * ple.heads_per_ngram;
     let mut offset = 0u64;
@@ -2924,6 +3063,108 @@ mod layout_equality {
             );
         }
         out
+    }
+
+    fn family_reference(arch: &Architecture, tp: TpPlan) -> ArchitectureTensorPlan {
+        let mut builder = Builder::new(tp, true, true, true);
+        let dense = arch.quantization.dense_format;
+        let experts = arch.quantization.expert_format;
+        builder.dense_format = dense;
+        builder.expert_format = if matches!(experts, WeightFormat::Bf16)
+            && matches!(dense, WeightFormat::Fp8Tile { .. })
+        {
+            dense
+        } else {
+            experts
+        };
+        builder.qwen(arch, true).expect("the reference planner");
+        builder.finish()
+    }
+
+    #[test]
+    fn the_second_worked_layout_reproduces_the_family_planner() {
+        let cases = [
+            (
+                "nvfp4",
+                include_str!(
+                    "../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json"
+                ),
+                false,
+                false,
+            ),
+            (
+                "fp8",
+                include_str!(
+                    "../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_fp8.hf.json"
+                ),
+                true,
+                false,
+            ),
+            (
+                "plain-fp8",
+                include_str!("../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json"),
+                false,
+                true,
+            ),
+        ];
+        for (label, text, experts_only, weight_only) in cases {
+            let mut architecture = Architecture::from_json(text).expect("the carried config");
+            if experts_only {
+                architecture.experts_only_fp8();
+            }
+            if weight_only {
+                architecture.weight_only_fp8();
+            }
+            // Both Qwen families are served at one rank, but the layout's tile splits must
+            // still reproduce the reference planner at every world.
+            for world in [1usize, 2, 4] {
+                let tp = TpPlan::for_architecture(&architecture, world, 0).expect("a TP plan");
+                let expected = family_reference(&architecture, tp);
+                let actual = ArchitectureTensorPlan::checkpoint(&architecture, tp)
+                    .expect("the layout checkpoint plan");
+                let want = table(&expected);
+                let have = table(&actual);
+                let missing: Vec<&String> = want
+                    .keys()
+                    .filter(|name| !have.contains_key(*name))
+                    .collect();
+                let extra: Vec<&String> = have
+                    .keys()
+                    .filter(|name| !want.contains_key(*name))
+                    .collect();
+                assert!(
+                    missing.is_empty() && extra.is_empty(),
+                    "{label} TP{world}: missing {} {:?}, extra {} {:?}",
+                    missing.len(),
+                    &missing[..missing.len().min(8)],
+                    extra.len(),
+                    &extra[..extra.len().min(8)],
+                );
+                for (name, expected) in &want {
+                    let actual = &have[name];
+                    assert_eq!(
+                        expected.0, actual.0,
+                        "{label} TP{world}: {name} stored dtype differs"
+                    );
+                    assert_eq!(
+                        expected.1, actual.1,
+                        "{label} TP{world}: {name} logical shape differs"
+                    );
+                    assert_eq!(
+                        expected.2, actual.2,
+                        "{label} TP{world}: {name} rank shape differs"
+                    );
+                    assert_eq!(
+                        expected.3, actual.3,
+                        "{label} TP{world}: {name} rank run differs"
+                    );
+                    assert_eq!(
+                        expected.4, actual.4,
+                        "{label} TP{world}: {name} role differs"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

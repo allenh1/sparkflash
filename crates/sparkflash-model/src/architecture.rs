@@ -25,6 +25,7 @@
 //! op plans; this document only says which parts a layer is made of.
 
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::config::{ConfigError, OneOrMany};
 use crate::coverage::{ConfigCoverage, entries, read_key, with_recording};
@@ -66,6 +67,8 @@ pub struct Architecture {
     pub tokens: Tokens,
     /// Inkling-2's relative-attention and block-residual geometry, when the release is one.
     pub inkling: Option<Inkling>,
+    /// Shape facts a matching layout resolved from config keys, by layout name.
+    pub layout_vars: BTreeMap<String, i64>,
 }
 
 /// The Inkling-2 text stack geometry that has no equivalent in the other releases.
@@ -1031,6 +1034,7 @@ impl Architecture {
             mtp,
             tokens,
             inkling,
+            layout_vars: BTreeMap::new(),
         })
     }
 
@@ -4590,13 +4594,17 @@ mod tests {
     #[test]
     fn the_released_parses_are_pinned_and_switch_nothing_on() {
         let pinned = [
-            0x0a9d_f00c_70fd_a130_u64,
-            0xbf31_362c_fd8a_5fc0,
-            0xeebb_ad76_01e9_edcb,
-            0x51eb_2882_3661_fe8f,
-            0xe909_cbc5_be7c_75db,
-            0xd5e4_aaab_5c0c_6990,
-            0xb355_0c20_34b7_3f01,
+            0x0015_f435_9a0c_13fd_u64,
+            // Dory's layout supplies layout_vars (the attention and MLP widths), so its
+            // parse carries those four facts and does not hash at the field's default.
+            0xd4f9_c4d2_70fa_cf05,
+            0x0d35_642d_b843_4b20,
+            // Inkling's layout learns the tower's learned-grid position, LayerNorm and
+            // erf-GELU wiring, and its [vars] resolve the MTP and convolution shape facts.
+            0xd274_49af_f7ed_a43d,
+            0xe179_2f8b_9972_febb,
+            0x6989_36fa_e0f3_fa07,
+            0x4810_320b_c6c3_a5a8,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");

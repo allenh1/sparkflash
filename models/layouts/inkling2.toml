@@ -1,0 +1,1617 @@
+# Inkling-2-Small layout.
+#
+# Sources, in the order the layout spec gives them:
+#   * config.json: text_config, vision_config and mtp_config;
+#   * the tensor index: every stored name, dtype and shape in model-*.safetensors and
+#     mtp.safetensors (1854 tensors);
+#   * the arm crate crates/sparkflash-model-inkling2, which runs the released checkpoint today
+#     and is the only published reference code for this producer: src/tensor.rs (names, shapes,
+#     rank splits), src/vision.rs (tower wiring and arithmetic) and src/config.rs (typed
+#     geometry). There is no reference/ directory for this producer.
+#
+# Every shape is an expression over the reader's facts or the [vars] below, which read their
+# config keys.
+
+schema = 1
+id = "inkling2-small"
+
+[match]
+# config.json architectures and model_type. This is the only family-string comparison.
+architectures = ["Inkling2ForConditionalGeneration"]
+model_types = ["inkling2"]
+
+[vars]
+# A shape fact the reader does not derive. Each key is claimed by this layout.
+sconv_kernel = { key = "text_config.sconv_kernel_size" }
+d_rel = { key = "text_config.d_rel" }
+rel_extent = { key = "text_config.rel_extent" }
+vision_posemb_grid = { key = "vision_config.posemb_grid_size", default = 32 }
+mtp_hidden = { key = "mtp_config.hidden_size", default = 4608 }
+mtp_heads = { key = "mtp_config.num_attention_heads", default = 48 }
+mtp_kv_heads = { key = "mtp_config.num_key_value_heads", default = 8 }
+mtp_head_dim = { key = "mtp_config.head_dim", default = 128 }
+mtp_intermediate = { key = "mtp_config.intermediate_size", default = 18432 }
+mtp_markov_rank = { key = "mtp_config.markov_rank", default = 256 }
+mtp_block = { key = "mtp_config.block_size", default = 8 }
+
+[[keys]]
+# config.json text_config.q_bias.
+path = "text_config.q_bias"
+ignore = "text_config.q_bias is false: no query bias tensor exists in the index, and the shared attention description reads its bias switch from the root attention_bias key; the arm's typed parser keeps this per-projection switch"
+
+[[keys]]
+# config.json text_config.o_bias.
+path = "text_config.o_bias"
+ignore = "text_config.o_bias is false: no output-projection bias tensor exists in the index; the shared attention description has no per-projection bias field, and the arm's typed parser keeps the switch"
+
+[[keys]]
+# config.json text_config.pre_norm_pre_affine.
+path = "text_config.pre_norm_pre_affine"
+ignore = "text_config.pre_norm_pre_affine is false, so the pre-norm is a plain RMSNorm; the shared description has no pre-affine field to carry a true value and the arm's typed parser keeps it"
+
+[[keys]]
+# config.json text_config.final_norm_pre_affine.
+path = "text_config.final_norm_pre_affine"
+ignore = "text_config.final_norm_pre_affine is false, so the final norm is a plain RMSNorm; the shared description has no pre-affine field and the arm's typed parser keeps it"
+
+[[keys]]
+# config.json text_config.swa_head_dim.
+path = "text_config.swa_head_dim"
+ignore = "the sliding layers' head width (128) equals text_config.head_dim, which the shared reader already reads; the arm's typed parser keeps the sliding spelling"
+
+[[keys]]
+# config.json text_config.swa_num_attention_heads.
+path = "text_config.swa_num_attention_heads"
+ignore = "the sliding layers' query-head count (48) equals text_config.num_attention_heads, which the shared reader already reads; the arm's typed parser keeps the sliding spelling"
+
+[[keys]]
+# config.json text_config.swa_num_key_value_heads.
+path = "text_config.swa_num_key_value_heads"
+ignore = "the sliding layers' key/value-head count (8) equals text_config.num_key_value_heads, which the shared reader already reads; the arm's typed parser keeps the sliding spelling"
+
+[[keys]]
+# config.json text_config.use_gate_bias.
+path = "text_config.use_gate_bias"
+ignore = "true here, and proved by the stored model.llm.layers.*.mlp.gate.bias tensor; the router bias is claimed as its own tensor below and the shared MoE description selects its bias from the tensor name, so the switch itself is not read"
+
+[[keys]]
+# config.json vision_config.projector_bias.
+path = "vision_config.projector_bias"
+ignore = "false here, and proved by the stored proj_in/proj_out tensors having no bias; the shared vision description learns the merger from the layout facts below and has no projector-bias field"
+
+[[keys]]
+# config.json mtp_config.max_position_embeddings.
+path = "mtp_config.max_position_embeddings"
+ignore = "the MTP stage's context limit is not arithmetic the draft stack executes in the shared description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.q_bias.
+path = "mtp_config.q_bias"
+ignore = "false: the MTP stage stores no q_proj bias in mtp.safetensors; the arm's typed parser keeps the switch"
+
+[[keys]]
+# config.json mtp_config.o_bias.
+path = "mtp_config.o_bias"
+ignore = "false: the MTP stage stores no o_proj bias in mtp.safetensors; the arm's typed parser keeps the switch"
+
+[[keys]]
+# config.json mtp_config.rms_norm_eps.
+path = "mtp_config.rms_norm_eps"
+ignore = "the MTP stage's 1e-6 RMS epsilon is not a field of the shared draft description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.rope_theta.
+path = "mtp_config.rope_theta"
+ignore = "the MTP stage's 1e6 rotary base is not a field of the shared draft description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.local_layer_ids.
+path = "mtp_config.local_layer_ids"
+ignore = "the MTP stage's sliding-layer schedule is not a field of the shared draft description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.sliding_window_size.
+path = "mtp_config.sliding_window_size"
+ignore = "the MTP stage's 1024-token window is not a field of the shared draft description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.markov_head_type.
+path = "mtp_config.markov_head_type"
+ignore = "the MTP stage's rnn_hidden Markov head is a stage-only wiring fact; the shared draft description has no field for it and the arm's typed parser keeps it"
+
+[stacks.language]
+# src/tensor.rs:265-520: each layer is mlp_norm, the attention branch, the MLP/router, inside
+# the block-attention residual, with a short convolution on both branches.
+order = [
+  "embedding",
+  "rms_norm",
+  "lm_head",
+  "block_attention_residual",
+  "gqa_attention",
+  "relative_attention",
+  "short_conv",
+  "moe",
+  "softcapped_activation",
+]
+
+[stacks.draft]
+order = ["mtp"]
+
+[stacks.vision]
+# src/vision.rs:381-470: patch embedding, learned position grid, LayerNorm blocks, axial rotary
+# attention, erf-GELU MLP, proj_in -> erf-GELU -> proj_out merger.
+order = [
+  "vision_patch_embed",
+  "vision_position",
+  "vision_norm",
+  "vision_attention",
+  "vision_mlp",
+  "vision_merger",
+]
+
+# src/vision.rs:208-235 and 397-408: the tower stores a learned 32x32 grid and no rotary base.
+[[stacks.vision.parts]]
+part = "vision_position"
+[[stacks.vision.parts.facts]]
+name = "position"
+value = "grid"
+
+# src/vision.rs:554-630: LayerNorm blocks with layer scale; attention has a bias, no qk norm,
+# and axial rotary; the MLP is exact erf-GELU.
+[[stacks.vision.parts]]
+part = "vision_norm"
+[[stacks.vision.parts.facts]]
+name = "norm"
+value = "layer"
+[[stacks.vision.parts.facts]]
+name = "norm_epsilon"
+value = { key = "vision_config.layer_norm_eps", default = 1e-5 }
+
+[[stacks.vision.parts]]
+part = "vision_attention"
+[[stacks.vision.parts.facts]]
+name = "attention_bias"
+value = true
+[[stacks.vision.parts.facts]]
+name = "qk_norm"
+value = false
+
+[[stacks.vision.parts]]
+part = "vision_mlp"
+[[stacks.vision.parts.facts]]
+name = "activation"
+value = "gelu_erf"
+
+# src/vision.rs:637-642 and 675-680: one projection per merge cell, erf-GELU, then the output
+# projection; no final norm and no separate downsample (the four patches are concatenated).
+[[stacks.vision.parts]]
+part = "vision_merger"
+[[stacks.vision.parts.facts]]
+name = "merger_activation"
+value = "gelu_erf"
+[[stacks.vision.parts.facts]]
+name = "merger_final_norm"
+value = false
+[[stacks.vision.parts.facts]]
+name = "downsample"
+value = "merge"
+
+[[stacks.language.parts]]
+part = "block_attention_residual"
+[[stacks.language.parts.facts]]
+name = "layers_per_block"
+value = { key = "text_config.n_layers_per_attn_res_block" }
+[[stacks.language.parts.facts]]
+name = "sliding_queries"
+value = 1
+[[stacks.language.parts.facts]]
+name = "full_queries"
+value = 3
+[[stacks.language.parts.facts]]
+name = "mlp_queries"
+value = 1
+[[stacks.language.parts.facts]]
+name = "normalize"
+value = { key = "text_config.attn_res_normalize_values" }
+
+[[stacks.language.parts]]
+part = "gqa_attention"
+[[stacks.language.parts.facts]]
+name = "relative_bias"
+value = true
+[[stacks.language.parts.facts]]
+name = "attention_sink"
+value = true
+[[stacks.language.parts.facts]]
+name = "output_gate"
+value = true
+[[stacks.language.parts.facts]]
+name = "qk_l2_clip"
+value = { key = "text_config.qk_l2_clip_threshold" }
+[[stacks.language.parts.facts]]
+name = "rel_l2_clip"
+value = { key = "text_config.rel_l2_clip_threshold" }
+
+[[stacks.language.parts]]
+part = "relative_attention"
+[[stacks.language.parts.facts]]
+name = "width"
+value = { key = "text_config.d_rel" }
+[[stacks.language.parts.facts]]
+name = "extent"
+value = { key = "text_config.rel_extent" }
+
+[[stacks.language.parts]]
+part = "short_conv"
+[[stacks.language.parts.facts]]
+name = "kernel"
+value = { key = "text_config.sconv_kernel_size" }
+
+[[stacks.language.parts]]
+part = "moe"
+[[stacks.language.parts.facts]]
+name = "routed"
+value = { key = "text_config.n_routed_experts" }
+[[stacks.language.parts.facts]]
+name = "active"
+value = { key = "text_config.num_experts_per_tok" }
+
+[[stacks.language.parts]]
+part = "softcapped_activation"
+[[stacks.language.parts.facts]]
+name = "gate_softcap"
+value = { key = "text_config.mlp_gate_softcap" }
+[[stacks.language.parts.facts]]
+name = "up_softcap"
+value = { key = "text_config.mlp_up_softcap" }
+
+# src/tensor.rs:204-227: embedding, norms and untied head; the vocabulary axis is a rows split.
+
+[[tensor]]
+name = "model.llm.embed.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.llm.embed_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.unembed.weight"
+part = "lm_head"
+role = "lm_head"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "rows"
+
+# src/tensor.rs:228-263: one output query; bank b belongs to layer b+1, three queries for a full layer and one for a sliding layer.
+
+[[tensor]]
+name = "model.llm.attn_res.output_query"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.0"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.1"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.2"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.3"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.4"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.5"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.6"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.7"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.8"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.9"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.10"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.11"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.12"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.13"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.14"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.15"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.16"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.17"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.18"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.19"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.20"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.21"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.22"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.23"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.24"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.25"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.26"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.27"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.28"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.29"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.30"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.31"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.32"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.33"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.34"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.35"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.36"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.37"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.38"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.39"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.40"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.41"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.42"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.43"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.44"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.45"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.46"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+# src/tensor.rs:256-263: one MLP query per layer.
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.{layer}"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+
+# src/tensor.rs:291-302: every layer has static attention and MLP short convolutions (text_config.sconv_kernel_size).
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "1", "sconv_kernel"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "1", "sconv_kernel"]
+split = "whole"
+repeat = "layers"
+
+# src/tensor.rs:303-362: fused query/dual, key/value, output, relative, gate and sink projections and the two L2 clip scales.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wq_du.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads * head_dim", "hidden"]
+split = "rows"
+repeat = "layers"
+
+# src/tensor.rs:861-875: key/value projections split on the key/value-head axis.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wk_dv.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wv_dv.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+
+# src/tensor.rs:849-851: output projection splits its query-width columns.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wo_ud.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "heads * head_dim"]
+split = "columns"
+repeat = "layers"
+
+# src/tensor.rs:327-332: the relative bank is [heads * d_rel, hidden].
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wr_du.weight"
+part = "relative_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads * d_rel", "hidden"]
+split = "rows"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.gate_attn.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads * head_dim", "hidden"]
+split = "rows"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.attn_sink_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads", "hidden"]
+split = "rows"
+repeat = "layers"
+
+# src/tensor.rs:345-350: d_rel x rel_extent.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.rel_logits_proj.proj"
+part = "relative_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["d_rel", "rel_extent"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.q_l2_clip.scale"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads", "head_dim"]
+split = "rows"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.rel_l2_clip.scale"
+part = "relative_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads", "d_rel"]
+split = "rows"
+repeat = "layers"
+
+# src/tensor.rs:390-401: the router and its f32 correction bias are replicated.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.gate.weight"
+part = "moe"
+role = "router"
+dtype = "bf16"
+shape = ["routed", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.gate.bias"
+part = "moe"
+role = "router"
+dtype = "f32"
+shape = ["routed"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+# src/tensor.rs:274-290: a sliding layer has one attn_norm; a full layer has q/k/v input norms instead.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+when = { layers = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.q_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+when = { layers = [5, 11, 17, 23, 29, 35, 41, 47] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.k_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+when = { layers = [5, 11, 17, 23, 29, 35, 41, 47] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.v_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+when = { layers = [5, 11, 17, 23, 29, 35, 41, 47] }
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "1", "sconv_kernel"]
+split = "conv"
+repeat = "layers"
+when = { layers = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "1", "sconv_kernel"]
+split = "conv"
+repeat = "layers"
+when = { layers = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46] }
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.k_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["sconv_kernel", "kv_heads * head_dim"]
+split = "columns"
+repeat = "layers"
+when = { layers = [5, 11, 17, 23, 29, 35, 41, 47] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.v_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["sconv_kernel", "kv_heads * head_dim"]
+split = "columns"
+repeat = "layers"
+when = { layers = [5, 11, 17, 23, 29, 35, 41, 47] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.k_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * sconv_kernel", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { layers = [5, 11, 17, 23, 29, 35, 41, 47] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.v_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * sconv_kernel", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { layers = [5, 11, 17, 23, 29, 35, 41, 47] }
+
+# The NVFP4 layers 0-39 (hf_quant_config.json model.parameter_groups, nvfp4) store a stacked expert tensor: [experts, 2 * intermediate, hidden / 2] packed bytes (src/tensor.rs:402-458).
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w13_weight"
+part = "moe"
+role = "experts"
+dtype = "u8"
+shape = ["routed", "2 * intermediate", "hidden / 2"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] }
+
+# The per-16-column NVFP4 block scale, a byte a block (src/tensor.rs:424-434).
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w13_weight_scale"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["routed", "2 * intermediate", "hidden / 16"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w13_weight_amax"
+part = "moe"
+role = "experts"
+dtype = "f32"
+shape = ["routed"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w13_weight_outer_scale_denominator"
+part = "moe"
+role = "experts"
+dtype = "f32"
+shape = ["1"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe", layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w2_weight"
+part = "moe"
+role = "experts"
+dtype = "u8"
+shape = ["routed", "hidden", "intermediate / 2"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w2_weight_scale"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["routed", "hidden", "intermediate / 16"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w2_weight_amax"
+part = "moe"
+role = "experts"
+dtype = "f32"
+shape = ["routed"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w2_weight_outer_scale_denominator"
+part = "moe"
+role = "experts"
+dtype = "f32"
+shape = ["1"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe", layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39] }
+
+# The MXFP8 layers 40-47 store a byte a column and a ue8m0 scale every 32 (src/tensor.rs:460-491).
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w13_weight"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["routed", "2 * intermediate", "hidden"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [40, 41, 42, 43, 44, 45, 46, 47] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w13_weight_scale"
+part = "moe"
+role = "experts"
+dtype = "u8"
+shape = ["routed", "2 * intermediate", "hidden / 32"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [40, 41, 42, 43, 44, 45, 46, 47] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w2_weight"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["routed", "hidden", "intermediate"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [40, 41, 42, 43, 44, 45, 46, 47] }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.experts.w2_weight_scale"
+part = "moe"
+role = "experts"
+dtype = "u8"
+shape = ["routed", "hidden", "intermediate / 32"]
+split = "expert_axis"
+repeat = "layers"
+when = { ffn = "moe", layers = [40, 41, 42, 43, 44, 45, 46, 47] }
+
+# src/vision.rs:390-396: the temporal axis is folded, so the stored width is three channels times the square patch.
+
+[[tensor]]
+name = "model.visual.backbone.embeddings.patch_embedding.weight"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "3 * vision_patch * vision_patch"]
+split = "whole"
+
+# src/vision.rs:397-404: a learned square position grid, resampled per image.
+
+[[tensor]]
+name = "model.visual.backbone.embeddings.position_embedding"
+part = "vision_position"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_posemb_grid * vision_posemb_grid", "vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.backbone.embeddings.class_embedding"
+part = "vision_position"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.backbone.embeddings.cls_position_embedding"
+part = "vision_position"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+# src/vision.rs:554-563: a LayerNorm before the blocks.
+
+[[tensor]]
+name = "model.visual.backbone.ln_pre.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.backbone.ln_pre.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+# src/vision.rs:560-630: each block is LayerNorm -> attention with layer scale, then LayerNorm -> GELU MLP with layer scale.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ln_1.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ln_1.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:560-630: each block is LayerNorm -> attention with layer scale, then LayerNorm -> GELU MLP with layer scale.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ln_2.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ln_2.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:599-615: the residual is x + ls * branch.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ls_1.gamma"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:599-615: the residual is x + ls * branch.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ls_2.gamma"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:566-595: full-width projections with a bias and no qk norm.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.q_proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.q_proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:566-595: full-width projections with a bias and no qk norm.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.k_proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.k_proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:566-595: full-width projections with a bias and no qk norm.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.v_proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.v_proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:566-595: full-width projections with a bias and no qk norm.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.out_proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.out_proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:616-626: c_fc -> erf-GELU -> c_proj.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.mlp.c_fc.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.mlp.c_fc.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.mlp.c_proj.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.mlp.c_proj.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:637-642 and 675-680: four patches per cell are concatenated, proj_in -> erf-GELU -> proj_out.
+
+[[tensor]]
+name = "model.visual.proj_in.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_projection", "vision_width * vision_merge * vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.proj_out.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out", "vision_projection"]
+split = "whole"
+
+# mtp.safetensors: the stage's own tensors, named without the backbone's model.llm prefix (src/tensor.rs:645-693).
+
+[[tensor]]
+name = "fuse_weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden", "mtp_hidden * 2"]
+split = "whole"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.dflare_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.input_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.post_attention_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.mlp.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden", "mtp_intermediate"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.mlp.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_intermediate", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.mlp.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_intermediate", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.k_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_head_dim"]
+split = "whole"
+repeat = "mtp_stages"
+
+# mtp.safetensors header: the released stage stores a context copy beside the plain
+# projection; the arm's converter does not plan it. {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.k_norm_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_head_dim"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.k_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_kv_heads * mtp_head_dim", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# mtp.safetensors header: the released stage stores a context copy beside the plain
+# projection; the arm's converter does not plan it. {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.k_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_kv_heads * mtp_head_dim", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_intermediate", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+[[tensor]]
+name = "layers.{stage}.self_attn.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_intermediate", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+[[tensor]]
+name = "layers.{stage}.self_attn.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden", "mtp_intermediate"]
+split = "whole"
+repeat = "mtp_stages"
+
+[[tensor]]
+name = "layers.{stage}.self_attn.o_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden", "mtp_heads * mtp_head_dim"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.q_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_head_dim"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.q_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_heads * mtp_head_dim", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.v_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_kv_heads * mtp_head_dim", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# mtp.safetensors header: the released stage stores a context copy beside the plain
+# projection; the arm's converter does not plan it. {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.v_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_kv_heads * mtp_head_dim", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+# mtp.safetensors header: the stage's shared Markov head and mask; config.json mtp_config.markov_rank sizes it.
+
+[[tensor]]
+name = "markov_head.dflare_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden"]
+split = "whole"
+
+# mtp.safetensors header: the stage's shared Markov head and mask; config.json mtp_config.markov_rank sizes it.
+
+[[tensor]]
+name = "markov_head.hidden_out.bias"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden"]
+split = "whole"
+
+# mtp.safetensors header: the stage's shared Markov head and mask; config.json mtp_config.markov_rank sizes it.
+
+[[tensor]]
+name = "markov_head.hidden_out.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden", "mtp_markov_rank"]
+split = "whole"
+
+# mtp.safetensors header: the stage's shared Markov head and mask; config.json mtp_config.markov_rank sizes it.
+
+[[tensor]]
+name = "markov_head.markov_w1.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["vocab", "mtp_markov_rank"]
+split = "whole"
+
+# mtp.safetensors header: the stage's shared Markov head and mask; config.json mtp_config.markov_rank sizes it.
+
+[[tensor]]
+name = "markov_head.rnn_proj.bias"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["3 * mtp_markov_rank"]
+split = "whole"
+
+# mtp.safetensors header: the stage's shared Markov head and mask; config.json mtp_config.markov_rank sizes it.
+
+[[tensor]]
+name = "markov_head.rnn_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["3 * mtp_markov_rank", "2 * mtp_hidden + 2 * mtp_markov_rank"]
+split = "whole"
+
+# mtp.safetensors header: the stage's shared Markov head and mask; config.json mtp_config.markov_rank sizes it.
+
+[[tensor]]
+name = "mask_embed"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden"]
+split = "whole"
+
+# mtp.safetensors header: the stage's shared Markov head and mask; config.json mtp_config.markov_rank sizes it.
+
+[[tensor]]
+name = "norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden"]
+split = "whole"

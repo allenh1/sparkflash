@@ -36,6 +36,10 @@
 //! [replay] is the gate: a fixed workload, an injected clock and a committed trace. The
 //! scheduler's time-based decisions are compared as decisions, never as wall time.
 
+// The trace and scheduler bookkeeping types below are internal to the runtime; their fields are
+// described by the module and are not part of a public API contract.
+#![allow(missing_docs)]
+
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
 /// Steps of the decoding members between two parts of a prompt (`--prefill-decode-interval 2`,

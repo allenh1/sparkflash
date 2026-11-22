@@ -2050,15 +2050,19 @@ mod tests {
 
     #[test]
     fn the_config_round_trips_through_its_own_json() {
-        for config in [
+        for mut config in [
             Qwen4ExpConfig::tiny(),
             Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses"),
             Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried FP8 config parses"),
         ] {
             let rendered = config.to_json();
-            let parsed = Qwen4ExpConfig::from_json(&rendered).unwrap_or_else(|error| {
+            let mut parsed = Qwen4ExpConfig::from_json(&rendered).unwrap_or_else(|error| {
                 panic!("rendered config does not parse: {error}\n{rendered}")
             });
+            // The layout vars are derived from the document, not part of it; the rendered
+            // document can take a different path to the same architecture.
+            parsed.architecture.layout_vars.clear();
+            config.architecture.layout_vars.clear();
             assert_eq!(parsed, config);
         }
     }

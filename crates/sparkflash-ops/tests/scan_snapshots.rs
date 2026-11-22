@@ -32,21 +32,17 @@ struct Snapshot {
     repo: &'static str,
     revision: &'static str,
     expectation: SnapshotExpectation,
+    /// The rank count the release is served at.
+    world: usize,
     /// The vision parts with no kernel or no stated wiring, in report order.
     vision_gaps: &'static [&'static str],
 }
 
 enum SnapshotExpectation {
+    /// Every row resolves and both coverage checks are clean.
+    Clean,
     /// Every tensor is claimed, but the tower's parts do not all resolve yet.
     Gaps,
-    /// These exact prefix groups are the only unclaimed tensors.
-    Unclaimed(Vec<(&'static str, usize)>),
-    /// The shared plan cannot be built; its tower tensors are the unclaimed ones and one
-    /// layout row names the missing planner.
-    PlanFailure {
-        vision_tensors: usize,
-        aligner_tensors: usize,
-    },
 }
 
 fn snapshot_dir(snapshot: &Snapshot) -> Option<std::path::PathBuf> {
@@ -58,7 +54,7 @@ fn snapshot_dir(snapshot: &Snapshot) -> Option<std::path::PathBuf> {
     path.is_dir().then_some(path)
 }
 
-fn real_report(dir: &std::path::Path) -> ScanReport {
+fn real_report(dir: &std::path::Path, world: usize) -> ScanReport {
     let config = std::fs::read_to_string(dir.join("config.json")).expect("the config");
     let index = sparkflash_weights::tensor_index::read_local(dir).expect("the headers");
     assert_eq!(index.len(), index.tensors.len());
@@ -67,7 +63,7 @@ fn real_report(dir: &std::path::Path) -> ScanReport {
         config: &config,
         tensors: Some(&tensors),
         target: Target::Sm121,
-        world: 1,
+        world,
     })
 }
 
@@ -123,6 +119,7 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "zai-org/GLM-5.3-Flash",
             revision: "3f1971b7b5f7a528c9c4ef6212c8785298a8c24a",
+            world: 4,
             expectation: SnapshotExpectation::Gaps,
             vision_gaps: &[
                 "vision_attention",
@@ -136,15 +133,16 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
             revision: "1bae0e1088993b9b82de08f59de5be5a34e42170",
-            expectation: SnapshotExpectation::PlanFailure {
-                vision_tensors: 259,
-                aligner_tensors: 4,
-            },
-            vision_gaps: &["vision_merger", "vision_mlp", "vision_norm"],
+            world: 4,
+            // The layout claims all 96,085 indexed tensors, including the vision tower and
+            // aligner, and every row resolves on sm121 TP4.
+            expectation: SnapshotExpectation::Clean,
+            vision_gaps: &[],
         },
         Snapshot {
             repo: "nvidia/Qwen3.8-Flash-Next-NVFP4",
             revision: "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+            world: 1,
             expectation: SnapshotExpectation::Gaps,
             vision_gaps: &[
                 "vision_attention",
@@ -158,18 +156,20 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "thinkingmachines/Inkling-2-Small",
             revision: "885d78bfca61a7e9a498e33cfa7ad35850533b8c",
-            expectation: SnapshotExpectation::Unclaimed(vec![("model.visual", 422)]),
-            vision_gaps: &["vision_merger", "vision_mlp", "vision_position"],
+            world: 4,
+            // The layout claims every indexed tensor. The tower's learned-grid position and
+            // axial-rotary attention are the only vision parts with no kernel yet, so the rows
+            // are claimed but not all resolve.
+            expectation: SnapshotExpectation::Gaps,
+            vision_gaps: &["vision_attention", "vision_position"],
         },
         Snapshot {
             repo: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
             revision: "f6c832e6963ddb74f62c75813a3e8c74b1af67b1",
-            // The one shared checkpoint plan is spelled `model.layers.*`; this checkpoint is
-            // `backbone.*`. The plan cannot claim it, and no tensor is silently unclaimed.
-            expectation: SnapshotExpectation::PlanFailure {
-                vision_tensors: 0,
-                aligner_tensors: 0,
-            },
+            world: 1,
+            // The layout names every tensor with the checkpoint's `backbone.*` spelling; the
+            // arm's plan and the shared plan are equal at each rank the arm builds.
+            expectation: SnapshotExpectation::Clean,
             vision_gaps: &[],
         },
     ];
@@ -179,7 +179,7 @@ fn the_real_snapshots_report_their_interim_claim_state() {
             continue;
         };
         checked += 1;
-        let report = real_report(&dir);
+        let report = real_report(&dir, snapshot.world);
         assert!(
             report.error.is_none(),
             "{}: {}",
@@ -258,68 +258,31 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                     }
                 }
             }
-            SnapshotExpectation::Unclaimed(expected) => {
-                let expected: Vec<(String, usize)> = expected
-                    .iter()
-                    .map(|(prefix, count)| ((*prefix).to_owned(), *count))
-                    .collect();
-                assert_eq!(
-                    unclaimed_groups(&report),
-                    expected,
-                    "{}:\n{}",
+            SnapshotExpectation::Clean => {
+                let groups = unclaimed_groups(&report);
+                assert!(
+                    groups.is_empty(),
+                    "{}: unclaimed {groups:?}\n{}",
                     snapshot.repo,
                     report.render()
                 );
-            }
-            SnapshotExpectation::PlanFailure {
-                vision_tensors,
-                aligner_tensors,
-            } => {
-                let layout = report
+                let unknown: Vec<&str> = report
                     .rows
                     .iter()
-                    .filter(|row| matches!(row.status, ScanStatus::UnknownLayout { .. }))
-                    .collect::<Vec<_>>();
+                    .filter_map(|row| match &row.status {
+                        ScanStatus::UnknownLayout { detail, .. } => Some(detail.as_str()),
+                        _ => None,
+                    })
+                    .collect();
                 assert!(
-                    layout.iter().any(|row| row
-                        .status
-                        .fix()
-                        .is_some_and(|fix| fix.contains("stack or layout"))),
-                    "{}: no row names the missing plan or layout\n{}",
+                    unknown.is_empty(),
+                    "{}: the layout left wiring unknown: {unknown:?}\n{}",
                     snapshot.repo,
                     report.render()
                 );
                 assert!(
-                    layout.iter().all(|row| row.status.fix().is_some()),
-                    "{}: an unknown-layout row has no fix\n{}",
-                    snapshot.repo,
-                    report.render()
-                );
-                let groups = unclaimed_groups(&report);
-                let vision = groups
-                    .iter()
-                    .find(|(prefix, _)| prefix == "vision")
-                    .cloned();
-                if *vision_tensors == 0 {
-                    assert!(vision.is_none(), "{}:\n{}", snapshot.repo, report.render());
-                } else {
-                    assert_eq!(
-                        vision,
-                        Some(("vision".to_owned(), *vision_tensors)),
-                        "{}:\n{}",
-                        snapshot.repo,
-                        report.render()
-                    );
-                }
-                let aligner: usize = groups
-                    .iter()
-                    .filter(|(prefix, _)| prefix.starts_with("aligner"))
-                    .map(|(_, count)| count)
-                    .sum();
-                assert_eq!(
-                    aligner,
-                    *aligner_tensors,
-                    "{}:\n{}",
+                    report.is_clean(),
+                    "{}: not clean\n{}",
                     snapshot.repo,
                     report.render()
                 );

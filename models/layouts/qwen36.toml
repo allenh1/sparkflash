@@ -1,0 +1,1188 @@
+# Qwen3.6-35B-A3B FP8 layout.
+#
+# Sources, in the order the layout spec gives them:
+#   * the checkpoint's config.json (a config key is named beside the fact it sets);
+#   * the tensor index (a tensor's presence and stored shape prove the component);
+#   * the arm that runs the model today, crates/sparkflash-model-qwen4-exp: its reference
+#     forward (src/forward.rs), its vision tower (src/vision.rs), its typed parser
+#     (src/config.rs) and the shared planner it reads
+#     (crates/sparkflash-ops/src/tensor_plan.rs, fn qwen and helpers).
+#     The carried document is crates/sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json.
+#
+# This is the plain-residual branch of the Qwen family: model.norm and a pre-norm a branch,
+# no hyper-connection, no PLE and no QSA indexer. Its dense projections and routed experts are
+# E4M3 with one BF16 inverse scale a 128x128 tile; norms, routers and the short convolution
+# stay BF16. The MTP stage is the plain branch too, with an ordinary fc pair.
+
+schema = 1
+id = "qwen36-35b-a3b-fp8"
+
+[match]
+architectures = ["Qwen3_5MoeForConditionalGeneration"]
+model_types = ["qwen3_5_moe"]
+quantization = ["fp8"]
+
+[vars]
+vision_positions = { key = "vision_config.num_position_embeddings", default = 2304 }
+
+# Config keys the description decodes through this layout. Every key below is one the shared
+# parser does not read: the producer's quantizer bookkeeping, the nested producer type words,
+# and switches the released documents restate rather than change.
+[[keys]]
+# config.json text_config.model_type: the nested producer type, matched here only.
+path = "text_config.model_type"
+fact = "match.text_model_type"
+
+[[keys]]
+# config.json vision_config.model_type: the nested tower type, matched here only.
+path = "vision_config.model_type"
+fact = "match.vision_model_type"
+
+[[keys]]
+# config.json tie_word_embeddings: duplicated inside text_config, which the parser reads.
+path = "tie_word_embeddings"
+ignore = "text_config.tie_word_embeddings is the field the description reads; this root copy states the same value"
+
+[[keys]]
+# config.json language_model_only: a producer output switch, not a stack declaration.
+path = "language_model_only"
+ignore = "a producer output switch; vision_config and the tensor index decide which stacks the checkpoint carries"
+
+[[keys]]
+# config.json text_config.full_attention_interval: the layer_types list is the schedule.
+path = "text_config.full_attention_interval"
+ignore = "the layer_types list is the attention schedule the parser reads; this interval restates the same pattern"
+
+[[keys]]
+# config.json text_config.mamba_ssm_dtype: the GDN recurrent state's precision.
+path = "text_config.mamba_ssm_dtype"
+ignore = "the GDN recurrence runs in f32 in the arm's device step and the tensor plan has no state dtype; this hint changes no planned tensor"
+
+[[keys]]
+# config.json text_config.number_of_conv_states: restates the layer schedule's conv states.
+path = "text_config.number_of_conv_states"
+ignore = "the convolution state count follows from the GDN layer schedule and the conv kernel; no planned tensor is sized from this field"
+
+[[keys]]
+# config.json text_config.mtp.layer_types: the MTP stage has one full-attention block.
+path = "text_config.mtp.layer_types"
+ignore = "the MTP stage's one block takes the first full-attention layer's wiring; this list names that same full-attention type"
+
+[[keys]]
+# config.json text_config.mtp.mtp_use_hidden_state_from_layer: null in the release.
+path = "text_config.mtp.mtp_use_hidden_state_from_layer"
+ignore = "null in both released Qwen3.8 documents; the stage reads the final hidden state, which is the planner's default"
+
+[[keys]]
+# config.json text_config.mtp.rope_theta: equals the language rotary base.
+path = "text_config.mtp.rope_theta"
+ignore = "equal to text_config.rope_parameters.rope_theta (10000000) in both released documents; the stage takes the reference layer's rotary base"
+
+[[keys]]
+# config.json text_config.rope_parameters.mrope_interleaved: the arm's rotary layout.
+path = "text_config.rope_parameters.mrope_interleaved"
+ignore = "the arm's rotary step reads the mRoPE interleaving itself; the shared tensor plan's names and shapes do not depend on the order"
+
+[[keys]]
+# config.json text_config.rope_parameters.rope_type: 'default' in both releases.
+path = "text_config.rope_parameters.rope_type"
+ignore = "both released documents name the unscaled default rotary; the parser already reads the theta and partial factor"
+
+# The producer's quantizer table. The parser derives the dense and expert formats from
+# quant_algo/quantized_layers; these groups repeat the same decision per module name, and the
+# tensor index states every stored dtype, so a second copy here would be weaker evidence.
+[[keys]]
+path = "quantization_config.config_groups"
+ignore = "the producer's per-group quantizer table; the tensor index states every stored dtype and quant_algo selects the backbone format"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0"
+ignore = "the producer's per-group quantizer table; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations.dynamic"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations.group_size"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations.num_bits"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations.type"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.targets"
+ignore = "the producer's module list for group 0; the tensor index's dtypes are the authority on which tensors the group covers"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights.dynamic"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights.group_size"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights.num_bits"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights.type"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1"
+ignore = "the producer's per-group quantizer table; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations.dynamic"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations.group_size"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations.num_bits"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations.type"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.targets"
+ignore = "the producer's module list for group 1 (the MTP experts); the tensor index's dtypes are the authority"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.weights"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.weights.dynamic"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.weights.num_bits"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.weights.type"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2"
+ignore = "the producer's per-group quantizer table (the PLE shards); the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.targets"
+ignore = "the producer's module list for group 2 (the PLE shards); the tensor index's dtypes are the authority"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.weights"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.weights.dynamic"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.weights.num_bits"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.weights.type"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+# config.json quantization_config.ignore: the producer's excluded module patterns.
+path = "quantization_config.ignore"
+ignore = "the producer's quantizer exclusion patterns; the tensor index states every stored dtype"
+
+[[keys]]
+# config.json quantization_config.group_size: the fixture's top-level restatement.
+path = "quantization_config.group_size"
+ignore = "a top-level restatement of the per-group sizes; the tensor index states every stored dtype"
+
+[[keys]]
+# config.json quantization_config.kv_cache_quant_algo: null in the fixture.
+path = "quantization_config.kv_cache_quant_algo"
+ignore = "null in the carried document; the cache precision is a serving choice, not a stored-weight fact"
+
+[[keys]]
+# config.json vision_config.deepstack_visual_indexes: empty in both releases.
+path = "vision_config.deepstack_visual_indexes"
+ignore = "empty in both released Qwen3.8 documents, so no deepstack tap is selected; the merger tensors are the only tower-to-language projection"
+
+# The producer's BF16 exclusion list. The tensor index states every stored dtype, so the
+# list is the producer's second statement of the same fact.
+[[keys]]
+path = "quantization_config.modules_to_not_convert"
+ignore = "the producer's modules kept out of the FP8 pass; the tensor index states every stored dtype"
+
+[[keys]]
+# config.json text_config.mtp_use_dedicated_embeddings: false in the carried document.
+path = "text_config.mtp_use_dedicated_embeddings"
+ignore = "false in the carried document; the MTP stage takes the embedding and final hidden state the plan already names"
+
+[[keys]]
+# config.json text_config.mtp_num_hidden_layers: the stage count.
+path = "text_config.mtp_num_hidden_layers"
+ignore = "the stage count is read by the parser that builds the MTP stage; the layout names the one stage it describes"
+
+[stacks.language]
+order = [
+  "embedding",
+  "rms_norm",
+  "gdn_scan",
+  "gqa_attention",
+  "moe",
+]
+
+[stacks.draft]
+order = ["mtp"]
+
+[stacks.vision]
+order = [
+  "vision_patch_embed",
+  "vision_position",
+  "vision_norm",
+  "vision_attention",
+  "vision_mlp",
+  "vision_merger",
+]
+
+# src/vision.rs:2304 and 423-447: a learned 2304-entry position grid is resampled and axial
+# rotary is applied. The tensor index stores model.visual.pos_embed.weight.
+[[stacks.vision.parts]]
+part = "vision_position"
+[[stacks.vision.parts.facts]]
+name = "position"
+value = "rotary_and_grid"
+
+# src/vision.rs:54: every tower LayerNorm uses 1e-6; the config states no vision epsilon.
+# src/vision.rs:454-523: the block norm is LayerNorm with a learned bias; the arm's
+# reference uses layer_norm for norm1 and norm2. The config states no norm kind or bias.
+[[stacks.vision.parts]]
+part = "vision_norm"
+[[stacks.vision.parts.facts]]
+name = "norm"
+value = "layer"
+[[stacks.vision.parts.facts]]
+name = "norm_epsilon"
+value = 1e-6
+
+# src/vision.rs:423-523: qkv and proj carry biases and the block applies no per-head q/k
+# norm; the tensor index stores .attn.qkv.bias and .attn.proj.bias and no q_norm/k_norm.
+[[stacks.vision.parts]]
+part = "vision_attention"
+[[stacks.vision.parts.facts]]
+name = "attention_bias"
+value = true
+[[stacks.vision.parts.facts]]
+name = "qk_norm"
+value = false
+
+# src/vision.rs:523-558: the merger applies erf GELU before linear_fc1 and no norm after the
+# projection.
+[[stacks.vision.parts]]
+part = "vision_merger"
+[[stacks.vision.parts.facts]]
+name = "merger_activation"
+value = "gelu_erf"
+[[stacks.vision.parts.facts]]
+name = "merger_final_norm"
+value = false
+
+[[tensor]]
+name = "model.language_model.embed_tokens.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "lm_head.weight"
+part = "lm_head"
+role = "lm_head"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.language_model.norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.input_layernorm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.post_attention_layernorm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.gate.weight"
+part = "moe"
+role = "router"
+dtype = "bf16"
+shape = ["routed", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert.gate_proj.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "f8e4m3"
+shape = ["shared_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert.gate_proj.weight_scale_inv"
+part = "moe"
+role = "shared_expert"
+dtype = "bf16"
+shape = ["(shared_width + 127) / 128", "(hidden + 127) / 128"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert.up_proj.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "f8e4m3"
+shape = ["shared_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert.up_proj.weight_scale_inv"
+part = "moe"
+role = "shared_expert"
+dtype = "bf16"
+shape = ["(shared_width + 127) / 128", "(hidden + 127) / 128"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert.down_proj.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "f8e4m3"
+shape = ["hidden", "shared_width"]
+split = "columns"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert.down_proj.weight_scale_inv"
+part = "moe"
+role = "shared_expert"
+dtype = "bf16"
+shape = ["(hidden + 127) / 128", "(shared_width + 127) / 128"]
+split = "columns"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert_gate.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "bf16"
+shape = [1, "hidden"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["moe_intermediate", "hidden"]
+split = "rows"
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight_scale_inv"
+part = "moe"
+role = "experts"
+dtype = "bf16"
+shape = ["(moe_intermediate + 127) / 128", "(hidden + 127) / 128"]
+split = "rows"
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["moe_intermediate", "hidden"]
+split = "rows"
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.up_proj.weight_scale_inv"
+part = "moe"
+role = "experts"
+dtype = "bf16"
+shape = ["(moe_intermediate + 127) / 128", "(hidden + 127) / 128"]
+split = "rows"
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["hidden", "moe_intermediate"]
+split = "columns"
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.down_proj.weight_scale_inv"
+part = "moe"
+role = "experts"
+dtype = "bf16"
+shape = ["(hidden + 127) / 128", "(moe_intermediate + 127) / 128"]
+split = "columns"
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_qkv.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["2 * gdn_key_width + gdn_value_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_qkv.weight_scale_inv"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["(2 * gdn_key_width + gdn_value_width + 127) / 128", "(hidden + 127) / 128"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_z.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["gdn_value_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_z.weight_scale_inv"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["(gdn_value_width + 127) / 128", "(hidden + 127) / 128"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_a.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_heads", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_b.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_heads", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.out_proj.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["hidden", "gdn_value_width"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.out_proj.weight_scale_inv"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["(hidden + 127) / 128", "(gdn_value_width + 127) / 128"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.conv1d.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["2 * gdn_key_width + gdn_value_width", 1, "gdn_conv"]
+split = "conv"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.A_log"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_heads"]
+split = "vector"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.dt_bias"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_heads"]
+split = "vector"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.norm.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["2 * heads * head_dim", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_proj.weight_scale_inv"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["(2 * heads * head_dim + 127) / 128", "(hidden + 127) / 128"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.k_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.k_proj.weight_scale_inv"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["(kv_heads * head_dim + 127) / 128", "(hidden + 127) / 128"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.v_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.v_proj.weight_scale_inv"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["(kv_heads * head_dim + 127) / 128", "(hidden + 127) / 128"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.o_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "f8e4m3"
+shape = ["hidden", "heads * head_dim"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.o_proj.weight_scale_inv"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["(hidden + 127) / 128", "(heads * head_dim + 127) / 128"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_norm.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.k_norm.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.fc.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "2 * hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.pre_fc_norm_embedding.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.pre_fc_norm_hidden.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.input_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.post_attention_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.q_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["2 * heads * head_dim", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.q_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(2 * heads * head_dim + 127) / 128", "(hidden + 127) / 128"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.k_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.k_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(kv_heads * head_dim + 127) / 128", "(hidden + 127) / 128"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.v_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.v_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(kv_heads * head_dim + 127) / 128", "(hidden + 127) / 128"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.o_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["hidden", "heads * head_dim"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.o_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(hidden + 127) / 128", "(heads * head_dim + 127) / 128"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.q_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.k_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.gate.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["routed", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["shared_width", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert.gate_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(shared_width + 127) / 128", "(hidden + 127) / 128"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["shared_width", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert.up_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(shared_width + 127) / 128", "(hidden + 127) / 128"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["hidden", "shared_width"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert.down_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(hidden + 127) / 128", "(shared_width + 127) / 128"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert_gate.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = [1, "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["moe_intermediate", "hidden"]
+split = "rows"
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.gate_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(moe_intermediate + 127) / 128", "(hidden + 127) / 128"]
+split = "rows"
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["moe_intermediate", "hidden"]
+split = "rows"
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.up_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(moe_intermediate + 127) / 128", "(hidden + 127) / 128"]
+split = "rows"
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["hidden", "moe_intermediate"]
+split = "columns"
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.down_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(hidden + 127) / 128", "(moe_intermediate + 127) / 128"]
+split = "columns"
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "model.visual.patch_embed.proj.weight"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_in_channels * vision_frames * vision_patch * vision_patch"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.patch_embed.proj.bias"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.pos_embed.weight"
+part = "vision_position"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_positions", "vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm1.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm1.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm2.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm2.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.qkv.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["3 * vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.qkv.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["3 * vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.linear_fc1.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.linear_fc1.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.linear_fc2.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.linear_fc2.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.merger.linear_fc1.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width * vision_merge * vision_merge", "vision_width * vision_merge * vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.linear_fc1.bias"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width * vision_merge * vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.linear_fc2.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out", "vision_width * vision_merge * vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.linear_fc2.bias"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.norm.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.norm.bias"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"

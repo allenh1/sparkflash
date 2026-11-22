@@ -1,0 +1,1380 @@
+# Qwen3.8-Flash-Next FP8 layout.
+#
+# Sources, in the order the layout spec gives them:
+#   * the checkpoint's own config.json (a config key is named beside the fact it sets);
+#   * the tensor index (a tensor's presence and stored shape prove the component);
+#   * the arm that runs the model today, crates/sparkflash-model-qwen4-exp: its reference
+#     forward (src/forward.rs), its vision tower (src/vision.rs: 2304 learned position rows
+#     resampled at line 423, axial rotary at 447 and 585, LayerNorm epsilon 1e-6 at 54,
+#     merger fc1/norm/fc2 at 523-558), its typed parser (src/config.rs) and the shared
+#     planner it reads (crates/sparkflash-ops/src/tensor_plan.rs, fn qwen and helpers).
+#     The released snapshot is nvidia/Qwen3.8-Flash-Next-NVFP4, revision
+#     fc694b54fb0174e0913e6adf86691ef85a4ead47.
+#
+# Every shape below is an expression over the description's facts where one exists. A few
+# Qwen dimensions have no fact in the shared description yet (the hyper-connection lowrank,
+# the GDN key width and PLE geometry); those are written as the config's literal and the
+# config key is named in the comment, rather than inventing a fact name.
+
+schema = 1
+id = "qwen38-flash-next-fp8"
+
+[match]
+architectures = ["Qwen4ExpForConditionalGeneration"]
+model_types = ["qwen4_exp"]
+# The FP8 release reuses the NVFP4 architecture name; its quantizer stores each routed expert
+# as E4M3 with one BF16 inverse scale a 128x128 tile instead of an NVFP4 group.
+quantization = ["fp8"]
+
+# Shape facts the description does not expose. Each names the config path it comes from; the
+# release's value is the fallback only where a producer omits a redundant field.
+[vars]
+hc_count = { key = "text_config.hc_count", default = 4 }
+hc_lowrank = { key = "text_config.hc_lowrank", default = 320 }
+indexer_kv_heads = { key = "text_config.indexer_kv_heads", default = 1 }
+vision_positions = { key = "vision_config.num_position_embeddings", default = 2304 }
+# config.json quantization_config.config_groups.group_1.weights.group_size: the MTP FP8 tile.
+mtp_scale_block = { key = "quantization_config.config_groups.group_1.weights.group_size", default = 128 }
+
+# Config keys the description decodes through this layout. Every key below is one the shared
+# parser does not read: the producer's quantizer bookkeeping, the nested producer type words,
+# and switches the released documents restate rather than change.
+[[keys]]
+# config.json text_config.model_type: the nested producer type, matched here only.
+path = "text_config.model_type"
+fact = "match.text_model_type"
+
+[[keys]]
+# config.json vision_config.model_type: the nested tower type, matched here only.
+path = "vision_config.model_type"
+fact = "match.vision_model_type"
+
+[[keys]]
+# config.json tie_word_embeddings: duplicated inside text_config, which the parser reads.
+path = "tie_word_embeddings"
+ignore = "text_config.tie_word_embeddings is the field the description reads; this root copy states the same value"
+
+[[keys]]
+# config.json language_model_only: a producer output switch, not a stack declaration.
+path = "language_model_only"
+ignore = "a producer output switch; vision_config and the tensor index decide which stacks the checkpoint carries"
+
+[[keys]]
+# config.json text_config.full_attention_interval: the layer_types list is the schedule.
+path = "text_config.full_attention_interval"
+ignore = "the layer_types list is the attention schedule the parser reads; this interval restates the same pattern"
+
+[[keys]]
+# config.json text_config.mamba_ssm_dtype: the GDN recurrent state's precision.
+path = "text_config.mamba_ssm_dtype"
+ignore = "the GDN recurrence runs in f32 in the arm's device step and the tensor plan has no state dtype; this hint changes no planned tensor"
+
+[[keys]]
+# config.json text_config.number_of_conv_states: restates the layer schedule's conv states.
+path = "text_config.number_of_conv_states"
+ignore = "the convolution state count follows from the GDN layer schedule and the conv kernel; no planned tensor is sized from this field"
+
+[[keys]]
+# config.json text_config.mtp.layer_types: the MTP stage has one full-attention block.
+path = "text_config.mtp.layer_types"
+ignore = "the MTP stage's one block takes the first full-attention layer's wiring; this list names that same full-attention type"
+
+[[keys]]
+# config.json text_config.mtp.mtp_use_hidden_state_from_layer: null in the release.
+path = "text_config.mtp.mtp_use_hidden_state_from_layer"
+ignore = "null in both released Qwen3.8 documents; the stage reads the final hidden state, which is the planner's default"
+
+[[keys]]
+# config.json text_config.mtp.rope_theta: equals the language rotary base.
+path = "text_config.mtp.rope_theta"
+ignore = "equal to text_config.rope_parameters.rope_theta (10000000) in both released documents; the stage takes the reference layer's rotary base"
+
+[[keys]]
+# config.json text_config.rope_parameters.mrope_interleaved: the arm's rotary layout.
+path = "text_config.rope_parameters.mrope_interleaved"
+ignore = "the arm's rotary step reads the mRoPE interleaving itself; the shared tensor plan's names and shapes do not depend on the order"
+
+[[keys]]
+# config.json text_config.rope_parameters.rope_type: 'default' in both releases.
+path = "text_config.rope_parameters.rope_type"
+ignore = "both released documents name the unscaled default rotary; the parser already reads the theta and partial factor"
+
+# The producer's quantizer table. The parser derives the dense and expert formats from
+# quant_algo/quantized_layers; these groups repeat the same decision per module name, and the
+# tensor index states every stored dtype, so a second copy here would be weaker evidence.
+[[keys]]
+path = "quantization_config.config_groups"
+ignore = "the producer's per-group quantizer table; the tensor index states every stored dtype and quant_algo selects the backbone format"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0"
+ignore = "the producer's per-group quantizer table; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations.dynamic"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations.group_size"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations.num_bits"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.input_activations.type"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.targets"
+ignore = "the producer's module list for group 0; the tensor index's dtypes are the authority on which tensors the group covers"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights.dynamic"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights.group_size"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights.num_bits"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_0.weights.type"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1"
+ignore = "the producer's per-group quantizer table; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations.dynamic"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations.group_size"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations.num_bits"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.input_activations.type"
+ignore = "the producer's activation-quantizer detail; the stored weights' dtypes come from the tensor index"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.targets"
+ignore = "the producer's module list for group 1 (the MTP experts); the tensor index's dtypes are the authority"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.weights"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.weights.dynamic"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.weights.num_bits"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_1.weights.type"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2"
+ignore = "the producer's per-group quantizer table (the PLE shards); the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.targets"
+ignore = "the producer's module list for group 2 (the PLE shards); the tensor index's dtypes are the authority"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.weights"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.weights.dynamic"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.weights.num_bits"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+path = "quantization_config.config_groups.group_2.weights.type"
+ignore = "the producer's weight-quantizer detail; the tensor index states every stored dtype"
+
+[[keys]]
+# config.json quantization_config.ignore: the producer's excluded module patterns.
+path = "quantization_config.ignore"
+ignore = "the producer's quantizer exclusion patterns; the tensor index states every stored dtype"
+
+[[keys]]
+# config.json quantization_config.group_size: the fixture's top-level restatement.
+path = "quantization_config.group_size"
+ignore = "a top-level restatement of the per-group sizes; the tensor index states every stored dtype"
+
+[[keys]]
+# config.json quantization_config.kv_cache_quant_algo: null in the fixture.
+path = "quantization_config.kv_cache_quant_algo"
+ignore = "null in the carried document; the cache precision is a serving choice, not a stored-weight fact"
+
+[[keys]]
+# config.json vision_config.deepstack_visual_indexes: empty in both releases.
+path = "vision_config.deepstack_visual_indexes"
+ignore = "empty in both released Qwen3.8 documents, so no deepstack tap is selected; the merger tensors are the only tower-to-language projection"
+
+[stacks.language]
+order = [
+  "embedding",
+  "hyper_connection",
+  "gdn_scan",
+  "gqa_attention",
+  "sparse_indexer",
+  "ple",
+  "moe",
+]
+
+[stacks.draft]
+order = ["mtp"]
+
+[stacks.vision]
+order = [
+  "vision_patch_embed",
+  "vision_position",
+  "vision_norm",
+  "vision_attention",
+  "vision_mlp",
+  "vision_merger",
+]
+
+# src/vision.rs:2304 and 423-447: a learned 2304-entry position grid is resampled and axial
+# rotary is applied, so both schemes run. The tensor index agrees: model.visual.pos_embed.weight
+# exists and no rotary table is stored.
+[[stacks.vision.parts]]
+part = "vision_position"
+[[stacks.vision.parts.facts]]
+name = "position"
+value = "rotary_and_grid"
+
+# src/vision.rs:54: every tower LayerNorm uses 1e-6. The config states no vision epsilon.
+# src/vision.rs:454-523: the block norm is LayerNorm with a learned bias; the arm's
+# reference uses layer_norm for norm1 and norm2. The config states no norm kind or bias.
+[[stacks.vision.parts]]
+part = "vision_norm"
+[[stacks.vision.parts.facts]]
+name = "norm"
+value = "layer"
+[[stacks.vision.parts.facts]]
+name = "norm_epsilon"
+value = 1e-6
+
+# src/vision.rs:423-523: qkv and proj carry biases and the block applies no per-head q/k
+# norm; the tensor index stores .attn.qkv.bias and .attn.proj.bias and no q_norm/k_norm.
+[[stacks.vision.parts]]
+part = "vision_attention"
+[[stacks.vision.parts.facts]]
+name = "attention_bias"
+value = true
+[[stacks.vision.parts.facts]]
+name = "qk_norm"
+value = false
+
+# src/vision.rs:523-558: the merger applies erf GELU after its 2x2 concatenation and before
+# linear_fc1; it applies no norm after the projection. The config states neither.
+[[stacks.vision.parts]]
+part = "vision_merger"
+[[stacks.vision.parts.facts]]
+name = "merger_activation"
+value = "gelu_erf"
+[[stacks.vision.parts.facts]]
+name = "merger_final_norm"
+value = false
+
+# The language backbone.
+[[tensor]]
+name = "model.language_model.embed_tokens.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "lm_head.weight"
+part = "lm_head"
+role = "lm_head"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "whole"
+
+# Qwen3.8 replaces the final norm and every branch pre-norm with hyper-connections: the
+# embedding feeds one global mixer (tensor_plan.rs qwen_hyper, also src/forward.rs).
+[[tensor]]
+name = "model.language_model.hyper_connection_mixer.hc_norm.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hc_count * hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hc_lowrank", "hc_count * hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hc_count * hidden", "hc_lowrank"]
+split = "whole"
+
+# One mixer pair a branch, plus the branch's injection row per stream (hc_count = 4).
+[[tensor]]
+name = "model.language_model.layers.{layer}.attn_hyper_connection.hc_norm.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hyper_width"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.attn_hyper_connection.input_mix_weight_down.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hc_lowrank", "hyper_width"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.attn_hyper_connection.input_mix_weight_up.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hyper_width", "hc_lowrank"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.attn_hyper_connection.block_inject_weight.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["streams", "hyper_width"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp_hyper_connection.hc_norm.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hyper_width"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp_hyper_connection.input_mix_weight_down.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hc_lowrank", "hyper_width"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp_hyper_connection.input_mix_weight_up.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["hyper_width", "hc_lowrank"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp_hyper_connection.block_inject_weight.weight"
+part = "hyper_connection"
+role = "hyper"
+dtype = "bf16"
+shape = ["streams", "hyper_width"]
+split = "whole"
+repeat = "layers"
+
+# Gated DeltaNet. The projection widths come from config.json text_config.linear_*:
+# key width 16 * 128 = 2048, value width 48 * 128 = 6144 (also heads * head_dim), conv width
+# 2 * 2048 + 6144 = 10240. The description exposes value_heads as kv_lora and value_dim as
+# v_head, but not the key-head pair, so the key width is the config's literal.
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_qkv.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["2 * gdn_key_width + gdn_value_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_z.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_a.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_heads", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.in_proj_b.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_lora", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.out_proj.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "gdn_value_width"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.conv1d.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["2 * gdn_key_width + gdn_value_width", 1, "gdn_conv"]
+split = "conv"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.A_log"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_heads"]
+split = "vector"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.dt_bias"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_lora"]
+split = "vector"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.linear_attn.norm.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gdn" }
+
+# Sparse gated GQA: the query projection carries the sigmoid gate in every other head, so it
+# is twice the attention width (tensor_plan.rs qwen_gqa and src/forward.rs).
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["2 * heads * head_dim", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.k_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.v_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.o_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "heads * head_dim"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.q_norm.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.k_norm.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gqa" }
+
+# The QSA indexer's one query/key projection: config.json text_config.indexer_n_heads = 4,
+# indexer_kv_heads = 1, indexer_head_dim = 128, so (4 + 1) * 128 = 640 rows. The description
+# exposes index_heads and index_dim but not the indexer's own KV-head count.
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.index_qk_proj.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["(index_heads + indexer_kv_heads) * index_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.q_layernorm.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.self_attn.indexer.k_layernorm.weight"
+part = "sparse_indexer"
+role = "indexer"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gqa" }
+
+# Every layer is a MoE layer. The router has no selection bias in this release.
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.gate.weight"
+part = "moe"
+role = "router"
+dtype = "bf16"
+shape = ["routed", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert.gate_proj.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "bf16"
+shape = ["shared_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert.up_proj.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "bf16"
+shape = ["shared_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert.down_proj.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "bf16"
+shape = ["hidden", "shared_width"]
+split = "columns"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.shared_expert_gate.weight"
+part = "moe"
+role = "shared_expert"
+dtype = "bf16"
+shape = [1, "hidden"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+# Routed experts: the NVFP4 release stores an E2M1 weight with a per-16 block scale and two
+# per-tensor f32 scales; dtype = expert is the checkpoint's expert format (tensor.rs).
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["moe_intermediate", "hidden"]
+split = "tile_rows"
+tile = 128
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight_scale_inv"
+part = "moe"
+role = "experts"
+dtype = "bf16"
+shape = ["(moe_intermediate + 127) / 128", "(hidden + 127) / 128"]
+split = "tile_rows"
+tile = 1
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["moe_intermediate", "hidden"]
+split = "tile_rows"
+tile = 128
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.up_proj.weight_scale_inv"
+part = "moe"
+role = "experts"
+dtype = "bf16"
+shape = ["(moe_intermediate + 127) / 128", "(hidden + 127) / 128"]
+split = "tile_rows"
+tile = 1
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
+part = "moe"
+role = "experts"
+dtype = "f8e4m3"
+shape = ["hidden", "moe_intermediate"]
+split = "tiles"
+tile = 128
+repeat = "experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.mlp.experts.{expert}.down_proj.weight_scale_inv"
+part = "moe"
+role = "experts"
+dtype = "bf16"
+shape = ["(hidden + 127) / 128", "(moe_intermediate + 127) / 128"]
+split = "tiles"
+tile = 1
+repeat = "experts"
+when = { ffn = "moe" }
+
+# PLE: only the layer config.json text_config.ple_layer_ids names carries these tensors.
+# when.layers selects the released layer (1, ple_layer_ids [2]); the ple_* facts come from that
+# layer's Side::Ple. The layers and shards follow src/ngram.rs and src/ple.rs; tensor.rs states
+# the FP8 shard storage.
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.key_proj.weight"
+part = "ple"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["hyper_width", "ple_embed_dim"]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.value_proj.weight"
+part = "ple"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["hidden", "ple_embed_dim"]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.norm_key.weight"
+part = "ple"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["hyper_width"]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.norm_query.weight"
+part = "ple"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["hyper_width"]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.norm_conv.weight"
+part = "ple"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["hyper_width"]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.conv1d.weight"
+part = "ple"
+role = "ple_aux"
+dtype = "bf16"
+shape = ["hyper_width", 1, "ple_conv"]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+# The n-gram table's hash constants, per-tensor scale and shards. The prime bucket layout gives
+# ple_rows; each of the ple_shards shards holds ple_shard_rows rows of ple_head_dim.
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.ple_embedding.layer_multipliers"
+part = "ple"
+role = "ple_table"
+dtype = "i64"
+shape = ["ple_ngram"]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.ple_embedding.ngram_heads_offsets"
+part = "ple"
+role = "ple_table"
+dtype = "i64"
+shape = ["ple_heads"]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.ple_embedding.ngram_heads_vocab_sizes"
+part = "ple"
+role = "ple_table"
+dtype = "i64"
+shape = ["ple_heads"]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding.weight_scale"
+part = "ple"
+role = "ple_table"
+dtype = "bf16"
+shape = [1]
+split = "whole"
+repeat = "layers"
+when = { side = "ple" }
+
+[[tensor]]
+name = "model.language_model.layers.{layer}.ple.ple_embedding.ngram_embedding.shard_{shard}.weight"
+part = "ple"
+role = "ple_table"
+dtype = "f8e4m3"
+shape = ["ple_shard_rows", "ple_head_dim"]
+split = "whole"
+repeat = "ple_shards"
+when = { side = "ple" }
+
+
+# The MTP stage: one full-attention, MoE block at stage 0, replicated whole at every world.
+
+[[tensor]]
+name = "mtp.fc_embedding.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.fc_hidden.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.hyper_connection_mixer.hc_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hyper_width"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.hyper_connection_mixer.input_mix_weight_down.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hc_lowrank", "hyper_width"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.hyper_connection_mixer.input_mix_weight_up.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hyper_width", "hc_lowrank"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.pre_fc_norm_embedding.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.pre_fc_norm_hidden.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hyper_width"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.attn_hyper_connection.hc_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hyper_width"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.attn_hyper_connection.input_mix_weight_down.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hc_lowrank", "hyper_width"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.attn_hyper_connection.input_mix_weight_up.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hyper_width", "hc_lowrank"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.attn_hyper_connection.block_inject_weight.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["streams", "hyper_width"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp_hyper_connection.hc_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hyper_width"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp_hyper_connection.input_mix_weight_down.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hc_lowrank", "hyper_width"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp_hyper_connection.input_mix_weight_up.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hyper_width", "hc_lowrank"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp_hyper_connection.block_inject_weight.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["streams", "hyper_width"]
+split = "whole"
+repeat = "mtp"
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.q_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["2 * heads * head_dim", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.k_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.v_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.o_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "heads * head_dim"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.q_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.k_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["head_dim"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.indexer.index_qk_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(index_heads + indexer_kv_heads) * index_dim", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.indexer.q_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.self_attn.indexer.k_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["index_dim"]
+split = "whole"
+repeat = "mtp"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.gate.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["routed", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["shared_width", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["shared_width", "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "shared_width"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.shared_expert_gate.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = [1, "hidden"]
+split = "whole"
+repeat = "mtp"
+when = { ffn = "moe" }
+
+# The MTP stage's routed experts store FP8 E4M3 codes with one BF16 inverse scale a
+# 128x128 tile (config.json quantization_config.config_groups.group_1, tensor.rs).
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["moe_intermediate", "hidden"]
+split = "tile_rows"
+tile = 128
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.gate_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(moe_intermediate + mtp_scale_block - 1) / mtp_scale_block", "(hidden + mtp_scale_block - 1) / mtp_scale_block"]
+split = "tile_rows"
+tile = 1
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["moe_intermediate", "hidden"]
+split = "tile_rows"
+tile = 128
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.up_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(moe_intermediate + mtp_scale_block - 1) / mtp_scale_block", "(hidden + mtp_scale_block - 1) / mtp_scale_block"]
+split = "tile_rows"
+tile = 1
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "f8e4m3"
+shape = ["hidden", "moe_intermediate"]
+split = "tiles"
+tile = 128
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "mtp.layers.{stage}.mlp.experts.{expert}.down_proj.weight_scale_inv"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["(hidden + mtp_scale_block - 1) / mtp_scale_block", "(moe_intermediate + mtp_scale_block - 1) / mtp_scale_block"]
+split = "tiles"
+tile = 1
+repeat = "mtp_stage_experts"
+when = { ffn = "moe" }
+
+# The vision tower (src/vision.rs). The patch projection folds the temporal pair into its
+# input width, the block MLP is the plain fc1/fc2 pair and the merger applies its own norm.
+
+[[tensor]]
+name = "model.visual.patch_embed.proj.weight"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_in_channels * vision_frames * vision_patch * vision_patch"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.patch_embed.proj.bias"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.pos_embed.weight"
+part = "vision_position"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_positions", "vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm1.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm1.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm2.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.norm2.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.qkv.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["3 * vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.qkv.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["3 * vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.attn.proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.linear_fc1.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.linear_fc1.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.linear_fc2.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.blocks.{block}.mlp.linear_fc2.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.merger.linear_fc1.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width * vision_merge * vision_merge", "vision_width * vision_merge * vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.linear_fc1.bias"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width * vision_merge * vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.linear_fc2.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out", "vision_width * vision_merge * vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.linear_fc2.bias"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.norm.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.merger.norm.bias"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"

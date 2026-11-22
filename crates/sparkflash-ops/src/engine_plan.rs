@@ -673,7 +673,7 @@ fn geometry_for(
                 PlanError::Invalid("a relative-attention part on a non-Inkling layer".to_owned())
             })?;
             geometry.heads = attention.heads;
-            geometry.head_dim = inkling.d_rel;
+            geometry.head_dim = attention.head_dim;
             geometry.window = inkling.rel_extent;
         }
         Part::ShortConv => {
