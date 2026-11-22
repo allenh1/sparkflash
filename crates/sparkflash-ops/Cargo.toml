@@ -29,6 +29,12 @@ half = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[build-dependencies]
+# build.rs reads kernels/instances.toml and generates the catalogue's shape rules for the kernel
+# families that take model shapes as instance arguments. The file is the one list both the build
+# and the catalogue read, so a claim cannot name a shape that was not built.
+toml = { workspace = true }
+
 [features]
 # The direct-RDMA exchange as every TP group's device leg (src/doorbell.rs), over
 # sparkflash_kernels::write_exchange and sparkflash-comm's verbs backend.

@@ -57,6 +57,210 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The one list of kernel instances: source, entry symbol, and the shapes one rank sees.
+///
+/// The file is parsed here (and by sparkflash-ops' build script and scripts/instances.py) so the
+/// probe, the cubin build and the kernel baseline compile a source with the same defines. See
+/// docs/engine/06-base-reads-description.md section D.
+const INSTANCES_FILE: &str = "../../kernels/instances.toml";
+
+/// One entry symbol's shape arguments, read from kernels/instances.toml.
+#[derive(Debug, Clone)]
+struct Instance {
+    /// The file under kernels/, normalized to `kernels/<name>.cu`.
+    source: String,
+    /// The cubin the instance is linked into.
+    cubin: String,
+    /// The `-D` flags that carry the instance's shapes.
+    defines: Vec<String>,
+}
+
+/// Reads kernels/instances.toml and validates what the build depends on.
+///
+/// The validation is deliberately here and not only in the Python reader: a malformed list must
+/// fail the Cargo build, not only the shell build. It checks the fields a family needs, that the
+/// entry appears in its source, that entries are unique, and that a cubin name cannot escape the
+/// output directory.
+fn read_instances() -> Vec<Instance> {
+    let text = std::fs::read_to_string(INSTANCES_FILE).unwrap_or_else(|error| {
+        panic!("sparkflash-kernels: cannot read {INSTANCES_FILE}: {error}")
+    });
+    let document: toml::Value = toml::from_str(&text).unwrap_or_else(|error| {
+        panic!("sparkflash-kernels: {INSTANCES_FILE} is not TOML: {error}")
+    });
+    let version = document.get("version").and_then(toml::Value::as_integer);
+    assert_eq!(
+        version,
+        Some(1),
+        "sparkflash-kernels: {INSTANCES_FILE} must carry version = 1"
+    );
+    let rows = document
+        .get("instance")
+        .and_then(toml::Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("sparkflash-kernels: {INSTANCES_FILE} has no [[instance]] tables")
+        });
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut instances = Vec::with_capacity(rows.len());
+    for (number, row) in rows.iter().enumerate() {
+        let table = row.as_table().unwrap_or_else(|| {
+            panic!("sparkflash-kernels: instance {} is not a table", number + 1)
+        });
+        let string = |key: &str| -> String {
+            table
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "sparkflash-kernels: instance {} ({INSTANCES_FILE}) has no string {key}",
+                        number + 1
+                    )
+                })
+                .to_owned()
+        };
+        let named = string("source");
+        let file_name = named.strip_prefix("kernels/").unwrap_or(&named);
+        assert!(
+            !file_name.is_empty() && !file_name.contains('/'),
+            "sparkflash-kernels: instance {}: source {named:?} is not a file directly under kernels/",
+            number + 1
+        );
+        let source = format!("kernels/{file_name}");
+        let entry = string("entry");
+        assert!(
+            entry
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && entry.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "sparkflash-kernels: instance {}: entry {entry:?} is not a C identifier",
+            number + 1
+        );
+        assert!(
+            seen.insert(entry.clone()),
+            "sparkflash-kernels: {entry} is listed twice in {INSTANCES_FILE}"
+        );
+        let path = Path::new("../../kernels").join(file_name);
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "sparkflash-kernels: instance {}: cannot read {}: {error}",
+                number + 1,
+                path.display()
+            )
+        });
+        assert!(
+            body.contains(&entry),
+            "sparkflash-kernels: instance {}: {entry} does not appear in {}",
+            number + 1,
+            path.display()
+        );
+        let family = string("family");
+        let keys: &[&str] = match family.as_str() {
+            "router" => &["hidden", "experts", "top_k"],
+            "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"],
+            other => panic!(
+                "sparkflash-kernels: instance {}: family {other:?} is not router or routed",
+                number + 1
+            ),
+        };
+        let cubin = table
+            .get("cubin")
+            .and_then(toml::Value::as_str)
+            .map_or_else(
+                || file_name.trim_end_matches(".cu").to_owned(),
+                str::to_owned,
+            );
+        assert!(
+            !cubin.is_empty() && cubin.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "sparkflash-kernels: instance {}: cubin {cubin:?} is not a stem",
+            number + 1
+        );
+        let mut defines = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = table
+                .get(*key)
+                .and_then(toml::Value::as_integer)
+                .filter(|value| *value > 0)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "sparkflash-kernels: instance {} ({entry}): {key} is a positive integer",
+                        number + 1
+                    )
+                });
+            defines.push(format!(
+                "-DSPARK_INSTANCE_{}_{}={value}u",
+                entry.to_ascii_uppercase(),
+                key.to_ascii_uppercase()
+            ));
+        }
+        instances.push(Instance {
+            source,
+            cubin,
+            defines,
+        });
+    }
+    instances
+}
+
+/// Writes the instance defines as Rust constants for the ABI tests.
+///
+/// One `<CUBIN>_DEFINES` string per compile group, holding the same `#define` lines
+/// `Consts::parse` reads from a source. A test extends its table with it, so the router and
+/// gate/up pins keep resolving the shape macros after the shapes moved out of the source.
+fn write_instance_defines(out_dir: &Path, groups: &[(String, String, Vec<String>)]) {
+    use std::fmt::Write as _;
+    let mut generated = String::from(
+        "// Generated by sparkflash-kernels/build.rs from kernels/instances.toml. Do not edit.\n",
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for (_source, cubin, defines) in groups {
+        assert!(
+            seen.insert(cubin.clone()),
+            "two compile groups share the cubin {cubin}; a cubin name is one output file"
+        );
+        let name = cubin.to_ascii_uppercase();
+        let _ = write!(generated, "pub const {name}_DEFINES: &str = \"");
+        for define in defines {
+            let body = define
+                .strip_prefix("-D")
+                .unwrap_or_else(|| panic!("build.rs emits only -D flags, got {define:?}"));
+            let (key, value) = body
+                .split_once('=')
+                .unwrap_or_else(|| panic!("an instance define has no value: {define:?}"));
+            let _ = write!(generated, "#define {key} {value}\\n");
+        }
+        generated.push_str("\";\n");
+    }
+    std::fs::write(out_dir.join("kernel_instance_defines.rs"), generated)
+        .expect("write the generated instance defines");
+}
+
+/// The instances that share a (source, cubin) pair, in file order, as one compile group.
+fn instance_groups(instances: &[Instance]) -> Vec<(String, String, Vec<String>)> {
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut defines: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for instance in instances {
+        let key = (instance.source.clone(), instance.cubin.clone());
+        if !defines.contains_key(&key) {
+            order.push(key.clone());
+            defines.insert(key.clone(), Vec::new());
+        }
+        defines
+            .get_mut(&key)
+            .expect("the key was just inserted")
+            .extend(instance.defines.iter().cloned());
+    }
+    order
+        .into_iter()
+        .map(|key| {
+            let flags = defines.remove(&key).expect("every group has defines");
+            (key.0, key.1, flags)
+        })
+        .collect()
+}
+
 /// The probe that pins the Rust/CUDA trace ABI.
 ///
 /// The assertions live inside a kernel so they are evaluated during device-only compilation,
@@ -361,6 +565,7 @@ fn combined_probe_source() -> String {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../kernels");
+    println!("cargo:rerun-if-changed={INSTANCES_FILE}");
     println!("cargo:rerun-if-changed=cuda_stub");
     println!("cargo:rustc-check-cfg=cfg(sparkflash_cuda_toolkit)");
     println!("cargo:rustc-check-cfg=cfg(sparkflash_model_cubin)");
@@ -379,12 +584,19 @@ fn main() {
         println!("cargo:rustc-env={env}={}", out_dir.join(cubin).display());
     }
 
+    let instances = read_instances();
+    let instance_groups = instance_groups(&instances);
+    // The library's own constant tables (router_abi, routed_gate_up_abi) resolve a source's
+    // shape macros through these defines, so the ABI tests read the same values the compiler
+    // was given rather than a second copy.
+    write_instance_defines(&out_dir, &instance_groups);
+
     let Some(nvcc) = which_nvcc() else {
         // No nvcc: the clang CUDA frontend can still parse the kernel against the stub
         // headers. That check is weaker than nvcc (no PTX validation, no ptxas), so it is
         // reported as a different kind of evidence, not as a substitute.
         match which_clang() {
-            Some(clang) => report_clang(&clang, &arch),
+            Some(clang) => report_clang(&clang, &arch, &instance_groups),
             None => println!(
                 "cargo:warning=sparkflash-kernels: neither nvcc nor clang++ was found; the \
                  CUDA ABI and kernel sources are UNVERIFIED by this build (CPU reference \
@@ -464,6 +676,7 @@ fn main() {
             &roce_kernel,
             &[Path::new("../../kernels")],
             "rocenante_oneshot_sm121",
+            &[],
         ),
     );
 
@@ -476,7 +689,15 @@ fn main() {
         );
         return;
     }
+    let instanced: std::collections::BTreeSet<&str> = instance_groups
+        .iter()
+        .map(|(source, _, _)| source.strip_prefix("kernels/").unwrap_or(source))
+        .collect();
     for (file, stem) in PROBED_KERNELS {
+        // An instanced source is probed once per compile group below, with its shape defines.
+        if instanced.contains(file) {
+            continue;
+        }
         let path = kernels.join(file);
         if !path.is_file() {
             println!(
@@ -491,23 +712,63 @@ fn main() {
             &nvcc,
             &arch,
             &format!("the probed kernel {file}"),
-            compile_file(&nvcc, &arch, &path, &[kernels], stem),
+            compile_file(&nvcc, &arch, &path, &[kernels], stem, &[]),
+        );
+    }
+    for (source, cubin, defines) in &instance_groups {
+        let path = Path::new("../../").join(source);
+        if !path.is_file() {
+            println!(
+                "cargo:warning=sparkflash-kernels: {source} is missing; the instance {cubin} \
+                 cannot be probed"
+            );
+            continue;
+        }
+        report(
+            &nvcc,
+            &arch,
+            &format!("the instance {cubin} ({source})"),
+            compile_file(&nvcc, &arch, &path, &[kernels], cubin, defines),
         );
     }
     report(
         &nvcc,
         &arch,
         "the combined probe (all forty-nine kernels, trace macros enabled)",
-        check_m4_probe(&nvcc, &arch, kernels),
+        check_m4_probe(&nvcc, &arch, kernels, &released_defines(&instance_groups)),
     );
 }
 
+/// The defines of every instance whose cubin is its source's own stem.
+///
+/// Those are the released instances. The combined probe includes every source in one translation
+/// unit, so it can only carry one set of shapes per source; a second-shape instance with its own
+/// cubin is probed separately, which is exactly the isolation the instance list describes.
+fn released_defines(groups: &[(String, String, Vec<String>)]) -> Vec<String> {
+    let mut defines = Vec::new();
+    for (source, cubin, flags) in groups {
+        let stem = source
+            .strip_prefix("kernels/")
+            .unwrap_or(source)
+            .trim_end_matches(".cu");
+        if cubin == stem {
+            defines.extend(flags.iter().cloned());
+        }
+    }
+    defines
+}
+
 /// Writes and compiles the combined probe with nvcc.
-fn check_m4_probe(nvcc: &Path, arch: &str, kernels: &Path) -> Result<(), ProbeFailure> {
+fn check_m4_probe(
+    nvcc: &Path,
+    arch: &str,
+    kernels: &Path,
+    defines: &[String],
+) -> Result<(), ProbeFailure> {
     let probe = out_dir()?.join("m4_kernels_probe.cu");
     std::fs::write(&probe, combined_probe_source())
         .map_err(|e| ProbeFailure::new(e.to_string()))?;
-    compile_file(nvcc, arch, &probe, &[kernels], "m4_kernels_probe")
+    compile_file(nvcc, arch, &probe, &[kernels], "m4_kernels_probe", defines)
 }
 
 /// Prints a warning for an unusable toolchain and aborts the build for a real compile error.
@@ -565,7 +826,7 @@ fn check_trace_header(nvcc: &Path, arch: &str, header: &Path) -> Result<(), Prob
     std::fs::write(&probe, source).map_err(|e| ProbeFailure::new(e.to_string()))?;
     let include = canonical.parent().map(Path::to_path_buf);
     let includes: Vec<&Path> = include.iter().map(PathBuf::as_path).collect();
-    compile_file(nvcc, arch, &probe, &includes, "trace_abi_probe")
+    compile_file(nvcc, arch, &probe, &includes, "trace_abi_probe", &[])
 }
 
 /// Compiles the RoCEnante slot ABI probe (and, through it, the kernel) with nvcc.
@@ -573,7 +834,7 @@ fn check_roce_probe(nvcc: &Path, arch: &str, kernels: &Path) -> Result<(), Probe
     let out_dir = out_dir()?;
     let probe = out_dir.join("roce_abi_probe.cu");
     std::fs::write(&probe, ROCE_PROBE).map_err(|e| ProbeFailure::new(e.to_string()))?;
-    compile_file(nvcc, arch, &probe, &[kernels], "roce_abi_probe")
+    compile_file(nvcc, arch, &probe, &[kernels], "roce_abi_probe", &[])
 }
 
 /// Compiles one model image to a cubin. False, with a warning, when nvcc cannot target the arch;
@@ -635,10 +896,14 @@ fn compile_file(
     source: &Path,
     includes: &[&Path],
     stem: &str,
+    defines: &[String],
 ) -> Result<(), ProbeFailure> {
     let out_dir = out_dir()?;
     let mut command = Command::new(nvcc);
     command.args(["-std=c++17", &format!("-arch={arch}"), "--ptx"]);
+    for define in defines {
+        command.arg(define);
+    }
     for include in includes {
         command.arg("-I").arg(include);
     }
@@ -665,9 +930,9 @@ fn out_dir() -> Result<PathBuf, ProbeFailure> {
 }
 
 /// Parses the kernel with clang's CUDA frontend, which is all a host without nvcc can do.
-fn report_clang(clang: &Path, arch: &str) {
+fn report_clang(clang: &Path, arch: &str, groups: &[(String, String, Vec<String>)]) {
     match check_kernel_syntax(clang, arch) {
-        Ok(()) => report_clang_probe(clang, arch),
+        Ok(()) => report_clang_probe(clang, arch, groups),
         // Retry once on a baseline architecture: the syntax and the slot layout do not depend
         // on the target, and an older clang may not know sm_121a yet.
         Err(failure) if failure.unusable_toolchain && arch != "sm_90" => {
@@ -678,7 +943,7 @@ fn report_clang(clang: &Path, arch: &str) {
                          parsed cleanly for sm_90 instead. Set SPARKFLASH_CUDA_ARCH (or \
                          SPARKFLASH_CLANG) to check the real target."
                     );
-                    report_clang_probe(clang, "sm_90");
+                    report_clang_probe(clang, "sm_90", groups);
                 }
                 Err(second) => clang_outcome(second, arch),
             }
@@ -691,15 +956,15 @@ fn report_clang(clang: &Path, arch: &str) {
 /// buys. The probe is the same translation unit nvcc would compile, so on this host it is the
 /// only place where the trace macros, the signature redeclaration and the literal slot
 /// assertions are evaluated together.
-fn report_clang_probe(clang: &Path, arch: &str) {
+fn report_clang_probe(clang: &Path, arch: &str, groups: &[(String, String, Vec<String>)]) {
     match check_roce_probe_syntax(clang, arch) {
-        Ok(()) => match check_probed_kernels_syntax(clang, arch) {
+        Ok(()) => match check_probed_kernels_syntax(clang, arch, groups) {
             Ok((checked, missing)) => {
                 // The model images are compiled by their own probes, so they are not in
                 // PROBED_KERNELS; Dory still gets the same clang type check on a host without nvcc.
                 let dory = Path::new("../../kernels/dory_sm121.cu");
                 if dory.is_file() {
-                    clang_syntax_check(clang, arch, dory).unwrap_or_else(|failure| {
+                    clang_syntax_check(clang, arch, dory, &[]).unwrap_or_else(|failure| {
                         panic!(
                             "sparkflash-kernels: the clang CUDA syntax probe failed; kernels/dory_sm121.cu does not parse:\n{}",
                             failure.stderr
@@ -744,14 +1009,39 @@ fn report_clang_probe(clang: &Path, arch: &str) {
 
 /// Parses the forty-nine probed kernels and the combined probe with clang. Returns how many kernels were
 /// found and how many were missing, so the warning can say which evidence was gathered.
-fn check_probed_kernels_syntax(clang: &Path, arch: &str) -> Result<(usize, usize), ProbeFailure> {
+fn check_probed_kernels_syntax(
+    clang: &Path,
+    arch: &str,
+    groups: &[(String, String, Vec<String>)],
+) -> Result<(usize, usize), ProbeFailure> {
     let kernels = Path::new("../../kernels");
+    let instanced: std::collections::BTreeSet<&str> = groups
+        .iter()
+        .map(|(source, _, _)| source.strip_prefix("kernels/").unwrap_or(source))
+        .collect();
     let mut checked = 0usize;
     let mut missing = 0usize;
     for (file, _) in PROBED_KERNELS {
         let path = kernels.join(file);
+        if instanced.contains(file) {
+            // Probe every group for this source, including a second-shape instance in its own
+            // cubin. The source is one of the forty-nine; the groups are its shapes.
+            let mut found = false;
+            for (source, _, defines) in groups {
+                if source.strip_prefix("kernels/").unwrap_or(source) == file {
+                    clang_syntax_check(clang, arch, &path, defines)?;
+                    found = true;
+                }
+            }
+            if found {
+                checked += 1;
+            } else {
+                missing += 1;
+            }
+            continue;
+        }
         if path.is_file() {
-            clang_syntax_check(clang, arch, &path)?;
+            clang_syntax_check(clang, arch, &path, &[])?;
             checked += 1;
         } else {
             missing += 1;
@@ -761,7 +1051,7 @@ fn check_probed_kernels_syntax(clang: &Path, arch: &str) -> Result<(usize, usize
         let probe = out_dir()?.join("m4_kernels_probe.cu");
         std::fs::write(&probe, combined_probe_source())
             .map_err(|e| ProbeFailure::new(e.to_string()))?;
-        clang_syntax_check(clang, arch, &probe)?;
+        clang_syntax_check(clang, arch, &probe, &released_defines(groups))?;
     }
     Ok((checked, missing))
 }
@@ -793,7 +1083,7 @@ fn check_kernel_syntax(clang: &Path, arch: &str) -> Result<(), ProbeFailure> {
             kernel.display()
         )));
     }
-    clang_syntax_check(clang, arch, kernel)
+    clang_syntax_check(clang, arch, kernel, &[])
 }
 
 /// Parses the RoCEnante ABI probe: the same source the nvcc path compiles, with the trace
@@ -808,11 +1098,16 @@ fn check_roce_probe_syntax(clang: &Path, arch: &str) -> Result<(), ProbeFailure>
     }
     let probe = out_dir()?.join("roce_abi_probe.cu");
     std::fs::write(&probe, ROCE_PROBE).map_err(|e| ProbeFailure::new(e.to_string()))?;
-    clang_syntax_check(clang, arch, &probe)
+    clang_syntax_check(clang, arch, &probe, &[])
 }
 
 /// Runs clang's CUDA device-only syntax check on one translation unit against the stub headers.
-fn clang_syntax_check(clang: &Path, arch: &str, source: &Path) -> Result<(), ProbeFailure> {
+fn clang_syntax_check(
+    clang: &Path,
+    arch: &str,
+    source: &Path,
+    defines: &[String],
+) -> Result<(), ProbeFailure> {
     let stub = Path::new("cuda_stub");
     if !stub.is_dir() {
         return Err(ProbeFailure::new(format!(
@@ -836,6 +1131,9 @@ fn clang_syntax_check(clang: &Path, arch: &str, source: &Path) -> Result<(), Pro
         "-I",
         "cuda_stub",
     ]);
+    for define in defines {
+        command.arg(define);
+    }
     command.arg(source);
     let output = command
         .output()

@@ -115,6 +115,9 @@ pub fn declaration() -> KernelDecl {
 pub fn constants() -> Consts {
     let mut table = Consts::parse(ROUTER_SOURCE);
     table.extend(COMMON_HEADER);
+    // The hidden width, expert count and top-k are instance arguments now; the generated table
+    // carries the defines the compiler received from kernels/instances.toml.
+    table.extend(crate::instances::MOE_ROUTER_SM121_DEFINES);
     table
 }
 

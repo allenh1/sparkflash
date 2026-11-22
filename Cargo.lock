@@ -2503,6 +2503,7 @@ dependencies = [
  "sparkflash-trace",
  "sparkflash-vision",
  "thiserror 2.0.21",
+ "toml",
 ]
 
 [[package]]
@@ -2663,6 +2664,7 @@ dependencies = [
  "sparkflash-weights",
  "tempfile",
  "thiserror 2.0.21",
+ "toml",
 ]
 
 [[package]]

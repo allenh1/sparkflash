@@ -38,6 +38,7 @@ set -eu
 
 crate_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 kernels=$(CDPATH= cd -- "$crate_dir/../../kernels" && pwd)
+instances=$(CDPATH= cd -- "$crate_dir/../.." && pwd)/scripts/instances.py
 nvcc=${SPARKFLASH_NVCC:-nvcc}
 arch=sm_121a
 
@@ -88,8 +89,14 @@ nvcc_build=$build
 arch=$arch
 EOF
     for kernel in mega_mhc_sm121 b12x_mxfp8_dense_sm121 b12x_mxfp8_dense_m1_sm121 b12x_mxfp8_gemv_m1_sm121 b12x_mxfp4_moe_sm121 b12x_mxfp4_moe_stored_sm121 flash_mla_csa2_sm121 b12x_mxfp8_wo_a_sm121 cert_lm_head_sm121 swiglu_mxfp8_quant_sm121 moe_router_sm121 routed_gate_up_sm121 swiglu_mxfp8_quant_weighted_sm121 rmsnorm_sm121 lm_head_reduce_sm121 flash_mla_csa2_seq_sm121 flash_mla_csa2_ring_sm121 b12x_bf16a_mxfp8w_dense_sm121 b12x_bf16a_mxfp8w_wo_a_sm121 engram_embed_sm121 engram_wkv_sm121 engram_gate_write_sm121 b12x_hostw_gemv_m1_sm121 layer_seams_sm121 kv_path_sm121 ref_select_sm121 compressed_append_sm121 engram_write_sm121 engram_stream_convert_sm121 moe_routed_device_sm121 pool_group_sm121 opt_attn_sm121 opt_draft_sm121 opt_gemv_sm121 opt_misc_sm121 opt_moe_sm121 opt_router_sm121 opt_rows_sm121 opt_seams_sm121 opt_select_sm121 opt_mma_sm121 opt_vision_sm121 moe_plan_sm121 inkling_attn_sm121 inkling_conv_sm121 inkling_epilogue_sm121 inkling_moe_sm121 inkling_vision_sm121 inkling_draft_sm121; do
-        "$nvcc" -std=c++17 "-arch=$arch" -cubin -I "$kernels" "$kernels/$kernel.cu" -o "$work/$kernel.cubin"
-        "$nvcc" -std=c++17 "-arch=$arch" --ptx -I "$kernels" "$kernels/$kernel.cu" -o "$work/$kernel.ptx"
+        # A kernel with instances is compiled with the defines kernels/instances.toml names, exactly
+        # as the Cargo probe and scripts/build-cubins.sh compile it. The others have none.
+        defines=$(python3 "$instances" --defines-for-cubin "$kernel")
+        # The defines are one flag per shape and never contain whitespace; the split is intended.
+        # shellcheck disable=SC2086
+        "$nvcc" -std=c++17 "-arch=$arch" -cubin -I "$kernels" $defines "$kernels/$kernel.cu" -o "$work/$kernel.cubin"
+        # shellcheck disable=SC2086
+        "$nvcc" -std=c++17 "-arch=$arch" --ptx -I "$kernels" $defines "$kernels/$kernel.cu" -o "$work/$kernel.ptx"
         bytes=$(wc -c < "$work/$kernel.cubin" | tr -d ' ')
         sha=$(sha256sum "$work/$kernel.cubin" | cut -d' ' -f1)
         membars=$(grep -c membar "$work/$kernel.ptx" || true)

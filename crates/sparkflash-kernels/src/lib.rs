@@ -65,6 +65,7 @@ pub mod hostw_gemv_launch;
 pub mod hostw_gemv_ref;
 pub mod images;
 pub mod index_channels;
+pub mod instances;
 pub mod kv_path_launch;
 pub mod kv_path_ref;
 pub mod lane_memory;

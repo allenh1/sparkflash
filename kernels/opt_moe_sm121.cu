@@ -42,25 +42,42 @@
 #include "opt_common_sm121.cuh"
 #include "m4_activation_quant_sm121.cuh"
 
-#define OPT_MOE_HIDDEN 5120u
-#define OPT_MOE_KB 160u
-#define OPT_MOE_INTER 576u
-#define OPT_MOE_GU_ROW 2560u
-#define OPT_MOE_GU_SCALE_ROW 160u
-#define OPT_MOE_D_ROW 288u
-#define OPT_MOE_D_KB 18u
-#define OPT_MOE_TOPK 6u
+// The model shapes are instance arguments (kernels/instances.toml). The source has no default
+// hidden width, routed width, padded width or top-k; each entry below names its own instance and
+// is omitted when that instance is not in the build. The derived counts are arithmetic on those
+// arguments, not a second copy of the model constants.
+#if !defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_HIDDEN)
+#error "opt_moe_sm121.cu: SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_HIDDEN is an instance argument; add the instance to kernels/instances.toml"
+#endif
+#if !defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_INTERMEDIATE)
+#error "opt_moe_sm121.cu: SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_INTERMEDIATE is an instance argument; add the instance to kernels/instances.toml"
+#endif
+#if !defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_PADDED)
+#error "opt_moe_sm121.cu: SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_PADDED is an instance argument; add the instance to kernels/instances.toml"
+#endif
+#if !defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_TOP_K)
+#error "opt_moe_sm121.cu: SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_TOP_K is an instance argument; add the instance to kernels/instances.toml"
+#endif
+
+#define OPT_MOE_HIDDEN SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_HIDDEN
+#define OPT_MOE_INTER SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_INTERMEDIATE
+#define OPT_MOE_PADDED SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_PADDED
+#define OPT_MOE_KB (OPT_MOE_HIDDEN / 32u)
+#define OPT_MOE_GU_ROW (OPT_MOE_HIDDEN / 2u)
+#define OPT_MOE_GU_SCALE_ROW (OPT_MOE_HIDDEN / 32u)
+#define OPT_MOE_D_ROW (OPT_MOE_INTER / 2u)
+#define OPT_MOE_D_KB (OPT_MOE_INTER / 32u)
 #define OPT_MOE_GU_THREADS 128u
 #define OPT_MOE_GU_COLS_PER_WARP 8u
 #define OPT_MOE_D_THREADS 256u
 #define OPT_MOE_D_TILE 32u
 #define OPT_MOE_D_CHUNKS (OPT_MOE_D_TILE * OPT_MOE_D_KB)
 
-static_assert(OPT_MOE_KB == 5u * 32u, "five K blocks per lane");
+static_assert(OPT_MOE_HIDDEN % 32u == 0u, "the hidden width tiles by 32");
 static_assert(OPT_MOE_INTER % 32u == 0u, "the intermediate width tiles by 32");
+static_assert(OPT_MOE_PADDED >= OPT_MOE_INTER, "the padded routed width covers the real width");
 static_assert((OPT_MOE_GU_THREADS / 32u) * OPT_MOE_GU_COLS_PER_WARP == 32u, "a block owns 32 columns");
 static_assert(OPT_MOE_D_ROW == OPT_MOE_D_KB * 16u, "one 16-byte chunk per down K block");
-static_assert(OPT_MOE_TOPK == SPARK_M4_MOE_TOP_K, "six routed slots");
 
 __device__ __forceinline__ uint4 opt_ldg_stream(const uint4 *p) {
     uint4 v;
@@ -222,9 +239,13 @@ __device__ __forceinline__ void opt_moe_gate_up_body(
                                    act_scales, out_codes, out_scales, rows, experts, limit);      \
     }
 
-OPT_MOE_GATE_UP_ENTRY(opt_moe_gate_up_sm121, OPT_MOE_TOPK)
+#if defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_HIDDEN)
+OPT_MOE_GATE_UP_ENTRY(opt_moe_gate_up_sm121, SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_TOP_K)
+#endif
 // The DSpark stages route top-3 of 128 experts with the backbone's expert geometry.
-OPT_MOE_GATE_UP_ENTRY(opt_moe_gate_up_k3_sm121, 3u)
+#if defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_K3_SM121_HIDDEN)
+OPT_MOE_GATE_UP_ENTRY(opt_moe_gate_up_k3_sm121, SPARK_INSTANCE_OPT_MOE_GATE_UP_K3_SM121_TOP_K)
+#endif
 
 template <uint32_t TOPK>
 __device__ __forceinline__ void opt_moe_down_combine_body(
@@ -345,8 +366,13 @@ __device__ __forceinline__ void opt_moe_down_combine_body(
                                         delta_bf16, tokens, experts, addend);                     \
     }
 
-OPT_MOE_DOWN_ENTRY(opt_moe_down_combine_sm121, OPT_MOE_TOPK)
-OPT_MOE_DOWN_ENTRY(opt_moe_down_combine_k3_sm121, 3u)
+#if defined(SPARK_INSTANCE_OPT_MOE_DOWN_COMBINE_SM121_HIDDEN)
+OPT_MOE_DOWN_ENTRY(opt_moe_down_combine_sm121, SPARK_INSTANCE_OPT_MOE_DOWN_COMBINE_SM121_TOP_K)
+#endif
+#if defined(SPARK_INSTANCE_OPT_MOE_DOWN_COMBINE_K3_SM121_HIDDEN)
+OPT_MOE_DOWN_ENTRY(opt_moe_down_combine_k3_sm121,
+                   SPARK_INSTANCE_OPT_MOE_DOWN_COMBINE_K3_SM121_TOP_K)
+#endif
 
 // ---- Multi-row variants: one weight read per distinct expert.
 //
@@ -374,6 +400,18 @@ OPT_MOE_DOWN_ENTRY(opt_moe_down_combine_k3_sm121, 3u)
 //   (ascending expert id, each rounded to bf16, f32 adds, then the addend), as opt_moe_down_combine.
 
 #define OPT_MOE_PLAN_MAX 384u
+// The per-expert plan holds one entry per expert of the instance, so an instance can never name
+// more experts than the plan table covers. These are the source's bounds, not copies of a shape.
+#if defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_K3_SM121_EXPERTS)
+static_assert(SPARK_INSTANCE_OPT_MOE_GATE_UP_K3_SM121_EXPERTS <= OPT_MOE_PLAN_MAX,
+              "the DSpark gate/up instance fits the plan table");
+static_assert(SPARK_INSTANCE_OPT_MOE_DOWN_COMBINE_K3_SM121_EXPERTS <= OPT_MOE_PLAN_MAX,
+              "the DSpark down instance fits the plan table");
+static_assert(SPARK_INSTANCE_OPT_MOE_GATE_UP_DEDUP_K3_SM121_EXPERTS <= OPT_MOE_PLAN_MAX,
+              "the DSpark dedup gate/up instance fits the plan table");
+static_assert(SPARK_INSTANCE_OPT_MOE_COMBINE_K3_SM121_EXPERTS <= OPT_MOE_PLAN_MAX,
+              "the DSpark combine instance fits the plan table");
+#endif
 
 struct OptMoePlan {
     uint32_t count;                       // distinct experts
@@ -537,6 +575,7 @@ __device__ __forceinline__ void opt_moe_plan_build(uint32_t n, uint32_t experts,
 // build stays behind SPARKFLASH_MOE_PLAN_INCTA=1 as the A/B arm. Both call the same two functions,
 // so the plan - the grouping, the group order and the row order within a group - is the same bytes
 // either way, and the dedup kernels' outputs are unchanged.
+#if defined(SPARK_INSTANCE_OPT_MOE_PLAN_SM121_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OPT_MOE_GU_THREADS) opt_moe_plan_sm121(
     const uint32_t *__restrict__ expert_ids, const uint32_t rows, const uint32_t experts,
     OptMoePlan *__restrict__ plan_out, unsigned long long *__restrict__ stats) {
@@ -569,6 +608,7 @@ extern "C" __global__ void __launch_bounds__(OPT_MOE_GU_THREADS) opt_moe_plan_sm
         atomicAdd(&stats[3u + 2u * band], 1ull);
     }
 }
+#endif
 
 #define OPT_MOE_GD_MB 4u       // members a fold serves: a warp's 8 columns x 4 members are its 32 lanes' chains
 #define OPT_MOE_GD_MP 16u      // members per pass over the weights
@@ -814,8 +854,14 @@ __device__ __forceinline__ void opt_moe_gate_up_dedup_body(
                                          plan_out, plan_in);                                      \
     }
 
-OPT_MOE_GATE_UP_DEDUP_ENTRY(opt_moe_gate_up_dedup_sm121, OPT_MOE_TOPK)
-OPT_MOE_GATE_UP_DEDUP_ENTRY(opt_moe_gate_up_dedup_k3_sm121, 3u)
+#if defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_DEDUP_SM121_HIDDEN)
+OPT_MOE_GATE_UP_DEDUP_ENTRY(opt_moe_gate_up_dedup_sm121,
+                            SPARK_INSTANCE_OPT_MOE_GATE_UP_DEDUP_SM121_TOP_K)
+#endif
+#if defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_DEDUP_K3_SM121_HIDDEN)
+OPT_MOE_GATE_UP_DEDUP_ENTRY(opt_moe_gate_up_dedup_k3_sm121,
+                            SPARK_INSTANCE_OPT_MOE_GATE_UP_DEDUP_K3_SM121_TOP_K)
+#endif
 
 // The plan comes from opt_moe_gate_up_dedup's plan_out (the launch before this one). A block serves
 // TILES consecutive 32-column tiles of one distinct expert, a thread two of a tile's 576 (column, K
@@ -961,7 +1007,9 @@ __device__ __forceinline__ void opt_moe_down_dedup_tiles_body(
         opt_moe_down_dedup_tiles_body<TILES>(down_table, plan, h_codes, h_scales, slot_val);      \
     }
 
+#if defined(SPARK_INSTANCE_OPT_MOE_DOWN_DEDUP_SM121_HIDDEN)
 OPT_MOE_DOWN_TILES_ENTRY(opt_moe_down_dedup_sm121, OPT_MOE_DD_TILES)
+#endif
 
 template <uint32_t TOPK>
 __device__ __forceinline__ void opt_moe_combine_body(
@@ -1016,5 +1064,9 @@ __device__ __forceinline__ void opt_moe_combine_body(
         opt_moe_combine_body<TOPK>(expert_ids, slot_val, delta_f32, delta_bf16, tokens, addend);  \
     }
 
-OPT_MOE_COMBINE_ENTRY(opt_moe_combine_sm121, OPT_MOE_TOPK)
-OPT_MOE_COMBINE_ENTRY(opt_moe_combine_k3_sm121, 3u)
+#if defined(SPARK_INSTANCE_OPT_MOE_COMBINE_SM121_HIDDEN)
+OPT_MOE_COMBINE_ENTRY(opt_moe_combine_sm121, SPARK_INSTANCE_OPT_MOE_COMBINE_SM121_TOP_K)
+#endif
+#if defined(SPARK_INSTANCE_OPT_MOE_COMBINE_K3_SM121_HIDDEN)
+OPT_MOE_COMBINE_ENTRY(opt_moe_combine_k3_sm121, SPARK_INSTANCE_OPT_MOE_COMBINE_K3_SM121_TOP_K)
+#endif

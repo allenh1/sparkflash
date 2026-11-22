@@ -83,6 +83,26 @@
 
 #include "m4_common_sm121.cuh"
 
+// The model shapes are instance arguments (kernels/instances.toml): hidden width, the rank's real
+// routed width, the padded width the launch writes and the routed slots per token. No default.
+#if !defined(SPARK_INSTANCE_ROUTED_GATE_UP_SM121_HIDDEN)
+#error "routed_gate_up_sm121.cu: SPARK_INSTANCE_ROUTED_GATE_UP_SM121_HIDDEN is an instance argument; add the instance to kernels/instances.toml"
+#endif
+#if !defined(SPARK_INSTANCE_ROUTED_GATE_UP_SM121_INTERMEDIATE)
+#error "routed_gate_up_sm121.cu: SPARK_INSTANCE_ROUTED_GATE_UP_SM121_INTERMEDIATE is an instance argument; add the instance to kernels/instances.toml"
+#endif
+#if !defined(SPARK_INSTANCE_ROUTED_GATE_UP_SM121_PADDED)
+#error "routed_gate_up_sm121.cu: SPARK_INSTANCE_ROUTED_GATE_UP_SM121_PADDED is an instance argument; add the instance to kernels/instances.toml"
+#endif
+#if !defined(SPARK_INSTANCE_ROUTED_GATE_UP_SM121_TOP_K)
+#error "routed_gate_up_sm121.cu: SPARK_INSTANCE_ROUTED_GATE_UP_SM121_TOP_K is an instance argument; add the instance to kernels/instances.toml"
+#endif
+
+#define SPARK_GATE_UP_HIDDEN SPARK_INSTANCE_ROUTED_GATE_UP_SM121_HIDDEN
+#define SPARK_GATE_UP_INTER SPARK_INSTANCE_ROUTED_GATE_UP_SM121_INTERMEDIATE
+#define SPARK_GATE_UP_PADDED SPARK_INSTANCE_ROUTED_GATE_UP_SM121_PADDED
+#define SPARK_GATE_UP_TOP_K SPARK_INSTANCE_ROUTED_GATE_UP_SM121_TOP_K
+
 // One output column per reducer thread and eight parallel K groups per block: 32 columns x 8
 // groups. The eight groups split the 160 ascending block partials the reference folds serially; the
 // reducer re-adds them in ascending block order, so the split changes the schedule, not the value.
@@ -90,27 +110,26 @@
 #define SPARK_GATE_UP_K_GROUPS 8u
 #define SPARK_GATE_UP_THREADS (SPARK_GATE_UP_TILE * SPARK_GATE_UP_K_GROUPS)
 // K is the whole hidden size: the block input, not the routed width.
-#define SPARK_GATE_UP_K_BLOCKS (SPARK_M4_HIDDEN / SPARK_M4_QUANT_BLOCK)
+#define SPARK_GATE_UP_K_BLOCKS (SPARK_GATE_UP_HIDDEN / SPARK_M4_QUANT_BLOCK)
 // Packed FP4 weight bytes per output row: 5120 values, two per byte.
-#define SPARK_GATE_UP_PACKED_ROW (SPARK_M4_HIDDEN / 2u)
+#define SPARK_GATE_UP_PACKED_ROW (SPARK_GATE_UP_HIDDEN / 2u)
 // ue8m0 scale bytes per output row and per activation row: one per 32 values along K.
-#define SPARK_GATE_UP_SCALE_ROW (SPARK_M4_HIDDEN / SPARK_M4_QUANT_BLOCK)
+#define SPARK_GATE_UP_SCALE_ROW (SPARK_GATE_UP_HIDDEN / SPARK_M4_QUANT_BLOCK)
 // The output tile count that covers the padded routed width.
-#define SPARK_GATE_UP_TILES ((SPARK_M4_MOE_WIDTH_PADDED + SPARK_GATE_UP_TILE - 1u) / SPARK_GATE_UP_TILE)
+#define SPARK_GATE_UP_TILES ((SPARK_GATE_UP_PADDED + SPARK_GATE_UP_TILE - 1u) / SPARK_GATE_UP_TILE)
 
-static_assert(SPARK_M4_HIDDEN % SPARK_M4_QUANT_BLOCK == 0u, "the hidden size tiles by 32");
-static_assert(SPARK_GATE_UP_K_BLOCKS == 160u, "5120 values are 160 MX blocks");
-static_assert(SPARK_M4_MOE_WIDTH % SPARK_M4_QUANT_BLOCK == 0u, "the routed width tiles by 32");
-static_assert(SPARK_M4_MOE_WIDTH_PADDED % SPARK_M4_QUANT_BLOCK == 0u,
+static_assert(SPARK_GATE_UP_HIDDEN % SPARK_M4_QUANT_BLOCK == 0u, "the hidden size tiles by 32");
+static_assert(SPARK_GATE_UP_INTER % SPARK_M4_QUANT_BLOCK == 0u, "the routed width tiles by 32");
+static_assert(SPARK_GATE_UP_PADDED % SPARK_M4_QUANT_BLOCK == 0u,
               "the padded routed width tiles by 32");
-static_assert(SPARK_GATE_UP_TILES * SPARK_GATE_UP_TILE >= SPARK_M4_MOE_WIDTH_PADDED,
+static_assert(SPARK_GATE_UP_TILES * SPARK_GATE_UP_TILE >= SPARK_GATE_UP_PADDED,
               "the tile grid covers the padded width");
 static_assert(SPARK_GATE_UP_THREADS == 256u, "the block is 32 columns x 8 parallel K groups");
 static_assert(SPARK_GATE_UP_TILE * SPARK_GATE_UP_K_GROUPS == SPARK_GATE_UP_THREADS,
               "one compute thread per (column, K group)");
-static_assert(SPARK_M4_MOE_TOP_K == 6u, "six routed slots per token");
-static_assert(SPARK_GATE_UP_PACKED_ROW == 2560u, "one 5120-wide FP4 row is 2560 bytes");
-static_assert(SPARK_GATE_UP_SCALE_ROW == 160u, "one 5120-wide row has 160 ue8m0 scales");
+static_assert(SPARK_GATE_UP_TOP_K > 0u, "the instance names the routed slots per token");
+static_assert(SPARK_GATE_UP_PACKED_ROW > 0u, "a packed FP4 row is non-empty");
+static_assert(SPARK_GATE_UP_SCALE_ROW > 0u, "a ue8m0 row is non-empty");
 
 // The E2M1 value stored in the low nibble of byte (index / 2) at even indices, high nibble at odd.
 __device__ __forceinline__ uint8_t spark_gate_up_fp4_low(uint8_t packed) { return (uint8_t)(packed & 0x0Fu); }
@@ -139,7 +158,7 @@ extern "C" __global__ void routed_gate_up_sm121(
     const uint32_t col_local = tid % SPARK_GATE_UP_TILE;
     const uint32_t group = tid / SPARK_GATE_UP_TILE;
     const uint32_t column = blockIdx.y * SPARK_GATE_UP_TILE + col_local;
-    const uint32_t live_rows = tokens * (uint32_t)SPARK_M4_MOE_TOP_K;
+    const uint32_t live_rows = tokens * (uint32_t)SPARK_GATE_UP_TOP_K;
     const bool live = routed_row < live_rows;
 
     uint64_t t_enter = 0u;
@@ -150,20 +169,20 @@ extern "C" __global__ void routed_gate_up_sm121(
     // reducer folds them in ascending block order, which is the reference's serial order.
     __shared__ float terms[SPARK_GATE_UP_K_BLOCKS][SPARK_GATE_UP_TILE];
 
-    if (live && column < (uint32_t)SPARK_M4_MOE_WIDTH) {
-        const uint32_t token = routed_row / (uint32_t)SPARK_M4_MOE_TOP_K;
+    if (live && column < (uint32_t)SPARK_GATE_UP_INTER) {
+        const uint32_t token = routed_row / (uint32_t)SPARK_GATE_UP_TOP_K;
         const uint32_t expert = expert_ids[routed_row];
         // The activation row is the token's row: the routing weight was folded into the activation
         // before quantisation (model.py:849-851), so every one of the token's slots multiplies the
         // same quantised E4M3 row and nothing here multiplies by routing again.
-        const uint8_t *act_row = act_fp8 + (uint64_t)token * SPARK_M4_HIDDEN;
+        const uint8_t *act_row = act_fp8 + (uint64_t)token * SPARK_GATE_UP_HIDDEN;
         const uint8_t *act_scale_row = act_scales + (uint64_t)token * SPARK_GATE_UP_SCALE_ROW;
         // The weight row is this rank's slice of the expert's gate (or up) matrix, [576, 5120] FP4
         // for one rank: the caller stages the slice and passes its rows contiguously.
-        const uint32_t weight_row = expert * (uint32_t)SPARK_M4_MOE_WIDTH + column;
+        const uint32_t weight_row = expert * (uint32_t)SPARK_GATE_UP_INTER + column;
         const uint8_t *w_row = w_fp4 + (uint64_t)weight_row * SPARK_GATE_UP_PACKED_ROW;
         const uint8_t *w_scale_row =
-            w_scales + spark_b12x_row_scale_index(weight_row, 0u, (uint32_t)SPARK_M4_HIDDEN);
+            w_scales + spark_b12x_row_scale_index(weight_row, 0u, (uint32_t)SPARK_GATE_UP_HIDDEN);
         for (uint32_t block = group; block < (uint32_t)SPARK_GATE_UP_K_BLOCKS;
              block += (uint32_t)SPARK_GATE_UP_K_GROUPS) {
             const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
@@ -193,9 +212,9 @@ extern "C" __global__ void routed_gate_up_sm121(
     // and it is the only ordered arithmetic in this kernel.
     if (tid < (uint32_t)SPARK_GATE_UP_TILE) {
         const uint32_t out_column = blockIdx.y * SPARK_GATE_UP_TILE + tid;
-        if (live && out_column < (uint32_t)SPARK_M4_MOE_WIDTH_PADDED) {
-            __nv_bfloat16 *out_row = out + (uint64_t)routed_row * SPARK_M4_MOE_WIDTH_PADDED;
-            if (out_column < (uint32_t)SPARK_M4_MOE_WIDTH) {
+        if (live && out_column < (uint32_t)SPARK_GATE_UP_PADDED) {
+            __nv_bfloat16 *out_row = out + (uint64_t)routed_row * SPARK_GATE_UP_PADDED;
+            if (out_column < (uint32_t)SPARK_GATE_UP_INTER) {
                 float acc = 0.0f;
                 for (uint32_t block = 0; block < (uint32_t)SPARK_GATE_UP_K_BLOCKS; ++block) {
                     acc = __fadd_rn(acc, terms[block][tid]);

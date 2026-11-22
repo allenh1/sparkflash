@@ -107,6 +107,9 @@ pub fn declaration() -> KernelDecl {
 pub fn constants() -> Consts {
     let mut table = Consts::parse(GATE_UP_SOURCE);
     table.extend(COMMON_HEADER);
+    // The widths and top-k are instance arguments now; the generated table carries the defines
+    // the compiler received from kernels/instances.toml.
+    table.extend(crate::instances::ROUTED_GATE_UP_SM121_DEFINES);
     table
 }
 

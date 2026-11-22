@@ -1,0 +1,219 @@
+# Kernel instances: the shapes one rank sees.
+#
+# Every device kernel the stack builds from a source whose body fixes model geometry is listed
+# here, one [instance] table per entry symbol. A build reads this file and passes each instance's
+# values to the compiler as SPARK_INSTANCE_<ENTRY>_<ARG> macros; a source that needs a shape has
+# no default and fails to compile without it. The same file is the input the catalogue's shape
+# rules are generated from (crates/sparkflash-ops/build.rs), so a shape cannot be claimed here
+# without being built, or built without being claimable.
+#
+# Fields:
+#   source       the .cu source under kernels/
+#   entry        the extern "C" __global__ symbol the instance builds
+#   cubin        the cubin the instance is linked into (default: the source stem). Instances that
+#                share a cubin are compiled in one translation unit, so the released multi-symbol
+#                cubins keep their file names and symbol sets.
+#   family       the shape vocabulary: "router" needs hidden/experts/top_k, "routed" needs those
+#                plus intermediate/padded.
+#   catalogue    optional catalogue key; sparkflash-ops generates that part's exact shape rule
+#                from every instance carrying the same key.
+#   catalogue_intermediate
+#                optional; false keeps the key's generated rule from claiming an intermediate
+#                width (the MTP part has no such geometry even though its expert bodies take one).
+#   hidden, experts, top_k, intermediate, padded
+#                the values one rank sees, as positive integers. They are passed to the compiler
+#                with the source's own suffix (u), not reinterpreted.
+#
+# A second shape is a line here and a rebuild. The proof instance at the bottom is deliberately
+# not in any released cubin: it exists to show a different width/expert count/top-k compiles
+# from the same body, and it is built into its own cubin so the released cubin's bytes stay pinned.
+
+version = 1
+
+# --- The routers -----------------------------------------------------------------------------
+# opt_router is the one-launch router. Its two released shapes are the backbone's 384 experts
+# top-6 and the DSpark stages' 128 experts top-3; both live in opt_router_sm121.cubin.
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_sm121"
+cubin = "opt_router_sm121"
+family = "router"
+catalogue = "deepseek-router"
+hidden = 5120
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_e128k3_sm121"
+cubin = "opt_router_sm121"
+family = "router"
+catalogue = "deepseek-router"
+hidden = 5120
+experts = 128
+top_k = 3
+
+# The task-37 serial-order router, kept as the reference the one-launch body was measured against.
+[[instance]]
+source = "moe_router_sm121.cu"
+entry = "moe_router_sm121"
+cubin = "moe_router_sm121"
+family = "router"
+catalogue = "deepseek-router"
+hidden = 5120
+experts = 384
+top_k = 6
+
+# --- The routed experts ----------------------------------------------------------------------
+# The W4A8 gate/up projection: 5120 activations, 576 real output columns a rank, padded to 640.
+[[instance]]
+source = "routed_gate_up_sm121.cu"
+entry = "routed_gate_up_sm121"
+cubin = "routed_gate_up_sm121"
+family = "routed"
+catalogue = "deepseek-moe"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+# opt_moe_sm121.cu's five routed bodies, each in its released top-6 shape and its DSpark top-3
+# shape. All ten entries share opt_moe_sm121.cubin, exactly as the forward loads them.
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-moe"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_combine_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-moe"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_dedup_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-moe"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_dedup_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-moe"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_combine_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-moe"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_plan_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-moe"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_k3_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 128
+top_k = 3
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_combine_k3_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 128
+top_k = 3
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_dedup_k3_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 128
+top_k = 3
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_combine_k3_sm121"
+cubin = "opt_moe_sm121"
+family = "routed"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 128
+top_k = 3
+
+# --- The second-shape build proof -------------------------------------------------------------
+# Not loaded by any arm and not in the baseline: a 4096-wide router with 256 experts and top-8.
+# It compiles from opt_router_sm121.cu alone, into its own cubin, so the released cubin's symbol
+# set and bytes are untouched. scripts/build-cubins.sh builds it and
+# crates/sparkflash-kernels/tests/kernel_instances.rs checks it takes the body's own bounds.
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_4096e256k8_sm121"
+cubin = "opt_router_4096e256k8_sm121"
+family = "router"
+hidden = 4096
+experts = 256
+top_k = 8

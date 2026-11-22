@@ -35,14 +35,21 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-#define OPT_R_HIDDEN 5120u
+// The model shapes are instance arguments (kernels/instances.toml): the source has no default
+// width, expert count or top-k, and a build that does not name a shape does not compile. Each
+// entry below is gated on its own instance's macros, so the released cubin keeps exactly the
+// symbols the forward loads and a second shape can be built into a cubin of its own.
+#if !defined(SPARK_INSTANCE_OPT_ROUTER_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_ROUTER_E128K3_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_ROUTER_4096E256K8_SM121_HIDDEN)
+#error "opt_router_sm121.cu: no instance macros; every shape is an argument from kernels/instances.toml"
+#endif
+
 #define OPT_R_WARPS 8u
 #define OPT_R_THREADS (OPT_R_WARPS * 32u)
 #define OPT_R_MAX_TOKENS 8u
 #define OPT_R_ROUTE_SCALE 1.5f
 #define OPT_R_NORM_EPS 1e-20f
-
-static_assert(OPT_R_HIDDEN % 256u == 0u, "a warp step is 256 values");
 
 __device__ __forceinline__ float opt_r_score(float value) {
     const float sp = value > 20.0f ? value : log1pf(expf(value));
@@ -71,10 +78,11 @@ __device__ __forceinline__ float opt_r_dot8_bf16(const uint4 x, const uint4 w, f
 }
 
 // Stage one for this block's groups of up to `per` tokens: the warp's expert's scores.
-template <uint32_t OPT_R_EXPERTS, bool BF>
+template <uint32_t OPT_R_HIDDEN, uint32_t OPT_R_EXPERTS, bool BF>
 __device__ __forceinline__ void opt_router_scores(
     const __nv_bfloat16 *__restrict__ x, const __nv_bfloat16 *__restrict__ gate, float *__restrict__ scores,
     const uint32_t tokens, const uint32_t per, const uint32_t lane, const uint32_t expert) {
+    static_assert(OPT_R_HIDDEN % 256u == 0u, "a warp step is 256 values");
     for (uint32_t t0 = blockIdx.y * per; t0 < tokens; t0 += gridDim.y * per) {
         const uint32_t live = tokens - t0 < per ? tokens - t0 : per;
         const __nv_bfloat16 *xg = x + (uint64_t)t0 * OPT_R_HIDDEN;
@@ -121,7 +129,7 @@ __device__ __forceinline__ void opt_router_scores(
     }
 }
 
-template <uint32_t OPT_R_EXPERTS, uint32_t OPT_R_TOPK>
+template <uint32_t OPT_R_HIDDEN, uint32_t OPT_R_EXPERTS, uint32_t OPT_R_TOPK>
 __device__ __forceinline__ void opt_router_body(
     const __nv_bfloat16 *__restrict__ x,     // [tokens][5120]
     const __nv_bfloat16 *__restrict__ gate,  // [experts][5120]
@@ -140,9 +148,9 @@ __device__ __forceinline__ void opt_router_body(
     const uint32_t even = (tokens + gridDim.y - 1u) / gridDim.y;
     const uint32_t per = even < OPT_R_MAX_TOKENS ? even : OPT_R_MAX_TOKENS;
     if (gridDim.y > 1u && per > 2u) {
-        opt_router_scores<OPT_R_EXPERTS, true>(x, gate, scores, tokens, per, lane, expert);
+        opt_router_scores<OPT_R_HIDDEN, OPT_R_EXPERTS, true>(x, gate, scores, tokens, per, lane, expert);
     } else {
-        opt_router_scores<OPT_R_EXPERTS, false>(x, gate, scores, tokens, per, lane, expert);
+        opt_router_scores<OPT_R_HIDDEN, OPT_R_EXPERTS, false>(x, gate, scores, tokens, per, lane, expert);
     }
 
     __shared__ uint32_t s_last;
@@ -207,15 +215,31 @@ __device__ __forceinline__ void opt_router_body(
     if (threadIdx.x == 0u) *ticket = 0u;
 }
 
-#define OPT_ROUTER_ENTRY(name, EXPERTS, TOPK)                                                      \
+#define OPT_ROUTER_ENTRY(name, HIDDEN, EXPERTS, TOPK)                                             \
     extern "C" __global__ void __launch_bounds__(OPT_R_THREADS) name(                              \
         const __nv_bfloat16 *__restrict__ x, const __nv_bfloat16 *__restrict__ gate,              \
         const float *__restrict__ bias, uint32_t *__restrict__ ids, float *__restrict__ weights,  \
         float *__restrict__ scores, const uint32_t tokens, uint32_t *__restrict__ ticket) {       \
         OPT_PDL_ENTRY();                                                                          \
-        opt_router_body<EXPERTS, TOPK>(x, gate, bias, ids, weights, scores, tokens, ticket);      \
+        opt_router_body<HIDDEN, EXPERTS, TOPK>(x, gate, bias, ids, weights, scores, tokens,       \
+                                               ticket);                                           \
     }
 
-OPT_ROUTER_ENTRY(opt_router_sm121, 384u, 6u)
+#if defined(SPARK_INSTANCE_OPT_ROUTER_SM121_HIDDEN)
+OPT_ROUTER_ENTRY(opt_router_sm121, SPARK_INSTANCE_OPT_ROUTER_SM121_HIDDEN,
+                 SPARK_INSTANCE_OPT_ROUTER_SM121_EXPERTS, SPARK_INSTANCE_OPT_ROUTER_SM121_TOP_K)
+#endif
 // The DSpark stages: 128 experts, top-3, the backbone's score function and route scale.
-OPT_ROUTER_ENTRY(opt_router_e128k3_sm121, 128u, 3u)
+#if defined(SPARK_INSTANCE_OPT_ROUTER_E128K3_SM121_HIDDEN)
+OPT_ROUTER_ENTRY(opt_router_e128k3_sm121, SPARK_INSTANCE_OPT_ROUTER_E128K3_SM121_HIDDEN,
+                 SPARK_INSTANCE_OPT_ROUTER_E128K3_SM121_EXPERTS,
+                 SPARK_INSTANCE_OPT_ROUTER_E128K3_SM121_TOP_K)
+#endif
+// The second-shape build proof (kernels/instances.toml): 4096 wide, 256 experts, top-8. It is
+// never in a released cubin and nothing loads it; it exists so a different shape is built from
+// this body on every instance build.
+#if defined(SPARK_INSTANCE_OPT_ROUTER_4096E256K8_SM121_HIDDEN)
+OPT_ROUTER_ENTRY(opt_router_4096e256k8_sm121, SPARK_INSTANCE_OPT_ROUTER_4096E256K8_SM121_HIDDEN,
+                 SPARK_INSTANCE_OPT_ROUTER_4096E256K8_SM121_EXPERTS,
+                 SPARK_INSTANCE_OPT_ROUTER_4096E256K8_SM121_TOP_K)
+#endif

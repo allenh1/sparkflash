@@ -27,9 +27,31 @@ ARCH="${SPARKFLASH_CUDA_ARCH:-sm_121a}"
 NVCC="${NVCC:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}"
 [ -x "$NVCC" ] || { echo "build-cubins: nvcc not found (set NVCC)" >&2; exit 1; }
 mkdir -p "$OUT"
-jobs="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
-ls "$ROOT"/kernels/*.cu | xargs -P "$jobs" -I{} sh -c '
-    name=$(basename "{}" .cu)
-    "$0" -std=c++17 -arch="$1" -cubin -I "$2/kernels" "{}" -o "$3/$name.cubin" || { echo "build-cubins: $name failed" >&2; exit 255; }
-' "$NVCC" "$ARCH" "$ROOT" "$OUT"
+python3 "$ROOT/scripts/instances.py" --check >/dev/null
+
+# Sources with instances are compiled from kernels/instances.toml: one compile per (source, cubin)
+# group with that group's shape macros. A source with a second-shape proof instance therefore
+# builds twice, into two cubins, and the released cubin keeps its own symbol set. Every other
+# source is compiled exactly as before, once, with no defines.
+plan=$(mktemp)
+trap 'rm -f "$plan"' EXIT
+python3 "$ROOT/scripts/instances.py" --cubin-plan > "$plan"
+instanced=$(python3 "$ROOT/scripts/instances.py" --sources | sed "s|^|$ROOT/|")
+
+while IFS=$'\t' read -r cubin source defines; do
+    [ -n "$cubin" ] || continue
+    # The defines are one flag per shape and never contain whitespace; the split is intended.
+    # shellcheck disable=SC2086
+    "$NVCC" -std=c++17 -arch="$ARCH" -cubin -I "$ROOT/kernels" $defines "$ROOT/$source" \
+        -o "$OUT/$cubin.cubin" || { echo "build-cubins: $cubin failed" >&2; exit 255; }
+done < "$plan"
+
+for source in "$ROOT"/kernels/*.cu; do
+    case $'\n'"$instanced"$'\n' in
+        *$'\n'"$source"$'\n'*) continue ;;
+    esac
+    name=$(basename "$source" .cu)
+    "$NVCC" -std=c++17 -arch="$ARCH" -cubin -I "$ROOT/kernels" "$source" \
+        -o "$OUT/$name.cubin" || { echo "build-cubins: $name failed" >&2; exit 255; }
+done
 echo "build-cubins: $(ls "$OUT"/*.cubin | wc -l) cubins in $OUT"

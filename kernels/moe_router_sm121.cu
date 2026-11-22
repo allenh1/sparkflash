@@ -77,10 +77,22 @@
 
 #include "m4_common_sm121.cuh"
 
+// The model shapes are instance arguments (kernels/instances.toml). This source has no default
+// expert count, hidden width or top-k: a build that does not name the instance does not compile.
+#if !defined(SPARK_INSTANCE_MOE_ROUTER_SM121_HIDDEN)
+#error "moe_router_sm121.cu: SPARK_INSTANCE_MOE_ROUTER_SM121_HIDDEN is an instance argument; add the instance to kernels/instances.toml"
+#endif
+#if !defined(SPARK_INSTANCE_MOE_ROUTER_SM121_EXPERTS)
+#error "moe_router_sm121.cu: SPARK_INSTANCE_MOE_ROUTER_SM121_EXPERTS is an instance argument; add the instance to kernels/instances.toml"
+#endif
+#if !defined(SPARK_INSTANCE_MOE_ROUTER_SM121_TOP_K)
+#error "moe_router_sm121.cu: SPARK_INSTANCE_MOE_ROUTER_SM121_TOP_K is an instance argument; add the instance to kernels/instances.toml"
+#endif
+
 // The released router geometry and constants (docs/architecture/03-moe.md section 1 and 2).
-#define SPARK_ROUTER_N_ROUTED 384u
-#define SPARK_ROUTER_HIDDEN SPARK_M4_HIDDEN
-#define SPARK_ROUTER_TOP_K 6u
+#define SPARK_ROUTER_N_ROUTED SPARK_INSTANCE_MOE_ROUTER_SM121_EXPERTS
+#define SPARK_ROUTER_HIDDEN SPARK_INSTANCE_MOE_ROUTER_SM121_HIDDEN
+#define SPARK_ROUTER_TOP_K SPARK_INSTANCE_MOE_ROUTER_SM121_TOP_K
 #define SPARK_ROUTER_GATE_TEMP 1.0f
 #define SPARK_ROUTER_SOFTPLUS_THRESHOLD 20.0f
 #define SPARK_ROUTER_NORM_EPS 1e-20f
@@ -104,9 +116,10 @@
 // Stage two is a 256-thread block with one thread per token.
 #define SPARK_ROUTER_TOPK_THREADS 256u
 
-static_assert(SPARK_ROUTER_N_ROUTED == 384u, "the released router has 384 experts");
-static_assert(SPARK_ROUTER_HIDDEN == 5120u, "the released hidden width is 5120");
-static_assert(SPARK_ROUTER_TOP_K == 6u, "the released router activates 6 experts");
+// The bounds the body states; the values are the instance's.
+static_assert(SPARK_ROUTER_N_ROUTED > 0u, "the instance names an expert count");
+static_assert(SPARK_ROUTER_HIDDEN > 0u, "the instance names a hidden width");
+static_assert(SPARK_ROUTER_TOP_K > 0u, "the instance names a top-k");
 static_assert(SPARK_ROUTER_TOP_K <= SPARK_ROUTER_N_ROUTED, "top-k fits the expert count");
 static_assert(SPARK_ROUTER_EXPERTS_PER_BLOCK == SPARK_ROUTER_WARPS,
               "one warp owns one expert of the block");
