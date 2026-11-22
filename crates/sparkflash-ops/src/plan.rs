@@ -602,6 +602,8 @@ pub struct KernelSymbol {
     pub class: ComputeClass,
     /// The token-row band this body is written for.
     pub rows: RowBand,
+    /// The shapes this body's own arithmetic accepts, beyond its entry's rule.
+    pub shape: ShapeConstraint,
 }
 
 impl KernelSymbol {
@@ -619,6 +621,7 @@ impl KernelSymbol {
             phase: KernelPhase::Both,
             class,
             rows,
+            shape: ShapeConstraint::ANY,
         }
     }
 
@@ -636,6 +639,7 @@ impl KernelSymbol {
             phase: KernelPhase::Prefill,
             class,
             rows,
+            shape: ShapeConstraint::ANY,
         }
     }
 
@@ -653,6 +657,7 @@ impl KernelSymbol {
             phase: KernelPhase::Decode,
             class,
             rows,
+            shape: ShapeConstraint::ANY,
         }
     }
 
@@ -669,6 +674,13 @@ impl KernelSymbol {
     #[must_use]
     pub const fn serves(&self, precision: Precision, phase: KernelPhase, rows: usize) -> bool {
         self.accepts(precision) && self.phase.serves(phase) && self.rows.contains(rows)
+    }
+
+    /// This symbol with its own shape rule.
+    #[must_use]
+    pub const fn with_shape(mut self, shape: ShapeConstraint) -> Self {
+        self.shape = shape;
+        self
     }
 }
 
@@ -767,6 +779,8 @@ pub struct PartGeometry {
     pub rows: usize,
     /// One expert's or MLP's rank-local intermediate width, padded.
     pub intermediate: usize,
+    /// The width a projection writes, when the part is a matrix projection.
+    pub output: usize,
     /// Rank-local attention heads.
     pub heads: usize,
     /// Rank-local key/value heads.
@@ -869,6 +883,7 @@ impl PartGeometry {
             hidden: 0,
             rows: 0,
             intermediate: 0,
+            output: 0,
             heads: 0,
             kv_heads: 0,
             head_dim: 0,
@@ -929,6 +944,8 @@ pub struct ShapeConstraint {
     pub head_dim_multiple: usize,
     /// Intermediate width must divide this.
     pub intermediate_multiple: usize,
+    /// Projection output width must divide this.
+    pub output_multiple: usize,
     /// Expert count must divide this.
     pub experts_multiple: usize,
     /// Residual stream count must divide this.
@@ -1016,6 +1033,7 @@ impl ShapeConstraint {
         heads_multiple: 1,
         head_dim_multiple: 1,
         intermediate_multiple: 1,
+        output_multiple: 1,
         experts_multiple: 1,
         streams_multiple: 1,
         min_positions: 0,
@@ -1088,6 +1106,13 @@ impl ShapeConstraint {
     #[must_use]
     pub const fn intermediate_multiple(mut self, multiple: usize) -> Self {
         self.intermediate_multiple = multiple;
+        self
+    }
+
+    /// Require the projection output width to be a multiple of `multiple`.
+    #[must_use]
+    pub const fn output_multiple(mut self, multiple: usize) -> Self {
+        self.output_multiple = multiple;
         self
     }
 
@@ -1401,6 +1426,7 @@ impl ShapeConstraint {
             geometry.intermediate,
             self.intermediate_multiple,
         )?;
+        multiple("output width", geometry.output, self.output_multiple)?;
         multiple("experts", geometry.experts, self.experts_multiple)?;
         multiple("streams", geometry.streams, self.streams_multiple)?;
         equals("hidden", geometry.hidden, self.hidden_equals)?;

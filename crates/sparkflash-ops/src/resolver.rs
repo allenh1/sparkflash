@@ -500,7 +500,12 @@ impl KernelResolver {
                 && symbol.phase.serves(phase)
         });
         match found {
-            Some(symbol) => Ok(symbol),
+            Some(symbol) => {
+                if let Err(reason) = symbol.shape.accepts(&requirement.geometry) {
+                    return Err(format!("{} {}: {reason}", entry.image.name(), symbol.name));
+                }
+                Ok(symbol)
+            }
             None => Err(match name {
                 Some(name) => format!(
                     "{} exports no {name} accepting {} in the {} pass",
