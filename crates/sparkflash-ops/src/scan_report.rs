@@ -40,6 +40,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use sparkflash_model::architecture::{Architecture, WeightFormat};
 use sparkflash_model::stack::{Shape, StackKind};
@@ -253,6 +254,14 @@ pub enum ScanStatus {
         /// What would fix the gap.
         fix: String,
     },
+    /// A part of a stack the switch turned off.
+    ///
+    /// The row is not a gap: the stack is deliberately not loaded, its tensors are still
+    /// claimed by the description, and the reason names the switch. It is never the default.
+    Off {
+        /// Why the stack is off.
+        reason: String,
+    },
 }
 
 impl ScanStatus {
@@ -267,6 +276,7 @@ impl ScanStatus {
             Self::UnknownKey { .. } => "unknown key",
             Self::UnclaimedTensor { .. } => "unclaimed tensor",
             Self::UnknownLayout { .. } => "unknown layout",
+            Self::Off { .. } => "off",
         }
     }
 
@@ -281,13 +291,29 @@ impl ScanStatus {
             | Self::UnknownKey { fix, .. }
             | Self::UnclaimedTensor { fix, .. }
             | Self::UnknownLayout { fix, .. } => Some(fix),
+            Self::Off { .. } => None,
         }
     }
 
-    /// Whether this row resolved.
+    /// Whether this row is a gap.
+    ///
+    /// A deliberately off row is not a gap: the report still prints it as off, but a gate that
+    /// refuses every row that is not `resolved` must not refuse a stack the operator turned off.
+    #[must_use]
+    pub const fn is_gap(&self) -> bool {
+        !matches!(self, Self::Resolved | Self::Off { .. })
+    }
+
+    /// Whether this row resolved or is deliberately off.
     #[must_use]
     pub const fn is_resolved(&self) -> bool {
-        matches!(self, Self::Resolved)
+        !self.is_gap()
+    }
+
+    /// Whether the switch turned this row's stack off.
+    #[must_use]
+    pub const fn is_off(&self) -> bool {
+        matches!(self, Self::Off { .. })
     }
 
     /// The key, tensor or detail this status refuses, when it has one.
@@ -304,6 +330,7 @@ impl ScanStatus {
             Self::UnknownKey { key, .. } => Some(key),
             Self::UnclaimedTensor { tensor, .. } => Some(tensor),
             Self::UnknownLayout { detail, .. } => Some(detail),
+            Self::Off { reason } => Some(reason),
         }
     }
 }
@@ -361,18 +388,33 @@ pub struct ScanReport {
 }
 
 impl ScanReport {
-    /// The rows that did not resolve.
+    /// The rows that are gaps: everything that did not resolve and is not deliberately off.
     pub fn unresolved(&self) -> impl Iterator<Item = &ScanRow> {
-        self.rows.iter().filter(|row| !row.status.is_resolved())
+        self.rows.iter().filter(|row| row.status.is_gap())
     }
 
-    /// Whether the scan ran and every kernel row resolved.
+    /// The rows the vision switch turned off, if any.
+    pub fn off_rows(&self) -> impl Iterator<Item = &ScanRow> {
+        self.rows.iter().filter(|row| row.status.is_off())
+    }
+
+    /// Why the vision stack is off, when its rows are.
+    #[must_use]
+    pub fn off_reason(&self) -> Option<&str> {
+        self.off_rows().find_map(|row| match &row.status {
+            ScanStatus::Off { reason } => Some(reason.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Whether the scan ran with no gap row.
     ///
-    /// This is kernel coverage only. A checkpoint is clean when [Self::is_clean] is also true,
-    /// which additionally requires both coverage checks to have run.
+    /// This is kernel coverage only, and deliberately-off rows are not gaps. A checkpoint is
+    /// clean when [Self::is_clean] is also true, which additionally requires both coverage
+    /// checks to have run.
     #[must_use]
     pub fn is_resolved(&self) -> bool {
-        self.error.is_none() && self.rows.iter().all(|row| row.status.is_resolved())
+        self.error.is_none() && self.unresolved().next().is_none()
     }
 
     /// Whether the checkpoint is clean: every part resolved and both coverage checks are clean.
@@ -382,6 +424,30 @@ impl ScanReport {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.is_resolved() && self.coverage.is_complete()
+    }
+
+    /// The rows that block a load.
+    ///
+    /// An unread config key is a description warning, not a load blocker: the read consumed the
+    /// keys the arithmetic needs, and an arm's own typed parser may consume keys the shared
+    /// description does not. Every other gap - a missing kernel, an unclaimed or mismatched
+    /// tensor, an undetermined layout, an unread key that changes no arithmetic - remains a
+    /// blocker. [Self::is_clean] and the rendered `clean:` verdict stay stricter: they still
+    /// report the description warning.
+    pub fn load_gaps(&self) -> impl Iterator<Item = &ScanRow> {
+        self.unresolved()
+            .filter(|row| !matches!(row.status, ScanStatus::UnknownKey { .. }))
+    }
+
+    /// Whether this checkpoint can be loaded: no load gap and the tensor claims were checked.
+    ///
+    /// This is [Self::is_clean] without the unread-config-key warning. A report that never
+    /// compared its tensor index is not loadable, even when every kernel row resolved.
+    #[must_use]
+    pub fn load_is_clean(&self) -> bool {
+        self.error.is_none()
+            && self.load_gaps().next().is_none()
+            && self.coverage.tensors.is_clean()
     }
 
     /// The plain-text report the console, `onboard` and the load refusal print.
@@ -411,9 +477,16 @@ impl ScanReport {
             let format = row
                 .format
                 .map_or_else(|| "?".to_owned(), |format| format.name().to_owned());
-            let status = match row.status.subject() {
-                Some(subject) => format!("{}: {subject}", row.status.name()),
-                None => row.status.name().to_owned(),
+            let status = match &row.status {
+                // A config key has no tensor shape; say so in the row rather than leaving a
+                // bare "?" that reads like a missing shape the index could have supplied.
+                ScanStatus::UnknownKey { key, .. } => {
+                    format!("unknown key: {key} (a config key, not a tensor)")
+                }
+                status => match status.subject() {
+                    Some(subject) => format!("{}: {subject}", status.name()),
+                    None => status.name().to_owned(),
+                },
             };
             let _ = writeln!(
                 out,
@@ -433,15 +506,19 @@ impl ScanReport {
         let resolved = self
             .rows
             .iter()
-            .filter(|row| row.status.is_resolved())
+            .filter(|row| matches!(row.status, ScanStatus::Resolved))
             .count();
+        let off = self.off_rows().count();
+        let unresolved = self.unresolved().count();
         let _ = writeln!(
             out,
-            "{} rows, {} resolved, {} unresolved",
+            "{} rows, {} resolved, {off} off, {unresolved} unresolved",
             self.rows.len(),
             resolved,
-            self.rows.len() - resolved
         );
+        if let Some(reason) = self.off_reason() {
+            let _ = writeln!(out, "vision: {reason}");
+        }
         let tensors = match (self.coverage.tensors, self.coverage.indexed_tensors) {
             (state, Some(count)) => format!("{} ({count} indexed)", state.name()),
             (state, None) => state.name().to_owned(),
@@ -453,6 +530,43 @@ impl ScanReport {
         );
         let _ = writeln!(out, "clean: {}", if self.is_clean() { "yes" } else { "no" });
         out
+    }
+
+    /// The one boot line for this report.
+    ///
+    /// It is the table's summary without the table: the counts, the vision switch's reason when
+    /// the stack is off, the coverage states and the verdict. A serve prints this after a clean
+    /// scan so the boot log says a tower is off and why.
+    #[must_use]
+    pub fn boot_line(&self) -> String {
+        let resolved = self
+            .rows
+            .iter()
+            .filter(|row| matches!(row.status, ScanStatus::Resolved))
+            .count();
+        let off = self.off_rows().count();
+        let unresolved = self.unresolved().count();
+        let tensors = match (self.coverage.tensors, self.coverage.indexed_tensors) {
+            (state, Some(count)) => format!("{} ({count} indexed)", state.name()),
+            (state, None) => state.name().to_owned(),
+        };
+        let mut line = format!(
+            "scan {} TP{}: {} rows, {resolved} resolved, {off} off, {unresolved} unresolved; \
+             tensors {tensors}; config keys {}; clean: {}; load: {}",
+            self.target.name(),
+            self.world,
+            self.rows.len(),
+            self.coverage.config_keys.name(),
+            if self.is_clean() { "yes" } else { "no" },
+            if self.load_is_clean() { "yes" } else { "no" }
+        );
+        if let Some(reason) = self.off_reason() {
+            let _ = write!(line, "; {reason}");
+        }
+        if let Some(error) = &self.error {
+            let _ = write!(line, "; error: {error}");
+        }
+        line
     }
 }
 
@@ -467,15 +581,160 @@ impl fmt::Display for ScanReport {
 /// The plan is built at rank zero of `inputs.world`; a scan describes the checkpoint, not one
 /// rank's slice, so rank zero is the representative the report prints. A config that does not
 /// parse or plan is reported in [ScanReport::error] with no rows; it is never silently empty.
+///
+/// The vision switch is read once, here, through
+/// [sparkflash_model::profile::vision_enabled]. A stack the switch turns off is printed as off,
+/// never as resolved and never as an unstated gap.
 #[must_use]
 pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
+    scan_impl(
+        inputs,
+        Availability::Catalogue,
+        sparkflash_model::profile::vision_enabled(),
+        None,
+    )
+}
+
+/// [scan] under an explicit availability policy.
+///
+/// A serving gate passes the policy its process runs under: a device arm uses the run-time
+/// images it can actually load, while a host reference that launches no kernel uses
+/// [Availability::Catalogue]. The scan still reads the one vision switch.
+#[must_use]
+pub fn scan_with_availability(inputs: ScanInputs<'_>, availability: Availability) -> ScanReport {
+    scan_impl(
+        inputs,
+        availability,
+        sparkflash_model::profile::vision_enabled(),
+        None,
+    )
+}
+
+/// [scan] with the vision switch already resolved.
+///
+/// This is the seam a test or a caller that has already read the switch uses; it does not read
+/// the environment itself, so the helper above remains the only reading.
+#[must_use]
+pub fn scan_with_switch(
+    inputs: ScanInputs<'_>,
+    availability: Availability,
+    vision: bool,
+) -> ScanReport {
+    scan_impl(inputs, availability, Ok(vision), None)
+}
+
+/// Scan the plan a caller already built, against the checkpoint's documents.
+///
+/// A pack arm may correct the document's own arithmetic while parsing it (for example, a
+/// weight-only quantization bridge). The gate must judge the plan that arm will execute, not a
+/// second raw parse, so this entry point takes the plan and reads only the config keys and the
+/// tensor index through [ScanInputs]. It reads the one vision switch.
+#[must_use]
+pub fn scan_plan(
+    inputs: ScanInputs<'_>,
+    plan: EnginePlan,
+    availability: Availability,
+) -> ScanReport {
+    scan_impl(
+        inputs,
+        availability,
+        sparkflash_model::profile::vision_enabled(),
+        Some(plan),
+    )
+}
+
+/// [scan_plan] with the vision switch already resolved, for a caller that read it once.
+#[must_use]
+pub fn scan_plan_with_switch(
+    inputs: ScanInputs<'_>,
+    plan: EnginePlan,
+    availability: Availability,
+    vision: bool,
+) -> ScanReport {
+    scan_impl(inputs, availability, Ok(vision), Some(plan))
+}
+
+/// The checkpoint's configuration file, the only document outside the safetensors headers a
+/// gate reads.
+const CHECKPOINT_CONFIG_NAME: &str = "config.json";
+
+/// Scan a checkpoint directory from its `config.json` and safetensors headers only.
+///
+/// This is the one gate call a serve makes before it opens a weight: the configuration and the
+/// headers name every part and tensor, and no weight byte is read. The report is returned even
+/// when the documents cannot be read, with [ScanReport::error] set, so a caller prints the same
+/// table and refusal for a malformed checkpoint as for an unresolved part.
+#[must_use]
+pub fn scan_checkpoint(
+    directory: &Path,
+    target: Target,
+    world: usize,
+    availability: Availability,
+) -> ScanReport {
+    let config_path = directory.join(CHECKPOINT_CONFIG_NAME);
+    let config = match std::fs::read_to_string(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            return ScanReport {
+                target,
+                world,
+                availability,
+                coverage: Coverage::not_checked(None),
+                rows: Vec::new(),
+                error: Some(format!("{}: {error}", config_path.display())),
+            };
+        }
+    };
+    let index = match sparkflash_weights::tensor_index::read_local(directory) {
+        Ok(index) => TensorIndex::from_reader(&index),
+        Err(error) => {
+            return ScanReport {
+                target,
+                world,
+                availability,
+                coverage: Coverage::not_checked(None),
+                rows: Vec::new(),
+                error: Some(format!(
+                    "{}: {error}; the gate needs the safetensors headers, not the weights",
+                    directory.display()
+                )),
+            };
+        }
+    };
+    scan_with_availability(
+        ScanInputs {
+            config: &config,
+            tensors: Some(&index),
+            target,
+            world,
+        },
+        availability,
+    )
+}
+
+fn scan_impl(
+    inputs: ScanInputs<'_>,
+    availability: Availability,
+    vision: Result<bool, sparkflash_model::profile::ProfileError>,
+    plan: Option<EnginePlan>,
+) -> ScanReport {
     let mut report = ScanReport {
         target: inputs.target,
         world: inputs.world,
-        availability: Availability::Catalogue,
+        availability,
         coverage: Coverage::not_checked(inputs.tensors.map(|index| index.tensors.len())),
         rows: Vec::new(),
         error: None,
+    };
+    let vision = match vision {
+        Ok(vision) => vision,
+        Err(error) => {
+            report.error = Some(format!(
+                "{}: {error}; the vision stack cannot be turned on or off by an unknown value",
+                sparkflash_model::profile::VISION_ENV
+            ));
+            return report;
+        }
     };
     let names: Option<Vec<String>> = inputs.tensors.map(|index| {
         index
@@ -484,25 +743,40 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             .map(|tensor| tensor.name.clone())
             .collect()
     });
-    let (mut architecture, keys) = match Architecture::from_json_with_coverage_and_tensor_names(
-        inputs.config,
-        names.as_deref(),
-    ) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            report.error = Some(error.to_string());
-            return report;
-        }
-    };
+    let (mut parsed_architecture, keys) =
+        match Architecture::from_json_with_coverage_and_tensor_names(
+            inputs.config,
+            names.as_deref(),
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                report.error = Some(error.to_string());
+                return report;
+            }
+        };
     if let Some(index) = inputs.tensors {
-        apply_patch_temporal(&mut architecture, index);
+        apply_patch_temporal(&mut parsed_architecture, index);
     }
+    let plan_architecture = plan.as_ref().map(|plan| plan.architecture().clone());
+    let architecture = plan_architecture.as_ref().unwrap_or(&parsed_architecture);
+    let unknown_keys = keys.unknown_keys();
     report.coverage.config_keys = match keys.state() {
         sparkflash_model::coverage::KeyCoverageState::Clean => CoverageState::Clean,
+        // A switched-off stack's own keys are not read because its parser does not run. They are
+        // part of the stated choice, like its tensors, not an unknown-key gap; a language key
+        // nothing read still reports dirty.
+        sparkflash_model::coverage::KeyCoverageState::Dirty
+            if !vision
+                && unknown_keys
+                    .iter()
+                    .all(|key| key.path.starts_with("vision_config.")) =>
+        {
+            CoverageState::Clean
+        }
         sparkflash_model::coverage::KeyCoverageState::Dirty => CoverageState::Dirty,
         sparkflash_model::coverage::KeyCoverageState::NotChecked => CoverageState::NotChecked,
     };
-    for key in keys.unknown_keys() {
+    for key in unknown_keys {
         let vision = key.path.starts_with("vision_config.");
         report.rows.push(ScanRow {
             stack: if vision {
@@ -526,14 +800,20 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             },
         });
     }
-    let plan = match EnginePlan::for_architecture(architecture, inputs.target, inputs.world, 0) {
-        Ok(plan) => plan,
-        Err(error) => {
-            report.error = Some(error.to_string());
-            return report;
+    let plan = match plan {
+        Some(plan) => plan,
+        None => {
+            match EnginePlan::for_architecture(architecture.clone(), inputs.target, inputs.world, 0)
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    report.error = Some(error.to_string());
+                    return report;
+                }
+            }
         }
     };
-    let resolver = KernelResolver::new(inputs.target, report.availability);
+    let resolver = KernelResolver::new(inputs.target, availability);
     let architecture = plan.architecture();
     for requirement in plan.globals() {
         push_row(
@@ -609,7 +889,10 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
         }
     }
     if let Some(index) = inputs.tensors {
-        apply_tensor_coverage(&mut report, architecture, inputs.world, index);
+        apply_tensor_coverage(&mut report, architecture, inputs.world, index, vision);
+    }
+    if !vision {
+        mark_vision_off(&mut report);
     }
     report
 }
@@ -654,12 +937,27 @@ fn apply_patch_temporal(architecture: &mut Architecture, index: &TensorIndex) {
     }
 }
 
+/// Print every row of the vision stack as deliberately off.
+///
+/// The rows stay in the report with their part and shape, so the table says exactly what is not
+/// loaded; only the status changes. The reason is the one the switch documents.
+fn mark_vision_off(report: &mut ScanReport) {
+    for row in &mut report.rows {
+        if row.stack == StackKind::Vision {
+            row.status = ScanStatus::Off {
+                reason: sparkflash_model::profile::VISION_OFF_REASON.to_owned(),
+            };
+        }
+    }
+}
+
 /// The tensor-claim pass: compare the description's claim set with the supplied index.
 fn apply_tensor_coverage(
     report: &mut ScanReport,
     architecture: &Architecture,
     world: usize,
     index: &TensorIndex,
+    vision: bool,
 ) {
     report.coverage.indexed_tensors = Some(index.tensors.len());
     let tp = match TpPlan::for_architecture(architecture, world, 0) {
@@ -719,7 +1017,19 @@ fn apply_tensor_coverage(
         );
         return;
     }
-    let coverage = compare_tensor_claims(&claims, index);
+    let mut coverage = compare_tensor_claims(&claims, index);
+    if !vision {
+        // The tower is deliberately not loaded, so its bytes are claimed but not required: a
+        // checkpoint whose tower is stored under another spelling, or not stored at all, must
+        // not turn a text-only serve into a refusal. The language stack is still checked in
+        // both directions.
+        coverage
+            .disagreements
+            .retain(|entry| stack_of_name(&entry.tensor) != StackKind::Vision);
+        coverage
+            .unclaimed
+            .retain(|group| stack_of_name(&group.prefix) != StackKind::Vision);
+    }
     report.coverage.tensors = if coverage.is_clean() {
         CoverageState::Clean
     } else {
@@ -729,7 +1039,7 @@ fn apply_tensor_coverage(
         push_disagreement(report, disagreement);
     }
     for group in &coverage.unclaimed {
-        push_unclaimed(report, group);
+        push_unclaimed(report, group, index);
     }
 }
 
@@ -759,7 +1069,7 @@ fn report_tensor_plan_failure(report: &mut ScanReport, index: &TensorIndex, deta
         .cloned()
         .collect();
     for group in group_unclaimed(&tower) {
-        push_unclaimed(report, &group);
+        push_unclaimed(report, &group, index);
     }
 }
 
@@ -800,8 +1110,15 @@ fn push_disagreement(report: &mut ScanReport, disagreement: &TensorDisagreement)
 }
 
 /// One unclaimed prefix group.
-fn push_unclaimed(report: &mut ScanReport, group: &TensorGroup) {
+fn push_unclaimed(report: &mut ScanReport, group: &TensorGroup, index: &TensorIndex) {
     let stack = stack_of_name(&group.prefix);
+    // The row names a tensor (or the first tensor of a prefix group), so print the shape the
+    // checkpoint stores for it. The index is the authority; a name it does not hold is unknown.
+    let shape = group
+        .names
+        .iter()
+        .find_map(|name| index.tensors.iter().find(|tensor| &tensor.name == name))
+        .map_or_else(Shape::unknown, |tensor| Shape::new(tensor.shape.clone()));
     let fix = if group.count() == 1 {
         format!(
             "the checkpoint tensor {} is not claimed by any planned part; add the stack or layout \
@@ -819,7 +1136,7 @@ fn push_unclaimed(report: &mut ScanReport, group: &TensorGroup) {
         stack,
         block: block_of_name(&group.prefix),
         part: part_of_stack(stack),
-        shape: Shape::unknown(),
+        shape,
         format: None,
         pass: KernelPhase::Both,
         target: report.target,
@@ -1066,11 +1383,48 @@ mod tests {
             "language  global lm_head            128x5120         BF16     both     resolved\n",
             "language  0      gqa_attention      1x128            BF16     both     resolved\n",
             "language  0      dense_mlp          256x5120         BF16     both     resolved\n",
-            "5 rows, 5 resolved, 0 unresolved\n",
+            "5 rows, 5 resolved, 0 off, 0 unresolved\n",
             "coverage: tensors not checked; config keys clean\n",
             "clean: no\n",
         );
         assert_eq!(scan(inputs(Target::Sm121)).render(), expected);
+    }
+
+    #[test]
+    fn an_unread_config_key_is_a_description_warning_not_a_load_blocker() {
+        let mut config: serde_json::Value =
+            serde_json::from_str(CONFIG).expect("the synthetic config");
+        config["an_unread_switch"] = serde_json::json!(true);
+        let config = config.to_string();
+        let entries = planned_entries(&config, 1);
+        let index = TensorIndex::new(entries);
+        let report = scan(ScanInputs {
+            config: &config,
+            tensors: Some(&index),
+            target: Target::Sm121,
+            world: 1,
+        });
+        assert!(report.error.is_none(), "{report:?}");
+        assert_eq!(report.coverage.tensors, CoverageState::Clean);
+        assert_eq!(report.coverage.config_keys, CoverageState::Dirty);
+        assert!(
+            report.rows.iter().any(|row| matches!(
+                row.status,
+                ScanStatus::UnknownKey { ref key, .. } if key == "an_unread_switch"
+            )),
+            "{}",
+            report.render()
+        );
+        assert!(!report.is_clean(), "the description warning still shows");
+        assert!(report.load_is_clean(), "{}", report.render());
+        assert_eq!(report.load_gaps().count(), 0, "{}", report.render());
+        let text = report.render();
+        assert!(text.contains("unknown key: an_unread_switch"), "{text}");
+        assert!(
+            text.contains("(a config key, not a tensor)"),
+            "the unknown-key row says why its shape is '?': {text}"
+        );
+        assert!(text.contains("clean: no"), "{text}");
     }
 
     #[test]
@@ -1086,6 +1440,10 @@ mod tests {
         });
         assert!(report.error.is_none(), "{report:?}");
         assert!(!report.is_clean());
+        assert!(
+            !report.load_is_clean(),
+            "an unclaimed tensor still blocks a load"
+        );
         assert_eq!(report.coverage.indexed_tensors, Some(1));
         assert_eq!(report.coverage.tensors, CoverageState::Dirty);
         // The one indexed tensor is unclaimed, and the plan that shares no name with the index is
@@ -1099,6 +1457,11 @@ mod tests {
         assert_eq!(
             unclaimed[0].status.subject(),
             Some("model.visual.nothing_claims_this")
+        );
+        assert_eq!(
+            unclaimed[0].shape,
+            Shape::new([16, 16]),
+            "the row prints the stored shape, not '?'"
         );
         let layout: Vec<&ScanRow> = report
             .rows
@@ -1174,6 +1537,48 @@ mod tests {
             "the refusal must name the precision the plan asked for: {fix}"
         );
         assert!(!report.is_resolved(), "a 16-patch tower has no body");
+        assert!(
+            !report.load_is_clean(),
+            "a missing kernel still blocks a load"
+        );
+    }
+
+    #[test]
+    fn a_switched_off_vision_stack_is_off_not_a_gap() {
+        const VISION_CONFIG: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16,"vision_config":{"depth":1,"hidden_size":64,"num_attention_heads":2,"intermediate_size":128,"patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2}}"#;
+        let report = scan_with_switch(
+            ScanInputs {
+                config: VISION_CONFIG,
+                tensors: None,
+                target: Target::Sm121,
+                world: 1,
+            },
+            Availability::Catalogue,
+            false,
+        );
+        assert!(report.error.is_none(), "{report:?}");
+        let vision: Vec<&ScanRow> = report
+            .rows
+            .iter()
+            .filter(|row| row.stack == StackKind::Vision)
+            .collect();
+        assert!(!vision.is_empty());
+        assert!(
+            vision
+                .iter()
+                .all(|row| matches!(row.status, ScanStatus::Off { .. })),
+            "{}",
+            report.render()
+        );
+        assert!(report.is_resolved(), "{}", report.render());
+        assert_eq!(
+            report.off_reason(),
+            Some(sparkflash_model::profile::VISION_OFF_REASON)
+        );
+        let text = report.render();
+        assert!(text.contains("off: the vision stack is off"), "{text}");
+        assert!(text.contains("vision: the vision stack is off"), "{text}");
+        assert!(!report.is_clean(), "the tensor check did not run");
     }
 
     #[test]
@@ -1391,13 +1796,13 @@ mod tests {
         let expected = concat!(
             "scan report: sm121 TP1, availability catalogue\n",
             "stack     block  part               shape            format   pass     status\n",
-            "language  global embedding          ?                ?        both     unknown key: model.new_switch\n",
+            "language  global embedding          ?                ?        both     unknown key: model.new_switch (a config key, not a tensor)\n",
             "    fix: teach the reader\n",
             "language  global embedding          ?                ?        both     unclaimed tensor: model.visual.patch.weight\n",
             "    fix: add a layout entry\n",
             "language  global embedding          ?                ?        both     unknown layout: no layout for the tower\n",
             "    fix: ship a layout file\n",
-            "3 rows, 0 resolved, 3 unresolved\n",
+            "3 rows, 0 resolved, 0 off, 3 unresolved\n",
             "coverage: tensors not checked; config keys not checked\n",
             "clean: no\n",
         );

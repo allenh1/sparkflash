@@ -164,8 +164,7 @@ use sparkflash_model_deepseek_v41::encoding::{
     HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
-use sparkflash_ops::parts::serving;
-use sparkflash_ops::resolver::{Availability, KernelResolver};
+use sparkflash_ops::resolver::Availability;
 use sparkflash_scheduler::config::SchedulerConfig;
 use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
 
@@ -820,13 +819,12 @@ impl ServeOptions {
                 if pack.is_reference() {
                     // Keep `cli.model` unset so `run` takes the V4.1 reference/TP4 path.
                 } else {
-                    let missing = pack::Pack::missing_parts(&directory);
-                    if !missing.is_empty() {
-                        let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+                    let report = pack::Pack::boot_report(&directory, 1);
+                    if !report.load_is_clean() {
                         return Err(format!(
-                            "--checkpoint {} names parts this build does not carry for sm121: {}",
+                            "--checkpoint {} is refused by the scan for sm121:\n{}",
                             directory.display(),
-                            names.join(", ")
+                            report.render()
                         ));
                     }
                     cli.model = Some(pack.model_id().to_owned());
@@ -5547,42 +5545,51 @@ pub(super) fn check_checkpoint_plan(
     let config = directory.join(CHECKPOINT_CONFIG_NAME);
     let plan = EnginePlan::from_path(&config, Target::Sm121, world, 0)
         .map_err(|error| format!("--checkpoint {}: {error}", directory.display()))?;
-    let resolver = KernelResolver::new(Target::Sm121, availability);
-    // The DeepSeek device arm loads and runs the 14-patch tower, so its serving set keeps
-    // Vision: a 16-patch document is still refused at boot. (The Qwen and GLM packs use
-    // [serving_language] instead.) The catalogue's own boot_check still judges the whole plan.
-    let failures = resolver
-        .boot_check_serving(&plan, &serving(Target::Sm121))
-        .err()
-        .unwrap_or_default();
-    if failures.is_empty() {
-        eprintln!("sparkflash serve: plan {}", plan.boot_summary());
+    // The one report every open prints. It reads config.json and the safetensors headers only,
+    // and it judges the tower like every other stack: a vision part with no body refuses the
+    // load unless the operator states SPARKFLASH_VISION=off.
+    let report = sparkflash_ops::scan_checkpoint(&directory, Target::Sm121, world, availability);
+    if report.load_is_clean() {
+        eprintln!("sparkflash serve: {}", report.boot_line());
         return Ok(());
     }
-    let reasons: Vec<String> = failures.iter().map(ToString::to_string).collect();
     Err(format!(
-        "--checkpoint {} cannot execute {} at TP{world}: {}",
+        "--checkpoint {} cannot execute {} at TP{world}:\n{}",
         directory.display(),
         plan.family(),
-        reasons.join("; ")
+        report.render()
     ))
 }
 
-/// The V4.1 serving path's kernel-shape boot gate.
-///
-/// Only an engine that launches kernels is gated. The reference engine runs the host twin and
-/// loads no kernel, so the catalogue's rank-local shape rules (DeepSeek's b12x MXFP4 MoE is
-/// compiled for the 576-column TP4 shape) do not describe it. Gating it at TP1 refused the
-/// default `sparkflash serve --checkpoint <released>` path for a run that never launches one.
-/// The device engine keeps the TP1/TP2 refusal.
-fn check_serve_plan(engine: EngineChoice, checkpoint: Option<&Path>) -> Result<(), String> {
-    if engine == EngineChoice::Reference {
-        return Ok(());
-    }
-    let Some(checkpoint) = checkpoint else {
-        return Ok(());
+/// The kernel-shape half of [check_checkpoint_plan] for a test checkpoint with no weights.
+#[cfg(test)]
+fn check_checkpoint_plan_kernels(
+    checkpoint: &Path,
+    world: usize,
+    availability: Availability,
+) -> Result<(), String> {
+    let directory = if checkpoint.is_dir() {
+        checkpoint.to_path_buf()
+    } else {
+        checkpoint.parent().unwrap_or(Path::new(".")).to_path_buf()
     };
-    check_checkpoint_plan(checkpoint, 1, Availability::runtime_env())
+    let plan = EnginePlan::from_path(
+        &directory.join(CHECKPOINT_CONFIG_NAME),
+        Target::Sm121,
+        world,
+        0,
+    )
+    .map_err(|error| format!("--checkpoint {}: {error}", directory.display()))?;
+    let resolver = sparkflash_ops::resolver::KernelResolver::new(Target::Sm121, availability);
+    resolver.boot_check(&plan).map(|_| ()).map_err(|errors| {
+        let reasons: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        format!(
+            "--checkpoint {} cannot execute {} at TP{world}: {}",
+            directory.display(),
+            plan.family(),
+            reasons.join("; ")
+        )
+    })
 }
 
 /// Load the default DeepSeek arm's typed profile and apply the declared environment overrides.
@@ -5617,6 +5624,22 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
     {
         eprintln!("sparkflash serve: {message}");
         return ExitCode::from(EXIT_REFUSED);
+    }
+    // Every checkpoint open passes the one scan before any arm dispatches: the reference and
+    // dynamic routes included, so a dirty report cannot reach a weight or a bind.
+    if !options.synthetic
+        && let Some(checkpoint) = options.checkpoint.as_deref()
+    {
+        let availability = if options.engine == EngineChoice::Reference {
+            Availability::Catalogue
+        } else {
+            Availability::runtime_env()
+        };
+        let world = options.tp4.as_ref().map_or(1, |tp4| tp4.world_size);
+        if let Err(message) = check_checkpoint_plan(checkpoint, world, availability) {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
     }
     // A packed model is served by its own arm: none of the V4.1 recipe, engine selection or
     // device-chain wiring below describes it, and running through them would serve the wrong model.
@@ -5680,10 +5703,6 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
         }
     };
     if !options.synthetic {
-        if let Err(message) = check_serve_plan(options.engine, options.checkpoint.as_deref()) {
-            eprintln!("sparkflash serve: {message}");
-            return ExitCode::from(EXIT_REFUSED);
-        }
         match load_deepseek_profile() {
             Ok(profile) => sparkflash_model::install_active(profile),
             Err(message) => {
@@ -10715,7 +10734,7 @@ mod device_token_serve_tests {
     }
 
     #[test]
-    fn the_default_reference_serve_is_not_refused_by_a_kernel_shape_rule() {
+    fn the_default_reference_serve_is_gated_by_the_scan() {
         let dir = tempfile::TempDir::new().expect("a temporary directory");
         std::fs::write(
             dir.path().join(CHECKPOINT_CONFIG_NAME),
@@ -10731,17 +10750,15 @@ mod device_token_serve_tests {
         ])
         .expect("the default reference serve parses");
         assert_eq!(options.engine, EngineChoice::Reference);
-        check_serve_plan(options.engine, options.checkpoint.as_deref()).expect(
-            "the reference engine launches no kernel, so the TP1 kernel-shape gate must not refuse it",
-        );
-        // The skip is the reference engine's alone: the device engine launches kernels and must
-        // still be gated, or the exemption would have removed the TP1 refusal from the arm it was
-        // written for.
-        let error = check_serve_plan(EngineChoice::Device, options.checkpoint.as_deref())
-            .expect_err("the device engine launches kernels and is still gated at TP1");
-        assert!(!error.is_empty(), "the device refusal names no reason");
+        // The gate is the scan, not a kernel-shape rule: without headers even the reference
+        // engine is refused before a weight is opened. The device policy gives the same answer.
+        for availability in [Availability::Catalogue, Availability::runtime_env()] {
+            let error = check_checkpoint_plan(dir.path(), 1, availability)
+                .expect_err("the scan refuses a directory with no tensor index");
+            assert!(error.contains("safetensors"), "{error}");
+        }
         // The resolver's TP1 refusal remains for the kernel path.
-        let error = check_checkpoint_plan(dir.path(), 1, Availability::Catalogue)
+        let error = check_checkpoint_plan_kernels(dir.path(), 1, Availability::Catalogue)
             .expect_err("a kernel launch at TP1 is still refused");
         assert!(error.contains("does not equal 576"), "{error}");
     }
@@ -10756,7 +10773,7 @@ mod device_token_serve_tests {
             ),
         )
         .expect("the released configuration");
-        check_checkpoint_plan(dir.path(), 4, Availability::Catalogue)
+        check_checkpoint_plan_kernels(dir.path(), 4, Availability::Catalogue)
             .expect("the released DeepSeek config plans and resolves at TP4");
     }
 
@@ -10800,9 +10817,11 @@ mod device_token_serve_tests {
             let dir = tempfile::TempDir::new().expect("a temporary directory");
             std::fs::write(dir.path().join(CHECKPOINT_CONFIG_NAME), text)
                 .expect("the carried configuration");
-            check_checkpoint_plan(dir.path(), 4, Availability::Catalogue).unwrap_or_else(|error| {
-                panic!("{label}: the serve plan check refused a resolvable config: {error}")
-            });
+            check_checkpoint_plan_kernels(dir.path(), 4, Availability::Catalogue).unwrap_or_else(
+                |error| {
+                    panic!("{label}: the serve plan check refused a resolvable config: {error}")
+                },
+            );
         }
     }
 

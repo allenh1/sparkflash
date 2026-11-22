@@ -17465,7 +17465,7 @@ fn run_forward_loop(
         let link = crate::device_link::take();
         // Serving with the vision cubin staged takes images (DECISIONS.md D59): every rank opens the
         // routing kernel, the tower rank the tower too.
-        if link.is_some() && crate::device_link::vision_enabled(dir) {
+        if link.is_some() && crate::device_link::vision_enabled(dir)? {
             device.open_vision(dir, request.weights, chunk.max(rows::R_MAX))?;
         }
         device.replicate_embedding(bind.tail.embed.0)?;

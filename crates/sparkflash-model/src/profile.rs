@@ -618,6 +618,42 @@ pub fn active() -> &'static ModelProfile {
     })
 }
 
+/// The neutral name of the vision switch; the profile key it writes is `diagnostics.vision`.
+pub const VISION_ENV: &str = "SPARKFLASH_VISION";
+
+/// Why a report or boot line says the vision stack is off.
+///
+/// The reason names the typed field and its environment alias, so an operator can tell an
+/// intentionally disabled tower from one the checkpoint does not describe.
+pub const VISION_OFF_REASON: &str =
+    "the vision stack is off (diagnostics.vision=false, SPARKFLASH_VISION=off)";
+
+/// The one reading of the vision switch: `SPARKFLASH_VISION`, the profile's
+/// `diagnostics.vision` field.
+///
+/// Unset means on: a checkpoint that describes a tower loads it unless the switch says
+/// otherwise. This works before a profile is installed (Inkling opens its group early), in
+/// which case the process environment is read through the same typed parser the profile uses.
+/// An installed profile wins: its typed field is the source of truth the boot validated.
+///
+/// # Errors
+/// A value outside the boolean domain (`0`/`1`, `off`/`on`, `false`/`true`), named with the
+/// switch.
+pub fn vision_enabled() -> Result<bool, ProfileError> {
+    if let Some(profile) = ACTIVE.get() {
+        return Ok(profile.diagnostics.vision.unwrap_or(true));
+    }
+    let mut profile = ModelProfile::default();
+    profile.apply_env(|name| {
+        if name == VISION_ENV {
+            std::env::var(name).ok()
+        } else {
+            None
+        }
+    })?;
+    Ok(profile.diagnostics.vision.unwrap_or(true))
+}
+
 /// The environment overrides this module owns, with the typed field each sets.
 ///
 /// A value the field does not accept is refused rather than silently ignored. These names are
@@ -1609,6 +1645,30 @@ probe = "hash"
             .apply_env(|name| (name == "SPARKFLASH_QWEN4_PREFILL_MMA").then(|| "yes".to_owned()))
             .expect_err("yes is not a bool");
         assert!(matches!(error, ProfileError::Env { .. }));
+    }
+
+    #[test]
+    fn the_neutral_vision_switch_is_the_profile_field() {
+        for (value, expected) in [
+            ("on", true),
+            ("1", true),
+            ("true", true),
+            ("off", false),
+            ("0", false),
+            ("false", false),
+        ] {
+            let mut profile = ModelProfile::default();
+            profile
+                .apply_env(|name| (name == VISION_ENV).then(|| value.to_owned()))
+                .expect("a boolean spelling");
+            assert_eq!(profile.diagnostics.vision, Some(expected), "{value}");
+        }
+        let mut profile = ModelProfile::default();
+        let error = profile
+            .apply_env(|name| (name == VISION_ENV).then(|| "yes".to_owned()))
+            .expect_err("yes is not a boolean");
+        assert!(error.to_string().contains(VISION_ENV), "{error}");
+        assert!(VISION_OFF_REASON.contains("diagnostics.vision"));
     }
 
     #[test]

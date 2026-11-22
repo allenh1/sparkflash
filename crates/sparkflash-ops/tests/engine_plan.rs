@@ -174,6 +174,21 @@ fn unregister_model_type(text: &str) -> String {
     value.to_string()
 }
 
+/// Every language part instance that fails a pass, in plan order.
+///
+/// The vision tower's rows are judged by the scan (and the one switch); these tests prove the
+/// language stack resolves in both passes without letting a tower refusal hide a language gap.
+fn language_failures(
+    resolver: &KernelResolver,
+    plan: &EnginePlan,
+) -> Vec<sparkflash_ops::ResolveError> {
+    [KernelPhase::Prefill, KernelPhase::Decode]
+        .into_iter()
+        .flat_map(|phase| resolver.failures_for(plan, phase))
+        .filter(|error| !is_vision(error.part))
+        .collect()
+}
+
 fn is_vision(part: Part) -> bool {
     matches!(
         part,
@@ -409,31 +424,16 @@ fn both_qwen_arms_resolve_their_own_dense_prefill_body() {
 fn a_boot_check_proves_both_passes_for_the_deepseek_arm() {
     let plan = EnginePlan::from_json(DEEPSEEK, Target::Sm121, 4, 0).expect("DeepSeek TP4");
     let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
-    let served = sparkflash_ops::parts::serving_language(Target::Sm121);
-    let language = plan
-        .requirements()
-        .filter(|requirement| !is_vision(requirement.part))
-        .count();
-    let resolved = resolver
-        .boot_check_serving(&plan, &served)
-        .unwrap_or_else(|errors| panic!("boot check: {errors:?}"));
-    assert!(!resolved.is_empty());
-    assert_eq!(resolved.len(), 2 * language);
+    let failures = language_failures(&resolver, &plan);
+    assert!(failures.is_empty(), "{failures:?}");
 }
 
 #[test]
 fn the_glm_fp8_arm_boot_checks_both_passes() {
     let plan = EnginePlan::from_json(GLM, Target::Sm121, 4, 0).expect("GLM FP8 TP4");
     let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
-    let served = sparkflash_ops::parts::serving_language(Target::Sm121);
-    let language = plan
-        .requirements()
-        .filter(|requirement| !is_vision(requirement.part))
-        .count();
-    let resolved = resolver
-        .boot_check_serving(&plan, &served)
-        .unwrap_or_else(|errors| panic!("GLM boot check: {errors:?}"));
-    assert_eq!(resolved.len(), 2 * language);
+    let failures = language_failures(&resolver, &plan);
+    assert!(failures.is_empty(), "{failures:?}");
 }
 
 /// A Qwen FP8 serve boots both passes at every rank width the release serves, not only at TP1.
@@ -645,12 +645,8 @@ fn every_released_document_boot_checks_or_is_an_explicit_refusal() {
     for document in released() {
         let world = document.worlds.first().copied().unwrap_or(4);
         let plan = plan_for(&document, world);
-        let result = resolver.boot_check_serving(
-            &plan,
-            &sparkflash_ops::parts::serving_language(Target::Sm121),
-        );
+        let errors = language_failures(&resolver, &plan);
         if document.worlds.is_empty() {
-            let errors = result.expect_err("a BF16 document has no routed-expert body");
             assert!(
                 !errors.is_empty(),
                 "{}: the refusal names no part",
@@ -687,18 +683,18 @@ fn every_released_document_boot_checks_or_is_an_explicit_refusal() {
                 );
             }
         } else {
-            result.unwrap_or_else(|errors| panic!("{}: {errors:?}", document.name));
+            assert!(errors.is_empty(), "{}: {errors:?}", document.name);
         }
     }
 }
 
-/// The serving gate and the catalogue answer different questions. The catalogue judges the
-/// whole checkpoint plan, so it still refuses Qwen's 16-patch tower; a serve executes the
-/// language parts only (D84), so the serving check must resolve them at every released width.
+/// The scan is the serving gate, and its one opt-out is honest: the catalogue still refuses
+/// Qwen's 16-patch tower, while a scan with the switch off reports the tower as off and still
+/// proves the language rows at every released width.
 #[test]
-fn the_serving_boot_check_skips_the_unloaded_vision_tower() {
+fn the_scan_can_turn_the_tower_off_without_hiding_language_gaps() {
+    use sparkflash_ops::ScanStatus;
     let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
-    let served = sparkflash_ops::parts::serving_language(Target::Sm121);
     for document in released() {
         for &world in document.worlds {
             let plan = plan_for(&document, world);
@@ -720,15 +716,47 @@ fn the_serving_boot_check_skips_the_unloaded_vision_tower() {
                     document.name
                 );
             }
-            let language = plan
-                .requirements()
-                .filter(|requirement| !is_vision(requirement.part))
-                .count();
-            let resolved = resolver
-                .boot_check_serving(&plan, &served)
-                .unwrap_or_else(|errors| panic!("{} TP{world}: {errors:?}", document.name));
-            assert_eq!(resolved.len(), 2 * language, "{} TP{world}", document.name);
-            assert!(resolved.iter().all(|kernel| kernel.target == Target::Sm121));
+            assert!(
+                language_failures(&resolver, &plan).is_empty(),
+                "{} TP{world}",
+                document.name
+            );
+            let report = sparkflash_ops::scan_with_switch(
+                sparkflash_ops::ScanInputs {
+                    config: &document.text,
+                    tensors: None,
+                    target: Target::Sm121,
+                    world,
+                },
+                Availability::Catalogue,
+                false,
+            );
+            assert_eq!(
+                report.off_reason(),
+                Some(sparkflash_model::profile::VISION_OFF_REASON),
+                "{} TP{world}: {}",
+                document.name,
+                report.render()
+            );
+            assert!(
+                report
+                    .rows
+                    .iter()
+                    .filter(|row| row.stack == sparkflash_model::stack::StackKind::Vision)
+                    .all(|row| matches!(row.status, ScanStatus::Off { .. })),
+                "{} TP{world}: {}",
+                document.name,
+                report.render()
+            );
+            assert!(
+                report
+                    .rows
+                    .iter()
+                    .filter(|row| row.stack != sparkflash_model::stack::StackKind::Vision)
+                    .all(|row| !row.status.is_off()),
+                "{} TP{world}: only the tower may be off",
+                document.name
+            );
         }
     }
 }

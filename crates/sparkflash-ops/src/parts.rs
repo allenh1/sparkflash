@@ -3755,25 +3755,14 @@ pub fn host_reference_quantization_refusal(architecture: &Architecture) -> Optio
 /// The parts a serving process that stages the checkpoint's vision tower launches for target.
 ///
 /// The DeepSeek arm loads and runs the 14-patch tower, so [Vision](Part::Vision) stays in its
-/// serving set and a 16-patch document is refused at boot. [serving_language] is the narrower
-/// set for the Qwen and GLM arms, whose tower is a later extraction (D84).
+/// serving set and a 16-patch document is refused at boot. There is no narrower language-only
+/// set: a checkpoint that describes a tower either loads it or states `SPARKFLASH_VISION=off`,
+/// and the scan is what decides which. An arm that executes only the language stack still
+/// filters [is_vision_part] at its own open, but it is not allowed to decide that the checkpoint
+/// may be served without the tower.
 #[must_use]
 pub fn serving(target: Target) -> PartSet {
     carried(target)
-}
-
-/// The parts a language-only serving process launches for target.
-///
-/// Every released document plans a vision tower (D84), but the Qwen and GLM packs do not stage
-/// one, so their serve gate must demand a body only for the language parts. A serving boot check
-/// uses this set; [CATALOGUE] and [crate::resolver::KernelResolver::boot_check] still judge the
-/// whole plan, so the catalogue's honest 14-patch vision constraint is untouched.
-#[must_use]
-pub fn serving_language(target: Target) -> PartSet {
-    serving(target)
-        .into_iter()
-        .filter(|part| !is_vision_part(*part))
-        .collect()
 }
 
 /// The parts architecture needs that this build can actually load for target.

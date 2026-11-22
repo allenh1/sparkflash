@@ -141,7 +141,8 @@ pub use resolver::{
 };
 pub use scan_report::{
     Coverage, CoverageState, ScanInputs, ScanReport, ScanRow, ScanStatus, TensorEntry, TensorIndex,
-    scan,
+    scan, scan_checkpoint, scan_plan, scan_plan_with_switch, scan_with_availability,
+    scan_with_switch,
 };
 pub use slot_pack::{PackSlot, SlotPack};
 pub use tensor_plan::{ArchitectureTensorPlan, Role as TensorRole};

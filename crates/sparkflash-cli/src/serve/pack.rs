@@ -37,8 +37,7 @@ use sparkflash_model_glm5_next::Glm5NextConfig;
 use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
 use sparkflash_ops::EngineBuilder;
 use sparkflash_ops::engine_plan::EnginePlan;
-use sparkflash_ops::parts::serving_language;
-use sparkflash_ops::resolver::{Availability, KernelResolver};
+use sparkflash_ops::resolver::Availability;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 
 use super::{CHECKPOINT_CONFIG_NAME, EXIT_REFUSED, ServeOptions, serve_with_seam};
@@ -710,51 +709,20 @@ impl Pack {
         self.descriptor.weights_id == weights
     }
 
-    /// The parts a checkpoint's own `config.json` names that this build cannot load.
-    ///
-    /// The model-side `Architecture` says what the checkpoint is; the ops catalogue says which
-    /// image implements each part, and [sparkflash_ops::parts::missing_loadable] keeps only the
-    /// parts with an image this build can actually load (an embedded image, or the DeepSeek arm's
-    /// run-time cubin directory). An empty list is the whole bring-up condition.
-    ///
-    /// The question is about the *served* parts, not every part the document names. The Qwen and
-    /// GLM packs do not stage a vision tower, so a document whose only missing image is the
-    /// tower's DeepSeek cubin (absent without `SPARKFLASH_CUBINS`) must still parse and boot.
-    /// The DeepSeek pack keeps the full set, because its device arm runs the tower.
-    /// A document that does not parse names no parts here; [Self::detect] already refused it.
-    pub(super) fn missing_parts(directory: &Path) -> Vec<sparkflash_model::Part> {
-        let path = directory.join(CHECKPOINT_CONFIG_NAME);
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Vec::new();
+    /// The scan every `--checkpoint` route passes before it opens a weight. A pack's device arm
+    /// uses the images this process can load; a host reference uses the catalogue.
+    pub(super) fn boot_report(directory: &Path, world: usize) -> sparkflash_ops::ScanReport {
+        let availability = if Self::detect(directory).is_some_and(Pack::has_pack_arm) {
+            Availability::runtime_env()
+        } else {
+            Availability::Catalogue
         };
-        let Ok(architecture) = sparkflash_model::Architecture::from_json(&text) else {
-            return Vec::new();
-        };
-        let served = match Self::detect(directory) {
-            // Without a Dory/Qwen cubin the dynamic route opens Dory's CPU host reference,
-            // which needs no kernel image. With a device arm, the catalogue is the gate.
-            Some(pack)
-                if pack.has_weights(sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID)
-                    && !sparkflash_model_dory::DoryDeviceBackend::available() =>
-            {
-                return Vec::new();
-            }
-            // The Inkling pack's host reference is the initial serving path; its device arm is
-            // gated by the same catalogue once it lands.
-            Some(pack)
-                if pack.has_weights(sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID) =>
-            {
-                return Vec::new();
-            }
-            Some(pack) if pack.route == Route::Pack => {
-                sparkflash_ops::parts::serving_language(sparkflash_model::Target::Sm121)
-            }
-            Some(_) | None => sparkflash_ops::parts::serving(sparkflash_model::Target::Sm121),
-        };
-        sparkflash_ops::parts::missing_loadable(&architecture, sparkflash_model::Target::Sm121)
-            .into_iter()
-            .filter(|part| served.contains(*part))
-            .collect()
+        sparkflash_ops::scan_checkpoint(
+            directory,
+            sparkflash_model::Target::Sm121,
+            world,
+            availability,
+        )
     }
 
     /// Whether this pack has a typed [PackArm] (the DeepSeek arm is the reference path).
@@ -1066,16 +1034,21 @@ fn check_plan<R: Release>(
     config: &ConfigOf<R>,
     world: usize,
 ) -> Result<EnginePlan, String> {
-    check_plan_with::<R>(directory, config, world, Availability::runtime_env())
+    let report = Pack::boot_report(directory, world);
+    if !report.load_is_clean() {
+        return Err(format!(
+            "{} cannot load {}: the scan refuses it\n{}",
+            R::NAME,
+            directory.display(),
+            report.render()
+        ));
+    }
+    let plan = check_plan_with::<R>(directory, config, world, Availability::runtime_env())?;
+    eprintln!("sparkflash serve: {} {}", R::NAME, report.boot_line());
+    Ok(plan)
 }
 
-/// [check_plan] under an explicit availability policy.
-///
-/// The gate is serving-aware: it checks the parts the arm executes ([serving]), not the whole
-/// plan, because the Qwen and GLM packs do not load a vision tower (D84): DeepSeek loads and
-/// runs the 14-patch tower, and those two arms do not. The catalogue's own
-/// [KernelResolver::boot_check] still refuses the 16-patch tower on the plan itself, so this
-/// does not weaken the catalogue's patch constraint.
+/// [check_plan]'s language-row check; the tower is judged by the full scan in [check_plan].
 fn check_plan_with<R: Release>(
     directory: &Path,
     config: &ConfigOf<R>,
@@ -1091,23 +1064,31 @@ fn check_plan_with<R: Release>(
         0,
     )
     .map_err(|error| format!("cannot plan the {} checkpoint: {error}", R::NAME))?;
-    let resolver = KernelResolver::new(Target::Sm121, availability);
-    // Prove both passes: a plan that resolves only because a decode symbol was accepted for a
-    // prefill request has not booted, it has half-booted.
-    let failures = resolver
-        .boot_check_serving(&plan, &serving_language(Target::Sm121))
-        .err()
-        .unwrap_or_default();
-    if failures.is_empty() {
-        eprintln!("sparkflash serve: {} plan {}", R::NAME, plan.boot_summary());
+    let config_text = std::fs::read_to_string(directory.join(CHECKPOINT_CONFIG_NAME))
+        .map_err(|error| format!("{}: {error}", directory.display()))?;
+    let report = sparkflash_ops::scan_plan_with_switch(
+        sparkflash_ops::ScanInputs {
+            config: &config_text,
+            tensors: None,
+            target: Target::Sm121,
+            world,
+        },
+        plan.clone(),
+        availability,
+        false,
+    );
+    let gap = report.rows.iter().any(|row| {
+        !matches!(row.status, sparkflash_ops::ScanStatus::UnknownKey { .. })
+            && !row.status.is_resolved()
+    });
+    if !gap {
         return Ok(plan);
     }
-    let reasons: Vec<String> = failures.iter().map(ToString::to_string).collect();
     Err(format!(
-        "{} cannot execute {} at TP{world}: {}",
+        "{} cannot execute {} at TP{world}:\n{}",
         R::NAME,
         directory.display(),
-        reasons.join("; ")
+        report.render()
     ))
 }
 
@@ -1475,6 +1456,7 @@ fn serve_group_lanes<R: Release>(
 #[cfg(test)]
 mod tests {
     use sparkflash_model::{Glm, Qwen, Qwen36, QwenFp8};
+    use sparkflash_ops::resolver::KernelResolver;
 
     use super::*;
 
@@ -1712,7 +1694,6 @@ mod tests {
                 .expect("Dory is a pack")
                 .has_pack_arm()
         );
-        assert!(Pack::missing_parts(directory.path()).is_empty());
     }
 
     #[test]
@@ -1737,7 +1718,6 @@ mod tests {
                 .expect("Inkling is a pack")
                 .has_pack_arm()
         );
-        assert!(Pack::missing_parts(directory.path()).is_empty());
     }
 
     #[test]
@@ -1921,28 +1901,23 @@ mod tests {
     }
 
     #[test]
-    fn missing_parts_needs_an_image_this_build_can_load() {
+    fn a_checkpoint_without_headers_is_refused_by_the_scan() {
         let directory = tempfile::tempdir().expect("a temporary checkpoint");
         std::fs::write(
             directory.path().join(CHECKPOINT_CONFIG_NAME),
             DEEPSEEK_CONFIG,
         )
         .expect("the carried config is written");
-        let missing = Pack::missing_parts(directory.path());
-        // The DeepSeek image is loaded from SPARKFLASH_CUBINS at run time. Unless that directory
-        // is configured, a part only DeepSeek implements cannot be loaded, and the catalogue's
-        // answer (which accepts any catalogued image) must not hide it.
-        let discovered = sparkflash_ops::parts::missing(
-            &sparkflash_model::Architecture::from_json(DEEPSEEK_CONFIG).expect("the config"),
-            sparkflash_model::Target::Sm121,
-        );
-        assert!(discovered.is_empty(), "the catalogue carries the parts");
-        if std::env::var_os(sparkflash_ops::parts::CUBIN_DIR_ENV).is_none() {
-            assert!(
-                missing.contains(&sparkflash_model::Part::Csa2Compression),
-                "a run-time-only image is not loadable without its cubin directory: {missing:?}"
-            );
-        }
+        // The gate reads the safetensors headers, never the weights. A directory with a config
+        // but no headers has no claim to be a checkpoint, and the report says so rather than
+        // passing every catalogue entry.
+        let report = Pack::boot_report(directory.path(), 1);
+        assert!(!report.is_clean());
+        let error = report
+            .error
+            .as_deref()
+            .expect("the scan reports the missing headers");
+        assert!(error.contains("safetensors"), "{error}");
     }
 
     /// The CLI's real Qwen FP8 boot path: the serving constructor parses the released FP8

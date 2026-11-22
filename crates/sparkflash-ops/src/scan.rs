@@ -29,7 +29,8 @@ use crate::resolver::{Availability, PlanContext};
 // keep their existing names.
 pub use crate::scan_report::{
     Coverage, CoverageState, ScanInputs, ScanReport, ScanRow, ScanStatus, TensorEntry, TensorIndex,
-    scan,
+    scan, scan_checkpoint, scan_plan, scan_plan_with_switch, scan_with_availability,
+    scan_with_switch,
 };
 
 /// The GDN scan symbols for one key/value head template, most specific first.

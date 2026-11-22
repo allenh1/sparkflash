@@ -170,41 +170,19 @@ fn a_checkpoint_names_its_pack_from_its_own_config() {
         Some(sparkflash_model::descriptor::DEFAULT_MODEL_ID)
     );
 
-    // The same detection makes --checkpoint enough to reach the pack's arm. The parts check is
-    // the loadable one: a build with no embedded cubin and no SPARKFLASH_CUBINS refuses the
-    // checkpoint by naming the images it cannot load.
-    let parsed = ServeOptions::parse(vec![
+    // Detection still needs only the checkpoint's own config.json, and a config-only directory
+    // is still enough to name the pack. The load gate is stricter on purpose: a checkpoint with
+    // no safetensors headers has no tensor claims to check, so --checkpoint refuses it and says
+    // which document is missing rather than treating the directory as loadable.
+    let error = ServeOptions::parse(vec![
         "--checkpoint".to_owned(),
         qwen.path().display().to_string(),
-    ]);
-    // The pack does not stage the vision tower, so the gate's answer is the language parts
-    // only; the tower's DeepSeek-only cubin is not a missing pack part.
-    let loadable: Vec<sparkflash_model::Part> = sparkflash_ops::parts::missing_loadable(
-        &sparkflash_model::Architecture::from_json(QWEN).expect("the Qwen config"),
-        sparkflash_model::Target::Sm121,
-    )
-    .into_iter()
-    .filter(|part| !sparkflash_ops::parts::is_vision_part(*part))
-    .collect();
-    match parsed {
-        Ok(parsed) => {
-            assert!(loadable.is_empty(), "this build can load every part");
-            assert_eq!(
-                parsed.model.as_deref(),
-                Some(sparkflash_model_qwen4_exp::MODEL_ID)
-            );
-        }
-        Err(error) => {
-            assert!(
-                !loadable.is_empty(),
-                "a loadable checkpoint must parse: {error}"
-            );
-            assert!(error.contains("does not carry for sm121"), "{error}");
-            for part in loadable {
-                assert!(error.contains(&part.to_string()), "{error}");
-            }
-        }
-    }
+    ])
+    .expect_err("a config without tensor headers is not a loadable checkpoint");
+    assert!(
+        error.contains("safetensors"),
+        "the refusal names the missing headers: {error}"
+    );
 }
 
 #[test]
@@ -1162,66 +1140,114 @@ fn tp4_stats_keep_the_reference_shape_and_name_the_fabric() {
     assert_eq!(tp4["kv_cache"]["global_kv_cached_tokens"], 0);
 }
 
-#[test]
-fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
-    // Qwen and GLM stage no vision tower; DeepSeek's device arm runs the 14-patch one.
-    let cubins = std::env::var_os(sparkflash_ops::parts::CUBIN_DIR_ENV);
-    for (name, text) in [
-        (
-            "Qwen",
-            include_str!(
-                "../../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_fp8.hf.json"
-            ),
-        ),
-        (
-            "GLM",
-            include_str!("../../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
-        ),
-    ] {
-        let dir = tempfile::tempdir().expect("a temporary checkpoint");
-        std::fs::write(dir.path().join(CHECKPOINT_CONFIG_NAME), text).expect("the config");
-        // SAFETY: the value is restored before the next document.
-        unsafe { std::env::remove_var(sparkflash_ops::parts::CUBIN_DIR_ENV) };
-        let parsed = ServeOptions::parse(vec![
-            "--checkpoint".to_owned(),
-            dir.path().to_string_lossy().to_string(),
-        ]);
-        if let Some(value) = cubins.as_ref() {
-            unsafe { std::env::set_var(sparkflash_ops::parts::CUBIN_DIR_ENV, value) };
-        }
-        // A CPU-only build embeds no pack image, so the language parts themselves are missing
-        // and the gate names them. What must never be missing is the unserved vision tower.
-        let missing: Vec<sparkflash_model::Part> = sparkflash_ops::parts::missing_loadable(
-            &sparkflash_model::Architecture::from_json(text).expect("the released config"),
-            sparkflash_model::Target::Sm121,
-        )
-        .into_iter()
-        .filter(|part| !sparkflash_ops::parts::is_vision_part(*part))
-        .collect();
-        if missing.is_empty() {
-            let options =
-                parsed.unwrap_or_else(|error| panic!("{name}: the checkpoint must parse: {error}"));
-            assert!(options.model.is_some(), "{name}: detection selects the arm");
+/// Write a checkpoint whose safetensors header claims exactly the tensors the shared
+/// checkpoint plan names, with a sparse data section. The gate reads only the header, so the
+/// test needs no weight bytes.
+fn write_planned_checkpoint(dir: &std::path::Path, config: &str) -> sparkflash_ops::TensorIndex {
+    use sparkflash_weights::TensorSpec;
+    use std::io::Write as _;
+
+    let architecture = sparkflash_model::Architecture::from_json(config).expect("the config");
+    let tp = sparkflash_model::TpPlan::for_architecture(&architecture, 1, 0).expect("the tp plan");
+    let claims = sparkflash_ops::tensor_plan::TensorClaims::from_checkpoint(&architecture, tp)
+        .expect("the checkpoint plan");
+    let mut offset = 0u64;
+    let mut tensors = serde_json::Map::new();
+    for spec in claims.specs() {
+        let TensorSpec { name, dtype, shape } = spec;
+        let mut stored_shape = shape.to_vec();
+        let stored_dtype = if *dtype == sparkflash_weights::DType::F4E2M1 {
+            let last = stored_shape
+                .last_mut()
+                .expect("an FP4 tensor has a dimension");
+            *last /= 2;
+            "I8".to_owned()
         } else {
-            let error = parsed.expect_err("an unembedded pack image still refuses");
-            assert!(!error.contains("vision"), "{name}: {error}");
-            for part in missing {
-                assert!(error.contains(&part.to_string()), "{name}: {error}");
-            }
-        }
+            dtype.name().to_owned()
+        };
+        let bytes = spec.storage_bytes() as u64;
+        tensors.insert(
+            name.to_owned(),
+            serde_json::json!({
+                "dtype": stored_dtype,
+                "shape": stored_shape,
+                "data_offsets": [offset, offset + bytes],
+            }),
+        );
+        offset += bytes;
     }
-    let released = include_str!(
-        "../../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
-    );
+    let header = serde_json::Value::Object(tensors).to_string();
+    let path = dir.join("model.safetensors");
+    let mut file = std::fs::File::create(&path).expect("the shard");
+    file.write_all(&(header.len() as u64).to_le_bytes())
+        .expect("the header length");
+    file.write_all(header.as_bytes()).expect("the header");
+    file.set_len(8 + header.len() as u64 + offset)
+        .expect("the sparse data section");
+
+    let index =
+        sparkflash_weights::tensor_index::read_local(dir).expect("the headers are readable");
+    sparkflash_ops::TensorIndex::from_reader(&index)
+}
+
+#[test]
+fn the_checkpoint_gate_refuses_a_tower_on_and_loads_it_off() {
+    const TOWER: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16,"vision_config":{"depth":1,"hidden_size":64,"num_attention_heads":2,"intermediate_size":128,"patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2}}"#;
     let dir = tempfile::tempdir().expect("a temporary checkpoint");
-    std::fs::write(
-        dir.path().join(CHECKPOINT_CONFIG_NAME),
-        released.replace("\"patch_size\": 14", "\"patch_size\": 16"),
-    )
-    .expect("the config");
-    let error = check_checkpoint_plan(dir.path(), 4, Availability::Catalogue)
-        .expect_err("a 16-patch tower is refused");
-    assert!(error.contains("vision patch 16"), "{error}");
+    std::fs::write(dir.path().join(CHECKPOINT_CONFIG_NAME), TOWER).expect("the config");
+    let index = write_planned_checkpoint(dir.path(), TOWER);
+    let inputs = sparkflash_ops::ScanInputs {
+        config: TOWER,
+        tensors: Some(&index),
+        target: sparkflash_model::Target::Sm121,
+        world: 1,
+    };
+
+    // The tower is on: its parts have no body at this patch shape, so the checkpoint is
+    // refused even though every language tensor is claimed.
+    let on =
+        sparkflash_ops::scan_with_switch(inputs, sparkflash_ops::Availability::Catalogue, true);
+    assert!(!on.load_is_clean(), "{}", on.render());
+    assert!(
+        on.rows.iter().any(|row| {
+            row.stack == sparkflash_model::stack::StackKind::Vision && !row.status.is_resolved()
+        }),
+        "{}",
+        on.render()
+    );
+    assert!(
+        on.render().contains("vision_patch_embed"),
+        "{}",
+        on.render()
+    );
+
+    // The one opt-out marks the tower off, keeps its tensors claimed, and the same checkpoint
+    // loads on the language stack.
+    let off =
+        sparkflash_ops::scan_with_switch(inputs, sparkflash_ops::Availability::Catalogue, false);
+    assert!(off.load_is_clean(), "{}", off.render());
+    assert!(
+        off.rows
+            .iter()
+            .filter(|row| row.stack == sparkflash_model::stack::StackKind::Vision)
+            .all(|row| row.status.is_off()),
+        "{}",
+        off.render()
+    );
+    assert!(
+        off.rows
+            .iter()
+            .filter(|row| row.stack != sparkflash_model::stack::StackKind::Vision)
+            .all(|row| !row.status.is_off()),
+        "only the tower may be off: {}",
+        off.render()
+    );
+
+    // The default reference engine is not exempt: the same production gate refuses this
+    // checkpoint on the dirty tower scan before any weight or bind.
+    let error = check_checkpoint_plan(dir.path(), 1, sparkflash_ops::Availability::Catalogue)
+        .expect_err("the default reference open is refused on the dirty scan");
+    assert!(error.contains("vision_patch_embed"), "{error}");
 }
 
 #[test]

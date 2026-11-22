@@ -43,7 +43,8 @@ use sparkflash_model::{
     Architecture, MEMORY_FLOOR_BYTES, NODE_MEMORY_BUDGET_BYTES, Target, TpPlan,
     canonical_model_type, gib,
 };
-use sparkflash_ops::parts::serving_language;
+
+use sparkflash_ops::parts::is_vision_part;
 use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
 use sparkflash_ops::{CoverageState, ScanInputs, ScanReport, ScanStatus, TensorIndex, scan};
 
@@ -493,12 +494,12 @@ fn scan_gaps(
     }
     let mut gaps = Vec::new();
     let mut seen = BTreeSet::new();
-    // The pack this gate describes is the language process: a pack that does not stage a vision
-    // tower reports its row on the page, but it is not an engine gap for this gate. The full
-    // plan's vision constraint is still the catalogue's and the page's.
-    let served = serving_language(Target::Sm121);
+    // This is the device-arm support answer, not the load gate: a pack that does not stage a
+    // vision tower reports its rows on the page, but the tower is not an engine gap for this
+    // arm. The CLI's scan gate is what refuses a checkpoint whose tower has no body; a scan
+    // with the switch off prints those rows as off and they are not in this iterator.
     for row in report.unresolved().filter(|row| {
-        served.contains(row.part) && !matches!(row.status, ScanStatus::UnknownKey { .. })
+        !is_vision_part(row.part) && !matches!(row.status, ScanStatus::UnknownKey { .. })
     }) {
         let reason = format!(
             "{} at {} on {} ({}): {}",

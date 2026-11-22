@@ -21,6 +21,7 @@
 //! [PartsDeviceBackend], so a boot from `EngineBuilder` proves the shared plan and the arm's
 //! execution describe the same checkpoint.
 
+use sparkflash_model::parts::PartSet;
 use sparkflash_model::{ModelBackend, ModelDescriptor, ModelSession, Part};
 use sparkflash_weights::WeightSource;
 
@@ -76,15 +77,27 @@ impl PartsDeviceRank {
         context: PlanContext,
     ) -> Result<Self, PlanError> {
         let resolver = context.resolver();
-        // The language-only serving set: every released document plans a vision tower, but no
-        // arm in this tree stages one, so the boot gate must not demand a tower body.
-        let serving = crate::parts::serving_language(context.target());
-        if let Err(errors) = resolver.boot_check_serving(plan, &serving) {
-            let reasons: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        // This shared rank executes the language stack. A tower the checkpoint describes is
+        // either loaded by an arm that stages it or refused by the checkpoint's scan (with the
+        // one `SPARKFLASH_VISION=off` opt-out); this rank must not decide it can be dropped.
+        let serving: PartSet = crate::parts::serving(context.target())
+            .into_iter()
+            .filter(|part| !crate::parts::is_vision_part(*part))
+            .collect();
+        let failures: Vec<ResolveError> = [
+            crate::plan::KernelPhase::Prefill,
+            crate::plan::KernelPhase::Decode,
+        ]
+        .into_iter()
+        .flat_map(|phase| resolver.failures_for(plan, phase))
+        .filter(|error| serving.contains(error.part))
+        .collect();
+        if !failures.is_empty() {
+            let reasons: Vec<String> = failures.iter().map(ToString::to_string).collect();
             return Err(PlanError::Invalid(format!(
                 "the serving boot check refuses {} part instance(s) in the prefill and decode \
                  passes: {}",
-                errors.len(),
+                failures.len(),
                 reasons.join("; ")
             )));
         }

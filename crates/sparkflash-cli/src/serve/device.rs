@@ -1462,7 +1462,7 @@ fn start_leader(
         metrics: Arc::clone(&metrics),
         seeds: RandomState::new(),
         draws: AtomicU64::new(0),
-        vision: crate::device_link::vision_enabled(&device.cubins),
+        vision: crate::device_link::vision_enabled(&device.cubins)?,
         health,
     };
     let state = AppState::new(Arc::new(driver))

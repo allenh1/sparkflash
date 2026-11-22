@@ -36,7 +36,6 @@
 use std::fmt;
 
 use sparkflash_kernels::images::Image;
-use sparkflash_model::parts::PartSet;
 use sparkflash_model::{Part, Target};
 
 use crate::engine_plan::{EnginePlan, PartRequirement};
@@ -560,27 +559,6 @@ impl KernelResolver {
     /// Every unresolved part instance in either pass.
     pub fn boot_check(&self, plan: &EnginePlan) -> Result<Vec<ResolvedKernel>, Vec<ResolveError>> {
         self.boot_check_where(plan, |_| true)
-    }
-
-    /// The serving boot check: prove both passes for the parts the arm actually executes.
-    ///
-    /// A plan describes the checkpoint, not the process. Every released document names a vision
-    /// tower (D84): DeepSeek loads and runs the 14-patch tower, while the Qwen and GLM packs do
-    /// not load theirs, so gating a serve on the whole plan refuses a 16-patch document whose
-    /// language parts all resolve. Restricting the check to served keeps [Self::boot_check]'s
-    /// whole-plan answer - and the catalogue's honest 14-patch refusal with it - while the
-    /// serving gate demands a body only for the parts it launches.
-    /// [crate::parts::serving] is the full serving set and [crate::parts::serving_language]
-    /// the language-only set the Qwen and GLM packs use.
-    ///
-    /// # Errors
-    /// Every unresolved part instance of a served part in either pass, in plan order.
-    pub fn boot_check_serving(
-        &self,
-        plan: &EnginePlan,
-        served: &PartSet,
-    ) -> Result<Vec<ResolvedKernel>, Vec<ResolveError>> {
-        self.boot_check_where(plan, |requirement| served.contains(requirement.part))
     }
 
     fn boot_check_where(

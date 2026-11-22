@@ -38,18 +38,23 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// The vision tower's cubin in the `--tp4-device` cubin directory: serving takes images when it is
-/// there and SPARKFLASH_VISION is not 0.
+/// there and the one vision switch (`SPARKFLASH_VISION`, `diagnostics.vision`) is on.
 pub const VISION_CUBIN: &str = "opt_vision_sm121.cubin";
 
 /// Whether the device path serves images with the cubins in `cubins`: every rank asks the same
 /// question of the same staged directory, so every rank gives the same answer.
-#[must_use]
-pub fn vision_enabled(cubins: &Path) -> bool {
-    sparkflash_model::active_profile()
-        .diagnostics
-        .vision
-        .unwrap_or(true)
-        && cubins.join(VISION_CUBIN).is_file()
+///
+/// The switch is read once through [sparkflash_model::profile::vision_enabled], the same helper
+/// the scan, the serve gate and Inkling use. The cubin is a separate condition: the switch turns
+/// the stack off, while a missing image means this build cannot run it at all.
+///
+/// # Errors
+/// A vision switch value outside the boolean domain, named with the variable.
+pub fn vision_enabled(cubins: &Path) -> Result<bool, String> {
+    Ok(
+        sparkflash_model::profile::vision_enabled().map_err(|error| error.to_string())?
+            && cubins.join(VISION_CUBIN).is_file(),
+    )
 }
 
 /// The rank that runs the vision tower: the owner of the image placeholder's embedding row.
