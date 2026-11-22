@@ -25,6 +25,7 @@
 //! op plans; this document only says which parts a layer is made of.
 
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::config::{ConfigError, OneOrMany};
 use crate::coverage::{ConfigCoverage, entries, read_key, with_recording};
@@ -66,6 +67,8 @@ pub struct Architecture {
     pub tokens: Tokens,
     /// Inkling-2's relative-attention and block-residual geometry, when the release is one.
     pub inkling: Option<Inkling>,
+    /// Shape facts a matching layout resolved from config keys, by layout name.
+    pub layout_vars: BTreeMap<String, i64>,
 }
 
 /// The Inkling-2 text stack geometry that has no equivalent in the other releases.
@@ -1031,6 +1034,7 @@ impl Architecture {
             mtp,
             tokens,
             inkling,
+            layout_vars: BTreeMap::new(),
         })
     }
 
@@ -4590,13 +4594,13 @@ mod tests {
     #[test]
     fn the_released_parses_are_pinned_and_switch_nothing_on() {
         let pinned = [
-            0x0a9d_f00c_70fd_a130_u64,
-            0xbf31_362c_fd8a_5fc0,
-            0xeebb_ad76_01e9_edcb,
-            0x51eb_2882_3661_fe8f,
-            0xe909_cbc5_be7c_75db,
-            0xd5e4_aaab_5c0c_6990,
-            0xb355_0c20_34b7_3f01,
+            0xe0a4_6a91_5f2e_aeb5_u64,
+            0x594a_226e_d501_88a5,
+            0x0d35_642d_b843_4b20,
+            0x9a08_2ac0_b2fa_f67c,
+            0x2416_b0da_0097_fad0,
+            0x6912_d984_45c3_3315,
+            0xf401_030a_ffce_bcd2,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");

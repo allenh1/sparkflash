@@ -208,6 +208,7 @@ pub fn tiny_architecture() -> Architecture {
             replicated: true,
         }),
         tokens: sparkflash_model::architecture::Tokens::default(),
+        layout_vars: std::collections::BTreeMap::new(),
     }
 }
 

@@ -41,18 +41,10 @@ struct Exemption {
 
 /// Every string kernel lookup in a model crate at this tip.
 ///
-/// The dense arm is the first converted arm: its two sites are the loaders in `Bound`, which
-/// checks the image's symbol list and the catalogue's precision mask before loading, and every
-/// launch in the crate holds the `Bound`. The other arms still load in their device files;
-/// phase 7 converts them one at a time and deletes their lines.
+/// Every model arm now loads through the catalogue-bound handle in `sparkflash-ops`, so no
+/// model crate holds a string lookup. The DeepSeek forward is the one remaining caller; phase 7
+/// converts it and deletes its lines.
 const EXEMPTIONS: &[Exemption] = &[
-    Exemption {
-        crate_name: "sparkflash-model-dense",
-        file: "src/lib.rs",
-        sites: 2,
-        why: "the two loaders in Bound: the catalogue and the image are checked once, and every \
-              launch holds the resolved handle",
-    },
     Exemption {
         crate_name: "sparkflash-deepseek-forward",
         file: "src/tp4_forward.rs",
@@ -88,34 +80,6 @@ const EXEMPTIONS: &[Exemption] = &[
         file: "src/tp4_tail.rs",
         sites: 1,
         why: "not converted yet: phase 7 runs by arm",
-    },
-    Exemption {
-        crate_name: "sparkflash-model-glm5-next",
-        file: "src/device.rs",
-        sites: 2,
-        why: "the two loaders in Bound: the catalogue and the image are checked once, and every \
-              launch in the crate holds the resolved handle",
-    },
-    Exemption {
-        crate_name: "sparkflash-model-qwen4-exp",
-        file: "src/device.rs",
-        sites: 2,
-        why: "the two loaders in Bound: the catalogue and the image are checked once, and every \
-              launch in the crate holds the resolved handle",
-    },
-    Exemption {
-        crate_name: "sparkflash-model-inkling2",
-        file: "src/device.rs",
-        sites: 2,
-        why: "the two loaders in Bound: the catalogue and the image are checked once, and the \
-              tower and the drafter load through the same bound handle",
-    },
-    Exemption {
-        crate_name: "sparkflash-model-dory",
-        file: "src/device.rs",
-        sites: 2,
-        why: "the two loaders in Bound: the catalogue and the image are checked once, and every \
-              launch in the crate holds the resolved handle",
     },
 ];
 
@@ -244,11 +208,18 @@ fn a_converted_model_crate_does_not_look_a_kernel_up_by_string() {
 }
 
 #[test]
-fn the_dense_arms_two_sites_are_its_binder() {
+fn a_converted_arm_holds_no_string_lookup() {
     let found = lookups();
-    assert_eq!(
-        found.get(&("sparkflash-model-dense".to_owned(), "src/lib.rs".to_owned())),
-        Some(&2),
-        "dense's only string lookups are Bound::new and Bound::shared"
-    );
+    for arm in [
+        "sparkflash-model-dense",
+        "sparkflash-model-glm5-next",
+        "sparkflash-model-qwen4-exp",
+        "sparkflash-model-inkling2",
+        "sparkflash-model-dory",
+    ] {
+        assert!(
+            !found.keys().any(|(crate_name, _)| crate_name == arm),
+            "{arm} looks a kernel up by string; its launches must hold a bound handle"
+        );
+    }
 }

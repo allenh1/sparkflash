@@ -171,6 +171,7 @@ fn hybrid() -> Architecture {
         vision: None,
         mtp: None,
         tokens: sparkflash_model::architecture::Tokens::default(),
+        layout_vars: std::collections::BTreeMap::new(),
     }
 }
 
