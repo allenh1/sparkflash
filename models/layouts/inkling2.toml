@@ -127,7 +127,6 @@ order = [
   "rms_norm",
   "lm_head",
   "block_attention_residual",
-  "gqa_attention",
   "relative_attention",
   "short_conv",
   "moe",
@@ -154,7 +153,7 @@ order = [
 part = "vision_position"
 [[stacks.vision.parts.facts]]
 name = "position"
-value = "grid"
+value = "rotary_and_grid"
 
 # src/vision.rs:554-630: LayerNorm blocks with layer scale; attention has a bias, no qk norm,
 # and axial rotary; the MLP is exact erf-GELU.
@@ -215,7 +214,7 @@ name = "normalize"
 value = { key = "text_config.attn_res_normalize_values" }
 
 [[stacks.language.parts]]
-part = "gqa_attention"
+part = "relative_attention"
 [[stacks.language.parts.facts]]
 name = "relative_bias"
 value = true
@@ -226,20 +225,17 @@ value = true
 name = "output_gate"
 value = true
 [[stacks.language.parts.facts]]
-name = "qk_l2_clip"
-value = { key = "text_config.qk_l2_clip_threshold" }
-[[stacks.language.parts.facts]]
-name = "rel_l2_clip"
-value = { key = "text_config.rel_l2_clip_threshold" }
-
-[[stacks.language.parts]]
-part = "relative_attention"
-[[stacks.language.parts.facts]]
 name = "width"
 value = { key = "text_config.d_rel" }
 [[stacks.language.parts.facts]]
 name = "extent"
 value = { key = "text_config.rel_extent" }
+[[stacks.language.parts.facts]]
+name = "qk_l2_clip"
+value = { key = "text_config.qk_l2_clip_threshold" }
+[[stacks.language.parts.facts]]
+name = "rel_l2_clip"
+value = { key = "text_config.rel_l2_clip_threshold" }
 
 [[stacks.language.parts]]
 part = "short_conv"
@@ -729,7 +725,7 @@ repeat = "layers"
 
 [[tensor]]
 name = "model.llm.layers.{layer}.attn.wq_du.weight"
-part = "gqa_attention"
+part = "relative_attention"
 role = "attention"
 dtype = "bf16"
 shape = ["heads * head_dim", "hidden"]
@@ -740,7 +736,7 @@ repeat = "layers"
 
 [[tensor]]
 name = "model.llm.layers.{layer}.attn.wk_dv.weight"
-part = "gqa_attention"
+part = "relative_attention"
 role = "attention"
 dtype = "bf16"
 shape = ["kv_heads * head_dim", "hidden"]
@@ -749,7 +745,7 @@ repeat = "layers"
 
 [[tensor]]
 name = "model.llm.layers.{layer}.attn.wv_dv.weight"
-part = "gqa_attention"
+part = "relative_attention"
 role = "attention"
 dtype = "bf16"
 shape = ["kv_heads * head_dim", "hidden"]
@@ -760,7 +756,7 @@ repeat = "layers"
 
 [[tensor]]
 name = "model.llm.layers.{layer}.attn.wo_ud.weight"
-part = "gqa_attention"
+part = "relative_attention"
 role = "attention"
 dtype = "bf16"
 shape = ["hidden", "heads * head_dim"]
@@ -780,7 +776,7 @@ repeat = "layers"
 
 [[tensor]]
 name = "model.llm.layers.{layer}.attn.gate_attn.weight"
-part = "gqa_attention"
+part = "relative_attention"
 role = "attention"
 dtype = "bf16"
 shape = ["heads * head_dim", "hidden"]
@@ -789,7 +785,7 @@ repeat = "layers"
 
 [[tensor]]
 name = "model.llm.layers.{layer}.attn.attn_sink_proj.weight"
-part = "gqa_attention"
+part = "relative_attention"
 role = "attention"
 dtype = "bf16"
 shape = ["heads", "hidden"]
@@ -809,7 +805,7 @@ repeat = "layers"
 
 [[tensor]]
 name = "model.llm.layers.{layer}.attn.q_l2_clip.scale"
-part = "gqa_attention"
+part = "relative_attention"
 role = "attention"
 dtype = "bf16"
 shape = ["heads", "head_dim"]
@@ -1331,17 +1327,21 @@ dtype = "bf16"
 shape = ["vision_out", "vision_projection"]
 split = "whole"
 
-# mtp.safetensors: the stage's own tensors, named without the backbone's model.llm prefix (src/tensor.rs:645-693).
+# mtp.safetensors: the stage's own tensors, named without the backbone's model.llm prefix.
+# The released fusion table is 6 rows of 8 taps ([6, 8]). config.json states neither number, so
+# the shape is the tensor index's header, the same [6, 8] the running drafter reads through its
+# FUSION_ROWS = 6 and TAPS = 8 constants (device/draft.rs:71-75).
 
 [[tensor]]
 name = "fuse_weight"
 part = "mtp"
 role = "mtp"
 dtype = "bf16"
-shape = ["mtp_hidden", "mtp_hidden * 2"]
+shape = ["6", "8"]
 split = "whole"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.dflare_norm.weight"
@@ -1352,7 +1352,8 @@ shape = ["mtp_hidden"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.input_layernorm.weight"
@@ -1363,7 +1364,8 @@ shape = ["mtp_hidden"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.post_attention_layernorm.weight"
@@ -1374,7 +1376,8 @@ shape = ["mtp_hidden"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.mlp.down_proj.weight"
@@ -1385,7 +1388,8 @@ shape = ["mtp_hidden", "mtp_intermediate"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.mlp.gate_proj.weight"
@@ -1396,7 +1400,8 @@ shape = ["mtp_intermediate", "mtp_hidden"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.mlp.up_proj.weight"
@@ -1407,7 +1412,8 @@ shape = ["mtp_intermediate", "mtp_hidden"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.self_attn.k_norm.weight"
@@ -1430,7 +1436,8 @@ shape = ["mtp_head_dim"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.self_attn.k_proj.weight"
@@ -1453,35 +1460,6 @@ shape = ["mtp_kv_heads * mtp_head_dim", "mtp_hidden"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
-
-[[tensor]]
-name = "layers.{stage}.self_attn.gate_proj.weight"
-part = "mtp"
-role = "mtp"
-dtype = "bf16"
-shape = ["mtp_intermediate", "mtp_hidden"]
-split = "whole"
-repeat = "mtp_stages"
-
-[[tensor]]
-name = "layers.{stage}.self_attn.up_proj.weight"
-part = "mtp"
-role = "mtp"
-dtype = "bf16"
-shape = ["mtp_intermediate", "mtp_hidden"]
-split = "whole"
-repeat = "mtp_stages"
-
-[[tensor]]
-name = "layers.{stage}.self_attn.down_proj.weight"
-part = "mtp"
-role = "mtp"
-dtype = "bf16"
-shape = ["mtp_hidden", "mtp_intermediate"]
-split = "whole"
-repeat = "mtp_stages"
-
 [[tensor]]
 name = "layers.{stage}.self_attn.o_proj.weight"
 part = "mtp"
@@ -1491,7 +1469,8 @@ shape = ["mtp_hidden", "mtp_heads * mtp_head_dim"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.self_attn.q_norm.weight"
@@ -1502,7 +1481,8 @@ shape = ["mtp_head_dim"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.self_attn.q_proj.weight"
@@ -1513,7 +1493,8 @@ shape = ["mtp_heads * mtp_head_dim", "mtp_hidden"]
 split = "whole"
 repeat = "mtp_stages"
 
-# src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+# mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
+# (device/draft.rs:532-611).
 
 [[tensor]]
 name = "layers.{stage}.self_attn.v_proj.weight"

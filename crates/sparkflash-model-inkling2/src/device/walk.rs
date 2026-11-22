@@ -1405,8 +1405,7 @@ mod tests {
             )
             .map_err(|error| BackendError::new("fixture", error))?;
             let walk = backend.walk_arm()?;
-            // The shared tensor plan does not spell Inkling's block-attention residual, so the
-            // fixture's floor is the weights it uploaded: every dense weight is read a token.
+            // The fixture's floor is the weights it uploaded: every dense weight is read a token.
             let bytes = backend.weight_bytes() as u64;
             Ok(Fixture::new(
                 walk,

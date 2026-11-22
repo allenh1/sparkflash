@@ -157,11 +157,11 @@ fn the_real_snapshots_report_their_interim_claim_state() {
             repo: "thinkingmachines/Inkling-2-Small",
             revision: "885d78bfca61a7e9a498e33cfa7ad35850533b8c",
             world: 4,
-            // The layout claims every indexed tensor. The tower's learned-grid position and
-            // axial-rotary attention are the only vision parts with no kernel yet, so the rows
-            // are claimed but not all resolve.
-            expectation: SnapshotExpectation::Gaps,
-            vision_gaps: &["vision_attention", "vision_position"],
+            // The layout claims every indexed tensor, and the tower's learned-grid position,
+            // axial-rotary attention, relative attention, block mixer and bf16 drafter all
+            // resolve at this rank count.
+            expectation: SnapshotExpectation::Clean,
+            vision_gaps: &[],
         },
         Snapshot {
             repo: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",

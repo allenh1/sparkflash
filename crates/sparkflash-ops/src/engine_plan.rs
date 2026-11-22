@@ -70,12 +70,25 @@ impl PrecisionPolicy {
         let quantization = &architecture.quantization;
         let dense = precision_of(quantization.dense_format);
         let experts = precision_of(quantization.expert_format);
-        let mtp = quantization.mtp_expert_format.map_or(experts, precision_of);
+        // Inkling's drafter is its own bf16 file (mtp.safetensors); the backbone's expert format
+        // is NVFP4 and does not describe the stage, whose config names no quantisation block.
+        let mtp = if architecture.inkling.is_some() {
+            Precision::Bf16
+        } else {
+            quantization.mtp_expert_format.map_or(experts, precision_of)
+        };
+        // Inkling's attention and its drafter are bf16 arithmetic over NVFP4/MXFP8 experts;
+        // the experts' stored format does not describe either operand class.
+        let attention = if architecture.inkling.is_some() {
+            Precision::Bf16
+        } else {
+            dense
+        };
         Self {
             dense,
             experts,
             mtp,
-            attention: dense,
+            attention,
         }
     }
 }
@@ -421,13 +434,22 @@ fn precision_for(part: Part, policy: PrecisionPolicy) -> Precision {
     match part {
         Part::Moe => policy.experts,
         Part::Mtp => policy.mtp,
-        Part::MlaAttention | Part::GqaAttention | Part::GdnScan | Part::KdaScan => policy.attention,
+        Part::MlaAttention
+        | Part::GqaAttention
+        | Part::RelativeAttention
+        | Part::GdnScan
+        | Part::KdaScan => policy.attention,
         // The embedding, both norms and the head are stored and computed at bf16 in every
         // released arm, including the DeepSeek FP8 checkpoint (its head is not converted).
         Part::Embedding
         | Part::RmsNorm
         | Part::LayerNorm
         | Part::LmHead
+        // Inkling's block mixer, short convolutions and softcapped epilogue are bf16/f32
+        // elementwise and reduction bodies; they are not routed-expert operands.
+        | Part::BlockAttentionResidual
+        | Part::ShortConv
+        | Part::SoftcappedActivation
         | Part::VisionPatchEmbed
         | Part::VisionPosition
         | Part::VisionNorm

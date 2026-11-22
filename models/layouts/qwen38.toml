@@ -42,12 +42,12 @@ mtp_scale_block = { key = "quantization_config.config_groups.group_1.weights.gro
 [[keys]]
 # config.json text_config.model_type: the nested producer type, matched here only.
 path = "text_config.model_type"
-fact = "match.text_model_type"
+ignore = "the nested producer type is matched by the root architectures/model_type this layout compares; the arm's typed parser reads it and the shared reader derives the family from the nested stack"
 
 [[keys]]
 # config.json vision_config.model_type: the nested tower type, matched here only.
 path = "vision_config.model_type"
-fact = "match.vision_model_type"
+ignore = "the nested tower type is matched by the root architectures/model_type this layout compares; the shared vision reader derives the tower from its structural keys"
 
 [[keys]]
 # config.json tie_word_embeddings: duplicated inside text_config, which the parser reads.

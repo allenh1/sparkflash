@@ -498,6 +498,8 @@ fn each_released_vision_tower_is_a_stack_of_named_components() {
 
     for (name, config, rows, resolved) in [
         ("deepseek", DEEPSEEK, 7, false),
+        // The config alone cannot prove whether the stored patch projection folds the temporal
+        // pair; the real-snapshot scan's index does, and there the tower is clean.
         ("inkling", INKLING, 6, false),
         ("glm", GLM, 7, false),
         ("qwen", QWEN, 6, false),

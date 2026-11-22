@@ -75,7 +75,11 @@ impl LayerStep {
     pub fn from_layer(layer: &Layer) -> Self {
         let attention = match &layer.attention.kind {
             AttentionKind::Mla { .. } => Part::MlaAttention,
-            AttentionKind::Gqa { .. } | AttentionKind::Inkling { .. } => Part::GqaAttention,
+            AttentionKind::Gqa { .. } => Part::GqaAttention,
+            // Inkling's GQA and its learned relative bias are one body: the arm launches the
+            // inkling_attn_* family for the whole layer's attention, and the catalogue carries
+            // that family under the relative-attention part.
+            AttentionKind::Inkling { .. } => Part::RelativeAttention,
             AttentionKind::Gdn(_) => Part::GdnScan,
             AttentionKind::Kda(_) => Part::KdaScan,
         };
