@@ -1893,6 +1893,9 @@ def rust_registry_check(path: Path) -> tuple[bool, str]:
     """
     if os.environ.get("SPARKFLASH_SKIP_RUST_REGISTRY") == "1":
         return True, "skipped by SPARKFLASH_SKIP_RUST_REGISTRY=1"
+    if not (REPO / "Cargo.toml").is_file():
+        # The declaration tests build throwaway git trees that carry only numerics files.
+        return True, "skipped: the tree has no Cargo.toml"
     cargo = shutil.which("cargo")
     if cargo is None:
         return False, "cargo is not on PATH, so the Rust registry parse did not run"
