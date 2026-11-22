@@ -69,6 +69,8 @@ pub struct Layout {
     pub keys: Vec<KeyDecl>,
     /// Stack declarations, keyed by stack name.
     pub stacks: BTreeMap<String, StackDecl>,
+    /// Shape facts named by the file and resolved from config keys.
+    pub vars: BTreeMap<String, FactValue>,
     /// Tensor declarations, in file order.
     pub tensors: Vec<TensorDecl>,
     /// Where this layout was read from, for a refusal that names both files.
@@ -130,13 +132,13 @@ pub enum FactValue {
 /// One tensor name template and the rank split it takes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TensorDecl {
-    /// The name template, with {layer}, {block} and {expert} placeholders.
+    /// The name template, with {layer}, {block}, {expert} and {stage} placeholders.
     pub name: String,
     /// The part kind that owns the tensor.
     pub part: String,
     /// The tensor role, as the ops library names it.
     pub role: String,
-    /// The stored element type: bf16, f32, dense or expert.
+    /// The stored element type: bf16, f32, dense, expert, mxfp8 or mxfp4.
     pub dtype: String,
     /// The logical shape, as integer literals or arithmetic expressions.
     pub shape: Vec<String>,
@@ -146,6 +148,8 @@ pub struct TensorDecl {
     pub repeat: Repeat,
     /// Which layers or experts the template selects.
     pub when: When,
+    /// The stack the tensor belongs to, when the part kind alone does not say.
+    pub stack: Option<String>,
     /// When the tensor is stored but never loaded, why.
     pub unloaded: Option<String>,
 }
@@ -155,6 +159,7 @@ pub struct TensorDecl {
 struct Placement {
     block: Option<usize>,
     expert: Option<usize>,
+    stage: Option<usize>,
     stack: StackKind,
 }
 
@@ -169,6 +174,10 @@ pub enum Repeat {
     Experts,
     /// One per routed expert of the MTP stage's selected MoE layer.
     MtpExperts,
+    /// One per MTP stage.
+    MtpStages,
+    /// One per routed expert of every MTP stage.
+    MtpStageExperts,
     /// One per vision block.
     VisionBlocks,
     /// The MTP stage, using the first selected layer's wiring.
@@ -184,6 +193,10 @@ pub struct When {
     pub ffn: Option<String>,
     /// Whether the layer owns an indexer (true) or reuses one (false).
     pub indexer: Option<bool>,
+    /// The exact layer indices, when only named layers carry the tensor.
+    pub layers: Vec<usize>,
+    /// The residual kind: plain or hyper.
+    pub residual: Option<String>,
 }
 
 /// A resolved tensor of one checkpoint.
@@ -220,6 +233,16 @@ pub enum LayoutDtype {
     Dense,
     /// The checkpoint's routed-expert format.
     Expert,
+    /// Explicit FP8 E4M3.
+    F8E4M3,
+    /// Explicit FP8 E8M0 (a power-of-two scale).
+    F8E8M0,
+    /// Explicit FP4 E2M1, packed two values per byte.
+    F4E2M1,
+    /// Raw unsigned bytes.
+    U8,
+    /// A 64-bit signed integer.
+    I64,
 }
 
 /// How a tensor is split across ranks.
@@ -241,6 +264,8 @@ pub enum TensorSplit {
     ExpertRows,
     /// An expert projection split on its input columns.
     ExpertColumns,
+    /// A stacked expert tensor split on its expert axis (axis 0).
+    ExpertAxis,
 }
 
 /// A layout selected and applied to one checkpoint.
@@ -359,6 +384,8 @@ struct RawLayout {
     keys: Vec<RawKey>,
     #[serde(default)]
     stacks: BTreeMap<String, RawStack>,
+    #[serde(default)]
+    vars: BTreeMap<String, toml::Value>,
     #[serde(default, rename = "tensor")]
     tensors: Vec<RawTensor>,
 }
@@ -420,6 +447,8 @@ struct RawTensor {
     #[serde(default)]
     when: Option<RawWhen>,
     #[serde(default)]
+    stack: Option<String>,
+    #[serde(default)]
     unloaded: Option<String>,
 }
 
@@ -439,6 +468,10 @@ struct RawWhen {
     ffn: Option<String>,
     #[serde(default)]
     indexer: Option<bool>,
+    #[serde(default)]
+    layers: Vec<usize>,
+    #[serde(default)]
+    residual: Option<String>,
 }
 impl Layout {
     /// Parse one layout file.
@@ -548,6 +581,8 @@ impl Layout {
                 "layers" => Repeat::Layers,
                 "experts" => Repeat::Experts,
                 "mtp_experts" => Repeat::MtpExperts,
+                "mtp_stages" => Repeat::MtpStages,
+                "mtp_stage_experts" => Repeat::MtpStageExperts,
                 "vision_blocks" => Repeat::VisionBlocks,
                 "mtp" => Repeat::Mtp,
                 other => {
@@ -566,6 +601,7 @@ impl Layout {
                 "conv" => TensorSplit::Conv,
                 "expert_rows" => TensorSplit::ExpertRows,
                 "expert_columns" => TensorSplit::ExpertColumns,
+                "expert_axis" => TensorSplit::ExpertAxis,
                 other => {
                     return Err(LayoutError::invalid(
                         origin,
@@ -574,7 +610,10 @@ impl Layout {
                 }
             };
             if matches!(split, TensorSplit::ExpertRows | TensorSplit::ExpertColumns)
-                && !matches!(repeat, Repeat::Experts | Repeat::MtpExperts)
+                && !matches!(
+                    repeat,
+                    Repeat::Experts | Repeat::MtpExperts | Repeat::MtpStageExperts
+                )
             {
                 return Err(LayoutError::invalid(
                     origin,
@@ -584,7 +623,20 @@ impl Layout {
                     ),
                 ));
             }
-            if !matches!(tensor.dtype.as_str(), "bf16" | "f32" | "dense" | "expert") {
+            if !matches!(
+                tensor.dtype.as_str(),
+                "bf16"
+                    | "f32"
+                    | "dense"
+                    | "expert"
+                    | "f8e4m3"
+                    | "f8e8m0"
+                    | "f4e2m1"
+                    | "u8"
+                    | "i64"
+                    | "mxfp8"
+                    | "mxfp4"
+            ) {
                 return Err(LayoutError::invalid(
                     origin,
                     format!("tensor {:?}: unknown dtype {:?}", tensor.name, tensor.dtype),
@@ -608,6 +660,8 @@ impl Layout {
                 attention: when.attention,
                 ffn: when.ffn,
                 indexer: when.indexer,
+                layers: when.layers,
+                residual: when.residual,
             });
             if let Some(attention) = &when.attention
                 && !matches!(
@@ -619,6 +673,17 @@ impl Layout {
                     origin,
                     format!(
                         "tensor {:?}: unknown attention selector {attention:?}",
+                        tensor.name
+                    ),
+                ));
+            }
+            if let Some(residual) = &when.residual
+                && !matches!(residual.as_str(), "plain" | "hyper" | "block_attention")
+            {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!(
+                        "tensor {:?}: unknown residual selector {residual:?}",
                         tensor.name
                     ),
                 ));
@@ -640,9 +705,15 @@ impl Layout {
                 split: tensor.split,
                 repeat,
                 when,
+                stack: tensor.stack,
                 unloaded: tensor.unloaded,
             });
         }
+        let vars = raw
+            .vars
+            .into_iter()
+            .map(|(name, value)| (name, fact_value(value)))
+            .collect();
         Ok(Self {
             id: raw.id,
             replaces: raw.replaces,
@@ -650,6 +721,7 @@ impl Layout {
             model_types: raw.matcher.model_types,
             keys,
             stacks,
+            vars,
             tensors,
             origin: origin.to_owned(),
         })
@@ -730,6 +802,42 @@ impl Layout {
                 }
             }
         }
+        for (name, fact) in &self.vars {
+            let (value, key_path) = match fact {
+                FactValue::Literal(value) => (layout_toml_value(value, self, name)?, None),
+                FactValue::Key { key, default } => {
+                    let value = read_path(root, key, self)?;
+                    let value = match (value, default) {
+                        (Some(value), _) => layout_value(value, self, key)?,
+                        (None, Some(default)) => layout_toml_value(default, self, key)?,
+                        (None, None) => {
+                            return Err(LayoutError::refused(
+                                &self.id,
+                                format!(
+                                    "var {name} needs {key}, but the checkpoint does not state                                      it and the layout gives no default"
+                                ),
+                            ));
+                        }
+                    };
+                    (value, Some(key.as_str()))
+                }
+            };
+            if let Some(path) = key_path {
+                coverage.claim_path(path);
+            }
+            let integer = match value {
+                LayoutValue::Integer(value) => value,
+                LayoutValue::Bool(value) => i64::from(value),
+                LayoutValue::Float(value) if value.fract() == 0.0 => value as i64,
+                other => {
+                    return Err(LayoutError::refused(
+                        &self.id,
+                        format!("var {name} is {other}, not an integer shape fact"),
+                    ));
+                }
+            };
+            architecture.layout_vars.insert(name.clone(), integer);
+        }
         self.apply_facts(architecture, &facts)?;
         Ok(facts)
     }
@@ -768,6 +876,56 @@ impl Layout {
         Ok((fact_path, value, Some(path.to_owned())))
     }
 
+    fn fact_bool(value: &LayoutValue, layout: &str, name: &str) -> Result<bool, LayoutError> {
+        match value {
+            LayoutValue::Bool(value) => Ok(*value),
+            other => Err(unknown_value(layout, name, &other.to_string(), "a boolean")),
+        }
+    }
+
+    fn fact_float(value: &LayoutValue, layout: &str, name: &str) -> Result<f64, LayoutError> {
+        match value {
+            LayoutValue::Float(value) => Ok(*value),
+            LayoutValue::Integer(value) => Ok(*value as f64),
+            other => Err(unknown_value(layout, name, &other.to_string(), "a number")),
+        }
+    }
+
+    fn fact_string<'a>(
+        value: &'a LayoutValue,
+        layout: &str,
+        name: &str,
+    ) -> Result<&'a str, LayoutError> {
+        match value {
+            LayoutValue::String(value) => Ok(value),
+            other => Err(unknown_value(layout, name, &other.to_string(), "a string")),
+        }
+    }
+
+    fn vision_activation(
+        layout: &str,
+        name: &str,
+    ) -> Result<crate::vision_geometry::VisionActivation, LayoutError> {
+        use crate::vision_geometry::VisionActivation;
+        Ok(match name {
+            "swiglu" | "silu" => VisionActivation::SwiGlu,
+            "gelu" | "gelu_erf" => VisionActivation::GeluErf,
+            "gelu_tanh" => VisionActivation::GeluTanh,
+            other => {
+                return Err(unknown_value(
+                    layout,
+                    name,
+                    other,
+                    "swiglu, gelu_erf or gelu_tanh",
+                ));
+            }
+        })
+    }
+
+    fn unknown_value(layout: &str, name: &str, value: &str, expected: &str) -> LayoutError {
+        LayoutError::refused(layout, format!("fact {name} is {value:?}, not {expected}"))
+    }
+
     fn apply_facts(
         &self,
         architecture: &mut Architecture,
@@ -802,6 +960,76 @@ impl Layout {
                         architecture.embedding_tied_to_head = *tied;
                     }
                 }
+                "vision.norm" | "vision.vision_norm.norm" => {
+                    let Some(vision) = architecture.vision.as_mut() else {
+                        continue;
+                    };
+                    let name = fact_string(value, &self.id, name)?;
+                    vision.norm = Some(match name {
+                        "rms" => crate::vision_geometry::VisionNorm::Rms,
+                        "layer" => crate::vision_geometry::VisionNorm::Layer,
+                        other => return Err(unknown_value(&self.id, name, other, "rms or layer")),
+                    });
+                }
+                "vision.norm_epsilon" | "vision.vision_norm.norm_epsilon" => {
+                    let Some(vision) = architecture.vision.as_mut() else {
+                        continue;
+                    };
+                    vision.norm_epsilon = Some(fact_float(value, &self.id, name)?);
+                }
+                "vision.attention_bias" | "vision.vision_attention.attention_bias" => {
+                    let Some(vision) = architecture.vision.as_mut() else {
+                        continue;
+                    };
+                    vision.attention_bias = Some(fact_bool(value, &self.id, name)?);
+                }
+                "vision.qk_norm" | "vision.vision_attention.qk_norm" => {
+                    let Some(vision) = architecture.vision.as_mut() else {
+                        continue;
+                    };
+                    vision.qk_norm = Some(fact_bool(value, &self.id, name)?);
+                }
+                "vision.activation" | "vision.vision_mlp.activation" => {
+                    let Some(vision) = architecture.vision.as_mut() else {
+                        continue;
+                    };
+                    let name = fact_string(value, &self.id, name)?;
+                    vision.activation = Some(vision_activation(&self.id, name)?);
+                }
+                "vision.downsample" | "vision.vision_merger.downsample" => {
+                    let Some(vision) = architecture.vision.as_mut() else {
+                        continue;
+                    };
+                    let name = fact_string(value, &self.id, name)?;
+                    let factor = vision.spatial_merge.max(1);
+                    vision.downsample = Some(match name {
+                        "none" => crate::vision_geometry::VisionDownsample::None,
+                        "unfold" => crate::vision_geometry::VisionDownsample::Unfold(factor),
+                        "merge" => crate::vision_geometry::VisionDownsample::Merge(factor),
+                        "conv" => crate::vision_geometry::VisionDownsample::Conv(factor),
+                        other => {
+                            return Err(unknown_value(
+                                &self.id,
+                                name,
+                                other,
+                                "none, unfold, merge or conv",
+                            ));
+                        }
+                    });
+                }
+                "vision.merger_activation" | "vision.vision_merger.merger_activation" => {
+                    let Some(vision) = architecture.vision.as_mut() else {
+                        continue;
+                    };
+                    let name = fact_string(value, &self.id, name)?;
+                    vision.merger_activation = Some(vision_activation(&self.id, name)?);
+                }
+                "vision.merger_final_norm" | "vision.vision_merger.merger_final_norm" => {
+                    let Some(vision) = architecture.vision.as_mut() else {
+                        continue;
+                    };
+                    vision.merger_final_norm = Some(fact_bool(value, &self.id, name)?);
+                }
                 _ => {}
             }
         }
@@ -825,10 +1053,25 @@ impl Layout {
                     ),
                 )
             })?;
-            let stack = match declaration.repeat {
-                Repeat::VisionBlocks => StackKind::Vision,
-                Repeat::Mtp | Repeat::MtpExperts => StackKind::Draft,
-                Repeat::Once | Repeat::Layers | Repeat::Experts => stack_of_part(part),
+            let stack = match &declaration.stack {
+                Some(name) => stack_kind(name).ok_or_else(|| {
+                    LayoutError::refused(
+                        &self.id,
+                        format!(
+                            "tensor {:?} names unknown stack {name:?}; name language, vision, \
+                             audio or draft",
+                            declaration.name
+                        ),
+                    )
+                })?,
+                None => match declaration.repeat {
+                    Repeat::VisionBlocks => StackKind::Vision,
+                    Repeat::Mtp
+                    | Repeat::MtpExperts
+                    | Repeat::MtpStages
+                    | Repeat::MtpStageExperts => StackKind::Draft,
+                    Repeat::Once | Repeat::Layers | Repeat::Experts => stack_of_part(part),
+                },
             };
             if stack == StackKind::Vision && architecture.vision.is_none() {
                 continue;
@@ -839,7 +1082,6 @@ impl Layout {
             match declaration.repeat {
                 Repeat::Once => {
                     let vars = self.global_vars(architecture);
-                    let stack = stack_of_part(part);
                     self.push_tensor(
                         &mut tensors,
                         declaration,
@@ -848,13 +1090,14 @@ impl Layout {
                         Placement {
                             block: (stack == StackKind::Vision).then_some(0),
                             expert: None,
+                            stage: None,
                             stack,
                         },
                     )?;
                 }
                 Repeat::Layers => {
                     for (index, layer) in architecture.layers.iter().enumerate() {
-                        if !when_matches(&declaration.when, layer) {
+                        if !when_matches(&declaration.when, layer, index) {
                             continue;
                         }
                         let vars = self.layer_vars(architecture, layer, index);
@@ -866,6 +1109,7 @@ impl Layout {
                             Placement {
                                 block: Some(index),
                                 expert: None,
+                                stage: None,
                                 stack: StackKind::Language,
                             },
                         )?;
@@ -873,7 +1117,7 @@ impl Layout {
                 }
                 Repeat::Experts => {
                     for (index, layer) in architecture.layers.iter().enumerate() {
-                        if !when_matches(&declaration.when, layer) {
+                        if !when_matches(&declaration.when, layer, index) {
                             continue;
                         }
                         let Ffn::Moe(moe) = &layer.ffn else {
@@ -896,6 +1140,7 @@ impl Layout {
                                 Placement {
                                     block: Some(index),
                                     expert: Some(expert),
+                                    stage: None,
                                     stack: StackKind::Language,
                                 },
                             )?;
@@ -909,10 +1154,11 @@ impl Layout {
                     if mtp.stages == 0 {
                         continue;
                     }
-                    let reference = architecture
+                    let (reference_index, reference) = architecture
                         .layers
                         .iter()
-                        .find(|layer| when_matches(&declaration.when, layer))
+                        .enumerate()
+                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -935,8 +1181,13 @@ impl Layout {
                     };
                     let index = architecture.layers.len();
                     for expert in 0..moe.routed_experts {
-                        let mut vars = self.layer_vars(architecture, reference, index);
+                        let mut vars = self.layer_vars(architecture, reference, reference_index);
                         vars.insert("expert".to_owned(), expert as i64);
+                        vars.insert("stage".to_owned(), 0);
+                        vars.insert(
+                            "mtp_routed".to_owned(),
+                            mtp.routed_experts.unwrap_or(moe.routed_experts) as i64,
+                        );
                         self.push_tensor(
                             &mut tensors,
                             declaration,
@@ -945,27 +1196,8 @@ impl Layout {
                             Placement {
                                 block: Some(index),
                                 expert: Some(expert),
+                                stage: Some(0),
                                 stack: StackKind::Draft,
-                            },
-                        )?;
-                    }
-                }
-                Repeat::VisionBlocks => {
-                    let Some(vision) = &architecture.vision else {
-                        continue;
-                    };
-                    for block in 0..vision.depth {
-                        let mut vars = self.vision_vars(vision);
-                        vars.insert("block".to_owned(), block as i64);
-                        self.push_tensor(
-                            &mut tensors,
-                            declaration,
-                            part,
-                            &vars,
-                            Placement {
-                                block: Some(block),
-                                expert: None,
-                                stack: StackKind::Vision,
                             },
                         )?;
                     }
@@ -977,11 +1209,12 @@ impl Layout {
                     if mtp.stages == 0 {
                         continue;
                     }
-                    let reference = architecture
+                    let (reference_index, reference) = architecture
                         .layers
                         .iter()
-                        .find(|layer| when_matches(&declaration.when, layer))
-                        .or_else(|| architecture.layers.first())
+                        .enumerate()
+                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .or_else(|| architecture.layers.first().map(|layer| (0, layer)))
                         .ok_or_else(|| {
                             LayoutError::refused(
                                 &self.id,
@@ -993,7 +1226,7 @@ impl Layout {
                             )
                         })?;
                     let index = architecture.layers.len();
-                    let vars = self.layer_vars(architecture, reference, index);
+                    let vars = self.layer_vars(architecture, reference, reference_index);
                     self.push_tensor(
                         &mut tensors,
                         declaration,
@@ -1002,9 +1235,138 @@ impl Layout {
                         Placement {
                             block: Some(index),
                             expert: None,
+                            stage: Some(0),
                             stack: StackKind::Draft,
                         },
                     )?;
+                }
+                Repeat::MtpStages => {
+                    let Some(mtp) = &architecture.mtp else {
+                        continue;
+                    };
+                    if mtp.stages == 0 {
+                        continue;
+                    }
+                    let (reference_index, reference) = architecture
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .or_else(|| architecture.layers.first().map(|layer| (0, layer)))
+                        .ok_or_else(|| {
+                            LayoutError::refused(
+                                &self.id,
+                                format!(
+                                    "tensor {:?} describes MTP stages, but the architecture has \
+                                     no layer to take its wiring from",
+                                    declaration.name
+                                ),
+                            )
+                        })?;
+                    for stage in 0..mtp.stages {
+                        let mut vars = self.layer_vars(architecture, reference, reference_index);
+                        vars.insert("stage".to_owned(), stage as i64);
+                        vars.insert("mtp_stages".to_owned(), mtp.stages as i64);
+                        vars.insert(
+                            "mtp_routed".to_owned(),
+                            mtp.routed_experts.unwrap_or(0) as i64,
+                        );
+                        vars.insert(
+                            "mtp_active".to_owned(),
+                            mtp.active_experts.unwrap_or(0) as i64,
+                        );
+                        self.push_tensor(
+                            &mut tensors,
+                            declaration,
+                            part,
+                            &vars,
+                            Placement {
+                                block: Some(stage),
+                                expert: None,
+                                stage: Some(stage),
+                                stack: StackKind::Draft,
+                            },
+                        )?;
+                    }
+                }
+                Repeat::MtpStageExperts => {
+                    let Some(mtp) = &architecture.mtp else {
+                        continue;
+                    };
+                    if mtp.stages == 0 {
+                        continue;
+                    }
+                    let (reference_index, reference) = architecture
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .find(|(index, layer)| when_matches(&declaration.when, layer, *index))
+                        .ok_or_else(|| {
+                            LayoutError::refused(
+                                &self.id,
+                                format!(
+                                    "tensor {:?} repeats over MTP stage experts, but no layer                                      matches its selector",
+                                    declaration.name
+                                ),
+                            )
+                        })?;
+                    let Ffn::Moe(moe) = &reference.ffn else {
+                        return Err(LayoutError::refused(
+                            &self.id,
+                            format!(
+                                "tensor {:?} repeats over MTP stage experts, but its reference                                  layer is not MoE",
+                                declaration.name
+                            ),
+                        ));
+                    };
+                    let routed = mtp.routed_experts.unwrap_or(moe.routed_experts);
+                    for stage in 0..mtp.stages {
+                        for expert in 0..routed {
+                            let mut vars =
+                                self.layer_vars(architecture, reference, reference_index);
+                            vars.insert("stage".to_owned(), stage as i64);
+                            vars.insert("expert".to_owned(), expert as i64);
+                            vars.insert("mtp_stages".to_owned(), mtp.stages as i64);
+                            vars.insert("mtp_routed".to_owned(), routed as i64);
+                            vars.insert(
+                                "mtp_active".to_owned(),
+                                mtp.active_experts.unwrap_or(0) as i64,
+                            );
+                            self.push_tensor(
+                                &mut tensors,
+                                declaration,
+                                part,
+                                &vars,
+                                Placement {
+                                    block: Some(stage),
+                                    expert: Some(expert),
+                                    stage: Some(stage),
+                                    stack: StackKind::Draft,
+                                },
+                            )?;
+                        }
+                    }
+                }
+                Repeat::VisionBlocks => {
+                    let Some(vision) = &architecture.vision else {
+                        continue;
+                    };
+                    for block in 0..vision.depth {
+                        let mut vars = self.vision_vars(architecture, vision);
+                        vars.insert("block".to_owned(), block as i64);
+                        self.push_tensor(
+                            &mut tensors,
+                            declaration,
+                            part,
+                            &vars,
+                            Placement {
+                                block: Some(block),
+                                expert: None,
+                                stage: None,
+                                stack: StackKind::Vision,
+                            },
+                        )?;
+                    }
                 }
             }
         }
@@ -1021,6 +1383,7 @@ impl Layout {
     ) -> Result<(), LayoutError> {
         let block = placement.block;
         let expert = placement.expert;
+        let stage = placement.stage;
         let stack = placement.stack;
         let mut name = declaration.name.clone();
         if let Some(block) = block {
@@ -1029,6 +1392,9 @@ impl Layout {
         }
         if let Some(expert) = expert {
             name = name.replace("{expert}", &expert.to_string());
+        }
+        if let Some(stage) = stage {
+            name = name.replace("{stage}", &stage.to_string());
         }
         if name.contains('{') {
             return Err(LayoutError::refused(
@@ -1052,6 +1418,11 @@ impl Layout {
             "f32" => LayoutDtype::F32,
             "dense" => LayoutDtype::Dense,
             "expert" => LayoutDtype::Expert,
+            "f8e4m3" => LayoutDtype::F8E4M3,
+            "f8e8m0" => LayoutDtype::F8E8M0,
+            "f4e2m1" => LayoutDtype::F4E2M1,
+            "u8" => LayoutDtype::U8,
+            "i64" => LayoutDtype::I64,
             other => {
                 return Err(LayoutError::refused(
                     &self.id,
@@ -1156,7 +1527,7 @@ impl Layout {
     }
 
     fn global_vars(&self, architecture: &Architecture) -> BTreeMap<String, i64> {
-        let mut vars = BTreeMap::new();
+        let mut vars = architecture.layout_vars.clone();
         insert(&mut vars, "hidden", architecture.hidden_size);
         insert(&mut vars, "vocab", architecture.vocab_size);
         insert(&mut vars, "layers", architecture.layers.len());
@@ -1171,8 +1542,8 @@ impl Layout {
         vars
     }
 
-    fn vision_vars(&self, vision: &Vision) -> BTreeMap<String, i64> {
-        let mut vars = BTreeMap::new();
+    fn vision_vars(&self, architecture: &Architecture, vision: &Vision) -> BTreeMap<String, i64> {
+        let mut vars = architecture.layout_vars.clone();
         insert(&mut vars, "hidden", vision.hidden_size);
         insert(&mut vars, "vocab", 0);
         self.insert_vision_vars(&mut vars, vision);
@@ -1282,6 +1653,45 @@ impl Layout {
         insert(&mut vars, "streams", streams);
         insert(&mut vars, "hyper_rows", (2 + streams) * streams);
         insert(&mut vars, "hyper_width", streams * architecture.hidden_size);
+        let lowrank = match &layer.residual {
+            Residual::Hyper(hyper) => hyper.lowrank.unwrap_or(0),
+            _ => 0,
+        };
+        insert(&mut vars, "hc_lowrank", lowrank);
+        if let AttentionKind::Gdn(gdn) = &layer.attention.kind {
+            insert(&mut vars, "gdn_key_heads", gdn.key_heads);
+            insert(&mut vars, "gdn_value_heads", gdn.value_heads);
+            insert(&mut vars, "gdn_key_dim", gdn.key_dim);
+            insert(&mut vars, "gdn_value_dim", gdn.value_dim);
+            insert(&mut vars, "gdn_key_width", gdn.key_heads * gdn.key_dim);
+            insert(
+                &mut vars,
+                "gdn_value_width",
+                gdn.value_heads * gdn.value_dim,
+            );
+            insert(&mut vars, "gdn_conv", gdn.conv_kernel);
+        }
+        if let Some(Side::Ple(ple)) = layer.sides.iter().find(|side| matches!(side, Side::Ple(_))) {
+            let rows = ple_padded_rows(ple);
+            let heads = ple.ngram_size.saturating_sub(1) * ple.heads_per_ngram;
+            insert(&mut vars, "ple_embed_dim", ple.embed_dim);
+            insert(&mut vars, "ple_conv", ple.conv_kernel);
+            insert(&mut vars, "ple_ngram", ple.ngram_size);
+            insert(&mut vars, "ple_heads_per_ngram", ple.heads_per_ngram);
+            insert(&mut vars, "ple_heads", heads);
+            insert(
+                &mut vars,
+                "ple_head_dim",
+                ple.embed_dim.checked_div(heads.max(1)).unwrap_or(0),
+            );
+            insert(&mut vars, "ple_rows", usize::try_from(rows).unwrap_or(0));
+            insert(&mut vars, "ple_shards", ple.split_parts);
+            insert(
+                &mut vars,
+                "ple_shard_rows",
+                usize::try_from(rows).unwrap_or(0) / ple.split_parts.max(1),
+            );
+        }
         vars
     }
 }
@@ -1302,6 +1712,40 @@ fn layout_format(tensors: &[&LayoutTensor], architecture: &Architecture) -> Opti
         }
     }
     format
+}
+
+fn ple_padded_rows(ple: &crate::architecture::PleGeometry) -> u64 {
+    let heads = ple.ngram_size.saturating_sub(1) * ple.heads_per_ngram;
+    let mut offset = 0u64;
+    let mut prime = ple.vocab_base;
+    for _ in 0..heads {
+        loop {
+            prime += 1;
+            if is_prime(prime) {
+                break;
+            }
+        }
+        offset += prime;
+    }
+    let divisor = ple.vocab_multiple.max(ple.split_parts as u64).max(1);
+    offset.div_ceil(divisor) * divisor
+}
+
+fn is_prime(value: u64) -> bool {
+    if value < 2 {
+        return false;
+    }
+    if value.is_multiple_of(2) {
+        return value == 2;
+    }
+    let mut divisor = 3;
+    while divisor.saturating_mul(divisor) <= value {
+        if value.is_multiple_of(divisor) {
+            return false;
+        }
+        divisor += 2;
+    }
+    true
 }
 
 fn insert(vars: &mut BTreeMap<String, i64>, name: &str, value: usize) {
@@ -1456,7 +1900,10 @@ fn read_path<'a>(
     Ok(Some(value))
 }
 
-fn when_matches(when: &When, layer: &Layer) -> bool {
+fn when_matches(when: &When, layer: &Layer, index: usize) -> bool {
+    if !when.layers.is_empty() && !when.layers.contains(&index) {
+        return false;
+    }
     if let Some(attention) = &when.attention {
         let have = match &layer.attention.kind {
             AttentionKind::Kda(_) => "kda",
@@ -1475,6 +1922,16 @@ fn when_matches(when: &When, layer: &Layer) -> bool {
             Ffn::Moe(_) => "moe",
         };
         if ffn != have {
+            return false;
+        }
+    }
+    if let Some(residual) = &when.residual {
+        let have = match &layer.residual {
+            Residual::Plain => "plain",
+            Residual::Hyper(_) => "hyper",
+            Residual::BlockAttention => "block_attention",
+        };
+        if residual != have {
             return false;
         }
     }

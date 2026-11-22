@@ -25,6 +25,7 @@
 //! op plans; this document only says which parts a layer is made of.
 
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::config::{ConfigError, OneOrMany};
 use crate::coverage::{ConfigCoverage, entries, read_key, with_recording};
@@ -66,6 +67,8 @@ pub struct Architecture {
     pub tokens: Tokens,
     /// Inkling-2's relative-attention and block-residual geometry, when the release is one.
     pub inkling: Option<Inkling>,
+    /// Shape facts a matching layout resolved from config keys, by layout name.
+    pub layout_vars: BTreeMap<String, i64>,
 }
 
 /// The Inkling-2 text stack geometry that has no equivalent in the other releases.
@@ -1031,6 +1034,7 @@ impl Architecture {
             mtp,
             tokens,
             inkling,
+            layout_vars: BTreeMap::new(),
         })
     }
 

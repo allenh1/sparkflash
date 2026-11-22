@@ -489,11 +489,22 @@ impl Builder {
                 })?;
                 self.expert(prefix, width, hidden, format, rows, role)?;
             }
-            LayoutDtype::Bf16 | LayoutDtype::F32 => {
-                let dtype = if tensor.dtype == LayoutDtype::Bf16 {
-                    DType::BF16
-                } else {
-                    DType::F32
+            LayoutDtype::Bf16
+            | LayoutDtype::F32
+            | LayoutDtype::F8E4M3
+            | LayoutDtype::F8E8M0
+            | LayoutDtype::F4E2M1
+            | LayoutDtype::U8
+            | LayoutDtype::I64 => {
+                let dtype = match tensor.dtype {
+                    LayoutDtype::Bf16 => DType::BF16,
+                    LayoutDtype::F32 => DType::F32,
+                    LayoutDtype::F8E4M3 => DType::F8E4M3,
+                    LayoutDtype::F8E8M0 => DType::F8E8M0,
+                    LayoutDtype::F4E2M1 => DType::F4E2M1,
+                    LayoutDtype::U8 => DType::U8,
+                    LayoutDtype::I64 => DType::I64,
+                    LayoutDtype::Dense | LayoutDtype::Expert => unreachable!(),
                 };
                 self.layout_split(&tensor.name, dtype, &tensor.shape, tensor.split, role)?;
             }
