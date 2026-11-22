@@ -41,8 +41,6 @@ enum SnapshotExpectation {
     Clean,
     /// Every tensor is claimed, but the tower's parts do not all resolve yet.
     Gaps,
-    /// These exact prefix groups are the only unclaimed tensors.
-    Unclaimed(Vec<(&'static str, usize)>),
     /// The shared plan cannot be built; its tower tensors are the unclaimed ones and one
     /// layout row names the missing planner.
     PlanFailure {
@@ -277,19 +275,6 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                         );
                     }
                 }
-            }
-            SnapshotExpectation::Unclaimed(expected) => {
-                let expected: Vec<(String, usize)> = expected
-                    .iter()
-                    .map(|(prefix, count)| ((*prefix).to_owned(), *count))
-                    .collect();
-                assert_eq!(
-                    unclaimed_groups(&report),
-                    expected,
-                    "{}:\n{}",
-                    snapshot.repo,
-                    report.render()
-                );
             }
             SnapshotExpectation::PlanFailure {
                 vision_tensors,
