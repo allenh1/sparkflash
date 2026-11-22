@@ -726,6 +726,8 @@ pub enum WeightFormat {
     /// Unquantized BF16.
     #[default]
     Bf16,
+    /// Unquantized F32.
+    F32,
     /// E4M3 codes with an inverse scale a tile.
     Fp8Tile {
         /// Rows a scale covers.
@@ -760,6 +762,7 @@ impl WeightFormat {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Bf16 => "BF16",
+            Self::F32 => "F32",
             Self::Fp8Tile { .. } => "FP8",
             Self::NvFp4 { .. } => "NVFP4",
             Self::MxFp8 { .. } => "MXFP8",
@@ -778,6 +781,9 @@ impl WeightFormat {
     pub fn from_name(method: Option<&str>, block: Option<usize>, scale: Option<&str>) -> Self {
         let name = method.unwrap_or("").to_ascii_lowercase();
         let scale = scale.unwrap_or("").to_ascii_lowercase();
+        if name == "f32" || name == "float32" {
+            return Self::F32;
+        }
         if name.contains("nvfp4") {
             return Self::NvFp4 {
                 group_size: block.unwrap_or(16),

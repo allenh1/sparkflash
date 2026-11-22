@@ -179,6 +179,7 @@ impl FormatRule {
     pub const fn of(format: WeightFormat) -> Self {
         Self::stored(match format {
             WeightFormat::Bf16 => "BF16",
+            WeightFormat::F32 => "F32",
             WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
             WeightFormat::MxFp8 { .. } => "MX FP8",
             WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",

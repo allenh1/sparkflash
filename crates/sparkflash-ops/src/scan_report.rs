@@ -33,11 +33,11 @@
 //! that gates a load must consult the process's own availability policy; the scan never claims a
 //! build embeds an image it did not check.
 //!
-//! Every refusal names the part, the rank-local shape the plan states, the stored format when the
-//! config states one, the pass and the target, and carries what would fix it. The statuses are the
-//! seven of the plan's section 4, no more.
+//! Every refusal names the part, the row's shape, the stored format the layout's claimed tensors
+//! state, the pass and the target, and carries what would fix it. The statuses are the seven of
+//! the plan's section 4, no more.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -323,16 +323,17 @@ pub struct ScanRow {
     pub block: Option<usize>,
     /// The part kind.
     pub part: Part,
-    /// The rank-local principal matrix the instance was resolved at, or [Shape::unknown].
+    /// The stored shape of the first tensor the part claims in the layout, or [Shape::unknown].
     ///
-    /// The plan is built at rank zero of the report's world size, so a TP4 row states the heads
-    /// and columns this rank holds, not the model's full width. A part whose operative shape
-    /// needs the tensor names and the layout file is printed as `?` rather than guessed.
+    /// The shape is the checkpoint's own, the one the index stores, so it is the same at every
+    /// TP world. A part with no claimed tensor falls back to the rank-local plan geometry; a part
+    /// with neither is printed as `?` rather than guessed.
     pub shape: Shape,
-    /// The stored weight format, when the checkpoint's typed fields state it.
+    /// The stored weight format the part's claimed tensors agree on.
     ///
-    /// `None` is printed as `?`: a composite part's format is not in the config, and the scan
-    /// never reports a format it did not resolve at.
+    /// `None` is printed as `?`: the row then has no stored dtype evidence and the scan never
+    /// substitutes a format it did not read. The format is the same one the requirement is
+    /// resolved at, so a row never prints a format the lookup did not use.
     pub format: Option<WeightFormat>,
     /// The pass this row reports: both when the instance resolved in both passes (or failed in
     /// both), otherwise the single pass that refused it.
@@ -362,6 +363,12 @@ pub struct ScanReport {
     ///
     /// These are reported for the next reader step; they never make a scan dirty.
     pub carried_facts: Vec<String>,
+    /// Parts whose arithmetic has no tensor or row of its own, and the row that covers it.
+    ///
+    /// A fused epilogue is not a part instance the walk schedules, but the arm still launches
+    /// it. The note says which scheduled row's arithmetic contains it, so its absence from the
+    /// table is stated rather than silent.
+    pub coverage_notes: Vec<String>,
 }
 
 impl ScanReport {
@@ -465,6 +472,9 @@ impl ScanReport {
                 self.carried_facts.join(", ")
             );
         }
+        for note in &self.coverage_notes {
+            let _ = writeln!(out, "coverage note: {note}");
+        }
         let _ = writeln!(out, "clean: {}", if self.is_clean() { "yes" } else { "no" });
         out
     }
@@ -491,6 +501,7 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
         rows: Vec::new(),
         error: None,
         carried_facts: Vec::new(),
+        coverage_notes: Vec::new(),
     };
     let names: Option<Vec<String>> = inputs.tensors.map(|index| {
         index
@@ -551,25 +562,47 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
     };
     let resolver = KernelResolver::new(inputs.target, report.availability);
     let architecture = plan.architecture();
+    // A softcapped SwiGLU is the MLP gate/up epilogue, not a tensor-bearing part: it is launched
+    // inside the layer's FFN row. The short convolution has tensors of its own and is planned as
+    // a row, so its absence needs no note.
+    let parts = architecture.parts();
+    if parts.contains(Part::SoftcappedActivation) {
+        report.coverage_notes.push(
+            "softcapped_activation has no tensor of its own: it is the MLP gate/up epilogue and \
+             is covered by each layer's ffn row; short_conv is planned as its own row"
+                .to_owned(),
+        );
+    }
+    // The layout's claimed tensors are the row's evidence: their stored dtypes decide the
+    // format and precision, their shapes decide the shape. The plan already resolved the
+    // format per part; the stored shape comes from the shared tensor plan's claim for the first
+    // tensor the part declares.
+    let shapes = claimed_shapes(architecture, &plan);
     for requirement in plan.globals() {
+        let block = None;
         push_row(
             &mut report,
-            architecture,
             &resolver,
-            None,
+            block,
             stack_of(requirement.part),
             requirement,
+            plan.stored_format(requirement.part, block)
+                .or_else(|| architecture.stored_format(requirement.part)),
+            shapes.get(&(stack_of(requirement.part), block, requirement.part)),
         );
     }
     for layer in plan.layers() {
         for requirement in &layer.requirements {
+            let block = Some(layer.index);
             push_row(
                 &mut report,
-                architecture,
                 &resolver,
-                Some(layer.index),
+                block,
                 StackKind::Language,
                 requirement,
+                plan.stored_format(requirement.part, block)
+                    .or_else(|| architecture.stored_format(requirement.part)),
+                shapes.get(&(StackKind::Language, block, requirement.part)),
             );
         }
     }
@@ -631,6 +664,55 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
     report
 }
 
+/// The stored shape of the first tensor each part claims in the layout.
+///
+/// A part with several tensors has no single shape; the first declaration is the one the layout
+/// names first, which is the part's principal matrix (a query projection before its clip
+/// scales, a fusion table before a bias). The shape is the checkpoint's stored shape, so it does
+/// not depend on the report's TP world.
+fn claimed_shapes(
+    architecture: &Architecture,
+    plan: &EnginePlan,
+) -> BTreeMap<(StackKind, Option<usize>, Part), Shape> {
+    let mut shapes = BTreeMap::new();
+    let Ok(Some(layout)) = sparkflash_model::layout::matching(architecture) else {
+        return shapes;
+    };
+    let Ok(tensors) = layout.tensors(architecture) else {
+        return shapes;
+    };
+    let claims = TensorClaims::from_checkpoint(architecture, plan.tp()).ok();
+    let by_name: BTreeMap<&str, &[usize]> = claims
+        .as_ref()
+        .map(|claims| {
+            claims
+                .specs()
+                .iter()
+                .map(|spec| (spec.name.as_str(), spec.shape.as_slice()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for tensor in tensors {
+        let block = match tensor.stack {
+            StackKind::Draft | StackKind::Vision | StackKind::Audio => None,
+            StackKind::Language => tensor.block,
+        };
+        let key = (tensor.stack, block, tensor.part);
+        if shapes.contains_key(&key) {
+            continue;
+        }
+        let dims = by_name
+            .get(tensor.name.as_str())
+            .map(|dims| (*dims).to_vec())
+            .unwrap_or_else(|| tensor.shape.clone());
+        if dims.is_empty() || dims.contains(&0) {
+            continue;
+        }
+        shapes.insert(key, Shape::new(dims));
+    }
+    shapes
+}
+
 /// Fill a vision row's shape and stored format from the layout and the tensor index.
 ///
 /// The config states the tower's components; the index is the only source for their stored
@@ -680,7 +762,7 @@ fn apply_layout_vision(report: &mut ScanReport, architecture: &Architecture, ind
 fn stored_format(dtype: &str, architecture: &Architecture) -> Option<WeightFormat> {
     match dtype.to_ascii_uppercase().as_str() {
         "BF16" | "BFLOAT16" => Some(WeightFormat::Bf16),
-        "F32" | "FLOAT32" => None,
+        "F32" | "FLOAT32" => Some(WeightFormat::F32),
         "F8_E4M3" | "F8E4M3" | "FP8" => match architecture.quantization.dense_format {
             format @ WeightFormat::Fp8Tile { .. } => Some(format),
             _ => Some(WeightFormat::Bf16),
@@ -951,19 +1033,20 @@ fn block_of_name(name: &str) -> Option<usize> {
 
 fn push_row(
     report: &mut ScanReport,
-    architecture: &Architecture,
     resolver: &KernelResolver,
     block: Option<usize>,
     stack: StackKind,
     requirement: &PartRequirement,
+    stored: Option<WeightFormat>,
+    claimed: Option<&Shape>,
 ) {
-    let shape = part_shape(requirement.part, &requirement.geometry);
-    // Report a format only when it is the precision this row is actually resolved at. A config
-    // that states a different format, or none, gets "?" rather than a claim the lookup did not
-    // use.
-    let format = architecture
-        .stored_format(requirement.part)
-        .filter(|format| precision_of(*format) == requirement.precision);
+    let shape = claimed
+        .cloned()
+        .unwrap_or_else(|| part_shape(requirement.part, &requirement.geometry));
+    // Report the format the claimed tensors are stored in, and only when it is the precision
+    // this row is resolved at. A part the layout does not claim falls back to the config's
+    // stated format; neither is guessed from the part kind.
+    let format = stored.filter(|format| precision_of(*format) == requirement.precision);
     // Resolve at the plan's precision, exactly as the load path does. Falling back to another
     // precision would report a part resolved that the plan still refuses.
     let prefill = resolver.resolve_for(requirement, KernelPhase::Prefill);
@@ -1167,6 +1250,7 @@ mod tests {
             rows: Vec::new(),
             error: None,
             carried_facts: Vec::new(),
+            coverage_notes: Vec::new(),
         };
         assert!(report.is_clean(), "the baseline scan is clean");
         report.carried_facts = vec![
@@ -1459,6 +1543,7 @@ mod tests {
             coverage: Coverage::not_checked(None),
             error: None,
             carried_facts: Vec::new(),
+            coverage_notes: Vec::new(),
             rows: vec![
                 ScanRow {
                     stack: StackKind::Language,

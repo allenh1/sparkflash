@@ -113,7 +113,7 @@ impl ExpertFormat {
                 block: block_n.max(1),
                 scale: scale_dtype_of(scale_dtype),
             },
-            WeightFormat::MxFp8 { .. } | WeightFormat::Bf16 => Self::Bf16,
+            WeightFormat::MxFp8 { .. } | WeightFormat::Bf16 | WeightFormat::F32 => Self::Bf16,
         }
     }
 }
