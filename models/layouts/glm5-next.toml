@@ -4,8 +4,11 @@
 #   * the checkpoint's own config.json (a config key is named beside the fact it sets);
 #   * the tensor index (a tensor name proves the component and its shape);
 #   * the producer reference for what neither states:
-#     transformers/models/glm5_next/modeling_glm5_next.py at the revision the
-#     checkpoint names (zai-org/GLM-5.3-Flash, revision 3f1971b7b5f7a528c9c4ef6212c8785298a8c24a).
+#     transformers/models/glm5_next/modeling_glm5_next.py at transformers commit
+#     42efcfde46e668067a74bbd439d33f107b4a7c6c. The checkpoint (revision
+#     3f1971b7b5f7a528c9c4ef6212c8785298a8c24a) ships no modelling code and names
+#     transformers_version 5.16.0; this is the producer implementation available for that
+#     model type.
 #     The vision tower is Glm5NextVisionModel (line 1809), whose blocks are RMSNorm
 #     (1698-1715), the attention has q/k RMSNorm and axial rotary (1610-1695), the patch
 #     embed is a 3-D convolution over temporal_patch_size frames (1728-1745), and the
