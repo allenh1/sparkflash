@@ -2873,3 +2873,84 @@ fn three(name: &str, shape: &[usize]) -> Result<[usize; 3], PlanError> {
         ))
     })
 }
+
+#[cfg(test)]
+mod layout_equality {
+    use super::*;
+
+    fn reference(arch: &Architecture, tp: TpPlan) -> ArchitectureTensorPlan {
+        let mut builder = Builder::new(tp, true, true, true);
+        let dense = arch.quantization.dense_format;
+        let experts = arch.quantization.expert_format;
+        builder.dense_format = dense;
+        builder.expert_format = if matches!(experts, WeightFormat::Bf16)
+            && matches!(dense, WeightFormat::Fp8Tile { .. })
+        {
+            dense
+        } else {
+            experts
+        };
+        builder.glm(arch, true).expect("the reference planner");
+        builder.finish()
+    }
+
+    #[test]
+    fn the_glm_layout_reproduces_the_family_planner() {
+        let text = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+        let architecture = Architecture::from_json(text).expect("the carried config");
+        for world in [1usize, 2, 4] {
+            let tp = TpPlan::for_architecture(&architecture, world, 0).expect("a TP plan");
+            let expected = reference(&architecture, tp);
+            let actual = ArchitectureTensorPlan::checkpoint(&architecture, tp)
+                .expect("the layout checkpoint plan");
+            assert_eq!(actual.len(), expected.len(), "TP{world}: tensor count");
+            let mut differences = Vec::new();
+            for index in 0..expected.len() {
+                let want = expected.spec_at(index);
+                let have = actual.spec_at(index);
+                if want.name != have.name {
+                    differences.push(format!(
+                        "tensor {index}: expected {}, layout built {}",
+                        want.name, have.name
+                    ));
+                    break;
+                }
+                if want.shape != have.shape || want.dtype != have.dtype {
+                    differences.push(format!(
+                        "tensor {}: expected {:?} {:?}, layout built {:?} {:?}",
+                        want.name, want.dtype, want.shape, have.dtype, have.shape
+                    ));
+                    break;
+                }
+                let want_rank = expected.rank_spec_at(index);
+                let have_rank = actual.rank_spec_at(index);
+                if want_rank.shape != have_rank.shape {
+                    differences.push(format!(
+                        "tensor {} at TP{world}: expected rank shape {:?}, layout built {:?}",
+                        want.name, want_rank.shape, have_rank.shape
+                    ));
+                    break;
+                }
+                if expected.rank_run_at(index) != actual.rank_run_at(index) {
+                    differences.push(format!(
+                        "tensor {} at TP{world}: expected run {:?}, layout built {:?}",
+                        want.name,
+                        expected.rank_run_at(index),
+                        actual.rank_run_at(index)
+                    ));
+                    break;
+                }
+                if expected.plan().role(index) != actual.plan().role(index) {
+                    differences.push(format!(
+                        "tensor {}: expected role {:?}, layout built {:?}",
+                        want.name,
+                        expected.plan().role(index),
+                        actual.plan().role(index)
+                    ));
+                    break;
+                }
+            }
+            assert!(differences.is_empty(), "{differences:?}");
+        }
+    }
+}
