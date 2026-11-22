@@ -637,7 +637,12 @@ fn apply_patch_temporal(architecture: &mut Architecture, index: &TensorIndex) {
     else {
         return;
     };
-    let Some(&features) = entry.shape.last() else {
+    // A 2-D projection stores [out, features]; a 5-D one stores [out, channels, frames, patch,
+    // patch]. The input width is every axis after the output, for both spellings.
+    let Some(features) = entry.shape.get(1..).and_then(|axes| {
+        axes.iter()
+            .try_fold(1usize, |width, &axis| width.checked_mul(axis))
+    }) else {
         return;
     };
     if per_frame == 0 || !features.is_multiple_of(per_frame) {

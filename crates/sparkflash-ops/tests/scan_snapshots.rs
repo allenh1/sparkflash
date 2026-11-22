@@ -160,7 +160,7 @@ fn the_real_snapshots_report_their_interim_claim_state() {
             repo: "thinkingmachines/Inkling-2-Small",
             revision: "885d78bfca61a7e9a498e33cfa7ad35850533b8c",
             expectation: SnapshotExpectation::Unclaimed(vec![("model.visual", 422)]),
-            vision_gaps: &["vision_attention", "vision_merger", "vision_mlp"],
+            vision_gaps: &["vision_merger", "vision_mlp", "vision_position"],
         },
         Snapshot {
             repo: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",

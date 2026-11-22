@@ -3169,12 +3169,16 @@ fn vision(
     };
     let mut qk_norm = optional_bool(config, "qk_norm")?;
     let mut attention_bias = optional_bool(config, "attention_bias")?;
-    let mut position = if geometry.num_position_embeddings > 0 {
-        Some(VisionPosition::RotaryAndGrid)
-    } else if read_key(config, "rope_theta").is_some() {
-        Some(VisionPosition::Rotary)
-    } else {
-        None
+    // A grid is not proof of rotary. Only a stated base proves the rotary component; a tower
+    // with a learned table and no stated base leaves the scheme unstated until a layout says
+    // which body it runs.
+    let mut position = match (
+        read_key(config, "rope_theta").is_some(),
+        geometry.num_position_embeddings > 0,
+    ) {
+        (true, true) => Some(VisionPosition::RotaryAndGrid),
+        (true, false) => Some(VisionPosition::Rotary),
+        (false, _) => None,
     };
     let mut downsample = if read_key(config, "downsample_ratio")
         .and_then(serde_json::Value::as_u64)
@@ -3208,26 +3212,31 @@ fn vision(
         }
         if any(".q_norm.weight") || any(".k_norm.weight") {
             qk_norm = Some(true);
-        } else if any(".qkv.weight") || any(".wqkv.weight") {
+        } else if any(".qkv.weight")
+            || any(".wqkv.weight")
+            || any(".q_proj.weight")
+            || any(".k_proj.weight")
+            || any(".v_proj.weight")
+        {
             qk_norm = Some(false);
         }
         if attention_bias.is_none() {
-            attention_bias = Some(any(".qkv.bias") || any(".wqkv.bias") || any(".attn.bias"));
+            attention_bias = Some(
+                any(".qkv.bias")
+                    || any(".wqkv.bias")
+                    || any(".attn.bias")
+                    || any(".q_proj.bias")
+                    || any(".k_proj.bias")
+                    || any(".v_proj.bias")
+                    || any(".out_proj.bias"),
+            );
         }
         if any("pos_embed") || any("position_embedding") {
-            // A learned position table proves the grid, not the absence of rotary: a tower can
-            // store both. Keep the scheme the config selected when it declares a grid; only a
-            // tower with no grid at all is proven learned-only by the tensor name.
-            position = Some(match position {
-                Some(VisionPosition::RotaryAndGrid | VisionPosition::Rotary) => {
-                    VisionPosition::RotaryAndGrid
-                }
-                Some(VisionPosition::LearnedGrid | VisionPosition::None) => {
-                    VisionPosition::LearnedGrid
-                }
-                None if geometry.num_position_embeddings > 0 => VisionPosition::RotaryAndGrid,
-                None => VisionPosition::LearnedGrid,
-            });
+            // A learned table proves a grid, not rotary. It can complete a rotary-only scheme
+            // the config stated, but it cannot invent the rotary component or its absence.
+            if matches!(position, Some(VisionPosition::Rotary)) {
+                position = Some(VisionPosition::RotaryAndGrid);
+            }
         }
         if any(".downsample.weight") {
             downsample = Some(VisionDownsample::Conv(geometry.spatial_merge_size.max(1)));
@@ -4576,10 +4585,10 @@ mod tests {
             0x0a9d_f00c_70fd_a130_u64,
             0xbf31_362c_fd8a_5fc0,
             0x939f_dfa0_088a_fb13,
-            0x79f4_c142_8ff9_87e6,
-            0x1ae4_3749_96ec_1320,
-            0x4ac1_ed81_2c41_664d,
-            0x2c07_d580_496a_3534,
+            0x51eb_2882_3661_fe8f,
+            0xe909_cbc5_be7c_75db,
+            0xd5e4_aaab_5c0c_6990,
+            0xb355_0c20_34b7_3f01,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");

@@ -1618,8 +1618,11 @@ impl Builder {
         };
         let width = vision.hidden_size;
         let prefix = VISION_PREFIX;
-        let patch =
-            vision.in_channels * vision.temporal_patch_size * vision.patch_size * vision.patch_size;
+        let frames = vision
+            .patch_temporal
+            .unwrap_or(vision.temporal_patch_size)
+            .max(1);
+        let patch = vision.in_channels * frames * vision.patch_size * vision.patch_size;
         self.whole(
             format!("{prefix}.patch_embed.proj.weight"),
             DType::BF16,
@@ -2250,7 +2253,10 @@ impl Builder {
             vec![
                 width,
                 vision.in_channels,
-                vision.temporal_patch_size,
+                vision
+                    .patch_temporal
+                    .unwrap_or(vision.temporal_patch_size)
+                    .max(1),
                 vision.patch_size,
                 vision.patch_size,
             ]
