@@ -72,6 +72,10 @@
 #   SPARK_LOCAL_RANKS      ranks that run on this node without ssh (space separated, e.g. "0";
 #                          the web UI sets it from `local = true`), for a lead that cannot ssh to
 #                          itself
+#   SPARKFLASH_TICK_TRACE, SPARKFLASH_LAUNCH_TRACE, SPARKFLASH_OPEN_MANIFEST
+#                          diagnostics. A path may spell {rank}; the chain expands it per process,
+#                          so all four ranks can share one value without sharing one file. The tick
+#                          trace remains rank 0's file.
 #   SPARKFLASH_DRY_RUN=1   same as print, for scripts that want one code path
 set -euo pipefail
 
@@ -227,6 +231,10 @@ rank_env() {
     # peers would meet them at the wrong collective. SPARKFLASH_TICK_TRACE is the one diagnostic
     # here: every rank may carry it, and only rank 0 writes the file.
     #
+    # The launch trace and open manifest are diagnostics too. Their path may spell `{rank}`; the
+    # chain expands it before opening, so all four ranks can share one environment value without
+    # sharing one file. The tick trace stays rank 0's file, as it always was.
+    #
     # The arms' own prefixes (GLM, QWEN4, INKLING, DENSE) are the ones their registrations state
     # (sparkflash_model::ARMS, Source::switches); a test in crates/sparkflash-model/tests/arms.rs
     # fails when an arm states a prefix this pattern does not forward.
@@ -234,7 +242,7 @@ rank_env() {
     # SPARKFLASH_NUMERICS_* are diagnostics too (the coverage and monitor dumps): a rank that
     # wrote its dump while its peers did not is a suite with missing inputs, and leaving them out
     # made a GLM coverage sweep produce no file at all (the recorders are constructed per rank).
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|DENSE|SPEC|DRAFTS|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE|NUMERICS)' || true); do
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|DENSE|SPEC|DRAFTS|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE|LAUNCH_TRACE|OPEN_MANIFEST|NUMERICS)' || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0
