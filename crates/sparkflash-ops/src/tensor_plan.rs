@@ -2894,6 +2894,46 @@ mod layout_equality {
         builder.finish()
     }
 
+    fn table(
+        plan: &ArchitectureTensorPlan,
+    ) -> BTreeMap<String, (String, Vec<usize>, Vec<usize>, Option<RankRun>, String)> {
+        let mut out = BTreeMap::new();
+        for index in 0..plan.len() {
+            let spec = plan.spec_at(index);
+            out.insert(
+                spec.name.clone(),
+                (
+                    format!("{:?}", spec.dtype),
+                    spec.shape.clone(),
+                    plan.rank_spec_at(index).shape.clone(),
+                    plan.rank_run_at(index),
+                    format!("{:?}", plan.plan().role(index)),
+                ),
+            );
+        }
+        out
+    }
+
+    fn table(
+        plan: &ArchitectureTensorPlan,
+    ) -> BTreeMap<String, (String, Vec<usize>, Vec<usize>, Option<RankRun>, String)> {
+        let mut out = BTreeMap::new();
+        for index in 0..plan.len() {
+            let spec = plan.spec_at(index);
+            out.insert(
+                spec.name.clone(),
+                (
+                    format!("{:?}", spec.dtype),
+                    spec.shape.clone(),
+                    plan.rank_spec_at(index).shape.clone(),
+                    plan.rank_run_at(index),
+                    format!("{:?}", plan.plan().role(index)),
+                ),
+            );
+        }
+        out
+    }
+
     #[test]
     fn the_glm_layout_reproduces_the_family_planner() {
         let text = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
@@ -2903,73 +2943,34 @@ mod layout_equality {
             let expected = reference(&architecture, tp);
             let actual = ArchitectureTensorPlan::checkpoint(&architecture, tp)
                 .expect("the layout checkpoint plan");
-            if actual.len() != expected.len() {
-                let have: BTreeSet<&str> = (0..actual.len())
-                    .map(|index| actual.spec_at(index).name.as_str())
-                    .collect();
-                let want: BTreeSet<&str> = (0..expected.len())
-                    .map(|index| expected.spec_at(index).name.as_str())
-                    .collect();
-                let mut missing: Vec<&&str> = want.difference(&have).collect();
-                let mut extra: Vec<&&str> = have.difference(&want).collect();
-                missing.sort();
-                extra.sort();
-                println!(
-                    "TP{world}: {} expected, {} layout; missing {:?}; extra {:?}",
-                    expected.len(),
-                    actual.len(),
-                    &missing[..missing.len().min(20)],
-                    &extra[..extra.len().min(20)]
+            let want = table(&expected);
+            let have = table(&actual);
+            let missing: Vec<&String> = want
+                .keys()
+                .filter(|name| !have.contains_key(*name))
+                .collect();
+            let extra: Vec<&String> = have
+                .keys()
+                .filter(|name| !want.contains_key(*name))
+                .collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "TP{world}: missing {missing:?}, extra {extra:?}"
+            );
+            for (name, expected) in &want {
+                let actual = &have[name];
+                assert_eq!(
+                    expected.0, actual.0,
+                    "TP{world}: {name} stored dtype differs"
                 );
-                panic!("TP{world}: tensor count");
+                assert_eq!(
+                    expected.1, actual.1,
+                    "TP{world}: {name} logical shape differs"
+                );
+                assert_eq!(expected.2, actual.2, "TP{world}: {name} rank shape differs");
+                assert_eq!(expected.3, actual.3, "TP{world}: {name} rank run differs");
+                assert_eq!(expected.4, actual.4, "TP{world}: {name} role differs");
             }
-            let mut differences = Vec::new();
-            for index in 0..expected.len() {
-                let want = expected.spec_at(index);
-                let have = actual.spec_at(index);
-                if want.name != have.name {
-                    differences.push(format!(
-                        "tensor {index}: expected {}, layout built {}",
-                        want.name, have.name
-                    ));
-                    break;
-                }
-                if want.shape != have.shape || want.dtype != have.dtype {
-                    differences.push(format!(
-                        "tensor {}: expected {:?} {:?}, layout built {:?} {:?}",
-                        want.name, want.dtype, want.shape, have.dtype, have.shape
-                    ));
-                    break;
-                }
-                let want_rank = expected.rank_spec_at(index);
-                let have_rank = actual.rank_spec_at(index);
-                if want_rank.shape != have_rank.shape {
-                    differences.push(format!(
-                        "tensor {} at TP{world}: expected rank shape {:?}, layout built {:?}",
-                        want.name, want_rank.shape, have_rank.shape
-                    ));
-                    break;
-                }
-                if expected.rank_run_at(index) != actual.rank_run_at(index) {
-                    differences.push(format!(
-                        "tensor {} at TP{world}: expected run {:?}, layout built {:?}",
-                        want.name,
-                        expected.rank_run_at(index),
-                        actual.rank_run_at(index)
-                    ));
-                    break;
-                }
-                if expected.plan().role(index) != actual.plan().role(index) {
-                    differences.push(format!(
-                        "tensor {}: expected role {:?}, layout built {:?}",
-                        want.name,
-                        expected.plan().role(index),
-                        actual.plan().role(index)
-                    ));
-                    break;
-                }
-            }
-            assert!(differences.is_empty(), "{differences:?}");
         }
     }
 }
