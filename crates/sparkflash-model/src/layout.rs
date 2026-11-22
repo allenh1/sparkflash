@@ -681,6 +681,30 @@ impl Layout {
         root: &Value,
         coverage: &mut ConfigCoverage,
     ) -> Result<LayoutDescription, LayoutError> {
+        let facts = self.read(architecture, root, coverage)?;
+        let tensors = self.tensors(architecture)?;
+        let stacks = self.describe_stacks(architecture, &tensors)?;
+        Ok(LayoutDescription {
+            layout: self.id.clone(),
+            facts,
+            tensors,
+            stacks,
+        })
+    }
+
+    /// Read the layout's keys and wiring facts, without building its tensors.
+    ///
+    /// A parse needs the facts and the key coverage; only the scan and the tensor plan need
+    /// the 76,000 names a checkpoint like the worked one expands to.
+    ///
+    /// # Errors
+    /// As [Self::apply].
+    pub fn read(
+        &self,
+        architecture: &mut Architecture,
+        root: &Value,
+        coverage: &mut ConfigCoverage,
+    ) -> Result<BTreeMap<String, LayoutValue>, LayoutError> {
         let mut facts = BTreeMap::new();
         for key in &self.keys {
             let value = read_path(root, &key.path, self)?;
@@ -710,14 +734,7 @@ impl Layout {
             }
         }
         self.apply_facts(architecture, &facts)?;
-        let tensors = self.tensors(architecture)?;
-        let stacks = self.describe_stacks(architecture, &tensors)?;
-        Ok(LayoutDescription {
-            layout: self.id.clone(),
-            facts,
-            tensors,
-            stacks,
-        })
+        Ok(facts)
     }
 
     fn part_fact(

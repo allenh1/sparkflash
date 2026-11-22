@@ -982,7 +982,7 @@ impl Architecture {
             .map_err(|error| ConfigError::Invalid(error.to_string()))?
         {
             layout
-                .apply(&mut architecture, root, &mut coverage)
+                .read(&mut architecture, root, &mut coverage)
                 .map_err(|error| ConfigError::Invalid(error.to_string()))?;
         }
         Ok((architecture, coverage))
