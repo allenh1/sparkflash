@@ -56,7 +56,8 @@ RANKS = 4
 DOT_PNG = base64.b64encode(
     bytes.fromhex(
         "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
-        "890000000d49444154789c6360000000020001e221bc330000000049454e44ae426082"
+        "890000000b4944415478da636000020000050001e9fadcd80000000049454e44"
+        "ae426082"
     )
 ).decode()
 IMAGE_URL = "data:image/png;base64," + DOT_PNG
@@ -236,6 +237,41 @@ def launch(args, out):
     if result.returncode != 0:
         raise SystemExit(f"open-manifest-ab: launcher failed; see {log_path}")
     wait_ready(args.url, args.timeout)
+    return env["SPARKFLASH_RUN_ID"]
+
+
+def collect_workers(out, run_id):
+    """Copy each worker's manifest, launch trace and rank log back to this node.
+
+    The trace paths are the same absolute paths on every node, but `/home/allenh1` is a
+    per-node home: rank 1..3 write into their own copy of the run directory. Without this
+    copy the baseline is rank 0's alone, and a comparison would pass while three ranks'
+    records were missing.
+    """
+    nodes = os.environ.get("SPARK_NODES", "").split()
+    if len(nodes) != RANKS:
+        raise SystemExit(
+            f"open-manifest-ab: SPARK_NODES names {len(nodes)} nodes, not {RANKS}; cannot collect the workers' records"
+        )
+    user = os.environ.get("SSH_USER", "")
+    log_dir = os.path.join(out, "logs", run_id)
+    os.makedirs(log_dir, exist_ok=True)
+    for rank in range(1, RANKS):
+        host = f"{user}@{nodes[rank]}" if user else nodes[rank]
+        for name in (f"manifest-r{rank}.jsonl", f"launch-r{rank}.trace"):
+            remote = os.path.join(out, name)
+            subprocess.run(
+                ["scp", "-q", "-o", "BatchMode=yes", f"{host}:{remote}", remote],
+                check=True,
+            )
+        remote = os.path.join(log_dir, f"rank{rank}.log")
+        subprocess.run(
+            ["scp", "-q", "-o", "BatchMode=yes", f"{host}:{remote}", remote],
+            check=True,
+        )
+    local = os.path.join(log_dir, "local-commands.txt")
+    if os.path.isfile(local):
+        shutil.copyfile(local, os.path.join(out, "local-commands.txt"))
 
 
 def stop(args):
@@ -308,11 +344,14 @@ def record_build(args, out):
     out = os.path.abspath(out)
     args.build = os.path.abspath(args.build)
     clean(out)
+    run_id = None
     try:
-        launch(args, out)
+        run_id = launch(args, out)
         speeds = run_workload(args)
     finally:
         stop(args)
+        if run_id:
+            collect_workers(out, run_id)
     with open(os.path.join(out, "speeds.json"), "w", encoding="utf-8") as handle:
         json.dump(speeds, handle, indent=2, sort_keys=True)
         handle.write("\n")

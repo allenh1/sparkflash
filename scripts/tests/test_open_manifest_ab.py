@@ -145,6 +145,57 @@ class OpenManifestAbTest(unittest.TestCase):
         self.assertGreater(speeds["prefill"], 0)
         self.assertAlmostEqual(speeds["draft_accept"], 0.5)
 
+    def test_the_image_fixture_is_a_valid_png(self):
+        import base64
+        import binascii
+        import struct
+        import zlib
+
+        png = base64.b64decode(ab.DOT_PNG)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        position = 8
+        kinds = []
+        while position < len(png):
+            length = struct.unpack(">I", png[position : position + 4])[0]
+            kind = png[position + 4 : position + 8]
+            data = png[position + 8 : position + 8 + length]
+            crc = struct.unpack(">I", png[position + 8 + length : position + 12 + length])[0]
+            self.assertEqual(binascii.crc32(kind + data) & 0xFFFFFFFF, crc, kind)
+            if kind == b"IDAT":
+                zlib.decompress(data)
+            kinds.append(kind)
+            position += 12 + length
+        self.assertEqual(kinds[0], b"IHDR")
+        self.assertEqual(kinds[-1], b"IEND")
+        self.assertEqual(position, len(png))
+
+    def test_worker_collection_copies_every_rank_and_the_commands(self):
+        import unittest.mock as mock
+
+        out = self.path("out")
+        os.makedirs(os.path.join(out, "logs", "run-1"))
+        write(os.path.join(out, "logs", "run-1", "local-commands.txt"), "commands\n")
+        calls = []
+        with mock.patch.dict(
+            os.environ, {"SPARK_NODES": "n0 n1 n2 n3", "SSH_USER": "u"}
+        ), mock.patch.object(
+            ab.subprocess, "run", side_effect=lambda command, check: calls.append(command)
+        ):
+            ab.collect_workers(out, "run-1")
+        remotes = [command[-2] for command in calls]
+        for rank in (1, 2, 3):
+            self.assertIn(
+                f"u@n{rank}:" + os.path.join(out, f"manifest-r{rank}.jsonl"), remotes
+            )
+            self.assertIn(
+                f"u@n{rank}:" + os.path.join(out, f"launch-r{rank}.trace"), remotes
+            )
+            self.assertIn(
+                f"u@n{rank}:" + os.path.join(out, "logs", "run-1", f"rank{rank}.log"),
+                remotes,
+            )
+        self.assertTrue(os.path.isfile(os.path.join(out, "local-commands.txt")))
+
 
 if __name__ == "__main__":
     unittest.main()
