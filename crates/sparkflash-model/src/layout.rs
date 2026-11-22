@@ -879,7 +879,12 @@ impl Layout {
     fn fact_bool(value: &LayoutValue, layout: &str, name: &str) -> Result<bool, LayoutError> {
         match value {
             LayoutValue::Bool(value) => Ok(*value),
-            other => Err(unknown_value(layout, name, &other.to_string(), "a boolean")),
+            other => Err(Self::unknown_value(
+                layout,
+                name,
+                &other.to_string(),
+                "a boolean",
+            )),
         }
     }
 
@@ -887,7 +892,12 @@ impl Layout {
         match value {
             LayoutValue::Float(value) => Ok(*value),
             LayoutValue::Integer(value) => Ok(*value as f64),
-            other => Err(unknown_value(layout, name, &other.to_string(), "a number")),
+            other => Err(Self::unknown_value(
+                layout,
+                name,
+                &other.to_string(),
+                "a number",
+            )),
         }
     }
 
@@ -898,7 +908,12 @@ impl Layout {
     ) -> Result<&'a str, LayoutError> {
         match value {
             LayoutValue::String(value) => Ok(value),
-            other => Err(unknown_value(layout, name, &other.to_string(), "a string")),
+            other => Err(Self::unknown_value(
+                layout,
+                name,
+                &other.to_string(),
+                "a string",
+            )),
         }
     }
 
@@ -912,7 +927,7 @@ impl Layout {
             "gelu" | "gelu_erf" => VisionActivation::GeluErf,
             "gelu_tanh" => VisionActivation::GeluTanh,
             other => {
-                return Err(unknown_value(
+                return Err(Self::unknown_value(
                     layout,
                     name,
                     other,
@@ -1706,6 +1721,11 @@ fn layout_format(tensors: &[&LayoutTensor], architecture: &Architecture) -> Opti
             LayoutDtype::F32 => continue,
             LayoutDtype::Dense => architecture.quantization.dense_format,
             LayoutDtype::Expert => architecture.quantization.expert_format,
+            LayoutDtype::F8E4M3
+            | LayoutDtype::F8E8M0
+            | LayoutDtype::F4E2M1
+            | LayoutDtype::U8
+            | LayoutDtype::I64 => continue,
         };
         match format {
             None => format = Some(this),
