@@ -25,14 +25,14 @@ model_types = ["inkling2"]
 sconv_kernel = { key = "text_config.sconv_kernel_size" }
 d_rel = { key = "text_config.d_rel" }
 rel_extent = { key = "text_config.rel_extent" }
-vision_posemb_grid = { key = "vision_config.posemb_grid_size" }
-mtp_hidden = { key = "mtp_config.hidden_size" }
-mtp_heads = { key = "mtp_config.num_attention_heads" }
-mtp_kv_heads = { key = "mtp_config.num_key_value_heads" }
-mtp_head_dim = { key = "mtp_config.head_dim" }
-mtp_intermediate = { key = "mtp_config.intermediate_size" }
-mtp_markov_rank = { key = "mtp_config.markov_rank" }
-mtp_block = { key = "mtp_config.block_size" }
+vision_posemb_grid = { key = "vision_config.posemb_grid_size", default = 32 }
+mtp_hidden = { key = "mtp_config.hidden_size", default = 4608 }
+mtp_heads = { key = "mtp_config.num_attention_heads", default = 48 }
+mtp_kv_heads = { key = "mtp_config.num_key_value_heads", default = 8 }
+mtp_head_dim = { key = "mtp_config.head_dim", default = 128 }
+mtp_intermediate = { key = "mtp_config.intermediate_size", default = 18432 }
+mtp_markov_rank = { key = "mtp_config.markov_rank", default = 256 }
+mtp_block = { key = "mtp_config.block_size", default = 8 }
 
 [[keys]]
 # config.json text_config.q_bias.
@@ -165,7 +165,7 @@ name = "norm"
 value = "layer"
 [[stacks.vision.parts.facts]]
 name = "norm_epsilon"
-value = { key = "vision_config.layer_norm_eps" }
+value = { key = "vision_config.layer_norm_eps", default = 1e-5 }
 
 [[stacks.vision.parts]]
 part = "vision_attention"

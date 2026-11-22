@@ -31,7 +31,12 @@ use sparkflash_ops::ArchitectureTensorPlan;
 const CONFIG: &str = include_str!("../config/inkling2_small.hf.json");
 const QUANT: &str = include_str!("../config/inkling2_small.hf_quant.json");
 
-type Row = (sparkflash_weights::DType, Vec<usize>, Vec<usize>, Option<sparkflash_ops::RankRun>);
+type Row = (
+    sparkflash_weights::DType,
+    Vec<usize>,
+    Vec<usize>,
+    Option<sparkflash_ops::RankRun>,
+);
 
 fn arm_rows(config: &Inkling2Config, tp: TpPlan) -> BTreeMap<String, Row> {
     let plan = InklingTensorPlan::checkpoint(config, tp).expect("the arm's plan");
@@ -41,11 +46,13 @@ fn arm_rows(config: &Inkling2Config, tp: TpPlan) -> BTreeMap<String, Row> {
         if !(spec.name.starts_with("model.llm.") || spec.name.starts_with("model.visual.")) {
             continue;
         }
-        let run = plan.rank_run_at(index).map(|slice| sparkflash_ops::RankRun {
-            offset: slice.split.offset,
-            count: slice.split.per_rank,
-            total: slice.split.total,
-        });
+        let run = plan
+            .rank_run_at(index)
+            .map(|slice| sparkflash_ops::RankRun {
+                offset: slice.split.offset,
+                count: slice.split.per_rank,
+                total: slice.split.total,
+            });
         rows.insert(
             spec.name.clone(),
             (
@@ -93,7 +100,10 @@ fn the_layout_reproduces_the_arms_language_and_vision_plan() {
             .keys()
             .filter(|name| !layout.contains_key(*name))
             .collect();
-        assert!(missing.is_empty(), "TP{world}: the layout misses {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "TP{world}: the layout misses {missing:?}"
+        );
 
         let extra: Vec<&String> = layout
             .keys()
@@ -105,8 +115,14 @@ fn the_layout_reproduces_the_arms_language_and_vision_plan() {
             let Some(actual) = layout.get(name) else {
                 continue;
             };
-            assert_eq!(expected.0, actual.0, "TP{world}: {name} stored dtype differs");
-            assert_eq!(expected.1, actual.1, "TP{world}: {name} logical shape differs");
+            assert_eq!(
+                expected.0, actual.0,
+                "TP{world}: {name} stored dtype differs"
+            );
+            assert_eq!(
+                expected.1, actual.1,
+                "TP{world}: {name} logical shape differs"
+            );
             assert_eq!(expected.2, actual.2, "TP{world}: {name} rank shape differs");
             assert_eq!(expected.3, actual.3, "TP{world}: {name} rank run differs");
         }
