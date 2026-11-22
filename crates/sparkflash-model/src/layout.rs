@@ -730,7 +730,7 @@ impl Layout {
     ) -> Result<(), LayoutError> {
         for (name, value) in facts {
             match name.as_str() {
-                "vision.position" => {
+                "vision.position" | "vision.vision_position.position" => {
                     let Some(vision) = architecture.vision.as_mut() else {
                         return Err(LayoutError::refused(
                             &self.id,
