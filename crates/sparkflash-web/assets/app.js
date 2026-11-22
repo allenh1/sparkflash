@@ -679,8 +679,9 @@ function fitDetail(model) {
 // report with a gap offers neither and prints each unresolved row as a work item.
 function scanReports(fit, model) {
   const reports = fit.scans.map((scan) => {
-    const status = scan.error ? "scan failed" : scan.clean ? "clean" : scan.work_items.length + " gap" +
-      (scan.work_items.length === 1 ? "" : "s");
+    const status = scan.error ? "scan failed" : scan.clean ? "clean" :
+      scan.work_items.length ? scan.work_items.length + " gap" +
+        (scan.work_items.length === 1 ? "" : "s") : "not clean";
     const rows = scan.rows.length
       ? '<div class="table-wrap"><table class="scan-table"><thead><tr><th>Stack</th><th>Block</th>' +
         "<th>Operation</th><th>Shape</th><th>Format</th><th>Pass</th><th>Status</th><th>Fix</th>" +

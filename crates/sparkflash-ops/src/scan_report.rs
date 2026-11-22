@@ -484,7 +484,7 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             .map(|tensor| tensor.name.clone())
             .collect()
     });
-    let (architecture, keys) = match Architecture::from_json_with_coverage_and_tensor_names(
+    let (mut architecture, keys) = match Architecture::from_json_with_coverage_and_tensor_names(
         inputs.config,
         names.as_deref(),
     ) {
@@ -494,6 +494,9 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             return report;
         }
     };
+    if let Some(index) = inputs.tensors {
+        apply_patch_temporal(&mut architecture, index);
+    }
     report.coverage.config_keys = match keys.state() {
         sparkflash_model::coverage::KeyCoverageState::Clean => CoverageState::Clean,
         sparkflash_model::coverage::KeyCoverageState::Dirty => CoverageState::Dirty,
@@ -583,11 +586,67 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             }
             row.format = None;
         }
+        // A declared clamp is arithmetic the plan must carry. The vision MLP geometry has no
+        // field for it yet, so a kernel that resolves at the right width is still not the right
+        // body; say so rather than call the row resolved.
+        if let Some(clamp) = spec.activation_clamp {
+            for row in &mut report.rows {
+                if row.stack == StackKind::Vision
+                    && row.part == Part::VisionMlp
+                    && row.status.is_resolved()
+                {
+                    row.status = ScanStatus::UnknownLayout {
+                        detail: format!(
+                            "vision_config states a {clamp} clamp on the vision MLP, which the \
+                             vision MLP geometry does not carry"
+                        ),
+                        fix: "carry the clamp into the vision MLP geometry and gate a kernel that \
+                              applies it"
+                            .to_owned(),
+                    };
+                }
+            }
+        }
     }
     if let Some(index) = inputs.tensors {
         apply_tensor_coverage(&mut report, architecture, inputs.world, index);
     }
     report
+}
+
+/// Take the patch kernel's frame count from the stored patch projection.
+///
+/// The config states the processor's frames, but a tower may fold a temporal pair into the
+/// stored weight. The projection's input width is the stored arithmetic: `in_channels * frames *
+/// patch * patch`. An index that does not carry the projection, or whose width is not a whole
+/// number of frames, leaves the config's statement in place.
+fn apply_patch_temporal(architecture: &mut Architecture, index: &TensorIndex) {
+    let Some(vision) = architecture.vision.as_mut() else {
+        return;
+    };
+    let Some(entry) = index.tensors.iter().find(|tensor| {
+        tensor.name.ends_with("patch_embed.proj.weight")
+            || tensor.name.ends_with("patch_embedding.weight")
+    }) else {
+        return;
+    };
+    let Some(per_frame) = vision
+        .in_channels
+        .checked_mul(vision.patch_size)
+        .and_then(|value| value.checked_mul(vision.patch_size))
+    else {
+        return;
+    };
+    let Some(&features) = entry.shape.last() else {
+        return;
+    };
+    if per_frame == 0 || !features.is_multiple_of(per_frame) {
+        return;
+    }
+    let frames = features / per_frame;
+    if frames > 0 {
+        vision.patch_temporal = Some(frames);
+    }
 }
 
 /// The tensor-claim pass: compare the description's claim set with the supplied index.

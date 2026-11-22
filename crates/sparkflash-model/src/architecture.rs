@@ -835,6 +835,8 @@ pub struct Vision {
     pub patch_size: usize,
     /// Frames one patch covers.
     pub temporal_patch_size: usize,
+    /// The frames the stored patch projection was built for, when the tensor index proves them.
+    pub patch_temporal: Option<usize>,
     /// Spatial merge factor before the aligner.
     pub spatial_merge: usize,
     /// The aligner's hidden width.
@@ -3120,6 +3122,31 @@ fn vision_activation(config: &Value) -> Result<Option<VisionActivation>, ConfigE
     Ok(Some(activation))
 }
 
+/// The merger's activation when the config names one.
+///
+/// A tower's merger is not required to run the block's activation (a tanh-GELU block can feed an
+/// erf-GELU merger), so an absent key stays [None] and the scan reports it unstated. A gated
+/// projection is proved by its tensor names in [vision].
+fn vision_merger_activation(config: &Value) -> Result<Option<VisionActivation>, ConfigError> {
+    let Some(name) = optional_string(config, "merger_activation")
+        .or_else(|| optional_string(config, "projector_activation"))
+    else {
+        return Ok(None);
+    };
+    let key = name.to_ascii_lowercase();
+    let activation = match key.as_str() {
+        "silu" | "swish" | "swiglu" => VisionActivation::SwiGlu,
+        "gelu" | "gelu_erf" | "gelu_python" => VisionActivation::GeluErf,
+        "gelu_pytorch_tanh" | "gelu_tanh" | "gelu_new" => VisionActivation::GeluTanh,
+        _ => {
+            return Err(ConfigError::Invalid(format!(
+                "vision_config.merger_activation {name:?} is not an activation this engine runs; accepted spellings are silu, gelu, gelu_pytorch_tanh"
+            )));
+        }
+    };
+    Ok(Some(activation))
+}
+
 fn vision(
     root: &Value,
     language_hidden: usize,
@@ -3169,6 +3196,7 @@ fn vision(
         None
     };
     let mut merger_final_norm = None;
+    let mut merger_activation = vision_merger_activation(config)?;
     let tower_names: Option<Vec<&String>> =
         tensors.map(|names| names.iter().filter(|name| is_tower_tensor(name)).collect());
     if let Some(names) = tower_names {
@@ -3187,14 +3215,18 @@ fn vision(
             attention_bias = Some(any(".qkv.bias") || any(".wqkv.bias") || any(".attn.bias"));
         }
         if any("pos_embed") || any("position_embedding") {
-            position = Some(if geometry.num_position_embeddings > 0 {
-                if read_key(config, "rope_theta").is_some() {
+            // A learned position table proves the grid, not the absence of rotary: a tower can
+            // store both. Keep the scheme the config selected when it declares a grid; only a
+            // tower with no grid at all is proven learned-only by the tensor name.
+            position = Some(match position {
+                Some(VisionPosition::RotaryAndGrid | VisionPosition::Rotary) => {
                     VisionPosition::RotaryAndGrid
-                } else {
+                }
+                Some(VisionPosition::LearnedGrid | VisionPosition::None) => {
                     VisionPosition::LearnedGrid
                 }
-            } else {
-                VisionPosition::LearnedGrid
+                None if geometry.num_position_embeddings > 0 => VisionPosition::RotaryAndGrid,
+                None => VisionPosition::LearnedGrid,
             });
         }
         if any(".downsample.weight") {
@@ -3204,10 +3236,14 @@ fn vision(
         } else if any("aligner.w1") {
             downsample = Some(VisionDownsample::Unfold(geometry.spatial_merge_size.max(1)));
         }
-        merger_final_norm = (any("merger.post_projection_norm")
-            || any("merger.norm.weight")
-            || any("post_layernorm.weight"))
-        .then_some(true);
+        if any("merger.post_projection_norm") || any("post_layernorm.weight") {
+            merger_final_norm = Some(true);
+        }
+        // A gated merger projection proves the gated body; a plain fc1/fc2 stack does not name
+        // its activation, so it stays unstated rather than borrowing the block's.
+        if any("merger.gate_proj") || any("merger.gate.weight") {
+            merger_activation = Some(VisionActivation::SwiGlu);
+        }
     }
     let activation = vision_activation(config)?;
     Ok(Some(Vision {
@@ -3217,6 +3253,7 @@ fn vision(
         intermediate: geometry.intermediate_size,
         patch_size: geometry.patch_size,
         temporal_patch_size: geometry.temporal_patch_size,
+        patch_temporal: None,
         spatial_merge: geometry.spatial_merge_size,
         projection_intermediate: geometry.projection_intermediate_size,
         in_channels: geometry.in_channels,
@@ -3235,7 +3272,7 @@ fn vision(
         position,
         downsample,
         merger_intermediate: geometry.projection_intermediate_size,
-        merger_activation: activation,
+        merger_activation,
         merger_final_norm,
     }))
 }
@@ -4536,13 +4573,13 @@ mod tests {
     #[test]
     fn the_released_parses_are_pinned_and_switch_nothing_on() {
         let pinned = [
-            0xcfee_3f63_89f5_a81f_u64,
+            0x0a9d_f00c_70fd_a130_u64,
             0xbf31_362c_fd8a_5fc0,
-            0x6241_ff28_ad8b_822a,
-            0xcec4_a3b3_c0e6_d5d7,
-            0xdae6_a46b_130a_8966,
-            0xd361_73f8_3e9a_17b7,
-            0x9303_7a9e_3df6_1248,
+            0x939f_dfa0_088a_fb13,
+            0x79f4_c142_8ff9_87e6,
+            0x1ae4_3749_96ec_1320,
+            0x4ac1_ed81_2c41_664d,
+            0x2c07_d580_496a_3534,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");

@@ -314,6 +314,12 @@ pub struct VisionTowerSpec {
     pub qk_norm: bool,
     /// The block MLP activation.
     pub activation: VisionActivation,
+    /// The frames one stored patch projection embeds, when the tensor index states it.
+    ///
+    /// A config's `temporal_patch_size` is the processor's frame count; a tower may fold the
+    /// second frame into the stored weight (Inkling's does). The index's patch-projection input
+    /// width is the only proof of which one the kernel will see.
+    pub patch_temporal: Option<usize>,
     /// The softcap on the block MLP's gate and up projections, when one is declared.
     pub activation_clamp: Option<f64>,
     /// The position scheme.
@@ -385,9 +391,10 @@ impl VisionTowerSpec {
         } else {
             match downsample {
                 VisionDownsample::Unfold(_) => geometry.out_hidden_size,
-                VisionDownsample::Merge(_) => {
-                    geometry.hidden_size * downsample.factor() * downsample.factor()
-                }
+                VisionDownsample::Merge(_) => geometry
+                    .hidden_size
+                    .saturating_mul(downsample.factor())
+                    .saturating_mul(downsample.factor()),
                 VisionDownsample::None | VisionDownsample::Conv(_) => 0,
             }
         };
@@ -399,17 +406,17 @@ impl VisionTowerSpec {
             qk_norm: vision.qk_norm.unwrap_or(false),
             activation,
             activation_clamp: vision.activation_clamp,
+            patch_temporal: vision.patch_temporal,
             position,
             rope_theta,
             downsample,
             merger_intermediate,
+            // A plain merger does not inherit the block's activation: Qwen's block is
+            // tanh-GELU while its merger is erf-GELU. The CLIP-family default is the erf body;
+            // a gated merger is proved by its tensor names in the architecture reader.
             merger_activation: vision
                 .merger_activation
-                .unwrap_or(if vision.activation.is_none() {
-                    VisionActivation::GeluErf
-                } else {
-                    activation
-                }),
+                .unwrap_or(VisionActivation::GeluErf),
             merger_final_norm: vision.merger_final_norm.unwrap_or(false),
             unstated,
         }
@@ -429,29 +436,31 @@ impl VisionTowerSpec {
     /// never sees.
     #[must_use]
     pub fn patch_features(&self) -> usize {
-        self.geometry.in_channels
-            * self.patch_temporal_size()
-            * self.geometry.patch_size
-            * self.geometry.patch_size
+        self.geometry
+            .in_channels
+            .saturating_mul(self.patch_temporal_size())
+            .saturating_mul(self.geometry.patch_size)
+            .saturating_mul(self.geometry.patch_size)
     }
 
     /// The frames one patch projection embeds.
     ///
-    /// A tower whose merger consumes a learned grid takes one frame in its patch kernel even when
-    /// its config names a temporal pair: the second frame is a duplicate the kernel never sees.
+    /// The stored weight decides when the index proved its input width; otherwise the config's
+    /// processor frame count is the only statement. A merger and a position grid say nothing
+    /// about the patch kernel, so they are not evidence either way.
     #[must_use]
     pub fn patch_temporal_size(&self) -> usize {
-        if self.merger_intermediate > 0 && self.position.has_grid() {
-            1
-        } else {
-            self.geometry.temporal_patch_size.max(1)
-        }
+        self.patch_temporal
+            .unwrap_or_else(|| self.geometry.temporal_patch_size.max(1))
     }
 
     /// The width a merge cell contributes before the merger.
     #[must_use]
     pub fn merged_width(&self) -> usize {
-        self.geometry.hidden_size * self.downsample.factor() * self.downsample.factor()
+        self.geometry
+            .hidden_size
+            .saturating_mul(self.downsample.factor())
+            .saturating_mul(self.downsample.factor())
     }
 }
 
@@ -620,7 +629,10 @@ impl VisionGeometry {
     /// The elements one patch contributes before the first projection.
     #[must_use]
     pub fn patch_dim(&self) -> usize {
-        self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
+        self.in_channels
+            .saturating_mul(self.temporal_patch_size)
+            .saturating_mul(self.patch_size)
+            .saturating_mul(self.patch_size)
     }
 
     /// The side of the learned position grid, when the tower has one.
@@ -667,8 +679,9 @@ impl VisionGeometry {
                 self.hidden_size, self.num_heads
             )));
         }
+        let side = self.position_side();
         if self.num_position_embeddings > 0
-            && self.position_side().pow(2) != self.num_position_embeddings
+            && side.checked_mul(side) != Some(self.num_position_embeddings)
         {
             return Err(ConfigError::Invalid(format!(
                 "the vision tower's {} position embeddings are not a square grid",

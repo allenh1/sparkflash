@@ -32,11 +32,13 @@ struct Snapshot {
     repo: &'static str,
     revision: &'static str,
     expectation: SnapshotExpectation,
+    /// The vision parts with no kernel or no stated wiring, in report order.
+    vision_gaps: &'static [&'static str],
 }
 
 enum SnapshotExpectation {
-    /// The shared checkpoint plan claims every tensor.
-    Clean,
+    /// Every tensor is claimed, but the tower's parts do not all resolve yet.
+    Gaps,
     /// These exact prefix groups are the only unclaimed tensors.
     Unclaimed(Vec<(&'static str, usize)>),
     /// The shared plan cannot be built; its tower tensors are the unclaimed ones and one
@@ -67,6 +69,24 @@ fn real_report(dir: &std::path::Path) -> ScanReport {
         target: Target::Sm121,
         world: 1,
     })
+}
+
+/// The vision components whose rows did not resolve, excluding the config-key and tensor rows
+/// whose part is the aggregate `vision`.
+fn vision_gaps(report: &ScanReport) -> Vec<&'static str> {
+    let mut gaps: Vec<&'static str> = report
+        .rows
+        .iter()
+        .filter(|row| {
+            row.stack == sparkflash_model::StackKind::Vision
+                && row.part != sparkflash_model::Part::Vision
+                && !row.status.is_resolved()
+        })
+        .map(|row| row.part.name())
+        .collect();
+    gaps.sort_unstable();
+    gaps.dedup();
+    gaps
 }
 
 fn unclaimed_groups(report: &ScanReport) -> Vec<(String, usize)> {
@@ -103,7 +123,16 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "zai-org/GLM-5.3-Flash",
             revision: "3f1971b7b5f7a528c9c4ef6212c8785298a8c24a",
-            expectation: SnapshotExpectation::Clean,
+            expectation: SnapshotExpectation::Gaps,
+            vision_gaps: &[
+                "vision_attention",
+                "vision_downsample",
+                "vision_merger",
+                "vision_mlp",
+                "vision_norm",
+                "vision_patch_embed",
+                "vision_position",
+            ],
         },
         Snapshot {
             repo: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
@@ -112,16 +141,26 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                 vision_tensors: 259,
                 aligner_tensors: 4,
             },
+            vision_gaps: &["vision_merger", "vision_mlp", "vision_norm"],
         },
         Snapshot {
             repo: "nvidia/Qwen3.8-Flash-Next-NVFP4",
             revision: "fc694b54fb0174e0913e6adf86691ef85a4ead47",
-            expectation: SnapshotExpectation::Clean,
+            expectation: SnapshotExpectation::Gaps,
+            vision_gaps: &[
+                "vision_attention",
+                "vision_merger",
+                "vision_mlp",
+                "vision_norm",
+                "vision_patch_embed",
+                "vision_position",
+            ],
         },
         Snapshot {
             repo: "thinkingmachines/Inkling-2-Small",
             revision: "885d78bfca61a7e9a498e33cfa7ad35850533b8c",
             expectation: SnapshotExpectation::Unclaimed(vec![("model.visual", 422)]),
+            vision_gaps: &["vision_attention", "vision_merger", "vision_mlp"],
         },
         Snapshot {
             repo: "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
@@ -132,6 +171,7 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                 vision_tensors: 0,
                 aligner_tensors: 0,
             },
+            vision_gaps: &[],
         },
     ];
     let mut checked = 0;
@@ -147,8 +187,15 @@ fn the_real_snapshots_report_their_interim_claim_state() {
             snapshot.repo,
             report.error.as_deref().unwrap_or("")
         );
+        assert_eq!(
+            vision_gaps(&report),
+            snapshot.vision_gaps,
+            "{}: the tower's unresolved components moved\n{}",
+            snapshot.repo,
+            report.render()
+        );
         match &snapshot.expectation {
-            SnapshotExpectation::Clean => {
+            SnapshotExpectation::Gaps => {
                 let groups = unclaimed_groups(&report);
                 assert!(
                     groups.is_empty(),
@@ -159,9 +206,14 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                 assert_eq!(
                     report.coverage.tensors,
                     CoverageState::Clean,
-                    "{}: {}\n{}",
+                    "{}: the plan and the index must agree\n{}",
                     snapshot.repo,
-                    "the plan and the index must agree",
+                    report.render()
+                );
+                assert!(
+                    !report.is_resolved(),
+                    "{}: a gap snapshot resolved every row\n{}",
+                    snapshot.repo,
                     report.render()
                 );
             }
@@ -187,13 +239,19 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                     .iter()
                     .filter(|row| matches!(row.status, ScanStatus::UnknownLayout { .. }))
                     .collect::<Vec<_>>();
-                assert_eq!(layout.len(), 1, "{}:\n{}", snapshot.repo, report.render());
                 assert!(
-                    layout[0]
+                    layout.iter().any(|row| row
                         .status
                         .fix()
-                        .is_some_and(|fix| fix.contains("stack or layout")),
-                    "{}",
+                        .is_some_and(|fix| fix.contains("stack or layout"))),
+                    "{}: no row names the missing plan or layout\n{}",
+                    snapshot.repo,
+                    report.render()
+                );
+                assert!(
+                    layout.iter().all(|row| row.status.fix().is_some()),
+                    "{}: an unknown-layout row has no fix\n{}",
+                    snapshot.repo,
                     report.render()
                 );
                 let groups = unclaimed_groups(&report);
