@@ -14,10 +14,11 @@
 
 //! The tensor plan of an [Architecture] at one tensor-parallel rank.
 //!
-//! The Qwen, GLM and DeepSeek arms all read the same released `config.json` through
-//! [Architecture]. This module turns that walk into names, shapes and rank slices, so a released
-//! index's tensor count and byte total are checked against the shared vocabulary rather than a
-//! second family parser. The family-specific names live here, not in a model crate.
+//! The arms all read the same released `config.json` through [Architecture]. This module turns
+//! that walk into names, shapes and rank slices, so a released index's tensor count and byte
+//! total are checked against the shared vocabulary rather than a second family parser. A
+//! checkpoint with a layout takes its names from `sparkflash_model::layout`; the planners here
+//! are the structural fallback and the test oracle for the worked layout.
 //!
 //! [ArchitectureTensorPlan::served] is what a rank uploads, [ArchitectureTensorPlan::checkpoint]
 //! adds the unserved vision tower, and [ArchitectureTensorPlan::rank_spec_at] is the rank-local
@@ -2454,11 +2455,10 @@ impl Builder {
 
 /// The tensors a model description takes, as one comparable set.
 ///
-/// This is the seam between the scan and the description. Today the set is
-/// [ArchitectureTensorPlan::checkpoint]'s names, because that is the one shared plan a released
-/// checkpoint is checked against. The layout reader's stack tensor roles will replace it there
-/// and nowhere else: the scan compares [TensorClaims] with an index and never learns how the
-/// claims were built.
+/// This is the seam between the scan and the description. The set is
+/// [ArchitectureTensorPlan::checkpoint]'s names, which a matching layout supplies when one
+/// exists. The scan compares [TensorClaims] with an index and never learns how the claims were
+/// built.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TensorClaims {
     specs: Vec<TensorSpec>,
