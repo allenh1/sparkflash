@@ -4594,15 +4594,14 @@ mod tests {
     #[test]
     fn the_released_parses_are_pinned_and_switch_nothing_on() {
         let pinned = [
-            0x0a9d_f00c_70fd_a130_u64,
-            0xbf31_362c_fd8a_5fc0,
-            0xeebb_ad76_01e9_edcb,
-            0x51eb_2882_3661_fe8f,
-            0xe909_cbc5_be7c_75db,
-            0xd5e4_aaab_5c0c_6990,
-            0xb355_0c20_34b7_3f01,
+            0xe0a4_6a91_5f2e_aeb5_u64,
+            0x594a_226e_d501_88a5,
+            0x0d35_642d_b843_4b20,
+            0x9a08_2ac0_b2fa_f67c,
+            0x2416_b0da_0097_fad0,
+            0x6912_d984_45c3_3315,
+            0xf401_030a_ffce_bcd2,
         ];
-        let mut digests = Vec::new();
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");
             assert_eq!(
@@ -4611,12 +4610,8 @@ mod tests {
                 "{name} turns a switch on"
             );
             let digest = fnv1a(format!("{architecture:#?}").as_bytes());
-            digests.push((name, digest, pin));
+            assert_eq!(digest, pin, "{name}'s parse moved: {digest:#018x}");
         }
-        for (name, digest, _) in &digests {
-            println!("PIN {name} {digest:#018x}");
-        }
-        assert!(false, "collect the pins above");
     }
 
     /// A latent-attention release with Hy4-flash's switches (made-up small numbers): each is a
