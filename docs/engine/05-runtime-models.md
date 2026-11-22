@@ -284,7 +284,8 @@ pass, target.
      reasons the scan cannot yet fix. The gate is not merged early.
 2. **The base reads a description.** 5.2 steps 1 and 2 on DeepSeek alone. DeepSeek bit-equal,
    same tick trace, same speed. This is the step that decides whether the plan holds; if it
-   cannot be done for free, stop here.
+   cannot be done for free, stop here. The work is broken down in
+   [06-base-reads-description.md](06-base-reads-description.md).
 3. **The base runs at TP 1 and 2 and takes other formats.** 5.2 steps 3 to 5, proved on tiny
    synthetic checkpoints before a real model moves.
 4. **GLM runs on the base and its crate is deleted.** Its one bit change, checked as in 3.3. Its

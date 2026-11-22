@@ -26,6 +26,7 @@
 | [engine/01-forward-order.md](engine/01-forward-order.md) | The reference forward pass in execution order, with the tensor map |
 | [engine/03-runtime.md](engine/03-runtime.md) | The shared runtime: one home for lanes, drafting rounds, prefill and group mirroring, and the plan to move every arm onto it |
 | [engine/05-runtime-models.md](engine/05-runtime-models.md) | The agreed direction: models built at load from the checkpoint, no model crates, DeepSeek's forward as the base engine, one shared kernel body an operation |
+| [engine/06-base-reads-description.md](engine/06-base-reads-description.md) | Milestone 2 of plan 05 in detail: what DeepSeek's forward is built from today, the rule that it opens from what the scan resolved, the proofs, and the four pieces of work |
 | [../reference/](../reference/) | Upstream model card, configuration, tokenizer and encoding reference |
 
 `build/` holds data files that tests and scripts read (tokenizer parity evidence, frozen
