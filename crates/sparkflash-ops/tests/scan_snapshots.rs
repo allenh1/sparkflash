@@ -131,7 +131,6 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                 "vision_mlp",
                 "vision_norm",
                 "vision_patch_embed",
-                "vision_position",
             ],
         },
         Snapshot {
