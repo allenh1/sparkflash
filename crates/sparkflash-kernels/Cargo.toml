@@ -34,6 +34,10 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 memmap2 = { workspace = true }
 cudarc = { workspace = true, optional = true }
+# The open manifest writes one JSON line per recorded value, tensor or kernel, and names each
+# loaded cubin by its sha256. Both are recording-only and cost one branch when the env is unset.
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 # The shared CUDA driver (src/cuda_driver.rs) resolves the driver API with dlopen at run time, so
 # nothing links libcuda and a CPU-only build is unaffected. Same crate and version family cudarc
 # itself uses for fallback-dynamic-loading, so this adds an edge and not a new package version.
@@ -65,9 +69,8 @@ rdma = ["dep:sparkflash-comm", "sparkflash-comm/rdma"]
 # quantiser); examples/m7_layer0/main.rs --stage 9 also uses its released Engram seam: the hash
 # layout and the paged table read are engine code, and duplicating them in the kernels crate
 # would put a second copy of the released arithmetic next to the one the host pair was produced
-# with. sha2 hashes the two determinism blobs; the harness does not otherwise hash anything.
+# with. The harness's determinism blobs use the regular sha2 dependency above.
 # Neither edge creates a cycle: the engine crate depends on no other workspace crate.
-sha2 = { workspace = true }
 # The task-14 union-attention example reads the engine-produced attention-case fixture (JSON) and
 # writes its run report as JSON; the fixture is data, not a new crate edge beyond these two.
 serde = { workspace = true }
@@ -77,9 +80,8 @@ serde = { workspace = true }
 # CPU-only build of the library is unaffected. The feature pulls libloading into the dev build,
 # the same dlopen-only driver family cuda_driver already uses.
 sparkflash-kv = { workspace = true, features = ["cuda"] }
-# The device run reads the node golden fixture (SequenceFixture derives Deserialize) and writes
-# its own JSON report; the library itself does not depend on a JSON writer.
-serde_json = { workspace = true }
+# The device run reads the node golden fixture (SequenceFixture derives Deserialize); its JSON
+# report is written with the regular serde_json dependency above.
 # The vision tower's golden check (examples/vision_golden.rs) builds the canvas with the image
 # front end the server uses, so the patches it checks are the served ones. Dev-only: the library
 # takes a canvas and never decodes an image.
