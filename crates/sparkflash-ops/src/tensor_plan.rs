@@ -408,9 +408,25 @@ impl Builder {
     /// structural reader. A layout that matches but describes no tensor is a refusal: a file
     /// exists to say what the structural reader could not.
     fn read_layout(&mut self, arch: &Architecture) -> Result<bool, PlanError> {
-        let layout = sparkflash_model::layout::matching(arch)
+        let set = sparkflash_model::layout::LayoutSet::load()
+            .map_err(|error| PlanError::Invalid(error.to_string()))?;
+        let layout = set
+            .select(arch)
             .map_err(|error| PlanError::Invalid(error.to_string()))?;
         let Some(layout) = layout else {
+            // A family with shipped layouts but no match is a release this tree does not
+            // describe, not a model to hand to the canonical fallback.
+            if set.layouts().iter().any(|layout| {
+                layout
+                    .model_types
+                    .iter()
+                    .any(|family| family == &arch.family)
+            }) {
+                return Err(PlanError::Invalid(format!(
+                    "the tree carries layouts for family {:?}, but none matches this release's                      architectures or quantization",
+                    arch.family
+                )));
+            }
             return Ok(false);
         };
         let tensors = layout
@@ -427,6 +443,9 @@ impl Builder {
                 continue;
             }
             if tensor.stack == sparkflash_model::StackKind::Draft && !self.serves_mtp(arch) {
+                continue;
+            }
+            if tensor.unloaded.is_some() {
                 continue;
             }
             self.layout_tensor(&tensor)?;
@@ -3066,10 +3085,9 @@ mod layout_equality {
             if weight_only {
                 architecture.weight_only_fp8();
             }
-            // Both Qwen families are served at one rank. The MTP stage stores FP8 experts
-            // whose BF16 tile scale needs a whole-tile split; an explicit-dtype layout
-            // declaration has no row-tile split yet, so the plan is proved at the served world.
-            for world in [1usize] {
+            // Both Qwen families are served at one rank, but the layout's tile splits must
+            // still reproduce the reference planner at every world.
+            for world in [1usize, 2, 4] {
                 let tp = TpPlan::for_architecture(&architecture, world, 0).expect("a TP plan");
                 let expected = family_reference(&architecture, tp);
                 let actual = ArchitectureTensorPlan::checkpoint(&architecture, tp)

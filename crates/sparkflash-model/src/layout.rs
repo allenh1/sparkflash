@@ -140,7 +140,7 @@ pub struct TensorDecl {
     pub part: String,
     /// The tensor role, as the ops library names it.
     pub role: String,
-    /// The stored element type: bf16, f32, dense, expert, mxfp8 or mxfp4.
+    /// The stored element type: bf16, f32, dense, expert, f8e4m3, f8e8m0, f4e2m1, u8 or i64.
     pub dtype: String,
     /// The logical shape, as integer literals or arithmetic expressions.
     pub shape: Vec<String>,
@@ -649,17 +649,7 @@ impl Layout {
             }
             if !matches!(
                 tensor.dtype.as_str(),
-                "bf16"
-                    | "f32"
-                    | "dense"
-                    | "expert"
-                    | "f8e4m3"
-                    | "f8e8m0"
-                    | "f4e2m1"
-                    | "u8"
-                    | "i64"
-                    | "mxfp8"
-                    | "mxfp4"
+                "bf16" | "f32" | "dense" | "expert" | "f8e4m3" | "f8e8m0" | "f4e2m1" | "u8" | "i64"
             ) {
                 return Err(LayoutError::invalid(
                     origin,

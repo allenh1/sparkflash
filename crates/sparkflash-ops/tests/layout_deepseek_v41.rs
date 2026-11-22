@@ -94,9 +94,9 @@ fn the_layout_equals_the_arm_plan_at_tp4() {
 
     assert_eq!(vision, 259, "the tower's 259 indexed tensors are claimed");
     assert_eq!(aligner, 4, "the aligner's four indexed tensors are claimed");
-    assert_eq!(
-        extras, ARM_OMITS,
-        "the only tensors outside the arm's plan are the resident image delimiters"
+    assert!(
+        extras.is_empty(),
+        "an unloaded delimiter is not a tensor the plan carries: {extras:?}"
     );
 
     let claimed: BTreeSet<&str> = (0..layout.len())
@@ -107,7 +107,7 @@ fn the_layout_equals_the_arm_plan_at_tp4() {
         missing.is_empty(),
         "the layout does not claim these arm tensors: {missing:#?}"
     );
-    assert_eq!(layout.len(), arm.len() + ARM_OMITS.len() + vision + aligner);
+    assert_eq!(layout.len(), arm.len() + vision + aligner);
 }
 
 /// The real snapshot the lead host holds. The test skips on a machine without it.

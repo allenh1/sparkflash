@@ -41,12 +41,6 @@ enum SnapshotExpectation {
     Clean,
     /// Every tensor is claimed, but the tower's parts do not all resolve yet.
     Gaps,
-    /// The shared plan cannot be built; its tower tensors are the unclaimed ones and one
-    /// layout row names the missing planner.
-    PlanFailure {
-        vision_tensors: usize,
-        aligner_tensors: usize,
-    },
 }
 
 fn snapshot_dir(snapshot: &Snapshot) -> Option<std::path::PathBuf> {
@@ -136,11 +130,10 @@ fn the_real_snapshots_report_their_interim_claim_state() {
         Snapshot {
             repo: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
             revision: "1bae0e1088993b9b82de08f59de5be5a34e42170",
-            expectation: SnapshotExpectation::PlanFailure {
-                vision_tensors: 259,
-                aligner_tensors: 4,
-            },
-            vision_gaps: &["vision_merger", "vision_mlp", "vision_norm"],
+            // The layout claims all 96,085 indexed tensors, including the vision tower and
+            // aligner, and every row resolves on sm121 TP4.
+            expectation: SnapshotExpectation::Clean,
+            vision_gaps: &[],
         },
         Snapshot {
             repo: "nvidia/Qwen3.8-Flash-Next-NVFP4",
@@ -282,59 +275,6 @@ fn the_real_snapshots_report_their_interim_claim_state() {
                 assert!(
                     report.is_clean(),
                     "{}: not clean\n{}",
-                    snapshot.repo,
-                    report.render()
-                );
-            }
-            SnapshotExpectation::PlanFailure {
-                vision_tensors,
-                aligner_tensors,
-            } => {
-                let layout = report
-                    .rows
-                    .iter()
-                    .filter(|row| matches!(row.status, ScanStatus::UnknownLayout { .. }))
-                    .collect::<Vec<_>>();
-                assert!(
-                    layout.iter().any(|row| row
-                        .status
-                        .fix()
-                        .is_some_and(|fix| fix.contains("stack or layout"))),
-                    "{}: no row names the missing plan or layout\n{}",
-                    snapshot.repo,
-                    report.render()
-                );
-                assert!(
-                    layout.iter().all(|row| row.status.fix().is_some()),
-                    "{}: an unknown-layout row has no fix\n{}",
-                    snapshot.repo,
-                    report.render()
-                );
-                let groups = unclaimed_groups(&report);
-                let vision = groups
-                    .iter()
-                    .find(|(prefix, _)| prefix == "vision")
-                    .cloned();
-                if *vision_tensors == 0 {
-                    assert!(vision.is_none(), "{}:\n{}", snapshot.repo, report.render());
-                } else {
-                    assert_eq!(
-                        vision,
-                        Some(("vision".to_owned(), *vision_tensors)),
-                        "{}:\n{}",
-                        snapshot.repo,
-                        report.render()
-                    );
-                }
-                let aligner: usize = groups
-                    .iter()
-                    .filter(|(prefix, _)| prefix.starts_with("aligner"))
-                    .map(|(_, count)| count)
-                    .sum();
-                assert_eq!(
-                    aligner,
-                    *aligner_tensors,
-                    "{}:\n{}",
                     snapshot.repo,
                     report.render()
                 );

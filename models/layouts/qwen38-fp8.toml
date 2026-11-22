@@ -1136,7 +1136,8 @@ part = "mtp"
 role = "mtp"
 dtype = "f8e4m3"
 shape = ["moe_intermediate", "hidden"]
-split = "rows"
+split = "tile_rows"
+tile = 128
 repeat = "mtp_stage_experts"
 when = { ffn = "moe" }
 
@@ -1146,7 +1147,8 @@ part = "mtp"
 role = "mtp"
 dtype = "bf16"
 shape = ["(moe_intermediate + mtp_scale_block - 1) / mtp_scale_block", "(hidden + mtp_scale_block - 1) / mtp_scale_block"]
-split = "rows"
+split = "tile_rows"
+tile = 1
 repeat = "mtp_stage_experts"
 when = { ffn = "moe" }
 
@@ -1156,7 +1158,8 @@ part = "mtp"
 role = "mtp"
 dtype = "f8e4m3"
 shape = ["moe_intermediate", "hidden"]
-split = "rows"
+split = "tile_rows"
+tile = 128
 repeat = "mtp_stage_experts"
 when = { ffn = "moe" }
 
@@ -1166,7 +1169,8 @@ part = "mtp"
 role = "mtp"
 dtype = "bf16"
 shape = ["(moe_intermediate + mtp_scale_block - 1) / mtp_scale_block", "(hidden + mtp_scale_block - 1) / mtp_scale_block"]
-split = "rows"
+split = "tile_rows"
+tile = 1
 repeat = "mtp_stage_experts"
 when = { ffn = "moe" }
 
@@ -1176,7 +1180,8 @@ part = "mtp"
 role = "mtp"
 dtype = "f8e4m3"
 shape = ["hidden", "moe_intermediate"]
-split = "columns"
+split = "tiles"
+tile = 128
 repeat = "mtp_stage_experts"
 when = { ffn = "moe" }
 
@@ -1186,7 +1191,8 @@ part = "mtp"
 role = "mtp"
 dtype = "bf16"
 shape = ["(hidden + mtp_scale_block - 1) / mtp_scale_block", "(moe_intermediate + mtp_scale_block - 1) / mtp_scale_block"]
-split = "columns"
+split = "tiles"
+tile = 1
 repeat = "mtp_stage_experts"
 when = { ffn = "moe" }
 

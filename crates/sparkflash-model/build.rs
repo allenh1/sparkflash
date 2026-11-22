@@ -21,15 +21,19 @@ fn main() {
     let directory = Path::new(&manifest).join("../../models/layouts");
     println!("cargo:rerun-if-changed={}", directory.display());
     let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&directory) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "toml")
-            {
-                files.push(path);
-            }
+    let entries = std::fs::read_dir(&directory).unwrap_or_else(|error| {
+        panic!(
+            "models/layouts at {} must be readable: {error}",
+            directory.display()
+        )
+    });
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            files.push(path);
         }
     }
     files.sort();

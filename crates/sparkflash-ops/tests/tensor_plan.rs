@@ -647,41 +647,16 @@ fn qwen36(fp8: bool) -> Architecture {
 }
 
 #[test]
-#[ignore = "no Qwen3.6 BF16 release ships; qwen36.toml names the carried FP8 index and the \
-            generic fallback is not that index"]
-fn the_qwen36_bf16_plan_is_the_released_index() {
-    // Qwen/Qwen3.6-35B-A3B: 1,045 names and `metadata.total_size` 71,903,645,408. The plan
-    // reproduced the index's name set exactly when this was written; the count and the byte
-    // total pin it.
+fn the_qwen36_bf16_document_is_refused_without_its_quantization() {
+    // qwen36.toml describes the carried FP8 release. A document with the same family and no
+    // quantization is not a release this tree describes, so the canonical fallback must not
+    // silently plan a different name set in its place.
     let tp = TpPlan::new(1, 0).expect("one rank");
-    let plan = ArchitectureTensorPlan::checkpoint(&qwen36(false), tp).expect("the plan builds");
-    assert_eq!(plan.len(), 1_045);
-    assert_eq!(plan.storage_bytes(), 71_903_645_408);
-    let fused = plan
-        .spec("model.language_model.layers.0.mlp.experts.gate_up_proj")
-        .expect("the fused gate/up experts");
-    assert_eq!(fused.shape, vec![256, 1024, 2048]);
-    let down = plan
-        .spec("model.language_model.layers.0.mlp.experts.down_proj")
-        .expect("the fused down experts");
-    assert_eq!(down.shape, vec![256, 2048, 512]);
-    assert_eq!(
-        plan.spec("mtp.fc.weight")
-            .expect("the MTP projection")
-            .shape,
-        vec![2048, 4096]
-    );
-    for name in [
-        "model.language_model.norm.weight",
-        "model.language_model.layers.3.input_layernorm.weight",
-        "model.language_model.layers.3.post_attention_layernorm.weight",
-    ] {
-        assert_eq!(plan.spec(name).expect(name).shape, vec![2048], "{name}");
-    }
+    let error = ArchitectureTensorPlan::checkpoint(&qwen36(false), tp)
+        .expect_err("the BF16 document has no shipped layout");
     assert!(
-        plan.spec("model.language_model.layers.3.self_attn.indexer.index_qk_proj.weight")
-            .is_none(),
-        "full attention has no indexer"
+        error.to_string().contains("none matches this release"),
+        "{error}"
     );
 }
 

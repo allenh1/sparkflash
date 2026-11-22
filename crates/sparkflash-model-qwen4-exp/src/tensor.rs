@@ -445,8 +445,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Qwen NVFP4 explicit scale rows at TP>1 are not expressible yet; the served \
-                world is TP1 and the MTP-at-TP4 gate is covered for the replicated GLM stage"]
     fn the_checkpoint_plan_keeps_mtp_at_tp4() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
         let tp = TpPlan::new(4, 0).expect("rank 0 of four");

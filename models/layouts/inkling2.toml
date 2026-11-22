@@ -1338,7 +1338,7 @@ name = "fuse_weight"
 part = "mtp"
 role = "mtp"
 dtype = "bf16"
-shape = ["mtp_block - 2", "mtp_block"]
+shape = ["mtp_hidden", "mtp_hidden * 2"]
 split = "whole"
 
 # src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
@@ -1452,6 +1452,33 @@ split = "whole"
 repeat = "mtp_stages"
 
 # src/tensor.rs:657-691 and mtp_config: one stage per repeat; {stage} is the MTP layer index.
+
+[[tensor]]
+name = "layers.{stage}.self_attn.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_intermediate", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+[[tensor]]
+name = "layers.{stage}.self_attn.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_intermediate", "mtp_hidden"]
+split = "whole"
+repeat = "mtp_stages"
+
+[[tensor]]
+name = "layers.{stage}.self_attn.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["mtp_hidden", "mtp_intermediate"]
+split = "whole"
+repeat = "mtp_stages"
 
 [[tensor]]
 name = "layers.{stage}.self_attn.o_proj.weight"

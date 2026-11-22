@@ -43,7 +43,10 @@ fn arm_rows(config: &Inkling2Config, tp: TpPlan) -> BTreeMap<String, Row> {
     let mut rows = BTreeMap::new();
     for index in 0..plan.plan().len() {
         let spec = &plan.plan().specs()[index];
-        if !(spec.name.starts_with("model.llm.") || spec.name.starts_with("model.visual.")) {
+        if !(spec.name.starts_with("model.llm.")
+            || spec.name.starts_with("model.visual.")
+            || spec.name.starts_with("mtp."))
+        {
             continue;
         }
         let run = plan
@@ -72,11 +75,15 @@ fn layout_rows(config: &Inkling2Config, tp: TpPlan) -> BTreeMap<String, Row> {
     let mut rows = BTreeMap::new();
     for index in 0..plan.plan().len() {
         let spec = plan.spec_at(index);
-        if !(spec.name.starts_with("model.llm.") || spec.name.starts_with("model.visual.")) {
-            continue;
-        }
+        // The checkpoint's mtp.safetensors stores bare `layers.N` names; the arm prefixes
+        // them with its runtime `mtp.` root. Compare under the arm's spelling.
+        let name = if spec.name.starts_with("model.") {
+            spec.name.clone()
+        } else {
+            format!("mtp.{}", spec.name)
+        };
         rows.insert(
-            spec.name.clone(),
+            name,
             (
                 spec.dtype,
                 spec.shape.clone(),
@@ -105,11 +112,21 @@ fn the_layout_reproduces_the_arms_language_and_vision_plan() {
             "TP{world}: the layout misses {missing:?}"
         );
 
+        // The arm's converter plans only the MTP tensors its runtime reads; the checkpoint's
+        // mtp.safetensors stores more (the Markov head, its mask, and the stage norms). Those
+        // extras are allowed only in the MTP stack, never in the language or vision plan.
         let extra: Vec<&String> = layout
             .keys()
             .filter(|name| !arm.contains_key(*name))
             .collect();
-        assert!(extra.is_empty(), "TP{world}: the layout adds {extra:?}");
+        let stray: Vec<&&String> = extra
+            .iter()
+            .filter(|name| !name.starts_with("mtp."))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "TP{world}: the layout adds non-MTP tensors {stray:?}"
+        );
 
         for (name, expected) in &arm {
             let Some(actual) = layout.get(name) else {
