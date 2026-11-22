@@ -279,6 +279,8 @@ pub enum TensorSplit {
     ExpertAxis,
     /// Columns split into whole `tile`-wide blocks.
     Tiles,
+    /// Rows split into whole `tile`-wide blocks.
+    TileRows,
 }
 
 /// A layout selected and applied to one checkpoint.
@@ -623,6 +625,7 @@ impl Layout {
                 "expert_columns" => TensorSplit::ExpertColumns,
                 "expert_axis" => TensorSplit::ExpertAxis,
                 "tiles" => TensorSplit::Tiles,
+                "tile_rows" => TensorSplit::TileRows,
                 other => {
                     return Err(LayoutError::invalid(
                         origin,
@@ -1544,6 +1547,7 @@ impl Layout {
             "expert_columns" => TensorSplit::ExpertColumns,
             "expert_axis" => TensorSplit::ExpertAxis,
             "tiles" => TensorSplit::Tiles,
+            "tile_rows" => TensorSplit::TileRows,
             other => {
                 return Err(LayoutError::refused(
                     &self.id,
@@ -1639,6 +1643,24 @@ impl Layout {
 
     fn global_vars(&self, architecture: &Architecture) -> BTreeMap<String, i64> {
         let mut vars = architecture.layout_vars.clone();
+        // A caller may hand the reader an Architecture without the config document that
+        // populated its layout_vars. A literal or a default is still a fact of the layout.
+        for (name, fact) in &self.vars {
+            if vars.contains_key(name) {
+                continue;
+            }
+            let value = match fact {
+                FactValue::Literal(value) => layout_toml_value(value, self, name).ok(),
+                FactValue::Key {
+                    default: Some(default),
+                    ..
+                } => layout_toml_value(default, self, name).ok(),
+                FactValue::Key { default: None, .. } => None,
+            };
+            if let Some(LayoutValue::Integer(value)) = value {
+                vars.insert(name.clone(), value);
+            }
+        }
         insert(&mut vars, "hidden", architecture.hidden_size);
         insert(&mut vars, "vocab", architecture.vocab_size);
         insert(&mut vars, "layers", architecture.layers.len());

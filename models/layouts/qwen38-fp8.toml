@@ -673,7 +673,8 @@ part = "moe"
 role = "experts"
 dtype = "f8e4m3"
 shape = ["moe_intermediate", "hidden"]
-split = "rows"
+split = "tile_rows"
+tile = 128
 repeat = "experts"
 when = { ffn = "moe" }
 
@@ -683,7 +684,8 @@ part = "moe"
 role = "experts"
 dtype = "bf16"
 shape = ["(moe_intermediate + 127) / 128", "(hidden + 127) / 128"]
-split = "rows"
+split = "tile_rows"
+tile = 1
 repeat = "experts"
 when = { ffn = "moe" }
 
@@ -693,7 +695,8 @@ part = "moe"
 role = "experts"
 dtype = "f8e4m3"
 shape = ["moe_intermediate", "hidden"]
-split = "rows"
+split = "tile_rows"
+tile = 128
 repeat = "experts"
 when = { ffn = "moe" }
 
@@ -703,7 +706,8 @@ part = "moe"
 role = "experts"
 dtype = "bf16"
 shape = ["(moe_intermediate + 127) / 128", "(hidden + 127) / 128"]
-split = "rows"
+split = "tile_rows"
+tile = 1
 repeat = "experts"
 when = { ffn = "moe" }
 
@@ -713,7 +717,8 @@ part = "moe"
 role = "experts"
 dtype = "f8e4m3"
 shape = ["hidden", "moe_intermediate"]
-split = "columns"
+split = "tiles"
+tile = 128
 repeat = "experts"
 when = { ffn = "moe" }
 
@@ -723,7 +728,8 @@ part = "moe"
 role = "experts"
 dtype = "bf16"
 shape = ["(hidden + 127) / 128", "(moe_intermediate + 127) / 128"]
-split = "columns"
+split = "tiles"
+tile = 1
 repeat = "experts"
 when = { ffn = "moe" }
 
@@ -736,7 +742,7 @@ name = "model.language_model.layers.{layer}.ple.key_proj.weight"
 part = "ple"
 role = "ple_aux"
 dtype = "bf16"
-shape = ["hyper_width", "hidden"]
+shape = ["hyper_width", "ple_embed_dim"]
 split = "whole"
 repeat = "layers"
 when = { side = "ple" }

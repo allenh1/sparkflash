@@ -210,6 +210,7 @@ pub(crate) fn tiny_architecture() -> Architecture {
         // The fixture's experts are the NVFP4 release's, declared the way the Qwen schema names
         // them, so the shared plan of its rendered document carries their scales.
         quantization: Quantization {
+            method: Some("MIXED_PRECISION".to_owned()),
             expert: Some("NVFP4".to_owned()),
             expert_format: WeightFormat::NvFp4 { group_size: 16 },
             // The release's MTP experts are FP8 on 128x128 tiles, declared FP8_PB_WO; the parser

@@ -72,8 +72,8 @@ dtype = "bf16"                   # bf16, f32, f8e4m3, f8e8m0, f4e2m1, u8, i64,
                                  # dense or expert
 shape = ["kda_width", "hidden"]  # arithmetic over facts, never a repeated literal
 split = "rows"                   # whole, rows, columns, kv_rows, vector, conv,
-                                 # expert_rows, expert_columns, expert_axis or tiles
-tile = 128                       # the block width a tiles split cuts on
+                                 # expert_rows, expert_columns, expert_axis, tiles or tile_rows
+tile = 128                       # the block width a tiles or tile_rows split cuts on
 repeat = "layers"                # once, layers, experts, mtp, mtp_experts, mtp_stages,
                                  # mtp_stage_experts, ple_shards or vision_blocks
 when = { attention = "kda" }     # attention, ffn, indexer, layers, residual or side

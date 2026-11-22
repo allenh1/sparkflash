@@ -37,12 +37,10 @@ struct Snapshot {
 }
 
 enum SnapshotExpectation {
-    /// Every tensor is claimed and both coverage checks are clean.
+    /// Every row resolves and both coverage checks are clean.
     Clean,
     /// Every tensor is claimed, but the tower's parts do not all resolve yet.
     Gaps,
-    /// Every row resolves and both coverage checks are clean.
-    Clean,
     /// The shared plan cannot be built; its tower tensors are the unclaimed ones and one
     /// layout row names the missing planner.
     PlanFailure {
@@ -195,22 +193,6 @@ fn the_real_snapshots_report_their_interim_claim_state() {
             report.render()
         );
         match &snapshot.expectation {
-            SnapshotExpectation::Clean => {
-                let groups = unclaimed_groups(&report);
-                assert!(
-                    groups.is_empty(),
-                    "{}: unclaimed {groups:?}\n{}",
-                    snapshot.repo,
-                    report.render()
-                );
-                assert_eq!(
-                    report.coverage.tensors,
-                    CoverageState::Clean,
-                    "{}: the plan and the index must agree\n{}",
-                    snapshot.repo,
-                    report.render()
-                );
-            }
             SnapshotExpectation::Gaps => {
                 let groups = unclaimed_groups(&report);
                 assert!(

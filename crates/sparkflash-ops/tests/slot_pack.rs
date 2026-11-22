@@ -58,7 +58,7 @@ impl WeightSource for Bytes {
 
 fn architecture() -> Architecture {
     Architecture::from_json(
-        r#"{"model_type":"qwen4_exp","text_config":{"hidden_size":2560,"vocab_size":1024,"num_hidden_layers":1,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"layer_types":["linear_attention"],"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"hc_count":4,"hc_lowrank":320,"indexer_n_heads":4,"indexer_kv_heads":1,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}"#,
+        r#"{"model_type":"qwen4_exp","text_config":{"hidden_size":2560,"vocab_size":1024,"num_hidden_layers":1,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"layer_types":["linear_attention"],"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"hc_count":4,"hc_lowrank":320,"indexer_n_heads":4,"indexer_kv_heads":1,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4,"quantization_config":{"quant_method":"fp8","weight_block_size":[128,128]}}}"#,
     )
     .expect("the fixture parses")
 }
@@ -109,7 +109,11 @@ fn a_slot_pack_round_trips_every_planned_tensor() {
 #[test]
 fn a_slot_pack_refuses_a_world_the_arm_walk_owns() {
     let tp = TpPlan::new(2, 0).expect("rank 0 of two");
-    let plan = ArchitectureTensorPlan::served(&architecture(), tp).expect("the TP2 plan builds");
+    let architecture = Architecture::from_json(
+        r#"{"model_type":"llama","hidden_size":32,"intermediate_size":64,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,"vocab_size":64}"#,
+    )
+    .expect("a plain fixture parses");
+    let plan = ArchitectureTensorPlan::served(&architecture, tp).expect("the TP2 plan builds");
     let error =
         SlotPack::new(&plan, Extra { label: 7 }).expect_err("the plan-order converter is TP1 only");
     assert!(

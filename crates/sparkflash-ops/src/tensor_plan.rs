@@ -177,7 +177,7 @@ impl ArchitectureTensorPlan {
     /// # Errors
     /// A family this plan does not name, or a world a sharded axis does not divide.
     pub fn served(architecture: &Architecture, tp: TpPlan) -> Result<Self, PlanError> {
-        Self::build(architecture, tp, false, false)
+        Self::build(architecture, tp, false, false, false)
     }
 
     /// Plan the served set plus the MTP stage, when the release has one the served set omits.
@@ -185,7 +185,7 @@ impl ArchitectureTensorPlan {
     /// # Errors
     /// As [Self::served].
     pub fn served_and_mtp(architecture: &Architecture, tp: TpPlan) -> Result<Self, PlanError> {
-        Self::build(architecture, tp, true, false)
+        Self::build(architecture, tp, true, false, false)
     }
 
     /// Plan the whole checkpoint, including the vision tower.
@@ -193,7 +193,7 @@ impl ArchitectureTensorPlan {
     /// # Errors
     /// As [Self::served].
     pub fn checkpoint(architecture: &Architecture, tp: TpPlan) -> Result<Self, PlanError> {
-        Self::build(architecture, tp, true, true)
+        Self::build(architecture, tp, true, true, true)
     }
 
     fn build(
@@ -201,8 +201,9 @@ impl ArchitectureTensorPlan {
         tp: TpPlan,
         mtp: bool,
         vision: bool,
+        mtp_all_worlds: bool,
     ) -> Result<Self, PlanError> {
-        let mut builder = Builder::new(tp, mtp, vision);
+        let mut builder = Builder::new(tp, mtp, vision, mtp_all_worlds);
         let dense = architecture.quantization.dense_format;
         let experts = architecture.quantization.expert_format;
         builder.dense_format = dense;
@@ -241,7 +242,7 @@ impl ArchitectureTensorPlan {
         tp: TpPlan,
         names: &TensorNames,
     ) -> Result<Self, PlanError> {
-        let mut builder = Builder::new(tp, false, false);
+        let mut builder = Builder::new(tp, false, false, false);
         builder.dense_format = architecture.quantization.dense_format;
         builder.expert_format = architecture.quantization.expert_format;
         builder.generic(architecture, names)?;
@@ -362,12 +363,15 @@ struct Builder {
     tp: TpPlan,
     mtp: bool,
     vision: bool,
+    /// Whether MTP is planned at every world. The checkpoint converter needs it; the served set
+    /// keeps the world gate (a non-replicated MTP stage is not loaded by a multi-rank serve).
+    mtp_all_worlds: bool,
     dense_format: WeightFormat,
     expert_format: WeightFormat,
 }
 
 impl Builder {
-    fn new(tp: TpPlan, mtp: bool, vision: bool) -> Self {
+    fn new(tp: TpPlan, mtp: bool, vision: bool, mtp_all_worlds: bool) -> Self {
         Self {
             plan: TensorPlan::default(),
             rank: Vec::new(),
@@ -375,9 +379,18 @@ impl Builder {
             tp,
             mtp,
             vision,
+            mtp_all_worlds,
             dense_format: WeightFormat::Bf16,
             expert_format: WeightFormat::Bf16,
         }
+    }
+
+    /// Whether this plan carries the MTP stage at this rank.
+    fn serves_mtp(&self, architecture: &Architecture) -> bool {
+        self.mtp
+            && (self.mtp_all_worlds
+                || self.tp.world() == 1
+                || architecture.mtp.as_ref().is_some_and(|mtp| mtp.replicated))
     }
 
     fn finish(self) -> ArchitectureTensorPlan {
@@ -413,7 +426,7 @@ impl Builder {
             if tensor.stack == sparkflash_model::StackKind::Vision && !self.vision {
                 continue;
             }
-            if tensor.stack == sparkflash_model::StackKind::Draft && !self.mtp {
+            if tensor.stack == sparkflash_model::StackKind::Draft && !self.serves_mtp(arch) {
                 continue;
             }
             self.layout_tensor(&tensor)?;
@@ -555,6 +568,27 @@ impl Builder {
                     dtype,
                     vec![rows, columns],
                     vec![rows, split.padded],
+                    Some(RankRun::tiled(split)),
+                    role,
+                );
+                Ok(())
+            }
+            TensorSplit::TileRows => {
+                let [rows, columns] = two(name, shape)?;
+                let tile = tile.ok_or_else(|| {
+                    PlanError::Invalid(format!(
+                        "tensor {name} has a tile_rows split but no tile width"
+                    ))
+                })?;
+                let split = self
+                    .tp
+                    .split_tiles(rows, tile, TpAxis::Heads)
+                    .map_err(|error| PlanError::Invalid(error.to_string()))?;
+                self.push(
+                    name.to_owned(),
+                    dtype,
+                    vec![rows, columns],
+                    vec![split.padded, columns],
                     Some(RankRun::tiled(split)),
                     role,
                 );
@@ -1369,7 +1403,7 @@ impl Builder {
                 }
             }
         }
-        if include_mtp && self.mtp {
+        if include_mtp && self.serves_mtp(arch) {
             self.qwen_mtp(arch, hidden, hyper_width, dense)?;
         }
         if self.vision {
@@ -2020,7 +2054,7 @@ impl Builder {
                 )?,
             }
         }
-        if include_mtp && self.mtp {
+        if include_mtp && self.serves_mtp(arch) {
             self.oracle_mtp(arch, hidden)?;
         }
         if self.vision {
@@ -2947,7 +2981,7 @@ mod layout_equality {
     use super::*;
 
     fn reference(arch: &Architecture, tp: TpPlan) -> ArchitectureTensorPlan {
-        let mut builder = Builder::new(tp, true, true);
+        let mut builder = Builder::new(tp, true, true, true);
         let dense = arch.quantization.dense_format;
         let experts = arch.quantization.expert_format;
         builder.dense_format = dense;
@@ -2983,7 +3017,7 @@ mod layout_equality {
     }
 
     fn family_reference(arch: &Architecture, tp: TpPlan) -> ArchitectureTensorPlan {
-        let mut builder = Builder::new(tp, true, true);
+        let mut builder = Builder::new(tp, true, true, true);
         let dense = arch.quantization.dense_format;
         let experts = arch.quantization.expert_format;
         builder.dense_format = dense;

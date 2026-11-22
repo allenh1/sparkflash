@@ -706,7 +706,7 @@ name = "model.language_model.layers.{layer}.ple.key_proj.weight"
 part = "ple"
 role = "ple_aux"
 dtype = "bf16"
-shape = ["hyper_width", "hidden"]
+shape = ["hyper_width", "ple_embed_dim"]
 split = "whole"
 repeat = "layers"
 when = { side = "ple" }

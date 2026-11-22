@@ -4601,7 +4601,7 @@ mod tests {
             0x0d35_642d_b843_4b20,
             // Inkling's layout learns the tower's learned-grid position, LayerNorm and
             // erf-GELU wiring, and its [vars] resolve the MTP and convolution shape facts.
-            0x70ca_7201_09d5_77db,
+            0xd274_49af_f7ed_a43d,
             0xe179_2f8b_9972_febb,
             0x6989_36fa_e0f3_fa07,
             0x4810_320b_c6c3_a5a8,
