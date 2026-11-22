@@ -904,6 +904,7 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
     let weights = source.as_ref();
     let config = sparkflash_engine::config::ModelConfig::v41_flash()
         .map_err(|error| format!("model config: {error}"))?;
+    sparkflash_deepseek_forward::open_manifest::record_model_config(&config, args.rank, args.world);
     let table =
         crate::resident_weights::rank_attention_plan_shapes(&config, args.rank, args.world)?;
     let mut lines: Vec<String> = vec![format!(
@@ -1120,6 +1121,12 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
                 (bind, arena_evidence, _arena_lines, Some(outcome))
             }
         };
+        sparkflash_deepseek_forward::open_manifest::record_tensors(
+            &setup.plan,
+            &bind.bound_names(),
+            args.rank,
+            args.world,
+        );
         let bind_path = args
             .evidence_dir
             .join(format!("tp4-bind-r{}.json", args.rank));
@@ -1355,6 +1362,10 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
 /// Runs one rank and returns its report lines.
 pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
     let args = ChainArgs::parse(args)?;
+    // The trace paths may spell `{rank}`: the four-rank launcher forwards one environment value
+    // to every rank, and this is the process that knows which rank it is.
+    sparkflash_kernels::open_manifest::set_rank(args.rank);
+    sparkflash_kernels::launch_trace::set_rank(args.rank);
     if args.loop_mode {
         return run_loop(&args);
     }

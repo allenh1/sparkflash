@@ -90,6 +90,7 @@ pub mod mxfp8_dense_m1_launch;
 pub mod mxfp8_gemv_launch;
 pub mod mxfp8_ref;
 pub mod mxfp8_wo_a_launch;
+pub mod open_manifest;
 pub mod pool_group_launch;
 pub mod ref_select_launch;
 pub mod ref_select_ref;
@@ -110,6 +111,7 @@ pub mod router_ref;
 pub mod sequence_chain;
 pub mod swiglu_ref;
 pub mod test_io;
+mod trace_path;
 pub mod vision_tower;
 #[cfg(feature = "rdma")]
 pub mod write_exchange;

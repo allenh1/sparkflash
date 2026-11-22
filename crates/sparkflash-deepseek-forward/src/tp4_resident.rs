@@ -28,7 +28,7 @@
 //! \`device_execution: false\`, \`token_produced: false\` and the RDMA shim mode unconditionally, and
 //! it names the window measurement it does not perform instead of implying one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -220,6 +220,18 @@ pub struct DeviceBind {
 }
 
 impl DeviceBind {
+    /// Every name this bind actually bound, across the four device-served classes.
+    #[must_use]
+    pub fn bound_names(&self) -> BTreeSet<String> {
+        let mut names: BTreeSet<String> = self.attention.coverage.bound.iter().cloned().collect();
+        names.extend(self.mhc_seam.coverage.bound.iter().cloned());
+        for (_, coverage) in &self.moe.coverage {
+            names.extend(coverage.bound.iter().cloned());
+        }
+        names.extend(self.tail_coverage.bound.iter().cloned());
+        names
+    }
+
     /// The complete bind evidence object, using the same builder the progressive writes use.
     #[must_use]
     pub fn evidence(&self, rank: usize, world: usize, table_entries: usize) -> Value {
@@ -495,7 +507,7 @@ fn bind_in_arena(
         Some(&census),
         None,
     )?;
-    Ok(DeviceBind {
+    let bind = DeviceBind {
         attention,
         mhc_seam,
         moe,
@@ -505,7 +517,12 @@ fn bind_in_arena(
         manifest_lines,
         #[cfg(feature = "cuda")]
         plan_index: PlanIndex::from_plan(&setup.plan),
-    })
+    };
+    // The manifest names what this bind actually bound. Recording at the one function that writes
+    // the bind evidence covers every opener; recording only in the chain CLI missed the serving
+    // epoch, which opens through device_chain and wrote no tensor records at all.
+    crate::open_manifest::record_tensors(&setup.plan, &bind.bound_names(), rank, world);
+    Ok(bind)
 }
 
 /// Streams the rank arena and binds every device-served tensor set: attention projections, routed
