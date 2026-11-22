@@ -167,6 +167,7 @@ fn trace() -> Option<&'static Trace> {
     TRACE
         .get_or_init(|| {
             let path = std::env::var_os(TRACE_ENV).filter(|path| !path.is_empty())?;
+            let path = crate::trace_path::expand(&path);
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -174,7 +175,7 @@ fn trace() -> Option<&'static Trace> {
                 .unwrap_or_else(|error| {
                     panic!(
                         "{TRACE_ENV}={} cannot be opened for the launch trace: {error}",
-                        std::path::Path::new(&path).display()
+                        path.display()
                     )
                 });
             Some(Trace {
@@ -183,6 +184,11 @@ fn trace() -> Option<&'static Trace> {
             })
         })
         .as_ref()
+}
+
+/// Sets the process rank a `{rank}` placeholder in [TRACE_ENV] expands to.
+pub fn set_rank(rank: usize) {
+    crate::trace_path::set_rank(rank);
 }
 
 /// Whether this process traces its launches.
