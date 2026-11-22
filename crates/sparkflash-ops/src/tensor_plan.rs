@@ -216,7 +216,7 @@ impl ArchitectureTensorPlan {
         } else {
             experts
         };
-        if builder.from_layout(architecture)? {
+        if builder.read_layout(architecture)? {
             return Ok(builder.finish());
         }
         match architecture.family.as_str() {
@@ -405,7 +405,7 @@ impl Builder {
     /// Returns false when no layout matches, so a checkpoint with no file still runs the
     /// structural reader. A layout that matches but describes no tensor is a refusal: a file
     /// exists to say what the structural reader could not.
-    fn from_layout(&mut self, arch: &Architecture) -> Result<bool, PlanError> {
+    fn read_layout(&mut self, arch: &Architecture) -> Result<bool, PlanError> {
         let layout = sparkflash_model::layout::matching(arch)
             .map_err(|error| PlanError::Invalid(error.to_string()))?;
         let Some(layout) = layout else {
@@ -2906,9 +2906,9 @@ mod layout_equality {
         builder.finish()
     }
 
-    fn table(
-        plan: &ArchitectureTensorPlan,
-    ) -> BTreeMap<String, (String, Vec<usize>, Vec<usize>, Option<RankRun>, String)> {
+    type PlanRow = (String, Vec<usize>, Vec<usize>, Option<RankRun>, String);
+
+    fn table(plan: &ArchitectureTensorPlan) -> BTreeMap<String, PlanRow> {
         let mut out = BTreeMap::new();
         for index in 0..plan.len() {
             let spec = plan.spec_at(index);
