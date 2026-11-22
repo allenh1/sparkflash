@@ -28,9 +28,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sparkflash_model::architecture::{
-    Architecture, AttentionKind, DenseMlp, Ffn, Kda, Layer, Moe, PleGeometry, Residual, ScaleDType,
-    Side, WeightFormat,
+    Architecture, AttentionKind, Ffn, Layer, Moe, PleGeometry, Residual, ScaleDType, Side,
+    WeightFormat,
 };
+#[cfg(test)]
+use sparkflash_model::architecture::{DenseMlp, Kda};
 use sparkflash_model::layout::{LayoutDtype, LayoutTensor, TensorSplit};
 use sparkflash_model::{TpAxis, TpPlan};
 use sparkflash_weights::rng::is_prime;
@@ -2925,7 +2927,7 @@ mod layout_equality {
     }
 
     #[test]
-    fn the_glm_layout_reproduces_the_family_planner() {
+    fn the_worked_layout_reproduces_the_family_planner() {
         let text = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
         let architecture = Architecture::from_json(text).expect("the carried config");
         for world in [1usize, 2, 4] {
