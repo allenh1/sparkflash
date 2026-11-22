@@ -8,10 +8,9 @@
 #     (revision 1bae0e1088993b9b82de08f59de5be5a34e42170). The checkpoint ships those two
 #     files beside its weights; the line numbers below are that copy.
 #
-# Every shape is an arithmetic expression over a config fact or an architecture fact. The one
-# exception is the Engram table row counts: config.json carries them as a per-layer array and
-# the reader's vars are scalar, so each layer's count is written once on the entry selecting
-# that layer.
+# Every shape is an arithmetic expression over a config fact or an architecture fact. Config
+# arrays are read as array vars, so the Engram row count is engram_rows[list] on the layer the
+# same list position names, and the MTP target count is the target array's length.
 #
 # Quantized classes, sourced from the tensor index and the arm's tensor.rs:
 #   * dense FP8: E4M3 codes with a 32x32 UE8M0 scale grid (model.py:759-761, tensor.rs dense());
@@ -41,18 +40,27 @@ engram_heads = { key = "text_config.engram_n_heads" }
 engram_head_dim = { key = "text_config.engram_head_dim" }
 engram_ngram = { key = "text_config.engram_max_ngram_size" }
 
-# config.json text_config.engram_num_embeddings entries 0 and 1, for layers 1 and 14
-# (engram_layer_ids). Two scalars because the reader's vars are scalars.
-engram_rows_1 = 384006168
-engram_rows_14 = 384016682
+# config.json text_config.engram_layer_ids / engram_num_embeddings: the layers that carry an
+# Engram and one table row count per entry. The listed repeat and rows[list] keep the two arrays
+# paired without naming a layer or a count.
+engram_ids = { key = "text_config.engram_layer_ids", array = true }
+engram_rows = { key = "text_config.engram_num_embeddings", array = true }
+
+# config.json text_config.kv_source_layer_ids / index_source_layer_ids: the layers that own the
+# compressed KV and the sparse indexer.
+kv_source_ids = { key = "text_config.kv_source_layer_ids", array = true }
+index_source_ids = { key = "text_config.index_source_layer_ids", array = true }
 
 # config.json text_config.dspark_markov_rank: the Markov head's rank (model.py:1117).
 markov_rank = { key = "text_config.dspark_markov_rank" }
 
-# config.json text_config.dspark_target_layer_ids has three entries and model.py:1113 sizes
-# main_proj's input by their number. The reader has no array-length var, so the count is
-# written once here rather than repeated in the two main_proj shapes.
-mtp_targets = 3
+# config.json text_config.dspark_target_layer_ids: model.py:1113 sizes main_proj's input by the
+# number of entries, not by a written count.
+mtp_targets = { key = "text_config.dspark_target_layer_ids", length = true }
+
+# config.json quantization_config.weight_block_size: the scale grid, read from the config rather
+# than repeated as a literal in every scale shape.
+quant_block = { key = "quantization_config.weight_block_size", array = true }
 
 # Config keys the description decodes through this layout. A key the arm's typed parser reads
 # and the shared description has no use for is listed ignorable with the reason.
@@ -77,12 +85,6 @@ fact = "match.vision_model_type"
 # reads it in ModelArgs; the shared checkpoint plan does not plan the DSpark sampler.
 path = "text_config.dspark_noise_token_id"
 ignore = "the arm typed DSpark parser owns this token id; the shared checkpoint plan does not run DSpark sampling"
-
-[[keys]]
-# config.json text_config.dspark_markov_rank is carried in [vars]; this entry keeps it out of
-# the unknown-key report even when a checkpoint omits the DSpark stage.
-path = "text_config.dspark_markov_rank"
-ignore = "the key sizes the MTP Markov head; [vars] carries it as markov_rank"
 
 [[keys]]
 # config.json vision_config.max_image_tokens: the image processor's token budget. vision.py has
@@ -335,7 +337,7 @@ name = "layers.{layer}.attn.wq_a.scale"
 part = "mla_attention"
 role = "attention"
 dtype = "f8e8m0"
-shape = ["(q_lora) / 32", "(hidden) / 32"]
+shape = ["(q_lora) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "whole"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
@@ -355,7 +357,7 @@ name = "layers.{layer}.attn.wq_b.scale"
 part = "mla_attention"
 role = "attention"
 dtype = "f8e8m0"
-shape = ["(heads * head_dim) / 32", "(q_lora) / 32"]
+shape = ["(heads * head_dim) / quant_block[0]", "(q_lora) / quant_block[0]"]
 split = "whole"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
@@ -375,7 +377,7 @@ name = "layers.{layer}.attn.wkv.scale"
 part = "mla_attention"
 role = "attention"
 dtype = "f8e8m0"
-shape = ["(head_dim) / 32", "(hidden) / 32"]
+shape = ["(head_dim) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "whole"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
@@ -395,7 +397,7 @@ name = "layers.{layer}.attn.wo_a.scale"
 part = "mla_attention"
 role = "attention"
 dtype = "f8e8m0"
-shape = ["(o_groups * o_lora) / 32", "(heads * head_dim / o_groups) / 32"]
+shape = ["(o_groups * o_lora) / quant_block[0]", "(heads * head_dim / o_groups) / quant_block[0]"]
 split = "whole"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
@@ -415,7 +417,7 @@ name = "layers.{layer}.attn.wo_b.scale"
 part = "mla_attention"
 role = "attention"
 dtype = "f8e8m0"
-shape = ["(hidden) / 32", "(o_groups * o_lora) / 32"]
+shape = ["(hidden) / quant_block[0]", "(o_groups * o_lora) / quant_block[0]"]
 split = "whole"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
@@ -469,7 +471,7 @@ name = "layers.{layer}.ffn.shared_experts.w1.scale"
 part = "moe"
 role = "shared_expert"
 dtype = "f8e8m0"
-shape = ["(shared_width) / 32", "(hidden) / 32"]
+shape = ["(shared_width) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "whole"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
@@ -489,7 +491,7 @@ name = "layers.{layer}.ffn.shared_experts.w2.scale"
 part = "moe"
 role = "shared_expert"
 dtype = "f8e8m0"
-shape = ["(hidden) / 32", "(shared_width) / 32"]
+shape = ["(hidden) / quant_block[0]", "(shared_width) / quant_block[0]"]
 split = "whole"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
@@ -509,7 +511,7 @@ name = "layers.{layer}.ffn.shared_experts.w3.scale"
 part = "moe"
 role = "shared_expert"
 dtype = "f8e8m0"
-shape = ["(shared_width) / 32", "(hidden) / 32"]
+shape = ["(shared_width) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "whole"
 repeat = "layers"
 when = { attention = "mla", ffn = "moe" }
@@ -533,7 +535,7 @@ name = "layers.{layer}.ffn.experts.{expert}.w1.scale"
 part = "moe"
 role = "experts"
 dtype = "f8e8m0"
-shape = ["moe_intermediate", "hidden / 32"]
+shape = ["moe_intermediate", "hidden / quant_block[0]"]
 split = "rows"
 repeat = "experts"
 when = { attention = "mla", ffn = "moe" }
@@ -553,7 +555,7 @@ name = "layers.{layer}.ffn.experts.{expert}.w2.scale"
 part = "moe"
 role = "experts"
 dtype = "f8e8m0"
-shape = ["hidden", "moe_intermediate / 32"]
+shape = ["hidden", "moe_intermediate / quant_block[0]"]
 split = "columns"
 repeat = "experts"
 when = { attention = "mla", ffn = "moe" }
@@ -573,569 +575,168 @@ name = "layers.{layer}.ffn.experts.{expert}.w3.scale"
 part = "moe"
 role = "experts"
 dtype = "f8e8m0"
-shape = ["moe_intermediate", "hidden / 32"]
+shape = ["moe_intermediate", "hidden / quant_block[0]"]
 split = "rows"
 repeat = "experts"
 when = { attention = "mla", ffn = "moe" }
 
-# model.py:429-470 and config kv_source_layer_ids: the four layers that own a compressed KV.
-# compressor.wgate exists only where compress_ratios[layer] > 1 (layers 2, 8, 14).
+# model.py:429-470 and config kv_source_layer_ids: the layers that own a compressed KV. The
+# listed repeat walks the config array, so no name carries a literal layer number.
 [[tensor]]
-name = "layers.2.attn.compressor.wkv.weight"
+name = "layers.{layer}.attn.compressor.wkv.weight"
 part = "csa2_compression"
 role = "attention"
 dtype = "bf16"
 shape = ["head_dim", "hidden"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [2] }
+repeat = "listed_layers"
+layers = "kv_source_ids"
+when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "layers.2.attn.compressor.norm.weight"
+name = "layers.{layer}.attn.compressor.norm.weight"
 part = "csa2_compression"
 role = "attention"
 dtype = "bf16"
 shape = ["head_dim"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [2] }
+repeat = "listed_layers"
+layers = "kv_source_ids"
+when = { attention = "mla", ffn = "moe" }
 
-[[tensor]]
-name = "layers.8.attn.compressor.wkv.weight"
-part = "csa2_compression"
-role = "attention"
-dtype = "bf16"
-shape = ["head_dim", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [8] }
+# compressor.wgate exists only where compress_ratios[layer] > 1. The config lists no such
+# layer array and the when selectors cannot filter on a compress ratio, so these three stored
+# tensors are deliberately not declared; the format gap is recorded in the PR rather than
+# worked around with literal layer numbers.
 
+# model.py:488-530 and config index_source_layer_ids: the indexer layers. The listed repeat
+# walks the config array. Only a layer that owns the compressed KV publishes its own index
+# keys (wk/k_norm), so that pair walks kv_source_layer_ids (tensor.rs push_indexer).
 [[tensor]]
-name = "layers.8.attn.compressor.norm.weight"
-part = "csa2_compression"
-role = "attention"
-dtype = "bf16"
-shape = ["head_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [8] }
-
-[[tensor]]
-name = "layers.14.attn.compressor.wkv.weight"
-part = "csa2_compression"
-role = "attention"
-dtype = "bf16"
-shape = ["head_dim", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-[[tensor]]
-name = "layers.14.attn.compressor.norm.weight"
-part = "csa2_compression"
-role = "attention"
-dtype = "bf16"
-shape = ["head_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-[[tensor]]
-name = "layers.20.attn.compressor.wkv.weight"
-part = "csa2_compression"
-role = "attention"
-dtype = "bf16"
-shape = ["head_dim", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [20] }
-
-[[tensor]]
-name = "layers.20.attn.compressor.norm.weight"
-part = "csa2_compression"
-role = "attention"
-dtype = "bf16"
-shape = ["head_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [20] }
-
-[[tensor]]
-name = "layers.2.attn.compressor.wgate.weight"
-part = "csa2_compression"
-role = "attention"
-dtype = "bf16"
-shape = ["head_dim", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [2] }
-
-[[tensor]]
-name = "layers.8.attn.compressor.wgate.weight"
-part = "csa2_compression"
-role = "attention"
-dtype = "bf16"
-shape = ["head_dim", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [8] }
-
-[[tensor]]
-name = "layers.14.attn.compressor.wgate.weight"
-part = "csa2_compression"
-role = "attention"
-dtype = "bf16"
-shape = ["head_dim", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-# model.py:488-530 and config index_source_layer_ids: the eight indexer layers. Only the four
-# kv-source layers (2, 8, 14, 20) publish their own index keys (wk/k_norm).
-[[tensor]]
-name = "layers.2.attn.indexer.wq_b.weight"
+name = "layers.{layer}.attn.indexer.wq_b.weight"
 part = "sparse_indexer"
 role = "indexer"
 dtype = "f8e4m3"
 shape = ["index_heads * index_dim", "q_lora"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [2] }
+repeat = "listed_layers"
+layers = "index_source_ids"
+when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "layers.2.attn.indexer.wq_b.scale"
+name = "layers.{layer}.attn.indexer.wq_b.scale"
 part = "sparse_indexer"
 role = "indexer"
 dtype = "f8e8m0"
-shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
+shape = ["(index_heads * index_dim) / quant_block[0]", "q_lora / quant_block[0]"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [2] }
+repeat = "listed_layers"
+layers = "index_source_ids"
+when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "layers.2.attn.indexer.weights_proj.weight"
+name = "layers.{layer}.attn.indexer.weights_proj.weight"
 part = "sparse_indexer"
 role = "indexer"
 dtype = "bf16"
 shape = ["index_heads", "hidden"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [2] }
+repeat = "listed_layers"
+layers = "index_source_ids"
+when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "layers.8.attn.indexer.wq_b.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e4m3"
-shape = ["index_heads * index_dim", "q_lora"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [8] }
-
-[[tensor]]
-name = "layers.8.attn.indexer.wq_b.scale"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e8m0"
-shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [8] }
-
-[[tensor]]
-name = "layers.8.attn.indexer.weights_proj.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_heads", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [8] }
-
-[[tensor]]
-name = "layers.14.attn.indexer.wq_b.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e4m3"
-shape = ["index_heads * index_dim", "q_lora"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-[[tensor]]
-name = "layers.14.attn.indexer.wq_b.scale"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e8m0"
-shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-[[tensor]]
-name = "layers.14.attn.indexer.weights_proj.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_heads", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-[[tensor]]
-name = "layers.20.attn.indexer.wq_b.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e4m3"
-shape = ["index_heads * index_dim", "q_lora"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [20] }
-
-[[tensor]]
-name = "layers.20.attn.indexer.wq_b.scale"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e8m0"
-shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [20] }
-
-[[tensor]]
-name = "layers.20.attn.indexer.weights_proj.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_heads", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [20] }
-
-[[tensor]]
-name = "layers.24.attn.indexer.wq_b.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e4m3"
-shape = ["index_heads * index_dim", "q_lora"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [24] }
-
-[[tensor]]
-name = "layers.24.attn.indexer.wq_b.scale"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e8m0"
-shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [24] }
-
-[[tensor]]
-name = "layers.24.attn.indexer.weights_proj.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_heads", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [24] }
-
-[[tensor]]
-name = "layers.28.attn.indexer.wq_b.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e4m3"
-shape = ["index_heads * index_dim", "q_lora"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [28] }
-
-[[tensor]]
-name = "layers.28.attn.indexer.wq_b.scale"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e8m0"
-shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [28] }
-
-[[tensor]]
-name = "layers.28.attn.indexer.weights_proj.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_heads", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [28] }
-
-[[tensor]]
-name = "layers.32.attn.indexer.wq_b.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e4m3"
-shape = ["index_heads * index_dim", "q_lora"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [32] }
-
-[[tensor]]
-name = "layers.32.attn.indexer.wq_b.scale"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e8m0"
-shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [32] }
-
-[[tensor]]
-name = "layers.32.attn.indexer.weights_proj.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_heads", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [32] }
-
-[[tensor]]
-name = "layers.36.attn.indexer.wq_b.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e4m3"
-shape = ["index_heads * index_dim", "q_lora"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [36] }
-
-[[tensor]]
-name = "layers.36.attn.indexer.wq_b.scale"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "f8e8m0"
-shape = ["(index_heads * index_dim) / 32", "q_lora / 32"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [36] }
-
-[[tensor]]
-name = "layers.36.attn.indexer.weights_proj.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_heads", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [36] }
-
-[[tensor]]
-name = "layers.2.attn.indexer.wk.weight"
+name = "layers.{layer}.attn.indexer.wk.weight"
 part = "sparse_indexer"
 role = "indexer"
 dtype = "bf16"
 shape = ["index_dim", "head_dim"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [2] }
+repeat = "listed_layers"
+layers = "kv_source_ids"
+when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "layers.2.attn.indexer.k_norm.weight"
+name = "layers.{layer}.attn.indexer.k_norm.weight"
 part = "sparse_indexer"
 role = "indexer"
 dtype = "bf16"
 shape = ["index_dim"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [2] }
+repeat = "listed_layers"
+layers = "kv_source_ids"
+when = { attention = "mla", ffn = "moe" }
 
-[[tensor]]
-name = "layers.8.attn.indexer.wk.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_dim", "head_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [8] }
-
-[[tensor]]
-name = "layers.8.attn.indexer.k_norm.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [8] }
-
-[[tensor]]
-name = "layers.14.attn.indexer.wk.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_dim", "head_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-[[tensor]]
-name = "layers.14.attn.indexer.k_norm.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-[[tensor]]
-name = "layers.20.attn.indexer.wk.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_dim", "head_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [20] }
-
-[[tensor]]
-name = "layers.20.attn.indexer.k_norm.weight"
-part = "sparse_indexer"
-role = "indexer"
-dtype = "bf16"
-shape = ["index_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [20] }
-
-# model.py:328-356 and config engram_layer_ids: the two Engram layers. Rows are the two
-# config engram_num_embeddings entries; the fetched width is
+# model.py:328-356 and config engram_layer_ids: the Engram layers. The rows are
+# engram_num_embeddings[list] for the same position in engram_layer_ids; the fetched width is
 # (engram_max_ngram_size - 1) * engram_n_heads * engram_head_dim (model.py:344-345).
 # The ops vocabulary has no Engram tensor role yet, so the table uses ple_table and the
 # projections use ple_aux; the part is engram.
 [[tensor]]
-name = "layers.1.engram.embed.weight"
+name = "layers.{layer}.engram.embed.weight"
 part = "engram"
 role = "ple_table"
 dtype = "f8e4m3"
-shape = ["engram_rows_1", "engram_head_dim"]
+shape = ["engram_rows[list]", "engram_head_dim"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [1] }
+repeat = "listed_layers"
+layers = "engram_ids"
+when = { side = "engram" }
 
 [[tensor]]
-name = "layers.1.engram.embed.scale"
+name = "layers.{layer}.engram.embed.scale"
 part = "engram"
 role = "ple_table"
 dtype = "f8e8m0"
-shape = ["engram_rows_1", "engram_head_dim / 32"]
+shape = ["engram_rows[list]", "engram_head_dim / quant_block[0]"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [1] }
+repeat = "listed_layers"
+layers = "engram_ids"
+when = { side = "engram" }
 
 [[tensor]]
-name = "layers.1.engram.wkv.weight"
-part = "engram"
-role = "ple_aux"
-dtype = "f8e4m3"
-shape = ["hidden * (streams + 1)", "(engram_ngram - 1) * engram_heads * engram_head_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [1] }
-
-[[tensor]]
-name = "layers.1.engram.wkv.scale"
-part = "engram"
-role = "ple_aux"
-dtype = "f8e8m0"
-shape = ["(hidden * (streams + 1)) / 32", "((engram_ngram - 1) * engram_heads * engram_head_dim) / 32"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [1] }
-
-[[tensor]]
-name = "layers.1.engram.q_weight"
-part = "engram"
-role = "ple_aux"
-dtype = "bf16"
-shape = ["streams", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [1] }
-
-[[tensor]]
-name = "layers.1.engram.k_weight"
-part = "engram"
-role = "ple_aux"
-dtype = "bf16"
-shape = ["streams", "hidden"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [1] }
-
-[[tensor]]
-name = "layers.14.engram.embed.weight"
-part = "engram"
-role = "ple_table"
-dtype = "f8e4m3"
-shape = ["engram_rows_14", "engram_head_dim"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-[[tensor]]
-name = "layers.14.engram.embed.scale"
-part = "engram"
-role = "ple_table"
-dtype = "f8e8m0"
-shape = ["engram_rows_14", "engram_head_dim / 32"]
-split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
-
-[[tensor]]
-name = "layers.14.engram.wkv.weight"
+name = "layers.{layer}.engram.wkv.weight"
 part = "engram"
 role = "ple_aux"
 dtype = "f8e4m3"
 shape = ["hidden * (streams + 1)", "(engram_ngram - 1) * engram_heads * engram_head_dim"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
+repeat = "listed_layers"
+layers = "engram_ids"
+when = { side = "engram" }
 
 [[tensor]]
-name = "layers.14.engram.wkv.scale"
+name = "layers.{layer}.engram.wkv.scale"
 part = "engram"
 role = "ple_aux"
 dtype = "f8e8m0"
-shape = ["(hidden * (streams + 1)) / 32", "((engram_ngram - 1) * engram_heads * engram_head_dim) / 32"]
+shape = ["(hidden * (streams + 1)) / quant_block[0]", "((engram_ngram - 1) * engram_heads * engram_head_dim) / quant_block[0]"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
+repeat = "listed_layers"
+layers = "engram_ids"
+when = { side = "engram" }
 
 [[tensor]]
-name = "layers.14.engram.q_weight"
+name = "layers.{layer}.engram.q_weight"
 part = "engram"
 role = "ple_aux"
 dtype = "bf16"
 shape = ["streams", "hidden"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
+repeat = "listed_layers"
+layers = "engram_ids"
+when = { side = "engram" }
 
 [[tensor]]
-name = "layers.14.engram.k_weight"
+name = "layers.{layer}.engram.k_weight"
 part = "engram"
 role = "ple_aux"
 dtype = "bf16"
 shape = ["streams", "hidden"]
 split = "whole"
-repeat = "layers"
-when = { attention = "mla", ffn = "moe", layers = [14] }
+repeat = "listed_layers"
+layers = "engram_ids"
+when = { side = "engram" }
 
 # model.py:1100-1160 and config num_nextn_predict_layers=3: three MTP stages. The gate,
 # experts and bias widths are the stage's 128 routed experts (dspark_n_routed_experts), not
@@ -1266,7 +867,7 @@ name = "mtp.{stage}.attn.wq_a.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["(q_lora) / 32", "(hidden) / 32"]
+shape = ["(q_lora) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "whole"
 repeat = "mtp_stages"
 when = { attention = "mla", ffn = "moe" }
@@ -1286,7 +887,7 @@ name = "mtp.{stage}.attn.wq_b.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["(heads * head_dim) / 32", "(q_lora) / 32"]
+shape = ["(heads * head_dim) / quant_block[0]", "(q_lora) / quant_block[0]"]
 split = "whole"
 repeat = "mtp_stages"
 when = { attention = "mla", ffn = "moe" }
@@ -1306,7 +907,7 @@ name = "mtp.{stage}.attn.wkv.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["(head_dim) / 32", "(hidden) / 32"]
+shape = ["(head_dim) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "whole"
 repeat = "mtp_stages"
 when = { attention = "mla", ffn = "moe" }
@@ -1326,7 +927,7 @@ name = "mtp.{stage}.attn.wo_a.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["(o_groups * o_lora) / 32", "(heads * head_dim / o_groups) / 32"]
+shape = ["(o_groups * o_lora) / quant_block[0]", "(heads * head_dim / o_groups) / quant_block[0]"]
 split = "whole"
 repeat = "mtp_stages"
 when = { attention = "mla", ffn = "moe" }
@@ -1346,7 +947,7 @@ name = "mtp.{stage}.attn.wo_b.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["(hidden) / 32", "(o_groups * o_lora) / 32"]
+shape = ["(hidden) / quant_block[0]", "(o_groups * o_lora) / quant_block[0]"]
 split = "whole"
 repeat = "mtp_stages"
 when = { attention = "mla", ffn = "moe" }
@@ -1396,7 +997,7 @@ name = "mtp.{stage}.ffn.shared_experts.w1.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["(shared_width) / 32", "(hidden) / 32"]
+shape = ["(shared_width) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "whole"
 repeat = "mtp_stages"
 when = { attention = "mla", ffn = "moe" }
@@ -1416,7 +1017,7 @@ name = "mtp.{stage}.ffn.shared_experts.w2.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["(hidden) / 32", "(shared_width) / 32"]
+shape = ["(hidden) / quant_block[0]", "(shared_width) / quant_block[0]"]
 split = "whole"
 repeat = "mtp_stages"
 when = { attention = "mla", ffn = "moe" }
@@ -1436,7 +1037,7 @@ name = "mtp.{stage}.ffn.shared_experts.w3.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["(shared_width) / 32", "(hidden) / 32"]
+shape = ["(shared_width) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "whole"
 repeat = "mtp_stages"
 when = { attention = "mla", ffn = "moe" }
@@ -1456,7 +1057,7 @@ name = "mtp.{stage}.ffn.experts.{expert}.w1.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["moe_intermediate", "hidden / 32"]
+shape = ["moe_intermediate", "hidden / quant_block[0]"]
 split = "rows"
 repeat = "mtp_stage_experts"
 when = { attention = "mla", ffn = "moe" }
@@ -1476,7 +1077,7 @@ name = "mtp.{stage}.ffn.experts.{expert}.w2.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["hidden", "moe_intermediate / 32"]
+shape = ["hidden", "moe_intermediate / quant_block[0]"]
 split = "columns"
 repeat = "mtp_stage_experts"
 when = { attention = "mla", ffn = "moe" }
@@ -1496,7 +1097,7 @@ name = "mtp.{stage}.ffn.experts.{expert}.w3.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["moe_intermediate", "hidden / 32"]
+shape = ["moe_intermediate", "hidden / quant_block[0]"]
 split = "rows"
 repeat = "mtp_stage_experts"
 when = { attention = "mla", ffn = "moe" }
@@ -1505,7 +1106,7 @@ when = { attention = "mla", ffn = "moe" }
 # head and the confidence head. Both are outside the per-stage repeat, so each is declared
 # once with its stage spelled in the name.
 [[tensor]]
-name = "mtp.0.main_proj.weight"
+name = "mtp.{mtp_targets - mtp_targets}.main_proj.weight"
 part = "mtp"
 role = "mtp"
 dtype = "f8e4m3"
@@ -1515,17 +1116,17 @@ repeat = "mtp"
 when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "mtp.0.main_proj.scale"
+name = "mtp.{mtp_targets - mtp_targets}.main_proj.scale"
 part = "mtp"
 role = "mtp"
 dtype = "f8e8m0"
-shape = ["(hidden) / 32", "(mtp_targets * hidden) / 32"]
+shape = ["(hidden) / quant_block[0]", "(mtp_targets * hidden) / quant_block[0]"]
 split = "whole"
 repeat = "mtp"
 when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "mtp.0.main_norm.weight"
+name = "mtp.{mtp_targets - mtp_targets}.main_norm.weight"
 part = "mtp"
 role = "mtp"
 dtype = "bf16"
@@ -1535,7 +1136,7 @@ repeat = "mtp"
 when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "mtp.2.norm.weight"
+name = "mtp.{mtp_targets - 1}.norm.weight"
 part = "mtp"
 role = "mtp"
 dtype = "bf16"
@@ -1545,7 +1146,7 @@ repeat = "mtp"
 when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "mtp.2.markov_head.embed.weight"
+name = "mtp.{mtp_targets - 1}.markov_head.embed.weight"
 part = "mtp"
 role = "mtp"
 dtype = "bf16"
@@ -1555,7 +1156,7 @@ repeat = "mtp"
 when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "mtp.2.markov_head.head.weight"
+name = "mtp.{mtp_targets - 1}.markov_head.head.weight"
 part = "mtp"
 role = "mtp"
 dtype = "bf16"
@@ -1565,7 +1166,7 @@ repeat = "mtp"
 when = { attention = "mla", ffn = "moe" }
 
 [[tensor]]
-name = "mtp.2.confidence_head.proj.weight"
+name = "mtp.{mtp_targets - 1}.confidence_head.proj.weight"
 part = "mtp"
 role = "mtp"
 dtype = "bf16"
