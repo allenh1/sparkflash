@@ -1,0 +1,3887 @@
+# Inkling-2-Small layout.
+#
+# Sources, in the order the layout spec gives them:
+#   * the checkpoint's config.json: the nested text_config, vision_config and mtp_config;
+#   * the tensor index: every stored name, dtype and shape in model-*.safetensors and
+#     mtp.safetensors (1854 tensors);
+#   * the arm crate crates/sparkflash-model-inkling2, which runs the released checkpoint today
+#     and is the only published reference code for this producer: src/tensor.rs (names, shapes,
+#     rank splits), src/vision.rs (tower wiring and arithmetic) and src/config.rs (typed
+#     geometry). There is no reference/ directory for this producer.
+#
+# Shapes are expressions over the facts the shared reader derives from config.json. Where the
+# reader exposes no fact (the short-convolution taps, d_rel, rel_extent, the position grid and
+# every MTP dimension) the stored dimension is written as the literal the index states, and the
+# comment names the config key it comes from.
+#
+# Known format gaps, recorded rather than worked around (see the PR report):
+#   * the routed experts are stacked per layer with an expert axis; no tensor declaration can
+#     express a 3-D stacked expert tensor or split its expert axis, so those 352 tensors are
+#     left unclaimed;
+#   * the MTP stage has five layers and its own geometry; the reader has no repeat over stages,
+#     so the 84 stage tensors are listed explicitly.
+
+schema = 1
+id = "inkling2-small"
+
+[match]
+# config.json architectures and model_type. This is the only family-string comparison.
+architectures = ["Inkling2ForConditionalGeneration"]
+model_types = ["inkling2"]
+
+[[keys]]
+# config.json text_config.q_bias.
+path = "text_config.q_bias"
+ignore = "text_config.q_bias is false: no query bias tensor exists in the index, and the shared attention description reads its bias switch from the root attention_bias key; the arm's typed parser is the reader that keeps this per-projection switch"
+
+[[keys]]
+# config.json text_config.o_bias.
+path = "text_config.o_bias"
+ignore = "text_config.o_bias is false: no output-projection bias tensor exists in the index; the shared attention description has no per-projection bias field, and the arm's typed parser keeps the switch"
+
+[[keys]]
+# config.json text_config.pre_norm_pre_affine.
+path = "text_config.pre_norm_pre_affine"
+ignore = "text_config.pre_norm_pre_affine is false, so the pre-norm is a plain RMSNorm; the shared description has no pre-affine field to carry a true value and the arm's typed parser keeps it"
+
+[[keys]]
+# config.json text_config.final_norm_pre_affine.
+path = "text_config.final_norm_pre_affine"
+ignore = "text_config.final_norm_pre_affine is false, so the final norm is a plain RMSNorm; the shared description has no pre-affine field and the arm's typed parser keeps it"
+
+[[keys]]
+# config.json text_config.swa_head_dim.
+path = "text_config.swa_head_dim"
+ignore = "the sliding layers' head width (128) equals text_config.head_dim, which the shared reader already reads; the arm's typed parser keeps the sliding spelling"
+
+[[keys]]
+# config.json text_config.swa_num_attention_heads.
+path = "text_config.swa_num_attention_heads"
+ignore = "the sliding layers' query-head count (48) equals text_config.num_attention_heads, which the shared reader already reads; the arm's typed parser keeps the sliding spelling"
+
+[[keys]]
+# config.json text_config.swa_num_key_value_heads.
+path = "text_config.swa_num_key_value_heads"
+ignore = "the sliding layers' key/value-head count (8) equals text_config.num_key_value_heads, which the shared reader already reads; the arm's typed parser keeps the sliding spelling"
+
+[[keys]]
+# config.json text_config.use_gate_bias.
+path = "text_config.use_gate_bias"
+ignore = "true here, and proved by the stored model.llm.layers.*.mlp.gate.bias tensor; the router bias is claimed as its own tensor below and the shared MoE description selects its bias from the tensor name, so the switch itself is not read"
+
+[[keys]]
+# config.json vision_config.projector_bias.
+path = "vision_config.projector_bias"
+ignore = "false here, and proved by the stored proj_in/proj_out tensors having no bias; the shared vision description has no projector-bias field, and the arm's typed parser keeps the switch"
+
+[[keys]]
+# config.json mtp_config.hidden_size.
+path = "mtp_config.hidden_size"
+ignore = "the MTP stage width is 4608 and equals text_config.hidden_size, which the shared reader reads for the backbone; the stage's tensors below carry their own shapes and the arm's typed parser keeps the stage field"
+
+[[keys]]
+# config.json mtp_config.num_attention_heads.
+path = "mtp_config.num_attention_heads"
+ignore = "the MTP stage's 48 query heads are not read by the shared draft description; the stage's tensors below carry their stored shapes and the arm's typed parser keeps the field"
+
+[[keys]]
+# config.json mtp_config.num_key_value_heads.
+path = "mtp_config.num_key_value_heads"
+ignore = "the MTP stage's 8 key/value heads are not read by the shared draft description; the stage's tensors below carry their stored shapes and the arm's typed parser keeps the field"
+
+[[keys]]
+# config.json mtp_config.head_dim.
+path = "mtp_config.head_dim"
+ignore = "the MTP stage's 128-wide head is not read by the shared draft description; the stage's tensors below carry their stored shapes and the arm's typed parser keeps the field"
+
+[[keys]]
+# config.json mtp_config.intermediate_size.
+path = "mtp_config.intermediate_size"
+ignore = "the MTP stage's 18432-wide MLP is not read by the shared draft description; the stage's tensors below carry their stored shapes and the arm's typed parser keeps the field"
+
+[[keys]]
+# config.json mtp_config.max_position_embeddings.
+path = "mtp_config.max_position_embeddings"
+ignore = "the MTP stage's context limit is not arithmetic the draft stack executes in the shared description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.q_bias.
+path = "mtp_config.q_bias"
+ignore = "false: the MTP stage stores no q_proj bias in mtp.safetensors; the arm's typed parser keeps the switch"
+
+[[keys]]
+# config.json mtp_config.o_bias.
+path = "mtp_config.o_bias"
+ignore = "false: the MTP stage stores no o_proj bias in mtp.safetensors; the arm's typed parser keeps the switch"
+
+[[keys]]
+# config.json mtp_config.rms_norm_eps.
+path = "mtp_config.rms_norm_eps"
+ignore = "the MTP stage's 1e-6 RMS epsilon is not a field of the shared draft description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.rope_theta.
+path = "mtp_config.rope_theta"
+ignore = "the MTP stage's 1e6 rotary base is not a field of the shared draft description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.local_layer_ids.
+path = "mtp_config.local_layer_ids"
+ignore = "the MTP stage's sliding-layer schedule is not a field of the shared draft description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.sliding_window_size.
+path = "mtp_config.sliding_window_size"
+ignore = "the MTP stage's 1024-token window is not a field of the shared draft description; the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.markov_rank.
+path = "mtp_config.markov_rank"
+ignore = "the MTP stage's 256-wide Markov head is a stage-only tensor shape (markov_head.* below); the shared draft description has no field for it and the arm's typed parser keeps it"
+
+[[keys]]
+# config.json mtp_config.markov_head_type.
+path = "mtp_config.markov_head_type"
+ignore = "the MTP stage's rnn_hidden Markov head is a stage-only wiring fact; the shared draft description has no field for it and the arm's typed parser keeps it"
+
+[stacks.language]
+# src/tensor.rs:265-520 walks each layer as mlp_norm, the attention branch, the MLP/router,
+# inside the block-attention residual, with a short convolution on both branches.
+order = [
+  "embedding",
+  "rms_norm",
+  "lm_head",
+  "block_attention_residual",
+  "gqa_attention",
+  "relative_attention",
+  "short_conv",
+  "moe",
+  "softcapped_activation",
+]
+
+[stacks.draft]
+order = ["mtp"]
+
+[stacks.vision]
+# src/vision.rs:381-470: patch embedding, learned 32x32 position grid, LayerNorm blocks,
+# axial rotary attention, erf-GELU MLP, proj_in -> erf-GELU -> proj_out merger.
+order = [
+  "vision_patch_embed",
+  "vision_position",
+  "vision_norm",
+  "vision_attention",
+  "vision_mlp",
+  "vision_merger",
+]
+
+# src/vision.rs:208-235 and 397-408: the tower resamples a learned 32x32 grid and stores no
+# rotary base; the index agrees (position_embedding is stored, no rope table). This is the one
+# vision fact the shared reader applies.
+[[stacks.vision.parts]]
+part = "vision_position"
+[[stacks.vision.parts.facts]]
+name = "position"
+value = "grid"
+
+# The facts below are carried with their sources. The shared reader's apply_facts only applies
+# vision.position today, so the scan rows they describe stay unknown layout until it learns the
+# fields; they are recorded here rather than guessed in Rust.
+[[stacks.vision.parts]]
+part = "vision_norm"
+[[stacks.vision.parts.facts]]
+name = "norm"
+value = "layer"
+[[stacks.vision.parts.facts]]
+name = "epsilon_key"
+value = "vision_config.layer_norm_eps"
+
+[[stacks.vision.parts]]
+part = "vision_attention"
+[[stacks.vision.parts.facts]]
+name = "position"
+value = "axial_rotary"
+[[stacks.vision.parts.facts]]
+name = "qk_norm"
+value = false
+[[stacks.vision.parts.facts]]
+name = "attention_bias"
+value = true
+
+[[stacks.vision.parts]]
+part = "vision_mlp"
+[[stacks.vision.parts.facts]]
+name = "activation"
+value = "gelu_erf"
+[[stacks.vision.parts.facts]]
+name = "intermediate"
+value = "4 * hidden"
+
+[[stacks.vision.parts]]
+part = "vision_merger"
+[[stacks.vision.parts.facts]]
+name = "activation"
+value = "gelu_erf"
+[[stacks.vision.parts.facts]]
+name = "final_norm"
+value = false
+[[stacks.vision.parts.facts]]
+name = "input"
+value = "merged_patch_cell"
+
+[[stacks.vision.parts]]
+part = "vision_patch_embed"
+[[stacks.vision.parts.facts]]
+name = "temporal_fold"
+value = 1
+
+[[stacks.language.parts]]
+part = "block_attention_residual"
+[[stacks.language.parts.facts]]
+name = "layers_per_block"
+value = { key = "text_config.n_layers_per_attn_res_block" }
+[[stacks.language.parts.facts]]
+name = "sliding_queries"
+value = 1
+[[stacks.language.parts.facts]]
+name = "full_queries"
+value = 3
+[[stacks.language.parts.facts]]
+name = "mlp_queries"
+value = 1
+[[stacks.language.parts.facts]]
+name = "normalize"
+value = { key = "text_config.attn_res_normalize_values" }
+
+[[stacks.language.parts]]
+part = "gqa_attention"
+[[stacks.language.parts.facts]]
+name = "relative_bias"
+value = true
+[[stacks.language.parts.facts]]
+name = "attention_sink"
+value = true
+[[stacks.language.parts.facts]]
+name = "output_gate"
+value = true
+[[stacks.language.parts.facts]]
+name = "qk_l2_clip"
+value = { key = "text_config.qk_l2_clip_threshold" }
+[[stacks.language.parts.facts]]
+name = "rel_l2_clip"
+value = { key = "text_config.rel_l2_clip_threshold" }
+[[stacks.language.parts.facts]]
+name = "q_bias"
+value = { key = "text_config.q_bias" }
+[[stacks.language.parts.facts]]
+name = "o_bias"
+value = { key = "text_config.o_bias" }
+
+[[stacks.language.parts]]
+part = "relative_attention"
+[[stacks.language.parts.facts]]
+name = "width"
+value = { key = "text_config.d_rel" }
+[[stacks.language.parts.facts]]
+name = "extent"
+value = { key = "text_config.rel_extent" }
+
+[[stacks.language.parts]]
+part = "short_conv"
+[[stacks.language.parts.facts]]
+name = "kernel"
+value = { key = "text_config.sconv_kernel_size" }
+[[stacks.language.parts.facts]]
+name = "depthwise"
+value = true
+
+[[stacks.language.parts]]
+part = "moe"
+[[stacks.language.parts.facts]]
+name = "routed"
+value = { key = "text_config.n_routed_experts" }
+[[stacks.language.parts.facts]]
+name = "active"
+value = { key = "text_config.num_experts_per_tok" }
+[[stacks.language.parts.facts]]
+name = "gate_bias"
+value = { key = "text_config.use_gate_bias" }
+
+[[stacks.language.parts]]
+part = "softcapped_activation"
+[[stacks.language.parts.facts]]
+name = "gate_softcap"
+value = { key = "text_config.mlp_gate_softcap" }
+[[stacks.language.parts.facts]]
+name = "up_softcap"
+value = { key = "text_config.mlp_up_softcap" }
+
+# src/tensor.rs:204-227: embedding, norms and untied head; the vocabulary axis is a rows split (TpAxis::Vocab and TpAxis::Heads divide the same way).
+
+[[tensor]]
+name = "model.llm.embed.weight"
+part = "embedding"
+role = "embedding"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.llm.embed_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.unembed.weight"
+part = "lm_head"
+role = "lm_head"
+dtype = "bf16"
+shape = ["vocab", "hidden"]
+split = "rows"
+
+# src/tensor.rs:228-263: one output query plus bank b at layer b+1; a full layer's bank is three queries, a sliding layer's one. The arm's block-residual role has no shared role name, so these are tagged attention.
+
+[[tensor]]
+name = "model.llm.attn_res.output_query"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.0"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.1"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.2"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.3"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.4"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.5"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.6"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.7"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.8"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.9"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.10"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.11"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.12"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.13"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.14"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.15"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.16"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.17"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.18"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.19"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.20"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.21"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.22"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.23"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.24"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.25"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.26"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.27"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.28"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.29"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.30"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.31"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.32"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.33"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.34"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.35"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.36"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.37"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.38"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.39"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.40"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.41"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.42"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.43"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.44"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.45"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.attn_queries.46"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["3", "hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.0"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.1"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.2"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.3"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.4"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.5"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.6"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.7"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.8"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.9"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.10"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.11"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.12"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.13"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.14"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.15"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.16"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.17"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.18"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.19"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.20"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.21"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.22"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.23"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.24"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.25"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.26"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.27"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.28"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.29"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.30"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.31"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.32"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.33"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.34"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.35"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.36"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.37"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.38"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.39"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.40"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.41"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.42"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.43"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.44"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.45"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.46"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.attn_res.mlp_queries.47"
+part = "block_attention_residual"
+role = "attention"
+dtype = "f32"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:265-302: every layer has mlp_norm, attn_sconv and mlp_sconv.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+repeat = "layers"
+
+# text_config.sconv_kernel_size is 4; the shared reader exposes no short-convolution fact to a shape expression.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "1", "4"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "1", "4"]
+split = "whole"
+repeat = "layers"
+
+# src/tensor.rs:303-362: the fused query/dual, key/value, gate, relative and sink projections and the two L2 clip scales.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wq_du.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads * head_dim", "hidden"]
+split = "rows"
+repeat = "layers"
+
+# src/tensor.rs:861-875: a key/value projection is split on the key/value-head axis, not on its rows.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wk_dv.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wv_dv.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+
+# src/tensor.rs:849-851: the output projection splits its query-width columns.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wo_ud.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "heads * head_dim"]
+split = "columns"
+repeat = "layers"
+
+# text_config.d_rel is 16; the relative bank is [heads * d_rel, hidden] (src/tensor.rs:327-332).
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.wr_du.weight"
+part = "relative_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads * 16", "hidden"]
+split = "rows"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.gate_attn.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads * head_dim", "hidden"]
+split = "rows"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.attn_sink_proj.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads", "hidden"]
+split = "rows"
+repeat = "layers"
+
+# text_config.d_rel x text_config.rel_extent (16 x 1024), src/tensor.rs:345-350.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.rel_logits_proj.proj"
+part = "relative_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["16", "1024"]
+split = "whole"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.q_l2_clip.scale"
+part = "gqa_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads", "head_dim"]
+split = "rows"
+repeat = "layers"
+
+[[tensor]]
+name = "model.llm.layers.{layer}.attn.rel_l2_clip.scale"
+part = "relative_attention"
+role = "attention"
+dtype = "bf16"
+shape = ["heads", "16"]
+split = "rows"
+repeat = "layers"
+
+# src/tensor.rs:390-401: the router is replicated and its correction bias is f32.
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.gate.weight"
+part = "moe"
+role = "router"
+dtype = "bf16"
+shape = ["routed", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.llm.layers.{layer}.mlp.gate.bias"
+part = "moe"
+role = "router"
+dtype = "f32"
+shape = ["routed"]
+split = "whole"
+repeat = "layers"
+when = { ffn = "moe" }
+
+[[tensor]]
+name = "model.llm.layers.0.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.0.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.0.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.1.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.1.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.1.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.2.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.2.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.2.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.3.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.3.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.3.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.4.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.4.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.4.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.6.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.6.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.6.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.7.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.7.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.7.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.8.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.8.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.8.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.9.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.9.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.9.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.10.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.10.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.10.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.12.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.12.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.12.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.13.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.13.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.13.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.14.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.14.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.14.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.15.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.15.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.15.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.16.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.16.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.16.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.18.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.18.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.18.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.19.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.19.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.19.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.20.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.20.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.20.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.21.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.21.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.21.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.22.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.22.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.22.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.24.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.24.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.24.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.25.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.25.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.25.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.26.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.26.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.26.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.27.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.27.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.27.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.28.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.28.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.28.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.30.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.30.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.30.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.31.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.31.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.31.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.32.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.32.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.32.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.33.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.33.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.33.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.34.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.34.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.34.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.36.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.36.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.36.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.37.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.37.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.37.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.38.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.38.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.38.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.39.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.39.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.39.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.40.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.40.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.40.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.42.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.42.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.42.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.43.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.43.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.43.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.44.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.44.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.44.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.45.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.45.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.45.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.46.attn_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:380-388 and 873-875: a sliding layer's key/value short convolution is a depthwise tap table split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.46.attn.k_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.46.attn.v_sconv.weight"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["1024", "1", "4"]
+split = "conv"
+
+[[tensor]]
+name = "model.llm.layers.5.q_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.5.k_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.5.v_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.5.attn.k_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.5.attn.k_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.5.attn.v_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.5.attn.v_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.llm.layers.11.q_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.11.k_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.11.v_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.11.attn.k_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.11.attn.k_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.11.attn.v_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.11.attn.v_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.llm.layers.17.q_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.17.k_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.17.v_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.17.attn.k_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.17.attn.k_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.17.attn.v_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.17.attn.v_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.llm.layers.23.q_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.23.k_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.23.v_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.23.attn.k_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.23.attn.k_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.23.attn.v_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.23.attn.v_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.llm.layers.29.q_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.29.k_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.29.v_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.29.attn.k_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.29.attn.k_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.29.attn.v_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.29.attn.v_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.llm.layers.35.q_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.35.k_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.35.v_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.35.attn.k_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.35.attn.k_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.35.attn.v_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.35.attn.v_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.llm.layers.41.q_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.41.k_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.41.v_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.41.attn.k_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.41.attn.k_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.41.attn.v_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.41.attn.v_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+[[tensor]]
+name = "model.llm.layers.47.q_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.47.k_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+[[tensor]]
+name = "model.llm.layers.47.v_input_norm.weight"
+part = "rms_norm"
+role = "norm"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.47.attn.k_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.47.attn.k_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+# src/tensor.rs:363-379 and 876-881: a full layer's dynamic short convolution stores the static taps and a per-token projection, split by key/value head.
+
+[[tensor]]
+name = "model.llm.layers.47.attn.v_sconv.static_w"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["4", "1024"]
+split = "columns"
+
+[[tensor]]
+name = "model.llm.layers.47.attn.v_sconv.weight_proj"
+part = "short_conv"
+role = "attention"
+dtype = "bf16"
+shape = ["32", "hidden"]
+split = "rows"
+
+# src/vision.rs:390-396: the temporal axis is folded, so the stored width is three channels times the square patch (1024 x 1200).
+
+[[tensor]]
+name = "model.visual.backbone.embeddings.patch_embedding.weight"
+part = "vision_patch_embed"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "3 * vision_patch * vision_patch"]
+split = "whole"
+
+# src/vision.rs:397-404: a 32x32 learned position grid (vision_config.posemb_grid_size), resampled per image.
+
+[[tensor]]
+name = "model.visual.backbone.embeddings.position_embedding"
+part = "vision_position"
+role = "vision"
+dtype = "bf16"
+shape = ["32 * 32", "vision_width"]
+split = "whole"
+
+# src/vision.rs:405-409: one class token and its own position.
+
+[[tensor]]
+name = "model.visual.backbone.embeddings.class_embedding"
+part = "vision_position"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.backbone.embeddings.cls_position_embedding"
+part = "vision_position"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+# src/vision.rs:554-563: a LayerNorm before the blocks (vision_config.layer_norm_eps).
+
+[[tensor]]
+name = "model.visual.backbone.ln_pre.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.backbone.ln_pre.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+
+# src/vision.rs:560-630: each block runs LayerNorm -> attention with layer scale, then LayerNorm -> GELU MLP with layer scale.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ln_1.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ln_1.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:560-630: each block runs LayerNorm -> attention with layer scale, then LayerNorm -> GELU MLP with layer scale.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ln_2.weight"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ln_2.bias"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:599-615: the residual is x + ls * branch, so the layer scale is a per-channel gamma.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ls_1.gamma"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:599-615: the residual is x + ls * branch, so the layer scale is a per-channel gamma.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.ls_2.gamma"
+part = "vision_norm"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:566-595: 16 heads of 64, full width projections with a bias and no qk norm.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.q_proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.q_proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:566-595: 16 heads of 64, full width projections with a bias and no qk norm.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.k_proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.k_proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:566-595: 16 heads of 64, full width projections with a bias and no qk norm.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.v_proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.v_proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:566-595: 16 heads of 64, full width projections with a bias and no qk norm.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.out_proj.weight"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.self_attn.out_proj.bias"
+part = "vision_attention"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:616-626: c_fc -> erf-GELU -> c_proj; vision_config.mlp_ratio 4 gives 4096.
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.mlp.c_fc.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate", "vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.mlp.c_fc.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.mlp.c_proj.weight"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width", "vision_intermediate"]
+split = "whole"
+repeat = "vision_blocks"
+
+[[tensor]]
+name = "model.visual.backbone.layers.{block}.mlp.c_proj.bias"
+part = "vision_mlp"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_width"]
+split = "whole"
+repeat = "vision_blocks"
+
+# src/vision.rs:637-642 and 675-680: each merge cell's four patches are concatenated, proj_in -> erf-GELU -> proj_out, no bias and no final norm.
+
+[[tensor]]
+name = "model.visual.proj_in.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_projection", "vision_width * vision_merge * vision_merge"]
+split = "whole"
+
+[[tensor]]
+name = "model.visual.proj_out.weight"
+part = "vision_merger"
+role = "vision"
+dtype = "bf16"
+shape = ["vision_out", "vision_projection"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "fuse_weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["6", "8"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.dflare_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.input_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.post_attention_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.mlp.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "18432"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.mlp.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.mlp.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.self_attn.k_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.self_attn.k_norm_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.self_attn.k_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.self_attn.k_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.self_attn.o_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "6144"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.self_attn.q_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.self_attn.q_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["6144", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.self_attn.v_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.0.self_attn.v_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.dflare_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.input_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.post_attention_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.mlp.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "18432"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.mlp.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.mlp.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.self_attn.k_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.self_attn.k_norm_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.self_attn.k_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.self_attn.k_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.self_attn.o_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "6144"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.self_attn.q_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.self_attn.q_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["6144", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.self_attn.v_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.1.self_attn.v_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.dflare_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.input_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.post_attention_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.mlp.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "18432"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.mlp.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.mlp.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.self_attn.k_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.self_attn.k_norm_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.self_attn.k_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.self_attn.k_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.self_attn.o_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "6144"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.self_attn.q_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.self_attn.q_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["6144", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.self_attn.v_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.2.self_attn.v_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.dflare_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.input_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.post_attention_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.mlp.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "18432"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.mlp.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.mlp.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.self_attn.k_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.self_attn.k_norm_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.self_attn.k_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.self_attn.k_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.self_attn.o_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "6144"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.self_attn.q_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.self_attn.q_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["6144", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.self_attn.v_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.3.self_attn.v_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.dflare_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.input_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.post_attention_layernorm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.mlp.down_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "18432"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.mlp.gate_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.mlp.up_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["18432", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.self_attn.k_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.self_attn.k_norm_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.self_attn.k_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.self_attn.k_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.self_attn.o_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "6144"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.self_attn.q_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["128"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.self_attn.q_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["6144", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.self_attn.v_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "layers.4.self_attn.v_proj_ctx.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["1024", "hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "markov_head.dflare_norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "markov_head.hidden_out.bias"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "markov_head.hidden_out.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden", "256"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "markov_head.markov_w1.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["vocab", "256"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "markov_head.rnn_proj.bias"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["768"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "markov_head.rnn_proj.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["768", "9728"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "mask_embed"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
+
+# mtp.safetensors header (84 tensors) and config.json mtp_config; the shared reader has no repeat over the five stages, so each stored name is listed here (the stage dimensions are literals because no MTP fact reaches a shape expression).
+
+[[tensor]]
+name = "norm.weight"
+part = "mtp"
+role = "mtp"
+dtype = "bf16"
+shape = ["hidden"]
+split = "whole"
