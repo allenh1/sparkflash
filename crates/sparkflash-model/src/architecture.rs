@@ -82,6 +82,12 @@ pub struct Inkling {
     pub d_rel: usize,
     /// The furthest backward distance the relative bank scores (rel_extent).
     pub rel_extent: usize,
+    /// Whether the relative attention carries a learned bias (always true here).
+    pub relative_bias: bool,
+    /// Whether every head carries a learned attention sink.
+    pub attention_sink: bool,
+    /// Whether the output projection is multiplied by a learned gate.
+    pub output_gate: bool,
     /// The per-head query/key L2 clip.
     pub qk_l2_clip: f64,
     /// The per-head relative-state L2 clip.
@@ -1836,7 +1842,8 @@ impl Architecture {
                     parts.insert(Part::GqaAttention);
                 }
                 AttentionKind::Inkling { .. } => {
-                    parts.insert(Part::GqaAttention);
+                    // One attention part: the arm launches inkling_attn_* for the GQA arithmetic
+                    // and its relative bias together.
                     parts.insert(Part::RelativeAttention);
                     parts.insert(Part::ShortConv);
                 }
@@ -2819,6 +2826,9 @@ fn inkling(text: &Value, root: &Value, vocab_size: usize) -> Result<Option<Inkli
     Ok(Some(Inkling {
         d_rel,
         rel_extent: optional_usize(text, "rel_extent")?.unwrap_or(0),
+        relative_bias: true,
+        attention_sink: true,
+        output_gate: true,
         qk_l2_clip: optional_f64(text, "qk_l2_clip_threshold")?.unwrap_or(f64::INFINITY),
         rel_l2_clip: optional_f64(text, "rel_l2_clip_threshold")?.unwrap_or(f64::INFINITY),
         log_scaling,
@@ -4601,9 +4611,10 @@ mod tests {
             // parse carries those four facts and does not hash at the field's default.
             0xd4f9_c4d2_70fa_cf05,
             0x0d35_642d_b843_4b20,
-            // Inkling's layout learns the tower's learned-grid position, LayerNorm and
-            // erf-GELU wiring, and its [vars] resolve the MTP and convolution shape facts.
-            0xd274_49af_f7ed_a43d,
+            // Inkling's layout learns the tower's rotary-plus-grid position, LayerNorm and
+            // erf-GELU wiring, its relative-attention switches, and its [vars] resolve the MTP
+            // and convolution shape facts.
+            0x92f9_7ff4_5a2c_d10b,
             0xe179_2f8b_9972_febb,
             0x6989_36fa_e0f3_fa07,
             0x4810_320b_c6c3_a5a8,

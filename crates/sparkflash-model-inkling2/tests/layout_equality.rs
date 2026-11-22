@@ -17,9 +17,10 @@
 //! The arm's plan is its own type (`InklingTensorPlan`), so this test is the oracle that
 //! captures it and compares it with the plan the shared reader builds from the layout, in the
 //! shape of `crates/sparkflash-ops/tests/layout_equality.rs`: by tensor name, logical shape and
-//! rank-local shape/run. The arm's MTP names are for its converter (a separate file and a
-//! `mtp.` prefix) and its plan is not the full stage, so the comparison is the language and
-//! vision stacks, where the arm is the released plan.
+//! rank-local shape/run. The comparison is the language and vision stacks, where the arm is the
+//! released plan. The drafter is a separate file with bare `layers.N` names; the layout
+//! describes it, and the arm's plan does not carry that stage (device/draft.rs reads it
+//! directly), so those layout rows are extras here.
 
 use std::collections::BTreeMap;
 
@@ -75,8 +76,8 @@ fn layout_rows(config: &Inkling2Config, tp: TpPlan) -> BTreeMap<String, Row> {
     let mut rows = BTreeMap::new();
     for index in 0..plan.plan().len() {
         let spec = plan.spec_at(index);
-        // The checkpoint's mtp.safetensors stores bare `layers.N` names; the arm prefixes
-        // them with its runtime `mtp.` root. Compare under the arm's spelling.
+        // The checkpoint's mtp.safetensors stores bare `layers.N` names. The arm plan does
+        // not carry that stage, so these rows stay outside the compared set.
         let name = if spec.name.starts_with("model.") {
             spec.name.clone()
         } else {

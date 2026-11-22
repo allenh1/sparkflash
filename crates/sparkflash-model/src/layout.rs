@@ -1080,6 +1080,20 @@ impl Layout {
         }
     }
 
+    fn fact_usize(value: &LayoutValue, layout: &str, name: &str) -> Result<usize, LayoutError> {
+        match value {
+            LayoutValue::Integer(value) => usize::try_from(*value).map_err(|_| {
+                Self::unknown_value(layout, name, &value.to_string(), "a non-negative integer")
+            }),
+            other => Err(Self::unknown_value(
+                layout,
+                name,
+                &other.to_string(),
+                "a non-negative integer",
+            )),
+        }
+    }
+
     fn fact_string<'a>(
         value: &'a LayoutValue,
         layout: &str,
@@ -1114,6 +1128,60 @@ impl Layout {
                 ));
             }
         })
+    }
+
+    fn inkling_mut<'a>(
+        architecture: &'a mut Architecture,
+        layout: &str,
+        name: &str,
+    ) -> Result<&'a mut crate::architecture::Inkling, LayoutError> {
+        architecture.inkling.as_mut().ok_or_else(|| {
+            LayoutError::refused(
+                layout,
+                format!(
+                    "fact {name} describes an Inkling stack, which this checkpoint does not carry"
+                ),
+            )
+        })
+    }
+
+    fn block_residual_mut<'a>(
+        architecture: &'a mut Architecture,
+        layout: &str,
+        name: &str,
+    ) -> Result<&'a mut crate::architecture::BlockAttentionResidual, LayoutError> {
+        Self::inkling_mut(architecture, layout, name)?
+            .block_residual
+            .as_mut()
+            .ok_or_else(|| {
+                LayoutError::refused(
+                    layout,
+                    format!("fact {name} describes a block-attention residual, which this checkpoint does not carry"),
+                )
+            })
+    }
+
+    fn apply_routed(
+        architecture: &mut Architecture,
+        layout: &str,
+        name: &str,
+        apply: impl Fn(&mut crate::architecture::Moe),
+    ) -> Result<(), LayoutError> {
+        let mut applied = false;
+        for layer in &mut architecture.layers {
+            if let Ffn::Moe(moe) = &mut layer.ffn {
+                apply(moe);
+                applied = true;
+            }
+        }
+        if applied {
+            Ok(())
+        } else {
+            Err(LayoutError::refused(
+                layout,
+                format!("fact {name} describes routed experts, but no layer runs a MoE block"),
+            ))
+        }
     }
 
     fn unknown_value(layout: &str, name: &str, value: &str, expected: &str) -> LayoutError {
@@ -1227,6 +1295,80 @@ impl Layout {
                         continue;
                     };
                     vision.merger_final_norm = Some(Self::fact_bool(value, &self.id, name)?);
+                }
+                // Inkling's one relative-attention part carries the bias, sink, gate and clips
+                // the arm launches. These are applied to the typed stack, not carried.
+                "language.relative_attention.relative_bias" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.relative_bias = Self::fact_bool(value, &self.id, name)?;
+                }
+                "language.relative_attention.attention_sink" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.attention_sink = Self::fact_bool(value, &self.id, name)?;
+                }
+                "language.relative_attention.output_gate" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.output_gate = Self::fact_bool(value, &self.id, name)?;
+                }
+                "language.relative_attention.width" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.d_rel = Self::fact_usize(value, &self.id, name)?;
+                }
+                "language.relative_attention.extent" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.rel_extent = Self::fact_usize(value, &self.id, name)?;
+                }
+                "language.relative_attention.qk_l2_clip" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.qk_l2_clip = Self::fact_float(value, &self.id, name)?;
+                }
+                "language.relative_attention.rel_l2_clip" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.rel_l2_clip = Self::fact_float(value, &self.id, name)?;
+                }
+                "language.short_conv.kernel" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.short_conv = Self::fact_usize(value, &self.id, name)?;
+                }
+                "language.softcapped_activation.gate_softcap" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.softcaps.gate = Self::fact_float(value, &self.id, name)?;
+                }
+                "language.softcapped_activation.up_softcap" => {
+                    let inkling = Self::inkling_mut(architecture, &self.id, name)?;
+                    inkling.softcaps.up = Self::fact_float(value, &self.id, name)?;
+                }
+                "language.block_attention_residual.layers_per_block" => {
+                    let block = Self::block_residual_mut(architecture, &self.id, name)?;
+                    block.layers_per_block = Self::fact_usize(value, &self.id, name)?;
+                }
+                "language.block_attention_residual.sliding_queries" => {
+                    let block = Self::block_residual_mut(architecture, &self.id, name)?;
+                    block.sliding_queries = Self::fact_usize(value, &self.id, name)?;
+                }
+                "language.block_attention_residual.full_queries" => {
+                    let block = Self::block_residual_mut(architecture, &self.id, name)?;
+                    block.full_queries = Self::fact_usize(value, &self.id, name)?;
+                }
+                "language.block_attention_residual.mlp_queries" => {
+                    let block = Self::block_residual_mut(architecture, &self.id, name)?;
+                    block.mlp_queries = Self::fact_usize(value, &self.id, name)?;
+                }
+                "language.block_attention_residual.normalize" => {
+                    let block = Self::block_residual_mut(architecture, &self.id, name)?;
+                    block.normalize = Self::fact_bool(value, &self.id, name)?;
+                }
+                "language.moe.routed" => {
+                    let experts = Self::fact_usize(value, &self.id, name)?;
+                    Self::apply_routed(architecture, &self.id, name, |moe| {
+                        moe.routed_experts = experts;
+                    })?;
+                }
+                "language.moe.active" => {
+                    let active = Self::fact_usize(value, &self.id, name)?;
+                    Self::apply_routed(architecture, &self.id, name, |moe| {
+                        moe.active_experts = active;
+                    })?;
                 }
                 _ => {
                     applied.remove(name);

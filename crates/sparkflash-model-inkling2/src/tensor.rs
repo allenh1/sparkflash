@@ -8,10 +8,11 @@
 
 //! The Inkling-2-Small tensor plan, logical and at one TP rank.
 //!
-//! The released checkpoint spells every tensor under `model.llm.*`, `mtp.*` and
-//! `model.visual.*`. [InklingTensorPlan::checkpoint] reproduces those names and stored shapes
-//! from the typed configuration, so the plan's byte total is a check against the released index
-//! rather than a second transcription of it.
+//! The released backbone spells every tensor under `model.llm.*` and `model.visual.*`.
+//! [InklingTensorPlan::checkpoint] reproduces those names and stored shapes from the typed
+//! configuration, so the plan's byte total is a check against the released index rather than a
+//! second transcription of it. The drafter's `mtp.safetensors` uses bare `layers.N` names;
+//! models/layouts/inkling2.toml describes that file and device/draft.rs reads it directly.
 
 use sparkflash_model::architecture::WeightFormat;
 use sparkflash_model::{Split, TpAxis, TpPlan};
@@ -134,18 +135,22 @@ impl InklingTensorPlan {
     /// # Errors
     /// A world the model's heads, experts or vocabulary do not divide.
     pub fn served(config: &Inkling2Config, tp: TpPlan) -> Result<Self, String> {
-        Self::build(config, tp, false, false)
+        Self::build(config, tp, false)
     }
 
-    /// Backbone, MTP and vision.
+    /// Backbone and vision.
+    ///
+    /// The MTP stage is a separate file with its own bare layers.N spelling. Its description
+    /// lives in models/layouts/inkling2.toml and its bytes are read by the device drafter
+    /// (device/draft.rs), not by this plan.
     ///
     /// # Errors
     /// As [Self::served].
     pub fn checkpoint(config: &Inkling2Config, tp: TpPlan) -> Result<Self, String> {
-        Self::build(config, tp, true, true)
+        Self::build(config, tp, true)
     }
 
-    fn build(config: &Inkling2Config, tp: TpPlan, mtp: bool, vision: bool) -> Result<Self, String> {
+    fn build(config: &Inkling2Config, tp: TpPlan, vision: bool) -> Result<Self, String> {
         let mut plan = TensorPlan::default();
         let hidden = config.hidden_size;
         let vocab = config.vocab_size;
@@ -640,56 +645,6 @@ impl InklingTensorPlan {
                 vec![vision.out_hidden_size, vision.projection_hidden_dim],
                 Role::Vision,
             );
-        }
-
-        if mtp {
-            // The MTP checkpoint is a separate file; the plan names its stage tensors for the
-            // converter and the drafter gate. The names follow the released module.
-            if let Some(mtp) = &config.mtp {
-                let hidden = mtp.hidden_size;
-                let prefix = "mtp";
-                plan.push(
-                    &format!("{prefix}.fuse_weight"),
-                    DType::BF16,
-                    vec![hidden, 2 * hidden],
-                    Role::Mtp,
-                );
-                for layer in 0..mtp.num_hidden_layers {
-                    let p = format!("{prefix}.layers.{layer}");
-                    for name in ["input_layernorm", "post_attention_layernorm", "dflare_norm"] {
-                        plan.push(
-                            &format!("{p}.{name}.weight"),
-                            DType::BF16,
-                            vec![hidden],
-                            Role::Mtp,
-                        );
-                    }
-                    for name in [
-                        "q_proj",
-                        "k_proj",
-                        "v_proj",
-                        "o_proj",
-                        "gate_proj",
-                        "up_proj",
-                        "down_proj",
-                    ] {
-                        let (rows, cols) = match name {
-                            "q_proj" => (mtp.num_attention_heads * mtp.head_dim, hidden),
-                            "k_proj" | "v_proj" => (mtp.num_key_value_heads * mtp.head_dim, hidden),
-                            "o_proj" => (hidden, mtp.num_attention_heads * mtp.head_dim),
-                            "gate_proj" | "up_proj" => (mtp.intermediate_size, hidden),
-                            "down_proj" => (hidden, mtp.intermediate_size),
-                            _ => unreachable!(),
-                        };
-                        plan.push(
-                            &format!("{p}.self_attn.{name}.weight"),
-                            DType::BF16,
-                            vec![rows, cols],
-                            Role::Mtp,
-                        );
-                    }
-                }
-            }
         }
 
         let runs = plan
