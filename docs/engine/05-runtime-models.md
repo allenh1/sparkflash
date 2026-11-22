@@ -294,7 +294,7 @@ pass, target.
 7. **Demonstration:** a model the owner picks, onboarded with zero Rust unless it has a new part
    kind.
 
-Work that can run in parallel from the start: milestone 1, the layout-file format (5.1), the
+Work that can run in parallel from the start: the scan and the layouts (1a and 1b), the
 reference-capture and drift scripts (5.6), and the chat-template engine (5.3). Milestones 2 and 3
 are one line of work in one crate and should have one owner at a time.
 

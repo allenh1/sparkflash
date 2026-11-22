@@ -36,7 +36,7 @@
 //! that names both, never a silent precedence rule.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -44,7 +44,7 @@ use serde_json::Value;
 use crate::architecture::{Architecture, AttentionKind, Ffn, Layer, Residual, Vision};
 use crate::coverage::{ConfigCoverage, read_key};
 use crate::parts::Part;
-use crate::stack::{Block, PartInstance, Shape, Stack, StackKind};
+use crate::stack::{Block, Stack, StackKind};
 
 /// The layouts shipped in the repository, embedded at build time.
 const SHIPPED: &[(&str, &str)] = &[(
@@ -1626,32 +1626,6 @@ fn cache_paths() -> Result<Vec<PathBuf>, LayoutError> {
 #[must_use]
 pub fn cache_path(root: &Path, file: &str) -> PathBuf {
     root.join(file)
-}
-
-/// Whether a part name is one the tree has.
-#[must_use]
-pub fn known_part(name: &str) -> bool {
-    Part::parse(name).is_some()
-}
-
-/// The shape a part instance's first tensor gives it, for a caller rendering a description.
-#[must_use]
-pub fn part_shape(tensors: &[LayoutTensor], part: Part) -> Shape {
-    tensors
-        .iter()
-        .find(|tensor| tensor.part == part)
-        .map_or_else(Shape::unknown, |tensor| Shape::new(tensor.shape.clone()))
-}
-
-/// A part instance with a layout tensor's stored shape, if it has one.
-#[must_use]
-pub fn instance_from_layout(part: Part, tensors: &[LayoutTensor]) -> Option<PartInstance> {
-    let tensor = tensors.iter().find(|tensor| tensor.part == part)?;
-    Some(PartInstance::new(
-        part,
-        Shape::new(tensor.shape.clone()),
-        None,
-    ))
 }
 
 #[cfg(test)]
