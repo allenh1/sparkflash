@@ -93,6 +93,9 @@ order = [
   "moe",
 ]
 
+[stacks.draft]
+order = ["mtp"]
+
 [stacks.vision]
 order = [
   "vision_patch_embed",

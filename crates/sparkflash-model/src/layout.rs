@@ -44,7 +44,7 @@ use serde_json::Value;
 use crate::architecture::{Architecture, AttentionKind, Ffn, Layer, Residual, Vision};
 use crate::coverage::{ConfigCoverage, read_key};
 use crate::parts::Part;
-use crate::stack::{Block, Stack, StackKind};
+use crate::stack::{Block, PartInstance, Shape, Stack, StackKind};
 
 /// The layouts shipped in the repository, embedded at build time.
 const SHIPPED: &[(&str, &str)] = &[(
@@ -206,6 +206,8 @@ pub struct LayoutTensor {
     pub stack: StackKind,
     /// The block index, when the tensor belongs to one block.
     pub block: Option<usize>,
+    /// Why the tensor is stored but never loaded, when it is.
+    pub unloaded: Option<String>,
 }
 
 /// The stored element class a layout declares.
@@ -734,6 +736,14 @@ impl Layout {
         facts: &BTreeMap<String, LayoutValue>,
     ) -> Result<(), LayoutError> {
         for (name, value) in facts {
+            if !known_fact(name) {
+                return Err(LayoutError::refused(
+                    &self.id,
+                    format!(
+                        "fact {name:?} is not one this reader knows; name the part field it sets"
+                    ),
+                ));
+            }
             match name.as_str() {
                 "vision.position" | "vision.vision_position.position" => {
                     let Some(vision) = architecture.vision.as_mut() else {
@@ -790,15 +800,16 @@ impl Layout {
             match declaration.repeat {
                 Repeat::Once => {
                     let vars = self.global_vars(architecture);
+                    let stack = stack_of_part(part);
                     self.push_tensor(
                         &mut tensors,
                         declaration,
                         part,
                         &vars,
                         Placement {
-                            block: None,
+                            block: (stack == StackKind::Vision).then_some(0),
                             expert: None,
-                            stack: StackKind::Language,
+                            stack,
                         },
                     )?;
                 }
@@ -1034,6 +1045,7 @@ impl Layout {
             split,
             stack,
             block,
+            unloaded: declaration.unloaded.clone(),
         });
         Ok(())
     }
@@ -1044,6 +1056,35 @@ impl Layout {
         tensors: &[LayoutTensor],
     ) -> Result<Vec<Stack>, LayoutError> {
         let mut stacks = architecture.stacks();
+        let draft: Vec<&LayoutTensor> = tensors
+            .iter()
+            .filter(|tensor| tensor.stack == StackKind::Draft)
+            .collect();
+        if !draft.is_empty() {
+            let mut parts = Vec::new();
+            let mut seen = BTreeSet::new();
+            for tensor in &draft {
+                if !seen.insert(tensor.part) {
+                    continue;
+                }
+                let names: Vec<String> = draft
+                    .iter()
+                    .filter(|other| other.part == tensor.part)
+                    .map(|other| other.name.clone())
+                    .collect();
+                parts.push(
+                    PartInstance::new(tensor.part, Shape::new(tensor.shape.clone()), None)
+                        .with_tensors(names),
+                );
+            }
+            stacks.push(Stack {
+                kind: StackKind::Draft,
+                blocks: vec![Block {
+                    index: architecture.layers.len(),
+                    parts,
+                }],
+            });
+        }
         for stack in &mut stacks {
             let Some(declaration) = self.stacks.get(stack.kind.name()) else {
                 continue;
@@ -1209,6 +1250,27 @@ fn attach_tensors(block: &mut Block, tensors: &[LayoutTensor], stack: StackKind)
             .map(|tensor| tensor.name.clone())
             .collect();
     }
+}
+
+fn known_fact(name: &str) -> bool {
+    matches!(
+        name,
+        "vision.position"
+            | "vision.vision_position.position"
+            | "vision.image_size"
+            | "language.attention.head_dim"
+            | "language.attention.rope"
+            | "language.attention.kv_heads"
+            | "language.moe.router_dtype"
+            | "language.indexer.pool_compress"
+            | "language.indexer.rope_interleave"
+            | "language.draft.indexer_shared"
+            | "language.linear_attention.kda_layers"
+            | "language.linear_attention.full_attn_layers"
+            | "language.tie_word_embeddings"
+            | "match.text_model_type"
+            | "match.vision_model_type"
+    )
 }
 
 fn stack_kind(name: &str) -> Option<StackKind> {
