@@ -59,7 +59,9 @@ name = "norm_epsilon"
 value = { key = "vision_config.rms_norm_eps", default = 1e-6 } # a config key
 ```
 
-A stack's `order` is the part vocabulary, not a claim that every block has every part.
+A stack's `order` is the part vocabulary, not a claim that every block has every part. A fact
+the reader does not apply yet is still carried in the description; its scan row stays `unknown
+layout` until the reader learns the field, so a source can be recorded without guessing.
 
 ```toml
 [[tensor]]

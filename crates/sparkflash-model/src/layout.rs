@@ -777,14 +777,6 @@ impl Layout {
         facts: &BTreeMap<String, LayoutValue>,
     ) -> Result<(), LayoutError> {
         for (name, value) in facts {
-            if !known_fact(name) {
-                return Err(LayoutError::refused(
-                    &self.id,
-                    format!(
-                        "fact {name:?} is not one this reader knows; name the part field it sets"
-                    ),
-                ));
-            }
             match name.as_str() {
                 "vision.position" | "vision.vision_position.position" => {
                     let Some(vision) = architecture.vision.as_mut() else {
@@ -1331,27 +1323,6 @@ fn attach_tensors(block: &mut Block, tensors: &[LayoutTensor], stack: StackKind)
             .map(|tensor| tensor.name.clone())
             .collect();
     }
-}
-
-fn known_fact(name: &str) -> bool {
-    matches!(
-        name,
-        "vision.position"
-            | "vision.vision_position.position"
-            | "vision.image_size"
-            | "language.attention.head_dim"
-            | "language.attention.rope"
-            | "language.attention.kv_heads"
-            | "language.moe.router_dtype"
-            | "language.indexer.pool_compress"
-            | "language.indexer.rope_interleave"
-            | "language.draft.indexer_shared"
-            | "language.linear_attention.kda_layers"
-            | "language.linear_attention.full_attn_layers"
-            | "language.tie_word_embeddings"
-            | "match.text_model_type"
-            | "match.vision_model_type"
-    )
 }
 
 fn stack_of_part(part: Part) -> StackKind {
