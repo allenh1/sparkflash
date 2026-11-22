@@ -96,6 +96,24 @@ ignore = "the image processor token budget; no tensor or tensor-plan dimension d
 path = "vision_config.max_wh_ratio"
 ignore = "the image processor aspect cap (null in the released document); no tensor shape derives from it"
 
+# Model keys this family ignores; each is a producer or training switch the arm's typed parser
+# reads, never a shared shape fact.
+
+[[keys]]
+# config.json text_config.attention_dropout: the producer's training-time attention dropout; inference runs dropout off, and no tensor shape depends on it.
+path = "text_config.attention_dropout"
+ignore = "the producer's training-time attention dropout; inference runs dropout off, and no tensor shape depends on it"
+
+[[keys]]
+# config.json text_config.initializer_range: the producer's training-time weight initialization range; this family derives no inference geometry from it.
+path = "text_config.initializer_range"
+ignore = "the producer's training-time weight initialization range; this family derives no inference geometry from it"
+
+[[keys]]
+# config.json text_config.use_cache: a producer output switch for returning the KV cache; serving always keeps the cache.
+path = "text_config.use_cache"
+ignore = "a producer output switch for returning the KV cache; serving always keeps the cache"
+
 [stacks.language]
 order = [
   "rms_norm",

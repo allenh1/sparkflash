@@ -57,6 +57,13 @@ fact = "language.attention.sliding_rope_type"
 path = "rope_parameters.full_attention.rope_type"
 fact = "language.attention.full_rope_type"
 
+[[keys]]
+# config.json initializer_range: config.rs:610-637 divides the nGPT residual alpha, the q/k
+# scale, the output-gate scale and the LM-head logit scale by it, so it is arithmetic the arm
+# applies even though no shared tensor shape uses it.
+path = "initializer_range"
+fact = "language.initializer_range"
+
 # Shape facts for the explicit tensor names. Each is the config key the arm reads: the
 # query width is num_attention_heads * head_dim, the KV width is
 # num_key_value_heads * head_dim, and the MLP width is intermediate_size

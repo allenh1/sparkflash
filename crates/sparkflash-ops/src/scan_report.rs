@@ -358,6 +358,10 @@ pub struct ScanReport {
     pub rows: Vec<ScanRow>,
     /// A failure that stopped the scan before it could produce rows.
     pub error: Option<String>,
+    /// Layout facts the reader carried but no shared field applies, by fact name.
+    ///
+    /// These are reported for the next reader step; they never make a scan dirty.
+    pub carried_facts: Vec<String>,
 }
 
 impl ScanReport {
@@ -451,6 +455,16 @@ impl ScanReport {
             "coverage: tensors {tensors}; config keys {}",
             self.coverage.config_keys.name()
         );
+        if self.carried_facts.is_empty() {
+            let _ = writeln!(out, "carried facts: 0");
+        } else {
+            let _ = writeln!(
+                out,
+                "carried facts: {} ({})",
+                self.carried_facts.len(),
+                self.carried_facts.join(", ")
+            );
+        }
         let _ = writeln!(out, "clean: {}", if self.is_clean() { "yes" } else { "no" });
         out
     }
@@ -476,6 +490,7 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
         coverage: Coverage::not_checked(inputs.tensors.map(|index| index.tensors.len())),
         rows: Vec::new(),
         error: None,
+        carried_facts: Vec::new(),
     };
     let names: Option<Vec<String>> = inputs.tensors.map(|index| {
         index
@@ -502,6 +517,7 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
         sparkflash_model::coverage::KeyCoverageState::Dirty => CoverageState::Dirty,
         sparkflash_model::coverage::KeyCoverageState::NotChecked => CoverageState::NotChecked,
     };
+    report.carried_facts = keys.carried_facts().map(str::to_owned).collect();
     for key in keys.unknown_keys() {
         let vision = key.path.starts_with("vision_config.");
         report.rows.push(ScanRow {
@@ -1131,9 +1147,30 @@ mod tests {
             "language  0      dense_mlp          256x5120         BF16     both     resolved\n",
             "5 rows, 5 resolved, 0 unresolved\n",
             "coverage: tensors not checked; config keys clean\n",
+            "carried facts: 0\n",
             "clean: no\n",
         );
         assert_eq!(scan(inputs(Target::Sm121)).render(), expected);
+    }
+
+    #[test]
+    fn carried_facts_are_printed_by_name_without_making_the_scan_dirty() {
+        let mut report = scan(inputs(Target::Sm121));
+        assert!(!report.is_clean());
+        report.carried_facts = vec![
+            "language.mlp_bias".to_owned(),
+            "language.ngpt.alpha_init".to_owned(),
+        ];
+        let text = report.render();
+        assert!(
+            text.contains(
+                "carried facts: 2 (language.mlp_bias, language.ngpt.alpha_init)
+"
+            ),
+            "{text}"
+        );
+        assert!(!report.is_clean(), "carried facts never fail the load");
+        assert!(text.contains("clean: no"), "{text}");
     }
 
     #[test]
@@ -1409,6 +1446,7 @@ mod tests {
             availability: Availability::Catalogue,
             coverage: Coverage::not_checked(None),
             error: None,
+            carried_facts: Vec::new(),
             rows: vec![
                 ScanRow {
                     stack: StackKind::Language,
@@ -1462,6 +1500,7 @@ mod tests {
             "    fix: ship a layout file\n",
             "3 rows, 0 resolved, 3 unresolved\n",
             "coverage: tensors not checked; config keys not checked\n",
+            "carried facts: 0\n",
             "clean: no\n",
         );
         assert_eq!(report.render(), expected);

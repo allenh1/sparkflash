@@ -68,6 +68,7 @@ pub struct ConfigCoverage {
     read: BTreeSet<String>,
     unknown: Vec<UnknownKey>,
     ignored: Vec<IgnoredKey>,
+    carried: BTreeSet<String>,
     checked: bool,
 }
 
@@ -127,6 +128,16 @@ impl ConfigCoverage {
         &self.ignored
     }
 
+    /// The layout facts the reader carried but no shared field applies.
+    pub fn carried_facts(&self) -> impl Iterator<Item = &str> {
+        self.carried.iter().map(String::as_str)
+    }
+
+    /// Record the facts a layout read but no shared field applies.
+    pub(crate) fn carry_facts(&mut self, facts: impl IntoIterator<Item = String>) {
+        self.carried.extend(facts);
+    }
+
     /// Mark a path as read by a source other than the structural parser, such as a layout.
     pub(crate) fn claim_path(&mut self, path: &str) {
         self.read.insert(path.to_owned());
@@ -177,26 +188,6 @@ const IGNORABLE: &[(&str, &str)] = &[
     (
         "dtype",
         "a producer dtype hint; the stored weight format is read from the quantization block, not this field",
-    ),
-    (
-        "initializer_range",
-        "the training-time weight initialization range; no inference value is derived from it",
-    ),
-    (
-        "attention_dropout",
-        "the training-time attention dropout probability; inference runs dropout off",
-    ),
-    (
-        "router_aux_loss_coef",
-        "the training-time auxiliary load-balancing loss coefficient; inference computes no loss",
-    ),
-    (
-        "output_router_logits",
-        "a debug output switch for the producer's forward; serving returns logits, not router logits",
-    ),
-    (
-        "use_cache",
-        "a producer output switch for returning the KV cache; serving always keeps the cache",
     ),
     (
         "_name_or_path",
@@ -288,6 +279,7 @@ impl Recorder {
             read: self.reads,
             unknown,
             ignored,
+            carried: BTreeSet::new(),
             checked: true,
         }
     }
@@ -599,6 +591,28 @@ mod tests {
             assert!(
                 resolved.is_empty(),
                 "{path} no longer reports these pinned residual paths: {resolved:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shared_ignore_list_names_the_writer_not_the_model() {
+        for key in [
+            "initializer_range",
+            "attention_dropout",
+            "router_aux_loss_coef",
+            "output_router_logits",
+            "use_cache",
+        ] {
+            assert!(
+                ignorable_reason(key).is_none(),
+                "{key} is a model fact and belongs in the layout that reads or ignores it"
+            );
+        }
+        for key in ["transformers_version", "torch_dtype", "_commit_hash"] {
+            assert!(
+                ignorable_reason(key).is_some(),
+                "{key} describes the writer"
             );
         }
     }
