@@ -28,14 +28,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sparkflash_model::architecture::{
-    Architecture, AttentionKind, Ffn, Layer, Moe, PleGeometry, Residual, ScaleDType, Side,
-    WeightFormat,
-};
+use sparkflash_model::architecture::{Architecture, AttentionKind, Ffn, ScaleDType, WeightFormat};
 #[cfg(test)]
-use sparkflash_model::architecture::{DenseMlp, Kda};
+use sparkflash_model::architecture::{DenseMlp, Kda, Layer, Moe, PleGeometry, Residual, Side};
 use sparkflash_model::layout::{LayoutDtype, LayoutTensor, TensorSplit};
 use sparkflash_model::{TpAxis, TpPlan};
+#[cfg(test)]
 use sparkflash_weights::rng::is_prime;
 use sparkflash_weights::{DType, TensorPlan, TensorSpec};
 
@@ -179,7 +177,7 @@ impl ArchitectureTensorPlan {
     /// # Errors
     /// A family this plan does not name, or a world a sharded axis does not divide.
     pub fn served(architecture: &Architecture, tp: TpPlan) -> Result<Self, PlanError> {
-        Self::build(architecture, tp, false, false, false)
+        Self::build(architecture, tp, false, false)
     }
 
     /// Plan the served set plus the MTP stage, when the release has one the served set omits.
@@ -187,7 +185,7 @@ impl ArchitectureTensorPlan {
     /// # Errors
     /// As [Self::served].
     pub fn served_and_mtp(architecture: &Architecture, tp: TpPlan) -> Result<Self, PlanError> {
-        Self::build(architecture, tp, true, false, false)
+        Self::build(architecture, tp, true, false)
     }
 
     /// Plan the whole checkpoint, including the vision tower.
@@ -195,7 +193,7 @@ impl ArchitectureTensorPlan {
     /// # Errors
     /// As [Self::served].
     pub fn checkpoint(architecture: &Architecture, tp: TpPlan) -> Result<Self, PlanError> {
-        Self::build(architecture, tp, true, true, true)
+        Self::build(architecture, tp, true, true)
     }
 
     fn build(
@@ -203,9 +201,8 @@ impl ArchitectureTensorPlan {
         tp: TpPlan,
         mtp: bool,
         vision: bool,
-        mtp_all_worlds: bool,
     ) -> Result<Self, PlanError> {
-        let mut builder = Builder::new(tp, mtp, vision, mtp_all_worlds);
+        let mut builder = Builder::new(tp, mtp, vision);
         let dense = architecture.quantization.dense_format;
         let experts = architecture.quantization.expert_format;
         builder.dense_format = dense;
@@ -220,17 +217,12 @@ impl ArchitectureTensorPlan {
         if builder.read_layout(architecture)? {
             return Ok(builder.finish());
         }
-        match architecture.family.as_str() {
-            "qwen4_exp" | "qwen3_5_moe" => builder.qwen(architecture, mtp)?,
-            _ => {
-                // A family no pack transcribes is planned in the canonical spelling; a caller
-                // holding the checkpoint plans its own spelling through [Self::named].
-                let names = NamingDialect::canonical(architecture)
-                    .names(architecture)
-                    .map_err(PlanError::Invalid)?;
-                builder.generic(architecture, &names)?;
-            }
-        }
+        // A family no pack transcribes is planned in the canonical spelling; a caller
+        // holding the checkpoint plans its own spelling through [Self::named].
+        let names = NamingDialect::canonical(architecture)
+            .names(architecture)
+            .map_err(PlanError::Invalid)?;
+        builder.generic(architecture, &names)?;
         Ok(builder.finish())
     }
 
@@ -249,7 +241,7 @@ impl ArchitectureTensorPlan {
         tp: TpPlan,
         names: &TensorNames,
     ) -> Result<Self, PlanError> {
-        let mut builder = Builder::new(tp, false, false, false);
+        let mut builder = Builder::new(tp, false, false);
         builder.dense_format = architecture.quantization.dense_format;
         builder.expert_format = architecture.quantization.expert_format;
         builder.generic(architecture, names)?;
@@ -370,15 +362,12 @@ struct Builder {
     tp: TpPlan,
     mtp: bool,
     vision: bool,
-    /// Whether MTP is planned at every world. The checkpoint converter needs it; the served set
-    /// keeps the world gate (a non-replicated MTP stage is not loaded by a multi-rank serve).
-    mtp_all_worlds: bool,
     dense_format: WeightFormat,
     expert_format: WeightFormat,
 }
 
 impl Builder {
-    fn new(tp: TpPlan, mtp: bool, vision: bool, mtp_all_worlds: bool) -> Self {
+    fn new(tp: TpPlan, mtp: bool, vision: bool) -> Self {
         Self {
             plan: TensorPlan::default(),
             rank: Vec::new(),
@@ -386,7 +375,6 @@ impl Builder {
             tp,
             mtp,
             vision,
-            mtp_all_worlds,
             dense_format: WeightFormat::Bf16,
             expert_format: WeightFormat::Bf16,
         }
@@ -1222,6 +1210,7 @@ impl Builder {
         )
     }
 
+    #[cfg(test)]
     fn qwen(&mut self, arch: &Architecture, include_mtp: bool) -> Result<(), PlanError> {
         let hidden = arch.hidden_size;
         let Some(reference) = arch.layers.first() else {
@@ -1380,12 +1369,7 @@ impl Builder {
                 }
             }
         }
-        if include_mtp
-            && self.mtp
-            && (self.mtp_all_worlds
-                || self.tp.world() == 1
-                || arch.mtp.as_ref().is_some_and(|mtp| mtp.replicated))
-        {
+        if include_mtp && self.mtp {
             self.qwen_mtp(arch, hidden, hyper_width, dense)?;
         }
         if self.vision {
@@ -1395,6 +1379,7 @@ impl Builder {
     }
 
     /// A plain-residual layer's two pre-norms.
+    #[cfg(test)]
     fn qwen_branch_norms(&mut self, prefix: &str, hidden: usize, role: Role) {
         for name in ["input_layernorm", "post_attention_layernorm"] {
             self.whole(
@@ -1410,6 +1395,7 @@ impl Builder {
     ///
     /// `stage` is the MTP role: an MTP block keeps every tensor whole, because a multi-rank
     /// serve replicates the stage rather than splitting it.
+    #[cfg(test)]
     fn qwen_moe(
         &mut self,
         prefix: &str,
@@ -1482,6 +1468,7 @@ impl Builder {
     ///
     /// A rank's share of the fused gate/up axis is two runs (its gate rows and its up rows), not
     /// one, so that tensor reports no run; the down projection's share is one run of columns.
+    #[cfg(test)]
     fn qwen_fused_experts(
         &mut self,
         prefix: &str,
@@ -1512,6 +1499,7 @@ impl Builder {
 
     /// A Gated DeltaNet branch. The three wide projections take the dense format; the decay and
     /// beta projections, the convolution and the norms stay BF16 in every release.
+    #[cfg(test)]
     fn qwen_gdn(
         &mut self,
         p: &str,
@@ -1582,6 +1570,7 @@ impl Builder {
     /// head, so it is twice the attention width. Qwen3.8's sparse layers add the QSA indexer.
     ///
     /// `stage` is the MTP role, under which every tensor stays whole.
+    #[cfg(test)]
     fn qwen_gqa(
         &mut self,
         p: &str,
@@ -1653,6 +1642,7 @@ impl Builder {
         }
         Ok(())
     }
+    #[cfg(test)]
     fn qwen_hyper(
         &mut self,
         prefix: &str,
@@ -1691,6 +1681,7 @@ impl Builder {
         }
     }
 
+    #[cfg(test)]
     fn qwen_mtp(
         &mut self,
         arch: &Architecture,
@@ -1817,6 +1808,7 @@ impl Builder {
         Ok(())
     }
 
+    #[cfg(test)]
     fn qwen_vision(&mut self, arch: &Architecture) -> Result<(), PlanError> {
         let Some(vision) = &arch.vision else {
             return Ok(());
@@ -2840,6 +2832,7 @@ fn stem(name: &str) -> Result<&str, PlanError> {
         .ok_or_else(|| PlanError::Invalid(format!("{name} is not a weight the plan can scale")))
 }
 
+#[cfg(test)]
 fn hyper_or_plain(layer: &Layer) -> Option<&sparkflash_model::architecture::HyperConnection> {
     match &layer.residual {
         Residual::Hyper(hyper) => Some(hyper),
@@ -2850,6 +2843,7 @@ fn hyper_or_plain(layer: &Layer) -> Option<&sparkflash_model::architecture::Hype
 /// Qwen's official FP8 releases store one BF16 inverse scale a 128x128 tile, for the dense
 /// projections and the experts alike, whatever scale dtype the quantization table names for the
 /// same arithmetic.
+#[cfg(test)]
 fn qwen_dense_format(format: WeightFormat) -> WeightFormat {
     match format {
         WeightFormat::Fp8Tile {
@@ -2868,6 +2862,7 @@ fn qwen_dense_format(format: WeightFormat) -> WeightFormat {
 }
 
 /// The routed experts' stored format, with Qwen's BF16 tile scale.
+#[cfg(test)]
 fn qwen_expert_format(format: WeightFormat) -> ExpertFormat {
     match ExpertFormat::of(format) {
         ExpertFormat::Fp8 { block, .. } => ExpertFormat::Fp8 {
@@ -2889,6 +2884,7 @@ fn hyper_of(layer: &Layer) -> Result<&sparkflash_model::architecture::HyperConne
     }
 }
 
+#[cfg(test)]
 fn ple_padded_rows(ple: &PleGeometry) -> u64 {
     let heads = ple.ngram_size.saturating_sub(1) * ple.heads_per_ngram;
     let mut offset = 0u64;
@@ -2951,7 +2947,7 @@ mod layout_equality {
     use super::*;
 
     fn reference(arch: &Architecture, tp: TpPlan) -> ArchitectureTensorPlan {
-        let mut builder = Builder::new(tp, true, true, true);
+        let mut builder = Builder::new(tp, true, true);
         let dense = arch.quantization.dense_format;
         let experts = arch.quantization.expert_format;
         builder.dense_format = dense;
@@ -2984,6 +2980,109 @@ mod layout_equality {
             );
         }
         out
+    }
+
+    fn family_reference(arch: &Architecture, tp: TpPlan) -> ArchitectureTensorPlan {
+        let mut builder = Builder::new(tp, true, true);
+        let dense = arch.quantization.dense_format;
+        let experts = arch.quantization.expert_format;
+        builder.dense_format = dense;
+        builder.expert_format = if matches!(experts, WeightFormat::Bf16)
+            && matches!(dense, WeightFormat::Fp8Tile { .. })
+        {
+            dense
+        } else {
+            experts
+        };
+        builder.qwen(arch, true).expect("the reference planner");
+        builder.finish()
+    }
+
+    #[test]
+    fn the_second_worked_layout_reproduces_the_family_planner() {
+        let cases = [
+            (
+                "nvfp4",
+                include_str!(
+                    "../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json"
+                ),
+                false,
+                false,
+            ),
+            (
+                "fp8",
+                include_str!(
+                    "../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_fp8.hf.json"
+                ),
+                true,
+                false,
+            ),
+            (
+                "plain-fp8",
+                include_str!("../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json"),
+                false,
+                true,
+            ),
+        ];
+        for (label, text, experts_only, weight_only) in cases {
+            let mut architecture = Architecture::from_json(text).expect("the carried config");
+            if experts_only {
+                architecture.experts_only_fp8();
+            }
+            if weight_only {
+                architecture.weight_only_fp8();
+            }
+            // Both Qwen families are served at one rank. The MTP stage stores FP8 experts
+            // whose BF16 tile scale needs a whole-tile split; an explicit-dtype layout
+            // declaration has no row-tile split yet, so the plan is proved at the served world.
+            for world in [1usize] {
+                let tp = TpPlan::for_architecture(&architecture, world, 0).expect("a TP plan");
+                let expected = family_reference(&architecture, tp);
+                let actual = ArchitectureTensorPlan::checkpoint(&architecture, tp)
+                    .expect("the layout checkpoint plan");
+                let want = table(&expected);
+                let have = table(&actual);
+                let missing: Vec<&String> = want
+                    .keys()
+                    .filter(|name| !have.contains_key(*name))
+                    .collect();
+                let extra: Vec<&String> = have
+                    .keys()
+                    .filter(|name| !want.contains_key(*name))
+                    .collect();
+                assert!(
+                    missing.is_empty() && extra.is_empty(),
+                    "{label} TP{world}: missing {} {:?}, extra {} {:?}",
+                    missing.len(),
+                    &missing[..missing.len().min(8)],
+                    extra.len(),
+                    &extra[..extra.len().min(8)],
+                );
+                for (name, expected) in &want {
+                    let actual = &have[name];
+                    assert_eq!(
+                        expected.0, actual.0,
+                        "{label} TP{world}: {name} stored dtype differs"
+                    );
+                    assert_eq!(
+                        expected.1, actual.1,
+                        "{label} TP{world}: {name} logical shape differs"
+                    );
+                    assert_eq!(
+                        expected.2, actual.2,
+                        "{label} TP{world}: {name} rank shape differs"
+                    );
+                    assert_eq!(
+                        expected.3, actual.3,
+                        "{label} TP{world}: {name} rank run differs"
+                    );
+                    assert_eq!(
+                        expected.4, actual.4,
+                        "{label} TP{world}: {name} role differs"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

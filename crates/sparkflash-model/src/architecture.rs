@@ -4602,9 +4602,9 @@ mod tests {
             // Inkling's layout learns the tower's learned-grid position, LayerNorm and
             // erf-GELU wiring, and its [vars] resolve the MTP and convolution shape facts.
             0x70ca_7201_09d5_77db,
-            0x2416_b0da_0097_fad0,
-            0x6912_d984_45c3_3315,
-            0xf401_030a_ffce_bcd2,
+            0xe179_2f8b_9972_febb,
+            0x6989_36fa_e0f3_fa07,
+            0x4810_320b_c6c3_a5a8,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");
