@@ -610,6 +610,28 @@ impl Layout {
                 ffn: when.ffn,
                 indexer: when.indexer,
             });
+            if let Some(attention) = &when.attention
+                && !matches!(
+                    attention.as_str(),
+                    "kda" | "mla" | "gqa" | "gdn" | "inkling"
+                )
+            {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!(
+                        "tensor {:?}: unknown attention selector {attention:?}",
+                        tensor.name
+                    ),
+                ));
+            }
+            if let Some(ffn) = &when.ffn
+                && !matches!(ffn.as_str(), "dense" | "moe")
+            {
+                return Err(LayoutError::invalid(
+                    origin,
+                    format!("tensor {:?}: unknown ffn selector {ffn:?}", tensor.name),
+                ));
+            }
             tensors.push(TensorDecl {
                 name: tensor.name,
                 part: tensor.part,

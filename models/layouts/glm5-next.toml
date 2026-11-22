@@ -24,54 +24,67 @@ model_types = ["glm5_next"]
 # Config keys the description decodes through this layout. A key that only names the
 # producer's own type is still read here so the config-key check can account for it.
 [[keys]]
+# config.json text_config.qk_head_dim: the MLA query/key width (head_dim is 0).
 path = "text_config.qk_head_dim"
 fact = "language.attention.head_dim"
 
 [[keys]]
+# config.json text_config.mla_use_nope: the NoPE MLA scheme (qk_rope_head_dim is 0).
 path = "text_config.mla_use_nope"
 fact = "language.attention.rope"
 
 [[keys]]
+# config.json text_config.num_key_value_heads: the producer's KV-head count.
 path = "text_config.num_key_value_heads"
 fact = "language.attention.kv_heads"
 
 [[keys]]
+# config.json text_config.moe_router_dtype: the router accumulator width.
 path = "text_config.moe_router_dtype"
 fact = "language.moe.router_dtype"
 
 [[keys]]
+# config.json text_config.index_kpool_compress: the indexer's pooled stage.
 path = "text_config.index_kpool_compress"
 fact = "language.indexer.pool_compress"
 
 [[keys]]
+# config.json text_config.index_share_for_mtp_iteration: the MTP indexer's selection.
 path = "text_config.index_share_for_mtp_iteration"
 fact = "language.draft.indexer_shared"
 
 [[keys]]
+# config.json text_config.indexer_rope_interleave: the indexer's rotary layout.
 path = "text_config.indexer_rope_interleave"
 fact = "language.indexer.rope_interleave"
 
 [[keys]]
+# config.json text_config.linear_attn_config.kda_layers: the KDA layer schedule.
 path = "text_config.linear_attn_config.kda_layers"
 fact = "language.linear_attention.kda_layers"
 
 [[keys]]
+# config.json text_config.linear_attn_config.full_attn_layers: the sparse-MLA layer schedule.
 path = "text_config.linear_attn_config.full_attn_layers"
 fact = "language.linear_attention.full_attn_layers"
 
 [[keys]]
+# config.json text_config.model_type: the nested producer type, matched here only.
 path = "text_config.model_type"
 fact = "match.text_model_type"
 
 [[keys]]
+# config.json tie_word_embeddings: whether the head shares the embedding.
 path = "tie_word_embeddings"
 fact = "language.tie_word_embeddings"
 
 [[keys]]
+# config.json vision_config.image_size: the processor's image side.
 path = "vision_config.image_size"
 fact = "vision.image_size"
 
 [[keys]]
+# config.json vision_config.model_type: the nested tower type, matched here only.
 path = "vision_config.model_type"
 fact = "match.vision_model_type"
 
