@@ -239,6 +239,7 @@ pub fn released_values() -> Result<ModelConfig, ConfigError> {
 #[must_use]
 pub fn cached_values() -> &'static ModelConfig {
     if let Some(description) = installed() {
+        publish_geometry(&description.values);
         return &description.values;
     }
     static CACHED: std::sync::OnceLock<ModelConfig> = std::sync::OnceLock::new();
@@ -624,6 +625,69 @@ pub fn handles() -> KernelHandles {
         .unwrap_or_else(|| panic!("forward open: no kernel handles installed"))
 }
 
+// The geometry the per-token code reads on every call. Set once at install, read without a
+// lock: a mutex on the crate::plan::hidden()/head/vocabulary path would be a decode-step cost.
+static DIM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static VOCAB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static HC_MULT_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static MLA_LATENT_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn publish_geometry(values: &ModelConfig) {
+    use std::sync::atomic::Ordering;
+    DIM.store(values.dim, Ordering::Relaxed);
+    VOCAB.store(values.vocab_size, Ordering::Relaxed);
+    HC_MULT_VALUE.store(values.hc_mult, Ordering::Relaxed);
+    MLA_LATENT_VALUE.store(values.head_dim, Ordering::Relaxed);
+}
+
+/// The residual stream width, read at open from the plan.
+#[must_use]
+pub fn hidden() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&DIM, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The vocabulary size, read at open from the plan.
+#[must_use]
+pub fn vocab() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&VOCAB, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One rank's vocabulary shard, computed at open from the plan's vocabulary and the four-rank
+/// split. Four ranks is milestone 3 and is left in place here.
+#[must_use]
+pub fn vocab_per_rank() -> usize {
+    vocab() / 4
+}
+
+/// The mHC stream count, read at open from the plan.
+#[must_use]
+pub fn hc_mult() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&HC_MULT_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The mHC coefficient rows, computed at open from the plan's stream count.
+#[must_use]
+pub fn predictor_rows() -> usize {
+    let hc = hc_mult();
+    hc * hc + 2 * hc
+}
+
+/// The MLA latent width, read at open from the plan's attention head width.
+#[must_use]
+pub fn mla_latent() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&MLA_LATENT_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn ensure_geometry() {
+    if DIM.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        let _ = cached_values();
+    }
+}
+
 static DESCRIPTION: Mutex<Option<&'static Description>> = Mutex::new(None);
 
 /// Install the process's open description.
@@ -638,6 +702,7 @@ pub fn install(plan: EnginePlan) -> Result<&'static Description, ConfigError> {
     *DESCRIPTION
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(description);
+    publish_geometry(&description.values);
     let handles = KernelHandles::from_plan()?;
     *HANDLES
         .lock()

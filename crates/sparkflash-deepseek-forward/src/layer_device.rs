@@ -639,7 +639,7 @@ impl LayerBuffers {
             (
                 "workspace.kv_latent",
                 workspace.kv_latent,
-                crate::tp4_forward::MLA_LATENT,
+                crate::plan::mla_latent(),
                 2,
             ),
             ("workspace.attn_mix", workspace.attn_mix, ATTN_MIX_BYTES, 1),

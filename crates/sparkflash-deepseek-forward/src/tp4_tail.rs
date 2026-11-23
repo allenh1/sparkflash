@@ -41,25 +41,39 @@ use std::path::{Path, PathBuf};
 use sparkflash_comm::transport::Transport;
 
 /// The hidden size of the released configuration.
-pub const HIDDEN: usize = 5120;
 /// The full vocabulary of the released configuration.
 pub const VOCAB: usize = 129_280;
 /// The per-rank head shard width (VOCAB / 4).
-pub const VOCAB_PER_RANK: usize = 32_320;
-/// The certified head's screening blocks per output row (HIDDEN / 128).
+/// The certified head's screening blocks per output row (crate::plan::hidden() / 128).
 pub const BLOCKS_PER_ENTRY: usize = 40;
 /// The certified head's chunk width (one block per chunk).
 pub const CHUNK: u32 = sparkflash_kernels::cert_lm_head_launch::CHUNK;
 /// The per-rank screening chunk count (the certified-head side tensors' length).
-pub const CHUNKS_PER_RANK: usize = VOCAB_PER_RANK.div_ceil(CHUNK as usize);
+/// The per-rank logit chunks, computed at open from the plan's vocabulary shard.
+#[must_use]
+pub fn chunks_per_rank() -> usize {
+    crate::plan::vocab_per_rank().div_ceil(CHUNK as usize)
+}
 /// The f32 logits one rank produces.
-pub const LOGITS_BYTES_PER_RANK: usize = VOCAB_PER_RANK * 4;
+/// The per-rank logit bytes, computed at open from the plan's vocabulary shard.
+#[must_use]
+pub fn logits_bytes_per_rank() -> usize {
+    crate::plan::vocab_per_rank() * 4
+}
 /// The BF16 bytes of one rank's derived head block-maxima side tensor.
-pub const W_BLOCK_MAX_BYTES: usize = VOCAB_PER_RANK * BLOCKS_PER_ENTRY * 2;
+/// The BF16 bytes of one rank's derived head block-maxima side tensor.
+#[must_use]
+pub fn w_block_max_bytes() -> usize {
+    crate::plan::vocab_per_rank() * BLOCKS_PER_ENTRY * 2
+}
 
 /// The bytes of one rank's side-buffer gather payload: the certified mask, the certified count,
 /// the per-chunk block maxima and the per-chunk block argmax.
-pub const SIDE_BYTES: usize = VOCAB_PER_RANK + 4 + CHUNKS_PER_RANK * 4 * 2;
+/// The head's per-rank side buffer, computed at open.
+#[must_use]
+pub fn side_bytes() -> usize {
+    crate::plan::vocab_per_rank() + 4 + chunks_per_rank() * 4 * 2
+}
 
 /// The kernel symbols the tail loads, in load order.
 pub const TAIL_CUBINS: [&str; 2] = ["rmsnorm_sm121", "cert_lm_head_sm121"];
@@ -147,14 +161,15 @@ pub fn argmax_of(full: Vec<f32>) -> Result<Logits, String> {
 /// Assembles rank-ordered per-rank chunks into the full vector and picks the argmax.
 ///
 /// # Errors
-/// A chunk that is not VOCAB_PER_RANK long, or a chunk set that is not the full vocabulary.
+/// A chunk that is not crate::plan::vocab_per_rank() long, or a chunk set that is not the full vocabulary.
 pub fn assemble_chunks(chunks: &[Vec<f32>]) -> Result<Logits, String> {
     let mut full = Vec::with_capacity(VOCAB);
     for (rank, chunk) in chunks.iter().enumerate() {
-        if chunk.len() != VOCAB_PER_RANK {
+        if chunk.len() != crate::plan::vocab_per_rank() {
             return Err(format!(
-                "exact logit gather: rank {rank} produced {} logits, the plan's shard is {VOCAB_PER_RANK}",
-                chunk.len()
+                "exact logit gather: rank {rank} produced {} logits, the plan's shard is {}",
+                chunk.len(),
+                crate::plan::vocab_per_rank()
             ));
         }
         full.extend_from_slice(chunk);
@@ -177,10 +192,11 @@ pub fn assemble_chunks(chunks: &[Vec<f32>]) -> Result<Logits, String> {
 /// # Errors
 /// A local shard of the wrong width, a collective failure, or an empty reassembled vector.
 pub fn gather_logits(transport: &dyn Transport, local: &[f32], seq: u64) -> Result<Logits, String> {
-    if local.len() != VOCAB_PER_RANK {
+    if local.len() != crate::plan::vocab_per_rank() {
         return Err(format!(
-            "exact logit gather: this rank holds {} logits, the plan's shard is {VOCAB_PER_RANK}",
-            local.len()
+            "exact logit gather: this rank holds {} logits, the plan's shard is {}",
+            local.len(),
+            crate::plan::vocab_per_rank()
         ));
     }
     let words = split_f32_words(local);
@@ -205,8 +221,8 @@ pub fn cubin_path(dir: &Path, symbol: &str) -> PathBuf {
 #[cfg(feature = "cuda")]
 mod device {
     use super::{
-        CHUNKS_PER_RANK, HIDDEN, LOGITS_BYTES_PER_RANK, TAIL_CUBINS, VOCAB_PER_RANK,
-        W_BLOCK_MAX_BYTES, cubin_path, join_f32_words, split_f32_words,
+        TAIL_CUBINS, chunks_per_rank, cubin_path, join_f32_words, logits_bytes_per_rank,
+        split_f32_words,
     };
     use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, Module};
     use sparkflash_kernels::{cert_lm_head_launch, head_screen_ref, lm_head_ref, rmsnorm_launch};
@@ -239,13 +255,13 @@ mod device {
     pub struct TailOutputs {
         /// The normalised hidden state the certified head consumed, BF16 (the normed buffer).
         pub normed_bf16: Vec<u8>,
-        /// The certified mask: VOCAB_PER_RANK bytes, 1 = the entry was pruned by the block bound.
+        /// The certified mask: crate::plan::vocab_per_rank() bytes, 1 = the entry was pruned by the block bound.
         pub certified: Vec<u8>,
         /// The number of certified entries, as the kernel wrote it.
         pub certified_count: u32,
-        /// The per-chunk block maxima the kernel screened with (CHUNKS_PER_RANK f32).
+        /// The per-chunk block maxima the kernel screened with (chunks_per_rank() f32).
         pub block_max: Vec<f32>,
-        /// The per-chunk block argmax entries (CHUNKS_PER_RANK u32, the lowest on a block tie).
+        /// The per-chunk block argmax entries (chunks_per_rank() u32, the lowest on a block tie).
         pub block_argmax: Vec<u32>,
     }
 
@@ -253,7 +269,7 @@ mod device {
     /// (`diagnostics.head_screen`).
     const HEAD_SCREEN_DEFAULT: bool = true;
     /// The tiles of int8 codes a rank's head slice fills (kernels/opt_rows_sm121.cu, OHS_TILE).
-    const SCREEN_TILES: usize = VOCAB_PER_RANK.div_ceil(head_screen_ref::TILE);
+    const SCREEN_TILES: usize = crate::plan::vocab_per_rank().div_ceil(head_screen_ref::TILE);
     /// The most hidden rows a step screens: the rows head's R_MAX.
     const SCREEN_ROWS: usize = 64;
     /// The rows the self test screens: two row blocks, the second partly filled.
@@ -286,11 +302,11 @@ mod device {
         codes: Deviceptr,
         /// `[SCREEN_TILES * 128][4]` f32: each entry's scale and its two error coefficients.
         coef: Deviceptr,
-        /// A step's hidden rows as two int8 digits each, `[2 * SCREEN_ROWS][HIDDEN]`.
+        /// A step's hidden rows as two int8 digits each, `[2 * SCREEN_ROWS][crate::plan::hidden()]`.
         act: Deviceptr,
         /// `[SCREEN_ROWS][4]` f32: each row's scale and its two norms.
         meta: Deviceptr,
-        /// `[SCREEN_ROWS][VOCAB_PER_RANK]` f32: every logit's upper bound.
+        /// `[SCREEN_ROWS][crate::plan::vocab_per_rank()]` f32: every logit's upper bound.
         upper: Deviceptr,
         /// `[SCREEN_ROWS][SCREEN_TILES]` f32: each tile's best lower bound.
         tile_lo: Deviceptr,
@@ -334,11 +350,17 @@ mod device {
             };
             let entries = SCREEN_TILES * head_screen_ref::TILE;
             let screen = Self {
-                codes: alloc(head_screen_ref::table_bytes(VOCAB_PER_RANK), "codes")?,
+                codes: alloc(
+                    head_screen_ref::table_bytes(crate::plan::vocab_per_rank()),
+                    "codes",
+                )?,
                 coef: alloc(entries * 16, "coefficients")?,
-                act: alloc(2 * SCREEN_ROWS * HIDDEN, "digits")?,
+                act: alloc(2 * SCREEN_ROWS * crate::plan::hidden(), "digits")?,
                 meta: alloc(SCREEN_ROWS * 16, "row scales")?,
-                upper: alloc(SCREEN_ROWS * VOCAB_PER_RANK * 4, "upper bounds")?,
+                upper: alloc(
+                    SCREEN_ROWS * crate::plan::vocab_per_rank() * 4,
+                    "upper bounds",
+                )?,
                 tile_lo: alloc(SCREEN_ROWS * SCREEN_TILES * 4, "tile bounds")?,
                 counts: alloc(SCREEN_ROWS * 4, "counts")?,
                 modules,
@@ -352,14 +374,19 @@ mod device {
                 build,
                 (entries as u32, 1, 1),
                 (256, 1, 1),
-                &[head.0, screen.codes.0, screen.coef.0, VOCAB_PER_RANK as u64],
+                &[
+                    head.0,
+                    screen.codes.0,
+                    screen.coef.0,
+                    crate::plan::vocab_per_rank() as u64,
+                ],
             )?;
             // The read waits for the build. An entry the bound does not cover (a value that is
             // not finite, or squares that sum past the kernel's cut) is always scored, which is
             // still exact; a head holding one is not a head this path was measured on, so say so
             // rather than serve it.
             let coef = screen.read_f32(cuda, screen.coef, entries * 4)?;
-            if let Some(entry) = (0..VOCAB_PER_RANK).find(|&entry| {
+            if let Some(entry) = (0..crate::plan::vocab_per_rank()).find(|&entry| {
                 coef[entry * 4..entry * 4 + 3]
                     .iter()
                     .any(|value| !value.is_finite())
@@ -386,10 +413,10 @@ mod device {
             // existed nothing in the logs or the docs said so.
             eprintln!(
                 "sparkflash serve: head screen on over {} x {} int8 codes: {} bytes of codes, {} of bounds for {} rows; self test passed{}",
-                VOCAB_PER_RANK,
-                HIDDEN,
-                head_screen_ref::table_bytes(VOCAB_PER_RANK),
-                SCREEN_ROWS * (VOCAB_PER_RANK + SCREEN_TILES) * 4,
+                crate::plan::vocab_per_rank(),
+                crate::plan::hidden(),
+                head_screen_ref::table_bytes(crate::plan::vocab_per_rank()),
+                SCREEN_ROWS * (crate::plan::vocab_per_rank() + SCREEN_TILES) * 4,
                 SCREEN_ROWS,
                 if check {
                     " (diagnostic check also armed)"
@@ -412,7 +439,7 @@ mod device {
                 .collect())
         }
 
-        /// Queues the screen of `(hidden, n)`, `n` rows of bf16 `[n][HIDDEN]`, and the exact pass over
+        /// Queues the screen of `(hidden, n)`, `n` rows of bf16 `[n][crate::plan::hidden()]`, and the exact pass over
         /// what it keeps, which writes the rows' chunk maxima where opt_rows_lm_head writes them.
         /// `noise` is that kernel's `(inv_t bits, seed, first position, id base, row parameters)`,
         /// all zero for a greedy step. With `count` the entries scored for each row are left in
@@ -448,7 +475,7 @@ mod device {
                     self.coef.0,
                     self.upper.0,
                     self.tile_lo.0,
-                    VOCAB_PER_RANK as u64,
+                    crate::plan::vocab_per_rank() as u64,
                     n as u64,
                     noise[0],
                     noise[1],
@@ -463,7 +490,7 @@ mod device {
             }
             cuda.launch(
                 self.exact,
-                (n.div_ceil(4) as u32, CHUNKS_PER_RANK as u32, 1),
+                (n.div_ceil(4) as u32, chunks_per_rank() as u32, 1),
                 (512, 1, 1),
                 &[
                     hidden,
@@ -472,7 +499,7 @@ mod device {
                     self.tile_lo.0,
                     block_max,
                     block_arg,
-                    VOCAB_PER_RANK as u64,
+                    crate::plan::vocab_per_rank() as u64,
                     n as u64,
                     SCREEN_TILES as u64,
                     if count { self.counts.0 } else { 0 },
@@ -511,9 +538,10 @@ mod device {
             if tally.rows != 0 {
                 eprintln!(
                     "head screen check: {} steps and {} rows agree with the full head; {:.1} of \
-                     {VOCAB_PER_RANK} entries scored a row, {} at most",
+                     {} entries scored a row, {} at most",
                     tally.steps,
                     tally.rows,
+                    crate::plan::vocab_per_rank(),
                     tally.scored as f64 / tally.rows as f64,
                     tally.most
                 );
@@ -539,13 +567,14 @@ mod device {
             let safe = |device: f32, exact: f64, slack: f64| {
                 f64::from(device) >= exact && f64::from(device) <= exact * slack + 2e-17
             };
-            let mut device_codes = vec![0u8; head_screen_ref::table_bytes(VOCAB_PER_RANK)];
+            let mut device_codes =
+                vec![0u8; head_screen_ref::table_bytes(crate::plan::vocab_per_rank())];
             cuda.copy_dtoh(&mut device_codes, &self.codes)
                 .map_err(|error| format!("head screen codes read: {error}"))?;
-            let mut codes = vec![0i8; VOCAB_PER_RANK * HIDDEN];
-            for entry in 0..VOCAB_PER_RANK {
+            let mut codes = vec![0i8; crate::plan::vocab_per_rank() * crate::plan::hidden()];
+            for entry in 0..crate::plan::vocab_per_rank() {
                 let host = head_screen_ref::entry_codes(&words(
-                    &shard[entry * HIDDEN * 2..][..HIDDEN * 2],
+                    &shard[entry * crate::plan::hidden() * 2..][..crate::plan::hidden() * 2],
                 ));
                 let c = &coef[entry * 4..entry * 4 + 4];
                 if c[0].to_bits() != host.scale.to_bits()
@@ -573,7 +602,8 @@ mod device {
                         ));
                     }
                 }
-                codes[entry * HIDDEN..(entry + 1) * HIDDEN].copy_from_slice(&host.codes);
+                codes[entry * crate::plan::hidden()..(entry + 1) * crate::plan::hidden()]
+                    .copy_from_slice(&host.codes);
             }
             drop(device_codes);
 
@@ -587,8 +617,8 @@ mod device {
                 ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
             };
             let bf16 = sparkflash_kernels::m4_quant::bf16_bits;
-            let mut hidden = vec![0u16; n * HIDDEN];
-            for (row, values) in hidden.chunks_mut(HIDDEN).enumerate() {
+            let mut hidden = vec![0u16; n * crate::plan::hidden()];
+            for (row, values) in hidden.chunks_mut(crate::plan::hidden()).enumerate() {
                 let scale = 2.0f32.powi(row as i32 % 9 - 4);
                 for (k, value) in values.iter_mut().enumerate() {
                     let v = (unit() + unit() + unit() + unit()) * 0.5 * scale;
@@ -626,7 +656,7 @@ mod device {
                         self.coef.0,
                         self.upper.0,
                         self.tile_lo.0,
-                        VOCAB_PER_RANK as u64,
+                        crate::plan::vocab_per_rank() as u64,
                         n as u64,
                         // Greedy rows: the bounds are the logit's own.
                         0,
@@ -636,12 +666,12 @@ mod device {
                         0,
                     ],
                 )?;
-                let mut act = vec![0u8; 2 * SCREEN_ROWS * HIDDEN];
+                let mut act = vec![0u8; 2 * SCREEN_ROWS * crate::plan::hidden()];
                 cuda.copy_dtoh(&mut act, &self.act)?;
                 Ok::<_, String>((
                     act,
                     self.read_f32(cuda, self.meta, n * 4)?,
-                    self.read_f32(cuda, self.upper, n * VOCAB_PER_RANK)?,
+                    self.read_f32(cuda, self.upper, n * crate::plan::vocab_per_rank())?,
                     self.read_f32(cuda, self.tile_lo, n * SCREEN_TILES)?,
                 ))
             })();
@@ -649,9 +679,12 @@ mod device {
             let (act, meta, upper, tile_lo) = outcome?;
 
             let check_row = |row: usize| -> Result<(), String> {
-                let host = head_screen_ref::row_digits(&hidden[row * HIDDEN..(row + 1) * HIDDEN]);
+                let host = head_screen_ref::row_digits(
+                    &hidden[row * crate::plan::hidden()..(row + 1) * crate::plan::hidden()],
+                );
                 let m = &meta[row * 4..row * 4 + 4];
-                let upper = &upper[row * VOCAB_PER_RANK..(row + 1) * VOCAB_PER_RANK];
+                let upper = &upper[row * crate::plan::vocab_per_rank()
+                    ..(row + 1) * crate::plan::vocab_per_rank()];
                 let tile_lo = &tile_lo[row * SCREEN_TILES..(row + 1) * SCREEN_TILES];
                 if host.usable != matches!(row, 0..=36 | 40) {
                     return Err(format!(
@@ -661,10 +694,12 @@ mod device {
                 if m[0].to_bits() != host.scale.to_bits() {
                     return Err(format!("row {row}: scale {} for {}", m[0], host.scale));
                 }
-                for k in 0..HIDDEN {
+                for k in 0..crate::plan::hidden() {
                     let (p0, p1) = host.pair(k);
-                    let lo = act[head_screen_ref::digit_row(row, 0) * HIDDEN + k] as i8;
-                    let hi = act[head_screen_ref::digit_row(row, 1) * HIDDEN + k] as i8;
+                    let lo =
+                        act[head_screen_ref::digit_row(row, 0) * crate::plan::hidden() + k] as i8;
+                    let hi =
+                        act[head_screen_ref::digit_row(row, 1) * crate::plan::hidden() + k] as i8;
                     if (lo, hi) != (p0, p1) {
                         return Err(format!("row {row}: the digits at {k} differ"));
                     }
@@ -689,10 +724,10 @@ mod device {
                     ));
                 }
                 let mut best = vec![(f32::NEG_INFINITY, 0.0f32); SCREEN_TILES];
-                for entry in 0..VOCAB_PER_RANK {
+                for entry in 0..crate::plan::vocab_per_rank() {
                     let c = &coef[entry * 4..entry * 4 + 4];
                     let dot = head_screen_ref::integer_dot(
-                        &codes[entry * HIDDEN..(entry + 1) * HIDDEN],
+                        &codes[entry * crate::plan::hidden()..(entry + 1) * crate::plan::hidden()],
                         &host.digits,
                     );
                     let p = head_screen_ref::proxy(c[0], m[0], dot);
@@ -752,8 +787,8 @@ mod device {
                 return refuse(what);
             }
             eprintln!(
-                "head screen self test: {VOCAB_PER_RANK} entries' codes and {n} rows' bounds match \
-                 the reference"
+                "head screen self test: {} entries' codes and {n} rows' bounds match \
+                 the reference", crate::plan::vocab_per_rank()
             );
             Ok(())
         }
@@ -825,38 +860,38 @@ mod device {
                 .map_err(|error| format!("tail certified-head cubin: {error}"))?;
             let mut allocated = 0usize;
             let hidden = cuda
-                .alloc(HIDDEN * 2, &mut allocated)
+                .alloc(crate::plan::hidden() * 2, &mut allocated)
                 .map_err(|error| format!("tail hidden buffer: {error}"))?;
             let normed = cuda
-                .alloc(HIDDEN * 2, &mut allocated)
+                .alloc(crate::plan::hidden() * 2, &mut allocated)
                 .map_err(|error| format!("tail normed buffer: {error}"))?;
             let w_block_max = cuda
-                .alloc(W_BLOCK_MAX_BYTES, &mut allocated)
+                .alloc(super::w_block_max_bytes(), &mut allocated)
                 .map_err(|error| format!("tail w_block_max buffer: {error}"))?;
             let logits = cuda
-                .alloc(LOGITS_BYTES_PER_RANK, &mut allocated)
+                .alloc(logits_bytes_per_rank(), &mut allocated)
                 .map_err(|error| format!("tail logits buffer: {error}"))?;
             let certified = cuda
-                .alloc(VOCAB_PER_RANK, &mut allocated)
+                .alloc(crate::plan::vocab_per_rank(), &mut allocated)
                 .map_err(|error| format!("tail certified buffer: {error}"))?;
             let certified_count = cuda
                 .alloc(4, &mut allocated)
                 .map_err(|error| format!("tail certified-count buffer: {error}"))?;
             let block_max = cuda
-                .alloc(CHUNKS_PER_RANK * 4, &mut allocated)
+                .alloc(chunks_per_rank() * 4, &mut allocated)
                 .map_err(|error| format!("tail block-max buffer: {error}"))?;
             let block_argmax = cuda
-                .alloc(CHUNKS_PER_RANK * 4, &mut allocated)
+                .alloc(chunks_per_rank() * 4, &mut allocated)
                 .map_err(|error| format!("tail block-argmax buffer: {error}"))?;
 
             // Derive w_block_max once, from the arena's head shard bytes, at loop open: this is
             // init-time work, not a per-token weight H2D, and it keeps TailBind at three pointers.
-            let shard_bytes = VOCAB_PER_RANK * HIDDEN * 2;
+            let shard_bytes = crate::plan::vocab_per_rank() * crate::plan::hidden() * 2;
             let mut shard = vec![0u8; shard_bytes];
             cuda.copy_dtoh(&mut shard, &bind.tail.head)
                 .map_err(|error| format!("head shard read for w_block_max: {error}"))?;
             let maxima = lm_head_ref::block_maxima_bf16(&shard);
-            debug_assert_eq!(maxima.len(), W_BLOCK_MAX_BYTES);
+            debug_assert_eq!(maxima.len(), super::w_block_max_bytes());
             cuda.copy_htod(&w_block_max, &maxima)
                 .map_err(|error| format!("w_block_max upload: {error}"))?;
 
@@ -915,7 +950,7 @@ mod device {
 
         /// Normalises one position's hidden state and screens this rank's head shard.
         ///
-        /// Returns this rank's VOCAB_PER_RANK f32 logits; the caller gathers them with
+        /// Returns this rank's crate::plan::vocab_per_rank() f32 logits; the caller gathers them with
         /// super::gather_logits so no rank ever argmaxes a partial vector.
         ///
         /// # Errors
@@ -927,11 +962,11 @@ mod device {
             layer_id: u32,
             step_seq: u64,
         ) -> Result<Vec<f32>, String> {
-            if hidden_bf16.len() != HIDDEN * 2 {
+            if hidden_bf16.len() != crate::plan::hidden() * 2 {
                 return Err(format!(
                     "tail screen: the hidden state is {} bytes, one BF16 row is {}",
                     hidden_bf16.len(),
-                    HIDDEN * 2
+                    crate::plan::hidden() * 2
                 ));
             }
             cuda.copy_htod(&self.buffers.hidden, hidden_bf16)
@@ -947,7 +982,7 @@ mod device {
                 weight: self.norm_weight,
                 out: self.buffers.normed,
                 rows: 1,
-                cols: HIDDEN as u32,
+                cols: crate::plan::hidden() as u32,
                 eps: self.eps,
                 trace_ring: 0,
                 layer_id,
@@ -963,16 +998,16 @@ mod device {
                 self.buffers.certified_count,
                 self.buffers.block_max,
                 self.buffers.block_argmax,
-                VOCAB_PER_RANK as u32,
+                crate::plan::vocab_per_rank() as u32,
                 0,
                 layer_id,
                 step_seq,
             );
             cert_lm_head_launch::launch(cuda, self.head, &head)?;
-            let mut raw = vec![0u8; LOGITS_BYTES_PER_RANK];
+            let mut raw = vec![0u8; logits_bytes_per_rank()];
             cuda.copy_dtoh(&mut raw, &self.buffers.logits)
                 .map_err(|error| format!("tail logits dtoh: {error}"))?;
-            let mut values = Vec::with_capacity(VOCAB_PER_RANK);
+            let mut values = Vec::with_capacity(crate::plan::vocab_per_rank());
             for index in (0..raw.len()).step_by(4) {
                 values.push(f32::from_le_bytes([
                     raw[index],
@@ -1002,7 +1037,7 @@ mod device {
                 weight: self.norm_weight,
                 out: self.buffers.normed,
                 rows: 1,
-                cols: HIDDEN as u32,
+                cols: crate::plan::hidden() as u32,
                 eps: self.eps,
                 trace_ring: 0,
                 layer_id,
@@ -1018,13 +1053,13 @@ mod device {
                 self.buffers.certified_count,
                 self.buffers.block_max,
                 self.buffers.block_argmax,
-                VOCAB_PER_RANK as u32,
+                crate::plan::vocab_per_rank() as u32,
                 0,
                 layer_id,
                 step_seq,
             );
             cert_lm_head_launch::launch(cuda, self.head, &head)?;
-            let chunks = CHUNKS_PER_RANK;
+            let chunks = chunks_per_rank();
             let mut max_bytes = vec![0u8; chunks * 4];
             let mut arg_bytes = vec![0u8; chunks * 4];
             cuda.copy_dtoh(&mut max_bytes, &self.buffers.block_max)
@@ -1062,8 +1097,8 @@ mod device {
             for rank in 0..world {
                 let w = &gathered[rank * 4..rank * 4 + 4];
                 let value = join_f32_words(&w[..2])?[0];
-                let index =
-                    ((u32::from(w[2]) << 16) | u32::from(w[3])) + (rank * VOCAB_PER_RANK) as u32;
+                let index = ((u32::from(w[2]) << 16) | u32::from(w[3]))
+                    + (rank * crate::plan::vocab_per_rank()) as u32;
                 if !winner.2 || value > winner.0 {
                     winner = (value, index, true);
                 }
@@ -1085,7 +1120,7 @@ mod device {
                 weight: self.norm_weight,
                 out: self.buffers.normed,
                 rows: 1,
-                cols: HIDDEN as u32,
+                cols: crate::plan::hidden() as u32,
                 eps: self.eps,
                 trace_ring: 0,
                 layer_id,
@@ -1101,16 +1136,16 @@ mod device {
                 self.buffers.certified_count,
                 self.buffers.block_max,
                 self.buffers.block_argmax,
-                VOCAB_PER_RANK as u32,
+                crate::plan::vocab_per_rank() as u32,
                 0,
                 layer_id,
                 step_seq,
             );
             cert_lm_head_launch::launch(cuda, self.head, &head)?;
-            let mut raw = vec![0u8; LOGITS_BYTES_PER_RANK];
+            let mut raw = vec![0u8; logits_bytes_per_rank()];
             cuda.copy_dtoh(&mut raw, &self.buffers.logits)
                 .map_err(|error| format!("tail logits dtoh: {error}"))?;
-            let mut values = Vec::with_capacity(VOCAB_PER_RANK);
+            let mut values = Vec::with_capacity(crate::plan::vocab_per_rank());
             for index in (0..raw.len()).step_by(4) {
                 values.push(f32::from_le_bytes([
                     raw[index],
@@ -1129,22 +1164,22 @@ mod device {
         /// # Errors
         /// A driver copy failure, or a certified count that is not inside the vocab.
         pub fn read_outputs(&self, cuda: &Cuda) -> Result<TailOutputs, String> {
-            let mut normed = vec![0u8; HIDDEN * 2];
+            let mut normed = vec![0u8; crate::plan::hidden() * 2];
             cuda.copy_dtoh(&mut normed, &self.buffers.normed)
                 .map_err(|error| format!("tail normed dtoh: {error}"))?;
-            let mut certified = vec![0u8; VOCAB_PER_RANK];
+            let mut certified = vec![0u8; crate::plan::vocab_per_rank()];
             cuda.copy_dtoh(&mut certified, &self.buffers.certified)
                 .map_err(|error| format!("tail certified dtoh: {error}"))?;
             let mut count_raw = [0u8; 4];
             cuda.copy_dtoh(&mut count_raw, &self.buffers.certified_count)
                 .map_err(|error| format!("tail certified-count dtoh: {error}"))?;
             let certified_count = u32::from_le_bytes(count_raw);
-            if certified_count as usize > VOCAB_PER_RANK {
+            if certified_count as usize > crate::plan::vocab_per_rank() {
                 return Err(format!(
-                    "tail certified count {certified_count} is larger than the rank vocabulary {VOCAB_PER_RANK}"
+                    "tail certified count {certified_count} is larger than the rank vocabulary {}", crate::plan::vocab_per_rank()
                 ));
             }
-            let mut max_raw = vec![0u8; CHUNKS_PER_RANK * 4];
+            let mut max_raw = vec![0u8; chunks_per_rank() * 4];
             cuda.copy_dtoh(&mut max_raw, &self.buffers.block_max)
                 .map_err(|error| format!("tail block-max dtoh: {error}"))?;
             let block_max = max_raw
@@ -1153,7 +1188,7 @@ mod device {
                 .iter()
                 .map(|word| f32::from_le_bytes(*word))
                 .collect();
-            let mut argmax_raw = vec![0u8; CHUNKS_PER_RANK * 4];
+            let mut argmax_raw = vec![0u8; chunks_per_rank() * 4];
             cuda.copy_dtoh(&mut argmax_raw, &self.buffers.block_argmax)
                 .map_err(|error| format!("tail block-argmax dtoh: {error}"))?;
             let block_argmax = argmax_raw
@@ -1245,16 +1280,16 @@ mod tests {
     fn assembling_the_four_rank_chunks_is_the_full_vocabulary_in_rank_order() {
         let chunks: Vec<Vec<f32>> = (0..4u32)
             .map(|rank| {
-                let mut chunk = vec![0.0f32; VOCAB_PER_RANK];
+                let mut chunk = vec![0.0f32; crate::plan::vocab_per_rank()];
                 chunk[0] = 10.0 * rank as f32;
                 chunk
             })
             .collect();
         let logits = assemble_chunks(&chunks).expect("assemble");
         assert_eq!(logits.full.len(), VOCAB);
-        assert_eq!(logits.argmax, 3 * VOCAB_PER_RANK as u32);
+        assert_eq!(logits.argmax, 3 * crate::plan::vocab_per_rank() as u32);
         assert_eq!(logits.top1, 30.0);
-        let short = vec![vec![0.0f32; VOCAB_PER_RANK], vec![0.0f32; 1]];
+        let short = vec![vec![0.0f32; crate::plan::vocab_per_rank()], vec![0.0f32; 1]];
         assert!(assemble_chunks(&short).is_err());
         assert!(
             assemble_chunks(&chunks[..3]).is_err(),
@@ -1276,7 +1311,7 @@ mod tests {
         let seq = 41;
         let expected: Vec<Vec<f32>> = (0..4usize)
             .map(|rank| {
-                (0..VOCAB_PER_RANK)
+                (0..crate::plan::vocab_per_rank())
                     .map(|index| {
                         let bits = (rank as u32) << 24 | (index as u32) << 4 | (index as u32 & 0xf);
                         f32::from_bits(bits)
@@ -1301,7 +1336,7 @@ mod tests {
         for rank in 0..4 {
             assert_eq!(assembled[rank].full.len(), VOCAB);
             for (full_rank, chunk) in expected.iter().enumerate() {
-                let base = full_rank * VOCAB_PER_RANK;
+                let base = full_rank * crate::plan::vocab_per_rank();
                 for (index, want) in chunk.iter().enumerate() {
                     assert_eq!(
                         assembled[rank].full[base + index].to_bits(),
@@ -1322,10 +1357,10 @@ mod tests {
         assert_eq!(TAIL_CUBINS, ["rmsnorm_sm121", "cert_lm_head_sm121"]);
         let path = cubin_path(Path::new("/cubins"), TAIL_CUBINS[1]);
         assert_eq!(path, PathBuf::from("/cubins/cert_lm_head_sm121.cubin"));
-        assert_eq!(CHUNKS_PER_RANK, 32);
-        assert_eq!(W_BLOCK_MAX_BYTES, 2_585_600);
-        assert_eq!(LOGITS_BYTES_PER_RANK, 129_280);
-        assert_eq!(VOCAB_PER_RANK * 4, VOCAB);
+        assert_eq!(chunks_per_rank(), 32);
+        assert_eq!(super::w_block_max_bytes(), 2_585_600);
+        assert_eq!(logits_bytes_per_rank(), 129_280);
+        assert_eq!(crate::plan::vocab_per_rank() * 4, VOCAB);
         assert_eq!(BLOCKS_PER_ENTRY, 40);
         assert_eq!(CHUNK, 1024);
     }

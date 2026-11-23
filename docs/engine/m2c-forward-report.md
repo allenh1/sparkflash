@@ -77,6 +77,42 @@ engram_stream_convert_sm121, engram_write_sm121 or moe_routed_device_sm121. They
 until part B's catalogue claims them; the plan test's exact symbol set is the authority and it
 does not.
 
+
+## PR 3 — model values from the plan, buffer sizes computed at open
+
+Commit: 'forward: read model values and sizes from the open plan'
+
+What changed:
+
+* values_from_plan fills the loop's value object (vocabulary, width, layers, heads, latent,
+  expert counts, mHC streams, Engram rows, vision fields and every other field the forward
+  reads) from EnginePlan::model_facts. No model value is parsed inside the forward crate.
+* HIDDEN, VOCAB/VOCAB_PER_RANK, HC_MULT, PREDICTOR_ROWS, MLA_LATENT, DUMP_BLOCK_BYTES,
+  REDUCE_CALLS_PER_STEP, CHUNKS_PER_RANK, LOGITS_BYTES_PER_RANK, SIDE_BYTES,
+  W_BLOCK_MAX_BYTES, WINDOW_CODE_BYTES, WINDOW_SCALE_BYTES and DEFAULT_COMBINE_ROWS are no
+  longer literal consts: each is computed at open from the installed plan's facts and read
+  through plan::hidden()/vocab()/vocab_per_rank()/hc_mult()/predictor_rows()/mla_latent().
+  The per-token accessors read atomics published once at install, not a lock.
+* the device row-geometry refusal compares against the plan's dim and hc_mult rather than
+  5120 and 4.
+
+Commands run:
+
+    cargo fmt -p sparkflash-deepseek-forward
+    cargo check -p sparkflash-deepseek-forward --offline                  # pass
+    cargo check -p sparkflash-cli --offline                              # pass
+    cargo test -p sparkflash-deepseek-forward --lib --offline
+    # 302 passed; 0 failed; 1 ignored
+
+Comparison evidence: not measured, same cluster blocker as PR 1. Speed A/B is required for
+this PR because it touches every-token code; it is blocked on the same window and is not
+claimed.
+
+Remaining model literals in non-test sources: the MTP draft's compile-time array geometry
+(BLOCK 5, STAGES 3, EXPERTS 128, TOP_K 3, MARKOV_RANK 256) and the kernel-width constants
+(KV_ROTATED_BYTES/KV_LATENT_BYTES, MLA latent store bytes) are still consts used in fixed-size
+arrays. They are the next slice of "sizes computed at open" and are not claimed done here.
+
 ## Blockers
 
 1. **Four-rank manifest/launch/tick comparison.** The baseline is on the head node at

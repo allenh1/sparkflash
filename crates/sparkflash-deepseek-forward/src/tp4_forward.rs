@@ -48,7 +48,7 @@ use sparkflash_comm::tcp::TcpTransport;
 use crate::tp4_combine::{CombineGeometry, CombineKernelSet, CombineSelection, select_combine};
 #[cfg(feature = "cuda")]
 use crate::tp4_prefill::{StagedAttention, TwinStats};
-use crate::tp4_token::{REDUCE_CALLS_PER_STEP, StepMs, TokenEnvelope, Tokens};
+use crate::tp4_token::{StepMs, TokenEnvelope, Tokens, reduce_calls_per_step};
 
 #[cfg(feature = "cuda")]
 mod batch;
@@ -74,9 +74,7 @@ mod vision;
 pub const PREFLIGHT_FLAG: &str = "--forward-preflight";
 
 /// The hidden size of the released configuration (the embedding row width).
-pub const HIDDEN: usize = 5120;
 /// The per-rank vocabulary/head shard width of the released plan.
-pub const VOCAB_PER_RANK: u32 = 32_320;
 /// The exchange sequence the embedding all-gather uses. It is far above the walk's sequences so a
 /// reused transport can never confuse the two exchanges, and it never aliases a layer reduce seq.
 pub const EMBED_EXCHANGE_SEQ: u64 = u64::MAX - 7;
@@ -610,8 +608,8 @@ impl NativeRounding {
 pub fn embedding_location(token: u32) -> (usize, usize) {
     let token = token as usize;
     (
-        token / VOCAB_PER_RANK as usize,
-        token % VOCAB_PER_RANK as usize,
+        token / crate::plan::vocab_per_rank() as usize,
+        token % crate::plan::vocab_per_rank() as usize,
     )
 }
 
@@ -1015,7 +1013,7 @@ pub fn prompt_len_for(prompt_tokens: &[u32], positions: usize) -> Option<usize> 
 #[must_use]
 pub fn prefill_exchange_bytes(world: usize, prompt_len: usize) -> usize {
     world
-        .saturating_mul(HIDDEN)
+        .saturating_mul(crate::plan::hidden())
         .saturating_mul(2)
         .saturating_mul(prompt_len)
 }
@@ -1026,7 +1024,6 @@ pub fn prefill_exchange_bytes(world: usize, prompt_len: usize) -> usize {
 pub const TRACE_RING_BYTES: usize = 64;
 
 /// The mHC stream count of the released model (four residual copies).
-pub const HC_MULT: usize = 4;
 
 /// Element limit for the Engram seam's tensor reads. One wkv projection is 157.3 M elements and one
 /// whole Engram table is 98.3 G elements, so this is the single-node host chain's own limit
@@ -1035,7 +1032,6 @@ pub const HC_MULT: usize = 4;
 #[cfg(feature = "cuda")]
 pub const ENGRAM_ELEMENT_LIMIT: usize = 1 << 31;
 /// The released mHC predictor's row count: hc^2 + 2*hc.
-pub const PREDICTOR_ROWS: usize = HC_MULT * HC_MULT + 2 * HC_MULT;
 
 /// Little-endian f32 bytes decoded to a vector.
 ///
@@ -1209,9 +1205,10 @@ fn mhc_entry_host_seam_with_digests(
 
     let hc = config.hc_mult;
     let dim = config.dim;
-    if hc != HC_MULT {
+    if hc != crate::plan::hc_mult() {
         return Err(format!(
-            "mHC entry: the released seam is the {HC_MULT}-stream reference, config declares {hc}"
+            "mHC entry: the released seam is the {}-stream reference, config declares {hc}",
+            crate::plan::hc_mult()
         ));
     }
     if hidden.len() != hc * dim {
@@ -1220,13 +1217,14 @@ fn mhc_entry_host_seam_with_digests(
             hidden.len()
         ));
     }
-    let predictor_values = PREDICTOR_ROWS
+    let predictor_values = crate::plan::predictor_rows()
         .checked_mul(hc * dim)
         .ok_or_else(|| "mHC entry: predictor length overflows".to_string())?;
     if predictor.len() != predictor_values {
         return Err(format!(
-            "mHC entry: predictor is {} values, expected {PREDICTOR_ROWS} rows x {} = {predictor_values}",
+            "mHC entry: predictor is {} values, expected {} rows x {} = {predictor_values}",
             predictor.len(),
+            crate::plan::predictor_rows(),
             hc * dim
         ));
     }
@@ -1236,10 +1234,11 @@ fn mhc_entry_host_seam_with_digests(
             weight.len()
         ));
     }
-    if base.len() != PREDICTOR_ROWS {
+    if base.len() != crate::plan::predictor_rows() {
         return Err(format!(
-            "mHC entry: base is {} values, expected {PREDICTOR_ROWS}",
-            base.len()
+            "mHC entry: base is {} values, expected {}",
+            base.len(),
+            crate::plan::predictor_rows()
         ));
     }
     if scale.len() != 3 {
@@ -1365,7 +1364,7 @@ struct LayerSeamRaw {
 #[derive(Debug, Clone)]
 struct LayerSeamTensors {
     attn_fn: Vec<f32>,
-    /// `attn_fn` transposed to the `[hc_width][PREDICTOR_ROWS]` layout the interleaved hc_*_fn
+    /// `attn_fn` transposed to the `[hc_width][crate::plan::predictor_rows()]` layout the interleaved hc_*_fn
     /// projection reads. The same f32 bits, staged once per layer so no per-call pass pays for it.
     attn_fn_transposed: Vec<f32>,
     attn_base: Vec<f32>,
@@ -1435,7 +1434,7 @@ fn read_layer_seam_raw(
         .ok_or_else(|| "mHC entry: the loop was built without the model config".to_string())?;
     let dim = config.dim;
     let hc = config.hc_mult;
-    let hc_attn_fn_bytes = PREDICTOR_ROWS
+    let hc_attn_fn_bytes = crate::plan::predictor_rows()
         .checked_mul(hc)
         .and_then(|rows| rows.checked_mul(dim))
         .and_then(|values| values.checked_mul(4))
@@ -1461,7 +1460,7 @@ fn read_layer_seam_raw(
     )?;
     let attn_base = reader(
         &crate::plan::layer_claim(layer, "hc_attn_base"),
-        PREDICTOR_ROWS * 4,
+        crate::plan::predictor_rows() * 4,
     )?;
     let attn_scale = reader(&crate::plan::layer_claim(layer, "hc_attn_scale"), 3 * 4)?;
     let attn_norm = reader(&attn_norm_name, attn_norm_bytes)?;
@@ -1480,7 +1479,7 @@ fn read_layer_seam_raw(
             ));
         }
     };
-    let hc_ffn_fn_bytes = PREDICTOR_ROWS
+    let hc_ffn_fn_bytes = crate::plan::predictor_rows()
         .checked_mul(hc)
         .and_then(|rows| rows.checked_mul(dim))
         .and_then(|values| values.checked_mul(4))
@@ -1491,7 +1490,7 @@ fn read_layer_seam_raw(
     )?;
     let ffn_base = reader(
         &crate::plan::layer_claim(layer, "hc_ffn_base"),
-        PREDICTOR_ROWS * 4,
+        crate::plan::predictor_rows() * 4,
     )?;
     let ffn_scale = reader(&crate::plan::layer_claim(layer, "hc_ffn_scale"), 3 * 4)?;
     let ffn_norm = reader(&ffn_norm_name, ffn_norm_bytes)?;
@@ -2512,7 +2511,10 @@ fn native_dense_parity_checks(
 }
 
 /// The per-rank row count of the released plan's routed down projection (`w2` output rows).
-pub const DEFAULT_COMBINE_ROWS: usize = 5120;
+#[must_use]
+pub fn default_combine_rows() -> usize {
+    crate::plan::hidden()
+}
 
 /// One rank's forward/token stage request.
 /// The run's device reduce handle as the token stage carries it.
@@ -2836,7 +2838,7 @@ pub fn run_with_arena(
                 run.tokens,
                 run.step_ms,
                 run.wall_ms,
-                REDUCE_CALLS_PER_STEP,
+                reduce_calls_per_step(),
                 run.dump,
                 run.launch_census,
             );
@@ -2905,14 +2907,14 @@ impl Layer0Projections {
             "rows": 1,
             "wq_a": {
                 "cols": 1280,
-                "inner": HIDDEN,
+                "inner": crate::plan::hidden(),
                 "out_bytes": 1280 * 2,
                 "latent_bf16_sha256": self.wq_a_latent_sha256,
                 "latent_l2": self.wq_a_l2,
             },
             "wkv": {
                 "cols": 512,
-                "inner": HIDDEN,
+                "inner": crate::plan::hidden(),
                 "out_bytes": 512 * 2,
                 "latent_bf16_sha256": self.wkv_latent_sha256,
                 "latent_l2": self.wkv_l2,
@@ -2922,7 +2924,7 @@ impl Layer0Projections {
                 "rule": "BF16 module output narrowed to BF16, then E4M3 codes with one ue8m0 scale per 32 contiguous values: 2^ceil(log2(amax/448)) after D23's 1e-4 amax floor, f32 accumulate",
                 "block": 32,
                 "rows": 1,
-                "inner": HIDDEN,
+                "inner": crate::plan::hidden(),
                 "codes_sha256": self.activation_codes_sha256,
                 "scales_sha256": self.activation_scales_sha256,
                 "code_bytes": self.activation_code_bytes,
@@ -3027,13 +3029,16 @@ impl Layer0QueryPath {
 }
 
 /// The kv_norm row width of one MLA latent row, which is also the window quantiser's row width.
-pub const MLA_LATENT: usize = 512;
 /// The latent channels one window E8M0 scale covers (the released window quantiser's block).
 pub const WINDOW_QUANT_BLOCK: usize = 32;
 /// The E4M3FN code bytes of one engine-format window row.
-pub const WINDOW_CODE_BYTES: usize = MLA_LATENT;
+pub fn window_code_bytes() -> usize {
+    crate::plan::mla_latent()
+}
 /// The E8M0 scale bytes of one engine-format window row.
-pub const WINDOW_SCALE_BYTES: usize = MLA_LATENT / WINDOW_QUANT_BLOCK;
+pub fn window_scale_bytes() -> usize {
+    crate::plan::mla_latent() / WINDOW_QUANT_BLOCK
+}
 
 /// The engine-format window bytes of one rotated kv row: E4M3FN codes, one per latent channel, and
 /// one E8M0 power-of-two scale per WINDOW_QUANT_BLOCK channels.
@@ -3049,21 +3054,24 @@ pub const WINDOW_SCALE_BYTES: usize = MLA_LATENT / WINDOW_QUANT_BLOCK;
 /// Refuses a row that is not one whole MLA latent row or that is not finite, and propagates the
 /// helper's refusal when the engine quantiser and the format oracle disagree.
 pub fn window_row_bytes(latent: &[f32]) -> Result<(Vec<u8>, Vec<u8>), String> {
-    if latent.len() != MLA_LATENT {
+    if latent.len() != crate::plan::mla_latent() {
         return Err(format!(
-            "window row: the rotated kv row is {} values, one window row is {MLA_LATENT}",
-            latent.len()
+            "window row: the rotated kv row is {} values, one window row is {}",
+            latent.len(),
+            crate::plan::mla_latent()
         ));
     }
     if !latent.iter().all(|value| value.is_finite()) {
         return Err("window row: the rotated kv row is not finite".to_string());
     }
     let row = sparkflash_kernels::cuda_harness::engine_window_row(latent)?;
-    if row.codes.len() != WINDOW_CODE_BYTES || row.scales.len() != WINDOW_SCALE_BYTES {
+    if row.codes.len() != window_code_bytes() || row.scales.len() != window_scale_bytes() {
         return Err(format!(
-            "window row: the quantiser produced {} code bytes and {} scale bytes, one engine window row is {WINDOW_CODE_BYTES} and {WINDOW_SCALE_BYTES}",
+            "window row: the quantiser produced {} code bytes and {} scale bytes, one engine window row is {} and {}",
             row.codes.len(),
-            row.scales.len()
+            row.scales.len(),
+            window_code_bytes(),
+            window_scale_bytes()
         ));
     }
     Ok((row.codes, row.scales))
@@ -3362,10 +3370,10 @@ impl AttentionBody {
         let config = request.config.ok_or_else(|| {
             "attention body: the loop was built without the model config".to_string()
         })?;
-        if head_width != mla_ref::MLA_LATENT {
+        if head_width != mla_ref::crate::plan::mla_latent() {
             return Err(format!(
                 "attention body: the q head width is {head_width}, the body's latent is {}",
-                mla_ref::MLA_LATENT
+                mla_ref::crate::plan::mla_latent()
             ));
         }
         let kernel_dir = request
@@ -3380,7 +3388,7 @@ impl AttentionBody {
             cuda.alloc(bytes, &mut allocated)
                 .map_err(|error| format!("attention body: {what} buffer: {error}"))
         };
-        let q_width = heads * mla_ref::MLA_LATENT * 2;
+        let q_width = heads * mla_ref::crate::plan::mla_latent() * 2;
         let index_blocks_staged = mla_ref::HSI_BLOCKS;
         let mut body = Self {
             module,
@@ -3388,9 +3396,12 @@ impl AttentionBody {
             heads,
             head_width,
             q: alloc(q_width, "q")?,
-            window_codes: alloc(config.window_size * mla_ref::MLA_LATENT, "window codes")?,
+            window_codes: alloc(
+                config.window_size * mla_ref::crate::plan::mla_latent(),
+                "window codes",
+            )?,
             window_scales: alloc(
-                config.window_size * mla_ref::MLA_LATENT / 32,
+                config.window_size * mla_ref::crate::plan::mla_latent() / 32,
                 "window scales",
             )?,
             kv_codes: alloc(
@@ -3513,8 +3524,9 @@ impl AttentionBody {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        if staged.window_codes.len() != staged.window_rows * mla_ref::MLA_LATENT
-            || staged.window_scales.len() != staged.window_rows * mla_ref::MLA_LATENT / 32
+        if staged.window_codes.len() != staged.window_rows * mla_ref::crate::plan::mla_latent()
+            || staged.window_scales.len()
+                != staged.window_rows * mla_ref::crate::plan::mla_latent() / 32
         {
             return Err(format!(
                 "attention body: {} window rows staged as {} code and {} scale bytes",
@@ -3763,9 +3775,9 @@ fn run_layer_query_path(
     let (wq_a_cols, wq_a_inner) = bind
         .plan_index
         .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wq_a.weight"))?;
-    if (wq_a_cols, wq_a_inner) != (rank_width, HIDDEN) {
+    if (wq_a_cols, wq_a_inner) != (rank_width, crate::plan::hidden()) {
         return Err(format!(
-            "layer-0 query path: the plan's wq_a geometry is {wq_a_cols}x{wq_a_inner}, the model config says {rank_width}x{HIDDEN}"
+            "layer-0 query path: the plan's wq_a geometry is {wq_a_cols}x{wq_a_inner}, the model config says {rank_width}x{}", crate::plan::hidden()
         ));
     }
     if wq_b_inner != rank_width {
@@ -3996,7 +4008,7 @@ impl Layer0AttentionOutput {
                     "heads_per_rank": self.heads_per_rank,
                     "head_width": self.head_width,
                     "o_lora_rank": self.o_lora_rank,
-                    "rule": "per-rank plan: groups = o_groups/world, group_inner = (heads_per_rank/groups)*head_width, wo_a = (groups*o_lora_rank, group_inner), wo_b = (HIDDEN, groups*o_lora_rank)",
+                    "rule": "per-rank plan: groups = o_groups/world, group_inner = (heads_per_rank/groups)*head_width, wo_a = (groups*o_lora_rank, group_inner), wo_b = (crate::plan::hidden(), groups*o_lora_rank)",
                 },
                 "out_sha256": self.wo_a_out_sha256,
                 "out_l2": self.wo_a_out_l2,
@@ -4008,7 +4020,7 @@ impl Layer0AttentionOutput {
                 "cubin_sha256": self.wo_b_cubin_sha256,
                 "launches": 1,
                 "rows": 1,
-                "cols": HIDDEN,
+                "cols": crate::plan::hidden(),
                 "inner": self.groups * self.o_lora_rank,
                 "activation_quant": {
                     "rule": "the BF16 wo_a output quantised to E4M3 codes with one ue8m0 scale per 32 contiguous values (the released W8A8 rule, D39 rule 1)",
@@ -4024,7 +4036,7 @@ impl Layer0AttentionOutput {
             },
             "attention_all_reduce": {
                 "transport": "tcp canonical bf16 all-reduce, ascending rank order",
-                "elements": HIDDEN,
+                "elements": crate::plan::hidden(),
                 "sequence": self.reduce_sequence,
                 "calls": self.reduce_calls,
                 "reduced_sha256": self.reduced_sha256,
@@ -4103,7 +4115,7 @@ impl AttentionOutputScratch {
             activation_bytes,
             attn: alloc(activation_bytes, "attention buffer")?,
             lo_out: alloc(groups * o_lora_rank * 2, "wo_a output buffer")?,
-            partial: alloc(HIDDEN * 2, "wo_b output buffer")?,
+            partial: alloc(crate::plan::hidden() * 2, "wo_b output buffer")?,
             wo_b_act_codes: alloc(wo_b_inner, "wo_b act code buffer")?,
             wo_b_act_scales: alloc(wo_b_inner.div_ceil(32), "wo_b act scale buffer")?,
             wo_a_ring: alloc(TRACE_RING_BYTES, "wo_a trace ring")?,
@@ -4210,10 +4222,10 @@ fn run_layer_attention_output(
         .plan_index
         .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
     let wo_b_inner = groups * o_lora_rank;
-    if wo_b_geometry != (HIDDEN, wo_b_inner) {
+    if wo_b_geometry != (crate::plan::hidden(), wo_b_inner) {
         return Err(format!(
             "layer-0 attention output: the plan's wo_b is {wo_b_geometry:?}, the per-rank launch expects {:?} (world {world}, {groups} groups/rank x o_lora_rank {o_lora_rank})",
-            (HIDDEN, wo_b_inner)
+            (crate::plan::hidden(), wo_b_inner)
         ));
     }
     let pair_for = |name: &str| -> Result<(Deviceptr, Deviceptr), String> {
@@ -4325,7 +4337,7 @@ fn run_layer_attention_output(
             wo_b_scales,
             partial,
             1,
-            HIDDEN as u32,
+            crate::plan::hidden() as u32,
             wo_b_inner as u32,
             wo_b_ring.0,
             layer as u32,
@@ -4333,7 +4345,7 @@ fn run_layer_attention_output(
         );
         mxfp8_gemv_launch::launch(cuda, wo_b_kernel, &wo_b_params)?;
         partial_raw.clear();
-        partial_raw.resize(HIDDEN * 2, 0);
+        partial_raw.resize(crate::plan::hidden() * 2, 0);
         cuda.copy_dtoh(&mut partial_raw, &partial)
             .map_err(|error| format!("layer-0 attention output: wo_b dtoh: {error}"))?;
         // wo_b's inner axis is TP4-sharded: the parity re-launch compares this rank's partial-GEMM
@@ -4347,7 +4359,7 @@ fn run_layer_attention_output(
             "layer0-attention-output",
             "wo_b",
             &crate::plan::layer_claim(layer, "attn.wo_b.weight"),
-            (HIDDEN, wo_b_inner),
+            (crate::plan::hidden(), wo_b_inner),
             &lo_values,
             &wo_b_codes,
             &wo_b_scale_bytes,
@@ -4382,8 +4394,12 @@ fn run_layer_attention_output(
                 .iter()
                 .map(|pair| u16::from_le_bytes(*pair)),
         );
-        let layout = CollectiveLayout::new(request.world, HIDDEN, FabricSchedule::OneShotAllToAll)
-            .map_err(|error| format!("layer-0 attention output: collective layout: {error}"))?;
+        let layout = CollectiveLayout::new(
+            request.world,
+            crate::plan::hidden(),
+            FabricSchedule::OneShotAllToAll,
+        )
+        .map_err(|error| format!("layer-0 attention output: collective layout: {error}"))?;
         let reduce_sequence = ATTENTION_REDUCE_SEQ.wrapping_sub(body.position as u64);
         reduce
             .all_reduce_bf16(&mut words, reduce_sequence, &layout)
@@ -4462,10 +4478,10 @@ impl AttentionResidualSeam {
             "attention_output": {
                 "encoding": "the wo_b dense output narrowed to BF16, then the canonical bf16 all-reduce sum",
                 "sha256": self.attn_out_sha256,
-                "width": HIDDEN,
+                "width": crate::plan::hidden(),
             },
             "residual": {
-                "streams": HC_MULT,
+                "streams": crate::plan::hc_mult(),
                 "sha256": self.residual_sha256,
                 "note": "the hc residual stream the mHC entry seam consumed",
             },
@@ -4515,9 +4531,10 @@ pub fn attention_residual_host_seam_with(
 
     let dim = config.dim;
     let hc = config.hc_mult;
-    if hc != HC_MULT {
+    if hc != crate::plan::hc_mult() {
         return Err(format!(
-            "attention residual: the released seam is the {HC_MULT}-stream reference, config declares {hc}"
+            "attention residual: the released seam is the {}-stream reference, config declares {hc}",
+            crate::plan::hc_mult()
         ));
     }
     let delta = bf16_from_le_bytes(attention_delta_bf16)?;
@@ -4730,9 +4747,10 @@ fn layer0_ffn_host_seams_with_transposed(
     use sparkflash_engine::quant;
     let hc = config.hc_mult;
     let dim = config.dim;
-    if hc != HC_MULT {
+    if hc != crate::plan::hc_mult() {
         return Err(format!(
-            "FFN seams: the released seam is the {HC_MULT}-stream reference, config declares {hc}"
+            "FFN seams: the released seam is the {}-stream reference, config declares {hc}",
+            crate::plan::hc_mult()
         ));
     }
     if post_attention_hidden.len() != hc * dim {
@@ -4747,23 +4765,23 @@ fn layer0_ffn_host_seams_with_transposed(
             attn_pre_mix.len()
         ));
     }
-    if hc_ffn_fn.len() != PREDICTOR_ROWS * hc * dim {
+    if hc_ffn_fn.len() != crate::plan::predictor_rows() * hc * dim {
         return Err(format!(
             "FFN seams: hc_ffn_fn is {} values, expected {}",
             hc_ffn_fn.len(),
-            PREDICTOR_ROWS * hc * dim
+            crate::plan::predictor_rows() * hc * dim
         ));
     }
-    if let Some(weight) =
-        transposed_predictor.filter(|weight| weight.len() != PREDICTOR_ROWS * hc * dim)
+    if let Some(weight) = transposed_predictor
+        .filter(|weight| weight.len() != crate::plan::predictor_rows() * hc * dim)
     {
         return Err(format!(
             "FFN seams: the transposed hc_ffn_fn is {} values, expected {}",
             weight.len(),
-            PREDICTOR_ROWS * hc * dim
+            crate::plan::predictor_rows() * hc * dim
         ));
     }
-    if hc_ffn_base.len() != PREDICTOR_ROWS || hc_ffn_scale.len() != 3 {
+    if hc_ffn_base.len() != crate::plan::predictor_rows() || hc_ffn_scale.len() != 3 {
         return Err(format!(
             "FFN seams: hc_ffn_base is {} and hc_ffn_scale is {}; expected 24 and 3",
             hc_ffn_base.len(),
@@ -4948,16 +4966,16 @@ impl Layer0MoeRouted {
             "ranks": 4,
             "experts": 384,
             "top_k": 6,
-            "hidden": HIDDEN,
+            "hidden": crate::plan::hidden(),
             "inter_per_rank": 576,
             "inter_padded": 640,
-            "hc_mult": HC_MULT,
+            "hc_mult": crate::plan::hc_mult(),
             "selected_rows": 6,
             "launches_per_rank": 5,
             "launches_stage": 20,
             "all_reduce_calls_per_rank": if self.native_combine { 0 } else { 1 },
             "combine_arith": if self.native_combine { "native_f32_rank_gather" } else { "rank_bf16_reduce" },
-            "combine_payload_bytes_per_rank": if self.native_combine { 6 * HIDDEN * 4 } else { self.payload.len() },
+            "combine_payload_bytes_per_rank": if self.native_combine { 6 * crate::plan::hidden() * 4 } else { self.payload.len() },
             "weight_h2d_bytes_per_token": 0,
             "cubin_pins": self.pins.iter().map(|(name, bytes, digest)| serde_json::json!({"name": name, "bytes": bytes, "sha256": digest})).collect::<Vec<_>>(),
             "router": {
@@ -5119,9 +5137,9 @@ fn run_layer_moe_routed(
     let experts = config.n_routed_experts;
     let inter = config.moe_inter_dim;
     let dim = config.dim;
-    if world != 4 || experts != 384 || top_k != 6 || dim != HIDDEN {
+    if world != 4 || experts != 384 || top_k != 6 || dim != crate::plan::hidden() {
         return Err(format!(
-            "MoE: this chain is the released four-rank shape (world 4, 384 experts, top-6, dim {HIDDEN}); got world {world}, {experts} experts, top-{top_k}, dim {dim}"
+            "MoE: this chain is the released four-rank shape (world 4, 384 experts, top-6, dim {}); got world {world}, {experts} experts, top-{top_k}, dim {dim}", crate::plan::hidden()
         ));
     }
     if !inter.is_multiple_of(world) || inter / world != 576 {
@@ -5611,7 +5629,7 @@ impl Layer0FfnEpilogue {
     }
 
     fn ffn_out_len(&self) -> usize {
-        HIDDEN * 4
+        crate::plan::hidden() * 4
     }
 }
 
@@ -8401,10 +8419,11 @@ fn run_layer_attention_projections(
 
     let wq_a_cols: usize = 1280;
     let wkv_cols: usize = 512;
-    if normed.len() != HIDDEN {
+    if normed.len() != crate::plan::hidden() {
         return Err(format!(
-            "layer-0 projections: the normed attention input is {} values, one row is {HIDDEN}",
-            normed.len()
+            "layer-0 projections: the normed attention input is {} values, one row is {}",
+            normed.len(),
+            crate::plan::hidden()
         ));
     }
     // D39 rule 1: the W8A8 activation is a BF16 module output, narrowed to BF16 and then quantised
@@ -8451,12 +8470,12 @@ fn run_layer_attention_projections(
         (
             &crate::plan::layer_claim(layer, "attn.wq_a.weight"),
             wq_a_cols,
-            HIDDEN,
+            crate::plan::hidden(),
         ),
         (
             &crate::plan::layer_claim(layer, "attn.wkv.weight"),
             wkv_cols,
-            HIDDEN,
+            crate::plan::hidden(),
         ),
     ] {
         let (planned_cols, planned_inner) = bind.plan_index.b12x_geometry(name)?;
@@ -8502,7 +8521,7 @@ fn run_layer_attention_projections(
             out_q,
             1,
             wq_a_cols as u32,
-            HIDDEN as u32,
+            crate::plan::hidden() as u32,
             trace_ring.0,
             layer as u32,
             0,
@@ -8516,7 +8535,7 @@ fn run_layer_attention_projections(
             out_kv,
             1,
             wkv_cols as u32,
-            HIDDEN as u32,
+            crate::plan::hidden() as u32,
             trace_ring.0,
             layer as u32,
             0,
@@ -8570,7 +8589,7 @@ fn run_layer_attention_projections(
         "layer0-attention-projections",
         "wq_a",
         &crate::plan::layer_claim(layer, "attn.wq_a.weight"),
-        (wq_a_cols, HIDDEN),
+        (wq_a_cols, crate::plan::hidden()),
         normed,
         &activation_codes,
         &activation_scales,
@@ -8586,7 +8605,7 @@ fn run_layer_attention_projections(
         "layer0-attention-projections",
         "wkv",
         &crate::plan::layer_claim(layer, "attn.wkv.weight"),
-        (wkv_cols, HIDDEN),
+        (wkv_cols, crate::plan::hidden()),
         normed,
         &activation_codes,
         &activation_scales,
@@ -8664,7 +8683,7 @@ fn run_head_position(
             tail_pre_mix.len()
         ));
     }
-    let mut collapsed = vec![0.0f32; HIDDEN];
+    let mut collapsed = vec![0.0f32; crate::plan::hidden()];
     let timer = BlockTimer::start(probe_on);
     sparkflash_engine::forward::mhc::hc_pre(config, tail_pre_mix, stream, &mut collapsed)
         .map_err(|error| format!("head position {position}: hc_pre: {error}"))?;
@@ -8674,7 +8693,7 @@ fn run_head_position(
     sparkflash_engine::linalg::rms_norm(
         &mut final_normed,
         final_norm,
-        HIDDEN,
+        crate::plan::hidden(),
         config.norm_eps as f32,
     )
     .map_err(|error| format!("head position {position}: final norm: {error}"))?;
@@ -8742,7 +8761,7 @@ fn run_head_position(
     )?;
     probe::head(cuda, "gather_logits", timer);
     let timer = BlockTimer::start(probe_on);
-    let mut side_bytes = Vec::with_capacity(crate::tp4_tail::SIDE_BYTES);
+    let mut side_bytes = Vec::with_capacity(crate::tp4_tail::side_bytes());
     side_bytes.extend_from_slice(&tail_outputs.certified);
     side_bytes.extend_from_slice(&tail_outputs.certified_count.to_le_bytes());
     for value in &tail_outputs.block_max {
@@ -8783,8 +8802,8 @@ fn run_head_position(
     }
     probe::head(cuda, "side_gather", timer);
     let timer = BlockTimer::start(probe_on);
-    let winner_rank = gathered.argmax as usize / crate::tp4_tail::VOCAB_PER_RANK;
-    let winner_index = gathered.argmax as usize % crate::tp4_tail::VOCAB_PER_RANK;
+    let winner_rank = gathered.argmax as usize / crate::plan::vocab_per_rank();
+    let winner_index = gathered.argmax as usize % crate::plan::vocab_per_rank();
     let winner_certified = rank_sides
         .get(winner_rank)
         .and_then(|side| side.certified.get(winner_index))
@@ -8803,8 +8822,8 @@ fn run_head_position(
     let gathered_sha256 = evidence_f32_sha256(&gathered.full);
     let mut head_ranks = Vec::with_capacity(request.world);
     for (rank, side) in rank_sides.iter().enumerate() {
-        let base = rank * crate::tp4_tail::VOCAB_PER_RANK;
-        let rank_logits = &gathered.full[base..base + crate::tp4_tail::VOCAB_PER_RANK];
+        let base = rank * crate::plan::vocab_per_rank();
+        let rank_logits = &gathered.full[base..base + crate::plan::vocab_per_rank()];
         head_ranks.push(serde_json::json!({
             "rank": rank,
             "logits_sha256": evidence_f32_sha256(rank_logits),
@@ -8837,7 +8856,7 @@ fn run_head_position(
         },
         "head": {
             "kernel": "cert_lm_head_sm121",
-            "grid": [crate::tp4_tail::CHUNKS_PER_RANK, 1, 1],
+            "grid": [crate::tp4_tail::chunks_per_rank(), 1, 1],
             "block": [128, 1, 1],
             "ranks": head_ranks,
         },
@@ -10377,12 +10396,12 @@ pub fn u32_le_bytes(values: &[u32]) -> Vec<u8> {
 /// that disagrees with its flags is refused instead of being adjudicated.
 ///
 /// # Errors
-/// A payload that is not [crate::tp4_tail::SIDE_BYTES] long, a count outside the vocabulary, or a
+/// A payload that is not [crate::tp4_tail::side_bytes()] long, a count outside the vocabulary, or a
 /// count that does not equal the number of set flags.
 pub fn parse_head_side(bytes: &[u8]) -> Result<HeadSide, String> {
-    let vocab = crate::tp4_tail::VOCAB_PER_RANK;
-    let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
-    let expected = crate::tp4_tail::SIDE_BYTES;
+    let vocab = crate::plan::vocab_per_rank();
+    let chunks = crate::tp4_tail::chunks_per_rank();
+    let expected = crate::tp4_tail::side_bytes();
     if bytes.len() != expected {
         return Err(format!(
             "head side gather: {} bytes, expected {expected} (certified {vocab}, count 4, maxima {}, argmax {})",
@@ -11601,7 +11620,7 @@ impl<'a> DeviceLayer<'a> {
         if world == 1 {
             return Err("layer device: the device arm needs the four-rank chain (world 1 has no communicator for its per-layer collectives); run the host arm for a single rank".to_owned());
         }
-        let dim = HIDDEN;
+        let dim = crate::plan::hidden();
         if config.dim != dim {
             return Err(format!(
                 "layer device: the loop's rows are {dim}-wide but the config says {}",
@@ -11629,8 +11648,8 @@ impl<'a> DeviceLayer<'a> {
             u32::try_from(hc_mult).map_err(|_| {
                 format!("layer device: hc_mult {hc_mult} does not fit the seam ABI")
             })?,
-            u32::try_from(PREDICTOR_ROWS).map_err(|_| {
-                format!("layer device: {PREDICTOR_ROWS} coefficient rows do not fit the seam ABI")
+            u32::try_from(crate::plan::predictor_rows()).map_err(|_| {
+                format!("layer device: {} coefficient rows do not fit the seam ABI", crate::plan::predictor_rows())
             })?,
         )
         .map_err(|error| format!("layer device: {error}"))?;
@@ -15221,8 +15240,8 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         };
         quant.check_spans(
             self.buffers.workspace.kv_rotated.len,
-            sparkflash_kernels::kv_path_ref::WINDOW_CODE_BYTES,
-            sparkflash_kernels::kv_path_ref::WINDOW_SCALE_BYTES,
+            sparkflash_kernels::kv_path_ref::window_code_bytes(),
+            sparkflash_kernels::kv_path_ref::window_scale_bytes(),
         )?;
         kv::launch_window_quant(self.cuda, self.kv_quant_kernel.1, &quant)
             .map_err(|error| format!("layer device stage kv_path: window quantiser: {error}"))?;
@@ -16770,7 +16789,7 @@ fn run_forward_loop(
     // store and the only state the writer could see stays empty.
     probe::begin_run(request.forward_perf);
     let probe_on = request.forward_perf.probe;
-    let row_bytes = HIDDEN * 2;
+    let row_bytes = crate::plan::hidden() * 2;
     // The forward needs every position's embedding row, not only the last prompt one: position
     // 129's hidden state is built from the 130-token prefill, and the decode rows after it are
     // teacher-forced from the same fixture ids. Each row is read by its owner rank from the arena
@@ -16842,14 +16861,15 @@ fn run_forward_loop(
         let local_words: Vec<u16> = (0..local_bytes.len() / 2)
             .map(|index| u16::from_le_bytes([local_bytes[index * 2], local_bytes[index * 2 + 1]]))
             .collect();
-        let mut gathered = vec![0u16; request.world * HIDDEN];
+        let mut gathered = vec![0u16; request.world * crate::plan::hidden()];
         let exchange_seq = EMBED_EXCHANGE_SEQ.wrapping_sub(position as u64);
         transport
             .all_gather_bf16(&local_words, &mut gathered, exchange_seq)
             .map_err(|error| {
                 format!("embedding all-gather (position {position}, token {prompt_token}): {error}")
             })?;
-        let hidden_row: Vec<u8> = gathered[owner * HIDDEN..(owner + 1) * HIDDEN]
+        let hidden_row: Vec<u8> = gathered
+            [owner * crate::plan::hidden()..(owner + 1) * crate::plan::hidden()]
             .iter()
             .flat_map(|word| word.to_le_bytes())
             .collect();
@@ -17112,8 +17132,8 @@ fn run_forward_loop(
     } else {
         let final_norm_name = "norm.weight";
         let final_norm_bytes = match planned_dtype(request.resident_plan, final_norm_name) {
-            Some("F32") => HIDDEN * 4,
-            Some("BF16") => HIDDEN * 2,
+            Some("F32") => crate::plan::hidden() * 4,
+            Some("BF16") => crate::plan::hidden() * 2,
             Some(other) => {
                 return Err(format!(
                     "forward loop: {final_norm_name} is planned as {other}; the final norm decodes F32 or BF16 only"
@@ -17126,7 +17146,7 @@ fn run_forward_loop(
             }
         };
         let raw = read_arena_bytes(&cuda, arena, final_norm_name, final_norm_bytes)?;
-        Some(if final_norm_bytes == HIDDEN * 4 {
+        Some(if final_norm_bytes == crate::plan::hidden() * 4 {
             f32_from_le_bytes(&raw)?
         } else {
             bf16_from_le_bytes(&raw)?
@@ -17389,7 +17409,7 @@ fn run_forward_loop(
             let mut file = std::io::BufWriter::new(
                 fs::File::create(&path).map_err(|error| format!("tap dump {path}: {error}"))?,
             );
-            let width = (config.dspark_target_layer_ids.len() * HIDDEN) as u32;
+            let width = (config.dspark_target_layer_ids.len() * crate::plan::hidden()) as u32;
             let mut header = b"DSPT".to_vec();
             header.extend_from_slice(&width.to_le_bytes());
             header.extend_from_slice(&(prompt_len as u32).to_le_bytes());
@@ -17432,7 +17452,7 @@ fn run_forward_loop(
             .iter()
             .map(|word| u16::from_le_bytes(*word))
             .collect();
-        let mut gathered = vec![0u16; request.world * HIDDEN];
+        let mut gathered = vec![0u16; request.world * crate::plan::hidden()];
         transport
             .all_gather_bf16(
                 &local,
@@ -17442,10 +17462,12 @@ fn run_forward_loop(
             .map_err(|error| {
                 format!("generated embedding all-gather (position {position}): {error}")
             })?;
-        Ok(gathered[owner * HIDDEN..(owner + 1) * HIDDEN]
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect())
+        Ok(
+            gathered[owner * crate::plan::hidden()..(owner + 1) * crate::plan::hidden()]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect(),
+        )
     };
     if dspark {
         let (Some(device), Some(rows), Some(dir)) = (
@@ -17558,7 +17580,7 @@ fn run_forward_loop(
             let pair = &more_rows[0];
             device.warm_bulk_comm(crate::layer_device::DeviceSpan {
                 device: pair.b.attn_out,
-                len: pair.cap * HIDDEN * 2,
+                len: pair.cap * crate::plan::hidden() * 2,
             })?;
         }
         for state in bulk_rows.iter_mut().chain(more_rows.iter_mut()) {
@@ -17618,7 +17640,7 @@ fn run_forward_loop(
                 continue;
             }
             let n = rows_n.min(total_positions - position);
-            let mut hidden = Vec::with_capacity(n * HIDDEN);
+            let mut hidden = Vec::with_capacity(n * crate::plan::hidden());
             for row in position..position + n {
                 hidden.extend(bf16_from_le_bytes(
                     &prefill_hidden[row * row_bytes..(row + 1) * row_bytes],
@@ -17697,7 +17719,7 @@ fn run_forward_loop(
         let timer = BlockTimer::start(probe_on);
         let hidden =
             bf16_from_le_bytes(&prefill_hidden[position * row_bytes..(position + 1) * row_bytes])?;
-        let mut stream: Vec<f32> = Vec::with_capacity(config_hc * HIDDEN);
+        let mut stream: Vec<f32> = Vec::with_capacity(config_hc * crate::plan::hidden());
         for _ in 0..config_hc {
             stream.extend_from_slice(&hidden);
         }
@@ -17732,10 +17754,10 @@ fn run_forward_loop(
                 if tap_dump.is_some() && config.dspark_target_layer_ids.contains(&layer) {
                     device.wait_collectives()?;
                     let residual = device.residual_out()?;
-                    let copies = residual.len() / HIDDEN;
-                    for column in 0..HIDDEN {
+                    let copies = residual.len() / crate::plan::hidden();
+                    for column in 0..crate::plan::hidden() {
                         let sum: f32 = (0..copies)
-                            .map(|copy| residual[copy * HIDDEN + column])
+                            .map(|copy| residual[copy * crate::plan::hidden() + column])
                             .sum();
                         position_taps.push(sum / copies as f32);
                     }
@@ -17845,7 +17867,7 @@ fn run_forward_loop(
                         ),
                     ] {
                         for (role, buffer) in [("partial", from), ("reduced", to)] {
-                            let mut bytes = vec![0u8; HIDDEN * 2];
+                            let mut bytes = vec![0u8; crate::plan::hidden() * 2];
                             device.read_row_bytes(
                                 *buffer,
                                 &mut bytes,
@@ -18205,7 +18227,7 @@ fn run_forward_loop(
                     // below is a row one of them wrote, so the wait is the layer's and the reads
                     // refuse to run without it (see `wait_collectives`).
                     device.wait_collectives()?;
-                    let mut dev_normed = vec![0.0f32; HIDDEN];
+                    let mut dev_normed = vec![0.0f32; crate::plan::hidden()];
                     device.copy_out(device.buffers.residual.normed, &mut dev_normed)?;
                     // The query path's own substages, in execution order, so a divergence inside
                     // it is attributed to wq_a, q_norm, the wq_b activation quantiser, wq_b, or
@@ -18239,7 +18261,7 @@ fn run_forward_loop(
                     )?;
                     let dev_body = bf16_from_le_bytes(&dev_body_bytes)?;
                     let host_body = bf16_from_le_bytes(&attention_step.activation_bf16)?;
-                    let mut dev_attn_bytes = vec![0u8; HIDDEN * 2];
+                    let mut dev_attn_bytes = vec![0u8; crate::plan::hidden() * 2];
                     device.read_row_bytes(
                         device.buffers.workspace.reduced_bf16,
                         &mut dev_attn_bytes,
@@ -18247,7 +18269,7 @@ fn run_forward_loop(
                     )?;
                     let dev_attn = bf16_from_le_bytes(&dev_attn_bytes)?;
                     let host_attn = bf16_from_le_bytes(&attention_output.reduced_bf16)?;
-                    let mut dev_moe_bytes = vec![0u8; HIDDEN * 2];
+                    let mut dev_moe_bytes = vec![0u8; crate::plan::hidden() * 2];
                     device.read_row_bytes(
                         device.buffers.workspace.moe_reduced_bf16,
                         &mut dev_moe_bytes,
@@ -18979,7 +19001,7 @@ fn run_forward_loop(
                 "routed_experts_bound": layer_device
                     .as_ref()
                     .map_or(0, |device| device.routed_experts_bound()),
-                "reduce_scratch_bytes": 2 * HIDDEN * 4,
+                "reduce_scratch_bytes": 2 * crate::plan::hidden() * 4,
                 // The communicator's own number, not the reserved-arena constant: the two agree at
                 // the released geometry only by coincidence, and a record that prints the constant
                 // cannot reveal a handle whose reservation changed.
@@ -19114,8 +19136,8 @@ fn run_forward_loop(
             "layer": 0,
             "tokens": 1,
             "ranks": request.world,
-            "hidden": HIDDEN,
-            "hc_mult": HC_MULT,
+            "hidden": crate::plan::hidden(),
+            "hc_mult": crate::plan::hc_mult(),
             "note": "the refused negative's only row (position 129) after the FFN host seams; this rank's H3/H4 bytes are deterministic, rank 0's are under moe-stage-input/ (the m26 --input convention) and ranks 1-3 under moe-stage-input-r1/r2/r3/, so four ranks never race on one path",
             "files": {
                 "pre_ffn_hidden.f32": {"path": "pre_ffn_hidden.f32", "dtype": "f32-le", "values": ffn_seams.pre_ffn_hidden.len(), "bytes": pre_ffn_bytes.len(), "sha256": ffn_seams.pre_ffn_hidden_sha256},
@@ -19905,8 +19927,8 @@ mod tests {
             evidence_dir: dir,
             kernel_cubin_dir: kernels,
             preflight: true,
-            combine_rows: DEFAULT_COMBINE_ROWS,
-            combine_bytes: Some((DEFAULT_COMBINE_ROWS * 288, DEFAULT_COMBINE_ROWS * 18)),
+            combine_rows: default_combine_rows(),
+            combine_bytes: Some((default_combine_rows() * 288, default_combine_rows() * 18)),
             prompt_tokens: &[129],
             reference_ids: &[],
             resident_plan: None,
@@ -20190,10 +20212,10 @@ mod tests {
             }
         }
         let attn_pre_mix = vec![0.25f32, 0.25, 0.25, 0.25];
-        let func: Vec<f32> = (0..PREDICTOR_ROWS * hc * dim)
+        let func: Vec<f32> = (0..crate::plan::predictor_rows() * hc * dim)
             .map(|index| (index % 89) as f32 * 0.0002)
             .collect();
-        let base = vec![0.0f32; PREDICTOR_ROWS];
+        let base = vec![0.0f32; crate::plan::predictor_rows()];
         let scale = vec![0.0f32; 3];
         let ffn_norm = vec![1.0f32; dim];
         let seams = layer0_ffn_host_seams(
@@ -20213,8 +20235,11 @@ mod tests {
         assert_eq!(seams.act_fp8.len(), dim);
         assert_eq!(seams.act_scales.len(), dim / 32);
         assert_eq!(seams.act_fp8_sha256, sha256_hex(&seams.act_fp8));
-        assert_eq!(seams.ffn_post.len(), HC_MULT);
-        assert_eq!(seams.ffn_comb.len(), HC_MULT * HC_MULT);
+        assert_eq!(seams.ffn_post.len(), crate::plan::hc_mult());
+        assert_eq!(
+            seams.ffn_comb.len(),
+            crate::plan::hc_mult() * crate::plan::hc_mult()
+        );
         assert_eq!(
             seams.ffn_post_sha256,
             sha256_hex(&f32_le_bytes(&seams.ffn_post))
@@ -20250,10 +20275,10 @@ mod tests {
                 hidden.push((index as f32 * 0.001) + copy as f32 * 0.5);
             }
         }
-        let predictor: Vec<f32> = (0..PREDICTOR_ROWS * hc * dim)
+        let predictor: Vec<f32> = (0..crate::plan::predictor_rows() * hc * dim)
             .map(|index| (index % 97) as f32 * 0.0001)
             .collect();
-        let base = vec![0.0f32; PREDICTOR_ROWS];
+        let base = vec![0.0f32; crate::plan::predictor_rows()];
         let scale = vec![0.0f32; 3];
         let attn_norm = vec![1.0f32; dim];
         let entry = mhc_entry_host_seam(
@@ -20344,10 +20369,10 @@ mod tests {
                 hidden.push((index as f32 * 0.001) + copy as f32 * 0.5);
             }
         }
-        let predictor: Vec<f32> = (0..PREDICTOR_ROWS * hc * dim)
+        let predictor: Vec<f32> = (0..crate::plan::predictor_rows() * hc * dim)
             .map(|index| (index % 97) as f32 * 0.0001)
             .collect();
-        let base = vec![0.0f32; PREDICTOR_ROWS];
+        let base = vec![0.0f32; crate::plan::predictor_rows()];
         let scale = vec![0.0f32; 3];
         let attn_norm = vec![1.0f32; dim];
         let mix = [1.0f32, 0.0, 0.0, 0.0];
@@ -20368,7 +20393,7 @@ mod tests {
         assert_eq!(residual.out, residual_none.out);
         assert_eq!(residual.attn_out_sha256, residual_none.attn_out_sha256);
         assert_eq!(residual.residual_sha256, residual_none.residual_sha256);
-        let func = vec![0.0f32; PREDICTOR_ROWS * hc * dim];
+        let func = vec![0.0f32; crate::plan::predictor_rows() * hc * dim];
         let seams = layer0_ffn_host_seams(
             config,
             &residual.out,
@@ -20412,10 +20437,10 @@ mod tests {
                 hidden.push((index as f32 * 0.001) + copy as f32 * 0.5);
             }
         }
-        let predictor: Vec<f32> = (0..PREDICTOR_ROWS * hc * dim)
+        let predictor: Vec<f32> = (0..crate::plan::predictor_rows() * hc * dim)
             .map(|index| (index % 97) as f32 * 0.0001)
             .collect();
-        let base = vec![0.0f32; PREDICTOR_ROWS];
+        let base = vec![0.0f32; crate::plan::predictor_rows()];
         let scale = vec![0.0f32; 3];
         let attn_norm = vec![1.0f32; dim];
         let mix = [1.0f32, 0.0, 0.0, 0.0];
@@ -20448,13 +20473,13 @@ mod tests {
 
     #[test]
     fn the_window_row_round_trip_is_one_engine_row() {
-        let mut row = vec![0.0f32; MLA_LATENT];
+        let mut row = vec![0.0f32; crate::plan::mla_latent()];
         for (index, slot) in row.iter_mut().enumerate() {
             *slot = (index as f32 * 0.03125).sin() * 11.0;
         }
         let (codes, scales) = window_row_bytes(&row).expect("window row");
-        assert_eq!(codes.len(), WINDOW_CODE_BYTES);
-        assert_eq!(scales.len(), WINDOW_SCALE_BYTES);
+        assert_eq!(codes.len(), window_code_bytes());
+        assert_eq!(scales.len(), window_scale_bytes());
         let (codes_again, scales_again) = window_row_bytes(&row).expect("stable");
         assert_eq!(codes, codes_again);
         assert_eq!(scales, scales_again);
@@ -20466,7 +20491,7 @@ mod tests {
             codes.iter().all(|code| *code != 0x7f),
             "the engine quantiser never emits the E4M3 NaN code"
         );
-        for index in 0..MLA_LATENT {
+        for index in 0..crate::plan::mla_latent() {
             let value = sparkflash_kernels::mla_ref::window_kv_value(&codes, &scales, 0, index);
             assert!(value.is_finite(), "window row value {index} is not finite");
         }
@@ -20476,7 +20501,7 @@ mod tests {
     fn the_window_row_round_trip_refuses_a_non_row() {
         let error = window_row_bytes(&[0.0f32; 32]).expect_err("32 values are not a row");
         assert!(error.contains("512"), "{error}");
-        let mut row = vec![0.0f32; MLA_LATENT];
+        let mut row = vec![0.0f32; crate::plan::mla_latent()];
         row[7] = f32::NAN;
         let error = window_row_bytes(&row).expect_err("a NaN row is refused");
         assert!(error.contains("finite"), "{error}");
@@ -20499,7 +20524,7 @@ mod tests {
         let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
-        assert_eq!(hc, HC_MULT);
+        assert_eq!(hc, crate::plan::hc_mult());
         // A constant hidden row keeps the reference arithmetic checkable by hand: the layer-0 seed
         // A = [1,0,0,0] must collapse the stream to exactly its first copy.
         let row = vec![2.0f32; dim];
@@ -20507,8 +20532,8 @@ mod tests {
         for _ in 0..hc {
             stream.extend_from_slice(&row);
         }
-        let predictor = vec![0.0f32; PREDICTOR_ROWS * hc * dim];
-        let base = vec![0.0f32; PREDICTOR_ROWS];
+        let predictor = vec![0.0f32; crate::plan::predictor_rows() * hc * dim];
+        let base = vec![0.0f32; crate::plan::predictor_rows()];
         let scale = [1.0f32, 1.0, 1.0];
         let norm = vec![1.0f32; dim];
         let seam = mhc_entry_host_seam(
@@ -20528,7 +20553,11 @@ mod tests {
         );
         let expected_pre = 0.5 + config.hc_eps as f32;
         assert!((seam.pre[0] - expected_pre).abs() < 1e-6, "{:?}", seam.pre);
-        assert_eq!(seam.post, vec![1.0; HC_MULT], "2*sigmoid(0) = 1");
+        assert_eq!(
+            seam.post,
+            vec![1.0; crate::plan::hc_mult()],
+            "2*sigmoid(0) = 1"
+        );
         for value in &seam.comb {
             assert!((value - 0.25).abs() < 1e-4, "uniform comb: {value}");
         }
@@ -20573,7 +20602,7 @@ mod tests {
     fn the_mhc_entry_seam_honours_the_cross_layer_pre_mix() {
         let config = crate::plan::cached_values();
         let dim = config.dim;
-        let hc = HC_MULT;
+        let hc = crate::plan::hc_mult();
         // Distinct copies so the selected copy is identifiable.
         let mut stream = Vec::with_capacity(hc * dim);
         for copy in 0..hc {
@@ -20581,8 +20610,8 @@ mod tests {
                 stream.push((copy as f32 + 1.0) * (index as f32 * 0.001));
             }
         }
-        let predictor = vec![0.0f32; PREDICTOR_ROWS * hc * dim];
-        let base = vec![0.0f32; PREDICTOR_ROWS];
+        let predictor = vec![0.0f32; crate::plan::predictor_rows() * hc * dim];
+        let base = vec![0.0f32; crate::plan::predictor_rows()];
         let scale = [1.0f32, 1.0, 1.0];
         let norm = vec![1.0f32; dim];
         let identity = [1.0f32, 0.0, 0.0, 0.0];
@@ -20629,13 +20658,13 @@ mod tests {
     fn the_layer0_mhc_entry_seam_refuses_geometry_that_does_not_match_the_released_model() {
         let config = crate::plan::cached_values();
         let dim = config.dim;
-        let stream = vec![0.0f32; HC_MULT * dim];
-        let predictor = vec![0.0f32; PREDICTOR_ROWS * HC_MULT * dim];
-        let base = vec![0.0f32; PREDICTOR_ROWS];
+        let stream = vec![0.0f32; crate::plan::hc_mult() * dim];
+        let predictor = vec![0.0f32; crate::plan::predictor_rows() * crate::plan::hc_mult() * dim];
+        let base = vec![0.0f32; crate::plan::predictor_rows()];
         let scale = [1.0f32, 1.0, 1.0];
         let norm = vec![1.0f32; dim];
 
-        let short_stream = &stream[..HC_MULT * dim - 1];
+        let short_stream = &stream[..crate::plan::hc_mult() * dim - 1];
         let error = mhc_entry_host_seam(
             config,
             short_stream,
@@ -20664,7 +20693,7 @@ mod tests {
             config,
             &stream,
             &predictor,
-            &base[..PREDICTOR_ROWS - 1],
+            &base[..crate::plan::predictor_rows() - 1],
             &scale,
             &norm,
             &[1.0, 0.0, 0.0, 0.0],
@@ -20847,8 +20876,8 @@ mod tests {
         assert_eq!(embedding_location(32_319), (0, 32_319));
         assert_eq!(embedding_location(32_320), (1, 0));
         assert_eq!(embedding_location(129_279), (3, 32_319));
-        assert_eq!(HIDDEN, 5120);
-        assert_eq!(VOCAB_PER_RANK * 4, 129_280);
+        assert_eq!(crate::plan::hidden(), 5120);
+        assert_eq!(crate::plan::vocab_per_rank() * 4, 129_280);
     }
 
     #[test]
@@ -20914,7 +20943,7 @@ mod tests {
     fn a_bind_geometry_that_belongs_to_neither_layout_refuses_with_the_arithmetic() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut req = request(dir.path(), None);
-        req.combine_bytes = Some((DEFAULT_COMBINE_ROWS * 289, DEFAULT_COMBINE_ROWS * 18));
+        req.combine_bytes = Some((default_combine_rows() * 289, default_combine_rows() * 18));
         let outcome = token_stage(&req);
         let error = outcome.error().expect("refusal");
         assert!(error.contains("bind and the selector disagree"), "{error}");
@@ -20944,15 +20973,15 @@ mod tests {
 
     #[test]
     fn the_head_side_payload_round_trips_and_rejects_tampering() {
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
-        let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
+        let vocab = crate::plan::vocab_per_rank();
+        let chunks = crate::tp4_tail::chunks_per_rank();
         let mut certified = vec![0u8; vocab];
         certified[0] = 1;
         certified[vocab - 1] = 1;
         certified[vocab / 2] = 1;
         let block_max: Vec<f32> = (0..chunks).map(|index| index as f32 * 0.25).collect();
         let block_argmax: Vec<u32> = (0..chunks).map(|index| index as u32 * 1024 + 7).collect();
-        let mut payload = Vec::with_capacity(crate::tp4_tail::SIDE_BYTES);
+        let mut payload = Vec::with_capacity(crate::tp4_tail::side_bytes());
         payload.extend_from_slice(&certified);
         payload.extend_from_slice(&3u32.to_le_bytes());
         for value in &block_max {
@@ -20961,7 +20990,7 @@ mod tests {
         for value in &block_argmax {
             payload.extend_from_slice(&value.to_le_bytes());
         }
-        assert_eq!(payload.len(), crate::tp4_tail::SIDE_BYTES);
+        assert_eq!(payload.len(), crate::tp4_tail::side_bytes());
         let side = parse_head_side(&payload).expect("payload parses");
         assert_eq!(side.certified, certified);
         assert_eq!(side.certified_count, 3);
@@ -20993,10 +21022,10 @@ mod tests {
     #[test]
     fn the_head_side_payload_is_the_sum_of_its_parts() {
         let expected =
-            crate::tp4_tail::VOCAB_PER_RANK + 4 + crate::tp4_tail::CHUNKS_PER_RANK * 4 * 2;
-        assert_eq!(crate::tp4_tail::SIDE_BYTES, expected);
+            crate::plan::vocab_per_rank() + 4 + crate::tp4_tail::chunks_per_rank() * 4 * 2;
+        assert_eq!(crate::tp4_tail::side_bytes(), expected);
         assert_eq!(
-            crate::tp4_tail::SIDE_BYTES % 2,
+            crate::tp4_tail::side_bytes() % 2,
             0,
             "the side payload is gathered as u16 words"
         );
@@ -21008,7 +21037,12 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/m1y16-pre-head-hidden-pos129.f32");
         let bytes = std::fs::read(&path).expect("the captured m1y16 activation fixture");
-        assert_eq!(bytes.len(), HIDDEN * 4, "one row of {HIDDEN} f32 values");
+        assert_eq!(
+            bytes.len(),
+            crate::plan::hidden() * 4,
+            "one row of {} f32 values",
+            crate::plan::hidden()
+        );
         bytes
             .as_chunks::<4>()
             .0
@@ -21061,8 +21095,8 @@ mod tests {
         let hidden = m1y16_pre_head_hidden_pos129();
         let (activation_codes, activation_scales) =
             quantise_native_activation(&hidden, "host twin").expect("quantise the captured row");
-        assert_eq!(activation_codes.len(), HIDDEN);
-        assert_eq!(activation_scales.len(), HIDDEN / 32);
+        assert_eq!(activation_codes.len(), crate::plan::hidden());
+        assert_eq!(activation_scales.len(), crate::plan::hidden() / 32);
         let activation_values: Vec<f32> = activation_codes
             .iter()
             .enumerate()
@@ -21072,7 +21106,7 @@ mod tests {
             })
             .collect();
 
-        let (cols, inner) = (1280usize, HIDDEN);
+        let (cols, inner) = (1280usize, crate::plan::hidden());
         let (weight_codes, weight_tiled, weight_scales) = synthetic_b12x_weight(cols, inner);
         let kernel_out = sparkflash_kernels::mxfp8_ref::dense_gemm(
             &activation_codes,
@@ -21122,8 +21156,8 @@ mod tests {
             cubin_sha256: "cubin".to_string(),
             activation_codes_sha256: "codes".to_string(),
             activation_scales_sha256: "scales".to_string(),
-            activation_code_bytes: HIDDEN,
-            activation_scale_bytes: HIDDEN / 32,
+            activation_code_bytes: crate::plan::hidden(),
+            activation_scale_bytes: crate::plan::hidden() / 32,
             wq_a_latent_sha256: "q".to_string(),
             wkv_latent_sha256: "kv".to_string(),
             wq_a_l2: 1.0,
@@ -21140,8 +21174,14 @@ mod tests {
         );
         assert_eq!(json["arithmetic_family"], NATIVE_DENSE_KERNEL);
         assert_eq!(json["activation_quant"]["block"], 32);
-        assert_eq!(json["activation_quant"]["code_bytes"], HIDDEN);
-        assert_eq!(json["activation_quant"]["scale_bytes"], HIDDEN / 32);
+        assert_eq!(
+            json["activation_quant"]["code_bytes"],
+            crate::plan::hidden()
+        );
+        assert_eq!(
+            json["activation_quant"]["scale_bytes"],
+            crate::plan::hidden() / 32
+        );
         assert_eq!(json["activation_quant"]["codes_sha256"], "codes");
         assert!(
             json["exact"]
@@ -21201,7 +21241,7 @@ mod tests {
             reduced_l2: 6.0,
             reduce_calls: 1,
             reduce_sequence: 1,
-            reduced_bf16: vec![0u8; HIDDEN * 2],
+            reduced_bf16: vec![0u8; crate::plan::hidden() * 2],
         };
         let json = output.to_json();
         assert_eq!(json["wo_a"]["kernel"], NATIVE_WO_A_KERNEL);
@@ -21356,10 +21396,10 @@ mod tests {
         let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
-        let predictor: Vec<f32> = (0..PREDICTOR_ROWS * hc * dim)
+        let predictor: Vec<f32> = (0..crate::plan::predictor_rows() * hc * dim)
             .map(|index| (index % 89) as f32 * 0.0002)
             .collect();
-        let base: Vec<f32> = (0..PREDICTOR_ROWS)
+        let base: Vec<f32> = (0..crate::plan::predictor_rows())
             .map(|index| (index as f32) * 0.125)
             .collect();
         let scale = vec![1.0f32, 0.5, 0.25];
@@ -21376,10 +21416,10 @@ mod tests {
         let dim = config.dim;
         let hc = config.hc_mult;
         let (attn_fn, attn_base, attn_scale, attn_norm) = cache_production_seam_vectors();
-        let ffn_fn: Vec<f32> = (0..PREDICTOR_ROWS * hc * dim)
+        let ffn_fn: Vec<f32> = (0..crate::plan::predictor_rows() * hc * dim)
             .map(|index| (index % 97) as f32 * 0.0001)
             .collect();
-        let ffn_base: Vec<f32> = (0..PREDICTOR_ROWS)
+        let ffn_base: Vec<f32> = (0..crate::plan::predictor_rows())
             .map(|index| 0.5 - (index as f32) * 0.01)
             .collect();
         let ffn_scale = vec![2.0f32, 1.0, 0.5];
@@ -21623,7 +21663,7 @@ mod tests {
         req.config = Some(&config);
         req.resident_plan = Some(&plan);
 
-        let predictor_bytes = PREDICTOR_ROWS * config.hc_mult * config.dim * 4;
+        let predictor_bytes = crate::plan::predictor_rows() * config.hc_mult * config.dim * 4;
         let norm_bytes = config.dim * 4;
         let mut expected: Vec<(String, usize)> = Vec::new();
         for layer in 0..n_layers {
@@ -21633,7 +21673,7 @@ mod tests {
             ));
             expected.push((
                 crate::plan::layer_claim(layer, "hc_attn_base").to_owned(),
-                PREDICTOR_ROWS * 4,
+                crate::plan::predictor_rows() * 4,
             ));
             expected.push((
                 crate::plan::layer_claim(layer, "hc_attn_scale").to_owned(),
@@ -21649,7 +21689,7 @@ mod tests {
             ));
             expected.push((
                 crate::plan::layer_claim(layer, "hc_ffn_base").to_owned(),
-                PREDICTOR_ROWS * 4,
+                crate::plan::predictor_rows() * 4,
             ));
             expected.push((
                 crate::plan::layer_claim(layer, "hc_ffn_scale").to_owned(),
@@ -21671,7 +21711,8 @@ mod tests {
         assert_eq!(calls, expected, "one read of each seam tensor per layer");
         // Each sublayer stages its predictor twice: the decoded [24][20480] rows that the digests and
         // the ordered fallback read, and the [20480][24] transpose the interleaved projection reads.
-        let per_layer = 2 * (2 * (predictor_bytes / 4) + PREDICTOR_ROWS + 3 + config.dim) * 4;
+        let per_layer =
+            2 * (2 * (predictor_bytes / 4) + crate::plan::predictor_rows() + 3 + config.dim) * 4;
         assert_eq!(cache.bytes, per_layer * n_layers);
 
         // BF16 norm dtype: the planned encoding still decides the requested norm byte length.
@@ -21736,7 +21777,10 @@ mod tests {
         let cache = build_layer_seam_cache_with_reader(&mut reader, &req, n_layers).expect("cache");
         assert_eq!(cache.reads, 8);
         let per_layer = 2
-            * (2 * PREDICTOR_ROWS * config.hc_mult * config.dim + PREDICTOR_ROWS + 3 + config.dim)
+            * (2 * crate::plan::predictor_rows() * config.hc_mult * config.dim
+                + crate::plan::predictor_rows()
+                + 3
+                + config.dim)
             * 4;
         assert_eq!(per_layer, 7_905_496);
         assert_eq!(cache.bytes, per_layer);

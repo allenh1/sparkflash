@@ -433,9 +433,9 @@ impl DraftState {
         let main_proj_tiled = alloc(tiled.len())?;
         cuda.copy_htod(&Deviceptr(main_proj_tiled), &tiled)?;
 
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
-        let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
-        let markov_head = ptr("mtp.2.markov_head.head.weight".to_owned())?
+        let vocab = crate::plan::vocab_per_rank();
+        let chunks = crate::tp4_tail::chunks_per_rank();
+        let markov_head = ptr(crate::plan::mtp_claim(2, "markov_head.head.weight").to_owned())?
             + (device.tp_rank * vocab * MARKOV_RANK * 2) as u64;
         let head_fp8 = if drafter.head_fp8() {
             // Whole 128-entry tiles, for the tiled copy.
@@ -939,8 +939,8 @@ impl DeviceLayer<'_> {
                 "draft: {seqs} blocks with {k} drafts are outside the pass or the run"
             ));
         }
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
-        let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
+        let vocab = crate::plan::vocab_per_rank();
+        let chunks = crate::tp4_tail::chunks_per_rank();
         let mut words = [0u32; PARAM_WORDS];
         for (g, block) in blocks.iter().enumerate() {
             let (inv_t, seed) = block.sampler.draft_noise();
@@ -1646,7 +1646,7 @@ impl DeviceLayer<'_> {
             step_seq: 0,
         };
         sparkflash_kernels::rmsnorm_launch::launch(self.cuda, self.row_norm.1, &norm)?;
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
+        let vocab = crate::plan::vocab_per_rank();
         if let (Some((codes, scales)), Some((quant, mma))) =
             (draft.head_fp8, draft.kernels.head_tiled)
         {
@@ -1785,8 +1785,8 @@ impl DeviceLayer<'_> {
         (sampler, index0): (&super::sample::Sampler, usize),
     ) -> Result<Drafts, String> {
         self.draft_logits(rows, draft, tail, (1, k, 0))?;
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
-        let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
+        let vocab = crate::plan::vocab_per_rank();
+        let chunks = crate::tp4_tail::chunks_per_rank();
         let (inv_t, seed) = sampler.draft_noise();
         if let Some((world, rank)) = self.device_exchange() {
             // The whole Markov chain stays on the stream: each step's pick writes ids[step + 1],

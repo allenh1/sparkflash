@@ -392,8 +392,8 @@ impl RowsState {
         share: Option<(&super::bulk::MoeShare, usize)>,
     ) -> Result<Self, String> {
         let refuse = |what: &str| Err(format!("rows: {what}"));
-        if device.dim != 5120 || device.hc_mult != 4 {
-            return refuse("the row kernels hold dim 5120 and hc 4 only");
+        if device.dim != crate::plan::hidden() || device.hc_mult != crate::plan::hc_mult() {
+            return refuse("the row kernels hold the plan dim and hc only");
         }
         if !device.opt_seams_active()
             || device.opt_rope.is_none()
@@ -564,7 +564,7 @@ impl RowsState {
             .engram
             .as_ref()
             .map_or((32, 8), |engram| (engram.inner, engram.out_width));
-        let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
+        let chunks = crate::tp4_tail::chunks_per_rank();
         let index_heads = device.index_n_heads;
         let index_cols = index_heads * device.index_head_dim;
         let head_width = device.head_width as usize;
@@ -666,7 +666,7 @@ impl RowsState {
             group_normed: alloc(R_MAX * head_width * 2)?,
             group_key_f32: alloc(R_MAX * device.index_head_dim * 4)?,
             group_key_bf16: alloc(R_MAX * device.index_head_dim * 2)?,
-            logits: alloc(R_MAX * crate::tp4_tail::VOCAB_PER_RANK * 4)?,
+            logits: alloc(R_MAX * crate::plan::vocab_per_rank() * 4)?,
             topc_gather: alloc(GATHER_WORLD * R_MAX * super::sample::TOPC_WORDS * 4)?,
             embed_gather: alloc(GATHER_WORLD * r * dim * 2)?,
         };
@@ -954,10 +954,18 @@ impl DeviceLayer<'_> {
         (_world, rank): (usize, usize),
         spans: bool,
     ) -> Result<(), String> {
-        if self.dim != HIDDEN || self.hc_mult != 4 || n == 0 || n > total || total > rows.cap {
+        if self.dim != crate::plan::hidden()
+            || self.hc_mult != 4
+            || n == 0
+            || n > total
+            || total > rows.cap
+        {
             return Err(format!(
                 "rows: the device embedding gather takes 1..={} rows of {} x 4, not {n} of {total} rows of {} x {}",
-                rows.cap, HIDDEN, self.dim, self.hc_mult
+                rows.cap,
+                crate::plan::hidden(),
+                self.dim,
+                self.hc_mult
             ));
         }
         if let Some(table) = self.embed_table
@@ -980,7 +988,7 @@ impl DeviceLayer<'_> {
                 embed,
                 ids,
                 rank as u64,
-                crate::tp4_tail::VOCAB_PER_RANK as u64,
+                crate::plan::vocab_per_rank() as u64,
                 gather + (rank * count * 2) as u64,
             ],
         )?;
@@ -1000,7 +1008,7 @@ impl DeviceLayer<'_> {
                 gather,
                 ids,
                 n as u64,
-                crate::tp4_tail::VOCAB_PER_RANK as u64,
+                crate::plan::vocab_per_rank() as u64,
                 noise,
                 rows.b.stream,
                 rows.b.pre_mix,
@@ -1026,7 +1034,7 @@ impl DeviceLayer<'_> {
         let Some((world, rank)) = self.device_exchange() else {
             return Ok(());
         };
-        let count = crate::tp4_tail::VOCAB_PER_RANK * self.dim;
+        let count = crate::plan::vocab_per_rank() * self.dim;
         let table = self.cuda.alloc(world * count * 2, &mut 0)?;
         self.cuda.copy_dtod(
             &Deviceptr(table.0 + (rank * count * 2) as u64),
@@ -3854,7 +3862,7 @@ impl DeviceLayer<'_> {
             &[
                 block_max,
                 block_arg,
-                crate::tp4_tail::CHUNKS_PER_RANK as u64,
+                crate::tp4_tail::chunks_per_rank() as u64,
                 slot,
                 slot + (n * 4) as u64,
             ],
@@ -3869,7 +3877,7 @@ impl DeviceLayer<'_> {
                 gather,
                 n as u64,
                 world as u64,
-                crate::tp4_tail::VOCAB_PER_RANK as u64,
+                crate::plan::vocab_per_rank() as u64,
                 ids_out,
                 values_out,
             ],
@@ -3949,7 +3957,7 @@ impl DeviceLayer<'_> {
             &[
                 b.lm_block_max,
                 b.lm_block_arg,
-                crate::tp4_tail::CHUNKS_PER_RANK as u64,
+                crate::tp4_tail::chunks_per_rank() as u64,
                 b.lm_value,
                 b.lm_index,
             ],
@@ -4019,8 +4027,8 @@ impl DeviceLayer<'_> {
             step_seq: 0,
         };
         sparkflash_kernels::rmsnorm_launch::launch(self.cuda, self.row_norm.1, &norm)?;
-        let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
+        let chunks = crate::tp4_tail::chunks_per_rank();
+        let vocab = crate::plan::vocab_per_rank();
         let truncated: Vec<bool> = samplers.iter().map(|(s, _)| s.truncated()).collect();
         let any_truncated = truncated.iter().any(|&cut| cut);
         // A constrained row needs raw logits on the host; every other row keeps its own path.
@@ -4347,7 +4355,7 @@ impl DeviceLayer<'_> {
                 let w = &gathered[(rank * n + row) * 4..(rank * n + row) * 4 + 4];
                 let value = f32::from_bits((u32::from(w[0]) << 16) | u32::from(w[1]));
                 let index = ((u32::from(w[2]) << 16) | u32::from(w[3]))
-                    + (rank * crate::tp4_tail::VOCAB_PER_RANK) as u32;
+                    + (rank * crate::plan::vocab_per_rank()) as u32;
                 if !winner.2 || value > winner.0 {
                     winner = (value, index, true);
                 }
