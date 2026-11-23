@@ -105,32 +105,20 @@ const SCAN_HEAD_PAIRS: &[(usize, usize)] = &[(64, 64), (128, 128), (128, 256)];
 /// value head, so the catalogue claims only the template the host can actually select.
 const KDA_SCAN_HEAD_PAIRS: &[(usize, usize)] = &[(128, 128)];
 
-/// The vision patch side the shared tower serves.
-///
-/// `opt_vision_sm121.cu` exports both `opt_vision_patchify` (14) and `opt_vision_patchify_16`, and
-/// `VisionShape::of_with_patch` derives either grid. The catalogue still claims only 14 because
-/// the Qwen tower's orchestration and weight loading live in its own arm (D84): the shared
-/// catalogue entry would name a tower this tree does not run at patch 16, so the Qwen3.8 release
-/// that asks for one is refused rather than booted against a 14-patch tower.
-const VISION_PATCH_SIZES: &[usize] = &[14];
-
 /// The vision patch side Inkling-2-Small's tower is released at.
 ///
 /// Inkling runs its own patchify, rope and scale-add on the shared `opt_vision_*` gemm and
 /// attention bodies, so its entry must claim its own patch: without this constraint the vision
 /// part falls to `ShapeConstraint::ANY` and a Qwen 16-patch plan would resolve against
-/// Inkling's entry, which is the refusal D84 relies on.
+/// Inkling's entry, which is the refusal D84 relies on. DeepSeek's own shapes are generated from
+/// kernels/instances.toml (D.2); only Inkling's separate tower stays hand-written here.
 const INKLING_VISION_PATCH_SIZES: &[usize] = &[20];
 
-/// The width the shared vision image compiles its norms, attention and MLP at.
-const VISION_DIM: usize = 1024;
-/// The heads and per-head width the shared vision attention compiles.
-const VISION_HEADS: usize = 16;
-const VISION_HEAD_DIM: usize = 64;
-/// The SwiGLU width `opt_vision_swiglu` compiles.
-const VISION_MLP: usize = 2816;
-/// The blend row `opt_vision_span_rows` compiles.
-const VISION_ROW: usize = 5120;
+/// Inkling's tower composes the same 1024-wide, 16-head, 64-wide shared bodies as DeepSeek's.
+const INKLING_VISION_DIM: usize = 1024;
+const INKLING_VISION_HEADS: usize = 16;
+const INKLING_VISION_HEAD_DIM: usize = 64;
+
 /// The epsilon `opt_vision_rmsnorm` hardcodes.
 const VISION_EPSILON_BITS: u64 = 1e-6f64.to_bits();
 
@@ -402,68 +390,58 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::Ple, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_multiple(128),
         (Part::Mtp, Image::Deepseek) => CATALOGUE_DEEPSEEK_MTP,
         (Part::Mtp, Image::Dflash2) => ShapeConstraint::ANY.hidden_multiple(256),
-        // The shared vision tower's components, each claiming only the shape its kernel source
-        // really compiles. The DeepSeek image carries the 14/16 patchify, 1024-wide norm and
-        // attention, 2816-wide SwiGLU, 3x3 unfold and 5120-wide aligner; Inkling's image carries
-        // its own 20-patch patchify, LayerNorm, axial rope, layer scale and 4096 GELU MLP.
-        (Part::VisionPatchEmbed, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
-            .patch_sizes(VISION_PATCH_SIZES)
+        // The shared vision tower's components. DeepSeek's shape terms are generated from
+        // kernels/instances.toml (D.2) and name exactly the widths, head count and patch sides
+        // the released image compiles; the codes and flags a kernel does not make a shape of stay
+        // here. Inkling's image carries its own 20-patch patchify, LayerNorm, axial rope, layer
+        // scale and 4096 GELU MLP, so its rules remain hand-written.
+        (Part::VisionPatchEmbed, Image::Deepseek) => CATALOGUE_DEEPSEEK_VISION_PATCH_EMBED
             .in_channels_equals(3)
             .temporal_patch_equals(1),
         (Part::VisionPatchEmbed, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
+            .hidden_equals(INKLING_VISION_DIM)
             .patch_sizes(INKLING_VISION_PATCH_SIZES)
             .in_channels_equals(3)
             .temporal_patch_equals(1),
-        (Part::VisionPosition, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
-            .head_dim_equals(VISION_HEAD_DIM)
-            .vision_position(VisionPosition::Rotary.code()),
+        (Part::VisionPosition, Image::Deepseek) => {
+            CATALOGUE_DEEPSEEK_VISION_POSITION.vision_position(VisionPosition::Rotary.code())
+        }
         (Part::VisionPosition, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
-            .head_dim_equals(VISION_HEAD_DIM)
+            .hidden_equals(INKLING_VISION_DIM)
+            .head_dim_equals(INKLING_VISION_HEAD_DIM)
             .vision_position(VisionPosition::RotaryAndGrid.code()),
-        (Part::VisionNorm, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
+        (Part::VisionNorm, Image::Deepseek) => CATALOGUE_DEEPSEEK_VISION_NORM
             .vision_norm(VisionNorm::Rms.code())
             .norm_epsilon_bits(VISION_EPSILON_BITS),
         (Part::VisionNorm, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
+            .hidden_equals(INKLING_VISION_DIM)
             .vision_norm(VisionNorm::Layer.code()),
-        (Part::VisionAttention, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
-            .heads_multiple(VISION_HEADS)
-            .head_dim_equals(VISION_HEAD_DIM)
+        (Part::VisionAttention, Image::Deepseek) => CATALOGUE_DEEPSEEK_VISION_ATTENTION
             .attention_bias(true)
             .qk_norm(false)
             .vision_position(VisionPosition::Rotary.code()),
         (Part::VisionAttention, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
-            .heads_multiple(VISION_HEADS)
-            .head_dim_equals(VISION_HEAD_DIM)
+            .hidden_equals(INKLING_VISION_DIM)
+            .heads_multiple(INKLING_VISION_HEADS)
+            .head_dim_equals(INKLING_VISION_HEAD_DIM)
             .attention_bias(true)
             .qk_norm(false)
             .vision_position(VisionPosition::RotaryAndGrid.code()),
-        (Part::VisionMlp, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
-            .intermediate_equals(VISION_MLP)
-            .vision_activation(VisionActivation::SwiGlu.code()),
+        (Part::VisionMlp, Image::Deepseek) => {
+            CATALOGUE_DEEPSEEK_VISION_MLP.vision_activation(VisionActivation::SwiGlu.code())
+        }
         (Part::VisionMlp, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
+            .hidden_equals(INKLING_VISION_DIM)
             .intermediate_equals(4096)
             .vision_activation(VisionActivation::GeluErf.code()),
-        (Part::VisionDownsample, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
+        (Part::VisionDownsample, Image::Deepseek) => CATALOGUE_DEEPSEEK_VISION_DOWNSAMPLE
             .spatial_merge_equals(3)
             .vision_downsample(VisionDownsample::Unfold(3).code()),
-        (Part::VisionMerger, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
-            .out_hidden_equals(VISION_ROW)
-            .merger_intermediate_equals(VISION_ROW)
-            .vision_activation(VisionActivation::GeluErf.code()),
+        (Part::VisionMerger, Image::Deepseek) => {
+            CATALOGUE_DEEPSEEK_VISION_MERGER.vision_activation(VisionActivation::GeluErf.code())
+        }
         (Part::VisionMerger, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(VISION_DIM)
+            .hidden_equals(INKLING_VISION_DIM)
             .out_hidden_equals(4608)
             .merger_intermediate_equals(4096)
             .vision_activation(VisionActivation::GeluErf.code()),

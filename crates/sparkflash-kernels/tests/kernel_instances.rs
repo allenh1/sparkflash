@@ -72,6 +72,9 @@ fn instances() -> Vec<Instance> {
                 "markov_rank",
                 "vocab_per_rank",
                 "ranks",
+                "heads",
+                "patch",
+                "out_hidden",
             ] {
                 if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                     assert!(value > 0, "{key} is positive");
@@ -125,8 +128,10 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
             path.display()
         );
         assert!(
-            ["router", "routed", "seams", "drafter", "rows", "head"]
-                .contains(&instance.family.as_str()),
+            [
+                "router", "routed", "seams", "drafter", "rows", "head", "vision"
+            ]
+            .contains(&instance.family.as_str()),
             "{} names family {:?}",
             instance.entry,
             instance.family
@@ -138,6 +143,15 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
             "drafter" => &["hidden", "hc", "taps", "latent", "window", "markov_rank"],
             "rows" => &["hidden", "intermediate", "experts", "top_k"],
             "head" => &["hidden", "vocab_per_rank", "ranks"],
+            "vision" => &[
+                "hidden",
+                "heads",
+                "patch",
+                "intermediate",
+                "out_hidden",
+                "experts",
+                "top_k",
+            ],
             other => panic!("{} names family {other}", instance.entry),
         };
         for key in keys {
@@ -431,4 +445,57 @@ fn the_head_family_has_its_released_shape_and_a_second_shape() {
             .any(|row| row.entry == second.entry && row.cubin == "cert_lm_head_sm121"),
         "the proof has its own cubin"
     );
+}
+
+#[test]
+fn the_vision_family_has_its_released_shape_and_a_second_shape() {
+    let rows = instances();
+    let vision: Vec<&Instance> = rows.iter().filter(|row| row.family == "vision").collect();
+    let released: Vec<&&Instance> = vision
+        .iter()
+        .filter(|row| row.cubin == "opt_vision_sm121")
+        .collect();
+    assert_eq!(
+        released.len(),
+        10,
+        "the released vision image's ten entries"
+    );
+    assert_eq!(released[0].shapes["hidden"], 1024);
+    assert_eq!(released[0].shapes["heads"], 16);
+    assert_eq!(released[0].shapes["intermediate"], 2816);
+    assert_eq!(released[0].shapes["out_hidden"], 5120);
+    assert_eq!(released[0].shapes["experts"], 384);
+    assert_eq!(released[0].shapes["top_k"], 6);
+    let sides: BTreeSet<u64> = released.iter().map(|row| row.shapes["patch"]).collect();
+    assert_eq!(sides, BTreeSet::from([14, 16]), "both patchify bodies");
+
+    let second = vision
+        .iter()
+        .find(|row| row.entry == "opt_vision_span_rows_4096_sm121")
+        .expect("the second-shape proof instance");
+    assert_eq!(second.shapes["out_hidden"], 4096);
+    assert_eq!(second.shapes["hidden"], 1024);
+    assert_ne!(
+        second.cubin, "opt_vision_sm121",
+        "the proof has its own cubin"
+    );
+
+    let keys: BTreeSet<&str> = vision
+        .iter()
+        .filter_map(|row| row.catalogue.as_deref())
+        .collect();
+    for key in [
+        "deepseek-vision-patch-embed",
+        "deepseek-vision-position",
+        "deepseek-vision-norm",
+        "deepseek-vision-attention",
+        "deepseek-vision-mlp",
+        "deepseek-vision-downsample",
+        "deepseek-vision-merger",
+    ] {
+        assert!(
+            keys.contains(key),
+            "the catalogue key {key} has no vision instance"
+        );
+    }
 }

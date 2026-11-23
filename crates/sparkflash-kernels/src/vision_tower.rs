@@ -722,6 +722,24 @@ impl VisionTower {
         ldo: usize,
         flags: u64,
     ) -> Result<(), String> {
+        // opt_vision_gemm's tile walk requires whole 32-value K steps and 8-wide rows/columns;
+        // a shape outside those bounds would silently drop the tail rather than compute it, so
+        // refuse it by name before the launch.
+        if k == 0 || !k.is_multiple_of(32) {
+            return Err(format!(
+                "vision gemm: reduction width {k} is not a positive multiple of 32"
+            ));
+        }
+        if n == 0 || !n.is_multiple_of(8) {
+            return Err(format!(
+                "vision gemm: output width {n} is not a positive multiple of 8"
+            ));
+        }
+        if !lda.is_multiple_of(8) || !ldo.is_multiple_of(8) {
+            return Err(format!(
+                "vision gemm: strides (lda {lda}, ldo {ldo}) are not multiples of 8"
+            ));
+        }
         cuda.launch(
             self.kernels.gemm,
             (n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1),

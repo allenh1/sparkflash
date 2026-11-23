@@ -55,6 +55,17 @@ FAMILIES = {
     # The certified head and the device reduction: the hidden width, this rank's vocabulary
     # shard, and the four rank shards the reduction folds. The total vocabulary is the product.
     "head": ("hidden", "vocab_per_rank", "ranks"),
+    # The vision tower's one-rank shape: its width, query heads and patch side, the MLP and
+    # aligner widths, and the expert count the image-token route selects over.
+    "vision": (
+        "hidden",
+        "heads",
+        "patch",
+        "intermediate",
+        "out_hidden",
+        "experts",
+        "top_k",
+    ),
 }
 OPTIONAL = {"seams": ("hc",)}
 # The catalogue generator understands these dimensions as shape claims. A key may name a subset

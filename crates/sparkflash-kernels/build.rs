@@ -169,8 +169,19 @@ fn read_instances() -> Vec<Instance> {
             // The certified head and the device reduction: the hidden width, this rank's
             // vocabulary shard, and the rank shards the reduction folds.
             "head" => &["hidden", "vocab_per_rank", "ranks"],
+            // The vision tower: width, query heads, patch side, MLP and aligner widths, and the
+            // expert count the image-token route selects over.
+            "vision" => &[
+                "hidden",
+                "heads",
+                "patch",
+                "intermediate",
+                "out_hidden",
+                "experts",
+                "top_k",
+            ],
             other => panic!(
-                "sparkflash-kernels: instance {}: family {other:?} is not router, routed, seams, drafter, rows or head",
+                "sparkflash-kernels: instance {}: family {other:?} is not router, routed, seams, drafter, rows, head or vision",
                 number + 1
             ),
         };

@@ -28,6 +28,38 @@ use std::path::Path;
 /// The instance list, relative to this crate.
 const INSTANCES: &str = "../../kernels/instances.toml";
 
+/// The shape values one vision catalogue key draws from its instances.
+#[derive(Default)]
+struct VisionKey {
+    hidden: BTreeSet<u64>,
+    heads: BTreeSet<u64>,
+    patch: BTreeSet<u64>,
+    intermediate: BTreeSet<u64>,
+    out_hidden: BTreeSet<u64>,
+}
+
+/// The shape fields each vision catalogue rule claims: the values all come from the instance
+/// list, and this table says which of them the part's compiled bodies actually read.
+const VISION_FIELDS: &[(&str, &[&str])] = &[
+    ("deepseek-vision-patch-embed", &["hidden", "patch"]),
+    ("deepseek-vision-position", &["hidden", "heads"]),
+    ("deepseek-vision-norm", &["hidden"]),
+    ("deepseek-vision-attention", &["hidden", "heads"]),
+    ("deepseek-vision-mlp", &["hidden", "intermediate"]),
+    ("deepseek-vision-downsample", &["hidden"]),
+    ("deepseek-vision-merger", &["hidden", "out_hidden"]),
+];
+
+/// The one value a vision field has, or a panic naming the ambiguous key.
+fn one(values: &BTreeSet<u64>, key: &str, field: &str) -> u64 {
+    assert!(
+        values.len() == 1,
+        "sparkflash-ops: {key} names {} {field} values {values:?}; an equality needs one",
+        values.len()
+    );
+    *values.iter().next().expect("one value")
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={INSTANCES}");
@@ -64,6 +96,7 @@ fn generate() -> String {
     // The head family's key names a compiled (hidden, total vocabulary) pair: one rank's
     // vocabulary shard times the rank shards is the model's vocabulary.
     let mut head_shapes: BTreeMap<String, BTreeSet<(u64, u64)>> = BTreeMap::new();
+    let mut vision: BTreeMap<String, VisionKey> = BTreeMap::new();
     let mut claims_intermediate: BTreeMap<String, bool> = BTreeMap::new();
     let mut claims_hidden: BTreeMap<String, bool> = BTreeMap::new();
     let mut dims: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -94,6 +127,31 @@ fn generate() -> String {
             .get("family")
             .and_then(toml::Value::as_str)
             .unwrap_or_default();
+        if family == "vision" {
+            let row = vision.entry(key.clone()).or_default();
+            row.hidden.insert(width);
+            row.heads.insert(
+                positive("heads").unwrap_or_else(|| {
+                    panic!("sparkflash-ops: {key} has no positive integer heads")
+                }),
+            );
+            row.patch.insert(
+                positive("patch").unwrap_or_else(|| {
+                    panic!("sparkflash-ops: {key} has no positive integer patch")
+                }),
+            );
+            row.intermediate
+                .insert(positive("intermediate").unwrap_or_else(|| {
+                    panic!("sparkflash-ops: {key} has no positive integer intermediate")
+                }));
+            row.out_hidden
+                .insert(positive("out_hidden").unwrap_or_else(|| {
+                    panic!("sparkflash-ops: {key} has no positive integer out_hidden")
+                }));
+            // The keys the vision rule does not claim are still validated.
+            let _ = (positive("experts"), positive("top_k"));
+            continue;
+        }
         if family == "head" {
             let ranks = positive("ranks")
                 .unwrap_or_else(|| panic!("sparkflash-ops: {key} has no positive integer ranks"));
@@ -233,6 +291,72 @@ fn generate() -> String {
             let _ = writeln!(
                 generated,
                 "pub(crate) const {name}: ShapeConstraint = ShapeConstraint::ANY\n    .hidden_equals({hidden})\n    .vocab_equals({vocab});"
+            );
+            continue;
+        }
+        if let Some(shapes) = vision.get(key) {
+            let fields = VISION_FIELDS
+                .iter()
+                .find_map(|(name, fields)| (*name == key.as_str()).then_some(*fields))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "sparkflash-ops: vision catalogue key {key:?} has no field list in VISION_FIELDS"
+                    )
+                });
+            let mut parts: Vec<String> = Vec::new();
+            if fields.contains(&"hidden") {
+                parts.push(format!(
+                    ".hidden_equals({})",
+                    one(&shapes.hidden, key, "hidden")
+                ));
+            }
+            if fields.contains(&"patch") {
+                assert!(
+                    !shapes.patch.is_empty(),
+                    "sparkflash-ops: {key} names no patch side"
+                );
+                let sides: Vec<String> = shapes
+                    .patch
+                    .iter()
+                    .map(|side| format!("{side}usize"))
+                    .collect();
+                parts.push(format!(".patch_sizes(&[{}])", sides.join(", ")));
+            }
+            if fields.contains(&"heads") {
+                let heads = one(&shapes.heads, key, "heads");
+                let hidden = one(&shapes.hidden, key, "hidden");
+                assert!(
+                    hidden % heads == 0,
+                    "sparkflash-ops: {key} has a {hidden}-wide tower over {heads} heads"
+                );
+                parts.push(format!(".heads_multiple({heads})"));
+                parts.push(format!(".max_heads({heads})"));
+                parts.push(format!(".head_dim_equals({})", hidden / heads));
+            }
+            if fields.contains(&"intermediate") {
+                parts.push(format!(
+                    ".intermediate_equals({})",
+                    one(&shapes.intermediate, key, "intermediate")
+                ));
+            }
+            if fields.contains(&"out_hidden") {
+                parts.push(format!(
+                    ".out_hidden_equals({})",
+                    one(&shapes.out_hidden, key, "out_hidden")
+                ));
+            }
+            let expression = if parts.is_empty() {
+                "ShapeConstraint::ANY".to_owned()
+            } else {
+                format!("ShapeConstraint::ANY\n    {}", parts.join("\n    "))
+            };
+            let _ = writeln!(
+                generated,
+                "#[allow(dead_code)] // a generated rule exists for every catalogue key, used or not"
+            );
+            let _ = writeln!(
+                generated,
+                "pub(crate) const {name}: ShapeConstraint = {expression};"
             );
             continue;
         }

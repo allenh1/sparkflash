@@ -74,18 +74,26 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
-#define OV_DIM 1024u
-#define OV_QKV (3u * OV_DIM)
-// The patch side is a template parameter of the patchify kernel (D85): 14 for DeepSeek's and
-// GLM's towers, 16 for Qwen's. Its feature count and the GEMM K stride follow from it.
-#define OV_PATCH 14u
-#define OV_PATCH_K (3u * OV_PATCH * OV_PATCH)
-#define OV_PATCH_KP ((OV_PATCH_K + 31u) / 32u * 32u)
-#define OV_PATCH_K_16 (3u * 16u * 16u)
-#define OV_PATCH_KP_16 ((OV_PATCH_K_16 + 31u) / 32u * 32u)
-#define OV_INTER 2816u
-#define OV_UNFOLD (9u * OV_DIM)
-#define OV_ROW 5120u
+// The model shapes are instance arguments (kernels/instances.toml): this source has no default
+// width, head count, patch side, MLP/aligner width or expert count, and a build that does not
+// name an instance does not compile. Each entry below is gated on its own instance's macros, so
+// the released cubin keeps exactly the symbols the forward loads and a second shape can be built
+// into a cubin of its own. The patch side is a template parameter of the patchify body (D85): 14
+// for DeepSeek's and GLM's towers, 16 for Qwen's; its feature count and the GEMM K stride follow
+// from it.
+#if !defined(SPARK_INSTANCE_OPT_VISION_PATCHIFY_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_PATCHIFY_16_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_GEMM_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_RMSNORM_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_ROPE_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_ATTN_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_SPAN_ROWS_4096_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_SWIGLU_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_UNFOLD_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_SPAN_ROWS_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_VISION_ROUTE_HIDDEN)
+#error "opt_vision_sm121.cu: no instance macros; every shape is an argument from kernels/instances.toml"
+#endif
 
 #define OV_GEMM_RESIDUAL 1u
 #define OV_GEMM_GELU 2u
@@ -135,6 +143,7 @@ template <uint32_t PATCH>
 __device__ __forceinline__ void opt_vision_patchify_body(
     const uint8_t *__restrict__ canvas, __nv_bfloat16 *__restrict__ out, const uint32_t n_vit_w,
     const uint32_t width, const uint32_t patches) {
+    static_assert(PATCH > 0u, "the instance names a positive patch side");
     constexpr uint32_t kFeatures = 3u * PATCH * PATCH;
     constexpr uint32_t kStride = (kFeatures + 31u) / 32u * 32u;
     const uint64_t t = (uint64_t)blockIdx.x * 256u + threadIdx.x;
@@ -154,21 +163,30 @@ __device__ __forceinline__ void opt_vision_patchify_body(
 }
 
 // The 14-pixel patch DeepSeek's and GLM's towers declare.
+#if defined(SPARK_INSTANCE_OPT_VISION_PATCHIFY_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_vision_patchify(
     const uint8_t *__restrict__ canvas, __nv_bfloat16 *__restrict__ out, const uint32_t n_vit_w,
     const uint32_t width, const uint32_t patches) {
     OPT_PDL_ENTRY();
-    opt_vision_patchify_body<14u>(canvas, out, n_vit_w, width, patches);
+    opt_vision_patchify_body<SPARK_INSTANCE_OPT_VISION_PATCHIFY_PATCH>(
+        canvas, out, n_vit_w, width, patches);
 }
+#endif
 
 // The 16-pixel patch Qwen's tower declares (D85): the same body, its own instantiation.
+#if defined(SPARK_INSTANCE_OPT_VISION_PATCHIFY_16_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_vision_patchify_16(
     const uint8_t *__restrict__ canvas, __nv_bfloat16 *__restrict__ out, const uint32_t n_vit_w,
     const uint32_t width, const uint32_t patches) {
     OPT_PDL_ENTRY();
-    opt_vision_patchify_body<16u>(canvas, out, n_vit_w, width, patches);
+    opt_vision_patchify_body<SPARK_INSTANCE_OPT_VISION_PATCHIFY_16_PATCH>(
+        canvas, out, n_vit_w, width, patches);
 }
+#endif
 
+// The projection takes rows, columns and the reduction extent at run time; only the tile shape is
+// compiled. The instance gates the symbol, not a width.
+#if defined(SPARK_INSTANCE_OPT_VISION_GEMM_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_vision_gemm(
     const __nv_bfloat16 *__restrict__ a, const __nv_bfloat16 *__restrict__ w,
     const __nv_bfloat16 *__restrict__ bias, __nv_bfloat16 *out, const uint32_t m, const uint32_t n,
@@ -282,7 +300,11 @@ extern "C" __global__ void __launch_bounds__(256) opt_vision_gemm(
         }
     }
 }
+#endif
 
+#if defined(SPARK_INSTANCE_OPT_VISION_RMSNORM_HIDDEN)
+#define OV_DIM SPARK_INSTANCE_OPT_VISION_RMSNORM_HIDDEN
+static_assert(OV_DIM % 256u == 0u, "a lane's share of the row is whole uint4 words");
 extern "C" __global__ void __launch_bounds__(256) opt_vision_rmsnorm(
     const __nv_bfloat16 *__restrict__ x, const __nv_bfloat16 *__restrict__ weight,
     __nv_bfloat16 *__restrict__ out, const uint32_t m) {
@@ -291,10 +313,10 @@ extern "C" __global__ void __launch_bounds__(256) opt_vision_rmsnorm(
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= m) return;
     const uint4 *src = reinterpret_cast<const uint4 *>(x + (uint64_t)row * OV_DIM);
-    float v[32];
+    float v[OV_DIM / 32u];
     float squares = 0.0f;
 #pragma unroll
-    for (uint32_t i = 0; i < 4u; ++i) {
+    for (uint32_t i = 0; i < OV_DIM / 256u; ++i) {
         const uint4 u = src[lane + 32u * i];
         const uint32_t words[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
@@ -312,7 +334,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_vision_rmsnorm(
     const uint4 *wsrc = reinterpret_cast<const uint4 *>(weight);
     uint4 *dst = reinterpret_cast<uint4 *>(out + (uint64_t)row * OV_DIM);
 #pragma unroll
-    for (uint32_t i = 0; i < 4u; ++i) {
+    for (uint32_t i = 0; i < OV_DIM / 256u; ++i) {
         const uint4 wu = wsrc[lane + 32u * i];
         const uint32_t words[4] = {wu.x, wu.y, wu.z, wu.w};
         uint32_t packed[4];
@@ -326,29 +348,58 @@ extern "C" __global__ void __launch_bounds__(256) opt_vision_rmsnorm(
     }
 }
 
+#undef OV_DIM
+#endif
+
+#if defined(SPARK_INSTANCE_OPT_VISION_ROPE_HIDDEN) && defined(SPARK_INSTANCE_OPT_VISION_ROPE_HEADS)
+#define OV_DIM SPARK_INSTANCE_OPT_VISION_ROPE_HIDDEN
+#define OV_HEADS SPARK_INSTANCE_OPT_VISION_ROPE_HEADS
+#define OV_QKV (3u * OV_DIM)
+#define OV_HEAD_DIM (OV_DIM / OV_HEADS)
+#define OV_PAIRS (OV_HEAD_DIM / 2u)
+#define OV_HALF (OV_HEAD_DIM / 4u)
+static_assert(OV_HEADS > 0u, "the instance names a head count");
+static_assert(OV_DIM % OV_HEADS == 0u, "the width divides into whole heads");
+static_assert(OV_HEAD_DIM == 64u, "the rope layout is 32 pairs of a 64-wide head");
 extern "C" __global__ void __launch_bounds__(256) opt_vision_rope(
     __nv_bfloat16 *__restrict__ qkv, const uint32_t m, const uint32_t n_w) {
     OPT_PDL_ENTRY();
     // Thread t is pair i of head slot s of row r: t = (r * 32 + s) * 32 + i; slots 0..15 are the q
     // heads and 16..31 the k heads, so slot s starts at column 64 s.
     const uint64_t t = (uint64_t)blockIdx.x * 256u + threadIdx.x;
-    const uint64_t row = t >> 10;
+    const uint64_t row = t / OV_DIM;
     if (row >= m) return;
-    const uint32_t slot = (uint32_t)(t >> 5) & 31u;
-    const uint32_t i = (uint32_t)t & 31u;
-    const uint32_t j = i & 15u;
-    const float freq = __fdiv_rn(1.0f, powf(10000.0f, __fdiv_rn((float)(2u * j), 32.0f)));
-    const float pos = (float)(i < 16u ? row / n_w : row % n_w);
+    const uint32_t slot = (uint32_t)(t / OV_PAIRS) % (2u * OV_HEADS);
+    const uint32_t i = (uint32_t)t % OV_PAIRS;
+    const uint32_t j = i % OV_HALF;
+    const float freq = __fdiv_rn(1.0f, powf(10000.0f, __fdiv_rn((float)(2u * j), (float)OV_PAIRS)));
+    const float pos = (float)(i < OV_HALF ? row / n_w : row % n_w);
     const float angle = __fmul_rn(pos, freq);
     const float c = cosf(angle);
     const float s = sinf(angle);
-    __nv_bfloat16 *head = qkv + row * OV_QKV + slot * 64u;
+    __nv_bfloat16 *head = qkv + row * OV_QKV + slot * OV_HEAD_DIM;
     const float x1 = __bfloat162float(head[i]);
-    const float x2 = __bfloat162float(head[i + 32u]);
+    const float x2 = __bfloat162float(head[i + OV_PAIRS]);
     head[i] = __float2bfloat16_rn(__fsub_rn(__fmul_rn(x1, c), __fmul_rn(x2, s)));
-    head[i + 32u] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(x2, c), __fmul_rn(x1, s)));
+    head[i + OV_PAIRS] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(x2, c), __fmul_rn(x1, s)));
 }
 
+#undef OV_HALF
+#undef OV_PAIRS
+#undef OV_HEAD_DIM
+#undef OV_QKV
+#undef OV_HEADS
+#undef OV_DIM
+#endif
+
+#if defined(SPARK_INSTANCE_OPT_VISION_ATTN_HIDDEN) && defined(SPARK_INSTANCE_OPT_VISION_ATTN_HEADS)
+#define OV_DIM SPARK_INSTANCE_OPT_VISION_ATTN_HIDDEN
+#define OV_HEADS SPARK_INSTANCE_OPT_VISION_ATTN_HEADS
+#define OV_QKV (3u * OV_DIM)
+#define OV_HEAD_DIM (OV_DIM / OV_HEADS)
+static_assert(OV_HEADS > 0u, "the instance names a head count");
+static_assert(OV_DIM % OV_HEADS == 0u, "the width divides into whole heads");
+static_assert(OV_HEAD_DIM == 64u, "the attention tiles load a 64-wide head");
 extern "C" __global__ void __launch_bounds__(128) opt_vision_attn(
     const __nv_bfloat16 *__restrict__ qkv, __nv_bfloat16 *__restrict__ out, const uint32_t n) {
     OPT_PDL_ENTRY();
@@ -372,7 +423,7 @@ extern "C" __global__ void __launch_bounds__(128) opt_vision_attn(
         const uint32_t chunk = idx & 7u;
         const bool live = q0 + row < n;
         ov_cp16(ov_smem(&s_q[row * OV_ALD + chunk * 8u]),
-                qkv + (live ? (uint64_t)(q0 + row) * OV_QKV + head * 64u + chunk * 8u : 0u), live);
+                qkv + (live ? (uint64_t)(q0 + row) * OV_QKV + head * OV_HEAD_DIM + chunk * 8u : 0u), live);
     }
     auto load_kv = [&](uint32_t stage, uint32_t tile) {
 #pragma unroll
@@ -382,7 +433,7 @@ extern "C" __global__ void __launch_bounds__(128) opt_vision_attn(
             const uint32_t chunk = idx & 7u;
             const uint32_t key = tile * OV_AK + row;
             const bool live = key < n;
-            const uint64_t at = live ? (uint64_t)key * OV_QKV + head * 64u + chunk * 8u : 0u;
+            const uint64_t at = live ? (uint64_t)key * OV_QKV + head * OV_HEAD_DIM + chunk * 8u : 0u;
             ov_cp16(ov_smem(&s_k[stage][row * OV_ALD + chunk * 8u]), qkv + (live ? at + OV_DIM : 0u), live);
             ov_cp16(ov_smem(&s_v[stage][row * OV_ALD + chunk * 8u]), qkv + (live ? at + 2u * OV_DIM : 0u), live);
         }
@@ -494,7 +545,7 @@ extern "C" __global__ void __launch_bounds__(128) opt_vision_attn(
         const float inv = 1.0f / sum;
         const uint32_t row = q0 + warp * 16u + g + 8u * r;
         if (row >= n) continue;
-        __nv_bfloat16 *dst = out + (uint64_t)row * OV_DIM + head * 64u + 2u * q;
+        __nv_bfloat16 *dst = out + (uint64_t)row * OV_DIM + head * OV_HEAD_DIM + 2u * q;
 #pragma unroll
         for (uint32_t nt = 0; nt < 8u; ++nt)
             *reinterpret_cast<__nv_bfloat162 *>(dst + nt * 8u) =
@@ -502,6 +553,15 @@ extern "C" __global__ void __launch_bounds__(128) opt_vision_attn(
     }
 }
 
+#undef OV_HEAD_DIM
+#undef OV_QKV
+#undef OV_HEADS
+#undef OV_DIM
+#endif
+
+#if defined(SPARK_INSTANCE_OPT_VISION_SWIGLU_HIDDEN)
+#define OV_INTER SPARK_INSTANCE_OPT_VISION_SWIGLU_INTERMEDIATE
+static_assert(OV_INTER % 2u == 0u, "the gate and up halves are whole pairs");
 extern "C" __global__ void __launch_bounds__(256) opt_vision_swiglu(
     const __nv_bfloat16 *__restrict__ g, __nv_bfloat16 *__restrict__ out, const uint32_t m) {
     OPT_PDL_ENTRY();
@@ -517,6 +577,13 @@ extern "C" __global__ void __launch_bounds__(256) opt_vision_swiglu(
         __floats2bfloat162_rn(__fmul_rn(act.x, up.x), __fmul_rn(act.y, up.y));
 }
 
+#undef OV_INTER
+#endif
+
+#if defined(SPARK_INSTANCE_OPT_VISION_UNFOLD_HIDDEN)
+#define OV_DIM SPARK_INSTANCE_OPT_VISION_UNFOLD_HIDDEN
+#define OV_UNFOLD (9u * OV_DIM)
+static_assert(OV_DIM > 0u, "the instance names a width");
 extern "C" __global__ void __launch_bounds__(256) opt_vision_unfold(
     const __nv_bfloat16 *__restrict__ x, __nv_bfloat16 *__restrict__ out, const uint32_t n_vit_h,
     const uint32_t n_vit_w, const uint32_t n_llm_w, const uint32_t rows) {
@@ -532,6 +599,13 @@ extern "C" __global__ void __launch_bounds__(256) opt_vision_unfold(
     out[t] = y < n_vit_h && xx < n_vit_w ? x[(y * n_vit_w + xx) * OV_DIM + c] : __float2bfloat16_rn(0.0f);
 }
 
+#undef OV_UNFOLD
+#undef OV_DIM
+#endif
+
+#if defined(SPARK_INSTANCE_OPT_VISION_SPAN_ROWS_HIDDEN)
+#define OV_ROW SPARK_INSTANCE_OPT_VISION_SPAN_ROWS_OUT_HIDDEN
+static_assert(OV_ROW % 8u == 0u, "a copied row is whole 16-byte words");
 extern "C" __global__ void __launch_bounds__(256) opt_vision_span_rows(
     const uint64_t *__restrict__ table, __nv_bfloat16 *__restrict__ dst) {
     OPT_PDL_ENTRY();
@@ -541,8 +615,31 @@ extern "C" __global__ void __launch_bounds__(256) opt_vision_span_rows(
     for (uint32_t i = threadIdx.x; i < OV_ROW / 8u; i += 256u) to[i] = src[i];
 }
 
-#define OV_EXPERTS 384u
-#define OV_TOPK 6u
+#undef OV_ROW
+#endif
+
+// The second-shape proof instance: the same row copy at a 4,096-wide aligner, built into its own
+// cubin so the released image's bytes and symbols do not move.
+#if defined(SPARK_INSTANCE_OPT_VISION_SPAN_ROWS_4096_SM121_HIDDEN)
+#define OV_ROW SPARK_INSTANCE_OPT_VISION_SPAN_ROWS_4096_SM121_OUT_HIDDEN
+static_assert(OV_ROW % 8u == 0u, "a copied row is whole 16-byte words");
+extern "C" __global__ void __launch_bounds__(256) opt_vision_span_rows_4096_sm121(
+    const uint64_t *__restrict__ table, __nv_bfloat16 *__restrict__ dst) {
+    OPT_PDL_ENTRY();
+    const uint64_t row = table[2u * blockIdx.x];
+    const uint4 *src = reinterpret_cast<const uint4 *>(table[2u * blockIdx.x + 1u]);
+    uint4 *to = reinterpret_cast<uint4 *>(dst + row * OV_ROW);
+    for (uint32_t i = threadIdx.x; i < OV_ROW / 8u; i += 256u) to[i] = src[i];
+}
+
+#undef OV_ROW
+#endif
+
+#if defined(SPARK_INSTANCE_OPT_VISION_ROUTE_HIDDEN)
+#define OV_EXPERTS SPARK_INSTANCE_OPT_VISION_ROUTE_EXPERTS
+#define OV_TOPK SPARK_INSTANCE_OPT_VISION_ROUTE_TOP_K
+static_assert(OV_EXPERTS % 32u == 0u, "the warp covers whole 32-expert lanes");
+static_assert(OV_TOPK > 0u && OV_TOPK <= OV_EXPERTS, "one warp picks a non-empty top-k of the experts");
 extern "C" __global__ void __launch_bounds__(256) opt_vision_route(
     const float *__restrict__ src, const uint32_t raw, const float *__restrict__ bias,
     const uint32_t *__restrict__ rows, const uint32_t count, uint32_t *__restrict__ ids,
@@ -602,3 +699,6 @@ extern "C" __global__ void __launch_bounds__(256) opt_vision_route(
         }
     }
 }
+#undef OV_TOPK
+#undef OV_EXPERTS
+#endif
