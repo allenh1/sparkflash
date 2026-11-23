@@ -61,6 +61,9 @@ fn generate() -> String {
     let mut experts: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut top_k: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut streams: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    // The head family's key names a compiled (hidden, total vocabulary) pair: one rank's
+    // vocabulary shard times the rank shards is the model's vocabulary.
+    let mut head_shapes: BTreeMap<String, BTreeSet<(u64, u64)>> = BTreeMap::new();
     let mut claims_intermediate: BTreeMap<String, bool> = BTreeMap::new();
     let mut claims_hidden: BTreeMap<String, bool> = BTreeMap::new();
     let mut dims: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -86,6 +89,23 @@ fn generate() -> String {
         let width = positive("hidden")
             .unwrap_or_else(|| panic!("sparkflash-ops: {key} has no positive integer hidden"));
         hidden.entry(key.clone()).or_default().insert(width);
+
+        let family = table
+            .get("family")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
+        if family == "head" {
+            let ranks = positive("ranks")
+                .unwrap_or_else(|| panic!("sparkflash-ops: {key} has no positive integer ranks"));
+            let shard = positive("vocab_per_rank").unwrap_or_else(|| {
+                panic!("sparkflash-ops: {key} has no positive integer vocab_per_rank")
+            });
+            head_shapes
+                .entry(key.clone())
+                .or_default()
+                .insert((width, ranks * shard));
+            continue;
+        }
 
         // The drafter's key shares its routed triple with the routed-expert instances; the
         // drafter rows themselves contribute only the hidden width they compile against.
@@ -152,10 +172,6 @@ fn generate() -> String {
         }
         // The router/routed convention inserts the triple; a key with catalogue_dims states its
         // own dimensions, and the drafter has no triple of its own.
-        let family = table
-            .get("family")
-            .and_then(toml::Value::as_str)
-            .unwrap_or_default();
         if !dims.contains_key(&key)
             && family != "drafter"
             && family != "seams"
@@ -200,6 +216,26 @@ fn generate() -> String {
     );
     for key in &keys {
         let name = format!("CATALOGUE_{}", key.to_ascii_uppercase().replace('-', "_"));
+        if let Some(head) = head_shapes.get(key) {
+            // A head body is compiled for one (hidden, vocabulary) pair. Refuse to emit a looser
+            // rule if a key ever names two pairs: the generated rule is an equality, not a bound.
+            assert_eq!(
+                head.len(),
+                1,
+                "sparkflash-ops: {key} names {} head shapes; one catalogue key is one compiled pair",
+                head.len()
+            );
+            let (hidden, vocab) = head.iter().next().expect("one head shape");
+            let _ = writeln!(
+                generated,
+                "#[allow(dead_code)] // a generated rule exists for every catalogue key, used or not"
+            );
+            let _ = writeln!(
+                generated,
+                "pub(crate) const {name}: ShapeConstraint = ShapeConstraint::ANY\n    .hidden_equals({hidden})\n    .vocab_equals({vocab});"
+            );
+            continue;
+        }
         let unique = |values: &BTreeMap<String, BTreeSet<u64>>| -> Option<u64> {
             let set = values.get(key)?;
             (set.len() == 1).then(|| *set.iter().next().expect("one value"))

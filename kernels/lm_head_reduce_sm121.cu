@@ -62,12 +62,18 @@
 
 #include "m4_common_sm121.cuh"
 
-#define SPARK_LM_REDUCE_RANKS 4u
-#define SPARK_LM_REDUCE_VOCAB_PER_RANK 32320u
-#define SPARK_LM_REDUCE_VOCAB 129280u
+// The model shapes are instance arguments (kernels/instances.toml): this rank's vocabulary shard
+// and the number of rank shards the four-way reduction folds. Every entry is gated on its own
+// instance macros, so the released cubin keeps exactly its symbols and a second shape can be built
+// into a cubin of its own. A build that names no instance does not compile.
+#if !defined(SPARK_INSTANCE_LM_HEAD_REDUCE_SM121_VOCAB_PER_RANK) && \
+    !defined(SPARK_INSTANCE_LM_HEAD_REDUCE_BATCHED_SM121_VOCAB_PER_RANK)
+#error "lm_head_reduce_sm121.cu: no instance macros; the vocabulary shard and rank count are arguments from kernels/instances.toml"
+#endif
+
+// The body's algorithm constants. The m16 chunk is the screen's 1,024-entry block; the thread
+// count, warp count, top-5 and the pinned status bits do not depend on the model geometry.
 #define SPARK_LM_REDUCE_CHUNK 1024u
-#define SPARK_LM_REDUCE_CHUNKS_PER_RANK 32u
-#define SPARK_LM_REDUCE_BLOCKS (SPARK_LM_REDUCE_RANKS * SPARK_LM_REDUCE_CHUNKS_PER_RANK)
 #define SPARK_LM_REDUCE_THREADS 256u
 #define SPARK_LM_REDUCE_WARPS 8u
 #define SPARK_LM_REDUCE_LANES 32u
@@ -76,20 +82,8 @@
 #define SPARK_LM_REDUCE_STATUS_TOP5_CLAIMED 2u
 #define SPARK_LM_REDUCE_STATUS_ANY_CERTIFIED 4u
 
-static_assert(SPARK_LM_REDUCE_VOCAB == 129280u, "the released vocabulary is 129,280 entries");
-static_assert(SPARK_LM_REDUCE_VOCAB == SPARK_LM_REDUCE_RANKS * SPARK_LM_REDUCE_VOCAB_PER_RANK,
-              "the vocabulary shards evenly over four ranks");
-static_assert(SPARK_LM_REDUCE_VOCAB_PER_RANK == SPARK_M4_VOCAB_PER_RANK,
-              "the per-rank vocabulary is the screen's per-rank vocabulary");
-static_assert(SPARK_LM_REDUCE_CHUNKS_PER_RANK * SPARK_LM_REDUCE_CHUNK >= SPARK_LM_REDUCE_VOCAB_PER_RANK,
-              "the per-rank chunks cover the rank");
-static_assert((SPARK_LM_REDUCE_CHUNKS_PER_RANK - 1u) * SPARK_LM_REDUCE_CHUNK < SPARK_LM_REDUCE_VOCAB_PER_RANK,
-              "the last block is the only partial block");
-static_assert(SPARK_LM_REDUCE_BLOCKS == 128u, "the m16 layout has 128 blocks");
 static_assert(SPARK_LM_REDUCE_THREADS == SPARK_LM_REDUCE_WARPS * SPARK_LM_REDUCE_LANES,
               "eight full warps");
-static_assert(SPARK_LM_REDUCE_BLOCKS % SPARK_LM_REDUCE_WARPS == 0u,
-              "each warp visits whole blocks");
 static_assert(SPARK_LM_REDUCE_TOP == 5u, "the top-5 has five entries");
 static_assert(SPARK_LM_REDUCE_STATUS_WINNER_CERTIFIED == 1u &&
               SPARK_LM_REDUCE_STATUS_TOP5_CLAIMED == 2u &&
@@ -203,6 +197,27 @@ __device__ __forceinline__ void spark_lm_reduce_warp_best(float *value, uint32_t
         }
     }
 }
+
+#if defined(SPARK_INSTANCE_LM_HEAD_REDUCE_SM121_VOCAB_PER_RANK)
+#define SPARK_LM_REDUCE_RANKS SPARK_INSTANCE_LM_HEAD_REDUCE_SM121_RANKS
+#define SPARK_LM_REDUCE_VOCAB_PER_RANK SPARK_INSTANCE_LM_HEAD_REDUCE_SM121_VOCAB_PER_RANK
+#define SPARK_LM_REDUCE_VOCAB (SPARK_LM_REDUCE_RANKS * SPARK_LM_REDUCE_VOCAB_PER_RANK)
+#define SPARK_LM_REDUCE_CHUNKS_PER_RANK \
+    ((SPARK_LM_REDUCE_VOCAB_PER_RANK + SPARK_LM_REDUCE_CHUNK - 1u) / SPARK_LM_REDUCE_CHUNK)
+#define SPARK_LM_REDUCE_BLOCKS (SPARK_LM_REDUCE_RANKS * SPARK_LM_REDUCE_CHUNKS_PER_RANK)
+
+static_assert(SPARK_LM_REDUCE_RANKS == 4u, "the reduction folds four rank shards");
+static_assert(SPARK_LM_REDUCE_VOCAB_PER_RANK > 0u,
+              "the instance names this rank's vocabulary shard");
+static_assert(SPARK_LM_REDUCE_CHUNKS_PER_RANK * SPARK_LM_REDUCE_CHUNK >=
+                  SPARK_LM_REDUCE_VOCAB_PER_RANK,
+              "the per-rank chunks cover the rank");
+static_assert((SPARK_LM_REDUCE_CHUNKS_PER_RANK - 1u) * SPARK_LM_REDUCE_CHUNK <
+                  SPARK_LM_REDUCE_VOCAB_PER_RANK,
+              "the last block is the only partial block");
+static_assert(SPARK_LM_REDUCE_BLOCKS > 0u, "the m16 layout has at least one block");
+static_assert(SPARK_LM_REDUCE_BLOCKS % SPARK_LM_REDUCE_WARPS == 0u,
+              "each warp visits whole blocks");
 
 extern "C" __global__ void lm_head_reduce_sm121(
     const float *__restrict__ logits_r0,        // [32,320] rank 0 stored logits (bound where certified)
@@ -343,6 +358,13 @@ extern "C" __global__ void lm_head_reduce_sm121(
     (void)layer_id;
     (void)step_seq;
 }
+#undef SPARK_LM_REDUCE_RANKS
+#undef SPARK_LM_REDUCE_VOCAB_PER_RANK
+#undef SPARK_LM_REDUCE_VOCAB
+#undef SPARK_LM_REDUCE_CHUNKS_PER_RANK
+#undef SPARK_LM_REDUCE_BLOCKS
+#endif
+
 // K8 batched reduction: one launch reduces SIX rows. The body is the scalar kernel's block
 // algorithm run once per row, in the same thread/chunk/shuffle/top-5 order and with the same
 // single-thread finalisation, so each row is BYTE-IDENTICAL to the scalar kernel's row at any
@@ -350,6 +372,27 @@ extern "C" __global__ void lm_head_reduce_sm121(
 // arrays [6][128], top-5 [6][5]. The block is reused across rows with a barrier between rows.
 #define SPARK_LM_REDUCE_BATCH_ROWS 6u
 static_assert(SPARK_LM_REDUCE_BATCH_ROWS == 6u, "the verifier batch is six rows");
+
+#if defined(SPARK_INSTANCE_LM_HEAD_REDUCE_BATCHED_SM121_VOCAB_PER_RANK)
+#define SPARK_LM_REDUCE_RANKS SPARK_INSTANCE_LM_HEAD_REDUCE_BATCHED_SM121_RANKS
+#define SPARK_LM_REDUCE_VOCAB_PER_RANK SPARK_INSTANCE_LM_HEAD_REDUCE_BATCHED_SM121_VOCAB_PER_RANK
+#define SPARK_LM_REDUCE_VOCAB (SPARK_LM_REDUCE_RANKS * SPARK_LM_REDUCE_VOCAB_PER_RANK)
+#define SPARK_LM_REDUCE_CHUNKS_PER_RANK \
+    ((SPARK_LM_REDUCE_VOCAB_PER_RANK + SPARK_LM_REDUCE_CHUNK - 1u) / SPARK_LM_REDUCE_CHUNK)
+#define SPARK_LM_REDUCE_BLOCKS (SPARK_LM_REDUCE_RANKS * SPARK_LM_REDUCE_CHUNKS_PER_RANK)
+
+static_assert(SPARK_LM_REDUCE_RANKS == 4u, "the reduction folds four rank shards");
+static_assert(SPARK_LM_REDUCE_VOCAB_PER_RANK > 0u,
+              "the instance names this rank's vocabulary shard");
+static_assert(SPARK_LM_REDUCE_CHUNKS_PER_RANK * SPARK_LM_REDUCE_CHUNK >=
+                  SPARK_LM_REDUCE_VOCAB_PER_RANK,
+              "the per-rank chunks cover the rank");
+static_assert((SPARK_LM_REDUCE_CHUNKS_PER_RANK - 1u) * SPARK_LM_REDUCE_CHUNK <
+                  SPARK_LM_REDUCE_VOCAB_PER_RANK,
+              "the last block is the only partial block");
+static_assert(SPARK_LM_REDUCE_BLOCKS > 0u, "the m16 layout has at least one block");
+static_assert(SPARK_LM_REDUCE_BLOCKS % SPARK_LM_REDUCE_WARPS == 0u,
+              "each warp visits whole blocks");
 
 extern "C" __global__ void lm_head_reduce_batched_sm121(
 
@@ -516,3 +559,9 @@ extern "C" __global__ void lm_head_reduce_batched_sm121(
     (void)layer_id;
     (void)step_seq;
 }
+#undef SPARK_LM_REDUCE_RANKS
+#undef SPARK_LM_REDUCE_VOCAB_PER_RANK
+#undef SPARK_LM_REDUCE_VOCAB
+#undef SPARK_LM_REDUCE_CHUNKS_PER_RANK
+#undef SPARK_LM_REDUCE_BLOCKS
+#endif

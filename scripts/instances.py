@@ -52,7 +52,9 @@ FAMILIES = {
     # The multi-row/bulk sources: every body is built for a hidden width; the routed-expert
     # bodies also name the intermediate width, the expert count and the selected slots.
     "rows": ("hidden", "intermediate", "experts", "top_k"),
-    "rows": ("hidden", "intermediate", "experts", "top_k"),
+    # The certified head and the device reduction: the hidden width, this rank's vocabulary
+    # shard, and the four rank shards the reduction folds. The total vocabulary is the product.
+    "head": ("hidden", "vocab_per_rank", "ranks"),
 }
 OPTIONAL = {"seams": ("hc",)}
 # The catalogue generator understands these dimensions as shape claims. A key may name a subset

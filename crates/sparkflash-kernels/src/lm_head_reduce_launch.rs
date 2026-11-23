@@ -291,6 +291,9 @@ mod tests {
     fn constants() -> Consts {
         let mut table = Consts::parse(SOURCE);
         table.extend(m4_abi::header_source());
+        // The vocabulary shard and rank count are instance arguments now: resolve them through
+        // the defines kernels/instances.toml gave this compile group.
+        table.extend(crate::instances::LM_HEAD_REDUCE_SM121_DEFINES);
         table
     }
 

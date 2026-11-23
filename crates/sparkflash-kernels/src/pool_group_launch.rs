@@ -183,6 +183,13 @@ pub fn launch_k_norm(
     cols: u32,
     eps: f32,
 ) -> Result<(), String> {
+    if cols == 0 {
+        return Err(
+            "k_norm_f32_to_bf16: cols is zero, so there is no row to normalise and the launch would \
+             silently write nothing"
+                .to_owned(),
+        );
+    }
     let args = [
         x.0,
         weight.0,
@@ -201,6 +208,13 @@ pub fn launch_fp4_round_trip(
     dst: Deviceptr,
     blocks: u32,
 ) -> Result<(), String> {
+    if blocks == 0 {
+        return Err(
+            "fp4_round_trip_bf16_to_f32: blocks is zero, so there is no 32-value block to round \
+             and the launch would silently write nothing"
+                .to_owned(),
+        );
+    }
     let grid_x = blocks.div_ceil(THREADS);
     let args = [src.0, dst.0, u64::from(blocks)];
     cuda.launch(kernel, (grid_x, 1, 1), (THREADS, 1, 1), &args)
@@ -215,6 +229,13 @@ pub fn launch_scale_index_weights(
     factor: f32,
     count: u32,
 ) -> Result<(), String> {
+    if count == 0 {
+        return Err(
+            "scale_index_weights_bf16_to_f32: count is zero, so there is no weight to scale and \
+             the launch would silently write nothing"
+                .to_owned(),
+        );
+    }
     let grid_x = count.div_ceil(THREADS);
     let args = [src.0, dst.0, u64::from(factor.to_bits()), u64::from(count)];
     cuda.launch(kernel, (grid_x, 1, 1), (THREADS, 1, 1), &args)
@@ -235,6 +256,20 @@ pub fn launch_hc_pre_collapse(
     hc_mult: u32,
     dim: u32,
 ) -> Result<(), String> {
+    if hc_mult == 0 {
+        return Err(
+            "hc_pre_collapse_bf16: hc_mult is zero, so there is no stream to collapse and the \
+             launch would silently write zeros"
+                .to_owned(),
+        );
+    }
+    if dim == 0 {
+        return Err(
+            "hc_pre_collapse_bf16: dim is zero, so there is no column to write and the launch \
+             would silently write nothing"
+                .to_owned(),
+        );
+    }
     let grid_x = dim.div_ceil(THREADS);
     let args = [
         pre_mix.0,

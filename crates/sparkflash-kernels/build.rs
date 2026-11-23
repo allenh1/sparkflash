@@ -166,8 +166,11 @@ fn read_instances() -> Vec<Instance> {
             // The multi-row/bulk family: every body is built for a hidden width; the
             // routed-expert bodies also name the intermediate width, experts and slots.
             "rows" => &["hidden", "intermediate", "experts", "top_k"],
+            // The certified head and the device reduction: the hidden width, this rank's
+            // vocabulary shard, and the rank shards the reduction folds.
+            "head" => &["hidden", "vocab_per_rank", "ranks"],
             other => panic!(
-                "sparkflash-kernels: instance {}: family {other:?} is not router, routed, seams, drafter or rows",
+                "sparkflash-kernels: instance {}: family {other:?} is not router, routed, seams, drafter, rows or head",
                 number + 1
             ),
         };

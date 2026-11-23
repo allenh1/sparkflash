@@ -16,8 +16,8 @@
 #   family       the shape vocabulary: "router" needs hidden/experts/top_k, "routed" needs those
 #                plus intermediate/padded, "seams" needs hidden and optionally hc (the residual
 #                stream count; the runtime-width seam entries omit it), "drafter" needs
-#                hidden/hc/taps/latent/window/markov_rank, and "rows" needs
-#                hidden/intermediate/experts/top_k.
+#                hidden/hc/taps/latent/window/markov_rank, "rows" needs
+#                hidden/intermediate/experts/top_k, and "head" needs hidden/vocab_per_rank/ranks.
 #   catalogue    optional catalogue key; sparkflash-ops generates that part's exact shape rule
 #                from every instance carrying the same key.
 #   catalogue_intermediate
@@ -32,7 +32,8 @@
 #                must name the same subset.
 #   intermediate_multiple / max_top_k
 #                optional runtime bounds the source states; they are emitted instead of an equality.
-#   hidden, experts, top_k, intermediate, padded, hc, taps, latent, window, markov_rank
+#   hidden, experts, top_k, intermediate, padded, hc, taps, latent, window, markov_rank,
+#   vocab_per_rank, ranks
 #                the values one rank sees, as positive integers. They are passed to the compiler
 #                with the source's own suffix (u), not reinterpreted.
 #
@@ -562,6 +563,51 @@ taps = 2
 latent = 256
 window = 64
 markov_rank = 128
+
+
+# --- The certified head ----------------------------------------------------------------------
+# The certified screen and its device reduction are compiled for the released hidden width and
+# this rank's vocabulary shard. The reduction folds four shards, so the total vocabulary is
+# ranks * vocab_per_rank = 129,280. Both entries of a source share the source's released cubin.
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_sm121"
+cubin = "cert_lm_head_sm121"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 5120
+vocab_per_rank = 32320
+ranks = 4
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_batched_sm121"
+cubin = "cert_lm_head_sm121"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 5120
+vocab_per_rank = 32320
+ranks = 4
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_sm121"
+cubin = "lm_head_reduce_sm121"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 5120
+vocab_per_rank = 32320
+ranks = 4
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_batched_sm121"
+cubin = "lm_head_reduce_sm121"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 5120
+vocab_per_rank = 32320
+ranks = 4
 
 
 # --- The second-shape build proof -------------------------------------------------------------
@@ -1929,3 +1975,15 @@ hidden = 4096
 intermediate = 576
 experts = 384
 top_k = 6
+
+# The head's second shape: the same bodies at a 4096-wide hidden state and a 16,384-entry rank
+# shard (65,536 total vocabulary over four ranks). It compiles from cert_lm_head_sm121.cu alone
+# into its own cubin, so the released cubin's bytes and symbol set stay pinned.
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_4096v16384_sm121"
+cubin = "cert_lm_head_4096v16384_sm121"
+family = "head"
+hidden = 4096
+vocab_per_rank = 16384
+ranks = 4

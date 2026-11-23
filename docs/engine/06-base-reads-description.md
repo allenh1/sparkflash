@@ -438,6 +438,67 @@ Finally, a generic body that reads a width at run time does not have to claim th
 the generated rule should carry the source's multiple (DenseMlp's `intermediate_multiple = 16`)
 rather than an equality the body does not require.
 
+#### D.5 head: the certified LM head and its reduction
+
+**Sources and shapes.** `kernels/cert_lm_head_sm121.cu` owns the scalar and K8-batched certified
+screens; `kernels/lm_head_reduce_sm121.cu` owns the four-shard device reduction. Both take the
+head family's three instance arguments, in the vocabulary the list names:
+
+| key | released value | meaning |
+| --- | --- | --- |
+| `hidden` | 5120 | the hidden width the screen tiles |
+| `vocab_per_rank` | 32320 | this rank's vocabulary shard |
+| `ranks` | 4 | the shards the reduction folds |
+
+The total vocabulary is `ranks * vocab_per_rank` (129,280), arithmetic on the arguments rather
+than a second copy. Each entry is gated on its own `SPARK_INSTANCE_<ENTRY>_*` macros, so the
+released cubins keep their two symbols each and the proof shape builds alone. The screen's 128-value
+tile, 1,024-entry chunk and six-row verify batch, and the reduction's 256 threads, top-5 and status
+bits, stay algorithm constants: they are the body's tiling, not model geometry. The literal
+`== 5120`, `== 40`, `== 32` and `== 129280` asserts became `HIDDEN % 128 == 0`, `BLOCKS > 0`,
+`ceil(vocab_per_rank / 1024)` and a positive shard; `ranks == 4` remains because the reduction's
+four logit and four certified pointers are the ABI, not a negotiable shape.
+
+`kernels/pool_group_sm121.cu` was inventoried with the family and needs no instance: every entry
+takes its dimensions at run time (`ratio`, `head_dim`, `cols`, `blocks`, `count`, `hc_mult`,
+`dim`). Its launch helpers did have silent zero-shape returns; `launch_k_norm`,
+`launch_fp4_round_trip`, `launch_scale_index_weights` and `launch_hc_pre_collapse` now refuse a
+zero extent with a message naming the symbol instead of launching a kernel that writes nothing.
+
+**The catalogue.** The instances that prove the released geometry carry
+`catalogue = "deepseek-head"`. `crates/sparkflash-ops/build.rs` reads the head family's
+`(hidden, ranks * vocab_per_rank)` pair and emits `CATALOGUE_DEEPSEEK_HEAD =
+ShapeConstraint::ANY.hidden_equals(5120).vocab_equals(129280)`; `src/parts.rs` uses it for both
+the `LmHead` and `Embedding` DeepSeek entries. The old hand-written
+`hidden_equals(5120).vocab_multiple(128)` is gone, so a 4096-wide or differently sized head is
+refused by name before a weight is read.
+
+**The proof.** The released cubins compile to the baseline bytes under their instance defines
+(nvcc 13.0.88, sm_121a), so the first proof step holds and neither disassembly nor launch outputs
+were needed:
+
+| released cubin | bytes | sha256 |
+| --- | --- | --- |
+| `cert_lm_head_sm121` | 36,800 | `bbd30c8d6d358bd200b07cffa54d662c9144501b69310864933b68a0e53b6798` |
+| `lm_head_reduce_sm121` | 76,176 | `b4ef4ce8141be1678b565cdf838af46fefb4116de3dcaed97d4bca4506a61e30` |
+| `pool_group_sm121` | 54,312 | `ed16a3a00d1150ea7b32de59c9dc7f44011faa8a8a45cb3ea518c1a84c6175b7` |
+
+All three hashes equal `baseline/kernel_baseline.txt`. The second shape is
+`cert_lm_head_4096v16384_sm121` (hidden 4096, 16,384 entries a rank, four ranks) in its own cubin:
+13,216 bytes, `d3c3d6b5074f7eff8820e29bcbfb0aa45f7f031b5f0b0ac7f70bfcd6d6c99a40`, containing only
+that symbol; it is absent from the released cubin and from the baseline. The proof was built in
+`/tmp/partd/inst-head` on the GPU head with the defines `scripts/instances.py
+--defines-for-cubin` prints.
+
+**What the next family should know.** A head-shape instance must carry `hidden` even for
+`lm_head_reduce`, which does not read it: the family key list is what the three readers validate.
+The generated `vocab_equals` is a new `ShapeConstraint` field; use it rather than
+`vocab_multiple` when a body's vocabulary is a compiled count, because a multiple still admits
+larger counts. The `m4_abi` static-assert scan resolves the released instance defines through
+`crate::instances::<CUBIN>_DEFINES`; a source whose asserts name a second-shape macro needs that
+cubin's generated defines too, or the scan sees an unknown identifier.
+
+
 ## 5. Order
 
 1. A, alone.
