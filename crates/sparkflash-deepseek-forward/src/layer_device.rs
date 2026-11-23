@@ -177,8 +177,12 @@ pub fn parse_device_switch(value: Option<&str>) -> Result<bool, String> {
 /// counter must be exactly `layers * this` (the three warm-up reduces are setup, not layer work).
 pub const COLLECTIVES_PER_LAYER: usize = 2;
 
-/// bf16 elements per collective: the attention delta and the routed MoE delta are both `dim` wide.
-pub const REDUCE_ELEMENTS: usize = 5_120;
+/// bf16 elements per collective: the attention delta and the routed MoE delta are both the plan's
+/// `dim` wide.
+#[must_use]
+pub fn reduce_elements() -> usize {
+    crate::plan::hidden()
+}
 
 /// The plan tensor names this port uses, as (logical key, plan-name suffix). Every stage body
 /// refers to a name through this table, so a name appears once in the codebase and a rename is one
@@ -2060,11 +2064,11 @@ mod tests {
         let buffers = LayerBuffers::carve(0, &geometry());
         assert_eq!(buffers.total_bytes(), LayerBuffers::bytes(&geometry()));
         assert!(
-            buffers.workspace.reduce_ws.len >= REDUCE_ELEMENTS * 2,
+            buffers.workspace.reduce_ws.len >= reduce_elements() * 2,
             "the warm-up scratch must hold one reduce payload"
         );
         assert_eq!(COLLECTIVES_PER_LAYER, 2);
-        assert_eq!(REDUCE_ELEMENTS, 5_120);
+        assert_eq!(reduce_elements(), 5_120);
     }
 
     #[test]

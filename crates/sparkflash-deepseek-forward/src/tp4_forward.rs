@@ -4655,7 +4655,10 @@ impl Layer0FfnSeams {
                 "sha256": self.pre_ffn_hidden_sha256,
                 "bytes": self.pre_ffn_hidden.len() * 4,
                 "l2": self.pre_ffn_hidden.iter().map(|value| value * value).sum::<f32>().sqrt(),
-                "rule": "rms_norm(ffn_in, layers.0.ffn_norm.weight, 5120, norm_eps), f32 output",
+                "rule": format!(
+                    "rms_norm(ffn_in, layers.0.ffn_norm.weight, {}, norm_eps), f32 output",
+                    crate::plan::hidden()
+                ),
             },
             "activation": {
                 "codes_sha256": self.act_fp8_sha256,
@@ -4964,6 +4967,10 @@ impl Layer0MoeRouted {
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         let sha = |bytes: &[u8]| sha256_hex(bytes);
+        let values = crate::plan::cached_values();
+        let top_k = values.n_activated_experts;
+        let local_inter = values.moe_inter_dim / 4;
+        let padded_inter = sparkflash_kernels::moe_routed_device::WIDTH_PADDED;
         serde_json::json!({
             "schema": "sparkflash-moe-stage-evidence/1",
             "stage": "layer0-moe-routed",
@@ -4971,18 +4978,18 @@ impl Layer0MoeRouted {
             "layer": 0,
             "tokens": 1,
             "ranks": 4,
-            "experts": 384,
-            "top_k": 6,
+            "experts": values.n_routed_experts,
+            "top_k": top_k,
             "hidden": crate::plan::hidden(),
-            "inter_per_rank": 576,
-            "inter_padded": 640,
+            "inter_per_rank": local_inter,
+            "inter_padded": padded_inter,
             "hc_mult": crate::plan::hc_mult(),
-            "selected_rows": 6,
+            "selected_rows": top_k,
             "launches_per_rank": 5,
             "launches_stage": 20,
             "all_reduce_calls_per_rank": if self.native_combine { 0 } else { 1 },
             "combine_arith": if self.native_combine { "native_f32_rank_gather" } else { "rank_bf16_reduce" },
-            "combine_payload_bytes_per_rank": if self.native_combine { 6 * crate::plan::hidden() * 4 } else { self.payload.len() },
+            "combine_payload_bytes_per_rank": if self.native_combine { top_k * crate::plan::hidden() * 4 } else { self.payload.len() },
             "weight_h2d_bytes_per_token": 0,
             "cubin_pins": self.pins.iter().map(|(name, bytes, digest)| serde_json::json!({"name": name, "bytes": bytes, "sha256": digest})).collect::<Vec<_>>(),
             "router": {
@@ -5002,16 +5009,16 @@ impl Layer0MoeRouted {
                 "gate_bytes": self.gate_raw.len(),
                 "up_bytes": self.up_raw.len(),
                 "launches": 2,
-                "grid": [6, 20, 1],
-                "note": "the rank's contiguous 576-row w1/w3 slices, expert-major by slot; the kernel writes the 576..639 zero padding itself",
+                "grid": [top_k, padded_inter / 32, 1],
+                "note": format!("the rank's contiguous {local_inter}-row w1/w3 slices, expert-major by slot; the kernel writes the {local_inter}..{} zero padding itself", padded_inter - 1),
             },
             "swiglu": {
                 "codes_sha256": sha(&self.swiglu_codes),
                 "scales_sha256": sha(&self.swiglu_scales),
                 "codes_bytes": self.swiglu_codes.len(),
                 "scales_bytes": self.swiglu_scales.len(),
-                "rows": 6,
-                "cols": 640,
+                "rows": top_k,
+                "cols": padded_inter,
                 "rule": "weighted swiglu+MXFP8 quantiser, router weights buffer read in place, limit 10.0",
             },
             "combine": {
@@ -5617,7 +5624,13 @@ impl Layer0FfnEpilogue {
                 "f32_row_sha256": self.shared_f32_sha256,
                 "native_vs_f32_rel_l2": self.shared_native_vs_f32_rel_l2,
                 "delta_scope": self.shared_f32_sha256.as_ref().map(|_| "layer0"),
-                "rule": "each rank's TP-column/row shards of the released shared expert are all-gathered per layer, untiled from the arena B12x micro-tile order back to the checkpoint stored order (scales are never tiled), and joined into the replicated [2304,5120]/[5120,2304] F8-E4M3+E8-E8M0 views, then the engine shared-expert seam runs on the full view (H5 replicated, byte-identical to the twin); the native arm runs the released FP8 32x32 Expert arithmetic instead of the f32 reference",
+                "rule": format!(
+                    "each rank's TP-column/row shards of the released shared expert are all-gathered per layer, untiled from the arena B12x micro-tile order back to the checkpoint stored order (scales are never tiled), and joined into the replicated [{},{}]/[{},{}] F8-E4M3+E8-E8M0 views, then the engine shared-expert seam runs on the full view (H5 replicated, byte-identical to the twin); the native arm runs the released FP8 32x32 Expert arithmetic instead of the f32 reference",
+                    crate::plan::moe_inter_dim(),
+                    crate::plan::hidden(),
+                    crate::plan::hidden(),
+                    crate::plan::moe_inter_dim(),
+                ),
             },
             "ffn_out": {
                 "sha256": self.ffn_out_sha256,
@@ -8892,7 +8905,10 @@ fn run_head_position(
             "head": request.world,
             "reduce": 0,
         },
-        "note": "seam = the position's post-layer-39 hc stream collapsed with hc_pre and the reference's cross-layer pre mix (the last layer's FFN pre mix; the identity one-hot only before layer 0), 5120 f32 pre-norm; the loop claims the token only when the four ranks agree and the winning entry survived every rank's screen",
+        "note": format!(
+            "seam = the position's post-layer-39 hc stream collapsed with hc_pre and the reference's cross-layer pre mix (the last layer's FFN pre mix; the identity one-hot only before layer 0), {} f32 pre-norm; the loop claims the token only when the four ranks agree and the winning entry survived every rank's screen",
+            crate::plan::hidden()
+        ),
     });
     probe::head(cuda, "head_record", timer);
     probe::head(cuda, "head_total", head_total_timer);
@@ -10869,8 +10885,8 @@ impl LayerWeights {
 #[cfg(feature = "cuda")]
 const SEAM_NORM_BF16: u32 = 1;
 
-/// The multi-block mHC seam kernels and their scratch: [80][32] f32 block partials, the [5120] f32
-/// hc_pre row, then the last-block ticket word.
+/// The multi-block mHC seam kernels and their scratch: [80][32] f32 block partials, the plan's
+/// [dim] f32 hc_pre row, then the last-block ticket word.
 #[cfg(feature = "cuda")]
 struct OptSeams {
     _modules: (
@@ -10881,12 +10897,18 @@ struct OptSeams {
     post: sparkflash_kernels::cuda_driver::Kernel,
     scratch: sparkflash_kernels::cuda_driver::Deviceptr,
 }
-#[cfg(feature = "cuda")]
-const OPT_SEAMS_SCRATCH: usize = 80 * 32 * 4 + 5120 * 4 + 64;
+/// The seam kernel's [80][32] f32 block-partial scratch and ticket word are its own layout; the
+/// hc_pre row between them is the plan's hidden width.
 #[cfg(feature = "cuda")]
 const OPT_SEAMS_ROW_OFFSET: u64 = 80 * 32 * 4;
 #[cfg(feature = "cuda")]
-const OPT_SEAMS_TICKET_OFFSET: u64 = OPT_SEAMS_ROW_OFFSET + 5120 * 4;
+fn opt_seams_scratch(dim: usize) -> usize {
+    OPT_SEAMS_ROW_OFFSET as usize + dim * 4 + 64
+}
+#[cfg(feature = "cuda")]
+fn opt_seams_ticket_offset(dim: usize) -> u64 {
+    OPT_SEAMS_ROW_OFFSET + (dim * 4) as u64
+}
 
 /// Whether the whole-layer device arm has a shared-expert row for the FFN epilogue: it does not.
 ///
@@ -11911,8 +11933,9 @@ impl<'a> DeviceLayer<'a> {
                 let (seam_module, seam) = cuda.load_named(&cubin, "opt_mhc_seam")?;
                 let (post_module, post) = cuda.load_named(&cubin, "opt_mhc_post")?;
                 let mut total = 0usize;
-                let scratch = cuda.alloc(OPT_SEAMS_SCRATCH, &mut total)?;
-                cuda.copy_htod(&scratch, &vec![0u8; OPT_SEAMS_SCRATCH])?;
+                let scratch_bytes = opt_seams_scratch(dim);
+                let scratch = cuda.alloc(scratch_bytes, &mut total)?;
+                cuda.copy_htod(&scratch, &vec![0u8; scratch_bytes])?;
                 Some(OptSeams {
                     _modules: (seam_module, post_module),
                     seam,
@@ -11934,7 +11957,7 @@ impl<'a> DeviceLayer<'a> {
                 let (module, kernel) = cuda.load_named(&cubin, "opt_sum_ranks_bf16")?;
                 let mut total = 0usize;
                 // Eight ranks' rows, for up to R_MAX rows a step (the multi-row verify step).
-                let gather = cuda.alloc(8 * rows::R_MAX * 5120 * 2, &mut total)?;
+                let gather = cuda.alloc(8 * rows::R_MAX * crate::plan::hidden() * 2, &mut total)?;
                 Some((module, kernel, gather))
             }
             _ => None,
@@ -12828,7 +12851,10 @@ impl<'a> DeviceLayer<'a> {
         let Some(opt) = self.opt_seams.as_ref() else {
             return Ok(false);
         };
-        if self.seam_trace_ring() != 0 || self.dim != 5120 || self.hc_mult != 4 {
+        if self.seam_trace_ring() != 0
+            || self.dim != crate::plan::hidden()
+            || self.hc_mult != crate::plan::hc_mult()
+        {
             return Ok(false);
         }
         let base = opt.scratch.0;
@@ -12852,7 +12878,7 @@ impl<'a> DeviceLayer<'a> {
                 x_bf16,
                 base,
                 base + OPT_SEAMS_ROW_OFFSET,
-                base + OPT_SEAMS_TICKET_OFFSET,
+                base + opt_seams_ticket_offset(self.dim),
                 u64::from(SEAM_NORM_BF16),
                 u64::from(self.native_bf16),
                 u64::from(quant_narrow),
@@ -12876,12 +12902,15 @@ impl<'a> DeviceLayer<'a> {
         let Some(opt) = self.opt_seams.as_ref() else {
             return Ok(false);
         };
-        if self.seam_trace_ring() != 0 || self.dim != 5120 || self.hc_mult != 4 {
+        if self.seam_trace_ring() != 0
+            || self.dim != crate::plan::hidden()
+            || self.hc_mult != crate::plan::hc_mult()
+        {
             return Ok(false);
         }
         self.cuda.launch(
             opt.post,
-            (40, 1, 1),
+            (self.dim.div_ceil(128) as u32, 1, 1),
             (128, 1, 1),
             &[
                 residual,
@@ -12898,8 +12927,8 @@ impl<'a> DeviceLayer<'a> {
     fn opt_seams_active(&self) -> bool {
         self.opt_seams.is_some()
             && self.seam_trace_ring() == 0
-            && self.dim == 5120
-            && self.hc_mult == 4
+            && self.dim == crate::plan::hidden()
+            && self.hc_mult == crate::plan::hc_mult()
     }
 
     fn rotate_q(&self, layer: usize, position: usize) -> Result<(), String> {
@@ -13231,7 +13260,7 @@ impl<'a> DeviceLayer<'a> {
             Some((_, sum_kernel, gather))
                 if handle.has_exchange()
                     && world <= 8
-                    && count <= 5120
+                    && count <= crate::plan::hidden()
                     && rows <= rows::R_MAX
                     && count.is_multiple_of(2) =>
             {
@@ -13263,7 +13292,7 @@ impl<'a> DeviceLayer<'a> {
                     let chunk = count / world;
                     let mine = (rank * chunk * 2) as u64;
                     // SAFETY: as below; the input holds world * chunk values and the gather
-                    // buffer world chunks of at most R_MAX * 5120 / world values each.
+                    // buffer world chunks of at most R_MAX * hidden / world values each.
                     unsafe { handle.scatter_bf16(input.device, gather.0, chunk, 0) }
                         .map_err(|error| format!("layer device stage {stage}: {error}"))?;
                     let pairs = (chunk / 2) as u32;
@@ -13289,7 +13318,7 @@ impl<'a> DeviceLayer<'a> {
                     probe::count(stage);
                     return Ok(());
                 }
-                // SAFETY: as below; the gather buffer holds 8 ranks x R_MAX rows of 5120 bf16 values.
+                // SAFETY: as below; the gather buffer holds 8 ranks x R_MAX rows of hidden bf16 values.
                 unsafe { handle.exchange_bf16(input.device, gather.0, count, 0) }
                     .map_err(|error| format!("layer device stage {stage}: {error}"))?;
                 let pairs = (count / 2) as u32;
@@ -17546,6 +17575,7 @@ fn run_forward_loop(
         // The bulk prefill's rows state, SPARKFLASH_PREFILL_CHUNK rows per chunk (8 or less keeps
         // every prompt on the exact rows step). 4096 by sweep: a 32K prompt takes 15.2 s at 2048,
         // 13.6 s at 4096 (the MoE weights read once for twice the rows) and 13.8 s at 8192.
+        // Rows per bulk chunk: a scheduling default chosen by the sweep above, not model geometry.
         let chunk: usize = sparkflash_model::active_profile()
             .prefill
             .chunk
@@ -18882,7 +18912,10 @@ fn run_forward_loop(
         "exact": "bf16 all-gather of raw u16 words; the assembled row is bit-identical to the owner arena bytes",
         "rank_read_its_shard": request.rank == owner,
         "hidden_bf16_sha256": first_step_hidden_sha256,
-        "next_missing": "selected-candidate construction, the 130-position prefill sequence, and the certified head tail (four rank screen launches + exact f32 logits gather + argmax over 129280)",
+        "next_missing": format!(
+            "selected-candidate construction, the 130-position prefill sequence, and the certified head tail (four rank screen launches + exact f32 logits gather + argmax over {})",
+            crate::plan::vocab()
+        ),
         "attention_operand_census": plan.operand_census,
         "attention_stage_census": census,
         "token_claimed": false,
@@ -19086,7 +19119,7 @@ fn run_forward_loop(
             "layer_collectives".to_string(),
             serde_json::json!({
                 "collectives_per_layer": crate::layer_device::COLLECTIVES_PER_LAYER,
-                "elements": crate::layer_device::REDUCE_ELEMENTS,
+                "elements": crate::layer_device::reduce_elements(),
                 "expected": n_layers * crate::layer_device::COLLECTIVES_PER_LAYER,
                 "note": "the counter must come out exactly expected: the three warm_up reduces are setup and are not in the stats",
             }),

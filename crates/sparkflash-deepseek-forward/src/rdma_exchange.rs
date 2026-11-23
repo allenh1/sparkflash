@@ -30,25 +30,15 @@ pub use sparkflash_kernels::write_exchange::{
     selection, stats, validate,
 };
 
-/// The largest row a step can send: `dim` (5120) times the most rows a step carries
-/// ([crate::tp4_forward::rows::R_MAX]) as bf16.
-///
-/// `rows::R_MAX` is derived rather than written down, so raising it grows the slab instead of
-/// pushing the widest verify rows onto the NCCL fallback without a word. The 5120 is not: it is the
-/// DeepSeek-V4.1 hidden width, and the forward is generic over `dim`. A profile whose `dim` is
-/// wider would find `row_bytes` above this cap, and each caller answers for itself: a slot of a run
-/// that opened the exchange declines the round and reports the fall-through once
-/// ([note_fall_through]), while the per-layer all-reduce never reaches the exchange at all - its
-/// arm is guarded by the same 5120 - and either keeps the group or refuses, as the switch says.
-const ROW_CAP: usize = 5120 * crate::tp4_forward::rows::R_MAX * 2;
-
 /// What this arm's open banner says moves to the exchange and what stays on the group.
 const REPLACES: &str = "the per-layer one-shot all-reduce and the step's one-shot slot exchanges; bulk prefill, the ring gathers and the overlapped collectives stay on NCCL";
 
-/// The widest row a round carries, in bytes. A collective wider than this is the group's.
+/// The widest row a round carries, in bytes: the plan's `dim` times the most rows a step carries
+/// ([crate::tp4_forward::rows::R_MAX]) as bf16. Both are read from the open plan, so raising either
+/// grows the cap instead of pushing wider verify rows onto the NCCL fallback without a word.
 #[must_use]
 pub fn row_cap() -> usize {
-    ROW_CAP
+    crate::plan::hidden() * crate::tp4_forward::rows::R_MAX * 2
 }
 
 /// The shared exchange, opened on the first call with this arm's row cap and the opt_misc image
@@ -67,7 +57,7 @@ pub fn shared(
     cubin_dir: Option<&Path>,
 ) -> Result<Option<&'static Mutex<ExchangeState>>, String> {
     let opening = Opening {
-        row_cap: ROW_CAP,
+        row_cap: row_cap(),
         replaces: REPLACES,
     };
     sparkflash_kernels::write_exchange::shared(cuda, world, rank, opening, || {

@@ -243,8 +243,12 @@ pub fn cached_values() -> &'static ModelConfig {
         return &description.values;
     }
     static CACHED: std::sync::OnceLock<ModelConfig> = std::sync::OnceLock::new();
-    CACHED
-        .get_or_init(|| released_values().expect("the released checkpoint must plan on this host"))
+    let values = CACHED
+        .get_or_init(|| released_values().expect("the released checkpoint must plan on this host"));
+    // The released plan is the fallback the per-token accessors read; publish it like an
+    // installed description so a unit test that only asks for a geometry value sees the plan.
+    publish_geometry(values);
+    values
 }
 
 /// A structurally complete tiny configuration for tests that must run without a checkpoint.

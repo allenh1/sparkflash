@@ -1481,6 +1481,10 @@ pub fn bind_rank_moe(
             check_bind_coverage("router", &expected_router, &router_names, &empty)?,
         ),
     ];
+    let local_inter = config.moe_inter_dim / 4;
+    let padded_inter = sparkflash_kernels::moe_routed_device::WIDTH_PADDED;
+    let hidden = config.dim;
+    let experts = config.n_routed_experts;
     let down_is_padded_640 = expected_down.iter().any(|name| {
         arena
             .slice(name)
@@ -1490,38 +1494,55 @@ pub fn bind_rank_moe(
         serde_json::json!({
             "class": "routed_experts_down",
             "launch_compatible": true,
-            "note": "sparkflash convert pre-padded w2 to the 640-K row layout (320 packed bytes and 20 scale bytes per output row) offline; zero boot repack",
+            "note": format!(
+                "sparkflash convert pre-padded w2 to the {padded_inter}-K row layout ({} packed bytes and {} scale bytes per output row) offline; zero boot repack",
+                padded_inter / 2,
+                padded_inter / 32,
+            ),
         })
     } else {
         serde_json::json!({
             "class": "routed_experts_down",
             "launch_compatible": false,
             "reason": format!(
-                "{} reads the A8 pre-padded 640-K row layout (320 packed bytes and 20 scale bytes per output row); this rank's unconverted plan stores the checkpoint's 288-byte rows and 18-byte grid",
-                crate::plan::handles().moe_fallback
+                "{} reads the A8 pre-padded {padded_inter}-K row layout ({} packed bytes and {} scale bytes per output row); this rank's unconverted plan stores the checkpoint's {}-byte rows and {}-byte grid",
+                crate::plan::handles().moe_fallback,
+                padded_inter / 2,
+                padded_inter / 32,
+                local_inter / 2,
+                local_inter / 32,
             ),
-            "remaining": "either launch the stored-layout kernel variant (b12x_mxfp4_moe_stored_sm121) or run `sparkflash convert` once offline to pre-pad w2 to the 640-wide layout with no boot repack",
+            "remaining": format!(
+                "either launch the stored-layout kernel variant ({}) or run `sparkflash convert` once offline to pre-pad w2 to the {padded_inter}-wide layout with no boot repack",
+                crate::tp4_combine::STORED_COMBINE_KERNEL
+            ),
         })
     };
     let compat = vec![
         serde_json::json!({
             "class": "routed_experts_gate_up",
             "launch_compatible": true,
-            "note": "routed_gate_up_sm121 reads SPARK_M4_MOE_WIDTH=576 output rows of 2560 packed bytes with the checkpoint's [576,160] row-scale grid; the arena stores exactly that per-expert slice",
+            "note": format!(
+                "routed_gate_up_sm121 reads SPARK_M4_MOE_WIDTH={local_inter} output rows of {} packed bytes with the checkpoint's [{local_inter},{}] row-scale grid; the arena stores exactly that per-expert slice",
+                hidden / 2,
+                hidden / 32,
+            ),
         }),
         down_compat,
         serde_json::json!({
             "class": "shared_experts",
             "launch_compatible": true,
             "note": format!(
-                "{} is runtime-shaped: w1/w3 launch with cols=576, inner=5120 and w2 with cols=5120, inner=576, which is exactly the B12x arena slice shape",
+                "{} is runtime-shaped: w1/w3 launch with cols={local_inter}, inner={hidden} and w2 with cols={hidden}, inner={local_inter}, which is exactly the B12x arena slice shape",
                 crate::plan::handles().dense_fallback
             ),
         }),
         serde_json::json!({
             "class": "router",
             "launch_compatible": true,
-            "note": "moe_router_sm121 reads the row-major BF16 [384,5120] gate weight and F32 [384] bias, which the arena stores untransformed",
+            "note": format!(
+                "moe_router_sm121 reads the row-major BF16 [{experts},{hidden}] gate weight and F32 [{experts}] bias, which the arena stores untransformed"
+            ),
         }),
     ];
     Ok(MoeBind {

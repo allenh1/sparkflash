@@ -85,8 +85,10 @@ const HSI_INDEX_QUERY_BYTES: usize = 64 * 128 * 2;
 const HSI_BLOCK_BYTES: usize = HSI_BLOCKS * 4;
 const MLA_SINK_BYTES: usize = 64 * 4;
 
-/// The maximum packed weight size: wo_b's 5,120 x 8,192 E4M3 bytes.
-const MAX_WEIGHT_BYTES: usize = 5_120 * 8_192;
+/// The maximum packed weight size: wo_b's plan-hidden x per-rank-q E4M3 bytes.
+fn max_weight_bytes() -> usize {
+    crate::plan::hidden() * crate::plan::heads_per_rank() * crate::plan::mla_latent()
+}
 /// The maximum packed weight-scale size: wo_b's [160, 256] grid.
 const MAX_WEIGHT_SCALES: usize = 160 * 256;
 /// The maximum activation code count: the 64 x 512-wide attention output.
@@ -385,7 +387,7 @@ impl AttentionDeviceBackend {
         let a_codes = alloc(MAX_ACT_BYTES, &mut total)?;
         let a_scales = alloc(MAX_ACT_SCALES, &mut total)?;
         let a_bf16 = alloc(MAX_ACT_BF16_BYTES, &mut total)?;
-        let w = alloc(MAX_WEIGHT_BYTES, &mut total)?;
+        let w = alloc(max_weight_bytes(), &mut total)?;
         let w_scales = alloc(MAX_WEIGHT_SCALES, &mut total)?;
         let out = alloc(MAX_OUT_BYTES, &mut total)?;
         let ptrs = vec![a_codes, a_scales, a_bf16, w, w_scales, out];
@@ -612,7 +614,7 @@ impl AttentionDeviceBackend {
         (MAX_ACT_BYTES
             + MAX_ACT_SCALES
             + MAX_ACT_BF16_BYTES
-            + MAX_WEIGHT_BYTES
+            + max_weight_bytes()
             + MAX_WEIGHT_SCALES
             + MAX_OUT_BYTES
             + MLA_Q_BYTES
@@ -657,7 +659,7 @@ impl AttentionDeviceBackend {
     }
 
     fn upload_weight(&mut self, packed: &[u8], scales: &[u8]) -> Result<(), String> {
-        if packed.len() > MAX_WEIGHT_BYTES || scales.len() > MAX_WEIGHT_SCALES {
+        if packed.len() > max_weight_bytes() || scales.len() > MAX_WEIGHT_SCALES {
             return Err(format!(
                 "weight ({} B codes, {} B scales) does not fit the staging buffers",
                 packed.len(),
