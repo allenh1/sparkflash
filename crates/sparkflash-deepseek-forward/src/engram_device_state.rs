@@ -303,8 +303,8 @@ pub fn build_with_hashes(
                 skip[slot * positions + position] = true;
                 continue;
             }
-            let codes_name = format!("layers.{layer}.engram.embed.weight");
-            let scales_name = format!("layers.{layer}.engram.embed.scale");
+            let codes_name = crate::plan::layer_claim(*layer, "engram.embed.weight");
+            let scales_name = crate::plan::layer_claim(*layer, "engram.embed.scale");
             let codes_ranges: Vec<(u64, usize)> = row
                 .iter()
                 .map(|&id| (u64::from(id) * layout.head_dim as u64, layout.head_dim))
@@ -318,8 +318,8 @@ pub fn build_with_hashes(
                     )
                 })
                 .collect();
-            let codes = read(&codes_name, &codes_ranges)?;
-            let scales = read(&scales_name, &scales_ranges)?;
+            let codes = read(codes_name, &codes_ranges)?;
+            let scales = read(scales_name, &scales_ranges)?;
             if codes.len() != layout.codes_len || scales.len() != layout.scales_len {
                 return Err(format!(
                     "engram arena: position {position} layer {layer} read {} code and {} scale bytes, the entry holds {} and {}",
@@ -350,7 +350,7 @@ pub fn build_with_hashes(
 /// # Errors
 /// Fewer tokens than positions, or a hashing/read failure (`build_with_hashes`).
 pub fn build(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     shape: EngramArenaShape<'_>,
     tokens: &[u32],
     positions: usize,
@@ -367,7 +367,7 @@ pub fn build(
         positions,
         |position, out| {
             let history = &tokens[..=position];
-            sparkflash_engine::forward::engram::ngram_hashes(config, history, position, out)
+            sparkflash_engine::forward::engram::ngram_hashes(&config, history, position, out)
                 .map_err(|error| format!("engram arena: hashes at position {position}: {error}"))
         },
         read,
@@ -403,14 +403,14 @@ pub struct EngramHostState {
 /// The arena's shape/read failures, a missing or mis-shaped `q_weight`/`k_weight`, or a wkv matrix
 /// whose bytes disagree with the geometry the projection takes.
 pub fn build_host_state(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     source: &dyn sparkflash_engine::weights::WeightSource,
     tokens: &[u32],
     positions: usize,
 ) -> Result<EngramHostState, String> {
     use sparkflash_engine::forward::engram::{HASH_SENTINEL, hash_columns};
     let _ = HASH_SENTINEL;
-    let columns = hash_columns(config);
+    let columns = hash_columns(&config);
     let head_dim = config.engram_head_dim;
     let layout = EngramArenaLayout::new(columns, head_dim)?;
     let layer_ids = config.engram_layer_ids.clone();
@@ -444,7 +444,7 @@ pub fn build_host_state(
     let element_limit = hc * dim;
     let scale_len = out_width.div_ceil(32) * inner.div_ceil(32);
     for &layer in &layer_ids {
-        let prefix = format!("layers.{layer}.engram");
+        let prefix = crate::plan::layer_claim(layer, "engram");
         let q = sparkflash_engine::linalg::decode_by_name(
             source,
             &format!("{prefix}.q_weight"),

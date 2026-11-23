@@ -3462,8 +3462,8 @@ impl DeviceLayer<'_> {
                 .copied()
                 .ok_or_else(|| format!("rows output: the bind has no {name}"))
         };
-        let wo_a = lookup(format!("layers.{layer}.attn.wo_a.weight"))?;
-        let wo_b = lookup(format!("layers.{layer}.attn.wo_b.weight"))?;
+        let wo_a = lookup(crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
+        let wo_b = lookup(crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
         let geometry = self.out_geometry;
         let groups = geometry.groups as u64;
         let (cols, inner) = (geometry.o_lora_rank as u64, geometry.group_inner as u64);

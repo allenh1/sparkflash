@@ -43,7 +43,7 @@ const SPEC_EMBED_SEQ: u64 = u64::MAX - 0xE_0000;
 
 /// What the spec loop needs from the forward loop's scope.
 pub(super) struct SpecInputs<'s> {
-    pub(super) config: &'s sparkflash_engine::config::ModelConfig,
+    pub(super) config: &'s crate::plan::ModelConfig,
     pub(super) tail: &'s crate::tp4_tail::TailStage,
     pub(super) transport: &'s dyn sparkflash_comm::transport::Transport,
     pub(super) engram: Option<&'s EngramReader>,
@@ -175,7 +175,7 @@ const ENGRAM_URING_ENTRIES: u32 = 512;
 
 impl EngramReader {
     pub(super) fn open(
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         source: &dyn sparkflash_engine::weights::WeightSource,
         tokenizer: &Path,
     ) -> Result<Self, String> {
@@ -241,8 +241,9 @@ impl EngramReader {
         };
         let mut slots = Vec::new();
         for layer in &config.engram_layer_ids {
-            let (codes, codes_at) = region(format!("layers.{layer}.engram.embed.weight"))?;
-            let (scales, scales_at) = region(format!("layers.{layer}.engram.embed.scale"))?;
+            let (codes, codes_at) = region(crate::plan::layer_claim(layer, "engram.embed.weight"))?;
+            let (scales, scales_at) =
+                region(crate::plan::layer_claim(layer, "engram.embed.scale"))?;
             slots.push((codes, codes_at, scales, scales_at));
         }
         Ok(Self {
@@ -1150,7 +1151,7 @@ impl DeviceLayer<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn engram_plan<'r>(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         reader: &'r EngramReader,
         history: &[u32],
         p0: usize,
@@ -1373,7 +1374,7 @@ impl DeviceLayer<'_> {
     /// The Engram entries of rows p0..p0+n, read and uploaded before returning.
     pub(super) fn engram_set_rows(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         reader: &EngramReader,
         history: &[u32],
         p0: usize,

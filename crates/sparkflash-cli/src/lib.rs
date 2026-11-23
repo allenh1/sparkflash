@@ -40,6 +40,7 @@ pub mod models;
 pub mod onboard;
 #[cfg(feature = "cuda")]
 pub use sparkflash_deepseek_forward::moe_device;
+pub use sparkflash_deepseek_forward::plan;
 pub use sparkflash_deepseek_forward::resident_weights;
 pub use sparkflash_deepseek_forward::run_header;
 pub mod serve;

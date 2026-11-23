@@ -32,11 +32,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::plan::ModelConfig;
 use sparkflash_device::arena::{
     ArenaAllocator, ArenaTensor, ResidentArena, TensorLayout, tile_b12x,
 };
 use sparkflash_device::resident::{ResidentGroup, ResidentPlan};
-use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::weights::WeightSource;
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
@@ -71,22 +71,29 @@ impl ResidentAttention {
         let mut payloads: Vec<Vec<u8>> = Vec::new();
         let mut geometry: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         for layer in 0..config.n_layers {
-            let prefix = format!("layers.{layer}.attn");
             let projections = [
                 (
-                    format!("{prefix}.wq_a.weight"),
+                    crate::plan::layer_claim(layer, "attn.wq_a.weight").to_owned(),
                     config.q_lora_rank,
                     config.dim,
                 ),
-                (format!("{prefix}.wq_b.weight"), wide, config.q_lora_rank),
-                (format!("{prefix}.wkv.weight"), config.head_dim, config.dim),
                 (
-                    format!("{prefix}.wo_a.weight"),
+                    crate::plan::layer_claim(layer, "attn.wq_b.weight").to_owned(),
+                    wide,
+                    config.q_lora_rank,
+                ),
+                (
+                    crate::plan::layer_claim(layer, "attn.wkv.weight").to_owned(),
+                    config.head_dim,
+                    config.dim,
+                ),
+                (
+                    crate::plan::layer_claim(layer, "attn.wo_a.weight").to_owned(),
                     config.o_groups * config.o_lora_rank,
                     wide / config.o_groups,
                 ),
                 (
-                    format!("{prefix}.wo_b.weight"),
+                    crate::plan::layer_claim(layer, "attn.wo_b.weight").to_owned(),
                     config.dim,
                     config.o_groups * config.o_lora_rank,
                 ),
@@ -237,23 +244,22 @@ pub fn rank_attention_geometry(
     };
     let mut map = BTreeMap::new();
     for layer in 0..config.n_layers {
-        let prefix = format!("layers.{layer}.attn");
         // Replicated: the whole projection on every rank.
         map.insert(
-            format!("{prefix}.wq_a.weight"),
+            crate::plan::layer_claim(layer, "attn.wq_a.weight").to_owned(),
             (config.q_lora_rank, config.dim),
         );
         map.insert(
-            format!("{prefix}.wkv.weight"),
+            crate::plan::layer_claim(layer, "attn.wkv.weight").to_owned(),
             (config.head_dim, config.dim),
         );
         // Column: split cols (the kernel's output rows) across ranks.
         map.insert(
-            format!("{prefix}.wq_b.weight"),
+            crate::plan::layer_claim(layer, "attn.wq_b.weight").to_owned(),
             (split(wide, "cols", "wq_b")?, config.q_lora_rank),
         );
         map.insert(
-            format!("{prefix}.wo_a.weight"),
+            crate::plan::layer_claim(layer, "attn.wo_a.weight").to_owned(),
             (
                 split(config.o_groups * config.o_lora_rank, "cols", "wo_a")?,
                 wide / config.o_groups,
@@ -261,7 +267,7 @@ pub fn rank_attention_geometry(
         );
         // Row: split inner (the kernel's reduction width) across ranks.
         map.insert(
-            format!("{prefix}.wo_b.weight"),
+            crate::plan::layer_claim(layer, "attn.wo_b.weight").to_owned(),
             (
                 config.dim,
                 split(config.o_groups * config.o_lora_rank, "inner", "wo_b")?,
@@ -276,7 +282,7 @@ mod rank_geometry_tests {
     use super::*;
 
     fn config() -> ModelConfig {
-        ModelConfig::v41_flash().expect("the shipped configuration must parse")
+        crate::plan::released_values().expect("the shipped configuration must parse")
     }
 
     #[test]
@@ -349,7 +355,7 @@ pub fn rank_attention_plan_shapes(
 ) -> Result<BTreeMap<String, (usize, usize)>, String> {
     let mut map = rank_attention_geometry(config, rank, world)?;
     for &layer in &config.kv_source_layers {
-        let prefix = format!("layers.{layer}.attn.compressor");
+        let prefix = crate::plan::layer_prefix(layer, "attn.compressor");
         map.insert(
             format!("{prefix}.wkv.weight"),
             (config.head_dim, config.dim),
@@ -363,7 +369,7 @@ pub fn rank_attention_plan_shapes(
         }
     }
     for &layer in &config.index_source_layers {
-        let prefix = format!("layers.{layer}.attn.indexer");
+        let prefix = crate::plan::layer_prefix(layer, "attn.indexer");
         map.insert(
             format!("{prefix}.wq_b.weight"),
             (
@@ -404,7 +410,7 @@ pub fn mhc_seam_plan_names(config: &ModelConfig) -> Vec<String> {
     let mut names = Vec::with_capacity(config.n_layers * MHC_SEAM_PARTS.len());
     for layer in 0..config.n_layers {
         for (suffix, _dtype) in MHC_SEAM_PARTS {
-            names.push(format!("layers.{layer}.{suffix}"));
+            names.push(crate::plan::layer_claim(layer, suffix).to_owned());
         }
     }
     names
@@ -473,8 +479,8 @@ fn mhc_seam_bound_shards<'a>(
     let mut selected = Vec::with_capacity(config.n_layers * MHC_SEAM_PARTS.len());
     for layer in 0..config.n_layers {
         for (suffix, dtype) in MHC_SEAM_PARTS {
-            let name = format!("layers.{layer}.{suffix}");
-            if let Some(shard) = by_name.get(name.as_str()) {
+            let name = crate::plan::layer_claim(layer, suffix);
+            if let Some(shard) = by_name.get(name) {
                 selected.push((*shard, dtype));
             }
         }
@@ -574,7 +580,7 @@ mod rank_plan_shape_tests {
     use sparkflash_engine::tensor::TensorPlan;
 
     fn released_plan() -> ResidentPlan {
-        let config = ModelConfig::v41_flash().expect("config");
+        let config = crate::plan::released_values().expect("config");
         let plan = TensorPlan::language_model(&config);
         let entries: Vec<HeaderEntry> = plan
             .specs()
@@ -597,7 +603,7 @@ mod rank_plan_shape_tests {
 
     #[test]
     fn every_attention_shape_key_is_a_real_plan_name_and_the_plan_shape_matches() {
-        let config = ModelConfig::v41_flash().expect("config");
+        let config = crate::plan::released_values().expect("config");
         let table = rank_attention_plan_shapes(&config, 0, 4).expect("table");
         let plan = released_plan();
         let mut matched = 0usize;
@@ -625,7 +631,7 @@ mod rank_plan_shape_tests {
 
     #[test]
     fn the_table_covers_compressor_and_indexer_tensors_the_forward_code_reads() {
-        let config = ModelConfig::v41_flash().expect("config");
+        let config = crate::plan::released_values().expect("config");
         let table = rank_attention_plan_shapes(&config, 0, 4).expect("table");
         assert!(table.contains_key("layers.2.attn.compressor.wkv.weight"));
         assert!(table.contains_key("layers.2.attn.indexer.wq_b.weight"));
@@ -642,7 +648,7 @@ mod rank_plan_shape_tests {
         // F1b, pinned as a unit test rather than left to the first open on a node. The old pass
         // suffix-matched every resident shard, so the 30 MTP-lane tensors (mtp.0/1/2, ten each)
         // bound too and the coverage check refused 400 expected / 430 bound.
-        let config = ModelConfig::v41_flash().expect("config");
+        let config = crate::plan::released_values().expect("config");
         let plan = released_plan();
 
         // The fixture must actually carry the lanes, or the assertion below proves nothing. The
@@ -651,7 +657,7 @@ mod rank_plan_shape_tests {
         let mut mtp_seam_names: BTreeSet<String> = BTreeSet::new();
         for stage in 0..config.n_mtp_layers {
             for (suffix, _dtype) in MHC_SEAM_PARTS {
-                mtp_seam_names.insert(format!("mtp.{stage}.{suffix}"));
+                mtp_seam_names.insert(crate::plan::mtp_claim(stage, suffix).to_owned());
             }
         }
         let present: Vec<&str> = plan
@@ -1317,27 +1323,32 @@ pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
     for layer in 0..config.n_layers {
         for expert in 0..config.n_routed_experts {
             for matrix in [Matrix::Gate, Matrix::Up] {
-                let base = format!(
-                    "layers.{layer}.ffn.experts.{expert}.{}.weight",
-                    matrix.as_str()
-                );
+                let base = crate::plan::layer_claim(
+                    layer,
+                    &format!("ffn.experts.{expert}.{}.weight", matrix.as_str()),
+                )
+                .to_owned();
                 gate_up.insert(base.clone());
                 gate_up.insert(format!("{}.scale", base.trim_end_matches(".weight")));
             }
-            let base = format!("layers.{layer}.ffn.experts.{expert}.w2.weight");
+            let base = crate::plan::layer_claim(layer, &format!("ffn.experts.{expert}.w2.weight"))
+                .to_owned();
             down.insert(base.clone());
             down.insert(format!("{}.scale", base.trim_end_matches(".weight")));
         }
         for matrix in [Matrix::Gate, Matrix::Up, Matrix::Down] {
-            let base = format!(
-                "layers.{layer}.ffn.shared_experts.{}.weight",
-                matrix.as_str()
-            );
+            let base = crate::plan::layer_claim(
+                layer,
+                &format!("ffn.shared_experts.{}.weight", matrix.as_str()),
+            )
+            .to_owned();
             shared.insert(base.clone());
             shared.insert(format!("{}.scale", base.trim_end_matches(".weight")));
         }
         for part in [RouterPart::Weight, RouterPart::Bias, RouterPart::BiasVl] {
-            router.insert(format!("layers.{layer}.ffn.gate.{}", part.as_str()));
+            router.insert(
+                crate::plan::layer_claim(layer, &format!("ffn.gate.{}", part.as_str())).to_owned(),
+            );
         }
     }
     MoeExpectedSets {
@@ -1571,7 +1582,7 @@ mod bind_coverage_tests {
     }
 
     fn released_plan() -> ResidentPlan {
-        let config = ModelConfig::v41_flash().expect("config");
+        let config = crate::plan::released_values().expect("config");
         let plan = TensorPlan::language_model(&config);
         let entries: Vec<HeaderEntry> = plan
             .specs()
@@ -1664,7 +1675,7 @@ mod bind_coverage_tests {
 
     #[test]
     fn the_four_rank_moe_expected_and_plan_sets_are_equal_and_named() {
-        let config = ModelConfig::v41_flash().expect("config");
+        let config = crate::plan::released_values().expect("config");
         let table = rank_attention_plan_shapes(&config, 0, 4).expect("table");
         let plan = released_plan();
         let expected = moe_expected_sets(&config);
@@ -1705,7 +1716,7 @@ mod bind_coverage_tests {
 
     #[test]
     fn the_resident_plan_census_claims_every_shard_by_class() {
-        let config = ModelConfig::v41_flash().expect("config");
+        let config = crate::plan::released_values().expect("config");
         let table = rank_attention_plan_shapes(&config, 0, 4).expect("table");
         let plan = released_plan();
         let census = resident_plan_census(&plan, &table);
@@ -1808,7 +1819,7 @@ mod bind_coverage_tests {
 
     #[test]
     fn large_bind_classes_are_digested_and_small_classes_are_named() {
-        let config = ModelConfig::v41_flash().expect("config");
+        let config = crate::plan::released_values().expect("config");
         let expected = moe_expected_sets(&config);
         let empty = BTreeSet::new();
         let large = check_bind_coverage(
@@ -1847,7 +1858,7 @@ mod bind_coverage_tests {
 
     #[test]
     fn the_four_rank_attention_expected_and_plan_sets_are_equal_and_named() {
-        let config = ModelConfig::v41_flash().expect("config");
+        let config = crate::plan::released_values().expect("config");
         let table = rank_attention_plan_shapes(&config, 0, 4).expect("table");
         let plan = released_plan();
         // Side A: the bind check's expected set (the table filtered by the structural host-seam
@@ -1936,7 +1947,7 @@ mod mhc_seam_class_tests {
     use sparkflash_engine::tensor::TensorPlan;
 
     fn released_config() -> ModelConfig {
-        ModelConfig::v41_flash().expect("config")
+        crate::plan::released_values().expect("config")
     }
 
     fn released_plan() -> ResidentPlan {

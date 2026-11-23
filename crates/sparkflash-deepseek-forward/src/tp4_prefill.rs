@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use sparkflash_engine::config::ModelConfig;
+use crate::plan::ModelConfig;
 use sparkflash_engine::forward::attention::{
     AttentionProjectionBackend, AttentionSeamStep, AttnState, attention_seam_step_with_backend,
     reset_shared_attention,
@@ -227,7 +227,7 @@ impl ReferenceAttention {
         attention_seam_step_with_backend(
             &self.config,
             layer,
-            &format!("layers.{layer}"),
+            crate::plan::layer_root(layer),
             x,
             q_latent,
             position,

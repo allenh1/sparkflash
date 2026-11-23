@@ -36,7 +36,7 @@ sparkflash-kernels = { workspace = true }
 sparkflash-kv = { workspace = true }
 sparkflash-model = { workspace = true }
 sparkflash-runtime = { workspace = true }
-sparkflash-model-deepseek-v41 = { workspace = true }
+sparkflash-ops = { workspace = true }
 sparkflash-vision = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

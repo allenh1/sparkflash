@@ -902,8 +902,10 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
     // The request borrows the checkpoint source for the Engram seam (the tables are paged, never
     // bound): keep the source owned here for the whole stage and pass a borrow everywhere else.
     let weights = source.as_ref();
-    let config = sparkflash_engine::config::ModelConfig::v41_flash()
-        .map_err(|error| format!("model config: {error}"))?;
+    let open_plan = tp4_resident::plan_for_chain(&refs)?;
+    let description = crate::plan::install(open_plan)
+        .map_err(|error| format!("forward open: {error}"))?;
+    let config = description.values().clone();
     let table =
         crate::resident_weights::rank_attention_plan_shapes(&config, args.rank, args.world)?;
     let mut lines: Vec<String> = vec![format!(

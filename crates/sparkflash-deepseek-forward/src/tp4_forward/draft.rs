@@ -365,11 +365,13 @@ impl DraftState {
         let latent = device.head_width as usize;
         let mut stages = Vec::with_capacity(STAGES);
         for stage in 0..STAGES {
-            let p = format!("mtp.{stage}");
             let mut words = Vec::with_capacity(3 * EXPERTS * 2);
             for leaf in ["w1", "w3", "w2"] {
                 for expert in 0..EXPERTS {
-                    let (weight, scales) = pair(format!("{p}.ffn.experts.{expert}.{leaf}"))?;
+                    let (weight, scales) = pair(
+                        crate::plan::mtp_claim(stage, &format!("ffn.experts.{expert}.{leaf}"))
+                            .to_owned(),
+                    )?;
                     words.push(weight);
                     words.push(scales);
                 }
@@ -379,31 +381,31 @@ impl DraftState {
             cuda.copy_htod(&Deviceptr(table), &table_bytes)?;
             stages.push(Stage {
                 attn_seam: [
-                    ptr(format!("{p}.hc_attn_fn"))?,
-                    ptr(format!("{p}.hc_attn_base"))?,
-                    ptr(format!("{p}.hc_attn_scale"))?,
-                    ptr(format!("{p}.attn_norm.weight"))?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_attn_fn").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_attn_base").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_attn_scale").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "attn_norm.weight").to_owned())?,
                 ],
                 ffn_seam: [
-                    ptr(format!("{p}.hc_ffn_fn"))?,
-                    ptr(format!("{p}.hc_ffn_base"))?,
-                    ptr(format!("{p}.hc_ffn_scale"))?,
-                    ptr(format!("{p}.ffn_norm.weight"))?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_ffn_fn").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_ffn_base").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_ffn_scale").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "ffn_norm.weight").to_owned())?,
                 ],
-                wq_a: pair(format!("{p}.attn.wq_a"))?,
-                wkv: pair(format!("{p}.attn.wkv"))?,
-                q_norm: ptr(format!("{p}.attn.q_norm.weight"))?,
-                wq_b: pair(format!("{p}.attn.wq_b"))?,
-                kv_norm: ptr(format!("{p}.attn.kv_norm.weight"))?,
-                sink: ptr(format!("{p}.attn.attn_sink"))?,
-                wo_a: pair(format!("{p}.attn.wo_a"))?,
-                wo_b: pair(format!("{p}.attn.wo_b"))?,
-                gate: ptr(format!("{p}.ffn.gate.weight"))?,
-                bias: ptr(format!("{p}.ffn.gate.bias"))?,
+                wq_a: pair(crate::plan::mtp_claim(stage, "attn.wq_a").to_owned())?,
+                wkv: pair(crate::plan::mtp_claim(stage, "attn.wkv").to_owned())?,
+                q_norm: ptr(crate::plan::mtp_claim(stage, "attn.q_norm.weight").to_owned())?,
+                wq_b: pair(crate::plan::mtp_claim(stage, "attn.wq_b").to_owned())?,
+                kv_norm: ptr(crate::plan::mtp_claim(stage, "attn.kv_norm.weight").to_owned())?,
+                sink: ptr(crate::plan::mtp_claim(stage, "attn.attn_sink").to_owned())?,
+                wo_a: pair(crate::plan::mtp_claim(stage, "attn.wo_a").to_owned())?,
+                wo_b: pair(crate::plan::mtp_claim(stage, "attn.wo_b").to_owned())?,
+                gate: ptr(crate::plan::mtp_claim(stage, "ffn.gate.weight").to_owned())?,
+                bias: ptr(crate::plan::mtp_claim(stage, "ffn.gate.bias").to_owned())?,
                 shared: [
-                    pair(format!("{p}.ffn.shared_experts.w1"))?,
-                    pair(format!("{p}.ffn.shared_experts.w3"))?,
-                    pair(format!("{p}.ffn.shared_experts.w2"))?,
+                    pair(crate::plan::mtp_claim(stage, "ffn.shared_experts.w1").to_owned())?,
+                    pair(crate::plan::mtp_claim(stage, "ffn.shared_experts.w3").to_owned())?,
+                    pair(crate::plan::mtp_claim(stage, "ffn.shared_experts.w2").to_owned())?,
                 ],
                 table,
                 ring_codes: alloc(own_rows * latent)?,

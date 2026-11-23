@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use sparkflash_engine::config::ModelConfig;
+use crate::plan::ModelConfig;
 use sparkflash_engine::forward::attention::sparse_attention;
 use sparkflash_engine::forward::attention::{AttentionProjectionBackend, indexer_wq_b_chunked};
 

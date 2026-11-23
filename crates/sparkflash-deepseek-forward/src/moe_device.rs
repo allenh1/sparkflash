@@ -24,7 +24,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use sparkflash_engine::config::ModelConfig;
+use crate::plan::ModelConfig;
 use sparkflash_engine::dtype::DType;
 use sparkflash_engine::forward::moe::{
     MoeDeviceBackend, MoeScratch, add_shared_expert, routed_forward,
@@ -569,8 +569,8 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         let mut host_bytes = 0u64;
         let mut allocated = 0usize;
 
-        let gate_name = format!("{prefix}.ffn.gate.weight");
-        let bias_name = format!("{prefix}.ffn.gate.bias");
+        let gate_name = crate::plan::layer_claim(layer, "ffn.gate.weight");
+        let bias_name = crate::plan::layer_claim(layer, "ffn.gate.bias");
         let gate = source
             .read(&gate_name)
             .map_err(|error| read_err(&gate_name, error))?;
@@ -681,7 +681,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             Vec::new()
         };
 
-        let experts = read_experts(source, prefix, &table, dim, inter)?;
+        let experts = read_experts(source, layer, &table, dim, inter)?;
         let expert_bytes: usize = experts.iter().map(Expert::bytes).sum();
         staged_bytes += expert_bytes as u64;
         host_bytes += expert_bytes as u64;
@@ -1225,7 +1225,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         }
         let tokens = x.len() / dim;
         let staging_started = std::time::Instant::now();
-        let base = format!("{prefix}.ffn.shared_experts");
+        let base = crate::plan::layer_prefix(layer, "ffn.shared_experts");
         let w1 = read_spec(
             source,
             &format!("{base}.w1.weight"),
@@ -1945,14 +1945,14 @@ impl Expert {
 
 fn read_experts(
     source: &dyn WeightSource,
-    prefix: &str,
+    layer: usize,
     table: &[(usize, usize)],
     dim: usize,
     inter: usize,
 ) -> Result<Vec<Expert>, EngineError> {
     let mut experts = Vec::with_capacity(table.len());
     for (_, expert) in table {
-        let base = format!("{prefix}.ffn.experts.{expert}");
+        let base = crate::plan::layer_prefix(layer, &format!("ffn.experts.{expert}"));
         let w1 = read_len(source, &format!("{base}.w1.weight"), inter * (dim / 2))?;
         let s1 = read_len(
             source,

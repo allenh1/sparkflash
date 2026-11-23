@@ -1133,7 +1133,7 @@ pub struct MhcEntrySeam {
 /// # Errors
 /// Any tensor whose length disagrees with the model geometry, or a non-finite coefficient.
 pub fn mhc_entry_host_seam(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     hidden: &[f32],
     predictor: &[f32],
     base: &[f32],
@@ -1161,7 +1161,7 @@ pub fn mhc_entry_host_seam(
 /// [mhc_entry_host_seam]'s refusals.
 #[allow(clippy::too_many_arguments)]
 pub fn mhc_entry_host_seam_with(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     hidden: &[f32],
     predictor: &[f32],
     base: &[f32],
@@ -1193,7 +1193,7 @@ pub fn mhc_entry_host_seam_with(
 /// [mhc_entry_host_seam]'s refusals.
 #[allow(clippy::too_many_arguments)]
 fn mhc_entry_host_seam_with_digests(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     hidden: &[f32],
     predictor: &[f32],
     base: &[f32],
@@ -1440,7 +1440,7 @@ fn read_layer_seam_raw(
         .and_then(|rows| rows.checked_mul(dim))
         .and_then(|values| values.checked_mul(4))
         .ok_or_else(|| "mHC entry: predictor byte length overflows".to_string())?;
-    let attn_norm_name = format!("layers.{layer}.attn_norm.weight");
+    let attn_norm_name = crate::plan::layer_claim(layer, "attn_norm.weight");
     let attn_norm_bytes = match planned_dtype(request.resident_plan, &attn_norm_name) {
         Some("F32") => dim * 4,
         Some("BF16") => dim * 2,
@@ -1455,11 +1455,17 @@ fn read_layer_seam_raw(
             ));
         }
     };
-    let attn_fn = reader(&format!("layers.{layer}.hc_attn_fn"), hc_attn_fn_bytes)?;
-    let attn_base = reader(&format!("layers.{layer}.hc_attn_base"), PREDICTOR_ROWS * 4)?;
-    let attn_scale = reader(&format!("layers.{layer}.hc_attn_scale"), 3 * 4)?;
+    let attn_fn = reader(
+        &crate::plan::layer_claim(layer, "hc_attn_fn"),
+        hc_attn_fn_bytes,
+    )?;
+    let attn_base = reader(
+        &crate::plan::layer_claim(layer, "hc_attn_base"),
+        PREDICTOR_ROWS * 4,
+    )?;
+    let attn_scale = reader(&crate::plan::layer_claim(layer, "hc_attn_scale"), 3 * 4)?;
     let attn_norm = reader(&attn_norm_name, attn_norm_bytes)?;
-    let ffn_norm_name = format!("layers.{layer}.ffn_norm.weight");
+    let ffn_norm_name = crate::plan::layer_claim(layer, "ffn_norm.weight");
     let ffn_norm_bytes = match planned_dtype(request.resident_plan, &ffn_norm_name) {
         Some("F32") => dim * 4,
         Some("BF16") => dim * 2,
@@ -1479,9 +1485,15 @@ fn read_layer_seam_raw(
         .and_then(|rows| rows.checked_mul(dim))
         .and_then(|values| values.checked_mul(4))
         .ok_or_else(|| "FFN seams: hc_ffn_fn byte length overflows".to_string())?;
-    let ffn_fn = reader(&format!("layers.{layer}.hc_ffn_fn"), hc_ffn_fn_bytes)?;
-    let ffn_base = reader(&format!("layers.{layer}.hc_ffn_base"), PREDICTOR_ROWS * 4)?;
-    let ffn_scale = reader(&format!("layers.{layer}.hc_ffn_scale"), 3 * 4)?;
+    let ffn_fn = reader(
+        &crate::plan::layer_claim(layer, "hc_ffn_fn"),
+        hc_ffn_fn_bytes,
+    )?;
+    let ffn_base = reader(
+        &crate::plan::layer_claim(layer, "hc_ffn_base"),
+        PREDICTOR_ROWS * 4,
+    )?;
+    let ffn_scale = reader(&crate::plan::layer_claim(layer, "hc_ffn_scale"), 3 * 4)?;
     let ffn_norm = reader(&ffn_norm_name, ffn_norm_bytes)?;
     Ok((
         LayerSeamRaw {
@@ -1509,7 +1521,7 @@ fn read_layer_seam_raw(
 /// pass would not reproduce.
 #[cfg(any(feature = "cuda", test))]
 fn verify_interleaved_projection(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     ordered: &[f32],
     transposed: &[f32],
 ) -> Result<(), String> {
@@ -1551,7 +1563,7 @@ fn verify_interleaved_projection(
 #[cfg(any(feature = "cuda", test))]
 fn decode_layer_seam_tensors(
     raw: LayerSeamRaw,
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
 ) -> Result<LayerSeamTensors, String> {
     let dim = config.dim;
     let attn_fn = f32_from_le_bytes(&raw.attn_fn)?;
@@ -2565,7 +2577,7 @@ pub struct TokenStageRequest<'a> {
     pub resident_plan: Option<&'a sparkflash_device::resident::ResidentPlan>,
     /// The released model geometry, when the preflight is built by the chain: the layer-0 mHC host
     /// seam reads its dimensions, hc stream count and norm epsilon from here.
-    pub config: Option<&'a sparkflash_engine::config::ModelConfig>,
+    pub config: Option<&'a crate::plan::ModelConfig>,
     /// The checkpoint directory the reference attention seams read: the compressor, indexer and
     /// candidate select run the reference's own host code on the device chain's per-layer input, and
     /// those tensors are read from the shards rather than through the arena bind.
@@ -3148,7 +3160,7 @@ fn run_layer_kv_path(
         ));
     }
 
-    let norm_name = format!("layers.{layer}.attn.kv_norm.weight");
+    let norm_name = crate::plan::layer_claim(layer, "attn.kv_norm.weight");
     let norm_bytes = read_arena_bytes(cuda, arena, &norm_name, mla_width * 2)?;
     let norm_weight = bf16_from_le_bytes(&norm_bytes)?;
     linalg::rms_norm(&mut kv, &norm_weight, mla_width, config.norm_eps as f32)
@@ -3412,7 +3424,7 @@ impl AttentionBody {
             let sink = read_arena_bytes(
                 cuda,
                 arena,
-                &format!("layers.{layer}.attn.attn_sink"),
+                &crate::plan::layer_claim(layer, "attn.attn_sink"),
                 heads * 4,
             )?;
             body.sinks.push(sink);
@@ -3725,7 +3737,7 @@ fn run_layer_query_path(
     }
 
     // q_norm: [q_lora_rank] BF16 resident, read from the live arena.
-    let norm_name = format!("layers.{layer}.attn.q_norm.weight");
+    let norm_name = crate::plan::layer_claim(layer, "attn.q_norm.weight");
     let norm_bytes = read_arena_bytes(cuda, arena, &norm_name, rank_width * 2)?;
     let norm_weight = bf16_from_le_bytes(&norm_bytes)?;
     let mut normed = latent.clone();
@@ -3747,10 +3759,10 @@ fn run_layer_query_path(
 
     let (wq_b_cols, wq_b_inner) = bind
         .plan_index
-        .b12x_geometry(&format!("layers.{layer}.attn.wq_b.weight"))?;
+        .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wq_b.weight"))?;
     let (wq_a_cols, wq_a_inner) = bind
         .plan_index
-        .b12x_geometry(&format!("layers.{layer}.attn.wq_a.weight"))?;
+        .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wq_a.weight"))?;
     if (wq_a_cols, wq_a_inner) != (rank_width, HIDDEN) {
         return Err(format!(
             "layer-0 query path: the plan's wq_a geometry is {wq_a_cols}x{wq_a_inner}, the model config says {rank_width}x{HIDDEN}"
@@ -3789,7 +3801,7 @@ fn run_layer_query_path(
     let (wq_b_weight, wq_b_scales) = bind
         .attention
         .pointers
-        .get(&format!("layers.{layer}.attn.wq_b.weight"))
+        .get(&crate::plan::layer_claim(layer, "attn.wq_b.weight"))
         .copied()
         .ok_or_else(|| "layer-0 query path: the bind has no wq_b pair".to_string())?;
     if wq_b_weight.0 == 0 || wq_b_scales.0 == 0 {
@@ -3856,7 +3868,7 @@ fn run_layer_query_path(
             position,
             "layer0-query-path",
             "wq_b",
-            &format!("layers.{layer}.attn.wq_b.weight"),
+            &crate::plan::layer_claim(layer, "attn.wq_b.weight"),
             (wq_b_cols, wq_b_inner),
             &activation_values,
             &activation_codes,
@@ -4184,7 +4196,7 @@ fn run_layer_attention_output(
     }
     let wo_a_geometry = bind
         .plan_index
-        .b12x_geometry(&format!("layers.{layer}.attn.wo_a.weight"))?;
+        .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
     if wo_a_geometry != (groups * o_lora_rank, group_inner) {
         return Err(format!(
             "layer-0 attention output: the plan's wo_a is {wo_a_geometry:?}, the per-rank launch expects {:?} (world {world}, o_groups {} -> {groups} groups/rank, heads_per_rank {heads}, head_width {}, group_inner {group_inner}, o_lora_rank {o_lora_rank})",
@@ -4196,7 +4208,7 @@ fn run_layer_attention_output(
     }
     let wo_b_geometry = bind
         .plan_index
-        .b12x_geometry(&format!("layers.{layer}.attn.wo_b.weight"))?;
+        .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
     let wo_b_inner = groups * o_lora_rank;
     if wo_b_geometry != (HIDDEN, wo_b_inner) {
         return Err(format!(
@@ -4217,8 +4229,10 @@ fn run_layer_attention_output(
         }
         Ok(*pair)
     };
-    let (wo_a_weight, wo_a_scales) = pair_for(&format!("layers.{layer}.attn.wo_a.weight"))?;
-    let (wo_b_weight, wo_b_scales) = pair_for(&format!("layers.{layer}.attn.wo_b.weight"))?;
+    let (wo_a_weight, wo_a_scales) =
+        pair_for(&crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
+    let (wo_b_weight, wo_b_scales) =
+        pair_for(&crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
     let kernel_dir = request.kernel_cubin_dir.ok_or_else(|| {
         "layer-0 attention output: the loop has no kernel cubin directory".to_string()
     })?;
@@ -4332,7 +4346,7 @@ fn run_layer_attention_output(
             position,
             "layer0-attention-output",
             "wo_b",
-            &format!("layers.{layer}.attn.wo_b.weight"),
+            &crate::plan::layer_claim(layer, "attn.wo_b.weight"),
             (HIDDEN, wo_b_inner),
             &lo_values,
             &wo_b_codes,
@@ -4478,7 +4492,7 @@ impl AttentionResidualSeam {
 /// Refuses a delta that is not one dim-wide BF16 row, a residual stream that is not hc copies of
 /// dim, any non-finite output, and propagates hc_post's own shape refusals.
 pub fn attention_residual_host_seam(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     entry: &MhcEntrySeam,
     attention_delta_bf16: &[u8],
 ) -> Result<AttentionResidualSeam, String> {
@@ -4492,7 +4506,7 @@ pub fn attention_residual_host_seam(
 /// # Errors
 /// [attention_residual_host_seam]'s refusals.
 pub fn attention_residual_host_seam_with(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     entry: &MhcEntrySeam,
     attention_delta_bf16: &[u8],
     native_mhc: bool,
@@ -4642,7 +4656,7 @@ impl Layer0FfnSeams {
 /// Refuses wrong shapes or encodings, a wrong hc_mult, non-finite intermediate values, and
 /// propagates hc_mixes/hc_pre/rms_norm/quantise errors.
 pub fn layer0_ffn_host_seams(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     post_attention_hidden: &[f32],
     attn_pre_mix: &[f32],
     hc_ffn_fn: &[f32],
@@ -4670,7 +4684,7 @@ pub fn layer0_ffn_host_seams(
 /// [layer0_ffn_host_seams]'s refusals.
 #[allow(clippy::too_many_arguments)]
 pub fn layer0_ffn_host_seams_with(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     post_attention_hidden: &[f32],
     attn_pre_mix: &[f32],
     hc_ffn_fn: &[f32],
@@ -4701,7 +4715,7 @@ pub fn layer0_ffn_host_seams_with(
 /// [layer0_ffn_host_seams]'s refusals.
 #[allow(clippy::too_many_arguments)]
 fn layer0_ffn_host_seams_with_transposed(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     post_attention_hidden: &[f32],
     attn_pre_mix: &[f32],
     hc_ffn_fn: &[f32],
@@ -5028,8 +5042,9 @@ fn routed_slice_base(
     let pair = bind.routed.get(&(layer, expert, matrix)).ok_or_else(|| {
         format!("MoE: the bind has no routed expert {expert} {leaf} (layer {layer})")
     })?;
-    let weight_name = format!("layers.{layer}.ffn.experts.{expert}.{leaf}.weight");
-    let scale_name = format!("layers.{layer}.ffn.experts.{expert}.{leaf}.scale");
+    let weight_name =
+        crate::plan::layer_claim(layer, &format!("ffn.experts.{expert}.{leaf}.weight"));
+    let scale_name = crate::plan::layer_claim(layer, &format!("ffn.experts.{expert}.{leaf}.scale"));
     let slice_values = slice_shape[0] * slice_shape[1];
     let scale_slice = slice_shape[0] * (slice_shape[1] / 16);
     let weight_shape = plan_index
@@ -5798,14 +5813,14 @@ impl sparkflash_engine::weights::WeightSource for EngramResidentSource<'_> {
 /// The tensors [EngramResidentSource] holds: each Engram layer's wkv codes and scale grid, the two
 /// names [sparkflash_engine::forward::engram::engram_forward] reads on every call.
 #[cfg(any(feature = "cuda", test))]
-fn engram_weight_names(config: &sparkflash_engine::config::ModelConfig) -> Vec<String> {
+fn engram_weight_names(config: &crate::plan::ModelConfig) -> Vec<String> {
     config
         .engram_layer_ids
         .iter()
         .flat_map(|layer| {
             [
-                format!("layers.{layer}.engram.wkv.weight"),
-                format!("layers.{layer}.engram.wkv.scale"),
+                crate::plan::layer_claim(*layer, "engram.wkv.weight").to_owned(),
+                crate::plan::layer_claim(*layer, "engram.wkv.scale").to_owned(),
             ]
         })
         .collect()
@@ -5836,7 +5851,7 @@ fn engram_weight_names(config: &sparkflash_engine::config::ModelConfig) -> Vec<S
 /// The source's error for a range it cannot read, named with the tensor.
 #[cfg(any(feature = "cuda", test))]
 fn warm_engram_rows(
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     tokens: &[u32],
     total_positions: usize,
     source: &dyn sparkflash_engine::weights::WeightSource,
@@ -5879,10 +5894,9 @@ fn warm_engram_rows(
         }
     }
     for (index, &layer) in config.engram_layer_ids.iter().enumerate() {
-        let prefix = format!("layers.{layer}");
         let ids = &rows[index];
         if !ids.is_empty() {
-            let weight_name = format!("{prefix}.engram.embed.weight");
+            let weight_name = crate::plan::layer_claim(layer, "engram.embed.weight");
             let weight_ranges: Vec<(u64, usize)> = ids
                 .iter()
                 .map(|&id| (id as u64 * width as u64, width))
@@ -5892,7 +5906,7 @@ fn warm_engram_rows(
                     format!("forward loop: Engram warm-up {weight_name}: {error}")
                 })?;
             }
-            let scale_name = format!("{prefix}.engram.embed.scale");
+            let scale_name = crate::plan::layer_claim(layer, "engram.embed.scale");
             let scale_ranges: Vec<(u64, usize)> = ids
                 .iter()
                 .map(|&id| (id as u64 * scale_width as u64, scale_width))
@@ -5904,7 +5918,7 @@ fn warm_engram_rows(
             }
         }
         for suffix in ["q_weight", "k_weight"] {
-            let name = format!("{prefix}.engram.{suffix}");
+            let name = crate::plan::layer_claim(layer, &format!("engram.{suffix}"));
             if source.spec(&name).is_ok() {
                 source
                     .read(&name)
@@ -5993,7 +6007,7 @@ impl<'a> EngramWkvDevice<'a> {
     /// cubin that disagrees with the baseline pin, an allocation or an upload failure.
     fn build(
         cuda: &'a sparkflash_kernels::cuda_driver::Cuda,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         kernel_dir: &std::path::Path,
         resident: &EngramResidentSource<'_>,
     ) -> Result<Self, String> {
@@ -6022,8 +6036,8 @@ impl<'a> EngramWkvDevice<'a> {
         let want_codes = out_width * inner;
         let want_scales = out_width.div_ceil(32) * inner.div_ceil(32);
         for &layer in &config.engram_layer_ids {
-            let codes_name = format!("layers.{layer}.engram.wkv.weight");
-            let scales_name = format!("layers.{layer}.engram.wkv.scale");
+            let codes_name = crate::plan::layer_claim(layer, "engram.wkv.weight");
+            let scales_name = crate::plan::layer_claim(layer, "engram.wkv.scale");
             let codes = resident.resident_bytes(&codes_name).ok_or_else(|| {
                 format!("Engram device wkv: the resident overlay holds no {codes_name}")
             })?;
@@ -6316,7 +6330,7 @@ impl<'a> SeamDevice<'a> {
     /// allocation/copy failure.
     fn build(
         cuda: &'a sparkflash_kernels::cuda_driver::Cuda,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         kernel_dir: &std::path::Path,
         src: &dyn sparkflash_engine::weights::WeightSource,
     ) -> Result<Self, String> {
@@ -6423,7 +6437,7 @@ impl<'a> SeamDevice<'a> {
                 continue;
             }
             let Some(wkv) = device.stage_hostw(
-                &format!("layers.{layer}.attn.compressor.wkv.weight"),
+                &crate::plan::layer_claim(layer, "attn.compressor.wkv.weight"),
                 config.dim,
                 config.head_dim,
                 OutStores::F32Row,
@@ -6435,7 +6449,7 @@ impl<'a> SeamDevice<'a> {
                 // wrong cause.
                 declines.push(decline_reason(
                     src,
-                    &format!("layers.{layer}.attn.compressor.wkv.weight"),
+                    &crate::plan::layer_claim(layer, "attn.compressor.wkv.weight"),
                     config.head_dim,
                     config.dim,
                 ));
@@ -6443,7 +6457,7 @@ impl<'a> SeamDevice<'a> {
             };
             let wgate = if ratio > 1 {
                 device.stage_hostw(
-                    &format!("layers.{layer}.attn.compressor.wgate.weight"),
+                    &crate::plan::layer_claim(layer, "attn.compressor.wgate.weight"),
                     config.dim,
                     config.head_dim,
                     OutStores::F32Row,
@@ -6459,7 +6473,7 @@ impl<'a> SeamDevice<'a> {
             // the pooled latent to the model dtype BEFORE the norm (`norm(kv.to(dtype))`,
             // model.py:475-486), so both the operand and this weight are bf16 and rmsnorm_sm121 is
             // the kernel. Widening it to f32 here would have been the wrong dtype for both sides.
-            let norm_name = format!("layers.{layer}.attn.compressor.norm.weight");
+            let norm_name = crate::plan::layer_claim(layer, "attn.compressor.norm.weight");
             let raw = src
                 .read(&norm_name)
                 .map_err(|error| format!("ref seam compressor norm: {norm_name}: {error}"))?;
@@ -6499,7 +6513,7 @@ impl<'a> SeamDevice<'a> {
             })?;
             device.compressor_norm.insert(layer, (span, width * 2));
             if let Some(wk) = device.stage_hostw(
-                &format!("layers.{layer}.attn.indexer.wk.weight"),
+                &crate::plan::layer_claim(layer, "attn.indexer.wk.weight"),
                 config.head_dim,
                 config.index_head_dim,
                 OutStores::F32Row,
@@ -6507,7 +6521,7 @@ impl<'a> SeamDevice<'a> {
             )? {
                 device.index_wk.insert(layer, wk.weight);
             }
-            let k_norm_name = format!("layers.{layer}.attn.indexer.k_norm.weight");
+            let k_norm_name = crate::plan::layer_claim(layer, "attn.indexer.k_norm.weight");
             if let Ok(raw) = src.read(&k_norm_name) {
                 let width = config.index_head_dim;
                 let bytes = if raw.len() == width * 2 {
@@ -6544,7 +6558,7 @@ impl<'a> SeamDevice<'a> {
         }
         for &layer in &config.index_source_layers {
             if let Some(proj) = device.stage_hostw(
-                &format!("layers.{layer}.attn.indexer.weights_proj.weight"),
+                &crate::plan::layer_claim(layer, "attn.indexer.weights_proj.weight"),
                 config.dim,
                 config.index_n_heads,
                 OutStores::Bf16Row,
@@ -6590,8 +6604,8 @@ impl<'a> SeamDevice<'a> {
             what: "ref seam indexer wq_b".to_owned(),
             detail,
         };
-        let name = format!("layers.{layer}.attn.indexer.wq_b.weight");
-        let scale_name = format!("layers.{layer}.attn.indexer.wq_b.scale");
+        let name = crate::plan::layer_claim(layer, "attn.indexer.wq_b.weight");
+        let scale_name = crate::plan::layer_claim(layer, "attn.indexer.wq_b.scale");
         let spec = src
             .spec(&name)
             .map_err(|error| shape(format!("{name}: {error}")))?;
@@ -6914,7 +6928,7 @@ impl Drop for SeamDevice<'_> {
 impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamDevice<'_> {
     fn wq_a(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         layer: usize,
         prefix: &str,
         x: &[f32],
@@ -6934,7 +6948,7 @@ impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamD
 
     fn wq_b(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         layer: usize,
         prefix: &str,
         latent: &[f32],
@@ -6954,7 +6968,7 @@ impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamD
 
     fn wkv(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         layer: usize,
         prefix: &str,
         x: &[f32],
@@ -6974,7 +6988,7 @@ impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamD
 
     fn wo_a(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         prefix: &str,
         wide: &[f32],
         src: &dyn sparkflash_engine::weights::WeightSource,
@@ -6992,7 +7006,7 @@ impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamD
 
     fn wo_b(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         prefix: &str,
         grouped: &[f32],
         src: &dyn sparkflash_engine::weights::WeightSource,
@@ -7018,7 +7032,7 @@ impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamD
     /// so a decline is the pre-arm arithmetic, not a third behaviour.
     fn indexer_wq_b(
         &mut self,
-        _config: &sparkflash_engine::config::ModelConfig,
+        _config: &crate::plan::ModelConfig,
         layer: usize,
         _prefix: &str,
         latent: &[f32],
@@ -7085,7 +7099,7 @@ impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamD
     /// time, so this is chunked prefill), or a layer this arm declined at build.
     fn compressor_wkv(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         layer: usize,
         _prefix: &str,
         x: &[f32],
@@ -7105,7 +7119,7 @@ impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamD
     /// The compressor's wgate projection on the host-weight decode GEMV; see [Self::compressor_wkv].
     fn compressor_wgate(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         layer: usize,
         _prefix: &str,
         x: &[f32],
@@ -7129,7 +7143,7 @@ impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamD
     /// layer that does not own the index keys.
     fn indexer_wk(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         layer: usize,
         _prefix: &str,
         latent: &[f32],
@@ -7162,7 +7176,7 @@ impl sparkflash_engine::forward::attention::AttentionProjectionBackend for SeamD
     /// None for a multi-row call or a layer this arm declined at build.
     fn indexer_weights_proj(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         layer: usize,
         _prefix: &str,
         x: &[f32],
@@ -7245,7 +7259,7 @@ fn gather_shared_expert_source(
     let dim_blocks = dim / 32;
     let inter_blocks = inter / 32;
     let shard_blocks = local_inter / 32;
-    let prefix = format!("layers.{layer}.ffn.shared_experts");
+    let prefix = crate::plan::layer_claim(layer, "ffn.shared_experts");
     let mut local_reads = 0usize;
     let mut gather_calls = 0usize;
     let mut tensors = std::collections::BTreeMap::new();
@@ -7506,7 +7520,7 @@ impl RoutedGeometry {
     /// # Errors
     /// A world other than four, a routed/activated expert count or width that is not the released
     /// one, or an intermediate width that does not split into whole 32-value blocks.
-    fn new(config: &sparkflash_engine::config::ModelConfig, world: usize) -> Result<Self, String> {
+    fn new(config: &crate::plan::ModelConfig, world: usize) -> Result<Self, String> {
         let dim = config.dim;
         let inter = config.moe_inter_dim;
         let experts = config.n_routed_experts;
@@ -7651,7 +7665,7 @@ fn build_shared_expert_device(
     let mut layers = Vec::with_capacity(shared.len());
     for (layer, gather) in shared.iter().enumerate() {
         let source: &dyn WeightSource = &gather.source;
-        let base = format!("layers.{layer}.ffn.shared_experts");
+        let base = crate::plan::layer_prefix(layer, "ffn.shared_experts");
         let (s1, s3, s2) = crate::moe_device::read_shared_scale_grids(source, &base, inter, dim)
             .map_err(|error| format!("shared expert (device): layer {layer} scales: {error}"))?;
         let mut stage = |leaf: &str,
@@ -8430,15 +8444,20 @@ fn run_layer_attention_projections(
         }
         Ok(*pair)
     };
-    let (wq_a_weight, wq_a_scales) = pair_for(&format!("layers.{layer}.attn.wq_a.weight"))?;
-    let (wkv_weight, wkv_scales) = pair_for(&format!("layers.{layer}.attn.wkv.weight"))?;
+    let (wq_a_weight, wq_a_scales) =
+        pair_for(&crate::plan::layer_claim(layer, "attn.wq_a.weight"))?;
+    let (wkv_weight, wkv_scales) = pair_for(&crate::plan::layer_claim(layer, "attn.wkv.weight"))?;
     for (name, cols, inner) in [
         (
-            &format!("layers.{layer}.attn.wq_a.weight"),
+            &crate::plan::layer_claim(layer, "attn.wq_a.weight"),
             wq_a_cols,
             HIDDEN,
         ),
-        (&format!("layers.{layer}.attn.wkv.weight"), wkv_cols, HIDDEN),
+        (
+            &crate::plan::layer_claim(layer, "attn.wkv.weight"),
+            wkv_cols,
+            HIDDEN,
+        ),
     ] {
         let (planned_cols, planned_inner) = bind.plan_index.b12x_geometry(name)?;
         if (planned_cols, planned_inner) != (cols, inner) {
@@ -8550,7 +8569,7 @@ fn run_layer_attention_projections(
         position,
         "layer0-attention-projections",
         "wq_a",
-        &format!("layers.{layer}.attn.wq_a.weight"),
+        &crate::plan::layer_claim(layer, "attn.wq_a.weight"),
         (wq_a_cols, HIDDEN),
         normed,
         &activation_codes,
@@ -8566,7 +8585,7 @@ fn run_layer_attention_projections(
         position,
         "layer0-attention-projections",
         "wkv",
-        &format!("layers.{layer}.attn.wkv.weight"),
+        &crate::plan::layer_claim(layer, "attn.wkv.weight"),
         (wkv_cols, HIDDEN),
         normed,
         &activation_codes,
@@ -8625,7 +8644,7 @@ fn run_head_position(
     request: &TokenStageRequest<'_>,
     tail_stage: &crate::tp4_tail::TailStage,
     transport: &TcpTransport,
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     final_norm: &[f32],
     stream: &[f32],
     tail_pre_mix: &[f32],
@@ -11560,7 +11579,7 @@ impl<'a> DeviceLayer<'a> {
     #[allow(clippy::too_many_arguments)]
     fn open(
         cuda: &'a Cuda,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         kernel_cubin_dir: Option<&std::path::Path>,
         world: usize,
         max_positions: usize,
@@ -11624,8 +11643,8 @@ impl<'a> DeviceLayer<'a> {
         let norm_dtype = if SEAM_NORM_BF16 == 1 { "BF16" } else { "F32" };
         for layer in 0..config.n_layers {
             for name in [
-                format!("layers.{layer}.attn_norm.weight"),
-                format!("layers.{layer}.ffn_norm.weight"),
+                crate::plan::layer_claim(layer, "attn_norm.weight"),
+                crate::plan::layer_claim(layer, "ffn_norm.weight"),
             ] {
                 match planned_dtype(plan, &name) {
                     Some(dtype) if dtype == norm_dtype => {}
@@ -12246,11 +12265,11 @@ impl<'a> DeviceLayer<'a> {
             for layer in 0..config.n_layers {
                 for (name, want) in [
                     (
-                        format!("layers.{layer}.attn.wo_a.weight"),
+                        crate::plan::layer_claim(layer, "attn.wo_a.weight"),
                         out_geometry.wo_a_shape(),
                     ),
                     (
-                        format!("layers.{layer}.attn.wo_b.weight"),
+                        crate::plan::layer_claim(layer, "attn.wo_b.weight"),
                         out_geometry.wo_b_shape(),
                     ),
                 ] {
@@ -12290,7 +12309,7 @@ impl<'a> DeviceLayer<'a> {
             let sink = read_arena_bytes(
                 cuda,
                 arena,
-                &format!("layers.{layer}.attn.attn_sink"),
+                &crate::plan::layer_claim(layer, "attn.attn_sink"),
                 sink_stride,
             )?;
             sink_bytes.extend_from_slice(&sink);
@@ -15884,8 +15903,8 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                 format!("layer device stage attention_output: the bind has no {name}")
             })
         };
-        let wo_a = lookup(&format!("layers.{layer}.attn.wo_a.weight"))?;
-        let wo_b = lookup(&format!("layers.{layer}.attn.wo_b.weight"))?;
+        let wo_a = lookup(&crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
+        let wo_b = lookup(&crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
         let layer_id = u32::try_from(layer).map_err(|_| {
             format!("layer device stage attention_output: layer {layer} does not fit u32")
         })?;
@@ -19899,7 +19918,7 @@ mod tests {
     #[test]
     fn the_preflight_refuses_an_engram_config_without_a_checkpoint_source() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = sparkflash_engine::config::ModelConfig::v41_flash().expect("released config");
+        let config = crate::plan::released_values().expect("released config");
         let mut req = request(dir.path(), None);
         req.config = Some(&config);
         let outcome = token_stage(&req);
@@ -20145,7 +20164,7 @@ mod tests {
 
     #[test]
     fn the_ffn_host_seams_build_the_moe_stage_inputs() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
         let mut hidden = Vec::with_capacity(hc * dim);
@@ -20206,7 +20225,7 @@ mod tests {
 
     #[test]
     fn the_attention_residual_seam_mixes_the_delta_onto_the_streams() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
         let mut hidden = Vec::with_capacity(hc * dim);
@@ -20300,7 +20319,7 @@ mod tests {
     /// that needs the checkpoint and four ranks, so it is re-run on the window as the default row.
     #[test]
     fn the_default_seams_are_the_unchanged_f32_arm() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
         let mut hidden = Vec::with_capacity(hc * dim);
@@ -20368,7 +20387,7 @@ mod tests {
     /// the norm output come back bf16-representable and differ from the f32 arm on the same input.
     #[test]
     fn the_native_mhc_seams_round_the_stream_at_the_release_boundaries() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
         let mut hidden = Vec::with_capacity(hc * dim);
@@ -20461,7 +20480,7 @@ mod tests {
 
     #[test]
     fn the_layer0_mhc_entry_seam_reproduces_the_released_reference() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
         assert_eq!(hc, HC_MULT);
@@ -20497,7 +20516,7 @@ mod tests {
         for value in &seam.comb {
             assert!((value - 0.25).abs() < 1e-4, "uniform comb: {value}");
         }
-        let expected_normed = 2.0 / (4.0 + config.norm_eps as f32).sqrt();
+        let expected_normed: f32 = 2.0 / (4.0 + config.norm_eps as f32).sqrt();
         for value in &seam.normed {
             assert!((value - expected_normed).abs() < 1e-5, "{value}");
         }
@@ -20536,7 +20555,7 @@ mod tests {
 
     #[test]
     fn the_mhc_entry_seam_honours_the_cross_layer_pre_mix() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = HC_MULT;
         // Distinct copies so the selected copy is identifiable.
@@ -20592,7 +20611,7 @@ mod tests {
 
     #[test]
     fn the_layer0_mhc_entry_seam_refuses_geometry_that_does_not_match_the_released_model() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let stream = vec![0.0f32; HC_MULT * dim];
         let predictor = vec![0.0f32; PREDICTOR_ROWS * HC_MULT * dim];
@@ -21288,16 +21307,15 @@ mod tests {
         }
     }
 
-    fn cache_small_layer_seam_config() -> sparkflash_engine::config::ModelConfig {
+    fn cache_small_layer_seam_config() -> crate::plan::ModelConfig {
         // The cache build only needs dim and hc_mult; the released config keeps the hc geometry.
-        let mut config =
-            sparkflash_engine::config::ModelConfig::v41_flash().expect("released config");
+        let mut config = crate::plan::released_values().expect("released config");
         config.dim = 64;
         config
     }
 
     fn cache_seam_plan(
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         dtype: &str,
         n_layers: usize,
     ) -> sparkflash_device::resident::ResidentPlan {
@@ -21305,12 +21323,12 @@ mod tests {
         let mut entries: Vec<HeaderEntry> = Vec::new();
         for layer in 0..n_layers {
             entries.push(HeaderEntry::new(
-                format!("layers.{layer}.attn_norm.weight"),
+                crate::plan::layer_claim(layer, "attn_norm.weight"),
                 dtype,
                 vec![config.dim],
             ));
             entries.push(HeaderEntry::new(
-                format!("layers.{layer}.ffn_norm.weight"),
+                crate::plan::layer_claim(layer, "ffn_norm.weight"),
                 dtype,
                 vec![config.dim],
             ));
@@ -21319,7 +21337,7 @@ mod tests {
     }
 
     fn cache_production_seam_vectors() -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
         let predictor: Vec<f32> = (0..PREDICTOR_ROWS * hc * dim)
@@ -21338,7 +21356,7 @@ mod tests {
     // T1: the cache decode equals the per-call decode for both released norm encodings.
     #[test]
     fn the_layer_seam_cache_decode_reproduces_the_per_call_decode() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
         let (attn_fn, attn_base, attn_scale, attn_norm) = cache_production_seam_vectors();
@@ -21426,7 +21444,7 @@ mod tests {
     // T2: reusing the cached digests changes nothing in the MhcEntrySeam, on both rounding arms.
     #[test]
     fn the_cached_digest_seam_is_the_computed_digest_seam() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
         let (predictor, base, scale, attn_norm) = cache_production_seam_vectors();
@@ -21504,7 +21522,7 @@ mod tests {
     // T3: the refactored cache-hit seam entry points equal the direct public seam calls.
     #[test]
     fn the_cached_layer_seams_are_the_direct_seams() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let dim = config.dim;
         let hc = config.hc_mult;
         let (predictor, base, scale, norm) = cache_production_seam_vectors();
@@ -21593,14 +21611,38 @@ mod tests {
         let norm_bytes = config.dim * 4;
         let mut expected: Vec<(String, usize)> = Vec::new();
         for layer in 0..n_layers {
-            expected.push((format!("layers.{layer}.hc_attn_fn"), predictor_bytes));
-            expected.push((format!("layers.{layer}.hc_attn_base"), PREDICTOR_ROWS * 4));
-            expected.push((format!("layers.{layer}.hc_attn_scale"), 3 * 4));
-            expected.push((format!("layers.{layer}.attn_norm.weight"), norm_bytes));
-            expected.push((format!("layers.{layer}.hc_ffn_fn"), predictor_bytes));
-            expected.push((format!("layers.{layer}.hc_ffn_base"), PREDICTOR_ROWS * 4));
-            expected.push((format!("layers.{layer}.hc_ffn_scale"), 3 * 4));
-            expected.push((format!("layers.{layer}.ffn_norm.weight"), norm_bytes));
+            expected.push((
+                crate::plan::layer_claim(layer, "hc_attn_fn").to_owned(),
+                predictor_bytes,
+            ));
+            expected.push((
+                crate::plan::layer_claim(layer, "hc_attn_base").to_owned(),
+                PREDICTOR_ROWS * 4,
+            ));
+            expected.push((
+                crate::plan::layer_claim(layer, "hc_attn_scale").to_owned(),
+                3 * 4,
+            ));
+            expected.push((
+                crate::plan::layer_claim(layer, "attn_norm.weight").to_owned(),
+                norm_bytes,
+            ));
+            expected.push((
+                crate::plan::layer_claim(layer, "hc_ffn_fn").to_owned(),
+                predictor_bytes,
+            ));
+            expected.push((
+                crate::plan::layer_claim(layer, "hc_ffn_base").to_owned(),
+                PREDICTOR_ROWS * 4,
+            ));
+            expected.push((
+                crate::plan::layer_claim(layer, "hc_ffn_scale").to_owned(),
+                3 * 4,
+            ));
+            expected.push((
+                crate::plan::layer_claim(layer, "ffn_norm.weight").to_owned(),
+                norm_bytes,
+            ));
         }
         let mut calls: Vec<(String, usize)> = Vec::new();
         let mut reader = |name: &str, want: usize| -> Result<Vec<u8>, String> {
@@ -21666,7 +21708,7 @@ mod tests {
     // transposed - so the 40-layer cache is 316,219,840 B.
     #[test]
     fn the_seam_cache_memory_is_the_production_per_layer_bytes() {
-        let config = sparkflash_engine::config::ModelConfig::v41_flash_cached();
+        let config = crate::plan::cached_values();
         let n_layers = 1;
         let plan = cache_seam_plan(config, "F32", n_layers);
         let dir = tempfile::tempdir().expect("tempdir");
@@ -22013,7 +22055,7 @@ mod evidence_switch_tests {
     /// reads on every call.
     #[test]
     fn the_engram_resident_names_are_each_layers_wkv_codes_and_grid() {
-        let mut config = sparkflash_engine::config::ModelConfig::tiny();
+        let mut config = crate::plan::tiny_values();
         config.engram_layer_ids = vec![1, 14];
         assert_eq!(
             engram_weight_names(&config),
@@ -22033,7 +22075,7 @@ mod evidence_switch_tests {
     fn the_engram_warm_up_reads_exactly_the_rows_the_run_will_look_up() {
         use sparkflash_engine::dtype::DType;
         use sparkflash_engine::forward::engram::{hash_columns, ngram_hashes};
-        let mut config = sparkflash_engine::config::ModelConfig::tiny();
+        let mut config = crate::plan::tiny_values();
         config.engram_layer_ids = vec![1];
         let tokens = [5u32, 7, 9, 11, 13];
         let total_positions = 4usize;
