@@ -25,7 +25,7 @@
 //! counters back and the next step overwrites it. The Engram entries of the verify rows are written
 //! from the step's own token history before it runs.
 
-use super::batch::{Batch, ENCODER_LAYERS, Emission, Pools};
+use super::batch::{Batch, Emission, Pools};
 use super::draft::DraftState;
 use super::rows::{R_MAX, RowsState};
 use super::sample::Sampler;
@@ -180,17 +180,8 @@ impl EngramReader {
         tokenizer: &Path,
     ) -> Result<Self, String> {
         use std::os::fd::AsRawFd as _;
-        // The hash constants (primes, offsets, multipliers) are the released model's two layers.
-        if config.engram_layer_ids != sparkflash_engram::ENGRAM_LAYERS
-            || sparkflash_engine::forward::engram::hash_columns(config)
-                != sparkflash_engram::hash::HASH_COLUMNS
-        {
-            return Err(format!(
-                "engram reader: layers {:?} with {} hash columns are not the released Engram layout",
-                config.engram_layer_ids,
-                sparkflash_engine::forward::engram::hash_columns(config)
-            ));
-        }
+        // The layers and hash width are the open plan's facts: the reader opens the tables the
+        // plan's Engram parts claim, and the forward sizes its hash rows from the same facts.
         let compressor =
             sparkflash_engram::compress::TokenizerCompressor::from_tokenizer_json(tokenizer)
                 .map_err(|error| format!("engram reader: {}: {error}", tokenizer.display()))?;
@@ -1512,7 +1503,7 @@ impl DeviceLayer<'_> {
     /// Engram reads (`task`, staged in its pinned buffer) are waited for and uploaded just before
     /// its slot's layer (the chunks share the arena rows: the run's stream orders each upload after
     /// the previous chunk's reads of them). The first `encoder_only` chunks stop after the
-    /// encoder layers ([`ENCODER_LAYERS`]). Each chunk's launches run on its lane
+    /// encoder layers ([`super::batch::encoder_layers`]). Each chunk's launches run on its lane
     /// ([`DeviceLayer::enter_lane`]; [`super::lanes::NO_LANE`] keeps the selected one). `then`
     /// runs once every layer is queued. Returns the ms spent waiting for reads.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -1539,7 +1530,8 @@ impl DeviceLayer<'_> {
             "prefill",
             chunks.iter().map(|&(_, _, _, n, _)| n).sum(),
         );
-        if encoder_only > chunks.len() || staged.len() < ENCODER_LAYERS {
+        let encoder_layers = super::batch::encoder_layers();
+        if encoder_only > chunks.len() || staged.len() < encoder_layers {
             return Err(format!(
                 "paired prefill: {encoder_only} encoder-only chunks of {} over {} layers",
                 chunks.len(),
@@ -1575,7 +1567,7 @@ impl DeviceLayer<'_> {
             for (layer, weights) in staged.iter().enumerate() {
                 // The decoder layers run the chunks after the encoder-only ones (a suffix, so the
                 // merged pass's rows are the suffix of its list too).
-                let chunks = if layer < ENCODER_LAYERS {
+                let chunks = if layer < encoder_layers {
                     chunks
                 } else {
                     &chunks[encoder_only..]

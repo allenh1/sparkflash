@@ -5132,19 +5132,16 @@ fn run_layer_moe_routed(
     let world = request.world;
     let rank = request.rank;
     let tokens = 1usize;
-    let top_k = 6usize;
+    let top_k = config.n_activated_experts;
     let experts = config.n_routed_experts;
     let inter = config.moe_inter_dim;
-    let dim = config.dim;
-    if world != 4 || experts != 384 || top_k != 6 || dim != crate::plan::hidden() {
+    let dim = crate::plan::hidden();
+    // Four ranks is milestone 3 and is the only shape assumption left here: the expert count,
+    // top-k and widths are the open plan's, and the resolved catalogue entries enforce their
+    // compiled shape before this stage runs.
+    if world != 4 {
         return Err(format!(
-            "MoE: this chain is the released four-rank shape (world 4, 384 experts, top-6, dim {}); got world {world}, {experts} experts, top-{top_k}, dim {dim}",
-            crate::plan::hidden()
-        ));
-    }
-    if !inter.is_multiple_of(world) || inter / world != 576 {
-        return Err(format!(
-            "MoE: the released split is 576 rows per rank, this config gives {inter} over {world}"
+            "MoE: this chain runs a four-rank world (milestone 3); got world {world}"
         ));
     }
     let kernel_dir = request
@@ -5196,20 +5193,22 @@ fn run_layer_moe_routed(
         cuda.alloc_pooled(bytes, &mut allocated)
             .map_err(|error| format!("MoE: {what}: {error}"))
     };
+    let local_inter = inter / world;
+    let padded_inter = sparkflash_kernels::moe_routed_device::WIDTH_PADDED;
     let x_bf16 = alloc(tokens * dim * 2, "router x bf16")?;
     let ids = alloc(routed_rows * 4, "router ids")?;
     let weights = alloc(routed_rows * 4, "router weights")?;
     let scores = alloc(tokens * experts * 4, "router scores")?;
     let act_fp8 = alloc(tokens * dim, "activation codes")?;
     let act_scales = alloc(tokens * dim / 32, "activation scales")?;
-    let gate_stage = alloc(top_k * 576 * (dim / 2), "w1 stage")?;
-    let gate_scale_stage = alloc(top_k * 576 * (dim / 32), "s1 stage")?;
-    let up_stage = alloc(top_k * 576 * (dim / 2), "w3 stage")?;
-    let up_scale_stage = alloc(top_k * 576 * (dim / 32), "s3 stage")?;
-    let gate_out = alloc(routed_rows * 640 * 2, "gate out")?;
-    let up_out = alloc(routed_rows * 640 * 2, "up out")?;
-    let codes = alloc(routed_rows * 640, "swiglu codes")?;
-    let swiglu_scales = alloc(routed_rows * 20, "swiglu scales")?;
+    let gate_stage = alloc(top_k * local_inter * (dim / 2), "w1 stage")?;
+    let gate_scale_stage = alloc(top_k * local_inter * (dim / 32), "s1 stage")?;
+    let up_stage = alloc(top_k * local_inter * (dim / 2), "w3 stage")?;
+    let up_scale_stage = alloc(top_k * local_inter * (dim / 32), "s3 stage")?;
+    let gate_out = alloc(routed_rows * padded_inter * 2, "gate out")?;
+    let up_out = alloc(routed_rows * padded_inter * 2, "up out")?;
+    let codes = alloc(routed_rows * padded_inter, "swiglu codes")?;
+    let swiglu_scales = alloc(routed_rows * padded_inter / 32, "swiglu scales")?;
     let w2_stage = alloc(top_k * dim * (inter / 2 / world), "w2 stage")?;
     let w2_scale_stage = alloc(top_k * dim * (inter / 32 / world), "s2 stage")?;
     let slot_ids = alloc(routed_rows * 4, "slot ids")?;
@@ -5272,8 +5271,8 @@ fn run_layer_moe_routed(
             .map_err(|error| format!("MoE: slot ids htod: {error}"))?;
         probe::layer(cuda, layer, "moe_router", timer);
         let timer = BlockTimer::start(request.forward_perf.probe);
-        let w_slice = 576 * (dim / 2);
-        let s_slice = 576 * (dim / 32);
+        let w_slice = local_inter * (dim / 2);
+        let s_slice = local_inter * (dim / 32);
         let d_slice = dim * (inter / 2 / world);
         let d_scale_slice = dim * (inter / 32 / world);
         for (slot, id) in slots.iter().enumerate() {
@@ -5285,7 +5284,7 @@ fn run_layer_moe_routed(
                 crate::resident_weights::Matrix::Gate,
                 "w1",
                 rank,
-                [576, dim / 2],
+                [local_inter, dim / 2],
             )?;
             let (w3, s3) = routed_slice_base(
                 &bind.moe,
@@ -5295,7 +5294,7 @@ fn run_layer_moe_routed(
                 crate::resident_weights::Matrix::Up,
                 "w3",
                 rank,
-                [576, dim / 2],
+                [local_inter, dim / 2],
             )?;
             let (w2, s2) = routed_slice_base(
                 &bind.moe,
@@ -5355,13 +5354,13 @@ fn run_layer_moe_routed(
                     codes.0,
                     swiglu_scales.0,
                     routed_rows as u64,
-                    640,
+                    padded_inter as u64,
                     u64::from(10.0f32.to_bits()),
                     0,
                     0,
                     rank as u64,
                 ];
-                let weighted_grid = ((routed_rows * 640 / 32).div_ceil(8) as u32, 1, 1);
+                let weighted_grid = ((routed_rows * padded_inter / 32).div_ceil(8) as u32, 1, 1);
                 cuda.launch(weighted_kernel, weighted_grid, (256, 1, 1), &weighted_words)?;
                 probe::layer(cuda, layer, "moe_weighted", timer);
                 Ok(())
@@ -5451,9 +5450,9 @@ fn run_layer_moe_routed(
         // The four stage readbacks below are the evidence record's stage digests and nothing else:
         // the combine consumes the device buffers, so a lean run has no numeric consumer for them.
         let (gate_raw, up_raw, codes_raw, scales_raw) = if layer_evidence_readbacks() {
-            let mut gate_raw = vec![0u8; routed_rows * 640 * 2];
-            let mut up_raw = vec![0u8; routed_rows * 640 * 2];
-            let mut codes_raw = vec![0u8; routed_rows * 640];
+            let mut gate_raw = vec![0u8; routed_rows * padded_inter * 2];
+            let mut up_raw = vec![0u8; routed_rows * padded_inter * 2];
+            let mut codes_raw = vec![0u8; routed_rows * padded_inter];
             let mut scales_raw = vec![0u8; routed_rows * 20];
             cuda.copy_dtoh(&mut gate_raw, &gate_out)
                 .map_err(|error| format!("MoE: gate dtoh: {error}"))?;
@@ -11343,7 +11342,7 @@ struct DeviceLayer<'a> {
     #[cfg(feature = "cuda")]
     vision: Option<Box<vision::VisionState>>,
     /// The selected lane's drafter stage rings, in place of the drafter's own.
-    draft_rings: Option<[(u64, u64); 3]>,
+    draft_rings: Option<Vec<(u64, u64)>>,
     /// The bf16 cache was freed (the lanes hold the history): the rows step writes no cache row
     /// and the M = 1 path refuses.
     kv_cache_off: bool,
@@ -11697,6 +11696,11 @@ impl<'a> DeviceLayer<'a> {
         }
         // wq_b is sharded over the head axis: 16 heads * 512 = 8,192 bf16 = 16,384 B per rank.
         let q_cols = (config.n_heads / world) * config.head_dim;
+        let attn_lo_values = config
+            .o_groups
+            .checked_mul(config.o_lora_rank)
+            .ok_or_else(|| "layer device: o_groups * o_lora_rank overflows".to_owned())?
+            / world;
         let geometry = crate::layer_device::LayerGeometry {
             dim,
             hc_mult,
@@ -11704,6 +11708,12 @@ impl<'a> DeviceLayer<'a> {
             topk,
             vocab_pad,
             q_cols,
+            kv_rotated_bytes: config.head_dim * 2,
+            kv_latent_bytes: config.head_dim * 2,
+            q_lora_values: config.q_lora_rank,
+            attn_lo_values,
+            rope_head_dim: config.rope_head_dim,
+            tap_layers: crate::plan::tap_layers_ref(),
             max_positions,
         };
         let bytes = crate::layer_device::LayerBuffers::bytes(&geometry);
@@ -12281,15 +12291,6 @@ impl<'a> DeviceLayer<'a> {
             dim,
         )
         .map_err(|error| format!("layer device: attention output geometry: {error}"))?;
-        if out_geometry.lo_bytes() != crate::layer_device::ATTN_LO_BYTES {
-            return Err(format!(
-                "layer device: wo_a's output row is {} B for o_groups {} / world {world} / o_lora_rank {}, the slab carves {} B; the arm is sized for the released (2, 1,024) shard",
-                out_geometry.lo_bytes(),
-                config.o_groups,
-                config.o_lora_rank,
-                crate::layer_device::ATTN_LO_BYTES
-            ));
-        }
         if let Some(plan) = plan {
             for layer in 0..config.n_layers {
                 for (name, want) in [
@@ -17498,10 +17499,10 @@ fn run_forward_loop(
             .speculation
             .dspark_k
             .unwrap_or(5);
-        if k == 0 || k > draft::BLOCK || k + 1 > rows::R_MAX {
+        if k == 0 || k > draft::draft_block() || k + 1 > rows::R_MAX {
             return Err(format!(
                 "SPARKFLASH_DSPARK_K={k}: needs 1..={}",
-                draft::BLOCK
+                draft::draft_block()
             ));
         }
         let staged: Vec<Option<SeamStagedWeights>> = (0..n_layers)
@@ -17565,7 +17566,7 @@ fn run_forward_loop(
             && ways <= sparkflash_kernels::moe_routed_device::MAX_BULK_SEGMENTS
         {
             // A way holds a bulk state's rows (the drafter's floor included).
-            let stride = chunk.max(draft::DRAFT_ROWS);
+            let stride = chunk.max(draft::draft_rows());
             Some(bulk::MoeShare::open(device, stride, ways)?)
         } else {
             None
@@ -17792,26 +17793,30 @@ fn run_forward_loop(
                     let _ = device.cuda.synchronize();
                     let stage_trace = device.seam_trace_document();
                     let document = serde_json::json!({
-                        "schema": "sparkflash-tp4-layer-device-frontier/1",
-                        "rank": request.rank,
-                        "world": request.world,
-                        "arm": layer_arm.why(),
-                        "status": "refused",
-                        "layer": layer,
-                        "position": position,
-                        "tolerance_arm": sparkflash_model::active_profile()
-                            .diagnostics
-                            .tolerance_arm
-                            .clone(),
-                        "stages_ran": device.runs().stages(),
-                        "frontier": device.runs().summary(),
-                        "message": error,
-                        "max_positions": device.max_positions(),
-                        "rope_table_bytes": 2 * crate::layer_device::rope_table_span_bytes(device.max_positions()),
-                        "slab_bytes": device.buffers().total_bytes(),
-                        "stage_trace": stage_trace,
-                        "note": "the device arm stopped at the stage named in frontier; no device value in this row is validated against the host reference",
-                    });
+                                "schema": "sparkflash-tp4-layer-device-frontier/1",
+                                "rank": request.rank,
+                                "world": request.world,
+                                "arm": layer_arm.why(),
+                                "status": "refused",
+                                "layer": layer,
+                                "position": position,
+                                "tolerance_arm": sparkflash_model::active_profile()
+                                    .diagnostics
+                                    .tolerance_arm
+                                    .clone(),
+                                "stages_ran": device.runs().stages(),
+                                "frontier": device.runs().summary(),
+                                "message": error,
+                                "max_positions": device.max_positions(),
+                                "rope_table_bytes": 2
+                    * crate::layer_device::rope_table_span_bytes(
+                        device.max_positions(),
+                        device.rope_head_dim as usize,
+                    ),
+                                "slab_bytes": device.buffers().total_bytes(),
+                                "stage_trace": stage_trace,
+                                "note": "the device arm stopped at the stage named in frontier; no device value in this row is validated against the host reference",
+                            });
                     let path = request
                         .evidence_dir
                         .join(format!("tp4-layer-device-r{}.json", request.rank));
@@ -17823,25 +17828,29 @@ fn run_forward_loop(
                     // The same record, on the completed path: what the layer object actually ran.
                     let summary = device.runs().summary();
                     let document = serde_json::json!({
-                        "schema": "sparkflash-tp4-layer-device-frontier/1",
-                        "rank": request.rank,
-                        "world": request.world,
-                        "arm": layer_arm.why(),
-                        "status": "completed",
-                        "layer": layer,
-                        "position": position,
-                        "tolerance_arm": sparkflash_model::active_profile()
-                            .diagnostics
-                            .tolerance_arm
-                            .clone(),
-                        "stages_ran": device.runs().stages(),
-                        "frontier": summary,
-                        "max_positions": device.max_positions(),
-                        "rope_table_bytes": 2 * crate::layer_device::rope_table_span_bytes(device.max_positions()),
-                        "slab_bytes": device.buffers().total_bytes(),
-                        "stage_trace": device.seam_trace_header_document(),
-                        "note": "the whole device prefix ran for this layer; no device value is validated against the host reference until the cluster row",
-                    });
+                                "schema": "sparkflash-tp4-layer-device-frontier/1",
+                                "rank": request.rank,
+                                "world": request.world,
+                                "arm": layer_arm.why(),
+                                "status": "completed",
+                                "layer": layer,
+                                "position": position,
+                                "tolerance_arm": sparkflash_model::active_profile()
+                                    .diagnostics
+                                    .tolerance_arm
+                                    .clone(),
+                                "stages_ran": device.runs().stages(),
+                                "frontier": summary,
+                                "max_positions": device.max_positions(),
+                                "rope_table_bytes": 2
+                    * crate::layer_device::rope_table_span_bytes(
+                        device.max_positions(),
+                        device.rope_head_dim as usize,
+                    ),
+                                "slab_bytes": device.buffers().total_bytes(),
+                                "stage_trace": device.seam_trace_header_document(),
+                                "note": "the whole device prefix ran for this layer; no device value is validated against the host reference until the cluster row",
+                            });
                     let path = request
                         .evidence_dir
                         .join(format!("tp4-layer-device-r{}.json", request.rank));
@@ -18250,7 +18259,7 @@ fn run_forward_loop(
                     // it is attributed to wq_a, q_norm, the wq_b activation quantiser, wq_b, or
                     // the rope tail instead of to the composed row: q_lora is the wq_a GEMV's
                     // bf16 output, q_normed the rmsnorm_sm121 output, q the post-rope row.
-                    let mut dev_lora_bytes = vec![0u8; crate::layer_device::Q_LORA_VALUES * 2];
+                    let mut dev_lora_bytes = vec![0u8; device.buffers.workspace.q_lora.len];
                     device.read_row_bytes(
                         device.buffers.workspace.q_lora,
                         &mut dev_lora_bytes,
@@ -18258,7 +18267,7 @@ fn run_forward_loop(
                     )?;
                     let dev_lora = bf16_from_le_bytes(&dev_lora_bytes)?;
                     let host_lora = bf16_from_le_bytes(&projections.wq_a_latent_bytes)?;
-                    let mut dev_qnorm_bytes = vec![0u8; crate::layer_device::Q_LORA_VALUES * 2];
+                    let mut dev_qnorm_bytes = vec![0u8; device.buffers.workspace.q_normed.len];
                     device.read_row_bytes(
                         device.buffers.workspace.q_normed,
                         &mut dev_qnorm_bytes,
@@ -18990,6 +18999,7 @@ fn run_forward_loop(
                 "max_positions": layer_device.as_ref().map_or(0, |device| device.max_positions()),
                 "rope_table_bytes": crate::layer_device::ROPE_TABLE_CLASSES * crate::layer_device::rope_table_span_bytes(
                     layer_device.as_ref().map_or(0, |device| device.max_positions()),
+                    layer_device.as_ref().map_or(0, |device| device.rope_head_dim as usize),
                 ),
                 "kv_cache_bytes": layer_device.as_ref().map_or(0, |device| device.kv_cache_bytes()),
                 "window_ring_bytes": layer_device.as_ref().map_or(0, |device| device.kv_ring_bytes()),

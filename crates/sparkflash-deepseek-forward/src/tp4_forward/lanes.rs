@@ -55,7 +55,7 @@ pub(super) fn slide_floor(pos: usize) -> usize {
 }
 
 /// Where each part of a lane starts, relative to the lane's base.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Offsets {
     kv_ring: usize,
     wkv: usize,
@@ -64,14 +64,11 @@ struct Offsets {
     store_scales: usize,
     index_keys: usize,
     /// Each drafter stage's (codes, scales) ring.
-    draft: [(usize, usize); DRAFT_STAGES],
+    draft: Vec<(usize, usize)>,
 }
 
-/// The drafter's stages (draft.rs `STAGES`).
-pub(super) const DRAFT_STAGES: usize = 3;
-
 /// One lane's device pointers, as the DeviceLayer fields hold them.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct LanePointers {
     pub(super) kv_ring: u64,
     pub(super) wkv: u64,
@@ -79,7 +76,7 @@ pub(super) struct LanePointers {
     pub(super) store_codes: u64,
     pub(super) store_scales: u64,
     pub(super) index_keys: u64,
-    pub(super) draft: [(u64, u64); DRAFT_STAGES],
+    pub(super) draft: Vec<(u64, u64)>,
 }
 
 /// The host counters of a lane's device state, swapped in and out with its pointers.
@@ -136,7 +133,7 @@ impl Lanes<'_> {
     pub(super) fn pointers(&self, lane: usize) -> LanePointers {
         let base = self.base + (lane * self.shape.stride) as u64;
         let at = |offset: usize| base + offset as u64;
-        let o = self.offsets;
+        let o = &self.offsets;
         LanePointers {
             kv_ring: at(o.kv_ring),
             wkv: at(o.wkv),
@@ -144,7 +141,11 @@ impl Lanes<'_> {
             store_codes: at(o.store_codes),
             store_scales: at(o.store_scales),
             index_keys: at(o.index_keys),
-            draft: o.draft.map(|(codes, scales)| (at(codes), at(scales))),
+            draft: o
+                .draft
+                .iter()
+                .map(|&(codes, scales)| (at(codes), at(scales)))
+                .collect(),
         }
     }
 
@@ -317,7 +318,7 @@ impl<'a> DeviceLayer<'a> {
         let store_scales = owner_parts(scale_bytes, SCALE_BYTES, min_rows);
         let key_bytes = self.max_positions * self.index_head_dim * 4;
         let index_keys = owner_parts(key_bytes.max(4), self.index_head_dim * 4, 0);
-        let mut draft = [(0usize, 0usize); DRAFT_STAGES];
+        let mut draft = vec![(0usize, 0usize); crate::plan::n_mtp_layers()];
         let draft_rows = geometry.draft_ring_rows.max(1);
         let latent = self.head_width as usize;
         for stage in &mut draft {

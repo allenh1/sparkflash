@@ -327,6 +327,8 @@ pub struct Description {
     tensors: BTreeMap<String, usize>,
     claims: BTreeMap<(usize, Part), Vec<String>>,
     symbols: BTreeMap<(Option<usize>, Part), Vec<&'static str>>,
+    /// The draft block's tap layers, read from its part facts once at open.
+    tap_layers: Box<[usize]>,
 }
 
 impl std::fmt::Debug for Description {
@@ -368,12 +370,34 @@ impl Description {
                 .or_default()
                 .extend(entry.symbols.iter().copied());
         }
+        let tap_layers = plan
+            .stacks()
+            .iter()
+            .find(|stack| stack.kind == sparkflash_model::StackKind::Draft)
+            .and_then(|stack| {
+                stack.blocks.iter().find_map(|block| {
+                    block
+                        .parts
+                        .iter()
+                        .find_map(|part| match part.facts.get("tap_layers") {
+                            Some(FactValue::Integers(values)) => Some(
+                                values
+                                    .iter()
+                                    .filter_map(|value| usize::try_from(*value).ok())
+                                    .collect(),
+                            ),
+                            _ => None,
+                        })
+                })
+            })
+            .unwrap_or_default();
         Ok(Self {
             plan,
             values,
             tensors,
             claims,
             symbols,
+            tap_layers,
         })
     }
 
@@ -631,6 +655,20 @@ static DIM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new
 static VOCAB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static HC_MULT_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static MLA_LATENT_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static N_LAYERS_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static N_HEADS_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static INDEX_TOPK_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WINDOW_SIZE_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ENCODER_LAYERS_VALUE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static MOE_INTER_DIM_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DSPARK_BLOCK_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static N_MTP_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DSPARK_EXPERTS_VALUE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DSPARK_TOP_K_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DSPARK_MARKOV_RANK_VALUE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn publish_geometry(values: &ModelConfig) {
     use std::sync::atomic::Ordering;
@@ -638,6 +676,26 @@ fn publish_geometry(values: &ModelConfig) {
     VOCAB.store(values.vocab_size, Ordering::Relaxed);
     HC_MULT_VALUE.store(values.hc_mult, Ordering::Relaxed);
     MLA_LATENT_VALUE.store(values.head_dim, Ordering::Relaxed);
+    N_LAYERS_VALUE.store(values.n_layers, Ordering::Relaxed);
+    N_HEADS_VALUE.store(values.n_heads, Ordering::Relaxed);
+    INDEX_TOPK_VALUE.store(values.index_topk, Ordering::Relaxed);
+    WINDOW_SIZE_VALUE.store(values.window_size, Ordering::Relaxed);
+    // The encoder half ends at the last layer that owns compressed KV; the stack's own fact uses
+    // the same rule, and the released owners are layers 2, 8, 14 and 20.
+    let encoder_layers = values
+        .kv_source_layers
+        .iter()
+        .copied()
+        .max()
+        .map_or(values.n_layers / 2, |last| last + 1)
+        .clamp(1, values.n_layers.max(1));
+    ENCODER_LAYERS_VALUE.store(encoder_layers, Ordering::Relaxed);
+    MOE_INTER_DIM_VALUE.store(values.moe_inter_dim, Ordering::Relaxed);
+    DSPARK_BLOCK_VALUE.store(values.dspark_block_size, Ordering::Relaxed);
+    N_MTP_VALUE.store(values.n_mtp_layers, Ordering::Relaxed);
+    DSPARK_EXPERTS_VALUE.store(values.dspark_n_routed_experts, Ordering::Relaxed);
+    DSPARK_TOP_K_VALUE.store(values.dspark_n_activated_experts, Ordering::Relaxed);
+    DSPARK_MARKOV_RANK_VALUE.store(values.dspark_markov_rank, Ordering::Relaxed);
 }
 
 /// The residual stream width, read at open from the plan.
@@ -680,6 +738,111 @@ pub fn predictor_rows() -> usize {
 pub fn mla_latent() -> usize {
     ensure_geometry();
     std::sync::atomic::AtomicUsize::load(&MLA_LATENT_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The backbone layer count, read at open from the plan.
+#[must_use]
+pub fn n_layers() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&N_LAYERS_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The attention head count over the whole model, read at open.
+#[must_use]
+pub fn n_heads() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&N_HEADS_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The compressed-position select bound, read at open from the plan's `index_topk`.
+#[must_use]
+pub fn index_topk() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&INDEX_TOPK_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The sliding-window width, read at open from the plan.
+#[must_use]
+pub fn window_size() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&WINDOW_SIZE_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The layers that run the whole prompt (the encoder half), read at open.
+#[must_use]
+pub fn encoder_layers() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(
+        &ENCODER_LAYERS_VALUE,
+        std::sync::atomic::Ordering::Relaxed,
+    )
+}
+
+/// The expert intermediate width before the rank split, read at open.
+#[must_use]
+pub fn moe_inter_dim() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&MOE_INTER_DIM_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The DSpark draft block size, read at open from the plan.
+#[must_use]
+pub fn dspark_block_size() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&DSPARK_BLOCK_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The DSpark MTP stage count, read at open from the plan.
+#[must_use]
+pub fn n_mtp_layers() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&N_MTP_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The DSpark drafter's routed expert count, read at open from the plan.
+#[must_use]
+pub fn dspark_n_routed_experts() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(
+        &DSPARK_EXPERTS_VALUE,
+        std::sync::atomic::Ordering::Relaxed,
+    )
+}
+
+/// The DSpark drafter's activated expert count (its top-k), read at open from the plan.
+#[must_use]
+pub fn dspark_n_activated_experts() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&DSPARK_TOP_K_VALUE, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The DSpark Markov head's rank, read at open from the plan.
+#[must_use]
+pub fn dspark_markov_rank() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(
+        &DSPARK_MARKOV_RANK_VALUE,
+        std::sync::atomic::Ordering::Relaxed,
+    )
+}
+
+/// The attention heads this rank runs: the model's heads over the four-rank split.
+#[must_use]
+pub fn heads_per_rank() -> usize {
+    n_heads() / 4
+}
+
+/// The most positions one attention row attends: the selected bound plus one full window.
+#[must_use]
+pub fn max_attended() -> usize {
+    index_topk() + window_size()
+}
+
+/// The selected list's row stride in ids: one selected entry per compressed position the select
+/// may keep, which is the plan's `index_topk`.
+#[must_use]
+pub fn selected_stride() -> usize {
+    index_topk()
 }
 
 fn ensure_geometry() {
@@ -933,33 +1096,13 @@ pub fn candidate_source_layer() -> usize {
 /// The tap layers the draft stage reads, read from the draft block's part fact.
 #[must_use]
 pub fn tap_layers() -> Vec<usize> {
-    let description = description();
-    let Some(stack) = description
-        .plan
-        .stacks()
-        .iter()
-        .find(|stack| stack.kind == sparkflash_model::StackKind::Draft)
-    else {
-        return Vec::new();
-    };
-    stack
-        .blocks
-        .iter()
-        .find_map(|block| {
-            block
-                .parts
-                .iter()
-                .find_map(|part| match part.facts.get("tap_layers") {
-                    Some(FactValue::Integers(values)) => Some(
-                        values
-                            .iter()
-                            .filter_map(|value| usize::try_from(*value).ok())
-                            .collect(),
-                    ),
-                    _ => None,
-                })
-        })
-        .unwrap_or_default()
+    tap_layers_ref().to_vec()
+}
+
+/// The tap layers as the open description holds them, for geometry that outlives one call.
+#[must_use]
+pub fn tap_layers_ref() -> &'static [usize] {
+    &description().tap_layers
 }
 
 /// Whether a part instance is one the forward has a block body for.
@@ -1171,6 +1314,42 @@ mod tests {
         }
         assert_eq!(candidate_source_layer(), values.candidate_source_layer);
         assert!(!tap_layers().is_empty());
+    }
+
+    #[test]
+    fn the_released_plan_drives_the_forward_geometry() {
+        let Some(description) = released() else {
+            eprintln!("skipping: the released checkpoint is not on this host");
+            return;
+        };
+        let values = description.values();
+        assert_eq!(n_layers(), values.n_layers);
+        assert_eq!(hidden(), values.dim);
+        assert_eq!(vocab(), values.vocab_size);
+        assert_eq!(n_heads(), values.n_heads);
+        assert_eq!(heads_per_rank(), values.n_heads / 4);
+        assert_eq!(selected_stride(), values.index_topk);
+        assert_eq!(max_attended(), values.index_topk + values.window_size);
+        assert_eq!(encoder_layers(), 21);
+        assert_eq!(moe_inter_dim(), values.moe_inter_dim);
+        assert_eq!(moe_inter_dim() / 4, 576);
+        assert_eq!(dspark_block_size(), values.dspark_block_size);
+        assert_eq!(n_mtp_layers(), values.n_mtp_layers);
+        assert_eq!(dspark_n_routed_experts(), values.dspark_n_routed_experts);
+        assert_eq!(
+            dspark_n_activated_experts(),
+            values.dspark_n_activated_experts
+        );
+        assert_eq!(dspark_markov_rank(), values.dspark_markov_rank);
+        // The drafter's compile-time-sized arrays are these open values: the released run
+        // allocates exactly the released five-row block, three stages and 128/3 experts.
+        assert_eq!(dspark_block_size(), 5);
+        assert_eq!(n_mtp_layers(), 3);
+        assert_eq!(dspark_n_routed_experts(), 128);
+        assert_eq!(dspark_n_activated_experts(), 3);
+        assert_eq!(dspark_markov_rank(), 256);
+        assert_eq!(tap_layers(), vec![37, 38, 39]);
+        assert_eq!(&*description.tap_layers, &[37, 38, 39][..]);
     }
 
     #[test]

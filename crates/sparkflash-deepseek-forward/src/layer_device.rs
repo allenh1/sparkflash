@@ -298,12 +298,6 @@ pub fn resolve_weight(
     ))
 }
 
-/// The rope output span: 1 KiB, of which the released `rope_head_dim` uses 256 B as f32.
-pub const KV_ROTATED_BYTES: usize = 1024;
-
-/// The wkv latent span: 512 bf16 values (1 KiB), the GEMV output `kv_path` rotates.
-pub const KV_LATENT_BYTES: usize = 1024;
-
 /// The mHC entry kernel's mix table: **pre[0..4], post[4..8], comb[8..24]** f32, 96 B.
 ///
 /// That is not an arbitrary packing, it is the write order of the only writer of all three regions,
@@ -316,19 +310,6 @@ pub const ATTN_MIX_BYTES: usize = 96;
 /// The FFN-seam kernel's mix table: the same **pre[0..4], post[4..8], comb[8..24]** layout, 96 B
 /// (same helper, same write order).
 pub const FFN_MIX_BYTES: usize = 96;
-
-/// The wq_a latent: 1,280 bf16 values, written by attention_projections, normed by query_path.
-pub const Q_LORA_VALUES: usize = 1280;
-/// The raw wq_a latent span, 2,560 B.
-pub const Q_LORA_BYTES: usize = 2 * Q_LORA_VALUES;
-/// The q_norm output span, 2,560 B. It cannot alias q_lora: rmsnorm_sm121 takes distinct in/out
-/// and the raw latent is still wanted for the record digest.
-pub const Q_NORMED_BYTES: usize = 2 * Q_LORA_VALUES;
-
-/// The wo_a output row: `groups * o_lora_rank` bf16 values (2,048 at world 4, 4,096 B).
-pub const ATTN_LO_VALUES: usize = 2_048;
-/// The raw wo_a output span, 4,096 B.
-pub const ATTN_LO_BYTES: usize = 2 * ATTN_LO_VALUES;
 
 /// The candidate select's id list: `MAX_SELECTED` u32 ids (512 at the released geometry).
 pub const SELECTED_BYTES: usize = sparkflash_kernels::flash_mla_csa2_seq_launch::MAX_SELECTED * 4;
@@ -354,10 +335,10 @@ pub const BLOCK_SCRATCH_BYTES: usize = sparkflash_kernels::mla_ref::HSI_BLOCKS *
 pub const ROPE_TABLE_CLASSES: usize = 2;
 
 /// One class's rope span: cos region then sin region, each `max_positions * (rope_head_dim / 2)`
-/// f32 values. At rope_head_dim 64 that is `max_positions * 256 B` per class.
+/// f32 values, with the rope width the open plan carries.
 #[must_use]
-pub fn rope_table_span_bytes(max_positions: usize) -> usize {
-    max_positions * 2 * (RELEASED_ROPE_HEAD_DIM / 2) * 4
+pub fn rope_table_span_bytes(max_positions: usize, rope_head_dim: usize) -> usize {
+    max_positions * 2 * (rope_head_dim / 2) * 4
 }
 
 /// The communicator's default init-time arena reserve (`stats.arena_bytes` at open). The run record
@@ -510,12 +491,6 @@ pub struct LayerWorkspace {
     pub dspark_aux_taps: DeviceSpan,
 }
 
-/// The three DSpark/Eagle3 auxiliary target backbone layers (`dspark_target_layer_ids = [37, 38, 39]`).
-pub const DSPARK_AUX_LAYERS: [usize; 3] = [37, 38, 39];
-
-/// Number of DSpark/Eagle3 auxiliary target layer taps per position (`cat(main_hiddens)` = `3 * dim`).
-pub const DSPARK_AUX_TAP_COUNT: usize = DSPARK_AUX_LAYERS.len();
-
 /// The slab's geometry: everything the carve needs, in one value, so adding a span does not grow
 /// a positional argument list that a caller can silently transpose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,6 +510,18 @@ pub struct LayerGeometry {
     /// The query-projection column count `wq_b` consumes (`n_heads * head_dim / world`, 8,192 at
     /// world 4).
     pub q_cols: usize,
+    /// The rope output span: `2 * head_dim` bytes, of which `rope_head_dim * 4` is the rotated tail.
+    pub kv_rotated_bytes: usize,
+    /// The wkv latent span: `head_dim` bf16 values.
+    pub kv_latent_bytes: usize,
+    /// The wq_a latent width (`q_lora_rank` bf16 values).
+    pub q_lora_values: usize,
+    /// The wo_a output row: `o_groups * o_lora_rank / world` bf16 values.
+    pub attn_lo_values: usize,
+    /// The rotary tail width the rope tables and kernels carry.
+    pub rope_head_dim: usize,
+    /// The DSpark tap layers, from the draft block's plan fact.
+    pub tap_layers: &'static [usize],
     /// Positions the slab's rope tables cover (`--max-positions`): the largest position the loop may
     /// advance to before the tables run out.
     pub max_positions: usize,
@@ -566,7 +553,7 @@ impl LayerBuffers {
         let residual = self.residual;
         let workspace = self.workspace;
         let hc_dim = geometry.hc_mult * geometry.dim;
-        let rope_values = geometry.max_positions * (RELEASED_ROPE_HEAD_DIM / 2) * 2;
+        let rope_values = geometry.max_positions * (geometry.rope_head_dim / 2) * 2;
         let checks: [(&str, DeviceSpan, usize, usize); 34] = [
             ("residual.stream", residual.stream, hc_dim, 4),
             ("residual.hc_rows", residual.hc_rows, hc_dim, 4),
@@ -633,19 +620,29 @@ impl LayerBuffers {
             (
                 "workspace.kv_rotated",
                 workspace.kv_rotated,
-                KV_ROTATED_BYTES,
+                geometry.kv_rotated_bytes,
                 1,
             ),
             (
                 "workspace.kv_latent",
                 workspace.kv_latent,
-                crate::plan::mla_latent(),
+                geometry.kv_latent_bytes / 2,
                 2,
             ),
             ("workspace.attn_mix", workspace.attn_mix, ATTN_MIX_BYTES, 1),
             ("workspace.ffn_mix", workspace.ffn_mix, FFN_MIX_BYTES, 1),
-            ("workspace.q_lora", workspace.q_lora, Q_LORA_VALUES, 2),
-            ("workspace.q_normed", workspace.q_normed, Q_LORA_VALUES, 2),
+            (
+                "workspace.q_lora",
+                workspace.q_lora,
+                geometry.q_lora_values,
+                2,
+            ),
+            (
+                "workspace.q_normed",
+                workspace.q_normed,
+                geometry.q_lora_values,
+                2,
+            ),
             ("workspace.q", workspace.q, geometry.q_cols, 2),
             (
                 "workspace.attn_body_bf16",
@@ -653,7 +650,12 @@ impl LayerBuffers {
                 geometry.q_cols,
                 2,
             ),
-            ("workspace.attn_lo", workspace.attn_lo, ATTN_LO_VALUES, 2),
+            (
+                "workspace.attn_lo",
+                workspace.attn_lo,
+                geometry.attn_lo_values,
+                2,
+            ),
             (
                 "workspace.selected",
                 workspace.selected,
@@ -699,7 +701,7 @@ impl LayerBuffers {
             (
                 "workspace.dspark_aux_taps",
                 workspace.dspark_aux_taps,
-                DSPARK_AUX_TAP_COUNT * geometry.dim,
+                geometry.tap_layers.len() * geometry.dim,
                 4,
             ),
         ];
@@ -732,6 +734,12 @@ impl LayerBuffers {
             topk,
             vocab_pad,
             q_cols,
+            kv_rotated_bytes,
+            kv_latent_bytes,
+            q_lora_values,
+            attn_lo_values,
+            rope_head_dim,
+            tap_layers,
             max_positions,
         } = *geometry;
         let spans = [
@@ -752,24 +760,24 @@ impl LayerBuffers {
             topk * 4,
             vocab_pad * 4,
             2 * dim * 4,
-            KV_ROTATED_BYTES,
-            KV_LATENT_BYTES,
+            kv_rotated_bytes,
+            kv_latent_bytes,
             ATTN_MIX_BYTES,
             FFN_MIX_BYTES,
-            Q_LORA_BYTES,
-            Q_NORMED_BYTES,
+            q_lora_values * 2,
+            q_lora_values * 2,
             q_cols * 2,
             q_cols * 2,
-            ATTN_LO_BYTES,
+            attn_lo_values * 2,
             SELECTED_BYTES,
             STORE_CODE_BYTES,
             STORE_SCALE_BYTES,
             INDEX_QUERY_BYTES,
             BLOCK_SCRATCH_BYTES,
             BLOCK_SCRATCH_BYTES,
-            rope_table_span_bytes(max_positions),
-            rope_table_span_bytes(max_positions),
-            DSPARK_AUX_TAP_COUNT * dim * 4,
+            rope_table_span_bytes(max_positions, rope_head_dim),
+            rope_table_span_bytes(max_positions, rope_head_dim),
+            tap_layers.len() * dim * 4,
         ];
         spans.iter().map(|&bytes| align_up(bytes.max(ALIGN))).sum()
     }
@@ -777,10 +785,13 @@ impl LayerBuffers {
     /// Returns the fixed `[dim]` f32 device sub-span inside `workspace.dspark_aux_taps` for the
     /// DSpark/Eagle3 auxiliary target layers (`[37, 38, 39]`), or `None` for any other layer.
     #[must_use]
-    pub fn dspark_aux_tap_span(&self, layer: usize, dim: usize) -> Option<DeviceSpan> {
-        let tap_idx = DSPARK_AUX_LAYERS
-            .iter()
-            .position(|&target| target == layer)?;
+    pub fn dspark_aux_tap_span(
+        &self,
+        layer: usize,
+        dim: usize,
+        tap_layers: &[usize],
+    ) -> Option<DeviceSpan> {
+        let tap_idx = tap_layers.iter().position(|&target| target == layer)?;
         let row_bytes = dim.checked_mul(4)?;
         let offset = tap_idx.checked_mul(row_bytes)?;
         if offset.checked_add(row_bytes)? > self.workspace.dspark_aux_taps.len {
@@ -852,6 +863,12 @@ impl LayerBuffers {
             topk,
             vocab_pad,
             q_cols,
+            kv_rotated_bytes,
+            kv_latent_bytes,
+            q_lora_values,
+            attn_lo_values,
+            rope_head_dim,
+            tap_layers,
             max_positions,
         } = *geometry;
         let mut at = 0usize;
@@ -882,24 +899,24 @@ impl LayerBuffers {
                 moe_weights: span(topk * 4),
                 logits: span(vocab_pad * 4),
                 reduce_ws: span(2 * dim * 4),
-                kv_rotated: span(KV_ROTATED_BYTES),
-                kv_latent: span(KV_LATENT_BYTES),
+                kv_rotated: span(kv_rotated_bytes),
+                kv_latent: span(kv_latent_bytes),
                 attn_mix: span(ATTN_MIX_BYTES),
                 ffn_mix: span(FFN_MIX_BYTES),
-                q_lora: span(Q_LORA_BYTES),
-                q_normed: span(Q_NORMED_BYTES),
+                q_lora: span(q_lora_values * 2),
+                q_normed: span(q_lora_values * 2),
                 q: span(q_cols * 2),
                 attn_body_bf16: span(q_cols * 2),
-                attn_lo: span(ATTN_LO_BYTES),
+                attn_lo: span(attn_lo_values * 2),
                 selected: span(SELECTED_BYTES),
                 store_codes: span(STORE_CODE_BYTES),
                 store_scales: span(STORE_SCALE_BYTES),
                 index_query: span(INDEX_QUERY_BYTES),
                 block_scores: span(BLOCK_SCRATCH_BYTES),
                 block_best: span(BLOCK_SCRATCH_BYTES),
-                rope_tables_plain: span(rope_table_span_bytes(max_positions)),
-                rope_tables_compressed: span(rope_table_span_bytes(max_positions)),
-                dspark_aux_taps: span(DSPARK_AUX_TAP_COUNT * dim * 4),
+                rope_tables_plain: span(rope_table_span_bytes(max_positions, rope_head_dim)),
+                rope_tables_compressed: span(rope_table_span_bytes(max_positions, rope_head_dim)),
+                dspark_aux_taps: span(tap_layers.len() * dim * 4),
             },
         }
     }
@@ -1325,13 +1342,10 @@ impl StageRuns {
 /// sparkflash_engine::forward::attention::rope_tables_for_layer (which already applies
 /// compress_rope_theta and the YaRN ramp per layer) and uploaded once at open.
 #[must_use]
-pub fn rope_table_bytes(table_classes: usize, max_positions: usize) -> usize {
-    let pairs = RELEASED_ROPE_HEAD_DIM / 2;
+pub fn rope_table_bytes(table_classes: usize, max_positions: usize, rope_head_dim: usize) -> usize {
+    let pairs = rope_head_dim / 2;
     table_classes * 2 * max_positions * pairs * 4
 }
-
-/// The released rotary tail: 64 wide, 32 f32 pairs.
-pub const RELEASED_ROPE_HEAD_DIM: usize = 64;
 /// Checks the run's collective counter against the count the loop's own sequence implies.
 ///
 /// A rank that skips a collective does not fail a check: it hangs the reduce, and the counter is the
@@ -1852,6 +1866,9 @@ pub trait LayerStages {
 mod tests {
     use super::*;
 
+    /// The released tap layers, as the plan's draft fact carries them.
+    static TAP_LAYERS: [usize; 3] = [37, 38, 39];
+
     /// The released geometry, in the one value the carve now takes.
     fn geometry() -> LayerGeometry {
         LayerGeometry {
@@ -1861,6 +1878,12 @@ mod tests {
             topk: 8,
             vocab_pad: 129_280,
             q_cols: 8192,
+            kv_rotated_bytes: 1024,
+            kv_latent_bytes: 1024,
+            q_lora_values: 1280,
+            attn_lo_values: 2048,
+            rope_head_dim: 64,
+            tap_layers: &TAP_LAYERS,
             max_positions: 2048,
         }
     }
@@ -1928,12 +1951,25 @@ mod tests {
         );
         assert_eq!(buffers.residual.stream.len, align_up(4 * 5120 * 4));
         assert_eq!(buffers.workspace.reduce_ws.len, align_up(2 * 5120 * 4));
-        assert_eq!(buffers.workspace.kv_rotated.len, align_up(KV_ROTATED_BYTES));
-        assert_eq!(buffers.workspace.kv_latent.len, align_up(KV_LATENT_BYTES));
+        let geometry = geometry();
+        assert_eq!(
+            buffers.workspace.kv_rotated.len,
+            align_up(geometry.kv_rotated_bytes)
+        );
+        assert_eq!(
+            buffers.workspace.kv_latent.len,
+            align_up(geometry.kv_latent_bytes)
+        );
         assert_eq!(buffers.workspace.attn_mix.len, align_up(ATTN_MIX_BYTES));
         assert_eq!(buffers.workspace.ffn_mix.len, align_up(FFN_MIX_BYTES));
-        assert_eq!(buffers.workspace.q_lora.len, align_up(Q_LORA_BYTES));
-        assert_eq!(buffers.workspace.q_normed.len, align_up(Q_NORMED_BYTES));
+        assert_eq!(
+            buffers.workspace.q_lora.len,
+            align_up(geometry.q_lora_values * 2)
+        );
+        assert_eq!(
+            buffers.workspace.q_normed.len,
+            align_up(geometry.q_lora_values * 2)
+        );
         assert_eq!(buffers.workspace.q.len, align_up(16_384));
         assert_eq!(
             buffers.workspace.rope_tables_plain.len,
@@ -2241,9 +2277,9 @@ mod tests {
     }
     #[test]
     fn the_rope_table_count_is_two_tables_of_thirty_two_pairs_per_class_and_position() {
-        assert_eq!(rope_table_bytes(1, 1), 2 * 128);
-        assert_eq!(rope_table_bytes(2, 100), 2 * 2 * 100 * 128);
-        assert_eq!(rope_table_bytes(2, 0), 0, "no positions, no tables");
+        assert_eq!(rope_table_bytes(1, 1, 64), 2 * 128);
+        assert_eq!(rope_table_bytes(2, 100, 64), 2 * 2 * 100 * 128);
+        assert_eq!(rope_table_bytes(2, 0, 64), 0, "no positions, no tables");
     }
     #[test]
     fn every_stage_has_a_blocker_row_in_the_same_order() {
@@ -2459,18 +2495,26 @@ mod tests {
         let taps = buffers.workspace.dspark_aux_taps;
         assert_eq!(taps.len, 3 * geometry.dim * 4);
         let row = geometry.dim * 4;
-        for (index, layer) in DSPARK_AUX_LAYERS.into_iter().enumerate() {
+        for (index, layer) in TAP_LAYERS.into_iter().enumerate() {
             let span = buffers
-                .dspark_aux_tap_span(layer, geometry.dim)
+                .dspark_aux_tap_span(layer, geometry.dim, &TAP_LAYERS)
                 .unwrap_or_else(|| panic!("layer {layer} is a DSpark tap"));
             assert_eq!(span.device, taps.device + (index * row) as u64);
             assert_eq!(span.len, row);
         }
         for layer in [0, 36, 40] {
-            assert!(buffers.dspark_aux_tap_span(layer, geometry.dim).is_none());
+            assert!(
+                buffers
+                    .dspark_aux_tap_span(layer, geometry.dim, &TAP_LAYERS)
+                    .is_none()
+            );
         }
         // A row wider than the carve does not fit the last tap: refused, never a span past the end.
-        assert!(buffers.dspark_aux_tap_span(39, geometry.dim + 1).is_none());
+        assert!(
+            buffers
+                .dspark_aux_tap_span(39, geometry.dim + 1, &TAP_LAYERS)
+                .is_none()
+        );
     }
 
     #[test]

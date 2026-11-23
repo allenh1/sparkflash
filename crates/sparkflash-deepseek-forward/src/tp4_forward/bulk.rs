@@ -1353,6 +1353,7 @@ impl DeviceLayer<'_> {
         };
         let mask_bytes = rows.mask_bytes;
         let stride = n_max.next_multiple_of(8);
+        let selected_stride = crate::plan::selected_stride();
         let slice = ((SCORE_ENTRIES / stride) / SCORE_ROWS * SCORE_ROWS).max(SCORE_ROWS);
         let mut y0 = 0;
         while y0 < n {
@@ -1390,7 +1391,7 @@ impl DeviceLayer<'_> {
                     (1024, 1, 1),
                     &[
                         bulk.scores,
-                        b.selected + (y0 * SELECTED_STRIDE * 4) as u64,
+                        b.selected + (y0 * selected_stride * 4) as u64,
                         if mask_mode == 1 { masks } else { 0 },
                         if mask_mode == 2 { masks } else { 0 },
                         bulk.select_scratch,
@@ -1402,7 +1403,7 @@ impl DeviceLayer<'_> {
                         self.candidate_topk_blocks as u64,
                         self.candidate_block_size as u64,
                         stride as u64,
-                        SELECTED_STRIDE as u64,
+                        selected_stride as u64,
                         (mask_bytes / 4) as u64,
                         bulk.select_words as u64,
                     ],
@@ -1540,10 +1541,9 @@ impl DeviceLayer<'_> {
         n: usize,
     ) -> Result<(), String> {
         let b = rows.b;
+        // The expert count and top-k are the open plan's routed geometry; the resolved router
+        // entries enforce the compiled shape at open.
         let experts = self.routed_geometry.experts;
-        if experts != 384 || self.routed_geometry.top_k != 6 {
-            return Err("bulk router: the kernels hold 384 experts, top 6".to_owned());
-        }
         self.cuda.launch(
             bulk.k.router_dots,
             ((experts / 128) as u32, (n as u32).div_ceil(128), 1),
@@ -1565,9 +1565,6 @@ impl DeviceLayer<'_> {
         )
     }
 }
-
-/// The selected list's row stride in u32 ids (as the rows step's).
-const SELECTED_STRIDE: usize = 512;
 
 #[cfg(test)]
 mod index_pack_tests {
