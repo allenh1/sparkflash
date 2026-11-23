@@ -105,6 +105,7 @@ class OpenManifestAbTest(unittest.TestCase):
             nodes=["a", "b", "c", "d"],
             checkpoint="/checkpoint",
             tokenizer="/tokenizer",
+            converted_dir="/converted",
             cubins=None,
             build="/build/sparkflash",
         )
@@ -113,6 +114,7 @@ class OpenManifestAbTest(unittest.TestCase):
         self.assertEqual(env["SPARK_NODES"], "a b c d")
         self.assertEqual(env["SPARKFLASH_CHECKPOINT"], "/checkpoint")
         self.assertEqual(env["SPARKFLASH_TOKENIZER"], "/tokenizer")
+        self.assertEqual(env["SPARKFLASH_CONVERTED_DIR"], "/converted")
         self.assertNotIn("SPARKFLASH_CUBINS", env)
         self.assertEqual(env["SPARKFLASH_BIN"], "/build/sparkflash")
         self.assertEqual(ab.launcher_env(args)["SPARK_NODES"], "a b c d")

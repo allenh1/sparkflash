@@ -223,6 +223,7 @@ def launch_env(args, out):
     env = launcher_env(args)
     env["SPARKFLASH_CHECKPOINT"] = args.checkpoint
     env["SPARKFLASH_TOKENIZER"] = args.tokenizer
+    env["SPARKFLASH_CONVERTED_DIR"] = args.converted_dir
     if args.cubins:
         env["SPARKFLASH_CUBINS"] = args.cubins
     env["SPARKFLASH_BIN"] = args.build
@@ -255,7 +256,7 @@ def launch(args, out):
         )
     if result.returncode != 0:
         raise SystemExit(f"open-manifest-ab: launcher failed; see {log_path}")
-    wait_ready(args.url, args.timeout)
+    wait_ready(args.url, args.ready_timeout)
     return env["SPARKFLASH_RUN_ID"]
 
 
@@ -476,12 +477,20 @@ def main():
         p.add_argument("--checkpoint", required=True, help="checkpoint directory on every node")
         p.add_argument("--tokenizer", required=True, help="tokenizer file on every node")
         p.add_argument("--cubins", required=True, help="cubin directory on every node")
+        p.add_argument(
+            "--converted-dir", required=True, help="converted weights directory on every node"
+        )
         p.add_argument("--site-script", required=True, help="the four-node launcher path")
         p.add_argument("--url", required=True, help="the served OpenAI-compatible base URL")
         p.add_argument("--max-tokens", type=int, default=32)
         p.add_argument("--draft-tokens", type=int, default=128)
         p.add_argument("--bulk-tokens", type=int, default=16000)
-        p.add_argument("--timeout", type=int, default=3600)
+        p.add_argument(
+            "--ready-timeout",
+            type=int,
+            default=420,
+            help="seconds to wait for /v1/models after the launcher returns",
+        )
         p.add_argument("--request-timeout", type=int, default=3600)
         p.add_argument("--launch-timeout", type=int, default=120)
         p.add_argument("--stop-timeout", type=int, default=180)

@@ -1278,6 +1278,45 @@ mod tests {
     }
 
     #[test]
+    fn the_released_plan_names_every_compressor_tensor_it_binds() {
+        let Some(description) = released() else {
+            eprintln!("skipping: the released checkpoint is not on this host");
+            return;
+        };
+        let map = crate::resident_weights::rank_attention_plan_shapes(description.values(), 0, 4)
+            .expect("the released plan's attention shapes");
+        assert!(
+            map.keys()
+                .any(|name| name.ends_with("attn.compressor.wkv.weight"))
+        );
+    }
+
+    #[test]
+    fn the_released_plan_owns_kv_on_the_source_layers_only() {
+        let Some(description) = released() else {
+            eprintln!("skipping: the released checkpoint is not on this host");
+            return;
+        };
+        let owners = layers_with_fact("kv_source", true);
+        assert_eq!(
+            owners,
+            vec![2, 8, 14, 20],
+            "the kv-source fact must mark the four layers that own the compressed cache"
+        );
+        for layer in owners {
+            description
+                .layer_tensor(layer, Part::Csa2Compression, "attn.compressor.wkv.weight")
+                .unwrap_or_else(|error| panic!("layer {layer}: {error}"));
+        }
+        // A layer that shares an owner's cache has no compressor tensor of its own; the seam
+        // stages only the owners and must not ask the plan for a name it never claimed.
+        let shared = description
+            .layer_tensor(3, Part::Csa2Compression, "attn.compressor.wkv.weight")
+            .expect_err("layer 3 shares layer 2's compressed cache");
+        assert!(shared.contains("claims no tensor"), "{shared}");
+    }
+
+    #[test]
     fn every_name_the_open_uses_is_a_claim() {
         let Some(description) = released() else {
             eprintln!("skipping: the released checkpoint is not on this host");

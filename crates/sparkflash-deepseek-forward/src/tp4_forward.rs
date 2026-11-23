@@ -6474,8 +6474,22 @@ impl<'a> SeamDevice<'a> {
             if ratio == 0 {
                 continue;
             }
+            // Only the layers that own the compressed cache are in the checkpoint; a layer that
+            // shares an owner's cache has no tensor of its own, so the name lookup declines rather
+            // than panicking the open. Same behaviour the release's own tensor set states.
+            let wkv_name = match crate::plan::description().layer_tensor(
+                layer,
+                sparkflash_model::Part::Csa2Compression,
+                "attn.compressor.wkv.weight",
+            ) {
+                Ok(name) => name,
+                Err(reason) => {
+                    declines.push(reason);
+                    continue;
+                }
+            };
             let Some(wkv) = device.stage_hostw(
-                &crate::plan::layer_claim(layer, "attn.compressor.wkv.weight"),
+                wkv_name,
                 config.dim,
                 config.head_dim,
                 OutStores::F32Row,
@@ -6485,22 +6499,24 @@ impl<'a> SeamDevice<'a> {
                 // Silent by design, but remembered: the diagnostic below names the tensor, whether the
                 // source lacks it or the shape differs, so a later refusal cannot be blamed on the
                 // wrong cause.
-                declines.push(decline_reason(
-                    src,
-                    &crate::plan::layer_claim(layer, "attn.compressor.wkv.weight"),
-                    config.head_dim,
-                    config.dim,
-                ));
+                declines.push(decline_reason(src, wkv_name, config.head_dim, config.dim));
                 continue;
             };
             let wgate = if ratio > 1 {
-                device.stage_hostw(
-                    &crate::plan::layer_claim(layer, "attn.compressor.wgate.weight"),
-                    config.dim,
-                    config.head_dim,
-                    OutStores::F32Row,
-                    src,
-                )?
+                match crate::plan::description().layer_tensor(
+                    layer,
+                    sparkflash_model::Part::Csa2Compression,
+                    "attn.compressor.wgate.weight",
+                ) {
+                    Ok(name) => device.stage_hostw(
+                        name,
+                        config.dim,
+                        config.head_dim,
+                        OutStores::F32Row,
+                        src,
+                    )?,
+                    Err(_) => None,
+                }
             } else {
                 None
             };
