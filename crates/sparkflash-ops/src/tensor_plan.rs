@@ -83,11 +83,14 @@ pub enum Role {
 /// The stored format of one expert class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExpertFormat {
-    /// A 4-bit E2M1 expert: NVFP4's per-group scale or MXFP4's per-block scale. The two share
-    /// the ops library's [Precision::NvFp4] operand class but not their scale granularity, so
-    /// the released group/block is carried here and used for every scale shape.
-    Nvfp4 {
-        group: usize,
+    /// A 4-bit E2M1 expert. NVFP4's per-16 group and MXFP4's per-32 block are different
+    /// arithmetic ([Precision::NvFp4] and [Precision::MxFp4]); the loader needs only the width
+    /// one scale covers, which the release declares and this carries for every scale shape.
+    Fp4 {
+        /// The values one scale covers: 16 for NVFP4's group, 32 for MXFP4's block.
+        block: usize,
+        /// Whether the release also stores a tensor-wide factor (NVFP4's two scales).
+        tensor_wide: bool,
     },
     Fp8 {
         block: usize,
@@ -99,11 +102,15 @@ enum ExpertFormat {
 impl ExpertFormat {
     fn of(format: WeightFormat) -> Self {
         match format {
-            WeightFormat::NvFp4 { group_size } => Self::Nvfp4 {
-                group: group_size.max(1),
+            WeightFormat::NvFp4 { group_size } => Self::Fp4 {
+                block: group_size.max(1),
+                tensor_wide: true,
             },
-            WeightFormat::MxFp4 { block } => Self::Nvfp4 {
-                group: block.max(1),
+            // MXFP4 applies one power-of-two code a block and has no tensor-wide factor: the
+            // released DeepSeek checkout stores only `.weight` and `.scale` per expert.
+            WeightFormat::MxFp4 { block } => Self::Fp4 {
+                block: block.max(1),
+                tensor_wide: false,
             },
             WeightFormat::Fp8Tile {
                 block_n,
@@ -780,7 +787,7 @@ impl Builder {
         self.push(
             format!("{prefix}.weight"),
             match format {
-                ExpertFormat::Nvfp4 { .. } => DType::F4E2M1,
+                ExpertFormat::Fp4 { .. } => DType::F4E2M1,
                 ExpertFormat::Fp8 { .. } => DType::F8E4M3,
                 ExpertFormat::Bf16 => DType::BF16,
             },
@@ -790,16 +797,16 @@ impl Builder {
             role,
         );
         match format {
-            ExpertFormat::Nvfp4 { group } => {
+            ExpertFormat::Fp4 { block, tensor_wide } => {
                 let scale_shape = if rows {
-                    vec![width, hidden.div_ceil(group)]
+                    vec![width, hidden.div_ceil(block)]
                 } else {
-                    vec![hidden, width.div_ceil(group)]
+                    vec![hidden, width.div_ceil(block)]
                 };
                 let scale_rank = if rows {
-                    vec![local, hidden.div_ceil(group)]
+                    vec![local, hidden.div_ceil(block)]
                 } else {
-                    vec![hidden, local.div_ceil(group)]
+                    vec![hidden, local.div_ceil(block)]
                 };
                 self.push(
                     format!("{prefix}.weight_scale"),
@@ -809,18 +816,20 @@ impl Builder {
                     None,
                     role,
                 );
-                self.whole(
-                    format!("{prefix}.weight_scale_2"),
-                    DType::F32,
-                    Vec::new(),
-                    role,
-                );
-                self.whole(
-                    format!("{prefix}.input_scale"),
-                    DType::F32,
-                    Vec::new(),
-                    role,
-                );
+                if tensor_wide {
+                    self.whole(
+                        format!("{prefix}.weight_scale_2"),
+                        DType::F32,
+                        Vec::new(),
+                        role,
+                    );
+                    self.whole(
+                        format!("{prefix}.input_scale"),
+                        DType::F32,
+                        Vec::new(),
+                        role,
+                    );
+                }
             }
             ExpertFormat::Fp8 { block, scale } => {
                 let scale_shape = if rows {
@@ -868,7 +877,7 @@ impl Builder {
         format: ExpertFormat,
     ) -> Result<(usize, Option<RankRun>), PlanError> {
         Ok(match format {
-            ExpertFormat::Nvfp4 { .. } => {
+            ExpertFormat::Fp4 { .. } => {
                 if self.tp.world() == 1 {
                     (
                         total,

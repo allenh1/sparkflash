@@ -1,0 +1,490 @@
+// Copyright (c) 2026 Hunter L. Allen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! One stored weight format, carried from the layout to the body that reads it.
+//!
+//! A format is three things, and losing any of them makes a body run another arithmetic:
+//!
+//! * the **values** (bf16, f32, E4M3 codes, E2M1 codes);
+//! * the **scale kind** and the **block** one scale covers. A power-of-two grid is an MX block
+//!   (one `ue8m0` code a 32); a tile scale is an FP8 inverse scale a 128 x 128 tile; a row scale is
+//!   one power-of-two code a row; and a tensor-wide scale is one factor for the whole matrix, on
+//!   top of a block scale (NVFP4);
+//! * the **layout** the body reads: row-major, the 32 x 32 tiling DeepSeek's dense bodies read, or
+//!   the packed bf16 word form.
+//!
+//! The checkpoint's `quantization_config` names a format in [WeightFormat]; the layout reader
+//! turns every tensor's declaration into one [StoredFormat], and that value is what the plan, the
+//! catalogue key and the bind carry. Nothing downstream reads a producer's dtype name again.
+
+use crate::architecture::WeightFormat;
+
+/// The values a stored format keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FormatValues {
+    /// Unquantized bfloat16.
+    Bf16,
+    /// IEEE binary32.
+    F32,
+    /// E4M3 codes, one byte a value.
+    Fp8E4M3,
+    /// E2M1 codes, two values a byte.
+    Fp4E2M1,
+}
+
+impl FormatValues {
+    /// The name a ledger or a scan row prints.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::F32 => "f32",
+            Self::Fp8E4M3 => "e4m3",
+            Self::Fp4E2M1 => "e2m1",
+        }
+    }
+
+    /// The values one byte holds: two for the 4-bit codes, one otherwise.
+    #[must_use]
+    pub const fn values_per_byte(self) -> usize {
+        match self {
+            Self::Fp4E2M1 => 2,
+            Self::Bf16 | Self::F32 | Self::Fp8E4M3 => 1,
+        }
+    }
+}
+
+/// What a format's scales are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScaleKind {
+    /// One power-of-two (`ue8m0`) code every [StoredFormat::block] values along the contraction.
+    PowerOfTwoGrid,
+    /// One inverse scale a tile of the matrix.
+    Tile,
+    /// One power-of-two scale a row, every [StoredFormat::block] columns.
+    Row,
+    /// One factor for the whole tensor, beside any block scale.
+    TensorWide,
+}
+
+impl ScaleKind {
+    /// The name a description uses.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PowerOfTwoGrid => "power-of-two grid",
+            Self::Tile => "tile scale",
+            Self::Row => "row scale",
+            Self::TensorWide => "tensor-wide scale",
+        }
+    }
+}
+
+/// How a body reads a tensor's values in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FormatLayout {
+    /// Consecutive columns, a row at a time.
+    RowMajor,
+    /// Re-tiled into 32 x 32 tiles at load, the B12x layout DeepSeek's dense bodies read.
+    Tile32,
+    /// The packed bf16 word form (two columns a 32-bit word, with its escape list).
+    Packed,
+}
+
+impl FormatLayout {
+    /// The name a description uses.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RowMajor => "row-major",
+            Self::Tile32 => "32-tile",
+            Self::Packed => "packed",
+        }
+    }
+}
+
+/// The scale kinds one format applies, in apply order.
+const NONE: &[ScaleKind] = &[];
+const GRID: &[ScaleKind] = &[ScaleKind::PowerOfTwoGrid];
+const TILE: &[ScaleKind] = &[ScaleKind::Tile];
+const ROW_AND_GRID: &[ScaleKind] = &[ScaleKind::Row, ScaleKind::PowerOfTwoGrid];
+const GROUP_AND_TENSOR: &[ScaleKind] = &[ScaleKind::Tile, ScaleKind::TensorWide];
+
+/// One stored tensor format: the values, the block one scale covers, the scales the body applies
+/// and the layout it reads.
+///
+/// A format is a value, not a model fact: two checkpoints that store the same arithmetic in the
+/// same arrangement compare equal, and a body that takes one cannot be handed another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoredFormat {
+    values: FormatValues,
+    block: usize,
+    scales: &'static [ScaleKind],
+    layout: FormatLayout,
+}
+
+impl StoredFormat {
+    /// A format from its parts.
+    #[must_use]
+    pub const fn new(
+        values: FormatValues,
+        block: usize,
+        scales: &'static [ScaleKind],
+        layout: FormatLayout,
+    ) -> Self {
+        Self {
+            values,
+            block,
+            scales,
+            layout,
+        }
+    }
+
+    /// Unquantized bf16, row-major.
+    pub const BF16: Self = Self::new(FormatValues::Bf16, 1, NONE, FormatLayout::RowMajor);
+    /// IEEE binary32, row-major.
+    pub const F32: Self = Self::new(FormatValues::F32, 1, NONE, FormatLayout::RowMajor);
+    /// FP8 E4M3 with one inverse scale a 128 x 128 tile, row-major.
+    pub const FP8_E4M3_TILE_128: Self =
+        Self::new(FormatValues::Fp8E4M3, 128, TILE, FormatLayout::RowMajor);
+    /// MXFP8: E4M3 codes with one power-of-two scale a 32-value block, row-major.
+    pub const MXFP8_32: Self = Self::new(FormatValues::Fp8E4M3, 32, GRID, FormatLayout::RowMajor);
+    /// MXFP8 in the 32 x 32 tiling DeepSeek's dense and attention bodies read.
+    pub const MXFP8_TILED_32: Self =
+        Self::new(FormatValues::Fp8E4M3, 32, GRID, FormatLayout::Tile32);
+    /// Row-scaled MXFP8: one power-of-two scale a row, every 32 columns, row-major.
+    pub const MXFP8_ROW_32: Self = Self::new(
+        FormatValues::Fp8E4M3,
+        32,
+        ROW_AND_GRID,
+        FormatLayout::RowMajor,
+    );
+    /// NVFP4: E2M1 codes with one E4M3 scale a 16-value group and a tensor-wide factor.
+    pub const NVFP4_16: Self = Self::new(
+        FormatValues::Fp4E2M1,
+        16,
+        GROUP_AND_TENSOR,
+        FormatLayout::RowMajor,
+    );
+    /// MXFP4: E2M1 codes with one power-of-two scale a 32-value block, row-major.
+    pub const MXFP4_32: Self = Self::new(FormatValues::Fp4E2M1, 32, GRID, FormatLayout::RowMajor);
+    /// The packed bf16 form: the same arithmetic as [Self::BF16], in the packed word layout.
+    pub const PACKED_BF16: Self = Self::new(FormatValues::Bf16, 1, NONE, FormatLayout::Packed);
+
+    /// The values the format keeps.
+    #[must_use]
+    pub const fn values(self) -> FormatValues {
+        self.values
+    }
+
+    /// The values one scale covers, or one for an unscaled format.
+    #[must_use]
+    pub const fn block(self) -> usize {
+        self.block
+    }
+
+    /// The scale kinds the body applies, in order.
+    #[must_use]
+    pub const fn scales(self) -> &'static [ScaleKind] {
+        self.scales
+    }
+
+    /// Whether the format carries no scale plane at all (bf16 or f32 values).
+    ///
+    /// An unscaled body widens what it reads, so bf16 and f32 are one operand class for
+    /// selection; the arithmetic a body accepts still comes from its precision mask.
+    #[must_use]
+    pub const fn is_unscaled(self) -> bool {
+        self.block == 1 && self.scales.is_empty()
+    }
+
+    /// Whether the format applies this scale kind.
+    #[must_use]
+    pub const fn has_scale(self, kind: ScaleKind) -> bool {
+        let mut index = 0;
+        while index < self.scales.len() {
+            if self.scales[index] as u8 == kind as u8 {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// The layout the body reads.
+    #[must_use]
+    pub const fn layout(self) -> FormatLayout {
+        self.layout
+    }
+
+    /// This format read in another layout: the same arithmetic, arranged for one body.
+    #[must_use]
+    pub const fn with_layout(self, layout: FormatLayout) -> Self {
+        Self { layout, ..self }
+    }
+
+    /// Whether two formats are the same arithmetic: the values, the block and the scales agree.
+    ///
+    /// The layout is the body's arrangement of the same stored tensor, so it is not part of the
+    /// arithmetic. A body may therefore read a row-major checkpoint through its 32-tile layout
+    /// without the format changing meaning.
+    #[must_use]
+    pub const fn same_arithmetic(self, other: Self) -> bool {
+        self.values as u8 == other.values as u8
+            && self.block == other.block
+            && self.scales.len() == other.scales.len()
+            && {
+                let mut index = 0;
+                let mut same = true;
+                while index < self.scales.len() {
+                    same = same && self.scales[index] as u8 == other.scales[index] as u8;
+                    index += 1;
+                }
+                same
+            }
+    }
+
+    /// The format's name, as a scan row or a ledger prints it.
+    ///
+    /// The names match [WeightFormat::name] for the formats a checkpoint declares, so the scan's
+    /// format column does not move when the reader starts carrying the whole format.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match (self.values, self.layout) {
+            (FormatValues::Bf16, FormatLayout::Packed) => "PACKED-BF16",
+            (FormatValues::Bf16, _) => "BF16",
+            (FormatValues::F32, _) => "F32",
+            (FormatValues::Fp8E4M3, _) if self.has_row() => "MXFP8-ROW",
+            (FormatValues::Fp8E4M3, _) if self.has_scale(ScaleKind::Tile) => "FP8",
+            (FormatValues::Fp8E4M3, _) => "MXFP8",
+            (FormatValues::Fp4E2M1, _) if self.has_scale(ScaleKind::TensorWide) => "NVFP4",
+            (FormatValues::Fp4E2M1, _) => "MXFP4",
+        }
+    }
+
+    /// Whether the format carries one scale a row.
+    const fn has_row(self) -> bool {
+        let mut index = 0;
+        while index < self.scales.len() {
+            if matches!(self.scales[index], ScaleKind::Row) {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// A one-line description: the name, the block and the scales, and the layout.
+    #[must_use]
+    pub fn describe(self) -> String {
+        let scales = if self.scales.is_empty() {
+            "unscaled".to_owned()
+        } else {
+            self.scales
+                .iter()
+                .map(|scale| scale.name())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        let block = if self.block > 1 {
+            format!(", one scale per {} values", self.block)
+        } else {
+            String::new()
+        };
+        format!(
+            "{} ({}{}, {})",
+            self.name(),
+            scales,
+            block,
+            self.layout.name()
+        )
+    }
+
+    /// The format a checkpoint's declaration describes.
+    ///
+    /// Every block width the declaration carries travels into the format, so a release that
+    /// declares an unusual group or tile keeps it rather than being read at a default.
+    #[must_use]
+    pub const fn of(format: WeightFormat) -> Self {
+        match format {
+            WeightFormat::Bf16 => Self::BF16,
+            WeightFormat::F32 => Self::F32,
+            WeightFormat::Fp8Tile {
+                block_n, block_m, ..
+            } => {
+                let block = if block_n >= block_m { block_n } else { block_m };
+                Self::new(FormatValues::Fp8E4M3, block, TILE, FormatLayout::RowMajor)
+            }
+            WeightFormat::NvFp4 { group_size } => Self::new(
+                FormatValues::Fp4E2M1,
+                group_size,
+                GROUP_AND_TENSOR,
+                FormatLayout::RowMajor,
+            ),
+            WeightFormat::MxFp8 { block } => {
+                Self::new(FormatValues::Fp8E4M3, block, GRID, FormatLayout::RowMajor)
+            }
+            WeightFormat::MxFp4 { block } => {
+                Self::new(FormatValues::Fp4E2M1, block, GRID, FormatLayout::RowMajor)
+            }
+        }
+    }
+
+    /// The format a name states, for a build list or a layout file.
+    ///
+    /// The names are the ones [Self::name] prints plus the explicit spellings a build file uses:
+    /// `mx-fp8-tiled` is the 32-tile layout, `mx-fp8-row` the row-scaled form, and `packed-bf16`
+    /// the packed word form. An unknown name is refused rather than guessed.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "bf16" | "bfloat16" => Some(Self::BF16),
+            "f32" | "float32" => Some(Self::F32),
+            "fp8" | "fp8-e4m3" | "fp8-tile" | "e4m3-tile" => Some(Self::FP8_E4M3_TILE_128),
+            "mxfp8" | "mx-fp8" => Some(Self::MXFP8_32),
+            "mxfp8-tiled" | "mx-fp8-tiled" => Some(Self::MXFP8_TILED_32),
+            "mxfp8-row" | "mx-fp8-row" | "mxfp8-rowscale" | "mx-fp8-rowscale" => {
+                Some(Self::MXFP8_ROW_32)
+            }
+            "nvfp4" => Some(Self::NVFP4_16),
+            "mxfp4" | "mx-fp4" => Some(Self::MXFP4_32),
+            "packed" | "packed-bf16" => Some(Self::PACKED_BF16),
+            _ => None,
+        }
+    }
+}
+
+impl From<WeightFormat> for StoredFormat {
+    fn from(format: WeightFormat) -> Self {
+        Self::of(format)
+    }
+}
+
+impl WeightFormat {
+    /// The format this declaration describes, with its block, scale kinds and layout.
+    #[must_use]
+    pub const fn stored_format(self) -> StoredFormat {
+        StoredFormat::of(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_checkpoint_declaration_carries_its_block_scales_and_layout() {
+        assert_eq!(StoredFormat::of(WeightFormat::Bf16), StoredFormat::BF16);
+        assert_eq!(StoredFormat::of(WeightFormat::F32), StoredFormat::F32);
+        assert_eq!(
+            StoredFormat::of(WeightFormat::Fp8Tile {
+                block_m: 128,
+                block_n: 128,
+                scale_dtype: crate::architecture::ScaleDType::F32,
+                dynamic_activations: true,
+            }),
+            StoredFormat::FP8_E4M3_TILE_128
+        );
+        assert_eq!(
+            StoredFormat::of(WeightFormat::MxFp8 { block: 32 }),
+            StoredFormat::MXFP8_32
+        );
+        assert_eq!(
+            StoredFormat::of(WeightFormat::MxFp4 { block: 32 }),
+            StoredFormat::MXFP4_32
+        );
+        assert_eq!(
+            StoredFormat::of(WeightFormat::NvFp4 { group_size: 16 }),
+            StoredFormat::NVFP4_16
+        );
+    }
+
+    #[test]
+    fn an_unusual_block_or_group_travels_rather_than_being_read_at_a_default() {
+        let wide = StoredFormat::of(WeightFormat::MxFp4 { block: 64 });
+        assert_eq!(wide.block(), 64);
+        assert!(wide.same_arithmetic(StoredFormat::MXFP4_32) == false);
+        let group = StoredFormat::of(WeightFormat::NvFp4 { group_size: 32 });
+        assert_eq!(group.block(), 32);
+        assert!(group.has_scale(ScaleKind::TensorWide));
+    }
+
+    #[test]
+    fn the_two_4_bit_formats_are_not_one_format() {
+        assert!(!StoredFormat::MXFP4_32.same_arithmetic(StoredFormat::NVFP4_16));
+        assert!(StoredFormat::MXFP4_32.has_scale(ScaleKind::PowerOfTwoGrid));
+        assert!(!StoredFormat::MXFP4_32.has_scale(ScaleKind::TensorWide));
+        assert!(StoredFormat::NVFP4_16.has_scale(ScaleKind::Tile));
+        assert!(StoredFormat::NVFP4_16.has_scale(ScaleKind::TensorWide));
+    }
+
+    #[test]
+    fn a_layout_is_the_body_arrangement_of_one_arithmetic() {
+        let tiled = StoredFormat::MXFP8_32.with_layout(FormatLayout::Tile32);
+        assert!(tiled.same_arithmetic(StoredFormat::MXFP8_32));
+        assert_ne!(tiled.layout(), StoredFormat::MXFP8_32.layout());
+        assert_eq!(tiled.name(), "MXFP8");
+        assert!(tiled.describe().contains("32-tile"));
+        assert!(StoredFormat::PACKED_BF16.same_arithmetic(StoredFormat::BF16));
+        assert_eq!(StoredFormat::PACKED_BF16.layout(), FormatLayout::Packed);
+    }
+
+    #[test]
+    fn a_build_name_round_trips_or_is_refused() {
+        for format in [
+            StoredFormat::BF16,
+            StoredFormat::F32,
+            StoredFormat::FP8_E4M3_TILE_128,
+            StoredFormat::MXFP8_32,
+            StoredFormat::MXFP8_TILED_32,
+            StoredFormat::MXFP8_ROW_32,
+            StoredFormat::NVFP4_16,
+            StoredFormat::MXFP4_32,
+            StoredFormat::PACKED_BF16,
+        ] {
+            // A name states the arithmetic, not the layout: the 32-tile and row-scaled forms
+            // print the same family name and round-trip to the same arithmetic.
+            let named = StoredFormat::from_name(&format.name().to_ascii_lowercase())
+                .unwrap_or_else(|| panic!("{}", format.name()));
+            assert!(named.same_arithmetic(format), "{}", format.name());
+        }
+        assert_eq!(StoredFormat::from_name("bf16"), Some(StoredFormat::BF16));
+        assert_eq!(
+            StoredFormat::from_name("mx-fp8-tiled"),
+            Some(StoredFormat::MXFP8_TILED_32)
+        );
+        assert_eq!(
+            StoredFormat::from_name("mx-fp8-row"),
+            Some(StoredFormat::MXFP8_ROW_32)
+        );
+        assert_eq!(
+            StoredFormat::from_name("nvfp4"),
+            Some(StoredFormat::NVFP4_16)
+        );
+        assert_eq!(
+            StoredFormat::from_name("mx-fp4"),
+            Some(StoredFormat::MXFP4_32)
+        );
+        assert_eq!(StoredFormat::from_name("nope"), None);
+    }
+
+    #[test]
+    fn an_unscaled_format_says_so() {
+        assert!(StoredFormat::BF16.is_unscaled());
+        assert!(StoredFormat::F32.is_unscaled());
+        assert!(StoredFormat::PACKED_BF16.is_unscaled());
+        assert!(!StoredFormat::MXFP8_32.is_unscaled());
+        assert!(!StoredFormat::NVFP4_16.is_unscaled());
+    }
+}

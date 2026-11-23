@@ -36,10 +36,11 @@
 use std::fmt;
 
 use sparkflash_kernels::images::Image;
+use sparkflash_model::format::StoredFormat;
 use sparkflash_model::parts::PartSet;
 use sparkflash_model::{Part, Target};
 
-use crate::engine_plan::{EnginePlan, PartRequirement};
+use crate::engine_plan::{EnginePlan, PartRequirement, precision_of_stored};
 use crate::error::OpError;
 use crate::parts::{self, CATALOGUE};
 use crate::plan::{KernelId, KernelPhase, KernelSymbol, ModelFamily, PartGeometry, Precision};
@@ -121,11 +122,20 @@ pub struct ResolvedKernel {
     pub canonical: bool,
     /// The rank-local geometry that was resolved.
     pub geometry: PartGeometry,
-    /// The precision that was resolved.
-    pub precision: Precision,
+    /// The stored format the body decodes, with the layout it reads.
+    ///
+    /// This is the format the bind carries: the checkpoint's declaration as the resolved body
+    /// reads it, never a second summary of the arithmetic.
+    pub format: StoredFormat,
 }
 
 impl ResolvedKernel {
+    /// The arithmetic the resolved format runs at.
+    #[must_use]
+    pub const fn precision(&self) -> Precision {
+        precision_of_stored(self.format)
+    }
+
     /// The pass the selected symbol belongs to.
     #[must_use]
     pub const fn phase(&self) -> KernelPhase {
@@ -176,8 +186,8 @@ pub struct ResolveError {
     pub part: Part,
     /// The target.
     pub target: Target,
-    /// The requested precision.
-    pub precision: Precision,
+    /// The requested stored format.
+    pub format: StoredFormat,
     /// The requested pass.
     pub phase: KernelPhase,
     /// Why each candidate was refused, or that there were no candidates.
@@ -193,7 +203,7 @@ impl fmt::Display for ResolveError {
             "{} on {} at {} in the {} pass: {}",
             self.part,
             self.target,
-            self.precision.name(),
+            self.format.describe(),
             self.phase.name(),
             if self.reasons.is_empty() {
                 "no catalogue entry".to_owned()
@@ -291,9 +301,10 @@ impl PlanContext {
             Precision::MxFp8,
             Precision::Fp8E4M3,
             Precision::NvFp4,
+            Precision::MxFp4,
         ] {
             let candidate = PartRequirement {
-                precision,
+                format: crate::engine_plan::format_of_precision(precision),
                 ..*requirement
             };
             match resolver.resolve_symbol(&candidate, phase, symbols) {
@@ -308,7 +319,7 @@ impl PlanContext {
         Err(OpError::Resolve(ResolveError {
             part: requirement.part,
             target: self.target,
-            precision: requirement.precision,
+            format: requirement.format,
             phase,
             reasons,
             cause: cause_for(requirement.part, self.target),
@@ -423,7 +434,7 @@ impl KernelResolver {
             return Err(ResolveError {
                 part: requirement.part,
                 target: self.target,
-                precision: requirement.precision,
+                format: requirement.format,
                 phase,
                 reasons: Vec::new(),
                 cause: cause_for(requirement.part, self.target),
@@ -453,7 +464,7 @@ impl KernelResolver {
         Err(ResolveError {
             part: requirement.part,
             target: self.target,
-            precision: requirement.precision,
+            format: requirement.format,
             phase,
             reasons,
             cause: cause_for(requirement.part, self.target),
@@ -473,7 +484,7 @@ impl KernelResolver {
             symbol,
             canonical: entry.canonical,
             geometry: requirement.geometry,
-            precision: requirement.precision,
+            format: symbol.format.unwrap_or_else(|| requirement.format),
         }
     }
 
@@ -508,10 +519,15 @@ impl KernelResolver {
         if let Err(reason) = entry.shape.accepts(&requirement.geometry) {
             return Err(format!("{}: {reason}", entry.image.name()));
         }
+        // A quantizer is chosen by the format it PRODUCES: its symbol list names the output
+        // plane, while the requirement describes the rows it reads. Its format key is therefore
+        // the output dtype's, stated by the symbol the plan named, not by the part's tensor.
+        let converts = requirement.part == Part::Quantize;
         let found = entry.symbols.iter().copied().find(|symbol| {
             name.is_none_or(|name| symbol.name == name)
-                && symbol.accepts(requirement.precision)
+                && symbol.accepts(requirement.precision())
                 && symbol.phase.serves(phase)
+                && (converts || symbol.decodes(requirement.format))
         });
         match found {
             Some(symbol) => {
@@ -522,15 +538,15 @@ impl KernelResolver {
             }
             None => Err(match name {
                 Some(name) => format!(
-                    "{} exports no {name} accepting {} in the {} pass",
+                    "{} exports no {name} decoding {} in the {} pass",
                     entry.image.name(),
-                    requirement.precision.name(),
+                    requirement.format.describe(),
                     phase.name()
                 ),
                 None => format!(
-                    "{} exports no symbol accepting {} in the {} pass",
+                    "{} exports no symbol decoding {} in the {} pass",
                     entry.image.name(),
-                    requirement.precision.name(),
+                    requirement.format.describe(),
                     phase.name()
                 ),
             }),
@@ -651,7 +667,7 @@ mod tests {
         PartRequirement {
             part,
             geometry,
-            precision,
+            format: crate::engine_plan::format_of_precision(precision),
         }
     }
 
@@ -673,7 +689,7 @@ mod tests {
                 rank: 0,
                 ..PartGeometry::new()
             },
-            Precision::NvFp4,
+            Precision::MxFp4,
         )
     }
 
@@ -717,7 +733,7 @@ mod tests {
             .expect("the catalogue carries MoE");
         assert_eq!(resolved.part, Part::Moe);
         assert_eq!(resolved.image, Image::Deepseek);
-        assert_eq!(resolved.precision, Precision::NvFp4);
+        assert_eq!(resolved.precision(), Precision::MxFp4);
         assert_eq!(resolved.phase(), KernelPhase::Both);
         assert!(resolved.canonical);
         assert_eq!(resolved.id().target, Target::Sm121);
@@ -747,7 +763,7 @@ mod tests {
             error
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("no q4e_gemm_bf16 accepting nvfp4")),
+                .any(|reason| reason.contains("no q4e_gemm_bf16 decoding NVFP4")),
             "{error}"
         );
     }
@@ -861,14 +877,15 @@ mod tests {
         let error = ResolveError {
             part: Part::Moe,
             target: Target::Sm121,
-            precision: Precision::NvFp4,
+            format: StoredFormat::NVFP4_16,
             phase: KernelPhase::Decode,
             reasons: vec!["first".to_owned(), "second".to_owned()],
             cause: ResolveCause::ShapeOrFormatRefused,
         };
         assert_eq!(
             error.to_string(),
-            "moe on sm121 at nvfp4 in the decode pass: first; second"
+            "moe on sm121 at NVFP4 (tile scale + tensor-wide scale, one scale per 16 values, \
+             row-major) in the decode pass: first; second"
         );
         let empty = ResolveError {
             reasons: Vec::new(),
@@ -876,7 +893,8 @@ mod tests {
         };
         assert_eq!(
             empty.to_string(),
-            "moe on sm121 at nvfp4 in the decode pass: no catalogue entry"
+            "moe on sm121 at NVFP4 (tile scale + tensor-wide scale, one scale per 16 values, \
+             row-major) in the decode pass: no catalogue entry"
         );
     }
 }

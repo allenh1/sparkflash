@@ -400,7 +400,6 @@ fn a_tp4_scan_row_states_the_rank_local_shape_the_stack_describes_in_full() {
 
 #[test]
 fn an_inkling_row_uses_the_format_and_shape_its_claimed_tensors_state() {
-    use sparkflash_model::architecture::WeightFormat;
     use sparkflash_model::{Architecture, Part, Target};
     use sparkflash_ops::{ScanInputs, ScanStatus, scan};
 
@@ -421,19 +420,28 @@ fn an_inkling_row_uses_the_format_and_shape_its_claimed_tensors_state() {
             .unwrap_or_else(|| panic!("no {part} row\n{report}"))
     };
     let attention = row(Part::RelativeAttention);
-    assert_eq!(attention.format, Some(WeightFormat::Bf16));
+    assert_eq!(
+        attention.format,
+        Some(sparkflash_model::format::StoredFormat::BF16)
+    );
     assert!(!attention.shape.is_unknown(), "{}", report.render());
     assert!(matches!(attention.status, ScanStatus::Resolved));
 
     let block = row(Part::BlockAttentionResidual);
-    assert_eq!(block.format, Some(WeightFormat::F32));
+    assert_eq!(
+        block.format,
+        Some(sparkflash_model::format::StoredFormat::F32)
+    );
     assert!(!block.shape.is_unknown(), "{}", report.render());
     assert!(matches!(block.status, ScanStatus::Resolved));
 
     // The short convolution is launched with the attention but owns tensors, so it is planned
     // as its own row rather than folded out of the report.
     let convolution = row(Part::ShortConv);
-    assert_eq!(convolution.format, Some(WeightFormat::Bf16));
+    assert_eq!(
+        convolution.format,
+        Some(sparkflash_model::format::StoredFormat::BF16)
+    );
     assert!(!convolution.shape.is_unknown(), "{}", report.render());
     assert!(matches!(convolution.status, ScanStatus::Resolved));
 
@@ -444,15 +452,24 @@ fn an_inkling_row_uses_the_format_and_shape_its_claimed_tensors_state() {
             .find(|row| row.part == Part::Moe && row.block == Some(block))
             .unwrap_or_else(|| panic!("no moe row for layer {block}\n{report}"))
     };
-    assert_eq!(moe(0).format, Some(WeightFormat::NvFp4 { group_size: 16 }));
-    assert_eq!(moe(40).format, Some(WeightFormat::MxFp8 { block: 32 }));
+    assert_eq!(
+        moe(0).format,
+        Some(sparkflash_model::format::StoredFormat::NVFP4_16)
+    );
+    assert_eq!(
+        moe(40).format,
+        Some(sparkflash_model::format::StoredFormat::MXFP8_32)
+    );
 
     let mtp = report
         .rows
         .iter()
         .find(|row| row.part == Part::Mtp)
         .expect("the draft row");
-    assert_eq!(mtp.format, Some(WeightFormat::Bf16));
+    assert_eq!(
+        mtp.format,
+        Some(sparkflash_model::format::StoredFormat::BF16)
+    );
     assert_eq!(mtp.shape.to_string(), "6x8");
     assert!(matches!(mtp.status, ScanStatus::Resolved));
 

@@ -192,7 +192,7 @@ impl AttentionPlan {
                 body if body == GqaBody::PER_HEAD => &["q4e_attn"][..],
                 body => &[body.symbol, "q4e_attn"][..],
             },
-            _ => symbols_for(kind, requirement.precision),
+            _ => symbols_for(kind, requirement.precision()),
         };
         let phase = KernelPhase::for_rows(rows);
         // Resolve the geometry the plan will launch: the schedule owns the row count, context
@@ -204,7 +204,7 @@ impl AttentionPlan {
             context: context_len,
             head_dim,
             stream,
-            precision: requirement.precision,
+            precision: requirement.precision(),
             geometry,
             resolved,
         })
@@ -236,7 +236,7 @@ impl AttentionPlan {
             context: context_len,
             head_dim,
             stream,
-            precision: requirement.precision,
+            precision: requirement.precision(),
             geometry,
             resolved,
         })
@@ -258,7 +258,7 @@ impl AttentionPlan {
             )));
         }
         validate_inputs(kind, rows, context_len, head_dim)?;
-        let precision = requirement.precision;
+        let precision = requirement.precision();
         if precision == Precision::NvFp4 {
             return Err(OpError::Unsupported {
                 op: "attention",
@@ -404,7 +404,9 @@ const fn symbols_for(kind: AttentionKind, precision: Precision) -> &'static [&'s
                 "q4e_glm_mla_attend",
             ],
             Precision::F32 => &["opt_bulk_attn", "glm_prefill_mla_attend"],
-            Precision::NvFp4 => &[],
+            // No attention body reads 4-bit weights: the MLA projections are MXFP8 and the cache
+            // is E4M3/mxfp8. A 4-bit operand here is a plan error, not a missing build.
+            Precision::NvFp4 | Precision::MxFp4 => &[],
         },
         AttentionKind::Gqa { .. } => &["q4e_attn"], // replaced below for 4/6-head groups
         AttentionKind::Sparse { .. } => {
@@ -523,7 +525,7 @@ impl SplitKvDecodePlan {
         let requirement = PartRequirement {
             part: Part::MlaAttention,
             geometry: attention.geometry,
-            precision: attention.precision,
+            format: crate::engine_plan::format_of_precision(attention.precision),
         };
         let resolved = context
             .resolve(

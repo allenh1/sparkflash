@@ -135,7 +135,7 @@ impl NormPlan {
                 &PartRequirement {
                     part: kind.part(),
                     geometry,
-                    precision,
+                    format: crate::engine_plan::format_of_precision(precision),
                 },
                 KernelPhase::for_rows(rows),
                 symbols,
@@ -450,7 +450,7 @@ impl ActivationPlan {
             kind,
             rows,
             width,
-            precision: resolved.precision,
+            precision: resolved.precision(),
             stream,
             geometry,
             resolved: resolved.id(),
@@ -545,7 +545,10 @@ impl QuantizePlan {
             )));
         }
         Operand::new(output, output_dtype, layout).validate("quantization output")?;
-        if !matches!(output_dtype, DType::NvFp4 | DType::Fp8E4M3 | DType::MxFp8) {
+        if !matches!(
+            output_dtype,
+            DType::NvFp4 | DType::Fp8E4M3 | DType::MxFp8 | DType::MxFp4
+        ) {
             return Err(OpError::Unsupported {
                 op: "quantization",
                 dtype: output_dtype.name(),
@@ -557,6 +560,7 @@ impl QuantizePlan {
             DType::Fp8E4M3 => Precision::Fp8E4M3,
             DType::MxFp8 => Precision::MxFp8,
             DType::NvFp4 => Precision::NvFp4,
+            DType::MxFp4 => Precision::MxFp4,
             DType::I32 | DType::U32 => {
                 return Err(OpError::Unsupported {
                     op: "quantization",
@@ -581,7 +585,7 @@ impl QuantizePlan {
                 &PartRequirement {
                     part: Part::Quantize,
                     geometry,
-                    precision,
+                    format: crate::engine_plan::format_of_precision(precision),
                 },
                 KernelPhase::for_rows(output.rows),
                 symbols,

@@ -122,7 +122,7 @@ impl ScanPlan {
                 requirement.part
             )));
         }
-        let precision = requirement.precision;
+        let precision = requirement.precision();
         if rows == 0 || heads == 0 || key_dim == 0 || value_dim == 0 {
             return Err(OpError::shape(
                 "linear-attention scan",
@@ -239,12 +239,15 @@ impl ScanPlan {
             return Ok(None);
         };
         if let Some(other) = scans.find(|requirement| {
-            requirement.geometry != first.geometry || requirement.precision != first.precision
+            requirement.geometry != first.geometry || requirement.precision() != first.precision()
         }) {
             return Err(OpError::Binding(format!(
                 "the plan's {kind:?} layers differ ({:?} {:?} vs {:?} {:?}); one scan launch \
                  serves them all",
-                first.geometry, first.precision, other.geometry, other.precision
+                first.geometry,
+                first.precision(),
+                other.geometry,
+                other.precision()
             )));
         }
         Self::scheduled(context, first, rows).map(Some)

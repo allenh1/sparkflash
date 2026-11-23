@@ -411,7 +411,7 @@ fn a_released_family_plan_names_its_family() {
 fn a_sparse_indexer_launcher_records_pool_score_and_pick() {
     use sparkflash_ops::engine_plan::PartRequirement;
     use sparkflash_ops::launchers::SparseIndexerLauncher;
-    use sparkflash_ops::plan::{PartGeometry, Precision};
+    use sparkflash_ops::plan::PartGeometry;
 
     let requirement = PartRequirement {
         part: sparkflash_model::Part::SparseIndexer,
@@ -428,7 +428,7 @@ fn a_sparse_indexer_launcher_records_pool_score_and_pick() {
             rank: 0,
             ..PartGeometry::new()
         },
-        precision: Precision::Bf16,
+        format: sparkflash_model::format::StoredFormat::BF16,
     };
     let resolved = PlanContext::SM121_CATALOGUE
         .resolver()
@@ -492,7 +492,7 @@ fn a_sparse_indexer_launcher_records_pool_score_and_pick() {
             rank: 0,
             ..PartGeometry::new()
         },
-        precision: Precision::Bf16,
+        format: sparkflash_model::format::StoredFormat::BF16,
     };
     let resolved = PlanContext::SM121_CATALOGUE
         .resolver()
@@ -573,7 +573,7 @@ fn the_rank_runs_reconstruct_the_five_tile_expert() {
 fn an_attention_launcher_describes_the_resolved_symbol() {
     use sparkflash_ops::engine_plan::PartRequirement;
     use sparkflash_ops::launchers::AttentionLauncher;
-    use sparkflash_ops::plan::{PartGeometry, Precision, StreamId};
+    use sparkflash_ops::plan::{PartGeometry, StreamId};
 
     let requirement = PartRequirement {
         part: sparkflash_model::Part::GqaAttention,
@@ -588,7 +588,7 @@ fn an_attention_launcher_describes_the_resolved_symbol() {
             rank: 0,
             ..PartGeometry::new()
         },
-        precision: Precision::Bf16,
+        format: sparkflash_model::format::StoredFormat::BF16,
     };
     let resolved = PlanContext::SM121_CATALOGUE
         .resolver()

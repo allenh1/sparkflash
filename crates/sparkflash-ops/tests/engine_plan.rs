@@ -392,9 +392,9 @@ fn both_qwen_arms_resolve_their_own_dense_prefill_body() {
                 rank: 0,
                 ..PartGeometry::new()
             },
-            precision: plan.precision().dense,
+            format: sparkflash_ops::engine_plan::format_of_precision(plan.precision().dense),
         };
-        assert_eq!(requirement.precision, Precision::Bf16, "{name}");
+        assert_eq!(requirement.precision(), Precision::Bf16, "{name}");
         let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
         let prefill = resolver
             .resolve_for(&requirement, KernelPhase::Prefill)
@@ -481,9 +481,9 @@ fn the_qwen_fp8_arm_boot_checks_both_passes_at_tp4() {
                 rank: 0,
                 ..PartGeometry::new()
             },
-            precision: plan.precision().dense,
+            format: sparkflash_ops::engine_plan::format_of_precision(plan.precision().dense),
         };
-        assert_eq!(dense.precision, Precision::Bf16, "Qwen FP8 TP{world}");
+        assert_eq!(dense.precision(), Precision::Bf16, "Qwen FP8 TP{world}");
         let prefill = resolver
             .resolve_for(&dense, KernelPhase::Prefill)
             .unwrap_or_else(|error| panic!("Qwen FP8 TP{world} dense prefill: {error}"));
@@ -504,7 +504,7 @@ fn the_qwen_fp8_arm_resolves_the_grouped_fp8_symbols_at_tp4() {
         .requirements()
         .find(|requirement| requirement.part == Part::Moe)
         .expect("a Qwen FP8 MoE requirement");
-    assert_eq!(moe.precision, Precision::Fp8E4M3, "Qwen FP8 experts");
+    assert_eq!(moe.precision(), Precision::Fp8E4M3, "Qwen FP8 experts");
     // Rank 0 of four holds two of the expert's five 128-wide scale tiles (256 columns), the
     // width `rank_config` uploads; the old 160-column even split is not a run of whole tiles.
     assert_eq!(moe.geometry.intermediate, 256, "Qwen FP8 TP4 rank 0");
@@ -549,7 +549,7 @@ fn the_qwen_fp8_arm_resolves_the_grouped_fp8_symbols_at_tp4() {
                 &["q4p_moe_gate_up_fp8", "q4e_expert_gate_up_fp8"],
             )
             .unwrap_or_else(|error| panic!("Qwen FP8 TP4 {phase:?}: {error}"));
-        assert_eq!(resolved.precision, Precision::Fp8E4M3, "{phase:?}");
+        assert_eq!(resolved.precision(), Precision::Fp8E4M3, "{phase:?}");
         assert_ne!(resolved.symbol_name(), "q4p_moe_gate_up", "{phase:?}");
     }
 }
@@ -565,7 +565,7 @@ fn the_glm_fp8_arm_inherits_its_grouped_policy_from_the_plan() {
         .requirements()
         .find(|requirement| requirement.part == Part::Moe)
         .expect("a GLM FP8 MoE requirement");
-    assert_eq!(moe.precision, Precision::Fp8E4M3, "GLM FP8 experts");
+    assert_eq!(moe.precision(), Precision::Fp8E4M3, "GLM FP8 experts");
     // The released-defaults case: no profile override is applied here, so the plan must carry
     // the dynamic q8 body and the host's nine-token grouped start (`MAX_ROWS` is 8).
     assert_eq!(
@@ -667,7 +667,7 @@ fn every_released_document_boot_checks_or_is_an_explicit_refusal() {
             for error in errors.iter().filter(|error| error.part != Part::Vision) {
                 assert_eq!(error.part, Part::Moe, "{}: {error}", document.name);
                 assert_eq!(
-                    error.precision,
+                    sparkflash_ops::engine_plan::precision_of_stored(error.format),
                     Precision::Bf16,
                     "{}: {error}",
                     document.name
@@ -749,7 +749,7 @@ fn the_qwen_fp8_expert_plan_splits_whole_128_tiles() {
             .requirements()
             .find(|requirement| requirement.part == Part::Moe)
             .expect("a Qwen FP8 MoE requirement");
-        assert_eq!(moe.precision, Precision::Fp8E4M3, "rank {rank}");
+        assert_eq!(moe.precision(), Precision::Fp8E4M3, "rank {rank}");
         assert_eq!(moe.geometry.intermediate, width, "rank {rank}");
     }
     let plan = plan_for(&document, 1);
@@ -880,8 +880,8 @@ fn the_catalogue_picks_the_image_by_shape_precision_and_pass() {
         .expect("a DeepSeek MoE requirement");
     assert_eq!(resolver.resolve(moe).expect("MoE").image, Image::Deepseek);
     assert_eq!(
-        resolver.resolve(moe).expect("MoE").precision,
-        Precision::NvFp4
+        resolver.resolve(moe).expect("MoE").precision(),
+        Precision::MxFp4
     );
 }
 
@@ -932,12 +932,13 @@ fn the_quantization_block_selects_the_precision_class() {
     assert_eq!(deepseek.precision().dense, Precision::MxFp8);
     assert_eq!(
         deepseek.precision().experts,
-        Precision::NvFp4,
-        "\"fp4\" is a 4-bit expert format, not BF16"
+        Precision::MxFp4,
+        "\"fp4\" beside a ue8m0 scale is MXFP4: one power-of-two code a 32 values, its own \
+         arithmetic rather than NVFP4's per-16 group and tensor-wide factor"
     );
     assert_eq!(
         deepseek.precision().mtp,
-        Precision::NvFp4,
+        Precision::MxFp4,
         "an unnamed MTP format uses the backbone experts'"
     );
 
@@ -968,7 +969,7 @@ fn the_quantization_block_selects_the_precision_class() {
         .iter()
         .find(|requirement| requirement.part == Part::Mtp)
         .expect("Qwen's boot plan carries an MTP part");
-    assert_eq!(mtp.precision, Precision::Fp8E4M3);
+    assert_eq!(mtp.precision(), Precision::Fp8E4M3);
 
     // The Qwen FP8 pack stores only the routed experts as E4M3; the document's global
     // `quant_method: fp8` is the producer's ambiguous flag, and the arm's architecture bridge
@@ -983,7 +984,7 @@ fn the_quantization_block_selects_the_precision_class() {
         .find(|requirement| requirement.part == Part::Moe)
         .expect("a Qwen MoE requirement");
     assert_eq!(
-        moe.precision,
+        moe.precision(),
         Precision::Fp8E4M3,
         "the routed experts are FP8"
     );
@@ -992,13 +993,17 @@ fn the_quantization_block_selects_the_precision_class() {
         .iter()
         .find(|requirement| requirement.part == Part::Mtp)
         .expect("Qwen's boot plan carries an MTP part");
-    assert_eq!(mtp.precision, Precision::Fp8E4M3, "the MTP experts are FP8");
+    assert_eq!(
+        mtp.precision(),
+        Precision::Fp8E4M3,
+        "the MTP experts are FP8"
+    );
     let attention = qwen_fp8
         .requirements()
         .find(|requirement| requirement.part == Part::GqaAttention)
         .expect("a Qwen GQA requirement");
     assert_eq!(
-        attention.precision,
+        attention.precision(),
         Precision::Bf16,
         "the attention weights are BF16"
     );

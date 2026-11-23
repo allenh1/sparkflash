@@ -130,7 +130,7 @@ pub use formats::{
     Bf16, F32, Format, FormatKind, Fp8E4m3, Mat, MxFp8, NvFp4, PackedBf16, PackedOrder,
     ScaleLayout, Scales, Tensor, UploadError, upload,
 };
-pub use parts::{CATALOGUE, PartKernel, carried, image_available, kernels, missing};
+pub use parts::{CATALOGUE, PartKernel, built_format, carried, image_available, kernels, missing};
 pub use parts_backend::{PartsDeviceBackend, PartsDeviceRank, PartsLayer};
 pub use plan::{
     ComputeClass, DType, KernelId, KernelPhase, KernelSymbol, Launch, Layout, Matrix, OpKind,

@@ -42,10 +42,12 @@ use std::fmt;
 use std::fmt::Write as _;
 
 use sparkflash_model::architecture::{Architecture, WeightFormat};
+use sparkflash_model::format::StoredFormat;
 use sparkflash_model::stack::{Shape, StackKind};
 use sparkflash_model::{Part, Target, TpPlan};
 
-use crate::engine_plan::{EnginePlan, PartRequirement, precision_of};
+use crate::engine_plan::EnginePlan;
+use crate::engine_plan::PartRequirement;
 use crate::plan::{KernelPhase, PartGeometry};
 use crate::resolver::{Availability, KernelResolver, ResolveCause, ResolveError};
 use crate::tensor_plan::{
@@ -332,9 +334,9 @@ pub struct ScanRow {
     /// The stored weight format the part's claimed tensors agree on.
     ///
     /// `None` is printed as `?`: the row then has no stored dtype evidence and the scan never
-    /// substitutes a format it did not read. The format is the same one the requirement is
-    /// resolved at, so a row never prints a format the lookup did not use.
-    pub format: Option<WeightFormat>,
+    /// substitutes a format it did not read. The value carries the block, scale kinds and layout,
+    /// so the row states the whole format the requirement was resolved at, not only its name.
+    pub format: Option<StoredFormat>,
     /// The pass this row reports: both when the instance resolved in both passes (or failed in
     /// both), otherwise the single pass that refused it.
     pub pass: KernelPhase,
@@ -586,8 +588,11 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             block,
             stack_of(requirement.part),
             requirement,
-            plan.stored_format(requirement.part, block)
-                .or_else(|| architecture.stored_format(requirement.part)),
+            plan.stored_format(requirement.part, block).or_else(|| {
+                architecture
+                    .stored_format(requirement.part)
+                    .map(WeightFormat::stored_format)
+            }),
             shapes.get(&(stack_of(requirement.part), block, requirement.part)),
         );
     }
@@ -600,8 +605,11 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
                 block,
                 StackKind::Language,
                 requirement,
-                plan.stored_format(requirement.part, block)
-                    .or_else(|| architecture.stored_format(requirement.part)),
+                plan.stored_format(requirement.part, block).or_else(|| {
+                    architecture
+                        .stored_format(requirement.part)
+                        .map(WeightFormat::stored_format)
+                }),
                 shapes.get(&(StackKind::Language, block, requirement.part)),
             );
         }
@@ -759,8 +767,8 @@ fn apply_layout_vision(report: &mut ScanReport, architecture: &Architecture, ind
 }
 
 /// The stored weight format a dtype word names, from the checkpoint's quantization block.
-fn stored_format(dtype: &str, architecture: &Architecture) -> Option<WeightFormat> {
-    match dtype.to_ascii_uppercase().as_str() {
+fn stored_format(dtype: &str, architecture: &Architecture) -> Option<StoredFormat> {
+    let format = match dtype.to_ascii_uppercase().as_str() {
         "BF16" | "BFLOAT16" => Some(WeightFormat::Bf16),
         "F32" | "FLOAT32" => Some(WeightFormat::F32),
         "F8_E4M3" | "F8E4M3" | "FP8" => match architecture.quantization.dense_format {
@@ -772,7 +780,8 @@ fn stored_format(dtype: &str, architecture: &Architecture) -> Option<WeightForma
             _ => Some(WeightFormat::NvFp4 { group_size: 16 }),
         },
         _ => None,
-    }
+    };
+    format.map(WeightFormat::stored_format)
 }
 
 /// Take the patch kernel's frame count from the stored patch projection.
@@ -1037,16 +1046,17 @@ fn push_row(
     block: Option<usize>,
     stack: StackKind,
     requirement: &PartRequirement,
-    stored: Option<WeightFormat>,
+    stored: Option<StoredFormat>,
     claimed: Option<&Shape>,
 ) {
     let shape = claimed
         .cloned()
         .unwrap_or_else(|| part_shape(requirement.part, &requirement.geometry));
-    // Report the format the claimed tensors are stored in, and only when it is the precision
-    // this row is resolved at. A part the layout does not claim falls back to the config's
-    // stated format; neither is guessed from the part kind.
-    let format = stored.filter(|format| precision_of(*format) == requirement.precision);
+    // Report the format the claimed tensors are stored in. A part the layout does not claim falls
+    // back to the config's stated format; neither is guessed from the part kind. The format is
+    // shown even when it did not resolve: a row whose format has no body says "not built" and
+    // names the format, rather than hiding it behind a `?`.
+    let format = stored;
     // Resolve at the plan's precision, exactly as the load path does. Falling back to another
     // precision would report a part resolved that the plan still refuses.
     let prefill = resolver.resolve_for(requirement, KernelPhase::Prefill);
@@ -1069,7 +1079,7 @@ fn push_row(
     });
 }
 
-fn refusal_status(error: &ResolveError, shape: &Shape, format: Option<WeightFormat>) -> ScanStatus {
+fn refusal_status(error: &ResolveError, shape: &Shape, format: Option<StoredFormat>) -> ScanStatus {
     match &error.cause {
         ResolveCause::NoCatalogueEntry => ScanStatus::NoPartKind {
             fix: format!(
@@ -1086,11 +1096,11 @@ fn refusal_status(error: &ResolveError, shape: &Shape, format: Option<WeightForm
             let stored = format.map_or_else(
                 || {
                     format!(
-                        "at the {} precision (the stored format is not in the config)",
-                        error.precision.name()
+                        "reading {} (the stored format is not in the config)",
+                        error.format.describe()
                     )
                 },
-                |format| format!("stored as {}", format.name()),
+                |format| format!("stored as {}", format.describe()),
             );
             ScanStatus::NotBuilt {
                 fix: format!(
@@ -1181,8 +1191,6 @@ fn part_shape(part: Part, geometry: &PartGeometry) -> Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::Precision;
-
     const CONFIG: &str = r#"{"model_type":"","hidden_size":5120,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":128,"vocab_size":128,"max_position_embeddings":16}"#;
 
     fn inputs(target: Target) -> ScanInputs<'static> {
@@ -1366,8 +1374,8 @@ mod tests {
         );
         let fix = vision.status.fix().expect("a fix");
         assert!(
-            fix.contains("at the bf16 precision"),
-            "the refusal must name the precision the plan asked for: {fix}"
+            fix.contains("reading BF16"),
+            "the refusal must name the format the plan asked for: {fix}"
         );
         assert!(!report.is_resolved(), "a 16-patch tower has no body");
     }
@@ -1409,20 +1417,21 @@ mod tests {
                 head_dim: 1,
                 ..PartGeometry::new()
             },
-            precision: Precision::Bf16,
+            format: StoredFormat::BF16,
         };
         let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
         let error = resolver
             .resolve_for(&requirement, KernelPhase::Prefill)
             .expect_err("the catalogue has no one-wide attention");
         let shape = part_shape(requirement.part, &requirement.geometry);
-        let status = refusal_status(&error, &shape, Some(WeightFormat::Bf16));
+        let status = refusal_status(&error, &shape, Some(StoredFormat::BF16));
         let ScanStatus::NotBuilt { fix } = &status else {
             panic!("expected not built, got {status}");
         };
         assert_eq!(
             fix,
-            "add a build-list line for `mla_attention` at 1x1 stored as BF16 on sm121 and rebuild"
+            "add a build-list line for `mla_attention` at 1x1 stored as BF16 (unscaled, row-major) \
+             on sm121 and rebuild"
         );
     }
 
@@ -1521,7 +1530,7 @@ mod tests {
         let error = ResolveError {
             part: Part::Moe,
             target: Target::Sm121,
-            precision: Precision::Bf16,
+            format: StoredFormat::BF16,
             phase: KernelPhase::Prefill,
             reasons: Vec::new(),
             cause: ResolveCause::NoCatalogueEntry,
@@ -1788,5 +1797,40 @@ mod tests {
             assert_eq!(status.to_string(), name);
             assert_eq!(status.fix().is_some(), has_fix);
         }
+    }
+
+    #[test]
+    fn a_format_with_no_body_is_not_built_and_names_the_format() {
+        // MXFP4 is a real stored format (one release stores its routed experts that way) and
+        // no head body decodes it. The row must say so and name the format, its block and its
+        // scale kind: before the format reached the catalogue key, the requirement was folded
+        // to NVFP4 and this lookup resolved against a body that would have misread the weights.
+        let requirement = PartRequirement {
+            part: Part::LmHead,
+            geometry: PartGeometry {
+                hidden: 5120,
+                vocab: 129_280,
+                rows: 1,
+                world: 4,
+                rank: 0,
+                ..PartGeometry::new()
+            },
+            format: StoredFormat::MXFP4_32,
+        };
+        let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
+        let error = resolver
+            .resolve_for(&requirement, KernelPhase::Decode)
+            .expect_err("no lm_head body decodes MXFP4");
+        let status = refusal_status(
+            &error,
+            &Shape::new([129_280, 5120]),
+            Some(StoredFormat::MXFP4_32),
+        );
+        let ScanStatus::NotBuilt { fix } = &status else {
+            panic!("expected not built, got {status}");
+        };
+        assert!(fix.contains("stored as MXFP4"), "{fix}");
+        assert!(fix.contains("power-of-two grid"), "{fix}");
+        assert!(fix.contains("one scale per 32 values"), "{fix}");
     }
 }

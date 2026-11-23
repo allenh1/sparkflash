@@ -186,7 +186,7 @@ pub(crate) fn failures(plan: &EnginePlan, availability: Availability) -> Vec<Str
                 let line = format!(
                     "{} [{geometry}] at {} ({} pass): {reason}",
                     requirement.part,
-                    requirement.precision.name(),
+                    requirement.precision().name(),
                     phase.name()
                 );
                 if seen.insert(line.clone()) {

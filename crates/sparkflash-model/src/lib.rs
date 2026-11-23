@@ -40,6 +40,7 @@ pub mod defaults;
 pub mod descriptor;
 pub mod dflash2;
 pub mod engine;
+pub mod format;
 pub mod gumbel;
 pub mod layout;
 pub mod ledger;
@@ -89,6 +90,7 @@ pub use descriptor::{
     model_max_output_tokens,
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};
+pub use format::{FormatLayout, FormatValues, ScaleKind, StoredFormat};
 pub use layout::{
     Layout, LayoutDescription, LayoutDtype, LayoutError, LayoutSet, LayoutTensor, LayoutValue,
     TensorSplit,

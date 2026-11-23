@@ -375,7 +375,7 @@ fn render_formats(out: &mut String, architecture: &Architecture, input: &Input, 
                 by_part
                     .entry(requirement.part)
                     .or_default()
-                    .insert(requirement.precision.name());
+                    .insert(requirement.precision().name());
             }
             let _ = writeln!(out, "per-part arithmetic formats (TP1):");
             for (part, precisions) in by_part {
