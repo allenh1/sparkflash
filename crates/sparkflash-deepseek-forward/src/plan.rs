@@ -705,10 +705,35 @@ static HANDLES: Mutex<Option<KernelHandles>> = Mutex::new(None);
 /// No plan is installed, or a catalogue entry this forward launches is missing.
 #[must_use]
 pub fn handles() -> KernelHandles {
-    HANDLES
+    let installed = *HANDLES
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .unwrap_or_else(|| panic!("forward open: no kernel handles installed"))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(handles) = installed {
+        return handles;
+    }
+    // A unit test that exercises a refusal or a diagnostic does not open a checkpoint. The
+    // released description is still the one whose symbols and catalogue positions it names, so
+    // install that plan once rather than reintroducing a symbol literal for the test's sake.
+    #[cfg(test)]
+    {
+        if let Ok(plan) = EnginePlan::from_json(
+            include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            ),
+            Target::Sm121,
+            4,
+            0,
+        ) {
+            let _ = install(plan);
+            if let Some(handles) = *HANDLES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                return handles;
+            }
+        }
+    }
+    panic!("forward open: no kernel handles installed")
 }
 
 // The geometry the per-token code reads on every call. Set once at install, read without a

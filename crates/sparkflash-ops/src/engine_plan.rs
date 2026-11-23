@@ -1445,6 +1445,10 @@ fn geometry_for(
         }
         Part::SoftcappedActivation => {}
         Part::Csa2Compression => {
+            // The compressor pools and appends the MLA head's latent rows, so its compiled body
+            // carries the attention head width beside the compression ratio. The generated
+            // catalogue rule names both; leaving the width at zero refused the released config.
+            geometry.head_dim = attention.head_dim;
             geometry.ratio = attention
                 .compression
                 .as_ref()
