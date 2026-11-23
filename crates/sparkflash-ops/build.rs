@@ -72,6 +72,19 @@ fn generate() -> String {
         let Some(key) = table.get("catalogue").and_then(toml::Value::as_str) else {
             continue;
         };
+        // The drafter's part geometry is its hidden width; its experts and top-k belong to the
+        // routed bodies that already carry the same key, and its latent, stream, tap and Markov
+        // values have no PartGeometry field. It still proves the key's hidden width.
+        let family = table
+            .get("family")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
+        if family == "drafter" {
+            let width = get("hidden");
+            keys.entry(key.to_owned()).or_default();
+            hidden.entry(key.to_owned()).or_default().insert(width);
+            continue;
+        }
         let shape = (get("hidden"), get("experts"), get("top_k"));
         keys.entry(key.to_owned()).or_default().insert(shape);
         hidden.entry(key.to_owned()).or_default().insert(shape.0);
