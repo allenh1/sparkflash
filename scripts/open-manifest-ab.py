@@ -47,6 +47,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -255,6 +256,36 @@ def launch(args, out):
     if result.returncode != 0:
         raise SystemExit(f"open-manifest-ab: launcher failed; see {log_path}")
     wait_ready(args.url, args.timeout)
+    return env["SPARKFLASH_RUN_ID"]
+
+
+def collect_workers(args, out, run_id):
+    """Copy each worker's manifest, launch trace and rank log back to this node.
+
+    The trace paths are the same absolute paths on every node, but a home directory is
+    per-node: ranks 1..3 write into their own copy of the run directory. Without this copy the
+    record is rank 0's alone, and a comparison would pass while three ranks' records were
+    missing.
+    """
+    log_dir = os.path.join(out, "logs", run_id)
+    os.makedirs(log_dir, exist_ok=True)
+    user = os.environ.get("SSH_USER", "")
+    for rank in range(1, RANKS):
+        host = f"{user}@{args.nodes[rank]}" if user else args.nodes[rank]
+        for name in (f"manifest-r{rank}.jsonl", f"launch-r{rank}.trace"):
+            remote = os.path.join(out, name)
+            subprocess.run(
+                ["scp", "-q", "-o", "BatchMode=yes", f"{host}:{remote}", remote],
+                check=True,
+            )
+        remote = os.path.join(log_dir, f"rank{rank}.log")
+        subprocess.run(
+            ["scp", "-q", "-o", "BatchMode=yes", f"{host}:{remote}", remote],
+            check=False,
+        )
+    local = os.path.join(log_dir, "local-commands.txt")
+    if os.path.isfile(local):
+        shutil.copyfile(local, os.path.join(out, "local-commands.txt"))
 
 
 def stop(args):
@@ -331,11 +362,14 @@ def record_build(args, out, build):
     args.build = os.path.abspath(build)
     args.url = args.url.rstrip("/")
     clean(out)
+    run_id = None
     try:
-        launch(args, out)
+        run_id = launch(args, out)
         speeds = run_workload(args)
     finally:
         stop(args)
+        if run_id:
+            collect_workers(args, out, run_id)
     with open(os.path.join(out, "speeds.json"), "w", encoding="utf-8") as handle:
         json.dump(speeds, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -441,12 +475,8 @@ def main():
         )
         p.add_argument("--checkpoint", required=True, help="checkpoint directory on every node")
         p.add_argument("--tokenizer", required=True, help="tokenizer file on every node")
-        p.add_argument("--cubins", help="cubin directory on every node (device path)")
-        p.add_argument(
-            "--site-script",
-            default="scripts/serve-four-node.sh",
-            help="the four-node launcher, relative to the repository root",
-        )
+        p.add_argument("--cubins", required=True, help="cubin directory on every node")
+        p.add_argument("--site-script", required=True, help="the four-node launcher path")
         p.add_argument("--url", required=True, help="the served OpenAI-compatible base URL")
         p.add_argument("--max-tokens", type=int, default=32)
         p.add_argument("--draft-tokens", type=int, default=128)
