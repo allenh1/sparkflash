@@ -20,6 +20,7 @@ import importlib.util
 import os
 import struct
 import tempfile
+import types
 import unittest
 import zlib
 
@@ -99,6 +100,23 @@ class OpenManifestAbTest(unittest.TestCase):
         os.makedirs(new)
         self.assertFalse(ab.compare(old, new, 0.05))
 
+    def test_the_launcher_environment_comes_from_arguments(self):
+        args = types.SimpleNamespace(
+            nodes=["a", "b", "c", "d"],
+            checkpoint="/checkpoint",
+            tokenizer="/tokenizer",
+            cubins=None,
+            build="/build/sparkflash",
+        )
+        out = self.path("record")
+        env = ab.launch_env(args, out)
+        self.assertEqual(env["SPARK_NODES"], "a b c d")
+        self.assertEqual(env["SPARKFLASH_CHECKPOINT"], "/checkpoint")
+        self.assertEqual(env["SPARKFLASH_TOKENIZER"], "/tokenizer")
+        self.assertNotIn("SPARKFLASH_CUBINS", env)
+        self.assertEqual(env["SPARKFLASH_BIN"], "/build/sparkflash")
+        self.assertEqual(ab.launcher_env(args)["SPARK_NODES"], "a b c d")
+
     def test_the_png_fixture_has_valid_chunk_crcs_and_an_iend(self):
         data = base64.b64decode(ab.DOT_PNG, validate=True)
         chunks = png_chunks(data)
@@ -114,7 +132,6 @@ class OpenManifestAbTest(unittest.TestCase):
         import http.server
         import json
         import threading
-        import types
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):

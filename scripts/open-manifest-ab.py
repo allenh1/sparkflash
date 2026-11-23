@@ -210,10 +210,16 @@ def clean(out):
             os.unlink(path)
 
 
-def launch_env(args, out):
-    """The launcher's environment: every host and path comes from an argument."""
+def launcher_env(args):
+    """The environment every launcher mode needs: the node list comes from an argument."""
     env = dict(os.environ)
     env["SPARK_NODES"] = " ".join(args.nodes)
+    return env
+
+
+def launch_env(args, out):
+    """The launcher's environment: every host and path comes from an argument."""
+    env = launcher_env(args)
     env["SPARKFLASH_CHECKPOINT"] = args.checkpoint
     env["SPARKFLASH_TOKENIZER"] = args.tokenizer
     if args.cubins:
@@ -254,7 +260,7 @@ def launch(args, out):
 def stop(args):
     subprocess.run(
         ["bash", args.site_script, "stop"],
-        env=dict(os.environ),
+        env=launcher_env(args),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         timeout=args.stop_timeout,
