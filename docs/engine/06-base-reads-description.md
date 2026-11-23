@@ -99,8 +99,9 @@ then one comparison for each change that alters what is bound, loaded or launche
 
 ### A. Harness and inventory (first, one owner)
 
-* The open manifest, the replay workload and one script that records and compares manifest,
-  launch trace, tick trace and speed.
+* The open manifest (`SPARKFLASH_OPEN_MANIFEST`), the replay workload and the in-repo script
+  `scripts/open-manifest-ab.py`, which records and compares manifest, launch trace, tick trace
+  and speed.
 * A rule test with pinned per-file counts that may only fall: reads of `ModelConfig`, uses of
   model constants and literals, tensor-name strings, kernel-symbol strings. Four-rank sites are
   counted on their own list, which milestone 3 drains.
