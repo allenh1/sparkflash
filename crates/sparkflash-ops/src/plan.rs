@@ -20,6 +20,7 @@
 //! improvement land in every model without a graph runtime or a host round trip.
 
 use sparkflash_model::Target;
+use sparkflash_model::format::StoredFormat;
 
 use crate::error::OpError;
 
@@ -36,6 +37,8 @@ pub enum DType {
     MxFp8,
     /// NVFP4: E2M1 codes with one E4M3 scale each 16 values and a per-tensor scale.
     NvFp4,
+    /// MXFP4: E2M1 codes with one power-of-two scale each 32 values.
+    MxFp4,
     /// Signed 32-bit integer, for indices and counters.
     I32,
     /// Unsigned 32-bit integer, for token ids.
@@ -49,7 +52,7 @@ impl DType {
         match self {
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::Bf16 => 2,
-            Self::Fp8E4M3 | Self::MxFp8 | Self::NvFp4 => 1,
+            Self::Fp8E4M3 | Self::MxFp8 | Self::NvFp4 | Self::MxFp4 => 1,
         }
     }
 
@@ -57,7 +60,7 @@ impl DType {
     #[must_use]
     pub const fn row_alignment(self) -> usize {
         match self {
-            Self::MxFp8 => 32,
+            Self::MxFp8 | Self::MxFp4 => 32,
             Self::NvFp4 => 16,
             _ => 16,
         }
@@ -72,6 +75,7 @@ impl DType {
             Self::Fp8E4M3 => "e4m3",
             Self::MxFp8 => "mxfp8",
             Self::NvFp4 => "nvfp4",
+            Self::MxFp4 => "mxfp4",
             Self::I32 => "i32",
             Self::U32 => "u32",
         }
@@ -91,6 +95,12 @@ pub enum Precision {
     MxFp8,
     /// NVFP4 operands with an f32 accumulator.
     NvFp4,
+    /// MXFP4 operands with an f32 accumulator.
+    ///
+    /// MXFP4 is its own arithmetic, not an NVFP4 spelling: one power-of-two code every 32 values
+    /// applies exactly, where NVFP4's per-16 E4M3 group and tensor-wide factor do not. Folding the
+    /// two let a release whose experts are stored MXFP4 resolve against an NVFP4 body.
+    MxFp4,
 }
 
 impl Precision {
@@ -103,6 +113,7 @@ impl Precision {
             Self::Fp8E4M3 => DType::Fp8E4M3,
             Self::MxFp8 => DType::MxFp8,
             Self::NvFp4 => DType::NvFp4,
+            Self::MxFp4 => DType::MxFp4,
         }
     }
 
@@ -604,6 +615,13 @@ pub struct KernelSymbol {
     pub rows: RowBand,
     /// The shapes this body's own arithmetic accepts, beyond its entry's rule.
     pub shape: ShapeConstraint,
+    /// The stored format this body decodes, when it reads a stored tensor.
+    ///
+    /// `None` is an activation-only body whose arithmetic does not depend on a weight's stored
+    /// format. A body that names a format is eligible only for that arithmetic
+    /// ([StoredFormat::same_arithmetic]), so the catalogue is keyed by part, image and format: a
+    /// release stored another way is refused by name instead of run through the wrong decode.
+    pub format: Option<StoredFormat>,
 }
 
 impl KernelSymbol {
@@ -622,6 +640,7 @@ impl KernelSymbol {
             class,
             rows,
             shape: ShapeConstraint::ANY,
+            format: crate::parts::entry_format(name),
         }
     }
 
@@ -640,6 +659,7 @@ impl KernelSymbol {
             class,
             rows,
             shape: ShapeConstraint::ANY,
+            format: crate::parts::entry_format(name),
         }
     }
 
@@ -658,6 +678,7 @@ impl KernelSymbol {
             class,
             rows,
             shape: ShapeConstraint::ANY,
+            format: crate::parts::entry_format(name),
         }
     }
 
@@ -682,6 +703,27 @@ impl KernelSymbol {
         self.shape = shape;
         self
     }
+
+    /// This symbol decoding exactly `format`.
+    #[must_use]
+    pub const fn decoding(mut self, format: StoredFormat) -> Self {
+        self.format = Some(format);
+        self
+    }
+
+    /// Whether this body decodes `format`'s arithmetic.
+    ///
+    /// A body that names no format accepts any; a body that names one accepts the same values,
+    /// block and scales, read through whichever layout the body was compiled for.
+    #[must_use]
+    pub fn decodes(&self, format: StoredFormat) -> bool {
+        self.format.is_none_or(|declared| {
+            declared.same_arithmetic(format)
+                // Both unscaled: bf16 and f32 are one operand class, and the precision mask
+                // decides which of the two the body's arithmetic accepts.
+                || (declared.is_unscaled() && format.is_unscaled())
+        })
+    }
 }
 
 /// The set of operand precisions a kernel accepts.
@@ -692,7 +734,7 @@ impl PrecisionMask {
     /// No precision.
     pub const NONE: Self = Self(0);
     /// Every precision this tree knows.
-    pub const ALL: Self = Self(0b1_1111);
+    pub const ALL: Self = Self(0b11_1111);
 
     /// The mask naming exactly `precisions`.
     #[must_use]
@@ -715,6 +757,7 @@ impl PrecisionMask {
             Precision::Fp8E4M3 => 0b00100,
             Precision::MxFp8 => 0b01000,
             Precision::NvFp4 => 0b10000,
+            Precision::MxFp4 => 0b10_0000,
         })
     }
 

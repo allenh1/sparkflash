@@ -315,7 +315,7 @@ impl SparseIndexerLauncher {
                 entry
                     .symbols
                     .iter()
-                    .filter(|symbol| symbol.accepts(requirement.precision))
+                    .filter(|symbol| symbol.accepts(requirement.precision()))
                     .map(|symbol| {
                         let (grid, block) =
                             indexer_geometry(symbol.name, requirement, rows, position);

@@ -106,11 +106,24 @@ OPTIONAL = {
 # The catalogue generator understands these dimensions as shape claims. A key may name a subset
 # with catalogue_dims; a key without it keeps the router/routed convention.
 CATALOGUE_DIMS = {"hidden", "head_dim", "intermediate", "experts", "top_k", "ratio", "positions"}
+# The stored formats an instance may state: the values, the block a scale covers and the layout
+# an entry's body reads. sparkflash-ops' build script is the other reader; the two lists agree.
+FORMATS = {
+    "bf16",
+    "f32",
+    "fp8",
+    "mx-fp8",
+    "mx-fp8-tiled",
+    "mx-fp8-row",
+    "nvfp4",
+    "mx-fp4",
+}
 ALLOWED = {
     "source",
     "entry",
     "cubin",
     "family",
+    "format",
     "catalogue",
     "catalogue_intermediate",
     "catalogue_hidden",
@@ -182,6 +195,12 @@ def load() -> list[dict]:
                 f"-DSPARK_INSTANCE_{entry.upper()}_{key.upper()}={value}u"
             )
             shapes[key] = value
+        stored_format = row.get("format")
+        if stored_format not in FORMATS:
+            raise SystemExit(
+                f"{INSTANCES}: instance {number} ({entry}): format {stored_format!r} is not one "
+                f"of {sorted(FORMATS)}"
+            )
         catalogue = row.get("catalogue")
         if catalogue is not None and (not isinstance(catalogue, str) or not catalogue):
             raise SystemExit(f"{INSTANCES}: instance {number}: bad catalogue key")

@@ -53,6 +53,7 @@
 use sparkflash_kernels::images::Image;
 use sparkflash_model::Architecture;
 use sparkflash_model::architecture::WeightFormat;
+use sparkflash_model::format::StoredFormat;
 use sparkflash_model::vision_geometry::{
     VisionActivation, VisionDownsample, VisionNorm, VisionPosition,
 };
@@ -69,8 +70,45 @@ use sparkflash_model::parts::PartSet;
 // width or expert count the cubins do not carry.
 include!(concat!(env!("OUT_DIR"), "/kernel_instances.rs"));
 
+impl PartKernel {
+    /// Whether some symbol of this implementation decodes `format`.
+    #[must_use]
+    pub fn decodes(&self, format: StoredFormat) -> bool {
+        self.symbols.iter().any(|symbol| symbol.decodes(format))
+    }
+
+    /// The stored formats at least one symbol of this implementation decodes.
+    pub fn formats(&self) -> impl Iterator<Item = StoredFormat> + '_ {
+        let mut seen: Vec<StoredFormat> = Vec::new();
+        self.symbols.iter().filter_map(move |symbol| {
+            let format = symbol.format?;
+            if seen.contains(&format) {
+                None
+            } else {
+                seen.push(format);
+                Some(format)
+            }
+        })
+    }
+}
+
+/// The stored format the instance that builds `symbol` states, if an instance builds it.
+///
+/// The build's record of what the source reads, generated from `kernels/instances.toml`: a
+/// catalogue symbol that an instance builds cannot claim another format, and a format the build
+/// did not state is refused at both ends.
+#[must_use]
+pub fn built_format(symbol: &str) -> Option<StoredFormat> {
+    entry_format(symbol)
+}
+
 /// One implementation of a [Part]: the target it runs on, the image that carries it and the
 /// kernel symbols the image exports.
+///
+/// The catalogue is keyed by the part, the image and the stored format a symbol decodes. A
+/// symbol's [KernelSymbol::format] is the format the build recorded for it
+/// ([built_format]), so two bodies in one image that read different arithmetic are told apart
+/// by this key rather than by their names or their position in a list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartKernel {
     /// The model-side part this entry implements.
@@ -663,22 +701,16 @@ pub const CATALOGUE: &[PartKernel] = &[
         Image::Deepseek,
         &[
             deepseek_sym("cert_lm_head_sm121", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym("opt_lm_head", &[Precision::Fp8E4M3, Precision::MxFp8]),
-            deepseek_sym("opt_rows_lm_head", &[Precision::NvFp4]),
+            deepseek_sym("opt_lm_head", &[Precision::Bf16]),
+            deepseek_sym("opt_rows_lm_head", &[Precision::Bf16]),
             deepseek_sym("opt_rows_argmax_fold", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "opt_rows_argmax_pick",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_rows_store_u32", &[Precision::NvFp4]),
-            deepseek_sym("opt_head_screen_build", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "opt_head_screen_exact",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_head_screen_mma", &[Precision::NvFp4]),
-            deepseek_sym("opt_head_screen_rows", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym("opt_rows_topc", &[Precision::Fp8E4M3, Precision::MxFp8]),
+            deepseek_sym("opt_rows_argmax_pick", &[Precision::F32, Precision::Bf16]),
+            deepseek_sym("opt_rows_store_u32", &[Precision::F32]),
+            deepseek_sym("opt_head_screen_build", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_head_screen_exact", &[Precision::Bf16]),
+            deepseek_sym("opt_head_screen_mma", &[Precision::Bf16]),
+            deepseek_sym("opt_head_screen_rows", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_rows_topc", &[Precision::F32]),
             // The device reduction the forward's uncertified head path launches when the
             // certified screen is unavailable: four rank shards folded to one logit row.
             deepseek_sym("lm_head_reduce_sm121", &[Precision::F32, Precision::Bf16]),
@@ -792,76 +824,28 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             deepseek_sym(
                 "compressed_append_sm121",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
+                &[Precision::Bf16, Precision::F32],
             ),
             deepseek_sym(
                 "compressed_selected_fill_sm121",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
+                &[Precision::Bf16, Precision::F32],
             ),
-            deepseek_sym(
-                "pool_group_f32",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_pool_rows",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_rows_group_pool",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_rows_group_keys",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_rows_group_append",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16w",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16w_f32o",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_f32w_f32o",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16a_bf16w",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16a_bf16w_f32o",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16a_f32w_f32o",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_rows_hostw_bf16w",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_rows_hostw_bf16w_f32o",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_rows_hostw_f32w_f32o",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_rows_hostw_bf16w_f32o_ring",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
-            deepseek_sym(
-                "opt_rows_hostw_f32w_f32o_ring",
-                &[Precision::Bf16, Precision::MxFp8, Precision::Fp8E4M3],
-            ),
+            deepseek_sym("pool_group_f32", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_pool_rows", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_rows_group_pool", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_rows_group_keys", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_rows_group_append", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_mma_hostw_bf16w", &[Precision::Bf16]),
+            deepseek_sym("opt_mma_hostw_bf16w_f32o", &[Precision::Bf16]),
+            deepseek_sym("opt_mma_hostw_f32w_f32o", &[Precision::F32]),
+            deepseek_sym("opt_mma_hostw_bf16a_bf16w", &[Precision::Bf16]),
+            deepseek_sym("opt_mma_hostw_bf16a_bf16w_f32o", &[Precision::Bf16]),
+            deepseek_sym("opt_mma_hostw_bf16a_f32w_f32o", &[Precision::F32]),
+            deepseek_sym("opt_rows_hostw_bf16w", &[Precision::Bf16]),
+            deepseek_sym("opt_rows_hostw_bf16w_f32o", &[Precision::Bf16]),
+            deepseek_sym("opt_rows_hostw_f32w_f32o", &[Precision::F32]),
+            deepseek_sym("opt_rows_hostw_bf16w_f32o_ring", &[Precision::Bf16]),
+            deepseek_sym("opt_rows_hostw_f32w_f32o_ring", &[Precision::F32]),
         ],
         true,
     ),
@@ -869,186 +853,26 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::SparseIndexer,
         Image::Deepseek,
         &[
-            deepseek_sym(
-                "opt_ref_select_fast",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_mma_index_scores",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_select_scores",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_select_scores_rows",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_select_scores_seg",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_select_scores_segs",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_select_rows",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_select_rows_bf16",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_select_rows_tab",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16w",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16w_f32o",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_f32w_f32o",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16a_bf16w",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16a_bf16w_f32o",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_mma_hostw_bf16a_f32w_f32o",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_rows_hostw_bf16w",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_rows_hostw_bf16w_f32o",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "opt_rows_hostw_f32w_f32o",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "scale_index_weights_bf16_to_f32",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "ref_select_sm121",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
+            deepseek_sym("opt_ref_select_fast", &[Precision::MxFp8]),
+            deepseek_sym("opt_mma_index_scores", &[Precision::MxFp8]),
+            deepseek_sym("opt_select_scores", &[Precision::MxFp8]),
+            deepseek_sym("opt_select_scores_rows", &[Precision::MxFp8]),
+            deepseek_sym("opt_select_scores_seg", &[Precision::MxFp8]),
+            deepseek_sym("opt_select_scores_segs", &[Precision::MxFp8]),
+            deepseek_sym("opt_select_rows", &[Precision::MxFp8]),
+            deepseek_sym("opt_select_rows_bf16", &[Precision::MxFp8]),
+            deepseek_sym("opt_select_rows_tab", &[Precision::MxFp8]),
+            deepseek_sym("opt_mma_hostw_bf16w", &[Precision::Bf16]),
+            deepseek_sym("opt_mma_hostw_bf16w_f32o", &[Precision::Bf16]),
+            deepseek_sym("opt_mma_hostw_f32w_f32o", &[Precision::F32]),
+            deepseek_sym("opt_mma_hostw_bf16a_bf16w", &[Precision::Bf16]),
+            deepseek_sym("opt_mma_hostw_bf16a_bf16w_f32o", &[Precision::Bf16]),
+            deepseek_sym("opt_mma_hostw_bf16a_f32w_f32o", &[Precision::F32]),
+            deepseek_sym("opt_rows_hostw_bf16w", &[Precision::Bf16]),
+            deepseek_sym("opt_rows_hostw_bf16w_f32o", &[Precision::Bf16]),
+            deepseek_sym("opt_rows_hostw_f32w_f32o", &[Precision::F32]),
+            deepseek_sym("scale_index_weights_bf16_to_f32", &[Precision::F32]),
+            deepseek_sym("ref_select_sm121", &[Precision::MxFp8]),
         ],
         true,
     ),
@@ -1187,19 +1011,13 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             deepseek_sym(
                 "swiglu_mxfp8_quant_sm121",
-                &[Precision::F32, Precision::Bf16],
+                &[Precision::Bf16, Precision::F32, Precision::MxFp8],
             ),
-            deepseek_sym(
-                "opt_mma_bf16a_bf16o",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_mma_f32a_f32o", &[Precision::NvFp4]),
-            deepseek_sym("opt_mma_fp8_bf16o", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "opt_mma_bf16a_f32o",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("shared_swiglu_f32", &[Precision::NvFp4]),
+            deepseek_sym("opt_mma_bf16a_bf16o", &[Precision::MxFp8]),
+            deepseek_sym("opt_mma_f32a_f32o", &[Precision::MxFp8]),
+            deepseek_sym("opt_mma_fp8_bf16o", &[Precision::MxFp8]),
+            deepseek_sym("opt_mma_bf16a_f32o", &[Precision::MxFp8]),
+            deepseek_sym("shared_swiglu_f32", &[Precision::Bf16, Precision::F32]),
         ],
         true,
     ),
@@ -1274,118 +1092,51 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseGemm,
         Image::Deepseek,
         &[
-            deepseek_sym(
-                "b12x_bf16a_mxfp8w_wo_a_sm121",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "b12x_mxfp8_gemv_m1_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("b12x_hostw_gemv_m1_bf16w_sm121", &[Precision::NvFp4]),
-            deepseek_sym(
-                "b12x_hostw_gemv_m1_f32w_f32o_sm121",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "opt_mma_bf16a_bf16o",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_mma_f32a_f32o", &[Precision::NvFp4]),
-            deepseek_sym("opt_mma_fp8_bf16o", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "b12x_hostw_gemv_m1_bf16w_f32o_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("b12x_mxfp8_gemv_m1_f32a_f32o_sm121", &[Precision::NvFp4]),
-            deepseek_sym(
-                "b12x_mxfp8_gemv_m1_nf_f32a_sm121",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "b12x_mxfp8_gemv_m1_nf_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_mma_f32a_bf16o", &[Precision::NvFp4]),
-            deepseek_sym(
-                "opt_gemv_bf16a_bf16o_t1",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "opt_gemv_bf16a_bf16o_t2",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_gemv_bf16a_bf16o_t4", &[Precision::NvFp4]),
-            deepseek_sym(
-                "opt_gemv_bf16a_bf16o_t8",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "opt_gemv_f32a_bf16o_t1",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_gemv_f32a_bf16o_t2", &[Precision::NvFp4]),
-            deepseek_sym("opt_gemv_f32a_bf16o_t4", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "opt_gemv_f32a_bf16o_t8",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_gemv_f32a_f32o_t1", &[Precision::NvFp4]),
-            deepseek_sym("opt_gemv_f32a_f32o_t2", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "opt_gemv_f32a_f32o_t4",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_gemv_f32a_f32o_t8", &[Precision::NvFp4]),
-            deepseek_sym("opt_gemv_fp8a_bf16o_t1", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "opt_gemv_fp8a_bf16o_t2",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_gemv_fp8a_bf16o_t4", &[Precision::NvFp4]),
-            deepseek_sym("opt_gemv_fp8a_bf16o_t8", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "opt_gemv_mma_bf16a_bf16o_m1",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_gemv_mma_bf16a_bf16o_m2", &[Precision::NvFp4]),
-            deepseek_sym(
-                "opt_gemv_mma_fp8a_bf16o_m1",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "opt_gemv_rows_bf16a_bf16o_r8c1",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_gemv_rows_bf16a_bf16o_r8c2", &[Precision::NvFp4]),
-            deepseek_sym(
-                "opt_gemv_rows_f32a_f32o_r4c1",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "opt_gemv_rows_f32a_f32o_r4c2",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_gemv_rows_fp8a_bf16o_r4c1", &[Precision::NvFp4]),
-            deepseek_sym(
-                "opt_gemv_rows_fp8a_bf16o_r8c1",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "opt_gemv_rows_fp8a_bf16o_r8c2",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
+            deepseek_sym("b12x_bf16a_mxfp8w_wo_a_sm121", &[Precision::MxFp8])
+                .decoding(StoredFormat::MXFP8_TILED_32),
+            deepseek_sym("b12x_mxfp8_gemv_m1_sm121", &[Precision::MxFp8]),
+            deepseek_sym("b12x_hostw_gemv_m1_bf16w_sm121", &[Precision::Bf16]),
+            deepseek_sym("b12x_hostw_gemv_m1_f32w_f32o_sm121", &[Precision::F32]),
+            deepseek_sym("opt_mma_bf16a_bf16o", &[Precision::MxFp8]),
+            deepseek_sym("opt_mma_f32a_f32o", &[Precision::MxFp8]),
+            deepseek_sym("opt_mma_fp8_bf16o", &[Precision::MxFp8]),
+            deepseek_sym("b12x_hostw_gemv_m1_bf16w_f32o_sm121", &[Precision::Bf16]),
+            deepseek_sym("b12x_mxfp8_gemv_m1_f32a_f32o_sm121", &[Precision::MxFp8]),
+            deepseek_sym("b12x_mxfp8_gemv_m1_nf_f32a_sm121", &[Precision::MxFp8]),
+            deepseek_sym("b12x_mxfp8_gemv_m1_nf_sm121", &[Precision::MxFp8]),
+            deepseek_sym("opt_mma_f32a_bf16o", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_bf16a_bf16o_t1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_bf16a_bf16o_t2", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_bf16a_bf16o_t4", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_bf16a_bf16o_t8", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_f32a_bf16o_t1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_f32a_bf16o_t2", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_f32a_bf16o_t4", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_f32a_bf16o_t8", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_f32a_f32o_t1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_f32a_f32o_t2", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_f32a_f32o_t4", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_f32a_f32o_t8", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_fp8a_bf16o_t1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_fp8a_bf16o_t2", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_fp8a_bf16o_t4", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_fp8a_bf16o_t8", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_mma_bf16a_bf16o_m1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_mma_bf16a_bf16o_m2", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_mma_fp8a_bf16o_m1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_rows_bf16a_bf16o_r8c1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_rows_bf16a_bf16o_r8c2", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_rows_f32a_f32o_r4c1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_rows_f32a_f32o_r4c2", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_rows_fp8a_bf16o_r4c1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_rows_fp8a_bf16o_r8c1", &[Precision::MxFp8]),
+            deepseek_sym("opt_gemv_rows_fp8a_bf16o_r8c2", &[Precision::MxFp8]),
             // The non-split MXFP8 dense fallback: the 64x64 tiled body the forward launches
             // when the split/tile variants are not staged, E4M3 codes over ue8m0 scales.
-            deepseek_sym(
-                "b12x_mxfp8_dense_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
+            deepseek_sym("b12x_mxfp8_dense_sm121", &[Precision::MxFp8]),
             // The untiled MXFP8 wo_a fallback beside the BF16-activation native path above.
-            deepseek_sym(
-                "b12x_mxfp8_wo_a_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
+            deepseek_sym("b12x_mxfp8_wo_a_sm121", &[Precision::MxFp8])
+                .decoding(StoredFormat::MXFP8_TILED_32),
         ],
         true,
     ),
@@ -1524,10 +1275,7 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "swiglu_mxfp8_quant_weighted_sm121",
                 &[Precision::Bf16, Precision::F32, Precision::MxFp8],
             ),
-            deepseek_sym(
-                "shared_swiglu_f32",
-                &[Precision::Bf16, Precision::F32, Precision::MxFp8],
-            ),
+            deepseek_sym("shared_swiglu_f32", &[Precision::Bf16, Precision::F32]),
             deepseek_sym(
                 "opt_rows_shared_swiglu",
                 &[Precision::Bf16, Precision::F32, Precision::MxFp8],
@@ -1690,29 +1438,34 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::Quantize,
         Image::Deepseek,
         &[
+            // A quantiser's mask names both sides: the operand class it reads (f32, bf16) and
+            // the class it writes. `opt_bulk_fp4_pack` packs E2M1 codes with an E4M3 scale a 16
+            // (the packed FP4 cache), the prologue writes E4M3 codes with one ue8m0 a 32
+            // (MXFP8), and `window_quant_fp8_bf16` writes one ue8m0 a row
+            // (`kernels/kv_path_sm121.cu`). The plan picks among them by output dtype.
             deepseek_sym(
                 "opt_bulk_fp4_pack",
-                &[Precision::F32, Precision::Bf16, Precision::Fp8E4M3],
+                &[Precision::F32, Precision::Bf16, Precision::NvFp4],
             ),
             deepseek_sym(
                 "w8a8_prologue_e4m3",
-                &[Precision::F32, Precision::Bf16, Precision::Fp8E4M3],
+                &[Precision::F32, Precision::Bf16, Precision::MxFp8],
             ),
             deepseek_sym(
                 "opt_rows_prologue_bf16",
-                &[Precision::F32, Precision::Bf16, Precision::Fp8E4M3],
+                &[Precision::F32, Precision::Bf16, Precision::MxFp8],
             ),
             deepseek_sym(
                 "window_quant_fp8_bf16",
-                &[Precision::F32, Precision::Bf16, Precision::Fp8E4M3],
+                &[Precision::F32, Precision::Bf16, Precision::MxFp8],
             ),
             deepseek_sym(
                 "fp4_round_trip_bf16_to_f32",
-                &[Precision::F32, Precision::Bf16, Precision::Fp8E4M3],
+                &[Precision::Bf16, Precision::F32, Precision::NvFp4],
             ),
             deepseek_sym(
                 "w8a8_prologue_bf16_e4m3",
-                &[Precision::F32, Precision::Bf16, Precision::Fp8E4M3],
+                &[Precision::F32, Precision::Bf16, Precision::MxFp8],
             ),
         ],
         true,
@@ -1745,39 +1498,23 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::Moe,
         Image::Deepseek,
         &[
-            deepseek_sym(
-                "b12x_mxfp4_moe_stored_sm121",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "opt_moe_gate_up_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_moe_gate_up_k3_sm121", &[Precision::NvFp4]),
-            deepseek_sym(
-                "opt_moe_down_combine_sm121",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "opt_moe_down_combine_k3_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_mma_moe_gate_up", &[Precision::NvFp4]),
-            deepseek_sym("opt_mma_moe_down", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "moe_expert_stage_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_moe_down_dedup_sm121", &[Precision::NvFp4]),
-            deepseek_sym("routed_gate_up_sm121", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym(
-                "opt_moe_gate_up_dedup_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_moe_gate_up_dedup_k3_sm121", &[Precision::NvFp4]),
+            deepseek_sym("b12x_mxfp4_moe_stored_sm121", &[Precision::MxFp4])
+                .decoding(StoredFormat::MXFP4_32),
+            deepseek_sym("opt_moe_gate_up_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_moe_gate_up_k3_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_moe_down_combine_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_moe_down_combine_k3_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_mma_moe_gate_up", &[Precision::MxFp4]),
+            deepseek_sym("opt_mma_moe_down", &[Precision::MxFp4]),
+            deepseek_sym("moe_expert_stage_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_moe_down_dedup_sm121", &[Precision::MxFp4]),
+            deepseek_sym("routed_gate_up_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_moe_gate_up_dedup_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_moe_gate_up_dedup_k3_sm121", &[Precision::MxFp4]),
             // The pre-padded A8 routed combine the forward's single-node path launches: E2M1
             // codes over the 640-K row layout, one rank's selected slots.
-            deepseek_sym("b12x_mxfp4_moe_sm121", &[Precision::NvFp4]),
+            deepseek_sym("b12x_mxfp4_moe_sm121", &[Precision::MxFp4])
+                .decoding(StoredFormat::MXFP4_32),
         ],
         true,
     ),
@@ -1974,17 +1711,12 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::GroupedMoeGemm,
         Image::Deepseek,
         &[
-            deepseek_sym(
-                "b12x_mxfp4_moe_stored_sm121",
-                &[Precision::F32, Precision::Bf16],
-            ),
-            deepseek_sym(
-                "opt_moe_gate_up_sm121",
-                &[Precision::Fp8E4M3, Precision::MxFp8],
-            ),
-            deepseek_sym("opt_moe_down_combine_sm121", &[Precision::NvFp4]),
-            deepseek_sym("opt_mma_moe_gate_up", &[Precision::F32, Precision::Bf16]),
-            deepseek_sym("opt_mma_moe_down", &[Precision::Fp8E4M3, Precision::MxFp8]),
+            deepseek_sym("b12x_mxfp4_moe_stored_sm121", &[Precision::MxFp4])
+                .decoding(StoredFormat::MXFP4_32),
+            deepseek_sym("opt_moe_gate_up_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_moe_down_combine_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_mma_moe_gate_up", &[Precision::MxFp4]),
+            deepseek_sym("opt_mma_moe_down", &[Precision::MxFp4]),
         ],
         true,
     ),
@@ -2274,24 +2006,8 @@ pub const CATALOGUE: &[PartKernel] = &[
                     Precision::MxFp8,
                 ],
             ),
-            deepseek_sym(
-                "engram_narrow_bf16",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
-            deepseek_sym(
-                "engram_widen_f32",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
+            deepseek_sym("engram_narrow_bf16", &[Precision::Bf16]),
+            deepseek_sym("engram_widen_f32", &[Precision::F32]),
             deepseek_sym(
                 "opt_bulk_engram_embed",
                 &[
@@ -2364,15 +2080,7 @@ pub const CATALOGUE: &[PartKernel] = &[
                     Precision::MxFp8,
                 ],
             ),
-            deepseek_sym(
-                "opt_rows_rank_permute",
-                &[
-                    Precision::Bf16,
-                    Precision::F32,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                ],
-            ),
+            deepseek_sym("opt_rows_rank_permute", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -2406,149 +2114,35 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::Mtp,
         Image::Deepseek,
         &[
-            deepseek_sym(
-                "opt_draft_fold_prob",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_pick_prob",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_embed_blocks",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_fold_seqs",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_pick_seqs",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_attn",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_logits",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_markov",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
+            deepseek_sym("opt_draft_fold_prob", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_draft_pick_prob", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_draft_embed_blocks", &[Precision::Bf16]),
+            deepseek_sym("opt_draft_fold_seqs", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_draft_pick_seqs", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_draft_attn", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_draft_logits", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_draft_markov", &[Precision::Bf16, Precision::F32]),
             deepseek_sym(
                 "opt_draft_markov_seqs_mma",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
+                &[Precision::Bf16, Precision::F32],
             ),
+            deepseek_sym("opt_draft_head_fp8", &[Precision::MxFp8]),
+            deepseek_sym("opt_draft_head_fp8t", &[Precision::MxFp8]),
+            deepseek_sym("opt_draft_logits_fp8", &[Precision::MxFp8]),
+            deepseek_sym("opt_draft_taps", &[Precision::Bf16]),
+            deepseek_sym("opt_draft_norm_quant", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym("opt_mma_bf16a_fp8row_f32o", &[Precision::MxFp8]),
+            deepseek_sym("opt_mma_head_fp8t_f32o", &[Precision::MxFp8]),
+            // The MTP stage's routed experts are the backbone's MXFP4 arithmetic in the k3 forms
+            // the draft walk launches (crates/sparkflash-deepseek-forward/src/tp4_forward/
+            // draft.rs names opt_moe_gate_up_dedup_k3, opt_moe_down_dedup and
+            // opt_moe_combine_k3). The stage's principal stored tensor is those experts, so the
+            // entry must carry their bodies or the scan reports a format with no body.
+            deepseek_sym("opt_moe_gate_up_dedup_k3_sm121", &[Precision::MxFp4]),
+            deepseek_sym("opt_moe_down_dedup_sm121", &[Precision::MxFp4]),
             deepseek_sym(
-                "opt_draft_head_fp8",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_head_fp8t",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_logits_fp8",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_taps",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_draft_norm_quant",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_mma_bf16a_fp8row_f32o",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
-            ),
-            deepseek_sym(
-                "opt_mma_head_fp8t_f32o",
-                &[
-                    Precision::Bf16,
-                    Precision::Fp8E4M3,
-                    Precision::MxFp8,
-                    Precision::NvFp4,
-                ],
+                "opt_moe_combine_k3_sm121",
+                &[Precision::Bf16, Precision::F32],
             ),
         ],
         true,
@@ -3173,8 +2767,8 @@ pub fn tensor_core_gaps(architecture: &Architecture, target: Target) -> TensorCo
         Ok(plan) => {
             for requirement in plan.requirements() {
                 let precisions = per_part.entry(requirement.part).or_default();
-                if !precisions.contains(&requirement.precision) {
-                    precisions.push(requirement.precision);
+                if !precisions.contains(&requirement.precision()) {
+                    precisions.push(requirement.precision());
                 }
             }
         }

@@ -76,7 +76,7 @@ fn synthetic(
             world: 1,
             ..PartGeometry::new()
         },
-        precision,
+        format: sparkflash_ops::engine_plan::format_of_precision(precision),
     }
 }
 
@@ -90,9 +90,10 @@ fn dense(
     columns: usize,
     split_k: usize,
 ) -> DenseGemmPlan {
-    let layout = match requirement.precision {
+    let layout = match requirement.precision() {
         Precision::MxFp8 => Layout::BlockScaled { block: 32 },
         Precision::NvFp4 => Layout::BlockScaled { block: 16 },
+        Precision::MxFp4 => Layout::BlockScaled { block: 32 },
         Precision::Fp8E4M3 => Layout::BlockScaled { block: 128 },
         Precision::F32 | Precision::Bf16 => Layout::RowMajor,
     };
@@ -999,7 +1000,7 @@ fn attention_validates_before_it_divides() {
 #[test]
 fn an_nvfp4_attention_is_unsupported_not_unresolved() {
     let mut requirement = requirement(&arm(DEEPSEEK, 4), Part::MlaAttention);
-    requirement.precision = Precision::NvFp4;
+    requirement.format = sparkflash_model::format::StoredFormat::NVFP4_16;
     let error = AttentionPlan::new(
         CTX,
         &requirement,

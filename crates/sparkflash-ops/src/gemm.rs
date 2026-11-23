@@ -79,7 +79,7 @@ impl DenseGemmPlan {
                 format!("K {k} does not split into {split_k} slices"),
             ));
         }
-        let precision = requirement.precision;
+        let precision = requirement.precision();
         let symbols = dense_symbols(precision, split_k)?;
         let mut geometry = requirement.geometry;
         geometry.hidden = k;
@@ -172,6 +172,10 @@ fn dense_symbols(precision: Precision, split_k: usize) -> Result<&'static [&'sta
         (Precision::NvFp4, false) => Err(OpError::Unsupported {
             op: "dense GEMM",
             dtype: "nvfp4 (no dense NVFP4 body; use the grouped MoE kernel)",
+        }),
+        (Precision::MxFp4, false) => Err(OpError::Unsupported {
+            op: "dense GEMM",
+            dtype: "mxfp4 (no dense MXFP4 body; the released MXFP4 tensors are routed experts)",
         }),
     }
 }
@@ -344,7 +348,7 @@ impl GroupedMoeGemmPlan {
                 requirement.part
             )));
         }
-        let precision = requirement.precision;
+        let precision = requirement.precision();
         if tokens == 0 {
             return Err(OpError::shape("grouped MoE GEMM", "tokens is zero"));
         }
@@ -409,11 +413,19 @@ impl GroupedMoeGemmPlan {
             ));
         }
         let symbols: &[&'static str] = match precision {
-            Precision::NvFp4 => &[
+            // The MXFP4 experts: E2M1 codes with one power-of-two scale a 32-value block, the
+            // arithmetic DeepSeek's routed bodies decode. It is not NVFP4 and does not name an
+            // NVFP4 body: the block scale applies exactly where NVFP4's group and tensor-wide
+            // factors do not.
+            Precision::MxFp4 => &[
                 "b12x_mxfp4_moe_stored_sm121",
+                "b12x_mxfp4_moe_sm121",
+                "routed_gate_up_sm121",
                 "q4e_expert_gate_up",
                 "q4p_moe_gate_up",
             ],
+            // NVFP4: E2M1 codes with one E4M3 scale a 16-value group and a tensor-wide factor.
+            Precision::NvFp4 => &["q4e_expert_gate_up", "q4p_moe_gate_up"],
             // The body the arm's host actually launches comes first: the grouped tile for a
             // Qwen chunk, the q8 MMA for GLM's released dynamic-activation profile. A step below
             // the host's threshold requests the decode pass and falls through the prefill-only
@@ -626,7 +638,7 @@ impl MoeRoutingPlan {
             hidden: geometry.hidden,
             experts: geometry.experts,
             top_k: geometry.top_k,
-            precision: resolved.precision,
+            precision: resolved.precision(),
             stream,
             geometry,
             resolved: resolved.id(),
@@ -749,7 +761,7 @@ impl ExpertCombinePlan {
             hidden: geometry.hidden,
             top_k: geometry.top_k,
             dtype,
-            precision: resolved.precision,
+            precision: resolved.precision(),
             stream,
             geometry,
             resolved: resolved.id(),

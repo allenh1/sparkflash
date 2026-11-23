@@ -101,7 +101,7 @@ impl CollectivePlan {
             element_bytes,
             world,
             stream,
-            precision: requirement.precision,
+            precision: requirement.precision(),
             geometry: PartGeometry {
                 world,
                 ..requirement.geometry
@@ -126,13 +126,13 @@ impl CollectivePlan {
             &PartRequirement {
                 part: Part::Collective,
                 geometry: plan_inputs.geometry,
-                precision: requirement.precision,
+                format: crate::engine_plan::format_of_precision(requirement.precision()),
             },
             KernelPhase::Both,
             symbols,
         )?;
         Ok(Self {
-            precision: resolved.precision,
+            precision: resolved.precision(),
             resolved: resolved.id(),
             ..plan_inputs
         })

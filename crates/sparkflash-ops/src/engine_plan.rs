@@ -37,6 +37,7 @@ use std::collections::BTreeMap;
 use sparkflash_model::architecture::{
     AttentionKind, Ffn, Quantization, Residual, ScaleDType, Side, WeightFormat,
 };
+use sparkflash_model::format::StoredFormat;
 use sparkflash_model::layout::LayoutDtype;
 use sparkflash_model::stack::StackKind;
 use sparkflash_model::{
@@ -55,7 +56,7 @@ type PartKey = (Part, Option<usize>);
 /// The formats and claimed element counts of one part's layout tensors.
 type FormatTotals = BTreeMap<PartKey, Vec<(WeightFormat, usize)>>;
 /// The stored format of each part instance.
-type PartFormats = BTreeMap<PartKey, WeightFormat>;
+type PartFormats = BTreeMap<PartKey, StoredFormat>;
 
 /// The operand precision this run uses for each class of weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,29 +98,76 @@ impl PrecisionPolicy {
 
 /// The operand precision one stored weight format uses.
 ///
-/// The two 4-bit formats share [Precision::NvFp4]: the ops library has one 4-bit operand
-/// class (its kernel is named for MXFP4's block but serves both), and the release's format
-/// still selects the loader. Every other format is distinct.
+/// Every format is its own arithmetic. MXFP4 and NVFP4 are not one class: MXFP4 applies one
+/// power-of-two code a 32-value block exactly, NVFP4 a per-16 E4M3 group and a tensor-wide
+/// factor, so folding them let an MXFP4 release resolve an NVFP4 body.
 #[must_use]
 pub const fn precision_of(format: WeightFormat) -> Precision {
-    match format {
-        WeightFormat::Bf16 => Precision::Bf16,
-        WeightFormat::F32 => Precision::F32,
-        WeightFormat::Fp8Tile { .. } => Precision::Fp8E4M3,
-        WeightFormat::MxFp8 { .. } => Precision::MxFp8,
-        WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => Precision::NvFp4,
+    precision_of_stored(format.stored_format())
+}
+
+/// The operand precision one format carries, scale kinds and block included.
+#[must_use]
+pub const fn precision_of_stored(format: StoredFormat) -> Precision {
+    match format.values() {
+        sparkflash_model::format::FormatValues::Bf16 => Precision::Bf16,
+        sparkflash_model::format::FormatValues::F32 => Precision::F32,
+        sparkflash_model::format::FormatValues::Fp8E4M3 => {
+            // A tile-scaled E4M3 is FP8; one power-of-two code a block (or a row) is MXFP8.
+            if format.has_scale(sparkflash_model::format::ScaleKind::Tile) {
+                Precision::Fp8E4M3
+            } else {
+                Precision::MxFp8
+            }
+        }
+        sparkflash_model::format::FormatValues::Fp4E2M1 => {
+            if format.has_scale(sparkflash_model::format::ScaleKind::TensorWide) {
+                Precision::NvFp4
+            } else {
+                Precision::MxFp4
+            }
+        }
     }
 }
 
-/// One part, at this rank's geometry, with the precision the run will use.
+/// The canonical stored format for an arithmetic class.
+///
+/// A part whose layout claims no tensor (an elementwise body, a synthetic test) has no stored
+/// dtype to read. Its arithmetic still names a format, and the resolver needs one to key the
+/// catalogue; this is that format. It is never substituted for a format the layout claimed.
+#[must_use]
+pub const fn format_of_precision(precision: Precision) -> StoredFormat {
+    match precision {
+        Precision::F32 => StoredFormat::F32,
+        Precision::Bf16 => StoredFormat::BF16,
+        Precision::Fp8E4M3 => StoredFormat::FP8_E4M3_TILE_128,
+        Precision::MxFp8 => StoredFormat::MXFP8_32,
+        Precision::NvFp4 => StoredFormat::NVFP4_16,
+        Precision::MxFp4 => StoredFormat::MXFP4_32,
+    }
+}
+
+/// One part, at this rank's geometry, with the stored format the run will read.
+///
+/// The format is the checkpoint fact the plan resolved, not a second summary of it: its values,
+/// block and scale kinds travel to the catalogue key and to the bind, and the arithmetic the
+/// resolver matches is derived from it ([PartRequirement::precision]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartRequirement {
     /// The model-side part.
     pub part: Part,
     /// The rank-local shape.
     pub geometry: PartGeometry,
-    /// The operand precision.
-    pub precision: Precision,
+    /// The stored format this part reads.
+    pub format: StoredFormat,
+}
+
+impl PartRequirement {
+    /// The arithmetic class the format runs at.
+    #[must_use]
+    pub const fn precision(&self) -> Precision {
+        precision_of_stored(self.format)
+    }
 }
 
 /// One decoder layer as the execution plan sees it.
@@ -295,7 +343,7 @@ impl EnginePlan {
                 requirements.push(PartRequirement {
                     part: *part,
                     geometry: geometry_for(*part, layer, &architecture, &tp)?,
-                    precision: format.map_or(precision.dense, precision_of),
+                    format: format.unwrap_or_else(|| format_of_precision(precision.dense)),
                 });
             }
             // A layout may claim layer tensors for a part the forward walk folds into another
@@ -320,7 +368,7 @@ impl EnginePlan {
                 requirements.push(PartRequirement {
                     part: *part,
                     geometry,
-                    precision: format.map_or(precision.dense, precision_of),
+                    format: format.unwrap_or_else(|| format_of_precision(precision.dense)),
                 });
             }
             for requirement in &mut requirements {
@@ -445,7 +493,7 @@ impl EnginePlan {
     /// the draft stage and the vision tower, whose tensors are not decoder blocks). The value is
     /// the format the layout's stored dtypes agree on; it is never inferred from the part kind.
     #[must_use]
-    pub fn stored_format(&self, part: Part, block: Option<usize>) -> Option<WeightFormat> {
+    pub fn stored_format(&self, part: Part, block: Option<usize>) -> Option<StoredFormat> {
         self.formats.get(&(part, block)).copied()
     }
 
@@ -616,7 +664,7 @@ fn stored_formats(architecture: &Architecture) -> PartFormats {
             formats
                 .into_iter()
                 .max_by_key(|(_, weight)| *weight)
-                .map(|(format, _)| (key, format))
+                .map(|(format, _)| (key, format.stored_format()))
         })
         .collect()
 }
@@ -1180,11 +1228,12 @@ fn format_for(
     formats: &PartFormats,
     part: Part,
     block: Option<usize>,
-) -> Option<WeightFormat> {
-    formats
-        .get(&(part, block))
-        .copied()
-        .or_else(|| architecture.stored_format(part))
+) -> Option<StoredFormat> {
+    formats.get(&(part, block)).copied().or_else(|| {
+        architecture
+            .stored_format(part)
+            .map(WeightFormat::stored_format)
+    })
 }
 
 fn global_requirements(
@@ -1206,8 +1255,8 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: format_for(architecture, formats, Part::Embedding, None)
-                .map_or(precision.dense, precision_of),
+            format: format_for(architecture, formats, Part::Embedding, None)
+                .unwrap_or_else(|| format_of_precision(precision.dense)),
         },
         PartRequirement {
             part: Part::RmsNorm,
@@ -1218,8 +1267,8 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: format_for(architecture, formats, Part::RmsNorm, None)
-                .map_or(precision.dense, precision_of),
+            format: format_for(architecture, formats, Part::RmsNorm, None)
+                .unwrap_or_else(|| format_of_precision(precision.dense)),
         },
         PartRequirement {
             part: Part::LmHead,
@@ -1231,8 +1280,8 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: format_for(architecture, formats, Part::LmHead, None)
-                .map_or(precision.dense, precision_of),
+            format: format_for(architecture, formats, Part::LmHead, None)
+                .unwrap_or_else(|| format_of_precision(precision.dense)),
         },
     ];
     // A non-replicated stage is not loaded by a multi-rank serve: the shared tensor plan's
@@ -1255,8 +1304,8 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: format_for(architecture, formats, Part::Mtp, None)
-                .map_or(precision.mtp, precision_of),
+            format: format_for(architecture, formats, Part::Mtp, None)
+                .unwrap_or_else(|| format_of_precision(precision.mtp)),
         });
     }
     if let Some(vision) = architecture.vision_spec() {
@@ -1295,8 +1344,7 @@ fn global_requirements(
                 geometry,
                 // A vision part with no tensor of its own (a rotary-only position scheme) has
                 // no stored dtype to read; the tower's arithmetic is bf16.
-                precision: format_for(architecture, formats, part, None)
-                    .map_or(Precision::Bf16, precision_of),
+                format: format_for(architecture, formats, part, None).unwrap_or(StoredFormat::BF16),
             });
         };
         push(Part::VisionPatchEmbed, base);

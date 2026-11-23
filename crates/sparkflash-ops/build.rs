@@ -66,6 +66,27 @@ fn list(values: &BTreeSet<u64>) -> String {
     format!("&[{}]", items.join(", "))
 }
 
+/// The `StoredFormat` constant an instance's `format` token names.
+///
+/// The tokens are the build file's vocabulary, not a producer's: the values, the block a scale
+/// covers and the layout the body reads. An unknown token stops the build rather than falling
+/// back to a format no source stated.
+fn stored_format_constant(token: &str, key: &str) -> &'static str {
+    match token {
+        "bf16" => "StoredFormat::BF16",
+        "f32" => "StoredFormat::F32",
+        "fp8" => "StoredFormat::FP8_E4M3_TILE_128",
+        "mx-fp8" => "StoredFormat::MXFP8_32",
+        "mx-fp8-tiled" => "StoredFormat::MXFP8_TILED_32",
+        "mx-fp8-row" => "StoredFormat::MXFP8_ROW_32",
+        "nvfp4" => "StoredFormat::NVFP4_16",
+        "mx-fp4" => "StoredFormat::MXFP4_32",
+        other => panic!(
+            "sparkflash-ops: {key} states format {other:?}; the instance list names bf16, f32, fp8, mx-fp8, mx-fp8-tiled, mx-fp8-row, nvfp4 or mx-fp4"
+        ),
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={INSTANCES}");
@@ -117,6 +138,9 @@ fn generate() -> String {
     let mut dims: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut max_top_k: BTreeMap<String, u64> = BTreeMap::new();
     let mut intermediate_multiple: BTreeMap<String, u64> = BTreeMap::new();
+    // The format each entry symbol decodes. The catalogue's symbols take their format from
+    // here, so a body can never claim a decode the build did not record.
+    let mut entry_formats: BTreeMap<String, &'static str> = BTreeMap::new();
     for row in rows {
         let table = row
             .as_table()
@@ -128,6 +152,24 @@ fn generate() -> String {
                 .filter(|value| *value > 0)
                 .map(|value| value as u64)
         };
+        // Every instance states the stored format its entry decodes. The catalogue's symbols
+        // take it from here, so the format is the build's record of what the source reads, and
+        // a key's rule can never claim a decode no instance was built for.
+        let entry = table
+            .get("entry")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("sparkflash-ops: an instance has no string entry"));
+        let token = table
+            .get("format")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("sparkflash-ops: instance {entry} states no format"));
+        let format = stored_format_constant(token, entry);
+        if let Some(previous) = entry_formats.insert(entry.to_owned(), format) {
+            assert_eq!(
+                previous, format,
+                "sparkflash-ops: {entry} is listed twice with different formats"
+            );
+        }
         let Some(key) = table.get("catalogue").and_then(toml::Value::as_str) else {
             continue;
         };
@@ -535,5 +577,49 @@ fn generate() -> String {
             "pub(crate) const {name}: ShapeConstraint = {expression};"
         );
     }
+    // The per-symbol format table. A symbol's format is looked up by its entry name at compile
+    // time, so a catalogue helper cannot forget it and a body can never claim a decode no
+    // instance recorded. This is the generated rule the catalogue key uses.
+    generated.push_str(
+        "/// The stored format each built entry symbol decodes, from its instance table.\n",
+    );
+    generated.push_str("#[allow(dead_code)] // a generated table exists for every built entry\n");
+    generated.push_str("pub(crate) const INSTANCE_FORMATS: &[(&str, StoredFormat)] = &[\n");
+    for (entry, format) in &entry_formats {
+        let _ = writeln!(generated, "    (\"{entry}\", {format}),");
+    }
+    generated.push_str("];\n\n");
+    generated.push_str("/// Whether two entry names are the same bytes.\n");
+    generated.push_str("const fn entry_name_eq(left: &str, right: &str) -> bool {\n");
+    generated.push_str("    let left = left.as_bytes();\n");
+    generated.push_str("    let right = right.as_bytes();\n");
+    generated.push_str("    if left.len() != right.len() {\n");
+    generated.push_str("        return false;\n");
+    generated.push_str("    }\n");
+    generated.push_str("    let mut index = 0;\n");
+    generated.push_str("    while index < left.len() {\n");
+    generated.push_str("        if left[index] != right[index] {\n");
+    generated.push_str("            return false;\n");
+    generated.push_str("        }\n");
+    generated.push_str("        index += 1;\n");
+    generated.push_str("    }\n");
+    generated.push_str("    true\n");
+    generated.push_str("}\n\n");
+    generated.push_str("/// The stored format the instance that builds `entry` states.\n");
+    generated.push_str("///\n");
+    generated
+        .push_str("/// `None` is a symbol no instance builds: an embedded image's body, whose\n");
+    generated.push_str("/// format the catalogue states by hand.\n");
+    generated.push_str("#[allow(dead_code)]\n");
+    generated.push_str("pub(crate) const fn entry_format(entry: &str) -> Option<StoredFormat> {\n");
+    generated.push_str("    let mut index = 0;\n");
+    generated.push_str("    while index < INSTANCE_FORMATS.len() {\n");
+    generated.push_str("        if entry_name_eq(INSTANCE_FORMATS[index].0, entry) {\n");
+    generated.push_str("            return Some(INSTANCE_FORMATS[index].1);\n");
+    generated.push_str("        }\n");
+    generated.push_str("        index += 1;\n");
+    generated.push_str("    }\n");
+    generated.push_str("    None\n");
+    generated.push_str("}\n");
     generated
 }
