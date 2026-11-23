@@ -1262,10 +1262,9 @@ fn glm_prefill_row_bodies_resolve_in_the_prefill_pass() {
 }
 
 /// The 16-patch kernel exists: `opt_vision_sm121.cu` exports `opt_vision_patchify_16` and
-/// `VisionShape::of_with_patch` derives its grid. The catalogue still claims only the 14-patch
-/// tower because the Qwen tower's orchestration and weight loading are its own arm's (D84),
-/// and a shared catalogue entry would claim a tower this tree does not run. The release that
-/// asks for 16 is refused, naming the patch, even when the 16 symbol is requested by name.
+/// the generated DeepSeek rule claims both compiled patch sides (D.2). Qwen's release still asks
+/// for a 1,152-wide tower, which the shared image does not compile, so it is refused by width even
+/// when the 16-patch symbol is requested by name.
 #[test]
 fn an_unimplemented_vision_patch_is_refused() {
     let qwen = requirement(&arm(QWEN, 1), Part::VisionPatchEmbed);

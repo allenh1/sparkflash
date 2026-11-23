@@ -28,6 +28,46 @@ use std::path::Path;
 /// The instance list, relative to this crate.
 const INSTANCES: &str = "../../kernels/instances.toml";
 
+/// The shape values one vision catalogue key draws from its instances.
+///
+/// A set holds every built value; the generator emits an equality for a singleton, a list for the
+/// patch sides (the tower compiles one body per side), and refuses an ambiguous equality rather
+/// than quietly widening the rule.
+#[derive(Default)]
+struct VisionKey {
+    hidden: BTreeSet<u64>,
+    heads: BTreeSet<u64>,
+    patch: BTreeSet<u64>,
+    intermediate: BTreeSet<u64>,
+    out_hidden: BTreeSet<u64>,
+}
+
+/// The shape fields each vision catalogue rule claims.
+///
+/// The values all come from kernels/instances.toml; this table says which of them the part's
+/// compiled bodies actually read, so a rule never claims an unrelated tower dimension. The
+/// non-shape part facts (norm kind, epsilon, activation, position, downsample) stay beside the
+/// rule in src/parts.rs.
+const VISION_FIELDS: &[(&str, &[&str])] = &[
+    ("deepseek-vision-patch-embed", &["hidden", "patch"]),
+    ("deepseek-vision-position", &["hidden", "heads"]),
+    ("deepseek-vision-norm", &["hidden"]),
+    ("deepseek-vision-attention", &["hidden", "heads"]),
+    ("deepseek-vision-mlp", &["hidden", "intermediate"]),
+    ("deepseek-vision-downsample", &["hidden"]),
+    ("deepseek-vision-merger", &["hidden", "out_hidden"]),
+];
+
+/// The one value a vision field has, or a panic naming the ambiguous key.
+fn one(values: &BTreeSet<u64>, key: &str, field: &str) -> u64 {
+    assert!(
+        values.len() == 1,
+        "sparkflash-ops: {key} names {} {field} values {values:?}; an equality needs one",
+        values.len()
+    );
+    *values.iter().next().expect("one value")
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={INSTANCES}");
@@ -56,6 +96,7 @@ fn generate() -> String {
     let mut hidden: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut intermediate: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut claims_intermediate: BTreeMap<String, bool> = BTreeMap::new();
+    let mut vision: BTreeMap<String, VisionKey> = BTreeMap::new();
     for row in rows {
         let table = row
             .as_table()
@@ -69,9 +110,28 @@ fn generate() -> String {
                     panic!("sparkflash-ops: an instance has no positive integer {key}")
                 }) as u64
         };
+        let family = table
+            .get("family")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("sparkflash-ops: an instance has no string family"));
         let Some(key) = table.get("catalogue").and_then(toml::Value::as_str) else {
             continue;
         };
+        if family == "vision" {
+            let row = vision.entry(key.to_owned()).or_default();
+            row.hidden.insert(get("hidden"));
+            row.heads.insert(get("heads"));
+            row.patch.insert(get("patch"));
+            row.intermediate.insert(get("intermediate"));
+            row.out_hidden.insert(get("out_hidden"));
+            // The required keys the vision catalogue rule does not claim are still validated.
+            let _ = (get("experts"), get("top_k"));
+            continue;
+        }
+        assert!(
+            family == "router" || family == "routed",
+            "sparkflash-ops: {key} names family {family:?}, not router, routed or vision"
+        );
         let shape = (get("hidden"), get("experts"), get("top_k"));
         keys.entry(key.to_owned()).or_default().insert(shape);
         hidden.entry(key.to_owned()).or_default().insert(shape.0);
@@ -137,6 +197,70 @@ fn generate() -> String {
             );
         }
         let _ = writeln!(generated, "    .routed_shapes(&[{shape_list}]);");
+    }
+    for (key, shapes) in &vision {
+        let fields = VISION_FIELDS
+            .iter()
+            .find_map(|(name, fields)| (*name == key.as_str()).then_some(*fields))
+            .unwrap_or_else(|| {
+                panic!(
+                    "sparkflash-ops: vision catalogue key {key:?} has no field list in VISION_FIELDS"
+                )
+            });
+        let name = format!("CATALOGUE_{}", key.to_ascii_uppercase().replace('-', "_"));
+        let _ = writeln!(
+            generated,
+            "#[allow(dead_code)] // a generated rule exists for every catalogue key, used or not"
+        );
+        let _ = writeln!(
+            generated,
+            "pub(crate) const {name}: ShapeConstraint = ShapeConstraint::ANY"
+        );
+        if fields.contains(&"hidden") {
+            let _ = writeln!(
+                generated,
+                "    .hidden_equals({})",
+                one(&shapes.hidden, key, "hidden")
+            );
+        }
+        if fields.contains(&"patch") {
+            assert!(
+                !shapes.patch.is_empty(),
+                "sparkflash-ops: {key} names no patch side"
+            );
+            let sides: Vec<String> = shapes
+                .patch
+                .iter()
+                .map(|side| format!("{side}usize"))
+                .collect();
+            let _ = writeln!(generated, "    .patch_sizes(&[{}])", sides.join(", "));
+        }
+        if fields.contains(&"heads") {
+            let heads = one(&shapes.heads, key, "heads");
+            let hidden = one(&shapes.hidden, key, "hidden");
+            assert!(
+                hidden % heads == 0,
+                "sparkflash-ops: {key} has a {hidden}-wide tower over {heads} heads"
+            );
+            let _ = writeln!(generated, "    .heads_multiple({heads})");
+            let _ = writeln!(generated, "    .max_heads({heads})");
+            let _ = writeln!(generated, "    .head_dim_equals({})", hidden / heads);
+        }
+        if fields.contains(&"intermediate") {
+            let _ = writeln!(
+                generated,
+                "    .intermediate_equals({})",
+                one(&shapes.intermediate, key, "intermediate")
+            );
+        }
+        if fields.contains(&"out_hidden") {
+            let _ = writeln!(
+                generated,
+                "    .out_hidden_equals({})",
+                one(&shapes.out_hidden, key, "out_hidden")
+            );
+        }
+        let _ = writeln!(generated, ";");
     }
     generated
 }
