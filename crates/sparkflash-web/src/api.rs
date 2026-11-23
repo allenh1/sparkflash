@@ -3435,9 +3435,12 @@ mod tests {
                 .display()
                 .to_string()
         };
+        // A handler on a loaded host can take longer than five seconds to reach the swap, and
+        // the job has to still be running when it does; the test asserts the refusal, not a
+        // sleep's length.
         let spec = CommandSpec {
             program: "bash".to_owned(),
-            args: vec!["-c".to_owned(), format!("sleep 5; # {scope}")],
+            args: vec!["-c".to_owned(), format!("sleep 30; # {scope}")],
             env: BTreeMap::new(),
             cwd: None,
             label: format!("Prepare {} on rank 0", crate::config::GLM_MODEL_ID),
