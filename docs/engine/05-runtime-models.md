@@ -287,7 +287,10 @@ pass, target.
    cannot be done for free, stop here. The work is broken down in
    [06-base-reads-description.md](06-base-reads-description.md).
 3. **The base runs at TP 1 and 2 and takes other formats.** 5.2 steps 3 to 5, proved on tiny
-   synthetic checkpoints before a real model moves.
+   synthetic checkpoints before a real model moves. The work is broken down in
+   [07-base-ranks-formats-seam.md](07-base-ranks-formats-seam.md), which also corrects two
+   statements of 5.2: format is more than a decode step, and only the dense arm's parts plug in
+   unchanged.
 4. **GLM runs on the base and its crate is deleted.** Its one bit change, checked as in 3.3. Its
    vision tower runs as a stack here.
 5. **Qwen, Inkling, dense, Dory**, one at a time, each with its own bit change and A/B.
