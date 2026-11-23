@@ -191,6 +191,18 @@ its scan shows those rows.
   with each scale type, BF16, packed BF16, NVFP4 with each set of tensor-wide scales, row-scaled
   MXFP8, and one variant whose expert format changes part-way up the stack.
 
+**Result (2026-11-23, F1).** `sparkflash_model::format::StoredFormat` is one value — the values,
+the block one scale covers, the scale kinds (power-of-two grid, tile scale, row scale,
+tensor-wide scale) and the layout (row-major, 32-tile, packed) — converted once from the release's
+declaration at the layout boundary and carried by the plan (`PartRequirement::format`) to the
+resolver (`ResolvedKernel::format`). `Precision` gains `MxFp4` and no longer folds it into
+`NvFP4`. Every catalogue symbol carries the format its build recorded, from the instance list
+(all 408 entries state one), and the resolver refuses a symbol of another arithmetic; DeepSeek's
+masks were corrected from what each source reads, and a part whose compressor tensors are shared
+across blocks takes the format of the tensor rather than the block's class. The scan row prints
+the format and names a format with no body as "not built". The forward's own dtype checks are
+F2's work and are untouched here.
+
 ### S. The seam
 
 * **S1. Blocks become steps, decided at open (rows path).** For each block the engine builds a
