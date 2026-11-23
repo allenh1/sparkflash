@@ -1057,31 +1057,30 @@ pub fn named(name: &str) -> &'static str {
         .unwrap_or_else(|| panic!("forward open: the plan claims no tensor {name}"))
 }
 
-/// One MTP stage's tensor, by the tail its checkpoint name carries.
-#[must_use]
-pub fn mtp_claim(stage: usize, tail: &str) -> &'static str {
-    layer_claim_any(mtp_block(stage), tail)
-}
-
-/// The MTP draft block a stage lives in, as a block index.
-fn mtp_block(stage: usize) -> usize {
+/// A claim under one MTP stage, by the `mtp.<stage>.<segment>` name the plan uses.
+///
+/// The draft stack's blocks do not carry one stage each (the Markov head is claimed on the
+/// first draft block while its name says stage two), so the lookup is by name, not by block
+/// index. The name is the identifier the checkpoint and the plan share.
+fn mtp_name(stage: usize, tail: &str) -> &'static str {
     let description = description();
-    description
-        .plan
-        .stacks()
-        .iter()
-        .find(|stack| stack.kind == sparkflash_model::StackKind::Draft)
-        .and_then(|stack| {
-            stack.blocks.iter().find(|block| {
-                block.index == stage
-                    || block.parts.iter().any(|part| {
-                        part.facts.get("stage").and_then(FactValue::as_integer)
-                            == Some(stage as i64)
-                    })
-            })
-        })
-        .map(|block| block.index)
-        .unwrap_or_else(|| panic!("forward open: no draft block for stage {stage}"))
+    let prefix = format!("mtp.{stage}.");
+    let suffix = format!(".{tail}");
+    for stack in description.plan.stacks() {
+        if stack.kind != sparkflash_model::StackKind::Draft {
+            continue;
+        }
+        for block in &stack.blocks {
+            for part in &block.parts {
+                for claim in &part.claims {
+                    if claim.name.starts_with(&prefix) && claim.name.ends_with(&suffix) {
+                        return claim.name.as_str();
+                    }
+                }
+            }
+        }
+    }
+    panic!("forward open: no MTP stage {stage} claims a tensor ending .{tail}");
 }
 
 /// The MTP stage prefix a claim under `segment` lives at, e.g. `mtp.1.attn`.
@@ -1090,7 +1089,34 @@ fn mtp_block(stage: usize) -> usize {
 /// them from this prefix rather than asking the plan for a name that does not exist.
 #[must_use]
 pub fn mtp_prefix(stage: usize, segment: &str) -> &'static str {
-    layer_prefix(mtp_block(stage), segment)
+    let description = description();
+    let prefix = format!("mtp.{stage}.");
+    let needle = format!(".{segment}.");
+    for stack in description.plan.stacks() {
+        if stack.kind != sparkflash_model::StackKind::Draft {
+            continue;
+        }
+        for block in &stack.blocks {
+            for part in &block.parts {
+                for claim in &part.claims {
+                    let name = claim.name.as_str();
+                    if !name.starts_with(&prefix) {
+                        continue;
+                    }
+                    if let Some(at) = name.find(&needle) {
+                        return &name[..at + 1 + segment.len()];
+                    }
+                }
+            }
+        }
+    }
+    panic!("forward open: MTP stage {stage} claims no tensor under .{segment}.");
+}
+
+/// One MTP stage's tensor, by the tail its checkpoint name carries.
+#[must_use]
+pub fn mtp_claim(stage: usize, tail: &str) -> &'static str {
+    mtp_name(stage, tail)
 }
 
 /// Install the released checkpoint's plan for `rank` of `world`.
@@ -1314,11 +1340,14 @@ mod tests {
         }
         assert_eq!(layer_prefix(1, "engram"), "layers.1.engram");
         assert!(claimed(1, "engram.q_weight"));
-        let stage = mtp_block(0);
+        assert_eq!(
+            mtp_claim(2, "markov_head.head.weight"),
+            "mtp.2.markov_head.head.weight"
+        );
         assert!(mtp_prefix(0, "attn.wq_a").ends_with(".attn.wq_a"));
         for leaf in ["w1", "w3", "w2"] {
             let tail = format!("ffn.experts.0.{leaf}.weight");
-            assert!(claimed(stage, &tail), "mtp stage 0 claims no {tail}");
+            assert_eq!(mtp_claim(0, &tail), format!("mtp.0.{tail}"));
         }
         for tail in [
             "attn.wq_a.weight",
@@ -1331,7 +1360,7 @@ mod tests {
             "ffn.shared_experts.w3.weight",
             "ffn.shared_experts.w2.weight",
         ] {
-            assert!(claimed(stage, tail), "mtp stage 0 claims no {tail}");
+            assert_eq!(mtp_claim(0, tail), format!("mtp.0.{tail}"));
         }
     }
 

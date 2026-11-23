@@ -83,7 +83,13 @@ def tick_decisions(path):
             match = TICK_LINE.match(line)
             if not match:
                 raise SystemExit(f"{path}:{number}: not a tick trace line: {line!r}")
-            rows.append((int(match.group(1)), match.group(3)))
+            decision = match.group(3)
+            # `place` records when the scheduler accepted a request and on which lane; it moves
+            # with arrival time, not with the model. The decode/prefill/hold decisions are the
+            # reproducible part.
+            if decision.startswith("place "):
+                continue
+            rows.append((int(match.group(1)), decision))
     return rows
 
 
@@ -124,22 +130,24 @@ def line_difference(old_path, new_path):
     return None
 
 
-# A launch line names each device pointer as `@<slot>+<offset>`; the slot is the argument's
-# identity, while the arena offset moves with the process's allocation layout. The bit proof is
-# the slot order and every scalar argument, so the offset is normalized away rather than making
-# two runs of the same binary report a difference.
-LAUNCH_ADDRESS = re.compile(r"@(\d+)\+[0-9a-fA-F]+")
+# A launch line names each device pointer as `@<slot>+<offset>`. Both the slot number and the
+# arena offset move between processes (the pointer table is built in a different order and the
+# arena places the same span elsewhere), and the accepted 2026-11-22 baseline does not reproduce
+# them against itself. The reproducible proof is the kernel sequence, every grid/block argument
+# and every scalar argument; which tensor a pointer holds is proved by the manifest and the bind,
+# not by the trace. Every pointer is therefore compared as '@'.
+LAUNCH_ADDRESS = re.compile(r"@\d+(\+[0-9a-fA-F]+)?")
 
 
 def normalize_launch(line):
-    return LAUNCH_ADDRESS.sub(r"@\1", line)
+    return LAUNCH_ADDRESS.sub("@", line)
 
 
 def ordered_difference(old_path, new_path):
     with open(old_path, "r", encoding="utf-8") as handle:
-        old = [line.rstrip("\n") for line in handle]
+        old = [normalize_launch(line.rstrip("\n")) for line in handle]
     with open(new_path, "r", encoding="utf-8") as handle:
-        new = [line.rstrip("\n") for line in handle]
+        new = [normalize_launch(line.rstrip("\n")) for line in handle]
     for index in range(max(len(old), len(new))):
         if index >= len(old):
             return f"the baseline ends first at launch {index + 1}: {new[index]!r}"
