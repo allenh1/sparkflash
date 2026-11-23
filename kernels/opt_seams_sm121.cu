@@ -42,19 +42,59 @@
 #define opt_s_warp_sum opt_warp_sum_rn
 #include "m4_activation_quant_sm121.cuh"
 
-#define OPT_S_HIDDEN 5120u
-#define OPT_S_HC 4u
+// The model shapes are instance arguments (kernels/instances.toml): the hidden width and the
+// residual-stream count have no default, and a build that does not name them does not compile.
+// Each entry below is gated on its own instance's macros, so the released cubin keeps exactly the
+// symbols the forward loads and the second shape is a cubin of its own.
+#if defined(SPARK_INSTANCE_OPT_MHC_SEAM_HIDDEN)
+#define OPT_S_HIDDEN SPARK_INSTANCE_OPT_MHC_SEAM_HIDDEN
+#define OPT_S_HC SPARK_INSTANCE_OPT_MHC_SEAM_HC
+#elif defined(SPARK_INSTANCE_OPT_MHC_POST_HIDDEN)
+#define OPT_S_HIDDEN SPARK_INSTANCE_OPT_MHC_POST_HIDDEN
+#define OPT_S_HC SPARK_INSTANCE_OPT_MHC_POST_HC
+#elif defined(SPARK_INSTANCE_OPT_MHC_SEAM_4096H2_SM121_HIDDEN)
+#define OPT_S_HIDDEN SPARK_INSTANCE_OPT_MHC_SEAM_4096H2_SM121_HIDDEN
+#define OPT_S_HC SPARK_INSTANCE_OPT_MHC_SEAM_4096H2_SM121_HC
+#else
+#error "opt_seams_sm121.cu: no instance macros; hidden and hc are arguments from kernels/instances.toml"
+#endif
+
+#if defined(SPARK_INSTANCE_OPT_MHC_SEAM_HIDDEN) && defined(SPARK_INSTANCE_OPT_MHC_POST_HIDDEN)
+static_assert(SPARK_INSTANCE_OPT_MHC_SEAM_HIDDEN == SPARK_INSTANCE_OPT_MHC_POST_HIDDEN,
+              "the two released seam entries are compiled for one hidden width");
+static_assert(SPARK_INSTANCE_OPT_MHC_SEAM_HC == SPARK_INSTANCE_OPT_MHC_POST_HC,
+              "the two released seam entries are compiled for one stream count");
+#endif
+
+// The released entry keeps its name; the second-shape instance is the same body under its own
+// symbol, in its own cubin, so the released cubin's symbol set cannot move.
+#if defined(SPARK_INSTANCE_OPT_MHC_SEAM_4096H2_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_MHC_SEAM_HIDDEN)
+#define OPT_S_SEAM_SYMBOL opt_mhc_seam_4096h2_sm121
+#else
+#define OPT_S_SEAM_SYMBOL opt_mhc_seam
+#endif
+
 #define OPT_S_WIDTH (OPT_S_HC * OPT_S_HIDDEN)
-#define OPT_S_ROWS 24u
+// The 24 released coefficient rows, as arithmetic on the stream count: n*n + 2n.
+#define OPT_S_ROWS (OPT_S_HC * OPT_S_HC + 2u * OPT_S_HC)
 #define OPT_S_THREADS 256u
 #define OPT_S_WARPS (OPT_S_THREADS / 32u)
-#define OPT_S_COLS 64u
+#define OPT_S_COLS (OPT_S_THREADS / OPT_S_HC)
 #define OPT_S_BLOCKS (OPT_S_HIDDEN / OPT_S_COLS)
-#define OPT_S_PART 26u          // 24 raw dots, the stream sum of squares, the row sum of squares
+#define OPT_S_PART (OPT_S_ROWS + 2u) // the raw dots, the stream and row sums of squares
 #define OPT_S_PART_STRIDE 32u
 #define OPT_S_QBLOCKS (OPT_S_HIDDEN / 32u)
+// The two sum-of-squares slots after the coefficient rows.
+#define OPT_S_SS_STREAM OPT_S_ROWS
+#define OPT_S_SS_ROW (OPT_S_ROWS + 1u)
 
+static_assert(OPT_S_HC > 0u, "a stream count of zero has no seam");
+static_assert(OPT_S_THREADS % OPT_S_HC == 0u, "the block splits into whole stream copies");
 static_assert(OPT_S_COLS * OPT_S_HC == OPT_S_THREADS, "one stream value per thread");
+static_assert(OPT_S_HIDDEN % OPT_S_COLS == 0u, "the block grid covers the hidden width");
+static_assert(OPT_S_PART <= OPT_S_PART_STRIDE, "the partial table holds every reduced value");
+static_assert(OPT_S_HIDDEN % 32u == 0u, "the norm and quantiser walk 32-value blocks");
 
 
 
@@ -119,7 +159,8 @@ __device__ void opt_s_coefficient_tail(const float *raw, float sum_squares, cons
         for (uint32_t column = 0; column < hc; ++column) mix_table[2u * hc + row * hc + column] = comb[row][column];
 }
 
-extern "C" __global__ void __launch_bounds__(OPT_S_THREADS) opt_mhc_seam(
+#if defined(SPARK_INSTANCE_OPT_MHC_SEAM_HIDDEN) || defined(SPARK_INSTANCE_OPT_MHC_SEAM_4096H2_SM121_HIDDEN)
+extern "C" __global__ void __launch_bounds__(OPT_S_THREADS) OPT_S_SEAM_SYMBOL(
     const float *__restrict__ stream,       // [hc][dim]
     const float *in_pre,                    // [hc] the input pre mix (hc_pre's coefficients)
     const float *__restrict__ fn_w,         // [24][hc*dim]
@@ -167,7 +208,7 @@ extern "C" __global__ void __launch_bounds__(OPT_S_THREADS) opt_mhc_seam(
             if (lane == 0u) red[warp][r] = s;
         }
         const float sq = opt_s_warp_sum(__fmul_rn(x, x));
-        if (lane == 0u) red[warp][24] = sq;
+        if (lane == 0u) red[warp][OPT_S_SS_STREAM] = sq;
         __syncthreads();
         if (t < OPT_S_COLS) {
             float accumulated = 0.0f;
@@ -178,11 +219,11 @@ extern "C" __global__ void __launch_bounds__(OPT_S_THREADS) opt_mhc_seam(
             if (native_bf16 != 0u) accumulated = opt_s_bf16_round(accumulated);
             row_buf[blockIdx.x * OPT_S_COLS + t] = accumulated;
             const float rs = opt_s_warp_sum(__fmul_rn(accumulated, accumulated));
-            if (lane == 0u) red[warp][25] = rs;
+            if (lane == 0u) red[warp][OPT_S_SS_ROW] = rs;
         }
         __syncthreads();
         if (t < OPT_S_PART) {
-            const uint32_t warps = t == 25u ? OPT_S_COLS / 32u : OPT_S_WARPS;
+            const uint32_t warps = t == OPT_S_SS_ROW ? OPT_S_COLS / 32u : OPT_S_WARPS;
             float s = red[0][t];
             for (uint32_t k = 1; k < warps; ++k) s = __fadd_rn(s, red[k][t]);
             partials[blockIdx.x * OPT_S_PART_STRIDE + t] = s;
@@ -207,13 +248,13 @@ extern "C" __global__ void __launch_bounds__(OPT_S_THREADS) opt_mhc_seam(
 
     if (warp == OPT_S_WARPS - 1u) {
         if (lane == 0u) {
-            opt_s_coefficient_tail(tot, tot[24], hc_scale, hc_base, norm_eps, hc_eps, sinkhorn_iterations,
+            opt_s_coefficient_tail(tot, tot[OPT_S_SS_STREAM], hc_scale, hc_base, norm_eps, hc_eps, sinkhorn_iterations,
                                    mix_table, pre_mix_out);
             *ticket = 0u;
         }
         return;
     }
-    const float mean = __fdiv_rn(tot[25], (float)OPT_S_HIDDEN);
+    const float mean = __fdiv_rn(tot[OPT_S_SS_ROW], (float)OPT_S_HIDDEN);
     const float inverse = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(mean, norm_eps)));
     // Every load of this warp's columns is issued before any arithmetic: one L2 round trip, not
     // one per 32-column block.
@@ -256,8 +297,11 @@ extern "C" __global__ void __launch_bounds__(OPT_S_THREADS) opt_mhc_seam(
     }
 }
 
+#endif // SPARK_INSTANCE_OPT_MHC_SEAM_*_HIDDEN
+
 // hc_post: out[c][j] = post[c] * x[j] + sum_s comb[s][c] * residual[s][j] (or the bf16 arm), with
 // x = delta[j] (+ shared[j] when shared is set). In place is safe: column j reads only column j.
+#if defined(SPARK_INSTANCE_OPT_MHC_POST_HIDDEN)
 extern "C" __global__ void __launch_bounds__(128) opt_mhc_post(
     const float *residual,                  // [hc][dim]
     const float *__restrict__ mix_table,    // [24]
@@ -292,3 +336,4 @@ extern "C" __global__ void __launch_bounds__(128) opt_mhc_post(
         stream_out[c * OPT_S_HIDDEN + column] = value;
     }
 }
+#endif // SPARK_INSTANCE_OPT_MHC_POST_HIDDEN

@@ -159,10 +159,17 @@ fn read_instances() -> Vec<Instance> {
         let keys: &[&str] = match family.as_str() {
             "router" => &["hidden", "experts", "top_k"],
             "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"],
+            "seams" => &["hidden"],
             other => panic!(
-                "sparkflash-kernels: instance {}: family {other:?} is not router or routed",
+                "sparkflash-kernels: instance {}: family {other:?} is not router, routed or seams",
                 number + 1
             ),
+        };
+        // The layer seams' hc is optional: only the hyper-connection bodies are compiled for a
+        // residual-stream count, and an instance that omits it must not be rejected.
+        let optional: &[&str] = match family.as_str() {
+            "seams" => &["hc"],
+            _ => &[],
         };
         let cubin = table
             .get("cubin")
@@ -176,18 +183,22 @@ fn read_instances() -> Vec<Instance> {
             "sparkflash-kernels: instance {}: cubin {cubin:?} is not a stem",
             number + 1
         );
-        let mut defines = Vec::with_capacity(keys.len());
-        for key in keys {
-            let value = table
-                .get(*key)
-                .and_then(toml::Value::as_integer)
-                .filter(|value| *value > 0)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "sparkflash-kernels: instance {} ({entry}): {key} is a positive integer",
-                        number + 1
-                    )
-                });
+        let mut defines = Vec::with_capacity(keys.len() + optional.len());
+        for key in keys.iter().chain(optional.iter()) {
+            let Some(value) = table.get(*key).and_then(toml::Value::as_integer) else {
+                if optional.contains(key) {
+                    continue;
+                }
+                panic!(
+                    "sparkflash-kernels: instance {} ({entry}): {key} is a positive integer",
+                    number + 1
+                );
+            };
+            assert!(
+                value > 0,
+                "sparkflash-kernels: instance {} ({entry}): {key} is a positive integer",
+                number + 1
+            );
             defines.push(format!(
                 "-DSPARK_INSTANCE_{}_{}={value}u",
                 entry.to_ascii_uppercase(),

@@ -14,12 +14,16 @@
 #                share a cubin are compiled in one translation unit, so the released multi-symbol
 #                cubins keep their file names and symbol sets.
 #   family       the shape vocabulary: "router" needs hidden/experts/top_k, "routed" needs those
-#                plus intermediate/padded.
+#                plus intermediate/padded, "seams" needs hidden and optionally hc (the residual
+#                stream count; the runtime-width seam entries omit it).
 #   catalogue    optional catalogue key; sparkflash-ops generates that part's exact shape rule
 #                from every instance carrying the same key.
 #   catalogue_intermediate
 #                optional; false keeps the key's generated rule from claiming an intermediate
 #                width (the MTP part has no such geometry even though its expert bodies take one).
+#   catalogue_hidden
+#                optional; false keeps the key's generated rule open on hidden, for a body whose
+#                width is a runtime launch word (the seam quantisers) rather than a compiled shape.
 #   hidden, experts, top_k, intermediate, padded
 #                the values one rank sees, as positive integers. They are passed to the compiler
 #                with the source's own suffix (u), not reinterpreted.
@@ -204,6 +208,138 @@ padded = 640
 experts = 128
 top_k = 3
 
+# --- The layer seams -------------------------------------------------------------------------
+# The mHC seam bodies are compiled for the hidden width and the residual-stream count; the
+# runtime-width seam entries (rope, quantisers, the shared SwiGLU, the kv append and the tail
+# norm) record the released hidden width and are gated the same way, so the cubin carries
+# exactly the symbols the forward loads. Every entry in one source shares that source's cubin.
+[[instance]]
+source = "opt_seams_sm121.cu"
+entry = "opt_mhc_seam"
+cubin = "opt_seams_sm121"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 5120
+hc = 4
+
+[[instance]]
+source = "opt_seams_sm121.cu"
+entry = "opt_mhc_post"
+cubin = "opt_seams_sm121"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 5120
+hc = 4
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "mhc_entry_bf16"
+cubin = "layer_seams_sm121"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 5120
+hc = 4
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "mhc_ffn_seams"
+cubin = "layer_seams_sm121"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 5120
+hc = 4
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "w8a8_prologue_bf16_e4m3"
+cubin = "layer_seams_sm121"
+family = "seams"
+catalogue = "deepseek-quantize"
+catalogue_hidden = false
+hidden = 5120
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "w8a8_prologue_e4m3"
+cubin = "layer_seams_sm121"
+family = "seams"
+catalogue = "deepseek-quantize"
+catalogue_hidden = false
+hidden = 5120
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "mhc_attn_residual"
+cubin = "layer_seams_sm121"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 5120
+hc = 4
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "mhc_ffn_epilogue"
+cubin = "layer_seams_sm121"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 5120
+hc = 4
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "shared_swiglu_f32"
+cubin = "layer_seams_sm121"
+family = "seams"
+hidden = 5120
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "rope_rotate_rows_bf16"
+cubin = "layer_seams_sm121"
+family = "seams"
+catalogue = "deepseek-rope"
+hidden = 5120
+
+[[instance]]
+source = "kv_path_sm121.cu"
+entry = "rope_rotate_bf16"
+cubin = "kv_path_sm121"
+family = "seams"
+catalogue = "deepseek-rope"
+hidden = 5120
+
+[[instance]]
+source = "kv_path_sm121.cu"
+entry = "kv_norm_rope_bf16"
+cubin = "kv_path_sm121"
+family = "seams"
+catalogue = "deepseek-rope"
+hidden = 5120
+
+[[instance]]
+source = "kv_path_sm121.cu"
+entry = "window_quant_fp8_bf16"
+cubin = "kv_path_sm121"
+family = "seams"
+catalogue = "deepseek-quantize"
+catalogue_hidden = false
+hidden = 5120
+
+[[instance]]
+source = "kv_path_sm121.cu"
+entry = "kv_append_bf16"
+cubin = "kv_path_sm121"
+family = "seams"
+hidden = 5120
+
+[[instance]]
+source = "rmsnorm_sm121.cu"
+entry = "rmsnorm_sm121"
+cubin = "rmsnorm_sm121"
+family = "seams"
+catalogue = "deepseek-rmsnorm"
+hidden = 5120
+
 # --- The second-shape build proof -------------------------------------------------------------
 # Not loaded by any arm and not in the baseline: a 4096-wide router with 256 experts and top-8.
 # It compiles from opt_router_sm121.cu alone, into its own cubin, so the released cubin's symbol
@@ -217,3 +353,14 @@ family = "router"
 hidden = 4096
 experts = 256
 top_k = 8
+
+# The seams' second shape: the mHC entry at 4096 wide with two residual streams, in its own
+# cubin. It compiles from opt_seams_sm121.cu alone, so the released opt_seams cubin keeps its two
+# symbols and bytes; it is not loaded by any arm and is not in the baseline.
+[[instance]]
+source = "opt_seams_sm121.cu"
+entry = "opt_mhc_seam_4096h2_sm121"
+cubin = "opt_mhc_seam_4096h2_sm121"
+family = "seams"
+hidden = 4096
+hc = 2

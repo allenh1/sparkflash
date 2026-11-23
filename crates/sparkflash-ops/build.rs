@@ -55,31 +55,55 @@ fn generate() -> String {
     let mut keys: BTreeMap<String, BTreeSet<(u64, u64, u64)>> = BTreeMap::new();
     let mut hidden: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut intermediate: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut streams: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut claims_intermediate: BTreeMap<String, bool> = BTreeMap::new();
+    let mut claims_hidden: BTreeMap<String, bool> = BTreeMap::new();
     for row in rows {
         let table = row
             .as_table()
             .unwrap_or_else(|| panic!("sparkflash-ops: an instance is not a table"));
-        let get = |key: &str| -> u64 {
+        let positive = |key: &str| -> Option<u64> {
             table
                 .get(key)
                 .and_then(toml::Value::as_integer)
                 .filter(|value| *value > 0)
-                .unwrap_or_else(|| {
-                    panic!("sparkflash-ops: an instance has no positive integer {key}")
-                }) as u64
+                .map(|value| value as u64)
         };
         let Some(key) = table.get("catalogue").and_then(toml::Value::as_str) else {
             continue;
         };
-        let shape = (get("hidden"), get("experts"), get("top_k"));
-        keys.entry(key.to_owned()).or_default().insert(shape);
-        hidden.entry(key.to_owned()).or_default().insert(shape.0);
+        let hidden_width = positive("hidden")
+            .unwrap_or_else(|| panic!("sparkflash-ops: {key} has no positive integer hidden"));
+        hidden
+            .entry(key.to_owned())
+            .or_default()
+            .insert(hidden_width);
+        keys.entry(key.to_owned()).or_default();
+        // The router and routed-expert keys are the only shapes with an expert count; the seam
+        // keys carry a hidden width (and, for the hyper-connection body, a stream count) and must
+        // not claim a routed shape that was never built.
+        if let (Some(experts), Some(top_k)) = (positive("experts"), positive("top_k")) {
+            keys.entry(key.to_owned())
+                .or_default()
+                .insert((hidden_width, experts, top_k));
+        }
+        if let Some(count) = positive("hc") {
+            streams.entry(key.to_owned()).or_default().insert(count);
+        }
         let claims = table
             .get("catalogue_intermediate")
             .and_then(toml::Value::as_bool)
             .unwrap_or(true);
         *claims_intermediate.entry(key.to_owned()).or_insert(true) &= claims;
+        // A runtime-width body (the quantisers, which take cols as a launch word) has no compiled
+        // hidden shape to claim; its instances say so and the generated rule stays open.
+        let claims_hidden_flag = table
+            .get("catalogue_hidden")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true);
+        *claims_hidden
+            .entry(key.to_owned())
+            .or_insert(true) &= claims_hidden_flag;
         if let Some(width) = table.get("intermediate").and_then(toml::Value::as_integer) {
             assert!(
                 width > 0,
@@ -102,12 +126,42 @@ fn generate() -> String {
     );
     for (key, shapes) in &keys {
         let name = format!("CATALOGUE_{}", key.to_ascii_uppercase().replace('-', "_"));
-        let mut shape_list = String::new();
-        for (index, (h, e, k)) in shapes.iter().enumerate() {
-            if index > 0 {
-                shape_list.push_str(", ");
+        let mut method = String::new();
+        if let Some(widths) = hidden.get(key)
+            && widths.len() == 1
+            && claims_hidden.get(key).copied().unwrap_or(true)
+        {
+            let _ = write!(
+                method,
+                "    .hidden_equals({})\n",
+                widths.iter().next().expect("one width")
+            );
+        }
+        if let Some(widths) = intermediate.get(key)
+            && widths.len() == 1
+            && claims_intermediate.get(key).copied().unwrap_or(false)
+        {
+            let _ = write!(
+                method,
+                "    .intermediate_equals({})\n",
+                widths.iter().next().expect("one width")
+            );
+        }
+        if let Some(counts) = streams.get(key)
+            && counts.len() == 1
+        {
+            let count = counts.iter().next().expect("one count");
+            let _ = write!(method, "    .streams_between({count}, {count})\n");
+        }
+        if !shapes.is_empty() {
+            let mut shape_list = String::new();
+            for (index, (h, e, k)) in shapes.iter().enumerate() {
+                if index > 0 {
+                    shape_list.push_str(", ");
+                }
+                let _ = write!(shape_list, "({h}usize, {e}usize, {k}usize)");
             }
-            let _ = write!(shape_list, "({h}usize, {e}usize, {k}usize)");
+            let _ = write!(method, "    .routed_shapes(&[{shape_list}])\n");
         }
         let _ = writeln!(
             generated,
@@ -117,26 +171,7 @@ fn generate() -> String {
             generated,
             "pub(crate) const {name}: ShapeConstraint = ShapeConstraint::ANY"
         );
-        if let Some(widths) = hidden.get(key)
-            && widths.len() == 1
-        {
-            let _ = writeln!(
-                generated,
-                "    .hidden_equals({})",
-                widths.iter().next().expect("one width")
-            );
-        }
-        if let Some(widths) = intermediate.get(key)
-            && widths.len() == 1
-            && claims_intermediate.get(key).copied().unwrap_or(false)
-        {
-            let _ = writeln!(
-                generated,
-                "    .intermediate_equals({})",
-                widths.iter().next().expect("one width")
-            );
-        }
-        let _ = writeln!(generated, "    .routed_shapes(&[{shape_list}]);");
+        let _ = writeln!(generated, "{};", method.trim_end());
     }
     generated
 }

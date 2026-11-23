@@ -61,10 +61,21 @@
 
 #include "m4_activation_quant_sm121.cuh"
 
+// The released entries are instance-gated (kernels/instances.toml) so one compile carries one
+// symbol set. The widths below are runtime words of the launch, not compile-time model geometry;
+// the instance records the released hidden width the model serves and marks the entry as built.
+#if !defined(SPARK_INSTANCE_ROPE_ROTATE_BF16_HIDDEN) && \
+    !defined(SPARK_INSTANCE_KV_NORM_ROPE_BF16_HIDDEN) && \
+    !defined(SPARK_INSTANCE_WINDOW_QUANT_FP8_BF16_HIDDEN) && \
+    !defined(SPARK_INSTANCE_KV_APPEND_BF16_HIDDEN)
+#error "kv_path_sm121.cu: no instance macros; every entry is built from kernels/instances.toml"
+#endif
+
 // One block of threads per row; head_width is at most a few hundred values, so one block finishes
 // the tail in a single wave and the head copy in a second loop of the same block.
 #define SPARK_KV_ROW_THREADS 256u
 
+#if defined(SPARK_INSTANCE_ROPE_ROTATE_BF16_HIDDEN)
 extern "C" __global__ void rope_rotate_bf16(
     const __nv_bfloat16 *__restrict__ row,      // [head_width] the stored rotated row
     const float *__restrict__ cos,              // [rope_head_dim / 2] this position's cos
@@ -90,6 +101,8 @@ extern "C" __global__ void rope_rotate_bf16(
         out[start + 2u * pair + 1u] = __float2bfloat16_rn(second);
     }
 }
+
+#endif // SPARK_INSTANCE_ROPE_ROTATE_BF16_HIDDEN
 
 // kv_norm_rope_bf16 - the host's kv_norm then rope, fused so the device rounds to bf16 ONCE.
 //
@@ -117,6 +130,7 @@ extern "C" __global__ void rope_rotate_bf16(
 //
 // norm is the released bf16 kv_norm.weight, whose bytes widen to the engine's f32 weight exactly.
 // cos/sin are this position's f32 tables, rope_head_dim / 2 long, one element per pair.
+#if defined(SPARK_INSTANCE_KV_NORM_ROPE_BF16_HIDDEN)
 extern "C" __global__ void kv_norm_rope_bf16(
     const __nv_bfloat16 *__restrict__ row,      // [head_width] the bf16 wkv latent
     const __nv_bfloat16 *__restrict__ norm,     // [head_width] the bf16 kv_norm weight
@@ -158,6 +172,9 @@ extern "C" __global__ void kv_norm_rope_bf16(
     }
 }
 
+#endif // SPARK_INSTANCE_KV_NORM_ROPE_BF16_HIDDEN
+
+#if defined(SPARK_INSTANCE_WINDOW_QUANT_FP8_BF16_HIDDEN)
 extern "C" __global__ void window_quant_fp8_bf16(
     const __nv_bfloat16 *__restrict__ row,      // [cols] the rotated row, already bf16-stored
     uint8_t *__restrict__ codes,                // [cols] E4M3FN, one per value
@@ -187,6 +204,8 @@ extern "C" __global__ void window_quant_fp8_bf16(
 }
 
 
+#endif // SPARK_INSTANCE_WINDOW_QUANT_FP8_BF16_HIDDEN
+
 // kv_append_bf16 - this position's k/v row pair written into the layer's ring of the device cache.
 //
 // GEOMETRY, from DeviceKvCache (crates/sparkflash-cli/src/layer_device.rs): one row is
@@ -206,6 +225,7 @@ extern "C" __global__ void window_quant_fp8_bf16(
 // append for the same position); this kernel copies, it does not compute. A caller that wants the
 // quantised window bytes for the position gets them from window_quant_fp8_bf16 on the same rotated
 // row - the cache itself stores the bf16 pair the attention body's slice-copy reads.
+#if defined(SPARK_INSTANCE_KV_APPEND_BF16_HIDDEN)
 extern "C" __global__ void kv_append_bf16(
     const __nv_bfloat16 *__restrict__ k_row,    // [head_dim] this position's k row
     const __nv_bfloat16 *__restrict__ v_row,    // [head_dim] this position's v row
@@ -221,4 +241,5 @@ extern "C" __global__ void kv_append_bf16(
         v_out[index] = v_row[index];
     }
 }
+#endif // SPARK_INSTANCE_KV_APPEND_BF16_HIDDEN
 

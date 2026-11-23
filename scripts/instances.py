@@ -43,7 +43,11 @@ IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FAMILIES = {
     "router": ("hidden", "experts", "top_k"),
     "routed": ("hidden", "intermediate", "padded", "experts", "top_k"),
+    # The layer seams: the hidden width is required; hc is the residual-stream count the
+    # hyper-connection bodies are compiled for, omitted by the runtime-width seam entries.
+    "seams": ("hidden",),
 }
+OPTIONAL = {"seams": ("hc",)}
 ALLOWED = {
     "source",
     "entry",
@@ -51,7 +55,9 @@ ALLOWED = {
     "family",
     "catalogue",
     "catalogue_intermediate",
+    "catalogue_hidden",
     *{key for keys in FAMILIES.values() for key in keys},
+    *{key for keys in OPTIONAL.values() for key in keys},
 }
 
 
@@ -100,8 +106,11 @@ def load() -> list[dict]:
         if not isinstance(cubin, str) or "/" in cubin or not IDENTIFIER.match(cubin):
             raise SystemExit(f"{INSTANCES}: instance {number}: bad cubin {cubin!r}")
         defines = []
-        for key in FAMILIES[family]:
+        shapes = {}
+        for key in FAMILIES[family] + OPTIONAL.get(family, ()):
             value = row.get(key)
+            if value is None and key in OPTIONAL.get(family, ()):
+                continue
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise SystemExit(
                     f"{INSTANCES}: instance {number} ({entry}): {key} is a positive integer"
@@ -109,6 +118,7 @@ def load() -> list[dict]:
             defines.append(
                 f"-DSPARK_INSTANCE_{entry.upper()}_{key.upper()}={value}u"
             )
+            shapes[key] = value
         catalogue = row.get("catalogue")
         if catalogue is not None and (not isinstance(catalogue, str) or not catalogue):
             raise SystemExit(f"{INSTANCES}: instance {number}: bad catalogue key")
@@ -120,7 +130,7 @@ def load() -> list[dict]:
                 "family": family,
                 "catalogue": catalogue,
                 "defines": defines,
-                "shapes": {key: row[key] for key in FAMILIES[family]},
+                "shapes": shapes,
             }
         )
     return result

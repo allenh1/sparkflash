@@ -1535,8 +1535,18 @@ mod tests {
 
     #[test]
     fn the_released_geometry_is_the_kernel_header_s() {
-        let mut table = Consts::parse(SOURCE);
+        // The kernel's dimensions are instance arguments now: the pins read the same defines the
+        // compiler received, not a second copy in the source.
+        let mut table = Consts::parse(crate::instances::LAYER_SEAMS_SM121_DEFINES);
         table.extend(crate::m4_abi::header_source());
+        assert_eq!(
+            table.value("SPARK_INSTANCE_MHC_ENTRY_BF16_HIDDEN"),
+            i128::from(RELEASED_DIM)
+        );
+        assert_eq!(
+            table.value("SPARK_INSTANCE_MHC_ENTRY_BF16_HC"),
+            i128::from(RELEASED_HC_MULT)
+        );
         assert_eq!(table.value("SPARK_M4_HIDDEN"), i128::from(RELEASED_DIM));
         assert_eq!(
             table.value("SPARK_M4_HC_MULT"),

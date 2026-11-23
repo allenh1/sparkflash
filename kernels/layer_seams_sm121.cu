@@ -133,16 +133,38 @@
 #define SPARK_SEAM_STAGE_ROPE_ROWS 7U
 
 
+// The model shapes are instance arguments (kernels/instances.toml): the hidden width and the
+// residual-stream count have no default, and a build that does not name them does not compile.
+// Each entry below is gated on its own instance's macros, so one compile carries one symbol set
+// and the released cubin keeps exactly the symbols the forward loads.
+#if defined(SPARK_INSTANCE_MHC_ENTRY_BF16_HIDDEN)
+#define SPARK_SEAM_HIDDEN SPARK_INSTANCE_MHC_ENTRY_BF16_HIDDEN
+#define SPARK_SEAM_HC SPARK_INSTANCE_MHC_ENTRY_BF16_HC
+#elif defined(SPARK_INSTANCE_MHC_FFN_SEAMS_HIDDEN)
+#define SPARK_SEAM_HIDDEN SPARK_INSTANCE_MHC_FFN_SEAMS_HIDDEN
+#define SPARK_SEAM_HC SPARK_INSTANCE_MHC_FFN_SEAMS_HC
+#elif defined(SPARK_INSTANCE_MHC_ATTN_RESIDUAL_HIDDEN)
+#define SPARK_SEAM_HIDDEN SPARK_INSTANCE_MHC_ATTN_RESIDUAL_HIDDEN
+#define SPARK_SEAM_HC SPARK_INSTANCE_MHC_ATTN_RESIDUAL_HC
+#elif defined(SPARK_INSTANCE_MHC_FFN_EPILOGUE_HIDDEN)
+#define SPARK_SEAM_HIDDEN SPARK_INSTANCE_MHC_FFN_EPILOGUE_HIDDEN
+#define SPARK_SEAM_HC SPARK_INSTANCE_MHC_FFN_EPILOGUE_HC
+#else
+#error "layer_seams_sm121.cu: no mHC instance macros; hidden and hc are arguments from kernels/instances.toml"
+#endif
+
 #define SPARK_SEAM_THREADS 256u
 #define SPARK_SEAM_WARPS (SPARK_SEAM_THREADS / 32u)
-/// The released coefficient-row count (2 * n + n^2 for n = 4); the launcher refuses any other.
-#define SPARK_SEAM_ROWS SPARK_M4_HC_PREDICTOR_ROWS
+/// The released coefficient-row count (2 * n + n^2 for n = 4), as arithmetic on the stream count.
+#define SPARK_SEAM_ROWS (SPARK_SEAM_HC * SPARK_SEAM_HC + 2u * SPARK_SEAM_HC)
 /// The rows one warp owns: SPARK_SEAM_ROWS over SPARK_SEAM_WARPS.
 #define SPARK_SEAM_ROWS_PER_WARP (SPARK_SEAM_ROWS / SPARK_SEAM_WARPS)
+static_assert(SPARK_SEAM_HC > 0u, "a stream count of zero has no seam");
 static_assert(SPARK_SEAM_ROWS % SPARK_SEAM_WARPS == 0u,
               "the coefficient rows must split evenly over the block's warps");
-static_assert(SPARK_M4_HIDDEN % SPARK_SEAM_THREADS == 0u,
+static_assert(SPARK_SEAM_HIDDEN % SPARK_SEAM_THREADS == 0u,
               "the row loops stride the block size into the hidden width");
+static_assert(SPARK_SEAM_HIDDEN % 32u == 0u, "the quantiser walks 32-value blocks");
 
 // The released BF16 boundary: round to nearest even, NaN kept quiet (quant.rs:157-171).
 
@@ -173,16 +195,16 @@ __device__ __forceinline__ float spark_seam_block_sum(float value, float *scratc
 
 // The column normalisation of the Sinkhorn pair (mhc.rs normalise_columns): hc_eps inside every
 // denominator.
-__device__ __forceinline__ void spark_seam_normalise_columns(float comb[SPARK_M4_HC_MULT]
-                                                                  [SPARK_M4_HC_MULT],
+__device__ __forceinline__ void spark_seam_normalise_columns(float comb[SPARK_SEAM_HC]
+                                                                  [SPARK_SEAM_HC],
                                                              float hc_eps) {
-    for (uint32_t column = 0; column < SPARK_M4_HC_MULT; ++column) {
+    for (uint32_t column = 0; column < SPARK_SEAM_HC; ++column) {
         float sum = hc_eps;
-        for (uint32_t row = 0; row < SPARK_M4_HC_MULT; ++row) {
+        for (uint32_t row = 0; row < SPARK_SEAM_HC; ++row) {
             sum = __fadd_rn(sum, comb[row][column]);
         }
         const float inverse = __fdiv_rn(1.0f, sum);
-        for (uint32_t row = 0; row < SPARK_M4_HC_MULT; ++row) {
+        for (uint32_t row = 0; row < SPARK_SEAM_HC; ++row) {
             comb[row][column] = __fmul_rn(comb[row][column], inverse);
         }
     }
@@ -190,33 +212,33 @@ __device__ __forceinline__ void spark_seam_normalise_columns(float comb[SPARK_M4
 
 // The released split Sinkhorn (mhc.rs:590-608): row softmax, + hc_eps, a column pass, then
 // hc_sinkhorn_iters - 1 row/column pairs. The softmax is linalg::softmax on the hc-wide row.
-__device__ __forceinline__ void spark_seam_split_sinkhorn(float comb[SPARK_M4_HC_MULT]
-                                                                [SPARK_M4_HC_MULT],
+__device__ __forceinline__ void spark_seam_split_sinkhorn(float comb[SPARK_SEAM_HC]
+                                                                [SPARK_SEAM_HC],
                                                           uint32_t iterations, float hc_eps) {
-    for (uint32_t row = 0; row < SPARK_M4_HC_MULT; ++row) {
+    for (uint32_t row = 0; row < SPARK_SEAM_HC; ++row) {
         float maximum = comb[row][0];
-        for (uint32_t column = 1; column < SPARK_M4_HC_MULT; ++column) {
+        for (uint32_t column = 1; column < SPARK_SEAM_HC; ++column) {
             maximum = comb[row][column] > maximum ? comb[row][column] : maximum;
         }
         float total = 0.0f;
-        for (uint32_t column = 0; column < SPARK_M4_HC_MULT; ++column) {
+        for (uint32_t column = 0; column < SPARK_SEAM_HC; ++column) {
             const float exponential = expf(__fadd_rn(comb[row][column], -maximum));
             comb[row][column] = exponential;
             total = __fadd_rn(total, exponential);
         }
-        for (uint32_t column = 0; column < SPARK_M4_HC_MULT; ++column) {
+        for (uint32_t column = 0; column < SPARK_SEAM_HC; ++column) {
             comb[row][column] = __fadd_rn(__fdiv_rn(comb[row][column], total), hc_eps);
         }
     }
     spark_seam_normalise_columns(comb, hc_eps);
     for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
-        for (uint32_t row = 0; row < SPARK_M4_HC_MULT; ++row) {
+        for (uint32_t row = 0; row < SPARK_SEAM_HC; ++row) {
             float sum = 0.0f;
-            for (uint32_t column = 0; column < SPARK_M4_HC_MULT; ++column) {
+            for (uint32_t column = 0; column < SPARK_SEAM_HC; ++column) {
                 sum = __fadd_rn(sum, comb[row][column]);
             }
             const float inverse = __fdiv_rn(1.0f, __fadd_rn(sum, hc_eps));
-            for (uint32_t column = 0; column < SPARK_M4_HC_MULT; ++column) {
+            for (uint32_t column = 0; column < SPARK_SEAM_HC; ++column) {
                 comb[row][column] = __fmul_rn(comb[row][column], inverse);
             }
         }
@@ -229,12 +251,12 @@ __device__ __forceinline__ void spark_seam_split_sinkhorn(float comb[SPARK_M4_HC
 // flattened-stream sum of squares (warp 0 covers the whole width, so no other warp's copy is
 // summed).
 __device__ __forceinline__ float spark_seam_project(
-    const float *__restrict__ stream,  // [SPARK_M4_HC_MULT * SPARK_M4_HIDDEN]
-    const float *__restrict__ fn_w,    // [SPARK_SEAM_ROWS][SPARK_M4_HC_MULT * SPARK_M4_HIDDEN]
+    const float *__restrict__ stream,  // [SPARK_SEAM_HC * SPARK_SEAM_HIDDEN]
+    const float *__restrict__ fn_w,    // [SPARK_SEAM_ROWS][SPARK_SEAM_HC * SPARK_SEAM_HIDDEN]
     float *raw_smem,                   // [SPARK_SEAM_ROWS]
     float *scratch)                    // [32]
 {
-    const uint32_t width = SPARK_M4_HC_MULT * SPARK_M4_HIDDEN;
+    const uint32_t width = SPARK_SEAM_HC * SPARK_SEAM_HIDDEN;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     float raw[SPARK_SEAM_ROWS_PER_WARP] = {0.0f, 0.0f, 0.0f};
@@ -290,8 +312,8 @@ __device__ __forceinline__ void spark_seam_coefficient_tail(
     if (threadIdx.x != 0u) {
         return;
     }
-    const uint32_t hc = SPARK_M4_HC_MULT;
-    const uint32_t width = hc * SPARK_M4_HIDDEN;
+    const uint32_t hc = SPARK_SEAM_HC;
+    const uint32_t width = hc * SPARK_SEAM_HIDDEN;
     const float mean_square = __fdiv_rn(sum_squares, (float)width);
     const float rsqrt = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(mean_square, norm_eps)));
     float mix[SPARK_SEAM_ROWS];
@@ -312,7 +334,7 @@ __device__ __forceinline__ void spark_seam_coefficient_tail(
             2.0f,
             spark_seam_sigmoid(__fadd_rn(__fmul_rn(mix[row], hc_scale[1]), hc_base[row])));
     }
-    float comb[SPARK_M4_HC_MULT][SPARK_M4_HC_MULT];
+    float comb[SPARK_SEAM_HC][SPARK_SEAM_HC];
     for (uint32_t row = 0; row < hc; ++row) {
         for (uint32_t column = 0; column < hc; ++column) {
             const uint32_t coefficient = 2u * hc + row * hc + column;
@@ -345,16 +367,16 @@ __device__ __forceinline__ void spark_seam_hc_pre_and_norm(
     uint32_t norm_bf16,
     uint32_t native_bf16,
     float norm_eps,
-    float *row_smem,          // [SPARK_M4_HIDDEN]
-    __nv_bfloat16 *x_bf16,    // [SPARK_M4_HIDDEN] optional: the normed row, RNE-narrowed
-    float *normed,            // [SPARK_M4_HIDDEN]
+    float *row_smem,          // [SPARK_SEAM_HIDDEN]
+    __nv_bfloat16 *x_bf16,    // [SPARK_SEAM_HIDDEN] optional: the normed row, RNE-narrowed
+    float *normed,            // [SPARK_SEAM_HIDDEN]
     float *scratch)           // [32]
 {
-    const uint32_t dim = SPARK_M4_HIDDEN;
+    const uint32_t dim = SPARK_SEAM_HIDDEN;
     float sum_squares = 0.0f;
     for (uint32_t column = threadIdx.x; column < dim; column += SPARK_SEAM_THREADS) {
         float accumulated = 0.0f;
-        for (uint32_t copy = 0; copy < SPARK_M4_HC_MULT; ++copy) {
+        for (uint32_t copy = 0; copy < SPARK_SEAM_HC; ++copy) {
             accumulated = __fadd_rn(
                 __fmul_rn(in_pre[copy], stream[(uint64_t)copy * dim + column]),
                 accumulated);
@@ -416,12 +438,13 @@ __device__ __forceinline__ void spark_seam_quantise_row(
 // against it and a mismatched launch writes nothing rather than a wrong row.
 __device__ __forceinline__ bool spark_seam_geometry_ok(uint32_t dim, uint32_t hc_mult,
                                                        uint32_t rows) {
-    return dim == SPARK_M4_HIDDEN && hc_mult == SPARK_M4_HC_MULT && rows == SPARK_SEAM_ROWS;
+    return dim == SPARK_SEAM_HIDDEN && hc_mult == SPARK_SEAM_HC && rows == SPARK_SEAM_ROWS;
 }
 
 // ---------------------------------------------------------------------------------------------
 // 1. mhc_entry_bf16: the layer's mHC entry.
 // ---------------------------------------------------------------------------------------------
+#if defined(SPARK_INSTANCE_MHC_ENTRY_BF16_HIDDEN)
 extern "C" __global__ void mhc_entry_bf16(
     const float *__restrict__ residual,      // [hc*dim] the hc stream the layer reads
     const float *__restrict__ attn_pre_mix,  // [hc] previous layer's FFN pre mix / identity seed
@@ -454,8 +477,8 @@ extern "C" __global__ void mhc_entry_bf16(
     if (!spark_seam_geometry_ok(dim, hc_mult, rows)) {
         return;
     }
-    __shared__ float row_smem[SPARK_M4_HIDDEN];
-    __shared__ float in_pre_smem[SPARK_M4_HC_MULT];
+    __shared__ float row_smem[SPARK_SEAM_HIDDEN];
+    __shared__ float in_pre_smem[SPARK_SEAM_HC];
     __shared__ float raw_smem[SPARK_SEAM_ROWS];
     __shared__ float scratch[32];
 
@@ -465,7 +488,7 @@ extern "C" __global__ void mhc_entry_bf16(
     // hc_pre(attn pre) at the FFN). The two sets are different, so the input is latched into its
     // own shared buffer before the coefficient tail overwrites the working one, and the caller may
     // still hand the same span as the pre-mix output.
-    if (threadIdx.x < SPARK_M4_HC_MULT) {
+    if (threadIdx.x < SPARK_SEAM_HC) {
         in_pre_smem[threadIdx.x] = attn_pre_mix[threadIdx.x];
     }
     __syncthreads();
@@ -479,7 +502,7 @@ extern "C" __global__ void mhc_entry_bf16(
     spark_seam_hc_pre_and_norm(residual, in_pre_smem, norm_w, norm_bf16, native_bf16, norm_eps,
                                row_smem, nullptr, normed, scratch);
 
-    const uint32_t width = SPARK_M4_HC_MULT * SPARK_M4_HIDDEN;
+    const uint32_t width = SPARK_SEAM_HC * SPARK_SEAM_HIDDEN;
     for (uint32_t element = threadIdx.x; element < width; element += SPARK_SEAM_THREADS) {
         hc_rows[element] = residual[element];
     }
@@ -489,6 +512,8 @@ extern "C" __global__ void mhc_entry_bf16(
 }
 
 // ---------------------------------------------------------------------------------------------
+#endif // SPARK_INSTANCE_MHC_ENTRY_BF16_HIDDEN
+
 // 2. mhc_ffn_seams: the FFN's mHC entry, its RMSNorm and its activation quantiser.
 // ---------------------------------------------------------------------------------------------
 // The x_bf16 out word is the host arm's pre_ffn_hidden: the FFN block's RMS-normed input in f32,
@@ -497,6 +522,7 @@ extern "C" __global__ void mhc_entry_bf16(
 // value. Under native_bf16 the released boundary already made the normed value bf16-representable,
 // so the narrowing is idempotent and one rule covers both arms. It is the ABI's one optional
 // pointer: null writes nothing, so a launcher can pass a null word until the span exists.
+#if defined(SPARK_INSTANCE_MHC_FFN_SEAMS_HIDDEN)
 extern "C" __global__ void mhc_ffn_seams(
     const float *__restrict__ stream,        // [hc*dim] the post-attention hc stream
     const float *__restrict__ attn_pre_mix,  // [hc] the entry's pre mix (this block's hc_pre)
@@ -533,15 +559,15 @@ extern "C" __global__ void mhc_ffn_seams(
     if (!spark_seam_geometry_ok(dim, hc_mult, rows)) {
         return;
     }
-    __shared__ float row_smem[SPARK_M4_HIDDEN];
-    __shared__ float in_pre_smem[SPARK_M4_HC_MULT];
+    __shared__ float row_smem[SPARK_SEAM_HIDDEN];
+    __shared__ float in_pre_smem[SPARK_SEAM_HC];
     __shared__ float raw_smem[SPARK_SEAM_ROWS];
     __shared__ float scratch[32];
 
     // The FFN block's hc_pre consumes the attention seam's pre set (the INPUT here), and this
     // seam's own pre set is the next layer's input: the reference's two different sets, so the
     // input is latched before the coefficient tail overwrites the working buffer.
-    if (threadIdx.x < SPARK_M4_HC_MULT) {
+    if (threadIdx.x < SPARK_SEAM_HC) {
         in_pre_smem[threadIdx.x] = attn_pre_mix[threadIdx.x];
     }
     __syncthreads();
@@ -553,7 +579,7 @@ extern "C" __global__ void mhc_ffn_seams(
     // The next layer's hc_pre input is this seam's pre set: the table's pre region, copied by the
     // same thread that wrote it, so no shared broadcast and no cross-lane read exist.
     if (threadIdx.x == 0u) {
-        for (uint32_t copy = 0; copy < SPARK_M4_HC_MULT; ++copy) {
+        for (uint32_t copy = 0; copy < SPARK_SEAM_HC; ++copy) {
             pre_mix[copy] = mix_table[copy];
         }
     }
@@ -563,13 +589,15 @@ extern "C" __global__ void mhc_ffn_seams(
                                row_smem, x_bf16, seam_row, scratch);
 
     __syncthreads();
-    spark_seam_quantise_row(seam_row, act_codes, act_scales, SPARK_M4_HIDDEN);
+    spark_seam_quantise_row(seam_row, act_codes, act_scales, SPARK_SEAM_HIDDEN);
     if (trace_ring != nullptr) {
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_MEGA_MHC, layer_id, SPARK_SEAM_STAGE_FFN_SEAMS, trace_enter);
     }
 }
 
 // ---------------------------------------------------------------------------------------------
+#endif // SPARK_INSTANCE_MHC_FFN_SEAMS_HIDDEN
+
 // 3. w8a8_prologue_e4m3: the attention projection's activation quantiser as a device pass.
 // ---------------------------------------------------------------------------------------------
 // One MX block per thread: the block's 32 values, its ue8m0 scale from the floored amax, and 32 E4M3
@@ -592,6 +620,7 @@ extern "C" __global__ void mhc_ffn_seams(
 // would encode values the reference never had. Same MX-block arithmetic as the f32 variant, one
 // widening per read. (It exists because query_path passes the bf16 q_normed span: reading it as f32
 // took 5,120 B out of a 2,560 B span and encoded wrong bytes.)
+#if defined(SPARK_INSTANCE_W8A8_PROLOGUE_BF16_E4M3_HIDDEN)
 extern "C" __global__ void w8a8_prologue_bf16_e4m3(
     const __nv_bfloat16 *__restrict__ normed,  // [rows][cols] the bf16 activation row
     uint8_t *__restrict__ codes,        // [rows][cols] out
@@ -634,6 +663,9 @@ extern "C" __global__ void w8a8_prologue_bf16_e4m3(
     }
 }
 
+#endif // SPARK_INSTANCE_W8A8_PROLOGUE_BF16_E4M3_HIDDEN
+
+#if defined(SPARK_INSTANCE_W8A8_PROLOGUE_E4M3_HIDDEN)
 extern "C" __global__ void w8a8_prologue_e4m3(
     const float *__restrict__ normed,   // [rows][cols] the f32 activation row
     uint8_t *__restrict__ codes,        // [rows][cols] out
@@ -683,6 +715,8 @@ extern "C" __global__ void w8a8_prologue_e4m3(
 }
 
 // ---------------------------------------------------------------------------------------------
+#endif // SPARK_INSTANCE_W8A8_PROLOGUE_E4M3_HIDDEN
+
 // 4. mhc_attn_residual: the attention sublayer's hc_post.
 // ---------------------------------------------------------------------------------------------
 // The released hc_post (mhc.rs:690-760): the reduced attention delta is mixed back onto the hc
@@ -697,6 +731,7 @@ extern "C" __global__ void w8a8_prologue_e4m3(
 // entry's own copy: the kernel reads residual.hc_rows and writes residual.stream, so the in-place
 // update cannot race itself. hc_post mixes the four copies at a fixed j and never across j, so one
 // thread reading all four sources for its j and then writing the four outputs is the whole order.
+#if defined(SPARK_INSTANCE_MHC_ATTN_RESIDUAL_HIDDEN)
 extern "C" __global__ void mhc_attn_residual(
     const float *__restrict__ hc_rows,       // [hc*dim] the hc stream the entry consumed
     const float *__restrict__ mix_table,     // [rows] the entry's pre, post, comb
@@ -720,10 +755,10 @@ extern "C" __global__ void mhc_attn_residual(
     if (!spark_seam_geometry_ok(dim, hc_mult, rows)) {
         return;
     }
-    const uint32_t hc = SPARK_M4_HC_MULT;
+    const uint32_t hc = SPARK_SEAM_HC;
     const __nv_bfloat16 *delta = reinterpret_cast<const __nv_bfloat16 *>(reduced_bf16);
-    float post[SPARK_M4_HC_MULT];
-    float comb[SPARK_M4_HC_MULT][SPARK_M4_HC_MULT];
+    float post[SPARK_SEAM_HC];
+    float comb[SPARK_SEAM_HC][SPARK_SEAM_HC];
     for (uint32_t copy = 0; copy < hc; ++copy) {
         post[copy] = mix_table[hc + copy];
     }
@@ -732,9 +767,9 @@ extern "C" __global__ void mhc_attn_residual(
             comb[source][copy] = mix_table[2u * hc + source * hc + copy];
         }
     }
-    for (uint32_t column = threadIdx.x; column < SPARK_M4_HIDDEN; column += SPARK_SEAM_THREADS) {
+    for (uint32_t column = threadIdx.x; column < SPARK_SEAM_HIDDEN; column += SPARK_SEAM_THREADS) {
         const float x = __bfloat162float(delta[column]);
-        float residual[SPARK_M4_HC_MULT];
+        float residual[SPARK_SEAM_HC];
         for (uint32_t source = 0; source < hc; ++source) {
             residual[source] = hc_rows[(uint64_t)source * dim + column];
         }
@@ -767,6 +802,8 @@ extern "C" __global__ void mhc_attn_residual(
 }
 
 // ---------------------------------------------------------------------------------------------
+#endif // SPARK_INSTANCE_MHC_ATTN_RESIDUAL_HIDDEN
+
 // 5. mhc_ffn_epilogue: the shared-expert add and the FFN's hc_post.
 // ---------------------------------------------------------------------------------------------
 // The released epilogue is two elementwise steps on one row: the shared expert's row is added to the
@@ -782,6 +819,7 @@ extern "C" __global__ void mhc_attn_residual(
 // guessed from a null pointer, and one word to flip when the shared expert lands. The stream is the
 // post-attention hc stream and the update is in place, safe for the same copy-wise reason as
 // mhc_attn_residual.
+#if defined(SPARK_INSTANCE_MHC_FFN_EPILOGUE_HIDDEN)
 extern "C" __global__ void mhc_ffn_epilogue(
     const float *__restrict__ stream,        // [hc*dim] the post-attention hc stream
     const void *__restrict__ moe_delta,      // [dim] bf16, the reduced routed MoE delta
@@ -808,12 +846,12 @@ extern "C" __global__ void mhc_ffn_epilogue(
     if (!spark_seam_geometry_ok(dim, hc_mult, rows)) {
         return;
     }
-    const uint32_t hc = SPARK_M4_HC_MULT;
+    const uint32_t hc = SPARK_SEAM_HC;
     const __nv_bfloat16 *delta = reinterpret_cast<const __nv_bfloat16 *>(moe_delta);
     const __nv_bfloat16 *shared_bf = reinterpret_cast<const __nv_bfloat16 *>(shared_row);
     const float *shared_f = reinterpret_cast<const float *>(shared_row);
-    float post[SPARK_M4_HC_MULT];
-    float comb[SPARK_M4_HC_MULT][SPARK_M4_HC_MULT];
+    float post[SPARK_SEAM_HC];
+    float comb[SPARK_SEAM_HC][SPARK_SEAM_HC];
     for (uint32_t copy = 0; copy < hc; ++copy) {
         post[copy] = mix_table[hc + copy];
     }
@@ -822,7 +860,7 @@ extern "C" __global__ void mhc_ffn_epilogue(
             comb[source][copy] = mix_table[2u * hc + source * hc + copy];
         }
     }
-    for (uint32_t column = threadIdx.x; column < SPARK_M4_HIDDEN; column += SPARK_SEAM_THREADS) {
+    for (uint32_t column = threadIdx.x; column < SPARK_SEAM_HIDDEN; column += SPARK_SEAM_THREADS) {
         const float shared = shared_present == 0u
                                  ? 0.0f
                                  : (shared_bf16 != 0u ? __bfloat162float(shared_bf[column])
@@ -830,7 +868,7 @@ extern "C" __global__ void mhc_ffn_epilogue(
         // The epilogue's own add: the widened routed delta plus the shared row, in f32. With no
         // shared row in the arm the addend is a true zero, so the row stays the routed delta.
         const float ffn_out = __fadd_rn(__bfloat162float(delta[column]), shared);
-        float residual[SPARK_M4_HC_MULT];
+        float residual[SPARK_SEAM_HC];
         for (uint32_t source = 0; source < hc; ++source) {
             residual[source] = stream[(uint64_t)source * dim + column];
         }
@@ -861,6 +899,8 @@ extern "C" __global__ void mhc_ffn_epilogue(
 }
 
 // ---------------------------------------------------------------------------------------------
+#endif // SPARK_INSTANCE_MHC_FFN_EPILOGUE_HIDDEN
+
 // 6. shared_swiglu_f32: the shared expert's activation, for the default (f32-reference) arm.
 // ---------------------------------------------------------------------------------------------
 // The host seam's arithmetic (tp4_forward.rs:7441-7462) with the clamps where the host has them:
@@ -881,6 +921,7 @@ extern "C" __global__ void mhc_ffn_epilogue(
 //
 // No trace: the seam kernels carry a ring because they are layer stages; this kernel is one
 // activation inside moe_shared, which records the stage's record itself.
+#if defined(SPARK_INSTANCE_SHARED_SWIGLU_F32_HIDDEN)
 extern "C" __global__ void shared_swiglu_f32(
     const float *__restrict__ gate,   // [inter] the gate projection's f32 row
     const float *__restrict__ up,     // [inter] the up projection's f32 row
@@ -903,6 +944,8 @@ extern "C" __global__ void shared_swiglu_f32(
 }
 
 // ---------------------------------------------------------------------------------------------
+#endif // SPARK_INSTANCE_SHARED_SWIGLU_F32_HIDDEN
+
 // 8. rope_rotate_rows_bf16: the attention output's inverse RoPE over the per-rank head rows.
 // ---------------------------------------------------------------------------------------------
 // The moved-out rotation the host loop still does in Rust: after the csa2 body writes the BF16 out
@@ -927,6 +970,7 @@ extern "C" __global__ void shared_swiglu_f32(
 // is the wq_b output the launch already knows. rows = 0 is refused by the entry guard (a launch
 // with an empty grid would silently record a stage that did nothing). out MAY alias rows: each pair
 // reads both its values before writing either, and no thread touches another pair's values.
+#if defined(SPARK_INSTANCE_ROPE_ROTATE_ROWS_BF16_HIDDEN)
 extern "C" __global__ void rope_rotate_rows_bf16(
     const __nv_bfloat16 *__restrict__ src,   // [rows][head_width] the stored head rows
     const float *__restrict__ cos,            // [rope_head_dim / 2] this position's cos
@@ -973,3 +1017,4 @@ extern "C" __global__ void rope_rotate_rows_bf16(
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, SPARK_SEAM_STAGE_ROPE_ROWS, trace_enter);
     }
 }
+#endif // SPARK_INSTANCE_ROPE_ROTATE_ROWS_BF16_HIDDEN

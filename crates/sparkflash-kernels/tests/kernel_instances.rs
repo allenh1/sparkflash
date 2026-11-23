@@ -59,7 +59,7 @@ fn instances() -> Vec<Instance> {
                     .to_owned()
             };
             let mut shapes = BTreeMap::new();
-            for key in ["hidden", "experts", "top_k", "intermediate", "padded"] {
+            for key in ["hidden", "experts", "top_k", "intermediate", "padded", "hc"] {
                 if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                     assert!(value > 0, "{key} is positive");
                     shapes.insert(key.to_owned(), value as u64);
@@ -112,15 +112,16 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
             path.display()
         );
         assert!(
-            ["router", "routed"].contains(&instance.family.as_str()),
+            ["router", "routed", "seams"].contains(&instance.family.as_str()),
             "{} names family {:?}",
             instance.entry,
             instance.family
         );
-        for key in if instance.family == "router" {
-            &["hidden", "experts", "top_k"][..]
-        } else {
-            &["hidden", "intermediate", "padded", "experts", "top_k"][..]
+        for key in match instance.family.as_str() {
+            "router" => &["hidden", "experts", "top_k"][..],
+            "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"][..],
+            "seams" => &["hidden"][..],
+            _ => unreachable!(),
         } {
             assert!(
                 instance.shapes.contains_key(*key),
@@ -199,5 +200,77 @@ fn the_router_family_has_its_released_shapes_and_a_second_shape() {
             keys.contains(key),
             "the catalogue key {key} has no instance"
         );
+    }
+}
+
+#[test]
+fn the_seams_family_has_its_released_shapes_and_a_second_shape() {
+    let rows = instances();
+    let seams: Vec<&Instance> = rows.iter().filter(|row| row.family == "seams").collect();
+    assert!(!seams.is_empty(), "the seams family has instances");
+
+    // Every released seam entry records the model hidden width, and the compiled mHC bodies also
+    // name the residual-stream count the source needs.
+    for row in &seams {
+        if row.entry == "opt_mhc_seam_4096h2_sm121" {
+            continue;
+        }
+        assert_eq!(row.shapes["hidden"], 5120, "{}", row.entry);
+    }
+    for entry in [
+        "opt_mhc_seam",
+        "opt_mhc_post",
+        "mhc_entry_bf16",
+        "mhc_ffn_seams",
+        "mhc_attn_residual",
+        "mhc_ffn_epilogue",
+    ] {
+        let row = seams
+            .iter()
+            .find(|row| row.entry == entry)
+            .unwrap_or_else(|| panic!("{entry} is not in the seams family"));
+        assert_eq!(row.shapes.get("hc").copied(), Some(4), "{entry}");
+    }
+    // The runtime-width entries record only the hidden width; they must not claim a stream count
+    // they do not compile against.
+    for entry in [
+        "rope_rotate_bf16",
+        "kv_norm_rope_bf16",
+        "window_quant_fp8_bf16",
+        "kv_append_bf16",
+        "rope_rotate_rows_bf16",
+        "w8a8_prologue_e4m3",
+        "w8a8_prologue_bf16_e4m3",
+        "shared_swiglu_f32",
+        "rmsnorm_sm121",
+    ] {
+        let row = seams
+            .iter()
+            .find(|row| row.entry == entry)
+            .unwrap_or_else(|| panic!("{entry} is not in the seams family"));
+        assert!(!row.shapes.contains_key("hc"), "{entry} claims hc");
+    }
+
+    let second = seams
+        .iter()
+        .find(|row| row.entry == "opt_mhc_seam_4096h2_sm121")
+        .expect("the seams second-shape proof instance");
+    assert_eq!(second.shapes["hidden"], 4096);
+    assert_eq!(second.shapes["hc"], 2);
+    assert_ne!(second.cubin, "opt_seams_sm121");
+    let released = seams
+        .iter()
+        .find(|row| row.cubin == "opt_seams_sm121")
+        .expect("the released seams cubin");
+    assert_ne!(second.cubin, released.cubin, "the proof has its own cubin");
+
+    let keys: BTreeSet<&str> = seams.iter().filter_map(|row| row.catalogue.as_deref()).collect();
+    for key in [
+        "deepseek-hyperconnection",
+        "deepseek-rope",
+        "deepseek-quantize",
+        "deepseek-rmsnorm",
+    ] {
+        assert!(keys.contains(key), "the catalogue key {key} has no seam instance");
     }
 }

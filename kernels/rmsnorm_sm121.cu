@@ -73,6 +73,13 @@
 
 #include "m4_common_sm121.cuh"
 
+// The entry is instance-gated (kernels/instances.toml). Its rows and cols are runtime words of the
+// launch, not compile-time model geometry; the instance records the released hidden width the
+// tail norm serves and marks the symbol as built, so one compile carries one symbol set.
+#if !defined(SPARK_INSTANCE_RMSNORM_SM121_HIDDEN)
+#error "rmsnorm_sm121.cu: no instance macros; the entry is built from kernels/instances.toml"
+#endif
+
 // One 128-bit read of eight BF16 values. nvcc gets the explicit vector load; the clang syntax probe
 // has no inline-asm validation for PTX and takes the equivalent alignment-trusted dereference.
 __device__ __forceinline__ uint4 spark_rmsnorm_load128(const __nv_bfloat16 *pointer) {
@@ -111,6 +118,7 @@ __device__ __forceinline__ float spark_rmsnorm_scale(float value, float inv, flo
     return __fmul_rn(__fmul_rn(value, inv), weight);
 }
 
+#if defined(SPARK_INSTANCE_RMSNORM_SM121_HIDDEN)
 extern "C" __global__ void rmsnorm_sm121(
     const __nv_bfloat16 *__restrict__ x,       // [rows][cols] BF16 input
     const __nv_bfloat16 *__restrict__ weight,  // [cols] BF16 released norm.weight
@@ -188,3 +196,4 @@ extern "C" __global__ void rmsnorm_sm121(
         }
     }
 }
+#endif // SPARK_INSTANCE_RMSNORM_SM121_HIDDEN
