@@ -119,6 +119,15 @@ class OpenManifestAbTest(unittest.TestCase):
         self.assertEqual(env["SPARKFLASH_BIN"], "/build/sparkflash")
         self.assertEqual(ab.launcher_env(args)["SPARK_NODES"], "a b c d")
 
+    def test_launch_pointer_offsets_are_normalized(self):
+        self.assertEqual(
+            ab.normalize_launch("main k a=@41+0 @74+10800000 5a00 0"),
+            "main k a=@41 @74 5a00 0",
+        )
+        self.assertEqual(
+            ab.normalize_launch("main k a=@0+11e0a0fe00"), "main k a=@0"
+        )
+
     def test_the_png_fixture_has_valid_chunk_crcs_and_an_iend(self):
         data = base64.b64decode(ab.DOT_PNG, validate=True)
         chunks = png_chunks(data)

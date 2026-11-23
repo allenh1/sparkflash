@@ -404,7 +404,7 @@ impl DraftState {
             for leaf in ["w1", "w3", "w2"] {
                 for expert in 0..draft_experts() {
                     let (weight, scales) = pair(
-                        crate::plan::mtp_claim(stage, &format!("ffn.experts.{expert}.{leaf}"))
+                        crate::plan::mtp_prefix(stage, &format!("ffn.experts.{expert}.{leaf}"))
                             .to_owned(),
                     )?;
                     words.push(weight);

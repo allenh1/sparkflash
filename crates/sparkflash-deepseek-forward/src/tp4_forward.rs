@@ -5956,10 +5956,19 @@ fn warm_engram_rows(
             }
         }
         for suffix in ["q_weight", "k_weight"] {
-            let name = crate::plan::layer_claim(layer, &format!("engram.{suffix}"));
-            if source.spec(&name).is_ok() {
+            // The plan claims the Engram tables the device binds; the q/k projection weights a
+            // source may carry are host-side warm-up inputs, so an absent claim is skipped rather
+            // than a name the open demands.
+            let Ok(name) = crate::plan::description().layer_tensor(
+                layer,
+                sparkflash_model::Part::Engram,
+                &format!("engram.{suffix}"),
+            ) else {
+                continue;
+            };
+            if source.spec(name).is_ok() {
                 source
-                    .read(&name)
+                    .read(name)
                     .map_err(|error| format!("forward loop: Engram warm-up {name}: {error}"))?;
             }
         }

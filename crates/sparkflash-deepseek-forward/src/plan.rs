@@ -1316,6 +1316,10 @@ mod tests {
         assert!(claimed(1, "engram.q_weight"));
         let stage = mtp_block(0);
         assert!(mtp_prefix(0, "attn.wq_a").ends_with(".attn.wq_a"));
+        for leaf in ["w1", "w3", "w2"] {
+            let tail = format!("ffn.experts.0.{leaf}.weight");
+            assert!(claimed(stage, &tail), "mtp stage 0 claims no {tail}");
+        }
         for tail in [
             "attn.wq_a.weight",
             "attn.wq_a.scale",

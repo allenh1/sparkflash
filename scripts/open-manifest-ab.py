@@ -124,6 +124,17 @@ def line_difference(old_path, new_path):
     return None
 
 
+# A launch line names each device pointer as `@<slot>+<offset>`; the slot is the argument's
+# identity, while the arena offset moves with the process's allocation layout. The bit proof is
+# the slot order and every scalar argument, so the offset is normalized away rather than making
+# two runs of the same binary report a difference.
+LAUNCH_ADDRESS = re.compile(r"@(\d+)\+[0-9a-fA-F]+")
+
+
+def normalize_launch(line):
+    return LAUNCH_ADDRESS.sub(r"@\1", line)
+
+
 def ordered_difference(old_path, new_path):
     with open(old_path, "r", encoding="utf-8") as handle:
         old = [line.rstrip("\n") for line in handle]
