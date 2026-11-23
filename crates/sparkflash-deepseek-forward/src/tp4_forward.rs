@@ -7640,7 +7640,7 @@ fn build_shared_expert_device(
         mxfp8_gemv_launch::Mode::NonFusedF32ActivationF32Stores,
     )?;
     let (swiglu_cubin, _swiglu_sha) =
-        load_pinned_addition(kernel_dir, "swiglu_mxfp8_quant_sm121", "shared expert")?;
+        load_pinned_addition(kernel_dir, crate::plan::handles().swiglu, "shared expert")?;
     let (swiglu_module, swiglu) = cuda.load_swiglu_quant(&swiglu_cubin)?;
     // One B12x weight buffer and one scale grid per tensor, plus the per-token scratch.
     let weight_bytes = (2 * inter * dim + dim * inter) as u64;
@@ -11698,8 +11698,11 @@ impl<'a> DeviceLayer<'a> {
         let kernel_dir = kernel_cubin_dir.ok_or_else(|| {
             "layer device: the loop has no kernel cubin directory, so the row-norm kernel cannot be loaded".to_string()
         })?;
-        let norm_bytes = std::fs::read(crate::tp4_tail::cubin_path(kernel_dir, "rmsnorm_sm121"))
-            .map_err(|error| format!("layer device: row-norm cubin: {error}"))?;
+        let norm_bytes = std::fs::read(crate::tp4_tail::cubin_path(
+            kernel_dir,
+            crate::plan::handles().rmsnorm,
+        ))
+        .map_err(|error| format!("layer device: row-norm cubin: {error}"))?;
         let row_norm = sparkflash_kernels::rmsnorm_launch::load(cuda, &norm_bytes)
             .map_err(|error| format!("layer device: load rmsnorm_sm121: {error}"))?;
         // The seam kernels are one pinned image: read, digest-checked against its baseline pin and
@@ -11758,8 +11761,11 @@ impl<'a> DeviceLayer<'a> {
         // carry it leaves the router unloaded and the stage refusing at open, not at layer 0.
         let router_kernels = match kernel_cubin_dir {
             Some(dir) => {
-                let (cubin, _sha256) =
-                    load_pinned_addition(dir, "moe_router_sm121", "layer device router")?;
+                let (cubin, _sha256) = load_pinned_addition(
+                    dir,
+                    crate::plan::handles().moe_router,
+                    "layer device router",
+                )?;
                 Some(sparkflash_kernels::router_launch::load(cuda, &cubin)?)
             }
             None => None,
@@ -11844,7 +11850,8 @@ impl<'a> DeviceLayer<'a> {
             {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_router_sm121.cubin"))
                     .map_err(|error| format!("layer device opt router: {error}"))?;
-                let (module, kernel) = cuda.load_named(&cubin, "opt_router_sm121")?;
+                let (module, kernel) =
+                    cuda.load_named(&cubin, crate::plan::handles().router_opt)?;
                 let mut total = 0usize;
                 let ticket = cuda.alloc(4, &mut total)?;
                 cuda.copy_htod(&ticket, &[0u8; 4])?;
@@ -13744,8 +13751,11 @@ impl<'a> DeviceLayer<'a> {
             sparkflash_kernels::engram_convert_launch::load_widen(self.cuda, &convert_cubin)
                 .map_err(|error| format!("layer device seam widen: load: {error}"))?;
         self.seam_widen = Some(widen);
-        let (norm_cubin, _sha) =
-            load_pinned_addition(kernel_dir, "rmsnorm_sm121", "layer device seam norm")?;
+        let (norm_cubin, _sha) = load_pinned_addition(
+            kernel_dir,
+            crate::plan::handles().rmsnorm,
+            "layer device seam norm",
+        )?;
         let (_m, norm) = sparkflash_kernels::rmsnorm_launch::load(self.cuda, &norm_cubin)
             .map_err(|error| format!("layer device seam norm: load: {error}"))?;
         self.seam_norm = Some(norm);
@@ -14085,9 +14095,15 @@ impl<'a> DeviceLayer<'a> {
         };
         let context = "layer device engram";
         let cuda = self.cuda;
-        let (embed_cubin, _) = load_pinned_addition(kernel_dir, "engram_embed_sm121", context)?;
-        let (wkv_cubin, _) = load_pinned_addition(kernel_dir, "engram_wkv_sm121", context)?;
-        let (gate_cubin, _) = load_pinned_addition(kernel_dir, "engram_gate_write_sm121", context)?;
+        let (embed_cubin, _) =
+            load_pinned_addition(kernel_dir, crate::plan::handles().engram_embed, context)?;
+        let (wkv_cubin, _) =
+            load_pinned_addition(kernel_dir, crate::plan::handles().engram_wkv, context)?;
+        let (gate_cubin, _) = load_pinned_addition(
+            kernel_dir,
+            crate::plan::handles().engram_gate_write,
+            context,
+        )?;
         let (write_cubin, _) = load_pinned_addition(kernel_dir, "engram_write_sm121", context)?;
         let (convert_cubin, _) =
             load_pinned_addition(kernel_dir, "engram_stream_convert_sm121", context)?;

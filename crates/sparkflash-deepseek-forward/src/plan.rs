@@ -501,6 +501,129 @@ impl Description {
     }
 }
 
+/// A part's catalogue symbol at one position, in catalogue order.
+///
+/// The catalogue order is part of the description; the forward names a role, not a symbol. A
+/// position outside the list is a refusal naming the part.
+///
+/// # Errors
+/// The part instance has no symbol at that position.
+pub fn symbol_at(
+    block: Option<usize>,
+    part: Part,
+    position: usize,
+) -> Result<&'static str, ConfigError> {
+    description()
+        .symbols(block, part)
+        .get(position)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "the plan's {part:?} part instance at {block:?} has no symbol {position} (it claims {:?})",
+                description().symbols(block, part)
+            )
+        })
+}
+
+/// The kernel handles the forward opens, all read from the plan's catalogue entries.
+#[derive(Debug, Clone, Copy)]
+pub struct KernelHandles {
+    /// The MoE router's stage one.
+    pub moe_router: &'static str,
+    /// The routed gate/up GEMM.
+    pub routed_gate_up: &'static str,
+    /// The weighted SwiGLU quantiser.
+    pub weighted_swiglu: &'static str,
+    /// The stored MP4 routed combine.
+    pub stored_combine: &'static str,
+    /// The SwiGLU quantiser.
+    pub swiglu: &'static str,
+    /// The certified LM head.
+    pub lm_head: &'static str,
+    /// The RMS norm.
+    pub rmsnorm: &'static str,
+    /// The BF16-activation MXFP8 wo_a projection.
+    pub wo_a_native: &'static str,
+    /// The CSA2 sequence attention entry.
+    pub flash_mla_seq: &'static str,
+    /// The Engram embed table lookup.
+    pub engram_embed: &'static str,
+    /// The Engram gate write.
+    pub engram_gate_write: &'static str,
+    /// The Engram wkv projection.
+    pub engram_wkv: &'static str,
+    /// The reference-grade candidate select.
+    pub ref_select: &'static str,
+    /// The MTP router (128 experts, top-3).
+    pub mtp_router: &'static str,
+    /// The MTP gate/up.
+    pub mtp_gate_up: &'static str,
+    /// The MTP down combine.
+    pub mtp_down_combine: &'static str,
+    /// The MTP gate/up, deduplicated.
+    pub mtp_gate_up_dedup: &'static str,
+    /// The MTP down, deduplicated.
+    pub mtp_down_dedup: &'static str,
+    /// The MTP combine.
+    pub mtp_combine: &'static str,
+    /// The MTP plan.
+    pub mtp_plan: &'static str,
+    /// The non-MTP opt router (384 experts, top-6).
+    pub router_opt: &'static str,
+    /// The MXFP8 decode GEMV.
+    pub gemv: &'static str,
+    /// The compressed-cache append.
+    pub compressed_append: &'static str,
+}
+
+impl KernelHandles {
+    /// Read every handle from the installed plan's catalogue entries.
+    ///
+    /// # Errors
+    /// A part whose catalogue entry is missing the position this forward launches.
+    pub fn from_plan() -> Result<Self, ConfigError> {
+        Ok(Self {
+            moe_router: symbol_at(None, Part::MoeRouter, 0)?,
+            routed_gate_up: symbol_at(None, Part::Moe, 9)?,
+            weighted_swiglu: symbol_at(None, Part::Activation, 1)?,
+            stored_combine: symbol_at(None, Part::Moe, 0)?,
+            swiglu: symbol_at(None, Part::Activation, 0)?,
+            lm_head: symbol_at(None, Part::LmHead, 0)?,
+            rmsnorm: symbol_at(None, Part::RmsNorm, 0)?,
+            wo_a_native: symbol_at(None, Part::DenseGemm, 0)?,
+            flash_mla_seq: symbol_at(None, Part::MlaAttention, 8)?,
+            engram_embed: symbol_at(None, Part::Engram, 0)?,
+            engram_gate_write: symbol_at(None, Part::Engram, 1)?,
+            engram_wkv: symbol_at(None, Part::Engram, 2)?,
+            ref_select: symbol_at(None, Part::SparseIndexer, 19)?,
+            mtp_router: symbol_at(None, Part::MoeRouter, 3)?,
+            mtp_gate_up: symbol_at(None, Part::Moe, 2)?,
+            mtp_down_combine: symbol_at(None, Part::Moe, 4)?,
+            mtp_gate_up_dedup: symbol_at(None, Part::Moe, 11)?,
+            mtp_down_dedup: symbol_at(None, Part::Moe, 8)?,
+            mtp_combine: symbol_at(None, Part::MoeCombine, 2)?,
+            mtp_plan: symbol_at(None, Part::MoePlan, 1)?,
+            router_opt: symbol_at(None, Part::MoeRouter, 2)?,
+            gemv: symbol_at(None, Part::DenseGemm, 1)?,
+            compressed_append: symbol_at(None, Part::Csa2Compression, 0)?,
+        })
+    }
+}
+
+static HANDLES: Mutex<Option<KernelHandles>> = Mutex::new(None);
+
+/// The installed plan's kernel handles.
+///
+/// # Panics
+/// No plan is installed, or a catalogue entry this forward launches is missing.
+#[must_use]
+pub fn handles() -> KernelHandles {
+    HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(|| panic!("forward open: no kernel handles installed"))
+}
+
 static DESCRIPTION: Mutex<Option<&'static Description>> = Mutex::new(None);
 
 /// Install the process's open description.
@@ -515,6 +638,10 @@ pub fn install(plan: EnginePlan) -> Result<&'static Description, ConfigError> {
     *DESCRIPTION
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(description);
+    let handles = KernelHandles::from_plan()?;
+    *HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handles);
     Ok(description)
 }
 
@@ -756,6 +883,51 @@ mod tests {
         }
         for name in ["embed.weight", "norm.weight", "head.weight"] {
             assert_eq!(named(name), name);
+        }
+    }
+
+    #[test]
+    fn the_kernel_handles_are_catalogue_entries() {
+        let Some(_) = released() else {
+            eprintln!("skipping: the released checkpoint is not on this host");
+            return;
+        };
+        let handles = handles();
+        for (name, symbol) in [
+            ("moe_router", handles.moe_router),
+            ("routed_gate_up", handles.routed_gate_up),
+            ("weighted_swiglu", handles.weighted_swiglu),
+            ("stored_combine", handles.stored_combine),
+            ("swiglu", handles.swiglu),
+            ("lm_head", handles.lm_head),
+            ("rmsnorm", handles.rmsnorm),
+            ("wo_a_native", handles.wo_a_native),
+            ("flash_mla_seq", handles.flash_mla_seq),
+            ("engram_embed", handles.engram_embed),
+            ("engram_gate_write", handles.engram_gate_write),
+            ("engram_wkv", handles.engram_wkv),
+            ("ref_select", handles.ref_select),
+            ("mtp_router", handles.mtp_router),
+            ("mtp_gate_up", handles.mtp_gate_up),
+            ("mtp_down_combine", handles.mtp_down_combine),
+            ("mtp_gate_up_dedup", handles.mtp_gate_up_dedup),
+            ("mtp_down_dedup", handles.mtp_down_dedup),
+            ("mtp_combine", handles.mtp_combine),
+            ("mtp_plan", handles.mtp_plan),
+            ("router_opt", handles.router_opt),
+            ("gemv", handles.gemv),
+            ("compressed_append", handles.compressed_append),
+        ] {
+            assert!(symbol.ends_with("_sm121"), "{name}: {symbol}");
+            let description = description();
+            assert!(
+                description
+                    .plan()
+                    .symbols()
+                    .iter()
+                    .any(|part| part.symbols.contains(&symbol)),
+                "{name}: {symbol} is not a catalogue symbol"
+            );
         }
     }
 

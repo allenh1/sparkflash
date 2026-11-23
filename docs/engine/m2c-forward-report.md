@@ -43,6 +43,40 @@ four-rank DeepSeek; taking it down needs a lead-scheduled window and the saved t
 `cargo test -p sparkflash-ops --test deepseek_plan_manifest` passes on this host (2 passed),
 which is the input side of the comparison, not the forward trace.
 
+
+## PR 2 — kernel handles come from the resolved catalogue entries
+
+Commit: 'forward: take kernel handles from the plan's catalogue entries'
+
+What changed:
+
+* plan::KernelHandles reads every handle the forward opens from the plan's PartSymbols
+  entries, in catalogue order, at install time. The launch shape is unchanged: the same
+  symbols, the same cubins, the same four-rank grids.
+* the MoE router, routed gate/up, weighted SwiGLU, stored combine, SwiGLU, certified head,
+  RMS norm, BF16-activation wo_a, CSA2 sequence attention, Engram embed/gate/wkv, reference
+  candidate select, the opt router, the decode GEMV and every MTP symbol now come from
+  plan::handles() instead of a string constant in the forward.
+* a test pins every handle to an entry in the plan's catalogue symbol set.
+
+Commands run:
+
+    cargo fmt -p sparkflash-deepseek-forward
+    cargo check -p sparkflash-deepseek-forward --offline                  # pass
+    cargo check -p sparkflash-cli --offline                              # pass
+    cargo test -p sparkflash-deepseek-forward --lib plan::tests --offline -- --nocapture
+    # the_kernel_handles_are_catalogue_entries, every_name_the_open_uses_is_a_claim,
+    # the_language_parts_all_have_a_body all pass
+
+Comparison evidence: not measured, same cluster blocker as PR 1.
+
+Remaining symbol strings (catalogue gap, not forward choice): the plan's DeepSeek symbol set
+does not contain b12x_mxfp8_dense_sm121, b12x_mxfp8_wo_a_sm121, flash_mla_csa2_sm121,
+b12x_mxfp4_moe_sm121 (the pre-added combine), lm_head_reduce_sm121, pool_group_sm121,
+engram_stream_convert_sm121, engram_write_sm121 or moe_routed_device_sm121. They stay literal
+until part B's catalogue claims them; the plan test's exact symbol set is the authority and it
+does not.
+
 ## Blockers
 
 1. **Four-rank manifest/launch/tick comparison.** The baseline is on the head node at

@@ -298,17 +298,26 @@ impl DraftState {
             .map_or(pass_seqs, |seqs| seqs.clamp(1, pass_seqs));
         let fold_seqs = load("opt_draft_sm121.cubin", "opt_draft_fold_seqs")?;
         let pick_seqs = load("opt_draft_sm121.cubin", "opt_draft_pick_seqs")?;
-        let router = load("opt_router_sm121.cubin", "opt_router_e128k3_sm121")?;
-        let gate_up = load("opt_moe_sm121.cubin", "opt_moe_gate_up_k3_sm121")?;
-        let down = load("opt_moe_sm121.cubin", "opt_moe_down_combine_k3_sm121")?;
+        let router = load("opt_router_sm121.cubin", crate::plan::handles().mtp_router)?;
+        let gate_up = load("opt_moe_sm121.cubin", crate::plan::handles().mtp_gate_up)?;
+        let down = load(
+            "opt_moe_sm121.cubin",
+            crate::plan::handles().mtp_down_combine,
+        )?;
         let (dedup, plan) = if drafter.moe_dedup() {
             (
                 Some([
-                    load("opt_moe_sm121.cubin", "opt_moe_gate_up_dedup_k3_sm121")?,
-                    load("opt_moe_sm121.cubin", "opt_moe_down_dedup_sm121")?,
-                    load("opt_moe_sm121.cubin", "opt_moe_combine_k3_sm121")?,
+                    load(
+                        "opt_moe_sm121.cubin",
+                        crate::plan::handles().mtp_gate_up_dedup,
+                    )?,
+                    load("opt_moe_sm121.cubin", crate::plan::handles().mtp_down_dedup)?,
+                    load("opt_moe_sm121.cubin", crate::plan::handles().mtp_combine)?,
                 ]),
-                Some(load("opt_moe_sm121.cubin", "opt_moe_plan_sm121")?),
+                Some(load(
+                    "opt_moe_sm121.cubin",
+                    crate::plan::handles().mtp_plan,
+                )?),
             )
         } else {
             (None, None)
