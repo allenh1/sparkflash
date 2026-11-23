@@ -414,7 +414,7 @@ mod tests {
     fn an_unusual_block_or_group_travels_rather_than_being_read_at_a_default() {
         let wide = StoredFormat::of(WeightFormat::MxFp4 { block: 64 });
         assert_eq!(wide.block(), 64);
-        assert!(wide.same_arithmetic(StoredFormat::MXFP4_32) == false);
+        assert!(!wide.same_arithmetic(StoredFormat::MXFP4_32));
         let group = StoredFormat::of(WeightFormat::NvFp4 { group_size: 32 });
         assert_eq!(group.block(), 32);
         assert!(group.has_scale(ScaleKind::TensorWide));
