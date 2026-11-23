@@ -1060,8 +1060,13 @@ pub fn named(name: &str) -> &'static str {
 /// One MTP stage's tensor, by the tail its checkpoint name carries.
 #[must_use]
 pub fn mtp_claim(stage: usize, tail: &str) -> &'static str {
+    layer_claim_any(mtp_block(stage), tail)
+}
+
+/// The MTP draft block a stage lives in, as a block index.
+fn mtp_block(stage: usize) -> usize {
     let description = description();
-    let block = description
+    description
         .plan
         .stacks()
         .iter()
@@ -1076,8 +1081,16 @@ pub fn mtp_claim(stage: usize, tail: &str) -> &'static str {
             })
         })
         .map(|block| block.index)
-        .unwrap_or_else(|| panic!("forward open: no draft block for stage {stage}"));
-    layer_claim_any(block, tail)
+        .unwrap_or_else(|| panic!("forward open: no draft block for stage {stage}"))
+}
+
+/// The MTP stage prefix a claim under `segment` lives at, e.g. `mtp.1.attn`.
+///
+/// A pair of tensors (a weight and its scale) shares a prefix; a caller that needs both derives
+/// them from this prefix rather than asking the plan for a name that does not exist.
+#[must_use]
+pub fn mtp_prefix(stage: usize, segment: &str) -> &'static str {
+    layer_prefix(mtp_block(stage), segment)
 }
 
 /// Install the released checkpoint's plan for `rank` of `world`.
@@ -1275,6 +1288,47 @@ mod tests {
         }
         let plan = plan_from_checkpoint(4, 0).ok()?;
         install(plan).ok()
+    }
+
+    #[test]
+    fn the_open_prefixes_resolve_to_the_plans_claims() {
+        let Some(description) = released() else {
+            eprintln!("skipping: the released checkpoint is not on this host");
+            return;
+        };
+        let claimed = |block: usize, tail: &str| {
+            let suffix = format!(".{tail}");
+            description.claims.iter().any(|((candidate, _), names)| {
+                *candidate == block && names.iter().any(|name| name.ends_with(&suffix))
+            })
+        };
+        assert_eq!(
+            layer_prefix(0, "ffn.shared_experts"),
+            "layers.0.ffn.shared_experts"
+        );
+        for leaf in ["w1", "w3", "w2"] {
+            for suffix in ["weight", "scale"] {
+                let tail = format!("ffn.shared_experts.{leaf}.{suffix}");
+                assert!(claimed(0, &tail), "layer 0 claims no {tail}");
+            }
+        }
+        assert_eq!(layer_prefix(1, "engram"), "layers.1.engram");
+        assert!(claimed(1, "engram.q_weight"));
+        let stage = mtp_block(0);
+        assert!(mtp_prefix(0, "attn.wq_a").ends_with(".attn.wq_a"));
+        for tail in [
+            "attn.wq_a.weight",
+            "attn.wq_a.scale",
+            "attn.wq_b.weight",
+            "attn.wo_a.weight",
+            "attn.wo_b.weight",
+            "attn.wkv.weight",
+            "ffn.shared_experts.w1.weight",
+            "ffn.shared_experts.w3.weight",
+            "ffn.shared_experts.w2.weight",
+        ] {
+            assert!(claimed(stage, tail), "mtp stage 0 claims no {tail}");
+        }
     }
 
     #[test]

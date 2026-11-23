@@ -444,7 +444,7 @@ pub fn build_host_state(
     let element_limit = hc * dim;
     let scale_len = out_width.div_ceil(32) * inner.div_ceil(32);
     for &layer in &layer_ids {
-        let prefix = crate::plan::layer_claim(layer, "engram");
+        let prefix = crate::plan::layer_prefix(layer, "engram");
         let q = sparkflash_engine::linalg::decode_by_name(
             source,
             &format!("{prefix}.q_weight"),

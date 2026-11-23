@@ -7313,7 +7313,7 @@ fn gather_shared_expert_source(
     let dim_blocks = dim / 32;
     let inter_blocks = inter / 32;
     let shard_blocks = local_inter / 32;
-    let prefix = crate::plan::layer_claim(layer, "ffn.shared_experts");
+    let prefix = crate::plan::layer_prefix(layer, "ffn.shared_experts");
     let mut local_reads = 0usize;
     let mut gather_calls = 0usize;
     let mut tensors = std::collections::BTreeMap::new();
