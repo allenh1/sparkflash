@@ -413,7 +413,13 @@ fn cuda_kernel_defines_are_the_kv_layout() {
     // The kernel's arithmetic is written in terms of the same defines, not fresh literals. The
     // three entries share one body, so the guard reads the entry and its common header together.
     let source = format!("{FLASH_MLA_CSA2}\n{FLASH_MLA_CSA2_COMMON}");
-    assert!(source.contains("#define SPARK_M4_MLA_LATENT SPARK_M4_KV_LORA_RANK"));
+    // The latent is an instance argument now: the entry's define carries the width the instance
+    // list names, and the arithmetic below is still written in terms of the define.
+    assert!(source.contains("#define SPARK_M4_MLA_LATENT SPARK_MLA_BASE_KV_LORA"));
+    assert!(
+        source
+            .contains("#define SPARK_MLA_BASE_KV_LORA SPARK_INSTANCE_FLASH_MLA_CSA2_SM121_KV_LORA")
+    );
     assert!(source.contains("SPARK_M4_MLA_LATENT / 2u"));
     assert!(source.contains("SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS"));
     assert!(source.contains("(SPARK_M4_MLA_LATENT / SPARK_M4_MLA_WINDOW_QUANT_BLOCK)"));

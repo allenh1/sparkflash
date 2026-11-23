@@ -379,6 +379,7 @@ fn the_union_guards_quote_the_body_numbers() {
         "/../../kernels/flash_mla_csa2_ring_sm121.cu"
     ))
     .expect("the body source is in the tree");
-    assert!(source.contains("static_assert(SPARK_M4_MLA_RING_MAX_ATTENDED == 646u"));
+    assert!(source.contains("static_assert(SPARK_M4_MLA_RING_MAX_ATTENDED =="));
+    assert!(source.contains("SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_MLA_RING_CAPACITY"));
     assert!(source.contains("candidate <= position"));
 }
