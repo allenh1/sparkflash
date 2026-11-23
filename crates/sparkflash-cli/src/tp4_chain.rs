@@ -1145,12 +1145,6 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
                 (bind, arena_evidence, _arena_lines, Some(outcome))
             }
         };
-        sparkflash_deepseek_forward::open_manifest::record_tensors(
-            &setup.plan,
-            &bind.bound_names(),
-            args.rank,
-            args.world,
-        );
         let bind_path = args
             .evidence_dir
             .join(format!("tp4-bind-r{}.json", args.rank));
