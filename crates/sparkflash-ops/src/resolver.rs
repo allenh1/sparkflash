@@ -484,7 +484,7 @@ impl KernelResolver {
             symbol,
             canonical: entry.canonical,
             geometry: requirement.geometry,
-            format: symbol.format.unwrap_or_else(|| requirement.format),
+            format: symbol.format.unwrap_or(requirement.format),
         }
     }
 
