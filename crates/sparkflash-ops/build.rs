@@ -97,6 +97,12 @@ fn generate() -> String {
     // vocabulary shard times the rank shards is the model's vocabulary.
     let mut head_shapes: BTreeMap<String, BTreeSet<(u64, u64)>> = BTreeMap::new();
     let mut vision: BTreeMap<String, VisionKey> = BTreeMap::new();
+    // The attention/selection vocabulary: the shape fields those parts expose, one set per key.
+    let mut family_of: BTreeMap<String, String> = BTreeMap::new();
+    let mut head_dim: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut index_topk: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut index_heads: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut positions: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut claims_intermediate: BTreeMap<String, bool> = BTreeMap::new();
     let mut claims_hidden: BTreeMap<String, bool> = BTreeMap::new();
     let mut dims: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -150,6 +156,39 @@ fn generate() -> String {
                 }));
             // The keys the vision rule does not claim are still validated.
             let _ = (positive("experts"), positive("top_k"));
+            continue;
+        }
+        if family == "mla" || family == "select" {
+            family_of.insert(key.clone(), family.to_owned());
+            let width_key = if family == "select" {
+                "index_head_dim"
+            } else {
+                "head_dim"
+            };
+            head_dim
+                .entry(key.clone())
+                .or_default()
+                .insert(positive(width_key).unwrap_or_else(|| {
+                    panic!("sparkflash-ops: {key} has no positive integer {width_key}")
+                }));
+            if family == "select" {
+                index_topk.entry(key.clone()).or_default().insert(
+                    positive("index_topk").unwrap_or_else(|| {
+                        panic!("sparkflash-ops: {key} has no positive integer index_topk")
+                    }),
+                );
+                index_heads.entry(key.clone()).or_default().insert(
+                    positive("index_heads").unwrap_or_else(|| {
+                        panic!("sparkflash-ops: {key} has no positive integer index_heads")
+                    }),
+                );
+            }
+            positions
+                .entry(key.clone())
+                .or_default()
+                .insert(positive("positions").unwrap_or_else(|| {
+                    panic!("sparkflash-ops: {key} has no positive integer positions")
+                }));
             continue;
         }
         if family == "head" {
@@ -344,6 +383,43 @@ fn generate() -> String {
                     ".out_hidden_equals({})",
                     one(&shapes.out_hidden, key, "out_hidden")
                 ));
+            }
+            let expression = if parts.is_empty() {
+                "ShapeConstraint::ANY".to_owned()
+            } else {
+                format!("ShapeConstraint::ANY\n    {}", parts.join("\n    "))
+            };
+            let _ = writeln!(
+                generated,
+                "#[allow(dead_code)] // a generated rule exists for every catalogue key, used or not"
+            );
+            let _ = writeln!(
+                generated,
+                "pub(crate) const {name}: ShapeConstraint = {expression};"
+            );
+            continue;
+        }
+        if let Some(family) = family_of.get(key) {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(values) = hidden.get(key) {
+                parts.push(format!(".hidden_equals({})", one(values, key, "hidden")));
+            }
+            if let Some(widths) = head_dim.get(key) {
+                parts.push(format!(
+                    ".head_dim_equals({})",
+                    one(widths, key, "head_dim")
+                ));
+            }
+            if family == "select" {
+                if let Some(values) = index_topk.get(key) {
+                    parts.push(format!(".top_k_equals({})", one(values, key, "index_topk")));
+                }
+                if let Some(values) = index_heads.get(key) {
+                    parts.push(format!(".max_heads({})", one(values, key, "index_heads")));
+                }
+            }
+            if let Some(values) = positions.get(key) {
+                parts.push(format!(".positions(0, {})", one(values, key, "positions")));
             }
             let expression = if parts.is_empty() {
                 "ShapeConstraint::ANY".to_owned()

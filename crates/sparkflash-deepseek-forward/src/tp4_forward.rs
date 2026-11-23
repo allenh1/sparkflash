@@ -3525,8 +3525,7 @@ impl AttentionBody {
             .flat_map(|value| value.to_le_bytes())
             .collect();
         if staged.window_codes.len() != staged.window_rows * crate::plan::mla_latent()
-            || staged.window_scales.len()
-                != staged.window_rows * crate::plan::mla_latent() / 32
+            || staged.window_scales.len() != staged.window_rows * crate::plan::mla_latent() / 32
         {
             return Err(format!(
                 "attention body: {} window rows staged as {} code and {} scale bytes",

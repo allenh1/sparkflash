@@ -921,6 +921,9 @@ pub fn consts() -> Consts {
     for (_, source) in KERNELS {
         table.extend(source);
     }
+    // flash_mla_csa2's shapes are instance arguments; the list's defines are what its #defines
+    // expand through, exactly as the build passes them.
+    table.extend(crate::instances::FLASH_MLA_CSA2_SM121_DEFINES);
     table
 }
 
@@ -1589,6 +1592,11 @@ fn every_static_assert_in_the_milestone_holds_under_rust_too() {
             // second-shape proof instance is a separate cubin and its own table.
             table.extend(crate::instances::CERT_LM_HEAD_SM121_DEFINES);
             table.extend(crate::instances::CERT_LM_HEAD_4096V16384_SM121_DEFINES);
+        }
+        // The CSA2 sequence attention's asserts read its instance arguments too; the generated
+        // defines are the same table the build passes to the compiler.
+        if name == "flash_mla_csa2_sm121.cu" {
+            table.extend(crate::instances::FLASH_MLA_CSA2_SM121_DEFINES);
         }
         let asserts = crate::c_decl::static_asserts(&stripped);
         let expected = ASSERT_COUNTS
@@ -2808,7 +2816,7 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
             && code.contains(
                 "#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_SWA_WINDOW)",
             )
-            && code.contains("static_assert(SPARK_M4_MLA_MAX_ATTENDED == 640u,")
+            && code.contains("static_assert(SPARK_M4_MLA_MAX_ATTENDED == SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_SWA_WINDOW,")
             && code.contains("__shared__ float s_scores[kMaxAttended];")
             && code.contains("__device__ __forceinline__ uint32_t spark_mla_union_attends(")
             && code.contains("return candidate <= position ? 1u : 0u;")

@@ -50,7 +50,16 @@
 #include "m4_common_sm121.cuh"
 #include "select_body_sm121.cuh"
 
+// The reference select is runtime-generic over the indexer's heads and head width, so it reads no
+// width from this header. It is still listed as the indexer's released shape (kernels/instances.toml)
+// and gated on its own instance, so a build that names no shape fails instead of compiling a
+// default. Its only compile-time bound is the body's 4096-position score table.
+#if !defined(SPARK_INSTANCE_REF_SELECT_SM121_HIDDEN)
+#error "ref_select_sm121.cu: no instance macros; the indexer shape is an argument from kernels/instances.toml"
+#endif
+
 // The exact entry: the serial score pass, then the shared body's masks, rank and emission.
+#if defined(SPARK_INSTANCE_REF_SELECT_SM121_HIDDEN)
 extern "C" __global__ void ref_select_sm121(
     const float* __restrict__ q_index,
     const float* __restrict__ keys,
@@ -74,3 +83,4 @@ extern "C" __global__ void ref_select_sm121(
                               mask_out, n_pos, heads, head_dim, reach, topk, offset, mask_mode,
                               topk_blocks, block_size, no_index, flags);
 }
+#endif

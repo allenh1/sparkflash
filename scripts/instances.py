@@ -66,6 +66,31 @@ FAMILIES = {
         "experts",
         "top_k",
     ),
+    # MLA / CSA2 attention: the latent width the three CSA2 entries read, the query and index
+    # head shapes the indexer prologue addresses, the sliding window and the HSI block pool.
+    "mla": (
+        "hidden",
+        "heads",
+        "head_dim",
+        "kv_lora",
+        "window",
+        "index_heads",
+        "index_head_dim",
+        "index_topk",
+        "hsi_blocks",
+        "hsi_block_tokens",
+        "ring_capacity",
+        "positions",
+    ),
+    # Candidate selection: the indexer's head shape, the compiled position bound and the part
+    # geometry the SparseIndexer catalogue rule claims.
+    "select": (
+        "hidden",
+        "index_heads",
+        "index_head_dim",
+        "index_topk",
+        "positions",
+    ),
 }
 OPTIONAL = {"seams": ("hc",)}
 # The catalogue generator understands these dimensions as shape claims. A key may name a subset

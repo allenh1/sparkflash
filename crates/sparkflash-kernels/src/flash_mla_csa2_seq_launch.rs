@@ -266,6 +266,7 @@ mod tests {
     fn constants() -> Consts {
         let mut table = Consts::parse(SOURCE);
         table.extend(m4_abi::header_source());
+        table.extend(crate::instances::FLASH_MLA_CSA2_SEQ_SM121_DEFINES);
         table
     }
 

@@ -232,6 +232,13 @@ pub struct SymbolLaunch {
     pub launch: KernelLaunch,
 }
 
+/// The most compressed positions the DeepSeek selection bodies were compiled to read.
+///
+/// `opt_select_fast`/`opt_select_rows` clamp a wider row to this bound (kernels/instances.toml,
+/// `positions`); a launch past it would silently select over a truncated candidate list, so
+/// [SparseIndexerLauncher::new] refuses it instead.
+pub const DEEPSEEK_INDEXER_MAX_POSITION: usize = 1 << 21;
+
 /// The sparse-indexer pool, score and selection launcher.
 ///
 /// The indexer is three bodies in one pass - pool, score and pick - so this launcher carries
@@ -275,6 +282,18 @@ impl SparseIndexerLauncher {
             return Err(PlanError::Invalid(format!(
                 "a {} requirement is not a sparse indexer",
                 requirement.part
+            )));
+        }
+        // The compiled position bound is a property of the built body, not a hint: a row past it
+        // would be clamped by the kernel, so the launch is refused by symbol before it runs.
+        if resolved.id().image == crate::images::Image::Deepseek
+            && position.saturating_add(rows) > DEEPSEEK_INDEXER_MAX_POSITION
+        {
+            return Err(PlanError::Invalid(format!(
+                "the sparse indexer {} reads at most {DEEPSEEK_INDEXER_MAX_POSITION} compressed \
+                 positions, but rows {rows} at position {position} reach {}",
+                resolved.id().symbol,
+                position.saturating_add(rows)
             )));
         }
         let (grid, block) = indexer_geometry(resolved.id().symbol, requirement, rows, position);

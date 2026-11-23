@@ -18,24 +18,19 @@
 // ring) had byte-identical copies of, under three prefixes. The entries differ in which positions
 // a query attends over; every helper below reads the same layout and returns the same value.
 //
-// The caller defines SPARK_M4_MLA_LATENT, the window formats and SPARK_M4_MLA_WINDOW_SCALES
-// before including this header, as each entry already did.
+// The caller defines the shape symbols this body reads - SPARK_M4_MLA_LATENT, the window formats,
+// SPARK_M4_MLA_MAX_SELECTED, SPARK_M4_MLA_MAX_ATTENDED and, for the ring entry, the ring capacity
+// and its attended bound - from its own instance before including this header. There is no
+// fallback here: a body compiled without a shape is a build error, not a default.
 
 #pragma once
 
 #include <cstdint>
 
-// The three entries define these differently (the base file has no ring at all), so the shared
-// body supplies the ones a given entry does not name.
-#ifndef SPARK_M4_MLA_MAX_ATTENDED
-#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_SWA_WINDOW)
-#endif
-#ifndef SPARK_M4_MLA_RING_CAPACITY
-#define SPARK_M4_MLA_RING_CAPACITY 134u
-#endif
-#ifndef SPARK_M4_MLA_RING_MAX_ATTENDED
-#define SPARK_M4_MLA_RING_MAX_ATTENDED \
-    (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_MLA_RING_CAPACITY)
+#if !defined(SPARK_M4_MLA_LATENT) || !defined(SPARK_M4_MLA_MAX_SELECTED) || \
+    !defined(SPARK_M4_MLA_MAX_ATTENDED) || !defined(SPARK_M4_MLA_RING_CAPACITY) || \
+    !defined(SPARK_M4_MLA_RING_MAX_ATTENDED)
+#error "flash_mla_csa2_common_sm121.cuh: the entry must define its shapes from its instance"
 #endif
 
 #include <cuda_bf16.h>

@@ -903,8 +903,8 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
     // bound): keep the source owned here for the whole stage and pass a borrow everywhere else.
     let weights = source.as_ref();
     let open_plan = tp4_resident::plan_for_chain(&refs)?;
-    let description = crate::plan::install(open_plan)
-        .map_err(|error| format!("forward open: {error}"))?;
+    let description =
+        crate::plan::install(open_plan).map_err(|error| format!("forward open: {error}"))?;
     let config = description.values().clone();
     let table =
         crate::resident_weights::rank_attention_plan_shapes(&config, args.rank, args.world)?;

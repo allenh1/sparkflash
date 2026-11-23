@@ -51,41 +51,93 @@
 
 #include "m4_common_sm121.cuh"
 
+// The model shapes are instance arguments (kernels/instances.toml). Every number below comes from
+// this entry's own instance, and the shared M4 header's geometry defaults are redefined from it
+// before the arithmetic header is included: a build that names no shape fails here instead of
+// compiling the defaults, and a second shape is a line in the list plus a rebuild. Each entry is
+// gated on its own macros so a proof compile emits only its own symbol.
+// The released entry is the last branch on purpose: the Rust constant readers parse every
+// #define in this file, so the last textual definition of a shared name must be the released shape.
+#if defined(SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_HIDDEN)
+#define SPARK_MLA_RING_KV_LORA SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_KV_LORA
+#define SPARK_MLA_RING_HEADS SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_HEADS
+#define SPARK_MLA_RING_WINDOW SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_WINDOW
+#define SPARK_MLA_RING_INDEX_HEADS SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_INDEX_HEADS
+#define SPARK_MLA_RING_INDEX_HEAD_DIM SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_INDEX_HEAD_DIM
+#define SPARK_MLA_RING_INDEX_TOPK SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_INDEX_TOPK
+#define SPARK_MLA_RING_HSI_BLOCKS SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_HSI_BLOCKS
+#define SPARK_MLA_RING_HSI_BLOCK_TOKENS SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_HSI_BLOCK_TOKENS
+#define SPARK_MLA_RING_RING_CAPACITY SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_RING_CAPACITY
+#elif defined(SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_HIDDEN)
+#define SPARK_MLA_RING_KV_LORA SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_KV_LORA
+#define SPARK_MLA_RING_HEADS SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_HEADS
+#define SPARK_MLA_RING_WINDOW SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_WINDOW
+#define SPARK_MLA_RING_INDEX_HEADS SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_INDEX_HEADS
+#define SPARK_MLA_RING_INDEX_HEAD_DIM SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_INDEX_HEAD_DIM
+#define SPARK_MLA_RING_INDEX_TOPK SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_INDEX_TOPK
+#define SPARK_MLA_RING_HSI_BLOCKS SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_HSI_BLOCKS
+#define SPARK_MLA_RING_HSI_BLOCK_TOKENS SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_HSI_BLOCK_TOKENS
+#define SPARK_MLA_RING_RING_CAPACITY SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_RING_CAPACITY
+#else
+#error "flash_mla_csa2_ring_sm121.cu: no instance macros; every shape is an argument from kernels/instances.toml"
+#endif
+
+// The shared header's names, redefined from this entry's instance. The header's own defaults are
+// for the families that still carry their geometry; this source does not read them.
+#undef SPARK_M4_HEADS
+#define SPARK_M4_HEADS SPARK_MLA_RING_HEADS
+#undef SPARK_M4_SWA_WINDOW
+#define SPARK_M4_SWA_WINDOW SPARK_MLA_RING_WINDOW
+#undef SPARK_M4_INDEX_HEADS
+#define SPARK_M4_INDEX_HEADS SPARK_MLA_RING_INDEX_HEADS
+#undef SPARK_M4_INDEX_HEAD_DIM
+#define SPARK_M4_INDEX_HEAD_DIM SPARK_MLA_RING_INDEX_HEAD_DIM
+#undef SPARK_M4_HSI_BLOCKS
+#define SPARK_M4_HSI_BLOCKS SPARK_MLA_RING_HSI_BLOCKS
+#undef SPARK_M4_HSI_BLOCK_TOKENS
+#define SPARK_M4_HSI_BLOCK_TOKENS SPARK_MLA_RING_HSI_BLOCK_TOKENS
+#undef SPARK_M4_MLA_HEADS_PER_INDEX_HEAD
+#define SPARK_M4_MLA_HEADS_PER_INDEX_HEAD (SPARK_M4_HEADS / SPARK_M4_INDEX_HEADS)
+
 #define SPARK_M4_MLA_THREADS 256u
-#define SPARK_M4_MLA_LATENT SPARK_M4_KV_LORA_RANK
+#define SPARK_M4_MLA_LATENT SPARK_MLA_RING_KV_LORA
 #define SPARK_M4_MLA_FP4_PER_BYTE 2u
 // One score per selected position lives in shared memory, which is what bounds the candidate
-// count: 512 positions of f32 plus the running statistics. In union format the window rows are
-// attended in the same array, so its capacity is one candidate list plus one full ring. The ring
-// capacity is written as its own symbol (no C cast) so the Rust reader evaluates the same sum.
-#define SPARK_M4_MLA_MAX_SELECTED 512u
-#define SPARK_M4_MLA_RING_CAPACITY 134u
+// count: the indexer's top-k positions of f32 plus the running statistics. In union format the
+// window rows are attended in the same array, so its capacity is one candidate list plus one full
+// ring. The ring capacity is written as its own symbol (no C cast) so the Rust reader evaluates
+// the same sum.
+#define SPARK_M4_MLA_MAX_SELECTED SPARK_MLA_RING_INDEX_TOPK
+#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_SWA_WINDOW)
+#define SPARK_M4_MLA_RING_CAPACITY SPARK_MLA_RING_RING_CAPACITY
 #define SPARK_M4_MLA_RING_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_MLA_RING_CAPACITY)
 
 static_assert(SPARK_M4_MLA_LATENT % SPARK_M4_KV_SCALE_CHANNELS == 0u,
               "the latent divides into 16-channel scale groups");
 static_assert(SPARK_M4_MLA_LATENT % SPARK_M4_MLA_THREADS == 0u, "the latent tiles across the block");
-static_assert(SPARK_M4_MLA_LATENT / SPARK_M4_MLA_THREADS == 2u, "two latent values per thread");
-static_assert(SPARK_M4_MLA_MAX_SELECTED == SPARK_M4_INDEX_TOPK, "the candidate list is index_topk");
-static_assert(SPARK_M4_MLA_RING_MAX_ATTENDED == 646u,
-              "the union capacity is 512 candidates plus the 134-slot ring");
+static_assert(SPARK_M4_MLA_LATENT == 2u * SPARK_M4_MLA_THREADS,
+              "two latent values per thread");
+static_assert(SPARK_M4_MLA_MAX_SELECTED > 0u, "the candidate list is the indexer's top-k");
+static_assert(SPARK_M4_MLA_RING_MAX_ATTENDED ==
+                  SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_MLA_RING_CAPACITY,
+              "the union capacity is one candidate list plus one ring");
 static_assert(SPARK_M4_MLA_RING_MAX_ATTENDED >= SPARK_M4_MLA_MAX_SELECTED,
               "the union array must hold every historical candidate list");
-static_assert(SPARK_M4_MLA_RING_CAPACITY == 134u,
-              "the D49 ring holds window 128 + nextn + 1 = 134 slots");
+static_assert(SPARK_M4_MLA_RING_CAPACITY > 0u, "the ring holds at least one slot");
 static_assert(SPARK_M4_MLA_RING_CAPACITY >= SPARK_M4_SWA_WINDOW,
               "the ring must be able to hold the whole arithmetic window");
-static_assert(SPARK_M4_KV_SCALE_CHANNELS == 16u, "an E4M3 scale per 16 channels");
-static_assert(SPARK_M4_SWA_WINDOW == 128u, "the sliding window is 128 tokens");
+static_assert(SPARK_M4_KV_SCALE_CHANNELS > 1u, "an E4M3 scale per 16 channels");
+static_assert(SPARK_M4_SWA_WINDOW > 0u, "the sliding window is positive");
 static_assert(SPARK_M4_MLA_THREADS == SPARK_M4_REDUCE_SLOTS, "the block reduction needs 256 threads");
 // The query heads and the indexer heads are two different index spaces: 64 query heads, 32 indexer
 // heads (8 per rank), so one indexer head serves two query heads and the indexer query must be
 // addressed as head / SPARK_M4_MLA_HEADS_PER_INDEX_HEAD. Using the query head directly would read
 // past the end of a [32][128] index query for half the blocks and give the wrong head's score for
 // the rest. SPARK_M4_MLA_SCORE_SCALE is the MLA score scale, defined once in the shared header.
-static_assert(SPARK_M4_HEADS == 64u, "64 query heads");
-static_assert(SPARK_M4_INDEX_HEADS == 32u, "32 indexer heads");
-static_assert(SPARK_M4_MLA_HEADS_PER_INDEX_HEAD == 2u, "two query heads per indexer head");
+static_assert(SPARK_M4_HEADS > 0u, "the entries address whole query heads");
+static_assert(SPARK_M4_INDEX_HEADS > 0u, "the entries address whole indexer heads");
+static_assert(SPARK_M4_HEADS % SPARK_M4_INDEX_HEADS == 0u,
+              "every indexer head serves whole query heads");
 // No C cast in a static_assert: the Rust reader evaluates these expressions itself, and a
 // parenthesised type name would be an identifier it cannot resolve.
 static_assert(SPARK_M4_HSI_BLOCKS * SPARK_M4_HSI_BLOCK_TOKENS == SPARK_M4_HSI_POSITIONS,
@@ -132,8 +184,9 @@ static_assert(SPARK_M4_INDEX_HEAD_DIM == 4u * SPARK_M4_MLA_WARP_LANES,
 #define spark_mla_ring_union_attends spark_mla_union_attends
 static_assert(SPARK_M4_MLA_LATENT % SPARK_M4_MLA_WINDOW_QUANT_BLOCK == 0u,
               "the engine window row is a whole number of 32-channel scale blocks");
-static_assert(SPARK_M4_MLA_WINDOW_SCALES == 16u,
-              "one E8M0 scale per 32 channels is sixteen bytes for a 512-wide row");
+static_assert(SPARK_M4_MLA_WINDOW_SCALES ==
+                  SPARK_M4_MLA_LATENT / SPARK_M4_MLA_WINDOW_QUANT_BLOCK,
+              "the window row is one E8M0 scale per 32 channels");
 
 // A position is attendable when it is inside the sliding window behind the query. The predicate
 // is a function of the query position and the candidate id, so the CPU reference can test it
@@ -160,6 +213,7 @@ static_assert(SPARK_M4_MLA_WINDOW_SCALES == 16u,
 // so an absolute candidate id is still a row index here. A candidate inside the sliding window is
 // deliberately NOT filtered out: the union is the released attention's whole candidate set.
 
+#if defined(SPARK_INSTANCE_FLASH_MLA_CSA2_RING_SM121_HIDDEN)
 extern "C" __global__ void flash_mla_csa2_ring_sm121(
     const __nv_bfloat16 *__restrict__ q,
     const uint8_t *__restrict__ kv_fp4,
@@ -187,3 +241,37 @@ extern "C" __global__ void flash_mla_csa2_ring_sm121(
         ring_capacity, compression_ratio, selected, index_key, index_query, sink, block_scores,
         block_best, out, position, selected_count, trace_ring, layer_id, step_seq);
 }
+#endif
+
+// The second-shape build proof (kernels/instances.toml): the same ring body compiled for 32 query
+// heads, 16 index heads (a 128-wide dot, four values per lane), a 256-id candidate list and a
+// 64-token window behind a 70-slot ring. It is never in a released cubin and nothing loads it.
+#if defined(SPARK_INSTANCE_FLASH_MLA_CSA2_RING_32H256K_SM121_HIDDEN)
+extern "C" __global__ void flash_mla_csa2_ring_32h256k_sm121(
+    const __nv_bfloat16 *__restrict__ q,
+    const uint8_t *__restrict__ kv_fp4,
+    const uint8_t *__restrict__ kv_scales,
+    const uint8_t *__restrict__ window_codes,
+    const uint8_t *__restrict__ window_scales,
+    const uint32_t window_kv_format,
+    const uint32_t window_rows,
+    const uint32_t ring_capacity,
+    const uint32_t compression_ratio,
+    const uint32_t *__restrict__ selected,
+    const __nv_bfloat16 *__restrict__ index_key,
+    const __nv_bfloat16 *__restrict__ index_query,
+    const float *__restrict__ sink,
+    float *__restrict__ block_scores,
+    uint32_t *__restrict__ block_best,
+    __nv_bfloat16 *__restrict__ out,
+    const uint32_t position,
+    const uint32_t selected_count,
+    GpuTraceRing *__restrict__ trace_ring,
+    const uint32_t layer_id,
+    const uint64_t step_seq) {
+    spark_mla_attention_body<SparkMlaRing>(
+        q, kv_fp4, kv_scales, window_codes, window_scales, window_kv_format, window_rows,
+        ring_capacity, compression_ratio, selected, index_key, index_query, sink, block_scores,
+        block_best, out, position, selected_count, trace_ring, layer_id, step_seq);
+}
+#endif

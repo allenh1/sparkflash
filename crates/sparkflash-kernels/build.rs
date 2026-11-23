@@ -180,8 +180,31 @@ fn read_instances() -> Vec<Instance> {
                 "experts",
                 "top_k",
             ],
+            // MLA / CSA2 attention: latent width, query and index head shapes, window, HSI pool.
+            "mla" => &[
+                "hidden",
+                "heads",
+                "head_dim",
+                "kv_lora",
+                "window",
+                "index_heads",
+                "index_head_dim",
+                "index_topk",
+                "hsi_blocks",
+                "hsi_block_tokens",
+                "ring_capacity",
+                "positions",
+            ],
+            // Candidate selection: indexer head shape, position bound and part geometry.
+            "select" => &[
+                "hidden",
+                "index_heads",
+                "index_head_dim",
+                "index_topk",
+                "positions",
+            ],
             other => panic!(
-                "sparkflash-kernels: instance {}: family {other:?} is not router, routed, seams, drafter, rows, head or vision",
+                "sparkflash-kernels: instance {}: family {other:?} is not a known family",
                 number + 1
             ),
         };

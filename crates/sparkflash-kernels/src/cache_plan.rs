@@ -902,7 +902,7 @@ mod tests {
             "/../../kernels/flash_mla_csa2_ring_sm121.cu"
         ))
         .expect("the body kernel source is in the tree");
-        assert!(source.contains("static_assert(SPARK_M4_INDEX_HEADS == 32u"));
+        assert!(source.contains("static_assert(SPARK_M4_INDEX_HEADS > 0u"));
         let host = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../sparkflash-deepseek-forward/src/tp4_forward.rs"

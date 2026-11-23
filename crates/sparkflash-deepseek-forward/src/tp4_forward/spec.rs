@@ -241,7 +241,8 @@ impl EngramReader {
         };
         let mut slots = Vec::new();
         for layer in &config.engram_layer_ids {
-            let (codes, codes_at) = region(crate::plan::layer_claim(*layer, "engram.embed.weight").to_owned())?;
+            let (codes, codes_at) =
+                region(crate::plan::layer_claim(*layer, "engram.embed.weight").to_owned())?;
             let (scales, scales_at) =
                 region(crate::plan::layer_claim(*layer, "engram.embed.scale").to_owned())?;
             slots.push((codes, codes_at, scales, scales_at));

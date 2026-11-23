@@ -18,7 +18,9 @@
 #                stream count; the runtime-width seam entries omit it), "drafter" needs
 #                hidden/hc/taps/latent/window/markov_rank, "rows" needs
 #                hidden/intermediate/experts/top_k, "head" needs hidden/vocab_per_rank/ranks,
-#                and "vision" needs hidden/heads/patch/intermediate/out_hidden/experts/top_k.
+#                "vision" needs hidden/heads/patch/intermediate/out_hidden/experts/top_k,
+#                "mla" needs the CSA2 latent/index/window geometry, and "select" the indexer's
+#                head shape and position bound.
 #   catalogue    optional catalogue key; sparkflash-ops generates that part's exact shape rule
 #                from every instance carrying the same key.
 #   catalogue_intermediate
@@ -34,7 +36,8 @@
 #   intermediate_multiple / max_top_k
 #                optional runtime bounds the source states; they are emitted instead of an equality.
 #   hidden, experts, top_k, intermediate, padded, hc, taps, latent, window, markov_rank,
-#   vocab_per_rank, ranks, heads, patch, out_hidden
+#   vocab_per_rank, ranks, heads, patch, out_hidden, head_dim, kv_lora, index_heads,
+#   index_head_dim, index_topk, hsi_blocks, hsi_block_tokens, ring_capacity, positions
 #                the values one rank sees, as positive integers. They are passed to the compiler
 #                with the source's own suffix (u), not reinterpreted.
 #
@@ -759,6 +762,247 @@ intermediate = 2816
 out_hidden = 5120
 experts = 384
 top_k = 6
+
+
+# --- The MLA / CSA2 attention entries ---------------------------------------------------------
+# The DeepSeek MLA latent and indexer geometry the CSA2 entries read. The window scales and the
+# union capacity are derived in the sources from `kv_lora`, `window` and `index_topk`;
+# `hidden` and `head_dim` are carried because the MlaAttention catalogue rule claims the part's
+# exact geometry even though the attention body does not read those two widths.
+[[instance]]
+source = "flash_mla_csa2_sm121.cu"
+entry = "flash_mla_csa2_sm121"
+cubin = "flash_mla_csa2_sm121"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 5120
+heads = 64
+head_dim = 512
+kv_lora = 512
+window = 128
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 2097152
+
+# The frozen 19-word sequence entry and its six-row batched twin are one cubin and one shape.
+[[instance]]
+source = "flash_mla_csa2_seq_sm121.cu"
+entry = "flash_mla_csa2_seq_sm121"
+cubin = "flash_mla_csa2_seq_sm121"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 5120
+heads = 64
+head_dim = 512
+kv_lora = 512
+window = 128
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 2097152
+
+[[instance]]
+source = "flash_mla_csa2_seq_sm121.cu"
+entry = "flash_mla_csa2_seq_batched_sm121"
+cubin = "flash_mla_csa2_seq_sm121"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 5120
+heads = 64
+head_dim = 512
+kv_lora = 512
+window = 128
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 2097152
+
+# D49's ring-capacity entry: 134 ring slots behind the same 128-token arithmetic window.
+[[instance]]
+source = "flash_mla_csa2_ring_sm121.cu"
+entry = "flash_mla_csa2_ring_sm121"
+cubin = "flash_mla_csa2_ring_sm121"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 5120
+heads = 64
+head_dim = 512
+kv_lora = 512
+window = 128
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 2097152
+
+# The split-KV decode entry: the same union attention with the slot loops over warps.
+[[instance]]
+source = "opt_attn_sm121.cu"
+entry = "opt_flash_mla_csa2_seq"
+cubin = "opt_attn_sm121"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 5120
+heads = 64
+head_dim = 512
+kv_lora = 512
+window = 128
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 2097152
+
+# --- The candidate-selection entries ---------------------------------------------------------
+# ref_select and opt_select share the indexer's 32 heads of width 128 and the 2^21-position bound
+# the fast select is compiled for. The reference body is runtime-generic, but it is the same
+# indexer shape and is listed so its released cubin keeps its one symbol under the same list.
+[[instance]]
+source = "ref_select_sm121.cu"
+entry = "ref_select_sm121"
+cubin = "ref_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+# The ten opt_select entries are one cubin and one shape: the released selection pass.
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_ref_select"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_ref_select_pre"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_ref_select_fast"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_rows"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_rows_bf16"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_rows_tab"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_scores"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_scores_rows"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_scores_seg"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_scores_segs"
+cubin = "opt_select_sm121"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 5120
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 2097152
 
 
 # --- The second-shape build proof -------------------------------------------------------------
@@ -2155,3 +2399,24 @@ intermediate = 2816
 out_hidden = 4096
 experts = 384
 top_k = 6
+
+# The ring entry compiled for a second shape: 32 query heads, 16 index heads of width 64, a
+# 256-id candidate list, a 64-token window and a 70-slot ring. Its own cubin, never in the
+# baseline and never loaded by an arm; the released ring cubin's symbol set and bytes stay pinned.
+[[instance]]
+source = "flash_mla_csa2_ring_sm121.cu"
+entry = "flash_mla_csa2_ring_32h256k_sm121"
+cubin = "flash_mla_csa2_ring_32h256k_sm121"
+family = "mla"
+hidden = 5120
+heads = 32
+head_dim = 512
+kv_lora = 512
+window = 64
+index_heads = 16
+index_head_dim = 128
+index_topk = 256
+hsi_blocks = 1024
+hsi_block_tokens = 8
+ring_capacity = 70
+positions = 1048576
