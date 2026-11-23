@@ -163,8 +163,6 @@ pub struct Deployment {
     pub search: &'static str,
     /// How many ranks the console launches the family on.
     pub world_size: usize,
-    /// Every tensor-parallel width the family's device arm runs, narrowest first.
-    pub worlds: &'static [usize],
     /// The organization most of the family's checkpoints live under.
     pub org: &'static str,
     /// Whether launch needs a per-rank converted file.
@@ -337,7 +335,6 @@ impl Arm for DeepSeek {
             search: "DeepSeek-V4.1",
             world_size: 4,
             // The V4.1 engine is the four-rank group; it has no narrower arm.
-            worlds: &[4],
             org: "deepseek-ai",
             requires_conversion: true,
             requires_cubins: true,
@@ -408,7 +405,6 @@ impl Arm for Qwen {
             search: "Qwen3.8-Flash",
             world_size: 1,
             // The pack's single-node arm and its TP=2/TP=4 group (!205, !207).
-            worlds: &[1, 2, 4],
             org: "Qwen",
             requires_conversion: true,
             requires_cubins: false,
@@ -536,7 +532,6 @@ impl Arm for Qwen36 {
             engine: engine::DYNAMIC,
             search: "Qwen3.6",
             world_size: 1,
-            worlds: &[1],
             org: "Qwen",
             requires_conversion: false,
             requires_cubins: false,
@@ -604,7 +599,6 @@ impl Arm for Glm {
             world_size: 4,
             // The pack's single-node arm (which refuses the released 328 GB on memory, not on
             // capability) and its TP=2/TP=4 group.
-            worlds: &[1, 2, 4],
             org: "zai-org",
             requires_conversion: true,
             requires_cubins: false,
@@ -677,7 +671,6 @@ impl Arm for Dory {
             engine: engine::DYNAMIC,
             search: "Dory1.0",
             world_size: 1,
-            worlds: &[1],
             org: "nvidia",
             requires_conversion: false,
             requires_cubins: false,
@@ -755,7 +748,6 @@ impl Arm for Inkling {
             search: "Inkling-2",
             world_size: 4,
             // The 393.5 GB checkpoint fits four Sparks; it does not fit one or two.
-            worlds: &[4],
             org: "thinkingmachines",
             requires_conversion: true,
             // The arm's kernels are built into the binary (SPARKFLASH_INKLING_CUBIN at build

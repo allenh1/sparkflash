@@ -1481,7 +1481,7 @@ pub fn bind_rank_moe(
             check_bind_coverage("router", &expected_router, &router_names, &empty)?,
         ),
     ];
-    let local_inter = config.moe_inter_dim / 4;
+    let local_inter = config.moe_inter_dim / crate::plan::world();
     let padded_inter = sparkflash_kernels::moe_routed_device::WIDTH_PADDED;
     let hidden = config.dim;
     let experts = config.n_routed_experts;

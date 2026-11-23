@@ -55,10 +55,10 @@ pub fn pre_added_combine_kernel() -> &'static str {
 }
 
 /// Values per output row in the stored plan layout: the plan's expert intermediate width over
-/// the four ranks (the checkpoint's `w2` K extent per rank).
+/// the world (the checkpoint's `w2` K extent per rank).
 #[must_use]
 pub fn stored_elements_per_row() -> usize {
-    crate::plan::moe_inter_dim() / 4
+    crate::plan::moe_inter_dim() / crate::plan::world()
 }
 /// Packed E2M1 bytes per stored row (two values per byte).
 #[must_use]

@@ -279,11 +279,6 @@ impl ChainArgs {
         }
         let rank = rank.ok_or_else(|| "--tp-rank is required".to_string())?;
         let world = world.ok_or_else(|| "--tp-world-size is required".to_string())?;
-        if world < 2 {
-            return Err(format!(
-                "tp4-chain is the multi-rank arm; got world {world} (use --run-stage tp4-resident for a single node)"
-            ));
-        }
         if rank >= world {
             return Err(format!("--tp-rank {rank} is outside world {world}"));
         }

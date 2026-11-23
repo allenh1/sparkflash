@@ -477,15 +477,26 @@ impl Tp4ServeOptions {
                 "--tp4-rank {rank} is outside a world of {world_size}"
             ));
         }
-        let raw_peers = peers.ok_or_else(|| {
-            format!(
-                "--tp4-peers is required for --tp4-rank: give all {world_size} rank addresses in rank order, comma separated"
-            )
-        })?;
-        let peers = parse_peers("--tp4-peers", raw_peers)?;
-        if peers.len() != world_size {
+        // One rank has no peer to name: its engine opens no transport, and the only socket left is
+        // serve's own loopback control channel.
+        let peers = match peers {
+            Some(raw) => parse_peers("--tp4-peers", raw)?,
+            None if world_size == 1 => Vec::new(),
+            None => {
+                return Err(format!(
+                    "--tp4-peers is required for --tp4-rank: give all {world_size} rank addresses in rank order, comma separated"
+                ));
+            }
+        };
+        if world_size > 1 && peers.len() != world_size {
             return Err(format!(
                 "--tp4-peers lists {} address(es) but --tp4-world-size is {world_size}",
+                peers.len()
+            ));
+        }
+        if world_size == 1 && peers.len() > 1 {
+            return Err(format!(
+                "--tp4-peers lists {} address(es) but a one-rank group names none or one",
                 peers.len()
             ));
         }
@@ -5378,13 +5389,9 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
-    if let Some(checkpoint) = options.checkpoint.as_deref()
-        && let Err(message) =
-            check_checkpoint_plan(checkpoint, tp4.world_size, Availability::Catalogue)
-    {
-        eprintln!("sparkflash serve: {message}");
-        return ExitCode::from(EXIT_REFUSED);
-    }
+    // The host TP4 arm runs the f32 twin and launches no kernel, like the reference engine: a
+    // world the device kernels were not built for is a row the device scan shows, not a reason
+    // this arm cannot open. The device arm's own gate runs before its first kernel.
     match load_deepseek_profile() {
         Ok(profile) => sparkflash_model::install_active(profile),
         Err(message) => {
@@ -5476,7 +5483,12 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
     };
     println!(
         "sparkflash serve: TP=4 rank 0/{} on {}; control {}; workers never detokenize",
-        tp4.world_size, tp4.peers[0], tp4.control_port
+        tp4.world_size,
+        tp4.peers
+            .first()
+            .copied()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        tp4.control_port
     );
     // Same sharing rule as the reference path: the rank-0 engine thread feeds this exporter and
     // the router serves it.

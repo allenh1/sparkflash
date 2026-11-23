@@ -57,9 +57,18 @@ pub struct Tp4RankConfig {
 
 impl Tp4RankConfig {
     /// The control channel address.
+    ///
+    /// Rank 0's address is the hub. A one-rank group names no peer, so its hub is loopback: the
+    /// control channel is serve's, not the engine collective, and a single rank has no other host
+    /// to reach.
     #[must_use]
     pub fn control_address(&self) -> SocketAddr {
-        SocketAddr::new(self.peers[0], self.control_port)
+        let hub = self
+            .peers
+            .first()
+            .copied()
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        SocketAddr::new(hub, self.control_port)
     }
 }
 

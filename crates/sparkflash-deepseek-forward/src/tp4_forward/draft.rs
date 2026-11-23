@@ -94,9 +94,9 @@ const LOGITS_GROUP: usize = 20;
 fn markov_rank() -> usize {
     crate::plan::dspark_markov_rank()
 }
-/// The expert intermediate rows on this rank, read at open from the plan's width over four ranks.
+/// The expert intermediate rows on this rank, read at open from the plan's width over the world.
 fn local_inter() -> usize {
-    crate::plan::moe_inter_dim() / 4
+    crate::plan::moe_inter_dim() / crate::plan::world()
 }
 /// The transport sequence range the draft argmax gathers use.
 const DRAFT_GATHER_SEQ: u64 = u64::MAX - 0xD_0000;

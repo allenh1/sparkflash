@@ -13,28 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""second-shape.py: the small second-shape checkpoint through the four-rank chain.
+"""second-shape.py: the small second-shape checkpoint through the chain at its world.
 
 The model is the fixture beside this test (`tests/fixtures/second-shape/config.json`): a
 DeepSeek-shaped configuration whose width, heads, experts, top-k, layer count, compression
 ratios, Engram layers and drafter taps all differ from the released model. The run has three
 parts, all on one host:
 
-  1. write the checkpoint (`write-synthetic-checkpoint`, the crate's own writer) and stage the
-     second shape's cubins under the released file names, so the chain's handles keep their
-     names;
+  1. write the checkpoint (`write-synthetic-checkpoint`, the crate's own writer) and, for the
+     device arm, stage the second shape's cubins under the released file names so the chain's
+     handles keep their names;
   2. run the host reference forward (the crate's f32 `InferenceEngine`) on a few token-id
      prompts at temperature 0;
-  3. start `scripts/one-host-group.sh deepseek 4 ... --check ...` and compare its greedy token
-     ids with the reference's.
+  3. start `scripts/one-host-group.sh deepseek WORLD ... --check ...` at each requested world
+     and compare its greedy token ids with the reference's.
 
     scripts/second-shape.py run --released DIR --out DIR --binary BIN --writer BIN \
-        --reference BIN [--tokenizer FILE] [--built DIR] [--build-cubins] [--port 8126]
+        --reference BIN [--tokenizer FILE] [--built DIR] [--build-cubins] [--world 1,2,4]
+        [--port 8126]
     scripts/second-shape.py run ... --device --released-cubins DIR
     scripts/second-shape.py compare --url URL --prompts FILE --expected FILE [--model ID]
 
-`run` needs a GPU host. `compare` is what `--check` calls while the group is up; it is also
-usable alone against a group someone else started.
+The host arm runs on a CPU host; `--device` needs a GPU host. `compare` is what `--check`
+calls while the group is up; it is also usable alone against a group someone else started.
 """
 
 from __future__ import annotations
@@ -187,43 +188,49 @@ def run_test(args: argparse.Namespace) -> int:
     print(f"second-shape: host reference {result.stdout.strip()}")
 
     tokenizer = args.tokenizer or str(Path(args.released) / "tokenizer.json")
-    url = f"http://127.0.0.1:{args.port}"
-    compare_cmd = (
-        f"{sys.executable} {Path(__file__).resolve()} compare --url {url} "
-        f"--prompts {prompts_file} --expected {expected_file} --max-tokens {args.max_tokens} "
-        f"--ready-timeout 60"
-    )
-    result = run(
-        [
-            str(ROOT / "scripts/one-host-group.sh"),
-            "deepseek",
-            "4",
-            "--model",
-            MODEL,
-            "--checkpoint",
-            str(checkpoint),
-            "--tokenizer",
-            tokenizer,
-            *(("--cubins", str(cubins)) if args.device else ()),
-            "--port",
-            str(args.port),
-            "--check",
-            compare_cmd,
-            "--apply",
-        ],
-        env={
-            **os.environ,
-            "SPARKFLASH_BIN": args.binary,
-            "ONE_HOST_LOGS": str(out / "logs"),
-            # The fixture streams its 2.8 GB checkpoint; the default 6 GiB a rank reserve would
-            # refuse a host whose page cache is holding the released model.
-            "ONE_HOST_SKIP_MEMORY": "1",
-            # The second shape's cubins are built from the instance list, not pinned in the
-            # released baseline; the open manifest records their hashes.
-            "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
-        },
-    )
-    return result.returncode
+    worlds = [int(world) for world in args.world.split(",") if world.strip()]
+    if not worlds:
+        fail("--world names no rank count")
+    for world in worlds:
+        url = f"http://127.0.0.1:{args.port}"
+        compare_cmd = (
+            f"{sys.executable} {Path(__file__).resolve()} compare --url {url} "
+            f"--prompts {prompts_file} --expected {expected_file} --max-tokens {args.max_tokens} "
+            f"--ready-timeout 60"
+        )
+        result = run(
+            [
+                str(ROOT / "scripts/one-host-group.sh"),
+                "deepseek",
+                str(world),
+                "--model",
+                MODEL,
+                "--checkpoint",
+                str(checkpoint),
+                "--tokenizer",
+                tokenizer,
+                *(("--cubins", str(cubins)) if args.device else ()),
+                "--port",
+                str(args.port),
+                "--check",
+                compare_cmd,
+                "--apply",
+            ],
+            env={
+                **os.environ,
+                "SPARKFLASH_BIN": args.binary,
+                "ONE_HOST_LOGS": str(out / f"logs-{world}"),
+                # The fixture streams its 2.8 GB checkpoint; the default 6 GiB a rank reserve
+                # would refuse a host whose page cache is holding the released model.
+                "ONE_HOST_SKIP_MEMORY": "1",
+                # The second shape's cubins are built from the instance list, not pinned in the
+                # released baseline; the open manifest records their hashes.
+                "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
+            },
+        )
+        if result.returncode != 0:
+            fail(f"the {world}-rank group did not agree with the host reference")
+    return 0
 
 
 def main() -> int:
@@ -245,6 +252,11 @@ def main() -> int:
         "--device",
         action="store_true",
         help="run the device arm (needs four GPUs); default is the four-rank host arm",
+    )
+    run_parser.add_argument(
+        "--world",
+        default="4",
+        help="comma-separated rank counts to run (default 4; the proof runs 1,2,4)",
     )
     run_parser.add_argument("--port", type=int, default=8126)
     run_parser.add_argument("--max-tokens", type=int, default=8)
