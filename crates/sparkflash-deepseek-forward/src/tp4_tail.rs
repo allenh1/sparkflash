@@ -22,11 +22,11 @@
 //!    bound arena's head shard (kernel-lead's direction, 2026-10-20: init-time derivation from the
 //!    arena, never a per-token weight H2D, and TailBind is not widened for it).
 //! 2. TailStage::screen normalises the hidden state of one position with rmsnorm_sm121 against the
-//!    arena's final-norm weight and screens the rank's own 32,320 vocabulary rows with
+//!    arena's final-norm weight and screens the plan's per-rank vocabulary shard with
 //!    cert_lm_head_sm121, returning the rank's f32 logits.
 //! 3. gather_logits moves those logits to every rank EXACTLY: each f32 is split into its two u16
 //!    halves, the words travel through the existing tcp all-gather (pure word movement, no
-//!    arithmetic, so no rounding), and every rank reassembles the full 129,280-entry vector and
+//!    arithmetic, so no rounding), and every rank reassembles the plan's full vocabulary and
 //!    takes the argmax with the lowest-id tie break.
 //!
 //! The tail is deliberately separate from the layer body: it is the last stage of every position
@@ -243,11 +243,12 @@ mod device {
         pub hidden: Deviceptr,
         /// The normalised hidden state, BF16.
         pub normed: Deviceptr,
-        /// The certified head's derived block-maxima side tensor, BF16 [32320][40].
+        /// The certified head's derived block-maxima side tensor, BF16
+        /// [vocab_per_rank][blocks_per_entry].
         pub w_block_max: Deviceptr,
-        /// This rank's f32 logits [32320].
+        /// This rank's f32 logits [vocab_per_rank].
         pub logits: Deviceptr,
-        /// The certified mask [32320].
+        /// The certified mask [vocab_per_rank].
         pub certified: Deviceptr,
         /// The certified count.
         pub certified_count: Deviceptr,

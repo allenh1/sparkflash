@@ -485,9 +485,9 @@ pub struct LayerWorkspace {
     pub rope_tables_plain: DeviceSpan,
     /// max_positions * 256 B: the compressed class (the YaRN/compress theta builder), same layout.
     pub rope_tables_compressed: DeviceSpan,
-    /// `3 * dim * 4` B (61,440 B at dim 5,120): fixed contiguous span for the DSpark/Eagle3
-    /// drafter taps (`dspark_target_layer_ids = [37, 38, 39]`), carved at open so S3 CUDA Graph
-    /// capture and S5 DSpark have fixed device addresses for all three hidden-row exports.
+    /// `tap_layers.len() * dim * 4` B: fixed contiguous span for the DSpark/Eagle3 drafter taps,
+    /// carved at open so S3 CUDA Graph capture and S5 DSpark have fixed device addresses for every
+    /// hidden-row export the plan's draft block names.
     pub dspark_aux_taps: DeviceSpan,
 }
 
