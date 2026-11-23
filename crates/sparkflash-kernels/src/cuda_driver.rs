@@ -4150,6 +4150,7 @@ impl Cuda {
                 .lock()
                 .map_err(|error| format!("module cache lock: {error}"))?;
             if let Some(hit) = cache.function(image, name) {
+                crate::open_manifest::note_kernel(cubin, name);
                 return Ok(hit);
             }
         }
@@ -4179,6 +4180,7 @@ impl Cuda {
                 .lock()
                 .map_err(|error| format!("module cache lock: {error}"))?
                 .insert_function(image, name, module, func);
+            crate::open_manifest::note_kernel(cubin, name);
             Ok((module, func))
         }
     }

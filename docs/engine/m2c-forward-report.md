@@ -39,7 +39,7 @@ cargo test -p sparkflash-deepseek-forward --lib plan::tests --offline -- --nocap
 
 Comparison evidence: **not measured**. The cluster-held production service is the only
 four-rank DeepSeek; taking it down needs a lead-scheduled window and the saved teardown/restore
-(`/home/allenh1/cluster-tests/20261122T202505Z/launch-command.sh`). The CPU plan-vs-baseline test
+(`/home/<user>/cluster-tests/20261122T202505Z/launch-command.sh`). The CPU plan-vs-baseline test
 `cargo test -p sparkflash-ops --test deepseek_plan_manifest` passes on this host (2 passed),
 which is the input side of the comparison, not the forward trace.
 
@@ -168,9 +168,9 @@ does not carry nine symbols the forward still loads; that is the part B gap reco
 
 ## Blockers
 
-1. **Four-rank manifest/launch/tick comparison.** The baseline is on the head node at
-   `/home/allenh1/cluster-tests/20261122T202505Z`; the harness must run from
-   `/home/allenh1/m2a-harness-prod` with its own `serve-four-node.sh`. No window was held at
+1. **Four-rank manifest/launch/tick comparison.** The baseline is on node0 at
+   `/home/<user>/cluster-tests/20261122T202505Z`; the harness must run from
+   `/home/<user>/m2a-harness-prod` with its own `serve-four-node.sh`. No window was held at
    the time of writing, and the primary agent is serving on the same ports/GPUs. Needs a scheduled
    window (<55 min) and the saved restore command.
 2. **Speed A/B on the real four-rank DeepSeek group.** Same window; `scripts/speed-log.sh`

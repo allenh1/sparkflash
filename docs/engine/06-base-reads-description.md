@@ -99,8 +99,9 @@ then one comparison for each change that alters what is bound, loaded or launche
 
 ### A. Harness and inventory (first, one owner)
 
-* The open manifest, the replay workload and one script that records and compares manifest,
-  launch trace, tick trace and speed.
+* The open manifest (`SPARKFLASH_OPEN_MANIFEST`), the replay workload and the in-repo script
+  `scripts/open-manifest-ab.py`, which records and compares manifest, launch trace, tick trace
+  and speed.
 * A rule test with pinned per-file counts that may only fall: reads of `ModelConfig`, uses of
   model constants and literals, tensor-name strings, kernel-symbol strings. Four-rank sites are
   counted on their own list, which milestone 3 drains.
@@ -642,7 +643,7 @@ kernels' in-body bounds remain as the last line of defence. The catalogue rule r
 whose geometry is outside the built shape before a weight is read.
 
 **The proof.** The six released cubins compiled to the baseline bytes under their instance
-defines on the GPU head (192.168.1.80, nvcc 13.0.88, CUDA 13.0, sm_121a), so neither
+defines on node0 (nvcc 13.0.88, CUDA 13.0, sm_121a), so neither
 disassembly nor launch output was needed:
 
 | released cubin | bytes | sha256 |

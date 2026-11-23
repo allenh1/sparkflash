@@ -35,6 +35,7 @@ pub mod layer_device;
 pub mod logits_dump;
 #[cfg(feature = "cuda")]
 pub mod moe_device;
+pub mod open_manifest;
 pub mod plan;
 // The exchange needs the CUDA driver (a pinned, mapped slab and the staging kernel's cubin) as
 // well as the verbs backend, so it is built only when both are on. Gating it on `rdma` alone broke
