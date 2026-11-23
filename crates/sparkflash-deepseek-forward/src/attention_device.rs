@@ -49,13 +49,22 @@ use crate::chain_timing::{
 /// One packed projection weight: the value bytes and their block scales, read once per name.
 type PackedWeight = Arc<(Vec<u8>, Vec<u8>)>;
 
-const DENSE_KERNEL: &str = "b12x_mxfp8_dense_sm121";
-const WO_A_KERNEL: &str = "b12x_mxfp8_wo_a_sm121";
+/// The non-split MXFP8 dense fallback, by its plan handle.
+fn dense_symbol() -> &'static str {
+    crate::plan::handles().dense_fallback
+}
+/// The untiled MXFP8 wo_a fallback, by its plan handle.
+fn wo_a_symbol() -> &'static str {
+    crate::plan::handles().wo_a_fallback
+}
 /// The BF16-activation grouped wo_a cubin: the native path.
 fn wo_a_native_symbol() -> &'static str {
     crate::plan::handles().wo_a_native
 }
-const FLASH_MLA_KERNEL: &str = "flash_mla_csa2_sm121";
+/// The non-sequence CSA2 attention fallback, by its plan handle.
+fn flash_mla_symbol() -> &'static str {
+    crate::plan::handles().flash_mla_fallback
+}
 fn flash_mla_seq_symbol() -> &'static str {
     crate::plan::handles().flash_mla_seq
 }
@@ -358,10 +367,10 @@ impl AttentionDeviceBackend {
     /// A missing/mis-pinned cubin, a driver failure, or an allocation failure.
     pub fn open(cubin_dir: impl AsRef<Path>) -> Result<Self, String> {
         let dir = cubin_dir.as_ref();
-        let dense_bytes = verified_cubin(dir, DENSE_KERNEL)?;
-        let wo_a_bytes = verified_cubin(dir, WO_A_KERNEL)?;
+        let dense_bytes = verified_cubin(dir, dense_symbol())?;
+        let wo_a_bytes = verified_cubin(dir, wo_a_symbol())?;
         let wo_a_native_bytes = verified_cubin(dir, wo_a_native_symbol())?;
-        let flash_bytes = verified_cubin(dir, FLASH_MLA_KERNEL)?;
+        let flash_bytes = verified_cubin(dir, flash_mla_symbol())?;
         let flash_seq_bytes = verified_cubin(dir, flash_mla_seq_symbol())?;
         let cuda = Cuda::load()?;
         let (dense_module, dense) = cuda.load_kernel(&dense_bytes, KernelId::Mxfp8Dense)?;
