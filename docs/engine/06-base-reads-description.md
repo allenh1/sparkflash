@@ -642,7 +642,7 @@ kernels' in-body bounds remain as the last line of defence. The catalogue rule r
 whose geometry is outside the built shape before a weight is read.
 
 **The proof.** The six released cubins compiled to the baseline bytes under their instance
-defines on the GPU head (192.168.1.80, nvcc 13.0.88, CUDA 13.0, sm_121a), so neither
+defines on node0 (nvcc 13.0.88, CUDA 13.0, sm_121a), so neither
 disassembly nor launch output was needed:
 
 | released cubin | bytes | sha256 |
