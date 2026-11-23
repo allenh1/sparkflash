@@ -201,10 +201,10 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .head_dim_multiple(16)
             .groups_between(0, 0)
             .positions(0, 1 << 21),
-        (Part::Csa2Compression, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(5120)
-            .min_ratio(1)
-            .positions(0, 1 << 21),
+        // The compression instances name the released hidden width, the latent width the append
+        // packs, the minimum ratio and the source's 2^21-position bound. The rule is generated
+        // from kernels/instances.toml, so a width or ratio no instance built is refused by name.
+        (Part::Csa2Compression, Image::Deepseek) => CATALOGUE_DEEPSEEK_CSA2,
         // The DeepSeek indexer's compiled geometry: the 128-wide, 32-head score bodies and the
         // 512-id candidate list the select bodies are built for. Generated from the instances.
         (Part::SparseIndexer, Image::Deepseek) => CATALOGUE_DEEPSEEK_INDEXER,
