@@ -258,6 +258,64 @@ The other families repeat the same four steps: add the instances, convert the so
 no-default rule, point the build and baseline at `instance_groups()`, and give the instances a
 `catalogue` key. Nothing in the mechanism is router-specific.
 
+#### D.2 The seams family
+
+The seams family covers the four sources that carry the mHC layer seams and the kv/tail path:
+`kernels/opt_seams_sm121.cu` (two entries), `kernels/layer_seams_sm121.cu` (eight),
+`kernels/kv_path_sm121.cu` (four) and `kernels/rmsnorm_sm121.cu` (one). Its shape vocabulary
+is `family = "seams"`: `hidden` is required and `hc` is optional. The mHC bodies take both as
+compile-time arguments; the rope, quantiser, kv-append and tail-norm entries take their widths as
+runtime launch words and carry only `hidden`, so their instance records the released model width
+without pretending the body was compiled for it.
+
+The converted sources follow D.1's rules. `opt_seams_sm121.cu` derives `OPT_S_ROWS =
+hc*hc + 2*hc`, `OPT_S_COLS = 256/hc` and the two sum-of-squares slots from `OPT_S_ROWS`, replacing
+the local 5120/4/24/25/26 literals; `layer_seams_sm121.cu` replaces every `SPARK_M4_HIDDEN`,
+`SPARK_M4_HC_MULT` and `SPARK_M4_HC_PREDICTOR_ROWS` read with `SPARK_SEAM_HIDDEN`,
+`SPARK_SEAM_HC` and the arithmetic row count. Both sources select the shared body's shape from
+whichever mHC entry instance the compile carries and `#error` when none does. Each entry is gated
+on its own macros; the runtime-width entries are gated too, so a one-entry proof cubin carries one
+symbol. `SPARK_M4_QUANT_BLOCK` stays a format constant: 32 is the MX block, not model geometry.
+The mHC host geometry refusal in `sparkflash-kernels::layer_seams_launch::check_seam_geometry`
+is unchanged and still names a non-released `(dim, hc_mult, rows)`; the kernel's own guard remains
+defence in depth.
+
+The catalogue keys and the generated rules are:
+
+| key | instances | generated rule |
+| --- | --- | --- |
+| `deepseek-hyperconnection` | the six mHC entries | `hidden_equals(5120).streams_between(4, 4)` |
+| `deepseek-rope` | `rope_rotate_bf16`, `kv_norm_rope_bf16`, `rope_rotate_rows_bf16` | `hidden_equals(5120)` |
+| `deepseek-quantize` | `w8a8_prologue_e4m3`, `w8a8_prologue_bf16_e4m3`, `window_quant_fp8_bf16` | `ANY` (`catalogue_hidden = false`) |
+| `deepseek-rmsnorm` | `rmsnorm_sm121` | `hidden_equals(5120)` |
+
+`catalogue_hidden = false` is the runtime-width escape: the quantiser entries state that their
+body has no compiled hidden shape, and `sparkflash-ops/build.rs` then emits an open rule rather
+than pinning a width the launch never checked. `scripts/instances.py` and the kernel build script
+accept the same field so the three readers stay one list.
+
+**Proof.** The four released cubins compile from the instance defines to the baseline bytes under
+nvcc 13.0.88, sm_121a, so no disassembly or launch comparison was needed:
+
+| released cubin | bytes | sha256 |
+| --- | --- | --- |
+| `opt_seams_sm121` | 124,024 | `3e9311bf973538224d2dbe359ed7cd443b509ec720edb63122905c9960eeb18e` |
+| `layer_seams_sm121` | 171,808 | `e3e1b4821da9bfafcdefce73d325ab0cf2ef85226020c8d069cdf880c310ad06` |
+| `kv_path_sm121` | 57,976 | `65a5891b123d9da0b858823abaf80d11b39dbe07a7ecdfd71e5eb780e4a19487` |
+| `rmsnorm_sm121` | 34,512 | `fb559d1bd3666fc249c4f5b5bf46fa236004b3068355963876db43245764e678` |
+
+The second shape is `opt_mhc_seam_4096h2_sm121` (hidden 4096, hc 2), built from
+`opt_seams_sm121.cu` alone into its own cubin: 95,200 bytes,
+`94830b867f92013a17fffc41c8072e71ded8cb1b68c9cb250a552eda1cbacd19`. `cuobjdump -symbols`
+shows only `opt_mhc_seam_4096h2_sm121` (beside the compiler's internal helpers); the symbol is
+absent from the released `opt_seams_sm121` cubin and from `kernel_baseline.txt`.
+
+**For the next family.** A seams compile group must carry at least one mHC entry instance because
+the shared helpers take `hidden`/`hc` from it; a group of runtime-width entries alone does not
+define a body shape. Add second-shape proofs for the runtime-width entries as their own cubins if
+a future model changes a launch width, and keep `catalogue_hidden = false` for any entry whose
+width the kernel reads at run time.
+
 ## 5. Order
 
 1. A, alone.
