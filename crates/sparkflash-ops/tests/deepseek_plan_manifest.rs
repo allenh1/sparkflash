@@ -181,12 +181,47 @@ fn the_plan_reproduces_the_deepseek_baseline_manifest() {
             plan_symbols.insert((*symbol).to_owned());
         }
     }
+    // Symbols the catalogue claims beyond the baseline's loaded set. The baseline recorded what
+    // the four-rank run launched; these are the fallback artifacts the forward can reach when a
+    // preferred body is absent, so the catalogue must carry them even though that run did not
+    // load them. Every addition is named here with the part that claims it.
+    let additions: BTreeSet<&str> = [
+        ("b12x_mxfp4_moe_sm121", Part::Moe),
+        ("b12x_mxfp8_dense_sm121", Part::DenseGemm),
+        ("b12x_mxfp8_wo_a_sm121", Part::DenseGemm),
+        ("flash_mla_csa2_sm121", Part::MlaAttention),
+        ("lm_head_reduce_sm121", Part::LmHead),
+    ]
+    .into_iter()
+    .map(|(symbol, _part)| symbol)
+    .collect();
     let missing: Vec<&String> = baseline_symbols.difference(&plan_symbols).collect();
-    let extra: Vec<&String> = plan_symbols.difference(&baseline_symbols).collect();
+    let extra: Vec<&String> = plan_symbols
+        .difference(&baseline_symbols)
+        .filter(|symbol| !additions.contains(symbol.as_str()))
+        .collect();
     assert!(
         missing.is_empty() && extra.is_empty(),
         "the catalogue's DeepSeek symbols differ from the baseline manifest: missing {missing:?}, extra {extra:?}"
     );
+    for (symbol, part) in [
+        ("b12x_mxfp4_moe_sm121", Part::Moe),
+        ("b12x_mxfp8_dense_sm121", Part::DenseGemm),
+        ("b12x_mxfp8_wo_a_sm121", Part::DenseGemm),
+        ("flash_mla_csa2_sm121", Part::MlaAttention),
+        ("lm_head_reduce_sm121", Part::LmHead),
+    ] {
+        assert!(
+            baseline_symbols.contains(symbol) || plan_symbols.contains(symbol),
+            "the addition {symbol} is not claimed"
+        );
+        assert!(
+            plan.symbols()
+                .iter()
+                .any(|entry| entry.part == part && entry.symbols.contains(&symbol)),
+            "{symbol} is not claimed under {part:?}"
+        );
+    }
 }
 
 #[test]

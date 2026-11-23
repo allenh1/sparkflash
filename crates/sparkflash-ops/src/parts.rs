@@ -667,6 +667,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             deepseek_sym("opt_head_screen_mma", &[Precision::NvFp4]),
             deepseek_sym("opt_head_screen_rows", &[Precision::F32, Precision::Bf16]),
             deepseek_sym("opt_rows_topc", &[Precision::Fp8E4M3, Precision::MxFp8]),
+            // The device reduction the forward's uncertified head path launches when the
+            // certified screen is unavailable: four rank shards folded to one logit row.
+            deepseek_sym("lm_head_reduce_sm121", &[Precision::F32, Precision::Bf16]),
         ],
         true,
     ),
@@ -720,6 +723,12 @@ pub const CATALOGUE: &[PartKernel] = &[
             ),
             deepseek_sym(
                 "flash_mla_csa2_seq_sm121",
+                &[Precision::Bf16, Precision::Fp8E4M3, Precision::MxFp8],
+            ),
+            // The non-sequence CSA2 fallback: one row's union attention over the expanded
+            // compressed view, the same arithmetic without the sequence entry's batching.
+            deepseek_sym(
+                "flash_mla_csa2_sm121",
                 &[Precision::Bf16, Precision::Fp8E4M3, Precision::MxFp8],
             ),
         ],
@@ -1354,6 +1363,17 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "opt_gemv_rows_fp8a_bf16o_r8c2",
                 &[Precision::Fp8E4M3, Precision::MxFp8],
             ),
+            // The non-split MXFP8 dense fallback: the 64x64 tiled body the forward launches
+            // when the split/tile variants are not staged, E4M3 codes over ue8m0 scales.
+            deepseek_sym(
+                "b12x_mxfp8_dense_sm121",
+                &[Precision::Fp8E4M3, Precision::MxFp8],
+            ),
+            // The untiled MXFP8 wo_a fallback beside the BF16-activation native path above.
+            deepseek_sym(
+                "b12x_mxfp8_wo_a_sm121",
+                &[Precision::Fp8E4M3, Precision::MxFp8],
+            ),
         ],
         true,
     ),
@@ -1743,6 +1763,9 @@ pub const CATALOGUE: &[PartKernel] = &[
                 &[Precision::Fp8E4M3, Precision::MxFp8],
             ),
             deepseek_sym("opt_moe_gate_up_dedup_k3_sm121", &[Precision::NvFp4]),
+            // The pre-padded A8 routed combine the forward's single-node path launches: E2M1
+            // codes over the 640-K row layout, one rank's selected slots.
+            deepseek_sym("b12x_mxfp4_moe_sm121", &[Precision::NvFp4]),
         ],
         true,
     ),
