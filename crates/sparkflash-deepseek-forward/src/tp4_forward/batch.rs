@@ -116,7 +116,7 @@ pub(super) fn encoder_layers() -> usize {
 /// the last layer's rows are the full run's from the decoder extent on. The drafter's window needs
 /// W more of them, and a resume reads both windows behind it.
 pub(super) fn decoder_warm() -> usize {
-    let window = sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW as usize;
+    let window = sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW;
     let decoder_layers = crate::plan::n_layers().saturating_sub(encoder_layers());
     (window - 1) * decoder_layers + window
 }

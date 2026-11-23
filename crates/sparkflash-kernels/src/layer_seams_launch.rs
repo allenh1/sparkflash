@@ -406,6 +406,12 @@ pub struct EntryParams {
     pub hc_eps: f32,
     /// The trace ring's device address, or 0 for the trace-disabled cubin.
     pub trace_ring: u64,
+    /// The residual-stream width this launch's cubin was compiled for.
+    pub dim: u32,
+    /// The residual-stream count it was compiled for.
+    pub hc_mult: u32,
+    /// The coefficient rows (`hc_mult * hc_mult + 2 * hc_mult`) it was compiled for.
+    pub rows: u32,
     /// The layer id the trace event would record.
     pub layer_id: u32,
     /// The step sequence the trace event would record.
@@ -426,9 +432,9 @@ impl EntryParams {
             self.mix_table.0,
             self.hc_rows.0,
             self.normed.0,
-            u64::from(RELEASED_DIM),
-            u64::from(RELEASED_HC_MULT),
-            u64::from(RELEASED_ROWS),
+            u64::from(self.dim),
+            u64::from(self.hc_mult),
+            u64::from(self.rows),
             u64::from(self.norm_bf16),
             u64::from(self.native_bf16),
             u64::from(self.sinkhorn_iterations),
@@ -484,6 +490,12 @@ pub struct FfnSeamsParams {
     pub hc_eps: f32,
     /// The trace ring's device address, or 0.
     pub trace_ring: u64,
+    /// The residual-stream width this launch's cubin was compiled for.
+    pub dim: u32,
+    /// The residual-stream count it was compiled for.
+    pub hc_mult: u32,
+    /// The coefficient rows (`hc_mult * hc_mult + 2 * hc_mult`) it was compiled for.
+    pub rows: u32,
     /// The layer id the trace event would record.
     pub layer_id: u32,
     /// The step sequence the trace event would record.
@@ -507,9 +519,9 @@ impl FfnSeamsParams {
             self.act_codes.0,
             self.act_scales.0,
             self.x_bf16.0,
-            u64::from(RELEASED_DIM),
-            u64::from(RELEASED_HC_MULT),
-            u64::from(RELEASED_ROWS),
+            u64::from(self.dim),
+            u64::from(self.hc_mult),
+            u64::from(self.rows),
             u64::from(self.norm_bf16),
             u64::from(self.native_bf16),
             u64::from(self.sinkhorn_iterations),
@@ -620,10 +632,22 @@ pub fn load(
 /// # Errors
 /// A (dim, hc_mult, rows) other than (5,120, 4, 24).
 pub fn check_seam_geometry(dim: u32, hc_mult: u32, rows: u32) -> Result<(), String> {
-    if dim != RELEASED_DIM || hc_mult != RELEASED_HC_MULT || rows != RELEASED_ROWS {
+    // The geometry is an instance argument now. Check the relations the body needs rather than
+    // the one shape the released checkpoint compiles: the 32-value quantiser walk, a positive
+    // stream count, and the coefficient table's own arithmetic.
+    if dim == 0 || !dim.is_multiple_of(32) {
         return Err(format!(
-            "the layer seam kernels are compiled for the released geometry (dim {RELEASED_DIM}, \
-             hc_mult {RELEASED_HC_MULT}, rows {RELEASED_ROWS}); got ({dim}, {hc_mult}, {rows})"
+            "the layer seam kernels walk {dim} hidden values in 32-value blocks; a width of zero \
+             or a non-multiple is not a compiled shape"
+        ));
+    }
+    if hc_mult == 0 {
+        return Err("a stream count of zero has no seam".to_string());
+    }
+    let expected = hc_mult * hc_mult + 2 * hc_mult;
+    if rows != expected {
+        return Err(format!(
+            "the layer seam coefficient table is {expected} rows for {hc_mult} streams, not {rows}"
         ));
     }
     Ok(())
@@ -724,6 +748,12 @@ pub struct AttnResidualParams {
     pub native_bf16: u32,
     /// The trace ring's device address, or 0 for the trace-disabled launch.
     pub trace_ring: u64,
+    /// The residual-stream width this launch's cubin was compiled for.
+    pub dim: u32,
+    /// The residual-stream count it was compiled for.
+    pub hc_mult: u32,
+    /// The coefficient rows (`hc_mult * hc_mult + 2 * hc_mult`) it was compiled for.
+    pub rows: u32,
     /// The layer id the trace event would record.
     pub layer_id: u32,
     /// The step sequence the trace event would record.
@@ -739,9 +769,9 @@ impl AttnResidualParams {
             self.mix_table.0,
             self.reduced_bf16.0,
             self.stream_out.0,
-            u64::from(RELEASED_DIM),
-            u64::from(RELEASED_HC_MULT),
-            u64::from(RELEASED_ROWS),
+            u64::from(self.dim),
+            u64::from(self.hc_mult),
+            u64::from(self.rows),
             u64::from(self.native_bf16),
             self.trace_ring,
             u64::from(self.layer_id),
@@ -777,6 +807,12 @@ pub struct FfnEpilogueParams {
     pub native_bf16: u32,
     /// The trace ring's device address, or 0 for the trace-disabled launch.
     pub trace_ring: u64,
+    /// The residual-stream width this launch's cubin was compiled for.
+    pub dim: u32,
+    /// The residual-stream count it was compiled for.
+    pub hc_mult: u32,
+    /// The coefficient rows (`hc_mult * hc_mult + 2 * hc_mult`) it was compiled for.
+    pub rows: u32,
     /// The layer id the trace event would record.
     pub layer_id: u32,
     /// The step sequence the trace event would record.
@@ -793,9 +829,9 @@ impl FfnEpilogueParams {
             self.shared_row.0,
             self.mix_table.0,
             self.stream_out.0,
-            u64::from(RELEASED_DIM),
-            u64::from(RELEASED_HC_MULT),
-            u64::from(RELEASED_ROWS),
+            u64::from(self.dim),
+            u64::from(self.hc_mult),
+            u64::from(self.rows),
             u64::from(self.shared_present),
             u64::from(self.shared_bf16),
             u64::from(self.native_bf16),
@@ -1216,6 +1252,9 @@ mod tests {
             sinkhorn_iterations: 20,
             norm_eps: 1e-20f32,
             hc_eps: 1e-6f32,
+            dim: RELEASED_DIM,
+            hc_mult: RELEASED_HC_MULT,
+            rows: RELEASED_ROWS,
             trace_ring: 0,
             layer_id: 3,
             step_seq: 9,
@@ -1255,6 +1294,9 @@ mod tests {
             sinkhorn_iterations: 20,
             norm_eps: 1e-20f32,
             hc_eps: 1e-6f32,
+            dim: RELEASED_DIM,
+            hc_mult: RELEASED_HC_MULT,
+            rows: RELEASED_ROWS,
             trace_ring: 0,
             layer_id: 2,
             step_seq: 4,
@@ -1297,6 +1339,9 @@ mod tests {
             reduced_bf16: p[2],
             stream_out: p[3],
             native_bf16: 1,
+            dim: RELEASED_DIM,
+            hc_mult: RELEASED_HC_MULT,
+            rows: RELEASED_ROWS,
             trace_ring: 0,
             layer_id: 5,
             step_seq: 6,
@@ -1320,6 +1365,9 @@ mod tests {
             shared_present: 0,
             shared_bf16: 1,
             native_bf16: 1,
+            dim: RELEASED_DIM,
+            hc_mult: RELEASED_HC_MULT,
+            rows: RELEASED_ROWS,
             trace_ring: 0,
             layer_id: 8,
             step_seq: 9,
@@ -1558,7 +1606,12 @@ mod tests {
         );
         assert_eq!(table.value("SPARK_M4_QUANT_BLOCK"), i128::from(QUANT_BLOCK));
         assert!(check_seam_geometry(5120, 4, 24).is_ok());
+        // The geometry is an instance argument now: a width the 32-value walk cannot take and a
+        // coefficient table that disagrees with the stream count are the refusals, not the
+        // released literal.
+        assert!(check_seam_geometry(2560, 4, 24).is_ok());
+        assert!(check_seam_geometry(2570, 4, 24).is_err());
         assert!(check_seam_geometry(5120, 4, 25).is_err());
-        assert!(check_seam_geometry(2560, 4, 24).is_err());
+        assert!(check_seam_geometry(5120, 0, 0).is_err());
     }
 }

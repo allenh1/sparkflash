@@ -78,7 +78,9 @@ use sparkflash_engine::parallel_tp::{BitGather, Wire};
 use sparkflash_engine::prompt_ranks;
 use sparkflash_engine::quant;
 use sparkflash_engine::safetensors::{SafeTensorsSource, TensorHeader};
-use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
+#[cfg(test)]
+use sparkflash_engine::tensor::TensorPlan;
+use sparkflash_engine::tensor::TensorSpec;
 use sparkflash_engine::weights::{WeightError, WeightSource};
 use sparkflash_scheduler::batching::PrefillMode;
 
@@ -972,7 +974,10 @@ impl Tp4Rank {
         let config = if input.source_mode == "fixture" {
             twin_config()
         } else {
-            released_config().map_err(Tp4Error::new)?
+            // The checkpoint's own document, not the released constant: a second shape's host
+            // group must describe the tensors it is about to shard, and every checkpoint this
+            // path opens carries the config.json that names them.
+            checkpoint_config(&input.source_dir).map_err(Tp4Error::new)?
         };
         let index_path = input.source_dir.join("model.safetensors.index.json");
         let source = Arc::new(
@@ -1792,123 +1797,24 @@ fn twin_config() -> ModelConfig {
     config
 }
 
-fn released_config() -> Result<ModelConfig, String> {
-    let config = ModelConfig::v41_flash_cached().clone();
-    // The cached construction is the released model; validating here keeps a bad build from
-    // reaching a node run half-way through a layer.
+/// The checkpoint's own configuration, validated.
+fn checkpoint_config(directory: &std::path::Path) -> Result<ModelConfig, String> {
+    let path = directory.join("config.json");
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let config =
+        ModelConfig::from_json(&text).map_err(|error| format!("{}: {error}", path.display()))?;
     config
         .validate()
         .map_err(|error| format!("config: {error}"))?;
     Ok(config)
 }
 
-/// The finite f32 value the twin fixture writes, the same recipe as the engine test source.
-fn fixture_value(index: usize, salt: u64, seed: u64) -> f32 {
-    let mut hashed = seed ^ salt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    hashed ^= index as u64;
-    for _ in 0..3 {
-        hashed = hashed
-            .wrapping_mul(0xbf58_476d_1ce4_e5b9)
-            .rotate_left(17)
-            .wrapping_add(0x94d0_49bb_1331_11eb);
-    }
-    0.01 + 0.0001 * ((hashed >> 56) as f32)
-}
-
-fn name_salt(name: &str) -> u64 {
-    let mut salt = 0xcbf2_9ce4_8422_2325u64;
-    for byte in name.as_bytes() {
-        salt ^= u64::from(*byte);
-        salt = salt.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    salt
-}
-
-/// One written fixture: how many tensors and bytes, and its FNV-1a content hash.
-#[derive(Debug, Clone)]
-struct FixtureSummary {
-    tensors: usize,
-    bytes: u64,
-    hash: u64,
-}
-
-/// Writes the deterministic 40-layer twin safetensors fixture and its index.
-fn write_twin_fixture(dir: &Path) -> Result<FixtureSummary, String> {
-    fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-    let config = twin_config();
-    let plan = TensorPlan::language_model(&config);
-    let mut entries: Vec<String> = Vec::with_capacity(plan.specs().len());
-    let mut data: Vec<u8> = Vec::new();
-    let mut tensors = 0usize;
-    for spec in plan.specs() {
-        let (dtype_word, shape, bytes) = fixture_tensor_bytes(spec);
-        entries.push(format!(
-            "{}:{{\"dtype\":\"{}\",\"shape\":{},\"data_offsets\":[{},{}]}}",
-            serde_json::to_string(&spec.name).map_err(|error| error.to_string())?,
-            dtype_word,
-            serde_json::to_string(&shape).map_err(|error| error.to_string())?,
-            data.len(),
-            data.len() + bytes.len()
-        ));
-        data.extend_from_slice(&bytes);
-        tensors += 1;
-    }
-    let header = format!(
-        "{{{},\"__metadata__\":{{\"format\":\"pt\"}}}}",
-        entries.join(",")
-    );
-    let header_len = header.len() as u64;
-    let mut file = Vec::with_capacity(8 + header.len() + data.len());
-    file.extend_from_slice(&header_len.to_le_bytes());
-    file.extend_from_slice(header.as_bytes());
-    file.extend_from_slice(&data);
-    let shard_path = dir.join("model.safetensors");
-    fs::write(&shard_path, &file)
-        .map_err(|error| format!("write {}: {error}", shard_path.display()))?;
-    let index = json!({
-        "metadata": {"total_size": data.len()},
-        "weight_map": plan.specs().iter().map(|spec| (spec.name.clone(), "model.safetensors".to_owned())).collect::<BTreeMap<_, _>>(),
-    });
-    let index_path = dir.join("model.safetensors.index.json");
-    fs::write(
-        &index_path,
-        serde_json::to_vec_pretty(&index).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("write {}: {error}", index_path.display()))?;
-    Ok(FixtureSummary {
-        tensors,
-        bytes: data.len() as u64,
-        hash: sparkflash_engine::synthetic::fnv1a(&file),
-    })
-}
-
-/// The dtype word, stored shape and bytes for one twin tensor.
-///
-/// Everything is finite f32 except the engram tensors whose plan storage is FP8, because the
-/// engine's paged Engram reader is a byte-range reader that must be described by the header (the
-/// table rows are 1 byte per value and 1 scale per 32 values); writing those as f32 would make the
-/// paged read decode the wrong bytes. The other Engram tensors stay f32.
-fn fixture_tensor_bytes(spec: &TensorSpec) -> (&'static str, Vec<usize>, Vec<u8>) {
-    let engram = spec.name.contains(".engram.");
-    if engram && spec.dtype == DType::F8E4M3 {
-        let salt = name_salt(&spec.name);
-        let elements = spec.elements() as usize;
-        let bytes = (0..elements)
-            .map(|index| quant::e4m3_encode(fixture_value(index, salt, 0x5eed)))
-            .collect();
-        ("F8_E4M3", spec.shape.clone(), bytes)
-    } else if engram && spec.dtype == DType::F8E8M0 {
-        let elements = spec.elements() as usize;
-        ("F8_E8M0", spec.shape.clone(), vec![127u8; elements])
-    } else {
-        let salt = name_salt(&spec.name);
-        let elements = spec.elements() as usize;
-        let mut bytes = Vec::with_capacity(elements * 4);
-        for index in 0..elements {
-            bytes.extend_from_slice(&fixture_value(index, salt, 0x5eed).to_le_bytes());
-        }
-        ("F32", spec.shape.clone(), bytes)
-    }
+/// Writes the deterministic 40-layer twin fixture and its index.
+fn write_twin_fixture(
+    dir: &Path,
+) -> Result<sparkflash_model_deepseek_v41::checkpoint::FixtureSummary, String> {
+    sparkflash_model_deepseek_v41::checkpoint::write_twin_fixture(dir, &twin_config())
 }
 
 /// Every non-Engram tensor the forward can touch, held in this process's memory exactly once.

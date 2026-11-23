@@ -367,7 +367,7 @@ pub fn build(
         positions,
         |position, out| {
             let history = &tokens[..=position];
-            sparkflash_engine::forward::engram::ngram_hashes(&config, history, position, out)
+            sparkflash_engine::forward::engram::ngram_hashes(config, history, position, out)
                 .map_err(|error| format!("engram arena: hashes at position {position}: {error}"))
         },
         read,
@@ -410,7 +410,7 @@ pub fn build_host_state(
 ) -> Result<EngramHostState, String> {
     use sparkflash_engine::forward::engram::{HASH_SENTINEL, hash_columns};
     let _ = HASH_SENTINEL;
-    let columns = hash_columns(&config);
+    let columns = hash_columns(config);
     let head_dim = config.engram_head_dim;
     let layout = EngramArenaLayout::new(columns, head_dim)?;
     let layer_ids = config.engram_layer_ids.clone();

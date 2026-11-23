@@ -71,7 +71,12 @@ EXPECTED_FILES="m4_abi.rs m4_abi/acquire_guard.rs m4_abi/scanner.rs"
 # two guards that read those bodies now read entry + header. The seventeen lines are that wiring: a
 # fix to scanners that already existed, cited to D26 and the merge's D90. No scanner was added and no
 # kernel invariant moved here - the cubin baseline still owns the artifact side.
-PINNED_LINES=13989
+# Pin 13,989 -> 14,007 (2026-11-23): the instance-list conversion taught the existing scanners to
+# resolve their static asserts through the generated instance-define tables - the certified head's
+# two cubins and flash_mla_csa2's list defines - and raised the certified head's counted asserts
+# from 9 to 18. The eighteen lines are that wiring: no scanner was added and no kernel invariant
+# moved here; the cubin baseline still owns the artifact side (D26).
+PINNED_LINES=14007
 
 if [ ! -f "$ROOT_FILE" ]; then
     echo "error: $ROOT_FILE is missing; the frozen Milestone-4 ABI lint cannot be removed silently (D26)" >&2

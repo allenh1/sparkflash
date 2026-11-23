@@ -204,7 +204,12 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // The compression instances name the released hidden width, the latent width the append
         // packs, the minimum ratio and the source's 2^21-position bound. The rule is generated
         // from kernels/instances.toml, so a width or ratio no instance built is refused by name.
-        (Part::Csa2Compression, Image::Deepseek) => CATALOGUE_DEEPSEEK_CSA2,
+        // The pooling bodies take the row width at run time. An instance records the latent
+        // width it packs (512), while the released plan's compression row is 128 wide, so both
+        // are accepted rather than pinning the latent field as the row.
+        (Part::Csa2Compression, Image::Deepseek) => {
+            CATALOGUE_DEEPSEEK_CSA2.head_dim_in(&[128, 512])
+        }
         // The DeepSeek indexer's compiled geometry: the 128-wide, 32-head score bodies and the
         // 512-id candidate list the select bodies are built for. Generated from the instances.
         (Part::SparseIndexer, Image::Deepseek) => CATALOGUE_DEEPSEEK_INDEXER,
@@ -287,7 +292,11 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .max_top_k(64),
         // The shared dense projection. The b12x and q4p bodies are generic over the hidden and
         // intermediate widths, so this entry is not pinned to one model's 5120.
-        (Part::DenseGemm, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROWS_GEMM,
+        // The b12x MXFP8 GEMV is generic over a runtime hidden width in whole 128-value
+        // vectors (the dense-GEMM plan passes the width, not a compiled constant); the
+        // 2,560-wide Qwen bulk body is the same arithmetic at a width its instances do not
+        // name. The plan's family keeps this canonical body from answering another arm.
+        (Part::DenseGemm, Image::Deepseek) => ShapeConstraint::ANY.hidden_multiple(128),
         (Part::DenseGemm, Image::Qwen4Prefill) => ShapeConstraint::ANY.hidden_equals(2560),
         (Part::DenseGemm, Image::GlmPrefill) => ShapeConstraint::ANY.hidden_equals(4096),
         // q4e_gemv_bf16 / q4e_gemm_bf16 take rows and columns as runtime arguments: the GEMV
@@ -380,8 +389,11 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::ManifoldHyperConnection, Image::GlmDecode) => ShapeConstraint::ANY
             .hidden_multiple(256)
             .streams_between(2, 5),
+        // The Engram bodies take the residual width as a launch word (engram_write_launch's
+        // `dim`), so the compiled head width is the only shape the entry fixes. The released
+        // rule pinned 5120 and refused a second shape the same kernels run.
         (Part::Engram, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(5120)
+            .hidden_multiple(32)
             .head_dim_equals(256),
         (Part::Ple, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_multiple(128),
         (Part::Mtp, Image::Deepseek) => CATALOGUE_DEEPSEEK_MTP,
@@ -5650,22 +5662,44 @@ mod tests {
     fn the_routed_shape_rules_are_the_built_instances() {
         // These are kernels/instances.toml's catalogue keys read back through the generated
         // constants. A rule that drifts from the list fails here before a checkpoint is scanned.
-        assert_eq!(CATALOGUE_DEEPSEEK_MOE.hidden_equals, Some(5120));
-        assert_eq!(CATALOGUE_DEEPSEEK_MOE.intermediate_equals, Some(576));
-        assert_eq!(
-            CATALOGUE_DEEPSEEK_MOE.routed_shapes,
-            &[(5120, 384, 6)],
-            "the released routed experts"
+        assert!(CATALOGUE_DEEPSEEK_MOE.hidden_in.contains(&5120));
+        assert!(CATALOGUE_DEEPSEEK_MOE.hidden_in.contains(&4096));
+        assert!(CATALOGUE_DEEPSEEK_MOE.intermediate_in.contains(&576));
+        assert!(CATALOGUE_DEEPSEEK_MOE.intermediate_in.contains(&128));
+        assert!(
+            CATALOGUE_DEEPSEEK_MOE
+                .routed_shapes
+                .contains(&(5120, 384, 6))
         );
-        assert_eq!(
-            CATALOGUE_DEEPSEEK_ROUTER.routed_shapes,
-            &[(5120, 128, 3), (5120, 384, 6)],
-            "the released router and the DSpark 128/3 shape"
+        assert!(
+            CATALOGUE_DEEPSEEK_MOE
+                .routed_shapes
+                .contains(&(4096, 64, 4))
         );
-        assert_eq!(
-            CATALOGUE_DEEPSEEK_MTP.routed_shapes,
-            &[(5120, 128, 3)],
-            "the DSpark router"
+        assert!(
+            CATALOGUE_DEEPSEEK_ROUTER
+                .routed_shapes
+                .contains(&(5120, 384, 6))
+        );
+        assert!(
+            CATALOGUE_DEEPSEEK_ROUTER
+                .routed_shapes
+                .contains(&(5120, 128, 3))
+        );
+        assert!(
+            CATALOGUE_DEEPSEEK_ROUTER
+                .routed_shapes
+                .contains(&(4096, 64, 4))
+        );
+        assert!(
+            CATALOGUE_DEEPSEEK_MTP
+                .routed_shapes
+                .contains(&(5120, 128, 3))
+        );
+        assert!(
+            CATALOGUE_DEEPSEEK_MTP
+                .routed_shapes
+                .contains(&(4096, 32, 2))
         );
         assert_eq!(
             CATALOGUE_DEEPSEEK_MTP.intermediate_equals, None,
@@ -5681,8 +5715,16 @@ mod tests {
             ..crate::PartGeometry::new()
         };
         assert_eq!(CATALOGUE_DEEPSEEK_MOE.accepts(&routed), Ok(()));
-        let wrong_width = crate::PartGeometry {
+        let second = crate::PartGeometry {
             hidden: 4096,
+            intermediate: 128,
+            experts: 64,
+            top_k: 4,
+            ..routed
+        };
+        assert_eq!(CATALOGUE_DEEPSEEK_MOE.accepts(&second), Ok(()));
+        let wrong_width = crate::PartGeometry {
+            hidden: 3584,
             ..routed
         };
         assert!(
@@ -5705,8 +5747,8 @@ mod tests {
         // over four ranks, i.e. 129,280 rows. The generated rule is that exact pair, not the old
         // hidden_equals(5120).vocab_multiple(128), which accepted widths and vocabularies no head
         // body was compiled for.
-        assert_eq!(CATALOGUE_DEEPSEEK_HEAD.hidden_equals, Some(5120));
-        assert_eq!(CATALOGUE_DEEPSEEK_HEAD.vocab_equals, Some(129_280));
+        assert_eq!(CATALOGUE_DEEPSEEK_HEAD.hidden_in, &[4096, 5120]);
+        assert_eq!(CATALOGUE_DEEPSEEK_HEAD.vocab_in, &[32_768, 129_280]);
         assert_eq!(CATALOGUE_DEEPSEEK_HEAD.vocab_multiple, 1);
 
         let served = crate::PartGeometry {
@@ -5715,9 +5757,15 @@ mod tests {
             ..crate::PartGeometry::new()
         };
         assert_eq!(CATALOGUE_DEEPSEEK_HEAD.accepts(&served), Ok(()));
+        let second = crate::PartGeometry {
+            hidden: 4096,
+            vocab: 32_768,
+            ..served
+        };
+        assert_eq!(CATALOGUE_DEEPSEEK_HEAD.accepts(&second), Ok(()));
         for wrong in [
             crate::PartGeometry {
-                hidden: 4096,
+                hidden: 3584,
                 ..served
             },
             crate::PartGeometry {
@@ -5737,13 +5785,14 @@ mod tests {
         // kernels/instances.toml's two attention catalogue keys, read back through the generated
         // constants. The MLA rule is the 5120-wide, 512-head-dimension part; the indexer rule is
         // the 128-wide, 32-head, top-512 selection the bodies are compiled for.
-        assert_eq!(CATALOGUE_DEEPSEEK_MLA.hidden_equals, Some(5120));
-        assert_eq!(CATALOGUE_DEEPSEEK_MLA.head_dim_equals, Some(512));
+        assert!(CATALOGUE_DEEPSEEK_MLA.hidden_in.contains(&5120));
+        assert!(CATALOGUE_DEEPSEEK_MLA.hidden_in.contains(&4096));
+        assert_eq!(CATALOGUE_DEEPSEEK_MLA.head_dim_in, &[512]);
         assert_eq!(CATALOGUE_DEEPSEEK_MLA.max_positions, 1 << 21);
-        assert_eq!(CATALOGUE_DEEPSEEK_MLA.top_k_equals, None);
-        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.hidden_equals, Some(5120));
-        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.head_dim_equals, Some(128));
-        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.top_k_equals, Some(512));
+        assert!(CATALOGUE_DEEPSEEK_MLA.top_k_in.is_empty());
+        assert!(CATALOGUE_DEEPSEEK_INDEXER.hidden_in.contains(&5120));
+        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.head_dim_in, &[128]);
+        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.top_k_in, &[512]);
         assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.max_heads, Some(32));
         assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.max_positions, 1 << 21);
 

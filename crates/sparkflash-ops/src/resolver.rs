@@ -42,7 +42,7 @@ use sparkflash_model::{Part, Target};
 use crate::engine_plan::{EnginePlan, PartRequirement};
 use crate::error::OpError;
 use crate::parts::{self, CATALOGUE};
-use crate::plan::{KernelId, KernelPhase, KernelSymbol, PartGeometry, Precision};
+use crate::plan::{KernelId, KernelPhase, KernelSymbol, ModelFamily, PartGeometry, Precision};
 
 /// Which implementations a resolver treats as loadable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,6 +491,20 @@ impl KernelResolver {
                 self.availability.name()
             ));
         }
+        // The canonical DeepSeek body is the DeepSeek arm's. Two arms can share a width (the
+        // second shape and GLM are both 4,096 wide), and the shape alone cannot tell them apart;
+        // a plan names its family so its own bodies answer for it.
+        if requirement
+            .geometry
+            .model
+            .is_some_and(|model| model != ModelFamily::Deepseek && model != ModelFamily::Other)
+            && entry.image == Image::Deepseek
+        {
+            return Err(format!(
+                "{} is the DeepSeek arm's body, not this plan's",
+                entry.image.name()
+            ));
+        }
         if let Err(reason) = entry.shape.accepts(&requirement.geometry) {
             return Err(format!("{}: {reason}", entry.image.name()));
         }
@@ -782,11 +796,13 @@ mod tests {
         let error = resolver
             .resolve(&requirement)
             .expect_err("the b12x kernel is compiled at 576");
+        // The routed rule is the set of rank-local widths the instance list built, so the full
+        // 2,304-wide expert intermediate is refused against that set by name.
         assert!(
             error
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("does not equal 576")),
+                .any(|reason| reason.contains("intermediate 2304")),
             "{error}"
         );
         assert_eq!(error.cause, ResolveCause::ShapeOrFormatRefused);

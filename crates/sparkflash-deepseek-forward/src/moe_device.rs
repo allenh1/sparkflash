@@ -590,14 +590,14 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         let gate_name = crate::plan::layer_claim(layer, "ffn.gate.weight");
         let bias_name = crate::plan::layer_claim(layer, "ffn.gate.bias");
         let gate = source
-            .read(&gate_name)
-            .map_err(|error| read_err(&gate_name, error))?;
+            .read(gate_name)
+            .map_err(|error| read_err(gate_name, error))?;
         let bias = source
-            .read(&bias_name)
-            .map_err(|error| read_err(&bias_name, error))?;
+            .read(bias_name)
+            .map_err(|error| read_err(bias_name, error))?;
         if gate.len() != n_routed * dim * 2 {
             return Err(err(
-                &gate_name,
+                gate_name,
                 format!(
                     "expected {} BF16 bytes, got {}",
                     n_routed * dim * 2,
@@ -607,7 +607,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         }
         if bias.len() != n_routed * 4 {
             return Err(err(
-                &bias_name,
+                bias_name,
                 format!("expected {} F32 bytes, got {}", n_routed * 4, bias.len()),
             ));
         }
@@ -1250,7 +1250,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             DType::F8E4M3,
             &[inter, dim],
         )?;
-        let (s1, s3, s2) = read_shared_scale_grids(source, &base, inter, dim)?;
+        let (s1, s3, s2) = read_shared_scale_grids(source, base, inter, dim)?;
         let w3 = read_spec(
             source,
             &format!("{base}.w3.weight"),

@@ -259,7 +259,7 @@ __device__ __forceinline__ float spark_seam_project(
     const uint32_t width = SPARK_SEAM_HC * SPARK_SEAM_HIDDEN;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    float raw[SPARK_SEAM_ROWS_PER_WARP] = {0.0f, 0.0f, 0.0f};
+    float raw[SPARK_SEAM_ROWS_PER_WARP] = {0.0f};
     float sum_squares = 0.0f;
     const uint32_t iterations = width / 32u;
     for (uint32_t stripe = 0; stripe < iterations; ++stripe) {

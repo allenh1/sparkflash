@@ -71,11 +71,16 @@ fn draft_experts() -> usize {
 fn draft_top_k() -> usize {
     crate::plan::dspark_n_activated_experts()
 }
-/// opt_moe_sm121.cu's OPT_MOE_PLAN_MAX: the routed rows one dedup plan groups.
-const MOE_PLAN_MAX: usize = 384;
+/// opt_moe_sm121.cu's OPT_MOE_PLAN_MAX, read from the instance entry that compiled the body.
+fn moe_plan_max() -> usize {
+    sparkflash_kernels::instances::capacities::OPT_MOE_SM121_PLAN_ROWS
+}
 /// opt_moe_sm121.cu's OptMoePlan (a count, then MOE_PLAN_MAX experts, one more start and
 /// MOE_PLAN_MAX rows, u32).
-const MOE_PLAN_BYTES: usize = (1 + MOE_PLAN_MAX + (MOE_PLAN_MAX + 1) + MOE_PLAN_MAX) * 4;
+fn moe_plan_bytes() -> usize {
+    let rows = moe_plan_max();
+    (1 + rows + (rows + 1) + rows) * 4
+}
 /// The tap width: the draft block's target layer count, read at open.
 fn draft_taps() -> usize {
     crate::plan::tap_layers().len()
@@ -251,12 +256,13 @@ impl DraftState {
         // rows are the plan's block size times its top-k; a plan that does not fit is refused here
         // rather than by a compile-time literal.
         let routed_rows = draft_rows() * draft_top_k();
-        if routed_rows > MOE_PLAN_MAX {
+        if routed_rows > moe_plan_max() {
             return Err(format!(
-                "draft: the block's {routed_rows} routed rows ({} sequences x block {} x top-{}) do not fit the dedup plan's {MOE_PLAN_MAX}",
+                "draft: the block's {routed_rows} routed rows ({} sequences x block {} x top-{}) do not fit the dedup plan's {}",
                 MAX_SEQS,
                 draft_block(),
                 draft_top_k(),
+                moe_plan_max(),
             ));
         }
         let mut modules = Vec::new();
@@ -486,7 +492,7 @@ impl DraftState {
             main_scales: alloc(r * dim / 32)?,
             h_codes: alloc(draft_rows() * draft_top_k() * local_inter())?,
             h_scales: alloc(draft_rows() * draft_top_k() * local_inter() / 32)?,
-            moe_plan: alloc(MOE_PLAN_BYTES)?,
+            moe_plan: alloc(moe_plan_bytes())?,
             slot_val: alloc(draft_rows() * draft_top_k() * dim * 4)?,
             logits: alloc(draft_rows() * vocab * 4)?,
             ids: alloc(MAX_SEQS * draft_ids_stride() * 4)?,

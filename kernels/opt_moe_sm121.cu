@@ -399,7 +399,15 @@ OPT_MOE_DOWN_ENTRY(opt_moe_down_combine_k3_sm121,
 // opt_moe_combine: grid (5120 / 256, tokens), 256 threads; the routed combine of the slot values
 //   (ascending expert id, each rounded to bf16, f32 adds, then the addend), as opt_moe_down_combine.
 
-#define OPT_MOE_PLAN_MAX 384u
+// The dedup plan's row capacity comes from the instance entry (plan_rows), so the launch code
+// that sizes the plan buffer reads the same number the body was compiled with.
+#if defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_PLAN_ROWS)
+#define OPT_MOE_PLAN_MAX SPARK_INSTANCE_OPT_MOE_GATE_UP_SM121_PLAN_ROWS
+#elif defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_K3_SM121_PLAN_ROWS)
+#define OPT_MOE_PLAN_MAX SPARK_INSTANCE_OPT_MOE_GATE_UP_K3_SM121_PLAN_ROWS
+#else
+#error "opt_moe_sm121.cu: no instance names the dedup plan's row capacity (plan_rows)"
+#endif
 // The per-expert plan holds one entry per expert of the instance, so an instance can never name
 // more experts than the plan table covers. These are the source's bounds, not copies of a shape.
 #if defined(SPARK_INSTANCE_OPT_MOE_GATE_UP_K3_SM121_EXPERTS)
