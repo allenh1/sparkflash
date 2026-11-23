@@ -144,6 +144,16 @@ Line numbers are the tree's at the start of this milestone.
   their symbols and are proved by the kernel ladder (hash, then disassembly, then outputs).
 * Done when the synthetic checkpoint agrees with the host reference at one, two and four ranks.
 
+**Result (2026-11-23, R1 and R2).** The plan's world is now the split's authority: the vocabulary
+shard, the attention heads and the routed-expert width all divide by the world the plan resolved
+at, and the deployment no longer states a list of worlds. The forward's transport slot is either
+the group's TCP transport or the one-rank identity (the shared `SingleRank` contract, no
+communicator opened); the host arm's boot gate no longer demands device kernels for a run that
+launches none, so an unbuilt world is a device-scan row rather than a host refusal. The synthetic
+checkpoint agrees with the host reference at one, two and four ranks (`scripts/second-shape.py
+run --world 1,2,4`). The device arm at one and two ranks still needs R3's rank-count instances;
+its scan shows those rows.
+
 ### F. Formats
 
 * **F1. The format arrives intact (`sparkflash-model`, `sparkflash-ops`, the instance list).**

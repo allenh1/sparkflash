@@ -28,7 +28,8 @@
 #                      DeepSeek also takes --cubins DIR (its device kernels) and --tokenizer
 #   inkling            --rank: the device arm's group, over --converted rank files
 #   dory               --recurrence-rank: the latent-recurrence ring (NCCL, --recurrence-net any)
-# world is 2 or 4 (default 2). Dory's ring takes world == its loop count and needs an NCCL
+# world is 2 or 4 (default 2); deepseek also takes 1, where the engine opens no communicator and
+# no transport. Dory's ring takes world == its loop count and needs an NCCL
 # library the serve binary can load; NCCL also refuses two ranks on one GPU, so a one-GPU host
 # cannot form the ring and Dory's group is owed to scripts/owed-cluster-window.sh.
 #
@@ -70,15 +71,24 @@ while [ $# -gt 0 ]; do
     *) echo "one-host-group: unknown argument $1" >&2; usage ;;
   esac
 done
-[ "$WORLD" -ge 2 ] || { echo "one-host-group: a group has two ranks or more, not $WORLD" >&2; exit 2; }
+[ "$WORLD" -ge 1 ] || { echo "one-host-group: a group has at least one rank, not $WORLD" >&2; exit 2; }
+[ "$WORLD" -ge 2 ] || [ "$ARM" = "deepseek" ] || {
+  echo "one-host-group: only the deepseek engine runs at one rank; got $ARM" >&2
+  exit 2
+}
 [ -n "$MODEL" ] || { echo "one-host-group: --model ID is required (the id the ranks serve)" >&2; exit 2; }
 [ -n "$CHECKPOINT" ] && [ -d "$CHECKPOINT" ] || { echo "one-host-group: --checkpoint DIR must be a directory" >&2; exit 2; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${SPARKFLASH_BIN:-$ROOT/target/release/sparkflash}"
 LOGS="${ONE_HOST_LOGS:-${TMPDIR:-/tmp}/one-host-group-$ARM-$WORLD}"
-PEERS="$(printf '127.0.0.1%.0s,' $(seq 1 "$WORLD"))"
-PEERS="${PEERS%,}"
+if [ "$WORLD" -gt 1 ]; then
+  PEERS="$(printf '127.0.0.1%.0s,' $(seq 1 "$WORLD"))"
+  PEERS="${PEERS%,}"
+else
+  # One rank has no peer to name; its engine opens no transport.
+  PEERS=""
+fi
 
 # Each rank's group flags, and the weights one rank holds as a share of the checkpoint's.
 ENVIRONMENT=()
@@ -87,7 +97,9 @@ case "$ARM" in
     ENVIRONMENT=(SPARK_COMM_REDUCE=tcp)
     [ -n "$CUBINS" ] && ENVIRONMENT+=(SPARKFLASH_CUBINS="$CUBINS")
     group() {
-      echo "--tp4-rank $1 --tp4-world-size $WORLD --tp4-peers $PEERS --tp4-base-port 29610 --tp4-control-port 29620"
+      local ranks="--tp4-rank $1 --tp4-world-size $WORLD --tp4-base-port 29610 --tp4-control-port 29620"
+      [ "$WORLD" -gt 1 ] && ranks="$ranks --tp4-peers $PEERS"
+      echo "$ranks"
       [ -n "$CUBINS" ] && echo --tp4-device "$CUBINS"
     }
     SHARE="$WORLD" ;;

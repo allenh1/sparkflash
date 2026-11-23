@@ -402,8 +402,8 @@ impl TokenEnvelope {
                 self.stage, self.loop_step
             ));
         }
-        if self.world != 4 {
-            return Err(format!("world {} is not 4", self.world));
+        if self.world == 0 {
+            return Err("world 0 is not a rank count".to_string());
         }
         if self.rank >= self.world {
             return Err(format!(

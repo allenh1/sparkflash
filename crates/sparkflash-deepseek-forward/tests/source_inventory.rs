@@ -261,13 +261,12 @@ const BUDGET: &[(&str, Counts)] = &[
     ),
 ];
 
-/// The four-rank sites, on their own list so milestone 3 can drain them without touching A's
+/// The rank-count sites, on their own list so milestone 3 can drain them without touching A's
 /// model-value and tensor-name budgets.
-const FOUR_RANK_BUDGET: &[(&str, usize)] = &[
-    ("src/tp4_forward.rs", 1),
-    ("src/tp4_operands.rs", 1),
-    ("src/tp4_token.rs", 1),
-];
+///
+/// The one entry left is the attn-operands evidence row: it pins the released world-4 plan's own
+/// group bytes, is not on the served path, and its constants are the released instances' sizes.
+const FOUR_RANK_BUDGET: &[(&str, usize)] = &[("src/tp4_operands.rs", 1)];
 
 const MODEL_CONSTANTS: &[&str] = &[
     "HIDDEN",
@@ -508,12 +507,21 @@ fn count_file(source: &str) -> (Counts, usize) {
     }
     let compact: String = code.chars().filter(|ch| !ch.is_whitespace()).collect();
     let four_rank = [
+        // A served path's world check: one rank's shapes come from the plan at that world.
         "world==4",
         "world!=4",
         "world<4",
         "world>4",
         "world_size==4",
         "world_size!=4",
+        "world==1",
+        "world!=1",
+        "world<1",
+        // A per-rank width taken from the model instead of the plan's split at its world.
+        "vocab()/4",
+        "n_heads()/4",
+        "moe_inter_dim/4",
+        "moe_inter_dim()/4",
     ]
     .iter()
     .map(|pattern| compact.matches(pattern).count())

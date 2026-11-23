@@ -41,6 +41,7 @@ sparkflash-model = { workspace = true }
 sparkflash-runtime = { workspace = true }
 sparkflash-ops = { workspace = true }
 sparkflash-vision = { workspace = true }
+sparkflash-weights = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

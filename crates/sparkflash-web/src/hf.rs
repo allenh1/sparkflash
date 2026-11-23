@@ -406,8 +406,6 @@ pub struct Family {
     pub weights: String,
     /// How many ranks the console launches the family on.
     pub world_size: usize,
-    /// Every tensor-parallel width the family's device arm runs.
-    pub worlds: Vec<usize>,
 }
 
 /// The families this build can configure, in sidebar order.
@@ -422,7 +420,6 @@ pub fn families() -> Vec<Family> {
             id: profile.id.to_owned(),
             weights: profile.weights.to_owned(),
             world_size: profile.world_size,
-            worlds: profile.worlds.to_vec(),
         })
         .collect()
 }

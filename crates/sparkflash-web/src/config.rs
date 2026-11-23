@@ -157,8 +157,6 @@ pub struct ModelProfile {
     pub search: &'static str,
     /// How many ranks the console launches the family on.
     pub world_size: usize,
-    /// Every tensor-parallel width the family's device arm runs, narrowest first.
-    pub worlds: &'static [usize],
     /// The organization most of the family's checkpoints live under.
     pub org: &'static str,
     /// The control-plane weight selector.
@@ -201,7 +199,6 @@ pub static MODEL_PROFILES: LazyLock<Vec<ModelProfile>> = LazyLock::new(|| {
                 label: &model.label,
                 search: deployment.search,
                 world_size: deployment.world_size,
-                worlds: deployment.worlds,
                 org: deployment.org,
                 weights: &model.weights_id,
                 engine: deployment.engine,
@@ -1901,7 +1898,6 @@ mod tests {
         assert_eq!(profile.model_type, "qwen3_5_moe");
         assert_eq!(profile.engine, DYNAMIC_ENGINE_ID);
         assert_eq!(profile.world_size, 1);
-        assert_eq!(profile.worlds, &[1]);
         assert!(!profile.requires_conversion);
         assert!(!profile.requires_cubins);
         // The text-only spelling the checkpoint's text_config carries resolves to the same entry.
@@ -1917,7 +1913,6 @@ mod tests {
         assert_eq!(profile.model_type, "dory");
         assert_eq!(profile.engine, DYNAMIC_ENGINE_ID);
         assert_eq!(profile.world_size, 1);
-        assert_eq!(profile.worlds, &[1]);
         assert!(!profile.requires_conversion);
         assert!(!profile.requires_cubins);
     }

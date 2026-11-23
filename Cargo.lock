@@ -2429,6 +2429,7 @@ dependencies = [
  "sparkflash-ops",
  "sparkflash-runtime",
  "sparkflash-vision",
+ "sparkflash-weights",
  "tempfile",
 ]
 

@@ -256,7 +256,12 @@ pub fn cached_values() -> &'static ModelConfig {
             released_values().expect("the released checkpoint must plan on this host")
         });
         // Publish the released plan like an installed description so a unit test that only asks
-        // for a geometry value sees the plan.
+        // for a geometry value sees the plan. The vendored document is planned at world 4.
+        std::sync::atomic::AtomicUsize::store(
+            &WORLD_VALUE,
+            4,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         publish_geometry(values);
         values
     }
@@ -366,6 +371,11 @@ impl Description {
     /// # Errors
     /// A plan whose facts do not fill the value object.
     pub fn new(plan: EnginePlan) -> Result<Self, ConfigError> {
+        std::sync::atomic::AtomicUsize::store(
+            &WORLD_VALUE,
+            plan.tp().world(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let values = values_from_plan(&plan)?;
         let mut tensors = BTreeMap::new();
         for (index, tensor) in plan.tensors().iter().enumerate() {
@@ -771,6 +781,7 @@ static DSPARK_EXPERTS_VALUE: std::sync::atomic::AtomicUsize =
 static DSPARK_TOP_K_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static DSPARK_MARKOV_RANK_VALUE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+static WORLD_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn publish_geometry(values: &ModelConfig) {
     use std::sync::atomic::Ordering;
@@ -800,6 +811,16 @@ fn publish_geometry(values: &ModelConfig) {
     DSPARK_MARKOV_RANK_VALUE.store(values.dspark_markov_rank, Ordering::Relaxed);
 }
 
+/// The world size this process's plan was opened at.
+///
+/// The plan's split is the one authority for every per-rank width: a model runs at the worlds its
+/// scan resolves, and a world the kernels were not built for is a row the scan shows.
+#[must_use]
+pub fn world() -> usize {
+    ensure_geometry();
+    std::sync::atomic::AtomicUsize::load(&WORLD_VALUE, std::sync::atomic::Ordering::Relaxed).max(1)
+}
+
 /// The residual stream width, read at open from the plan.
 #[must_use]
 pub fn hidden() -> usize {
@@ -814,11 +835,11 @@ pub fn vocab() -> usize {
     std::sync::atomic::AtomicUsize::load(&VOCAB, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// One rank's vocabulary shard, computed at open from the plan's vocabulary and the four-rank
-/// split. Four ranks is milestone 3 and is left in place here.
+/// One rank's vocabulary shard, computed at open from the plan's vocabulary and the world the
+/// plan resolved at.
 #[must_use]
 pub fn vocab_per_rank() -> usize {
-    vocab() / 4
+    vocab() / world()
 }
 
 /// The mHC stream count, read at open from the plan.
@@ -928,10 +949,10 @@ pub fn dspark_markov_rank() -> usize {
     )
 }
 
-/// The attention heads this rank runs: the model's heads over the four-rank split.
+/// The attention heads this rank runs: the model's heads over the world the plan resolved at.
 #[must_use]
 pub fn heads_per_rank() -> usize {
-    n_heads() / 4
+    n_heads() / world()
 }
 
 /// The most positions one attention row attends: the selected bound plus one full window.

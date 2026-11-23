@@ -466,13 +466,15 @@ fn scan_gaps(
     tensors: Option<&TensorIndex>,
 ) -> Result<(), Vec<String>> {
     let profile = profile_for_model_type(&architecture.family);
+    // The console judges the width it launches a family on; a narrower or wider hypothetical
+    // group is not a configuration it offers. The scan at that width is the rank-count authority:
+    // a world the kernels were not built for is an unresolved row it reports.
     if let Some(profile) = profile
-        && !profile.worlds.contains(&world)
+        && world != profile.world_size
     {
         return Err(vec![format!(
-            "the {} engine at TP={world} (it runs at {})",
-            profile.label,
-            widths(profile.worlds)
+            "the {} engine at TP={world} (the console launches it at TP={})",
+            profile.label, profile.world_size
         )]);
     }
     // A checkpoint no device arm reads may still be executable by the shared CPU host
@@ -1023,14 +1025,6 @@ fn summary(fit: &Fit) -> String {
             format!("Cannot judge without {first}")
         }
     }
-}
-
-fn widths(worlds: &[usize]) -> String {
-    worlds
-        .iter()
-        .map(|world| format!("TP={world}"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn thousands(value: usize) -> String {

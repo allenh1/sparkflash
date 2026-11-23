@@ -44,6 +44,8 @@ use sparkflash_kernels::cuda_driver::Cuda;
 use sparkflash_kernels::cuda_driver::Deviceptr;
 
 use sparkflash_comm::tcp::TcpTransport;
+#[cfg(feature = "cuda")]
+use sparkflash_weights::tp::SingleRank;
 
 use crate::tp4_combine::{CombineGeometry, CombineKernelSet, CombineSelection, select_combine};
 #[cfg(feature = "cuda")]
@@ -198,6 +200,81 @@ fn open_roce_reduce(rank: usize, world: usize) -> (Option<RoceReduceHandle>, Str
 }
 
 #[cfg(feature = "cuda")]
+/// The one-rank transport: no communicator and no sockets.
+///
+/// [SingleRank] is the one-rank collective the other arms use, and its contract is that every
+/// collective is a strict no-op. This adapter gives that contract the wire form the forward's
+/// transport slots take: a reduce is the identity (no bf16 round) and a gather is a copy.
+pub struct SingleRankTransport {
+    single: SingleRank,
+}
+
+#[cfg(feature = "cuda")]
+impl SingleRankTransport {
+    /// The one-rank transport every world-1 forward slot shares.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { single: SingleRank }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Default for SingleRankTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl sparkflash_comm::transport::Transport for SingleRankTransport {
+    fn world_size(&self) -> usize {
+        sparkflash_weights::tp::TpCollective::world(&self.single)
+    }
+
+    fn rank(&self) -> usize {
+        sparkflash_weights::tp::TpCollective::rank(&self.single)
+    }
+
+    fn all_reduce_bf16(
+        &self,
+        _buf: &mut [u16],
+        _seq: u64,
+        layout: &sparkflash_comm::layout::CollectiveLayout,
+    ) -> Result<(), sparkflash_comm::CommError> {
+        if layout.world_size() == 1 {
+            Ok(())
+        } else {
+            Err(sparkflash_comm::CommError::InvalidLayout(format!(
+                "a one-rank reduce was handed a {}-rank layout",
+                layout.world_size()
+            )))
+        }
+    }
+
+    fn all_gather_bf16(
+        &self,
+        local: &[u16],
+        out: &mut [u16],
+        _seq: u64,
+    ) -> Result<(), sparkflash_comm::CommError> {
+        if out.len() == local.len() {
+            out.copy_from_slice(local);
+            Ok(())
+        } else {
+            Err(sparkflash_comm::CommError::InvalidLayout(format!(
+                "a one-rank gather of {} words has {} slots",
+                local.len(),
+                out.len()
+            )))
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+/// The world-1 transport every forward slot shares: nothing is opened and nothing is exchanged.
+static SINGLE_RANK_TRANSPORT: SingleRankTransport = SingleRankTransport::new();
+
+#[cfg(feature = "cuda")]
 /// The forward's reduce transport slot for the two per-layer collectives (attention output and the
 /// routed MoE combine).
 ///
@@ -208,7 +285,7 @@ fn open_roce_reduce(rank: usize, world: usize) -> (Option<RoceReduceHandle>, Str
 /// canonical order is the file's existing rule, and the two runs' evidence digests are directly
 /// comparable.
 pub struct ForwardReduce<'a> {
-    tcp: &'a TcpTransport,
+    comm: &'a dyn sparkflash_comm::transport::Transport,
     roce: Option<&'a RoceReduceHandle>,
     /// Requested switch, resolved path and (on a fallback) why. Printed before position 0 and again
     /// when the run drops the slot, so a row can prove which path its calls took even if it fails.
@@ -229,15 +306,13 @@ impl<'a> ForwardReduce<'a> {
     /// is what makes the switch safe: a rank that opened RoCE while a peer stayed on TCP would
     /// block in a different exchange at the first reduce, so the path is all-or-nothing per run.
     fn resolve(
-        tcp: &'a TcpTransport,
+        comm: &'a dyn sparkflash_comm::transport::Transport,
         maybe_roce: &'a Option<RoceReduceHandle>,
         switch: ReduceSwitch,
         requested: &str,
         open_detail: &str,
         world: usize,
     ) -> Result<Self, String> {
-        use sparkflash_comm::transport::Transport;
-
         let mut report = format!("requested={requested:?} ");
         let roce = match switch {
             ReduceSwitch::Tcp => {
@@ -253,7 +328,7 @@ impl<'a> ForwardReduce<'a> {
             ReduceSwitch::Roce => {
                 let ready = [u16::from(maybe_roce.is_some())];
                 let mut seen = vec![0u16; world];
-                tcp.all_gather_bf16(&ready, &mut seen, REDUCE_AGREEMENT_SEQ)
+                comm.all_gather_bf16(&ready, &mut seen, REDUCE_AGREEMENT_SEQ)
                     .map_err(|error| {
                         format!("forward reduce: reduce-path agreement gather: {error}")
                     })?;
@@ -269,7 +344,7 @@ impl<'a> ForwardReduce<'a> {
             }
         };
         Ok(Self {
-            tcp,
+            comm,
             roce,
             report,
             nccl: switch == ReduceSwitch::Nccl,
@@ -302,10 +377,9 @@ impl<'a> ForwardReduce<'a> {
         seq: u64,
         layout: &sparkflash_comm::layout::CollectiveLayout,
     ) -> Result<(), sparkflash_comm::CommError> {
-        use sparkflash_comm::transport::Transport;
         #[cfg(feature = "rdma")]
         if let Some(roce) = self.roce {
-            roce.all_reduce_bf16(buf, seq, layout)?;
+            sparkflash_comm::transport::Transport::all_reduce_bf16(roce, buf, seq, layout)?;
             self.roce_calls.set(self.roce_calls.get() + 1);
             return Ok(());
         }
@@ -314,7 +388,7 @@ impl<'a> ForwardReduce<'a> {
             self.roce.is_none(),
             "a build without the rdma feature cannot hold a RoCE transport"
         );
-        self.tcp.all_reduce_bf16(buf, seq, layout)?;
+        sparkflash_comm::transport::Transport::all_reduce_bf16(self.comm, buf, seq, layout)?;
         self.tcp_calls.set(self.tcp_calls.get() + 1);
         Ok(())
     }
@@ -4964,7 +5038,7 @@ impl Layer0MoeRouted {
         let sha = |bytes: &[u8]| sha256_hex(bytes);
         let values = crate::plan::cached_values();
         let top_k = values.n_activated_experts;
-        let local_inter = values.moe_inter_dim / 4;
+        let local_inter = values.moe_inter_dim / crate::plan::world();
         let padded_inter = sparkflash_kernels::moe_routed_device::WIDTH_PADDED;
         serde_json::json!({
             "schema": "sparkflash-moe-stage-evidence/1",
@@ -5126,11 +5200,10 @@ fn run_layer_moe_routed(
     request: &TokenStageRequest<'_>,
     bind: &crate::tp4_resident::DeviceBind,
     seams: &Layer0FfnSeams,
-    transport: &TcpTransport,
+    transport: &dyn sparkflash_comm::transport::Transport,
     reduce: &ForwardReduce<'_>,
 ) -> Result<Layer0MoeRouted, String> {
     use sparkflash_comm::layout::{CollectiveLayout, FabricSchedule};
-    use sparkflash_comm::transport::Transport;
     use sparkflash_kernels::cuda_driver::KernelId;
     use sparkflash_kernels::{
         mxfp4_moe_stored_launch, mxfp4_ref, routed_gate_up_launch, router_launch,
@@ -5146,14 +5219,8 @@ fn run_layer_moe_routed(
     let experts = config.n_routed_experts;
     let inter = config.moe_inter_dim;
     let dim = crate::plan::hidden();
-    // Four ranks is milestone 3 and is the only shape assumption left here: the expert count,
-    // top-k and widths are the open plan's, and the resolved catalogue entries enforce their
-    // compiled shape before this stage runs.
-    if world != 4 {
-        return Err(format!(
-            "MoE: this chain runs a four-rank world (milestone 3); got world {world}"
-        ));
-    }
+    // The expert count, top-k and widths are the open plan's, and the resolved catalogue entries
+    // enforce their compiled shape before this stage runs; the world comes from the plan's split.
     let kernel_dir = request
         .kernel_cubin_dir
         .ok_or_else(|| "MoE: the loop has no kernel cubin directory".to_string())?;
@@ -7288,9 +7355,8 @@ fn gather_shared_expert_source(
     arena: &sparkflash_device::arena::ResidentArena,
     request: &TokenStageRequest<'_>,
     layer: usize,
-    transport: &TcpTransport,
+    transport: &dyn sparkflash_comm::transport::Transport,
 ) -> Result<SharedExpertGather, String> {
-    use sparkflash_comm::transport::Transport;
     use sparkflash_engine::dtype::DType;
     use sparkflash_engine::tensor::TensorSpec;
 
@@ -8707,15 +8773,13 @@ fn run_head_position(
     cuda: &sparkflash_kernels::cuda_driver::Cuda,
     request: &TokenStageRequest<'_>,
     tail_stage: &crate::tp4_tail::TailStage,
-    transport: &TcpTransport,
+    transport: &dyn sparkflash_comm::transport::Transport,
     config: &crate::plan::ModelConfig,
     final_norm: &[f32],
     stream: &[f32],
     tail_pre_mix: &[f32],
     position: usize,
 ) -> Result<HeadPosition, String> {
-    use sparkflash_comm::transport::Transport;
-
     let started = std::time::Instant::now();
     let probe_on = request.forward_perf.probe;
     // Started here, not at the record site: a timer built at the end would snapshot the counters
@@ -11668,12 +11732,8 @@ impl<'a> DeviceLayer<'a> {
         // variable at all, and a typo would leave a run measuring the arm it meant to replace.
         #[cfg(all(feature = "cuda", feature = "rdma"))]
         crate::rdma_exchange::validate()?;
-        // The device arm's collectives are the four-rank chain's; a single-rank device run has no
-        // communicator to reduce with, and failing here names the real reason instead of failing
-        // later inside all_reduce with a message that blames the bootstrap. Host arm: unaffected.
-        if world == 1 {
-            return Err("layer device: the device arm needs the four-rank chain (world 1 has no communicator for its per-layer collectives); run the host arm for a single rank".to_owned());
-        }
+        // A single-rank device run opens no communicator: its collectives are the identity, so
+        // the layer opens like any other world.
         let dim = crate::plan::hidden();
         if config.dim != dim {
             return Err(format!(
@@ -16804,11 +16864,15 @@ fn run_forward_loop(
                 .to_string(),
         );
     };
-    let Some(transport) = transport else {
-        return Err(
-            "the four-rank forward loop needs the tcp transport: the embedding row of the last prompt token is gathered from its owner rank over the same collective the walk uses, and --forward without --comm-peers cannot even build the first hidden state"
-                .to_string(),
-        );
+    let transport: &dyn Transport = match transport {
+        Some(transport) => transport,
+        None if request.world <= 1 => &SINGLE_RANK_TRANSPORT,
+        None => {
+            return Err(
+                "the forward loop needs the tcp transport at a world of two or more ranks: the embedding row of the last prompt token is gathered from its owner rank over the same collective the walk uses, and --forward without --comm-peers cannot even build the first hidden state"
+                    .to_string(),
+            );
+        }
     };
     // The host arm's two per-layer reduces take the reference TCP exchange unless
     // `SPARK_COMM_REDUCE=roce` asks for the canonical RoCE one-shot and every rank can open it; the
@@ -16818,7 +16882,13 @@ fn run_forward_loop(
     // ranks on one transport (see ForwardReduce::resolve). A tcp or nccl run never issues either of
     // them, so its collectives, bytes and arithmetic are exactly the ones they were before this slot
     // existed.
-    let reduce_switch = ReduceSwitch::for_path(request.header.reduce);
+    // A single rank exchanges nothing, so its slot is the identity whatever the header asked;
+    // this keeps the run off a communicator it never opened.
+    let reduce_switch = if request.world <= 1 {
+        ReduceSwitch::Tcp
+    } else {
+        ReduceSwitch::for_path(request.header.reduce)
+    };
     let reduce_requested = request.header.reduce.as_str();
     if reduce_switch == ReduceSwitch::Roce {
         // The QP endpoint exchange has a bounded deadline and the arena upload ends at a different

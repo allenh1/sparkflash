@@ -48,6 +48,37 @@ fn every_tensor_the_second_shape_binds_is_one_the_writer_names() {
 }
 
 #[test]
+fn one_ranks_shapes_come_from_the_plans_world() {
+    let dir = fixture();
+    let text = std::fs::read_to_string(dir.join("config.json")).expect("the fixture config");
+    let config = ModelConfig::from_json(&text).expect("the fixture parses");
+    // One process opens one plan; the test opens them in sequence, so each world's split is read
+    // through the same accessors the forward uses.
+    for world in [1usize, 2, 4] {
+        let plan = sparkflash_deepseek_forward::plan::plan_from_path(&dir, world, 0)
+            .unwrap_or_else(|error| panic!("world {world}: {error}"));
+        sparkflash_deepseek_forward::plan::install(plan).expect("the plan installs");
+        assert_eq!(sparkflash_deepseek_forward::plan::world(), world);
+        assert_eq!(
+            sparkflash_deepseek_forward::plan::vocab_per_rank(),
+            config.vocab_size / world,
+            "vocabulary at world {world}"
+        );
+        assert_eq!(
+            sparkflash_deepseek_forward::plan::heads_per_rank(),
+            config.n_heads / world,
+            "heads at world {world}"
+        );
+        assert_eq!(
+            sparkflash_deepseek_forward::plan::moe_inter_dim()
+                / sparkflash_deepseek_forward::plan::world(),
+            config.moe_inter_dim / world,
+            "expert width at world {world}"
+        );
+    }
+}
+
+#[test]
 fn the_second_shape_values_reach_the_forward() {
     let dir = fixture();
     let text = std::fs::read_to_string(dir.join("config.json")).expect("the fixture config");
