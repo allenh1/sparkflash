@@ -765,6 +765,59 @@ pub enum GroupedFp8Body {
     SplitActivation,
 }
 
+/// The released model family a plan describes.
+///
+/// This is the plan's own fact, read from `model_type`; it is not inferred from a width. The
+/// catalogue uses it only to keep the canonical DeepSeek body from answering another arm's
+/// geometry at a width both arms happen to share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelFamily {
+    /// DeepSeek V4.1 (including the second-shape proof configuration).
+    Deepseek,
+    /// The Qwen3.8 arms.
+    Qwen,
+    /// The GLM-5.3 arms.
+    Glm,
+    /// Inkling-2.
+    Inkling,
+    /// Dory1.0.
+    Dory,
+    /// A family whose bodies share the catalogue by shape.
+    Other,
+}
+
+impl ModelFamily {
+    /// The family a configuration names, from its `model_type` or its `architectures` list.
+    ///
+    /// A document may carry an unregistered `model_type` while its architecture class still
+    /// names the family; the class list is the fallback so an unknown string does not turn a
+    /// released plan into another arm's body.
+    #[must_use]
+    pub fn of(family: &str, architectures: &[String]) -> Self {
+        std::iter::once(family)
+            .chain(architectures.iter().map(String::as_str))
+            .find_map(Self::from_name)
+            .unwrap_or(Self::Other)
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        let name = name.to_ascii_lowercase();
+        if name.starts_with("deepseek") {
+            Some(Self::Deepseek)
+        } else if name.starts_with("qwen") {
+            Some(Self::Qwen)
+        } else if name.starts_with("glm") {
+            Some(Self::Glm)
+        } else if name.starts_with("inkling") {
+            Some(Self::Inkling)
+        } else if name.starts_with("dory") {
+            Some(Self::Dory)
+        } else {
+            None
+        }
+    }
+}
+
 /// The geometry one part runs at on this rank, after the tensor-parallel split.
 ///
 /// Zero means "not applicable to this part". The fields are deliberately a flat bag: a
@@ -773,6 +826,12 @@ pub enum GroupedFp8Body {
 /// released architecture and the [TpPlan](sparkflash_model::TpPlan); the resolver consumes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct PartGeometry {
+    /// The model arm the geometry belongs to, when the plan names one.
+    ///
+    /// A synthetic requirement leaves this [None] and the catalogue answers by shape alone.
+    /// A plan sets it from its architecture, so two arms that share a width (DeepSeek's second
+    /// shape and GLM at 4,096) cannot select each other's bodies.
+    pub model: Option<ModelFamily>,
     /// Residual width.
     pub hidden: usize,
     /// Rows the plan describes (1 for decode; a fixture may use more).
@@ -880,6 +939,7 @@ impl PartGeometry {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            model: None,
             hidden: 0,
             rows: 0,
             intermediate: 0,
@@ -958,6 +1018,21 @@ pub struct ShapeConstraint {
     pub min_ratio: usize,
     /// The GQA group sizes this kernel implements; empty means any.
     pub gqa_groups: &'static [usize],
+    /// Hidden widths this implementation was built for; empty means any. One entry is the same
+    /// rule as [Self::hidden_equals].
+    pub hidden_in: &'static [usize],
+    /// Vocabulary rows this implementation was built for; empty means any.
+    pub vocab_in: &'static [usize],
+    /// Intermediate widths this implementation was built for; empty means any.
+    pub intermediate_in: &'static [usize],
+    /// Expert counts this implementation was built for; empty means any.
+    pub experts_in: &'static [usize],
+    /// Active-expert counts this implementation was built for; empty means any.
+    pub top_k_in: &'static [usize],
+    /// Head widths this implementation was built for; empty means any.
+    pub head_dim_in: &'static [usize],
+    /// Residual stream counts this implementation was built for; empty means any.
+    pub streams_in: &'static [usize],
     /// Hidden width that must equal this, when named and nonzero.
     pub hidden_equals: Option<usize>,
     /// Vocabulary rows that must equal this, when named and nonzero.
@@ -1016,6 +1091,8 @@ pub struct ShapeConstraint {
     pub merger_intermediate_equals: Option<usize>,
     /// The exact width a vision merger hands the language model, when named.
     pub out_hidden_equals: Option<usize>,
+    /// The widths a vision merger hands the language model, empty means any.
+    pub out_hidden_in: &'static [usize],
     /// The `(key, value)` head-width template pairs this implementation accepts; empty means any.
     pub head_pairs: &'static [(usize, usize)],
     /// The routed-expert `(hidden, experts, top-k)` shapes this implementation is published at;
@@ -1042,6 +1119,13 @@ impl ShapeConstraint {
         max_positions: 0,
         min_ratio: 0,
         gqa_groups: &[],
+        hidden_in: &[],
+        vocab_in: &[],
+        intermediate_in: &[],
+        experts_in: &[],
+        top_k_in: &[],
+        head_dim_in: &[],
+        streams_in: &[],
         hidden_equals: None,
         vocab_equals: None,
         intermediate_equals: None,
@@ -1071,6 +1155,7 @@ impl ShapeConstraint {
         vision_downsample: None,
         merger_intermediate_equals: None,
         out_hidden_equals: None,
+        out_hidden_in: &[],
         head_pairs: &[],
         routed_shapes: &[],
         world_equals: None,
@@ -1155,7 +1240,66 @@ impl ShapeConstraint {
         self
     }
 
-    /// Require an exact hidden width (ignored when the geometry leaves it at zero).
+    /// Accept exactly the hidden widths the build produced.
+    #[must_use]
+    pub const fn hidden_in(mut self, widths: &'static [usize]) -> Self {
+        self.hidden_in = widths;
+        self
+    }
+
+    /// Accept exactly the vocabularies the build produced.
+    #[must_use]
+    pub const fn vocab_in(mut self, vocabularies: &'static [usize]) -> Self {
+        self.vocab_in = vocabularies;
+        self
+    }
+
+    /// Accept exactly the intermediate widths the build produced.
+    #[must_use]
+    pub const fn intermediate_in(mut self, widths: &'static [usize]) -> Self {
+        self.intermediate_in = widths;
+        self
+    }
+
+    /// Accept exactly the expert counts the build produced.
+    #[must_use]
+    pub const fn experts_in(mut self, counts: &'static [usize]) -> Self {
+        self.experts_in = counts;
+        self
+    }
+
+    /// Accept exactly the active-expert counts the build produced.
+    #[must_use]
+    pub const fn top_k_in(mut self, counts: &'static [usize]) -> Self {
+        self.top_k_in = counts;
+        self
+    }
+
+    /// Accept exactly the merger output widths the build produced.
+    #[must_use]
+    pub const fn out_hidden_in(mut self, widths: &'static [usize]) -> Self {
+        self.out_hidden_in = widths;
+        self
+    }
+
+    /// Accept exactly the head widths the build produced.
+    #[must_use]
+    pub const fn head_dim_in(mut self, widths: &'static [usize]) -> Self {
+        self.head_dim_in = widths;
+        self
+    }
+
+    /// Accept exactly the residual-stream counts the build produced.
+    #[must_use]
+    pub const fn streams_in(mut self, counts: &'static [usize]) -> Self {
+        self.streams_in = counts;
+        self
+    }
+
+    /// Require an exact hidden width.
+    ///
+    /// # Panics
+    /// Never; the constraint is checked when a geometry is tested against it.
     #[must_use]
     pub const fn hidden_equals(mut self, hidden: usize) -> Self {
         self.hidden_equals = Some(hidden);
@@ -1401,6 +1545,14 @@ impl ShapeConstraint {
             }
             Ok(())
         }
+        fn one_of(name: &str, value: usize, built: &[usize]) -> Result<(), String> {
+            if built.is_empty() || built.contains(&value) {
+                return Ok(());
+            }
+            Err(format!(
+                "{name} {value} is not one of the shapes the kernel was built for ({built:?})"
+            ))
+        }
         fn at_most(name: &str, value: usize, max: Option<usize>) -> Result<(), String> {
             if let Some(max) = max {
                 if value == 0 {
@@ -1439,6 +1591,13 @@ impl ShapeConstraint {
         multiple("output width", geometry.output, self.output_multiple)?;
         multiple("experts", geometry.experts, self.experts_multiple)?;
         multiple("streams", geometry.streams, self.streams_multiple)?;
+        one_of("hidden", geometry.hidden, self.hidden_in)?;
+        one_of("vocab", geometry.vocab, self.vocab_in)?;
+        one_of("intermediate", geometry.intermediate, self.intermediate_in)?;
+        one_of("experts", geometry.experts, self.experts_in)?;
+        one_of("top-k", geometry.top_k, self.top_k_in)?;
+        one_of("head width", geometry.head_dim, self.head_dim_in)?;
+        one_of("streams", geometry.streams, self.streams_in)?;
         equals("hidden", geometry.hidden, self.hidden_equals)?;
         equals("vocab", geometry.vocab, self.vocab_equals)?;
         equals(
@@ -1568,6 +1727,7 @@ impl ShapeConstraint {
                 geometry.merger_intermediate
             ));
         }
+        one_of("merger output", geometry.out_hidden, self.out_hidden_in)?;
         if let Some(width) = self.out_hidden_equals
             && geometry.out_hidden != width
         {

@@ -90,7 +90,7 @@ fn the_cache_plan_charges_sliding_layers_once_and_full_layers_per_token() {
 fn the_part_set_names_every_new_inkling_mechanism() {
     let parts = architecture().parts();
     for part in [
-        Part::GqaAttention,
+        // Inkling's text attention is the relative form; GqaAttention is another arm's body.
         Part::RelativeAttention,
         Part::ShortConv,
         Part::BlockAttentionResidual,

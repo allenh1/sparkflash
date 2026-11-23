@@ -95,7 +95,14 @@ FAMILIES = {
     # compression ratio and the position bound the claim states.
     "csa2": ("hidden", "head_dim", "ratio", "positions"),
 }
-OPTIONAL = {"seams": ("hc",)}
+# Capacities the device body fixes and the Rust launch code must not spell twice: the routed
+# dedup plan's row table (OPT_MOE_PLAN_MAX) and the batched score launch's block cap. They are
+# optional because only the entries whose launch reads the capacity carry it.
+OPTIONAL = {
+    "seams": ("hc",),
+    "routed": ("plan_rows",),
+    "select": ("score_blocks",),
+}
 # The catalogue generator understands these dimensions as shape claims. A key may name a subset
 # with catalogue_dims; a key without it keeps the router/routed convention.
 CATALOGUE_DIMS = {"hidden", "head_dim", "intermediate", "experts", "top_k", "ratio", "positions"}
@@ -145,9 +152,6 @@ def load() -> list[dict]:
             )
         if not IDENTIFIER.match(entry):
             raise SystemExit(f"{INSTANCES}: instance {number}: {entry!r} is not a symbol")
-        if entry in seen:
-            raise SystemExit(f"{INSTANCES}: instance {number}: {entry} is listed twice")
-        seen.add(entry)
         path = (kernels / source).resolve()
         if path.parent != kernels or not path.is_file():
             raise SystemExit(f"{INSTANCES}: instance {number}: kernels/{source} does not exist")
@@ -159,6 +163,11 @@ def load() -> list[dict]:
         cubin = row.get("cubin", path.stem)
         if not isinstance(cubin, str) or "/" in cubin or not IDENTIFIER.match(cubin):
             raise SystemExit(f"{INSTANCES}: instance {number}: bad cubin {cubin!r}")
+        # An entry symbol is unique inside its cubin. A second shape exports the same symbols
+        # from its own cubin, which is what lets one loader name a symbol at two shapes.
+        if (cubin, entry) in seen:
+            raise SystemExit(f"{INSTANCES}: instance {number}: {entry} is listed twice in {cubin}")
+        seen.add((cubin, entry))
         defines = []
         shapes = {}
         for key in FAMILIES[family] + OPTIONAL.get(family, ()):

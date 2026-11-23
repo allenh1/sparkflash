@@ -25,6 +25,9 @@ description = "DeepSeek-V4.1-Flash's device forward, out of sparkflash-cli"
 default = []
 cuda = ["sparkflash-device/cuda"]
 rdma = ["sparkflash-comm/rdma", "sparkflash-kernels/rdma"]
+# Enables the released-checkpoint fallback for another crate's unit tests. Production never
+# sets it, so a read with no installed plan still refuses by name.
+test-support = []
 
 [dependencies]
 sparkflash-api = { workspace = true }
@@ -47,3 +50,4 @@ clap = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+sparkflash-model-deepseek-v41 = { path = "../sparkflash-model-deepseek-v41" }

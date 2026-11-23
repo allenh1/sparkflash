@@ -283,7 +283,11 @@ fn deepseek_moe_refuses_tp1_and_tp2_with_the_intermediate_width() {
                 "TP{world} refused an unexpected part: {failure}"
             );
             let message = failure.to_string();
-            assert!(message.contains("does not equal 576"), "{message}");
+            assert!(
+                message.contains(&format!("intermediate {} ", 2304 / world)),
+                "{message}"
+            );
+            assert!(message.contains("576"), "{message}");
             assert!(message.contains("deepseek_ptx"), "{message}");
         }
         let moe = plan

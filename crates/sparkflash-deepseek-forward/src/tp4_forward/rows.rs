@@ -807,7 +807,11 @@ const ATTN_SCORE_CHUNK: usize = 32;
 /// opt_select_scores_rows' positions a tile (SR_TILE), and the blocks a batched select's scores
 /// spread over (each strides over its row's tiles).
 const SELECT_SCORE_TILE: usize = 16;
-const SELECT_SCORE_BLOCKS: usize = 384;
+
+/// The batched score launch's block cap, read from the select instance entry that built the body.
+fn select_score_blocks() -> usize {
+    sparkflash_kernels::instances::capacities::OPT_SELECT_SM121_SCORE_BLOCKS
+}
 
 /// opt_select_scores_seg's heads, positions a tile and rows (SG_HEADS, SG_TILE, SG_ROWS), and the
 /// blocks its tiles spread over (SPARKFLASH_SEG_BLOCKS overrides).
@@ -2845,7 +2849,7 @@ impl DeviceLayer<'_> {
             )?;
         } else {
             let tiles = reach.div_ceil(SELECT_SCORE_TILE);
-            let blocks = tiles.min((SELECT_SCORE_BLOCKS / seg.n).max(1));
+            let blocks = tiles.min((select_score_blocks() / seg.n).max(1));
             self.cuda.launch(
                 scores_rows,
                 (blocks as u32, seg.n as u32, 1),

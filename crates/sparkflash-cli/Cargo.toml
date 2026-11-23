@@ -90,6 +90,7 @@ libc = { workspace = true }
 io-uring = { workspace = true, optional = true }
 
 [dev-dependencies]
+sparkflash-deepseek-forward = { workspace = true, features = ["test-support"] }
 # The `--checkpoint` fixture tests build a tiny safetensors checkpoint in a temporary directory.
 tempfile = { workspace = true }
 # The device-token window tests write a synthetic four-rank envelope: paper records, UNMEASURED.

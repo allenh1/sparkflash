@@ -110,23 +110,21 @@ pub fn setup_for_chain(argv: &[&str]) -> Result<(RankSetup, Option<SafeTensorsSo
 
 /// The open description's plan for one chain rank, from the checkpoint the chain was given.
 ///
-/// The checkpoint path is the same `--checkpoint` the resident setup read; a headers-only
-/// `--tensor-index` run has no `config.json`, so it falls back to the checkpoint the environment
-/// names and refuses when neither is present.
+/// The checkpoint path is the same `--checkpoint` the resident setup read. A headers-only
+/// `--tensor-index` run has no `config.json`, so it refuses by name instead of looking one up:
+/// the plan names the tensors and kernels the run binds, and a guessed released checkpoint
+/// would describe a different model.
 ///
 /// # Errors
-/// The resident arguments do not parse, no checkpoint's `config.json` is reachable, or the plan
-/// refuses the checkpoint at this world/rank.
+/// The resident arguments do not parse, the chain named no checkpoint, or the plan refuses the
+/// checkpoint at this world/rank.
 pub fn plan_for_chain(argv: &[&str]) -> Result<sparkflash_ops::engine_plan::EnginePlan, String> {
     let args = ResidentArgs::parse(argv)?;
-    let dir = match args.source_path.as_deref() {
-        Some(path) => path.to_path_buf(),
-        None => crate::plan::checkpoint_dir().ok_or_else(|| {
-            "the chain was given a tensor index and no checkpoint config.json is reachable"
-                .to_string()
-        })?,
-    };
-    crate::plan::plan_from_path(&dir, args.world, args.rank)
+    let dir = args.source_path.as_deref().ok_or_else(|| {
+        "the chain was given a tensor index and no --checkpoint, so it cannot open a plan: the          description needs the checkpoint's config.json"
+            .to_string()
+    })?;
+    crate::plan::plan_from_path(dir, args.world, args.rank)
 }
 
 /// The plan's by-name lookups, built once from the plan record.

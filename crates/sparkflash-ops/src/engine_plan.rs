@@ -47,7 +47,7 @@ use sparkflash_weights::weights::WeightSource;
 use thiserror::Error;
 
 use crate::gemv::GEMV_MAX_BATCH;
-use crate::plan::{GroupedFp8Body, PartGeometry, Precision};
+use crate::plan::{GroupedFp8Body, ModelFamily, PartGeometry, Precision};
 use crate::resolver::PlanContext;
 
 /// One part instance's position: the part kind and its layout block, or `None` for a global.
@@ -273,7 +273,11 @@ impl EnginePlan {
         // the operand precision: a block mixer stored in f32 and an attention stored in bf16 are
         // both exact even beside NVFP4 experts.
         let formats = stored_formats(&architecture);
-        let globals = global_requirements(&architecture, &tp, precision, &formats)?;
+        let model = ModelFamily::of(&architecture.family, &architecture.architectures);
+        let mut globals = global_requirements(&architecture, &tp, precision, &formats)?;
+        for requirement in &mut globals {
+            requirement.geometry.model = Some(model);
+        }
         let steps = architecture.steps();
         if steps.len() != architecture.layers.len() {
             return Err(PlanError::Invalid(format!(
@@ -318,6 +322,9 @@ impl EnginePlan {
                     geometry,
                     precision: format.map_or(precision.dense, precision_of),
                 });
+            }
+            for requirement in &mut requirements {
+                requirement.geometry.model = Some(model);
             }
             layers.push(LayerExecution {
                 index: step.index,

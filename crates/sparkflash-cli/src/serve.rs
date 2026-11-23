@@ -10743,7 +10743,10 @@ mod device_token_serve_tests {
         // The resolver's TP1 refusal remains for the kernel path.
         let error = check_checkpoint_plan(dir.path(), 1, Availability::Catalogue)
             .expect_err("a kernel launch at TP1 is still refused");
-        assert!(error.contains("does not equal 576"), "{error}");
+        // The routed rule is the set of rank-local widths the instance list builds, so TP1's
+        // full 2,304-wide expert intermediate is refused against that set by name.
+        assert!(error.contains("intermediate 2304"), "{error}");
+        assert!(error.contains("576"), "{error}");
     }
 
     #[test]

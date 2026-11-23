@@ -233,6 +233,13 @@ pub fn run(args: &[&str]) -> ExitCode {
 /// Runs the gate and returns its outcome and the evidence path.
 fn run_lines(args: &[&str]) -> Result<(GateOutcome, PathBuf), String> {
     let args = GateArgs::parse(args)?;
+    if crate::plan::installed().is_none()
+        && let Some(dir) = args.checkpoint.as_deref()
+    {
+        let plan = crate::plan::plan_from_path(dir, args.world, args.rank)?;
+        crate::plan::install(plan)
+            .map_err(|error| format!("install the checkpoint description: {error}"))?;
+    }
     let (entries, source) = load_entries(&args)?;
     let plan = ResidentPlan::plan(args.rank, args.world, entries)
         .map_err(|error| format!("plan rank {}: {error}", args.rank))?;
@@ -333,8 +340,22 @@ fn evaluate(
     source: &str,
     expect_plan_hash: Option<u64>,
 ) -> Result<GateOutcome, String> {
-    let config =
-        crate::plan::released_values().map_err(|error| format!("model config: {error}"))?;
+    let config = match crate::plan::installed() {
+        Some(description) => description.values().clone(),
+        None => {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                crate::plan::released_values().map_err(|error| format!("model config: {error}"))?
+            }
+            #[cfg(not(any(test, feature = "test-support")))]
+            {
+                return Err(
+                    "attn operands: no plan is installed, so the rank geometry has no model                      description; pass --checkpoint or open the checkpoint first"
+                        .to_string(),
+                );
+            }
+        }
+    };
     let geometry = crate::resident_weights::rank_attention_geometry(&config, rank, world)?;
     let planned: BTreeMap<&str, &sparkflash_device::resident::ResidentShard> = plan
         .shards()
@@ -727,12 +748,12 @@ mod tests {
                 ));
             }
             entries.push(entry(
-                &crate::plan::layer_claim(layer, "attn.q_norm.weight"),
+                crate::plan::layer_claim(layer, "attn.q_norm.weight"),
                 "BF16",
                 &[1280],
             ));
             entries.push(entry(
-                &crate::plan::layer_claim(layer, "attn.kv_norm.weight"),
+                crate::plan::layer_claim(layer, "attn.kv_norm.weight"),
                 "BF16",
                 &[512],
             ));

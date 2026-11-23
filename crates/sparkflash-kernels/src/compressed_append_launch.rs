@@ -27,7 +27,11 @@ pub const SELECT_KERNEL: &str = "compressed_selected_fill_sm121";
 /// The CUDA source both symbols are compiled from.
 pub const SOURCE: &str = include_str!("../../../kernels/compressed_append_sm121.cu");
 /// The append signature, whitespace-normalised for the declaration check.
-pub const APPEND_DECLARATION: &str = "extern \"C\" __global__ void compressed_append_sm121(const float* __restrict__ latent, unsigned char* __restrict__ codes, unsigned char* __restrict__ scales, unsigned first_row, unsigned row_count, unsigned ratio)";
+///
+/// The entry is a per-instance macro in the source: the file serves both the 5120-wide group's
+/// compressed_append_sm121 and the second shape's compressed_append_256_sm121, so it states the
+/// signature once as REF_WRITE_ENTRY.
+pub const APPEND_DECLARATION: &str = "extern \"C\" __global__ void REF_WRITE_ENTRY(const float* __restrict__ latent, unsigned char* __restrict__ codes, unsigned char* __restrict__ scales, unsigned first_row, unsigned row_count, unsigned ratio)";
 /// The selected-fill signature, whitespace-normalised for the declaration check.
 pub const SELECT_DECLARATION: &str = "extern \"C\" __global__ void compressed_selected_fill_sm121(const unsigned* __restrict__ ids, unsigned n_ids, unsigned window_rows, unsigned ratio, unsigned* __restrict__ out, unsigned* __restrict__ out_count)";
 /// Argument words of one append launch: latent, codes, scales, first_row, row_count, ratio.

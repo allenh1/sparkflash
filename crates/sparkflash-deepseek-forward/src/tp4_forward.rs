@@ -608,8 +608,8 @@ impl NativeRounding {
 pub fn embedding_location(token: u32) -> (usize, usize) {
     let token = token as usize;
     (
-        token / crate::plan::vocab_per_rank() as usize,
-        token % crate::plan::vocab_per_rank() as usize,
+        token / crate::plan::vocab_per_rank(),
+        token % crate::plan::vocab_per_rank(),
     )
 }
 
@@ -1030,15 +1030,12 @@ pub fn prefill_exchange_bytes(world: usize, prompt_len: usize) -> usize {
 #[cfg(feature = "cuda")]
 pub const TRACE_RING_BYTES: usize = 64;
 
-/// The mHC stream count of the released model (four residual copies).
-
 /// Element limit for the Engram seam's tensor reads. One wkv projection is 157.3 M elements and one
 /// whole Engram table is 98.3 G elements, so this is the single-node host chain's own limit
 /// (tp4_host.rs ELEMENT_LIMIT): the projection fits, a whole-table fallback on a source that cannot
 /// page rows is refused by name instead of materialising 98 GB.
 #[cfg(feature = "cuda")]
 pub const ENGRAM_ELEMENT_LIMIT: usize = 1 << 31;
-/// The released mHC predictor's row count: hc^2 + 2*hc.
 
 /// Little-endian f32 bytes decoded to a vector.
 ///
@@ -1447,7 +1444,7 @@ fn read_layer_seam_raw(
         .and_then(|values| values.checked_mul(4))
         .ok_or_else(|| "mHC entry: predictor byte length overflows".to_string())?;
     let attn_norm_name = crate::plan::layer_claim(layer, "attn_norm.weight");
-    let attn_norm_bytes = match planned_dtype(request.resident_plan, &attn_norm_name) {
+    let attn_norm_bytes = match planned_dtype(request.resident_plan, attn_norm_name) {
         Some("F32") => dim * 4,
         Some("BF16") => dim * 2,
         Some(other) => {
@@ -1462,17 +1459,17 @@ fn read_layer_seam_raw(
         }
     };
     let attn_fn = reader(
-        &crate::plan::layer_claim(layer, "hc_attn_fn"),
+        crate::plan::layer_claim(layer, "hc_attn_fn"),
         hc_attn_fn_bytes,
     )?;
     let attn_base = reader(
-        &crate::plan::layer_claim(layer, "hc_attn_base"),
+        crate::plan::layer_claim(layer, "hc_attn_base"),
         crate::plan::predictor_rows() * 4,
     )?;
-    let attn_scale = reader(&crate::plan::layer_claim(layer, "hc_attn_scale"), 3 * 4)?;
-    let attn_norm = reader(&attn_norm_name, attn_norm_bytes)?;
+    let attn_scale = reader(crate::plan::layer_claim(layer, "hc_attn_scale"), 3 * 4)?;
+    let attn_norm = reader(attn_norm_name, attn_norm_bytes)?;
     let ffn_norm_name = crate::plan::layer_claim(layer, "ffn_norm.weight");
-    let ffn_norm_bytes = match planned_dtype(request.resident_plan, &ffn_norm_name) {
+    let ffn_norm_bytes = match planned_dtype(request.resident_plan, ffn_norm_name) {
         Some("F32") => dim * 4,
         Some("BF16") => dim * 2,
         Some(other) => {
@@ -1492,15 +1489,15 @@ fn read_layer_seam_raw(
         .and_then(|values| values.checked_mul(4))
         .ok_or_else(|| "FFN seams: hc_ffn_fn byte length overflows".to_string())?;
     let ffn_fn = reader(
-        &crate::plan::layer_claim(layer, "hc_ffn_fn"),
+        crate::plan::layer_claim(layer, "hc_ffn_fn"),
         hc_ffn_fn_bytes,
     )?;
     let ffn_base = reader(
-        &crate::plan::layer_claim(layer, "hc_ffn_base"),
+        crate::plan::layer_claim(layer, "hc_ffn_base"),
         crate::plan::predictor_rows() * 4,
     )?;
-    let ffn_scale = reader(&crate::plan::layer_claim(layer, "hc_ffn_scale"), 3 * 4)?;
-    let ffn_norm = reader(&ffn_norm_name, ffn_norm_bytes)?;
+    let ffn_scale = reader(crate::plan::layer_claim(layer, "hc_ffn_scale"), 3 * 4)?;
+    let ffn_norm = reader(ffn_norm_name, ffn_norm_bytes)?;
     Ok((
         LayerSeamRaw {
             attn_fn,
@@ -3177,7 +3174,7 @@ fn run_layer_kv_path(
     }
 
     let norm_name = crate::plan::layer_claim(layer, "attn.kv_norm.weight");
-    let norm_bytes = read_arena_bytes(cuda, arena, &norm_name, mla_width * 2)?;
+    let norm_bytes = read_arena_bytes(cuda, arena, norm_name, mla_width * 2)?;
     let norm_weight = bf16_from_le_bytes(&norm_bytes)?;
     linalg::rms_norm(&mut kv, &norm_weight, mla_width, config.norm_eps as f32)
         .map_err(|error| format!("layer-0 kv path: kv_norm: {error}"))?;
@@ -3443,7 +3440,7 @@ impl AttentionBody {
             let sink = read_arena_bytes(
                 cuda,
                 arena,
-                &crate::plan::layer_claim(layer, "attn.attn_sink"),
+                crate::plan::layer_claim(layer, "attn.attn_sink"),
                 heads * 4,
             )?;
             body.sinks.push(sink);
@@ -3756,7 +3753,7 @@ fn run_layer_query_path(
 
     // q_norm: [q_lora_rank] BF16 resident, read from the live arena.
     let norm_name = crate::plan::layer_claim(layer, "attn.q_norm.weight");
-    let norm_bytes = read_arena_bytes(cuda, arena, &norm_name, rank_width * 2)?;
+    let norm_bytes = read_arena_bytes(cuda, arena, norm_name, rank_width * 2)?;
     let norm_weight = bf16_from_le_bytes(&norm_bytes)?;
     let mut normed = latent.clone();
     linalg::rms_norm(
@@ -3777,10 +3774,10 @@ fn run_layer_query_path(
 
     let (wq_b_cols, wq_b_inner) = bind
         .plan_index
-        .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wq_b.weight"))?;
+        .b12x_geometry(crate::plan::layer_claim(layer, "attn.wq_b.weight"))?;
     let (wq_a_cols, wq_a_inner) = bind
         .plan_index
-        .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wq_a.weight"))?;
+        .b12x_geometry(crate::plan::layer_claim(layer, "attn.wq_a.weight"))?;
     if (wq_a_cols, wq_a_inner) != (rank_width, crate::plan::hidden()) {
         return Err(format!(
             "layer-0 query path: the plan's wq_a geometry is {wq_a_cols}x{wq_a_inner}, the model config says {rank_width}x{}",
@@ -3887,7 +3884,7 @@ fn run_layer_query_path(
             position,
             "layer0-query-path",
             "wq_b",
-            &crate::plan::layer_claim(layer, "attn.wq_b.weight"),
+            crate::plan::layer_claim(layer, "attn.wq_b.weight"),
             (wq_b_cols, wq_b_inner),
             &activation_values,
             &activation_codes,
@@ -4215,7 +4212,7 @@ fn run_layer_attention_output(
     }
     let wo_a_geometry = bind
         .plan_index
-        .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
+        .b12x_geometry(crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
     if wo_a_geometry != (groups * o_lora_rank, group_inner) {
         return Err(format!(
             "layer-0 attention output: the plan's wo_a is {wo_a_geometry:?}, the per-rank launch expects {:?} (world {world}, o_groups {} -> {groups} groups/rank, heads_per_rank {heads}, head_width {}, group_inner {group_inner}, o_lora_rank {o_lora_rank})",
@@ -4227,7 +4224,7 @@ fn run_layer_attention_output(
     }
     let wo_b_geometry = bind
         .plan_index
-        .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
+        .b12x_geometry(crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
     let wo_b_inner = groups * o_lora_rank;
     if wo_b_geometry != (crate::plan::hidden(), wo_b_inner) {
         return Err(format!(
@@ -4248,10 +4245,8 @@ fn run_layer_attention_output(
         }
         Ok(*pair)
     };
-    let (wo_a_weight, wo_a_scales) =
-        pair_for(&crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
-    let (wo_b_weight, wo_b_scales) =
-        pair_for(&crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
+    let (wo_a_weight, wo_a_scales) = pair_for(crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
+    let (wo_b_weight, wo_b_scales) = pair_for(crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
     let kernel_dir = request.kernel_cubin_dir.ok_or_else(|| {
         "layer-0 attention output: the loop has no kernel cubin directory".to_string()
     })?;
@@ -4365,7 +4360,7 @@ fn run_layer_attention_output(
             position,
             "layer0-attention-output",
             "wo_b",
-            &crate::plan::layer_claim(layer, "attn.wo_b.weight"),
+            crate::plan::layer_claim(layer, "attn.wo_b.weight"),
             (crate::plan::hidden(), wo_b_inner),
             &lo_values,
             &wo_b_codes,
@@ -5080,10 +5075,10 @@ fn routed_slice_base(
     let slice_values = slice_shape[0] * slice_shape[1];
     let scale_slice = slice_shape[0] * (slice_shape[1] / 16);
     let weight_shape = plan_index
-        .shard_shape(&weight_name)
+        .shard_shape(weight_name)
         .ok_or_else(|| format!("MoE: the rank plan does not carry {weight_name}"))?;
     let scale_shape = plan_index
-        .shard_shape(&scale_name)
+        .shard_shape(scale_name)
         .ok_or_else(|| format!("MoE: the rank plan does not carry {scale_name}"))?;
     let weight_values = weight_shape.iter().product::<usize>();
     let weight = if weight_values == slice_values {
@@ -5939,7 +5934,7 @@ fn warm_engram_rows(
                 .iter()
                 .map(|&id| (id as u64 * width as u64, width))
                 .collect();
-            if let Some(result) = source.read_ranges_paged(&weight_name, &weight_ranges) {
+            if let Some(result) = source.read_ranges_paged(weight_name, &weight_ranges) {
                 result.map_err(|error| {
                     format!("forward loop: Engram warm-up {weight_name}: {error}")
                 })?;
@@ -5949,7 +5944,7 @@ fn warm_engram_rows(
                 .iter()
                 .map(|&id| (id as u64 * scale_width as u64, scale_width))
                 .collect();
-            if let Some(result) = source.read_ranges_paged(&scale_name, &scale_ranges) {
+            if let Some(result) = source.read_ranges_paged(scale_name, &scale_ranges) {
                 result.map_err(|error| {
                     format!("forward loop: Engram warm-up {scale_name}: {error}")
                 })?;
@@ -6085,10 +6080,10 @@ impl<'a> EngramWkvDevice<'a> {
         for &layer in &config.engram_layer_ids {
             let codes_name = crate::plan::layer_claim(layer, "engram.wkv.weight");
             let scales_name = crate::plan::layer_claim(layer, "engram.wkv.scale");
-            let codes = resident.resident_bytes(&codes_name).ok_or_else(|| {
+            let codes = resident.resident_bytes(codes_name).ok_or_else(|| {
                 format!("Engram device wkv: the resident overlay holds no {codes_name}")
             })?;
-            let scales = resident.resident_bytes(&scales_name).ok_or_else(|| {
+            let scales = resident.resident_bytes(scales_name).ok_or_else(|| {
                 format!("Engram device wkv: the resident overlay holds no {scales_name}")
             })?;
             if codes.len() != want_codes || scales.len() != want_scales {
@@ -6538,7 +6533,7 @@ impl<'a> SeamDevice<'a> {
             // the kernel. Widening it to f32 here would have been the wrong dtype for both sides.
             let norm_name = crate::plan::layer_claim(layer, "attn.compressor.norm.weight");
             let raw = src
-                .read(&norm_name)
+                .read(norm_name)
                 .map_err(|error| format!("ref seam compressor norm: {norm_name}: {error}"))?;
             let width = config.head_dim;
             let bytes = if raw.len() == width * 2 {
@@ -6576,7 +6571,7 @@ impl<'a> SeamDevice<'a> {
             })?;
             device.compressor_norm.insert(layer, (span, width * 2));
             if let Some(wk) = device.stage_hostw(
-                &crate::plan::layer_claim(layer, "attn.indexer.wk.weight"),
+                crate::plan::layer_claim(layer, "attn.indexer.wk.weight"),
                 config.head_dim,
                 config.index_head_dim,
                 OutStores::F32Row,
@@ -6585,7 +6580,7 @@ impl<'a> SeamDevice<'a> {
                 device.index_wk.insert(layer, wk.weight);
             }
             let k_norm_name = crate::plan::layer_claim(layer, "attn.indexer.k_norm.weight");
-            if let Ok(raw) = src.read(&k_norm_name) {
+            if let Ok(raw) = src.read(k_norm_name) {
                 let width = config.index_head_dim;
                 let bytes = if raw.len() == width * 2 {
                     raw
@@ -6621,7 +6616,7 @@ impl<'a> SeamDevice<'a> {
         }
         for &layer in &config.index_source_layers {
             if let Some(proj) = device.stage_hostw(
-                &crate::plan::layer_claim(layer, "attn.indexer.weights_proj.weight"),
+                crate::plan::layer_claim(layer, "attn.indexer.weights_proj.weight"),
                 config.dim,
                 config.index_n_heads,
                 OutStores::Bf16Row,
@@ -6670,7 +6665,7 @@ impl<'a> SeamDevice<'a> {
         let name = crate::plan::layer_claim(layer, "attn.indexer.wq_b.weight");
         let scale_name = crate::plan::layer_claim(layer, "attn.indexer.wq_b.scale");
         let spec = src
-            .spec(&name)
+            .spec(name)
             .map_err(|error| shape(format!("{name}: {error}")))?;
         let released = spec.dtype == sparkflash_engine::dtype::DType::F8E4M3
             && spec.shape.as_slice() == [self.cols, self.inner];
@@ -6679,7 +6674,7 @@ impl<'a> SeamDevice<'a> {
             return Ok(None);
         }
         let scale_spec = src
-            .spec(&scale_name)
+            .spec(scale_name)
             .map_err(|error| shape(format!("{scale_name}: {error}")))?;
         let scale_released = scale_spec.dtype == sparkflash_engine::dtype::DType::F8E8M0
             && scale_spec.elements() == (self.cols / 32 * (self.inner / 32)) as u128;
@@ -6688,7 +6683,7 @@ impl<'a> SeamDevice<'a> {
             return Ok(None);
         }
         let raw = src
-            .read(&name)
+            .read(name)
             .map_err(|error| shape(format!("{name}: {error}")))?;
         if raw.len() != self.cols * self.inner {
             return Err(shape(format!(
@@ -6700,7 +6695,7 @@ impl<'a> SeamDevice<'a> {
             )));
         }
         let scales = src
-            .read(&scale_name)
+            .read(scale_name)
             .map_err(|error| shape(format!("{scale_name}: {error}")))?;
         let expected_scales = (self.cols / 32) * (self.inner / 32);
         if scales.len() != expected_scales {
@@ -7729,7 +7724,7 @@ fn build_shared_expert_device(
     for (layer, gather) in shared.iter().enumerate() {
         let source: &dyn WeightSource = &gather.source;
         let base = crate::plan::layer_prefix(layer, "ffn.shared_experts");
-        let (s1, s3, s2) = crate::moe_device::read_shared_scale_grids(source, &base, inter, dim)
+        let (s1, s3, s2) = crate::moe_device::read_shared_scale_grids(source, base, inter, dim)
             .map_err(|error| format!("shared expert (device): layer {layer} scales: {error}"))?;
         let mut stage = |leaf: &str,
                          cols: usize,
@@ -8427,6 +8422,12 @@ fn load_pinned_addition(
     let cubin_name = format!("{kernel}.cubin");
     let (cubin, cubin_sha256) = cached_cubin(&kernel_dir.join(&cubin_name))
         .map_err(|error| format!("{context}: read {cubin_name}: {error}"))?;
+    // The baseline pins the released shape's bytes. A second-shape run compiles the same entry
+    // for another shape and stages it under the released name; the open manifest records its
+    // sha256, which is the integrity record for that run. The escape is explicit, never implied.
+    if std::env::var_os("SPARKFLASH_UNPINNED_SECOND_SHAPE").is_some() {
+        return Ok((cubin, cubin_sha256));
+    }
     let pinned = sparkflash_kernels::baseline::pin(kernel)
         .map_err(|error| format!("{context}: baseline: {error}"))?
         .ok_or_else(|| format!("{context}: the baseline does not pin {kernel}"))?;
@@ -8508,9 +8509,8 @@ fn run_layer_attention_projections(
         }
         Ok(*pair)
     };
-    let (wq_a_weight, wq_a_scales) =
-        pair_for(&crate::plan::layer_claim(layer, "attn.wq_a.weight"))?;
-    let (wkv_weight, wkv_scales) = pair_for(&crate::plan::layer_claim(layer, "attn.wkv.weight"))?;
+    let (wq_a_weight, wq_a_scales) = pair_for(crate::plan::layer_claim(layer, "attn.wq_a.weight"))?;
+    let (wkv_weight, wkv_scales) = pair_for(crate::plan::layer_claim(layer, "attn.wkv.weight"))?;
     for (name, cols, inner) in [
         (
             &crate::plan::layer_claim(layer, "attn.wq_a.weight"),
@@ -8633,7 +8633,7 @@ fn run_layer_attention_projections(
         position,
         "layer0-attention-projections",
         "wq_a",
-        &crate::plan::layer_claim(layer, "attn.wq_a.weight"),
+        crate::plan::layer_claim(layer, "attn.wq_a.weight"),
         (wq_a_cols, crate::plan::hidden()),
         normed,
         &activation_codes,
@@ -8649,7 +8649,7 @@ fn run_layer_attention_projections(
         position,
         "layer0-attention-projections",
         "wkv",
-        &crate::plan::layer_claim(layer, "attn.wkv.weight"),
+        crate::plan::layer_claim(layer, "attn.wkv.weight"),
         (wkv_cols, crate::plan::hidden()),
         normed,
         &activation_codes,
@@ -11722,7 +11722,7 @@ impl<'a> DeviceLayer<'a> {
                 crate::plan::layer_claim(layer, "attn_norm.weight"),
                 crate::plan::layer_claim(layer, "ffn_norm.weight"),
             ] {
-                match planned_dtype(plan, &name) {
+                match planned_dtype(plan, name) {
                     Some(dtype) if dtype == norm_dtype => {}
                     Some(other) => {
                         return Err(format!(
@@ -12359,7 +12359,7 @@ impl<'a> DeviceLayer<'a> {
                         out_geometry.wo_b_shape(),
                     ),
                 ] {
-                    let got = planned_b12x_geometry(plan, &name)
+                    let got = planned_b12x_geometry(plan, name)
                         .map_err(|error| format!("layer device: {error}"))?;
                     if got != want {
                         return Err(format!(
@@ -12395,7 +12395,7 @@ impl<'a> DeviceLayer<'a> {
             let sink = read_arena_bytes(
                 cuda,
                 arena,
-                &crate::plan::layer_claim(layer, "attn.attn_sink"),
+                crate::plan::layer_claim(layer, "attn.attn_sink"),
                 sink_stride,
             )?;
             sink_bytes.extend_from_slice(&sink);
@@ -15089,6 +15089,9 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             sinkhorn_iterations: self.sinkhorn_iters,
             norm_eps: self.eps,
             hc_eps: self.hc_eps,
+            dim: self.dim as u32,
+            hc_mult: self.hc_mult as u32,
+            rows: crate::plan::predictor_rows() as u32,
             trace_ring,
             layer_id,
             step_seq,
@@ -16025,8 +16028,8 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                 format!("layer device stage attention_output: the bind has no {name}")
             })
         };
-        let wo_a = lookup(&crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
-        let wo_b = lookup(&crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
+        let wo_a = lookup(crate::plan::layer_claim(layer, "attn.wo_a.weight"))?;
+        let wo_b = lookup(crate::plan::layer_claim(layer, "attn.wo_b.weight"))?;
         let layer_id = u32::try_from(layer).map_err(|_| {
             format!("layer device stage attention_output: layer {layer} does not fit u32")
         })?;
@@ -16149,6 +16152,9 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             reduced_bf16: Deviceptr(workspace.reduced_bf16.device),
             stream_out: Deviceptr(residual.stream.device),
             native_bf16: self.native_bf16,
+            dim: self.dim as u32,
+            hc_mult: self.hc_mult as u32,
+            rows: crate::plan::predictor_rows() as u32,
             trace_ring,
             layer_id,
             step_seq,
@@ -16270,6 +16276,9 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             sinkhorn_iterations: self.sinkhorn_iters,
             norm_eps: self.eps,
             hc_eps: self.hc_eps,
+            dim: self.dim as u32,
+            hc_mult: self.hc_mult as u32,
+            rows: crate::plan::predictor_rows() as u32,
             trace_ring,
             layer_id,
             step_seq,
@@ -16744,6 +16753,9 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             shared_present: u32::from(FFN_EPILOGUE_SHARED_PRESENT && !self.shared_tp_active()),
             shared_bf16: u32::from(self.native_shared),
             native_bf16: self.native_bf16,
+            dim: self.dim as u32,
+            hc_mult: self.hc_mult as u32,
+            rows: crate::plan::predictor_rows() as u32,
             trace_ring,
             layer_id,
             step_seq,

@@ -26,7 +26,9 @@
 //! are the only source of a kernel handle.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(test, feature = "test-support"))]
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub use sparkflash_engine::ModelConfig;
@@ -182,24 +184,15 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
     })
 }
 
-/// The released checkpoint's directory.
+/// The released checkpoint's directory, for the unit tests that pin the shipped values.
 ///
-/// The chain passes its checkpoint explicitly; the environment and the acceptance cache are the
-/// fallbacks the plan test already uses.
+/// The chain passes its checkpoint explicitly. A production read never looks one up: a model
+/// value with no installed plan is refused by name in [cached_values]. The path is the
+/// environment's, so no repository name or snapshot is written here.
+#[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn checkpoint_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("SPARKFLASH_CHECKPOINT") {
-        let path = PathBuf::from(path);
-        if path.join("config.json").is_file() {
-            return Some(path);
-        }
-    }
-    let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home)
-        .join(".cache/sparkflash/acceptance/hub")
-        .join("models--deepseek-ai--DeepSeek-V4.1-Flash-1017")
-        .join("snapshots")
-        .join("1bae0e1088993b9b82de08f59de5be5a34e42170");
+    let path = PathBuf::from(std::env::var_os("SPARKFLASH_CHECKPOINT")?);
     path.join("config.json").is_file().then_some(path)
 }
 
@@ -207,6 +200,7 @@ pub fn checkpoint_dir() -> Option<PathBuf> {
 ///
 /// # Errors
 /// No checkpoint on this host, an unreadable `config.json`, or a checkpoint the plan refuses.
+#[cfg(any(test, feature = "test-support"))]
 pub fn plan_from_checkpoint(world: usize, rank: usize) -> Result<EnginePlan, ConfigError> {
     let dir = checkpoint_dir()
         .ok_or_else(|| "no released DeepSeek checkpoint on this host".to_owned())?;
@@ -227,28 +221,49 @@ pub fn plan_from_path(dir: &Path, world: usize, rank: usize) -> Result<EnginePla
 ///
 /// # Errors
 /// No checkpoint on this host, or a plan whose facts do not fill the value object.
+#[cfg(any(test, feature = "test-support"))]
 pub fn released_values() -> Result<ModelConfig, ConfigError> {
-    let plan = plan_from_checkpoint(4, 0)?;
+    // The vendored released document is the plan's own input, so a unit test does not need the
+    // 510 GB checkpoint on disk to ask what the released values are.
+    let plan = EnginePlan::from_json(
+        include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"),
+        Target::Sm121,
+        4,
+        0,
+    )
+    .map_err(|error| format!("the vendored released configuration: {error}"))?;
     values_from_plan(&plan)
 }
 
-/// The installed values, or the released checkpoint's plan when none is installed.
+/// The installed values.
+///
+/// A read with no installed plan refuses by name. Only a unit test falls back to the released
+/// checkpoint's plan, because a production process opens from a checkpoint before it reads a
+/// value and a silent released default would hide a missed open.
 ///
 /// # Panics
-/// No checkpoint is installed or present on this host.
+/// No plan is installed (outside tests).
 #[must_use]
 pub fn cached_values() -> &'static ModelConfig {
     if let Some(description) = installed() {
         publish_geometry(&description.values);
         return &description.values;
     }
-    static CACHED: std::sync::OnceLock<ModelConfig> = std::sync::OnceLock::new();
-    let values = CACHED
-        .get_or_init(|| released_values().expect("the released checkpoint must plan on this host"));
-    // The released plan is the fallback the per-token accessors read; publish it like an
-    // installed description so a unit test that only asks for a geometry value sees the plan.
-    publish_geometry(values);
-    values
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        static CACHED: std::sync::OnceLock<ModelConfig> = std::sync::OnceLock::new();
+        let values = CACHED.get_or_init(|| {
+            released_values().expect("the released checkpoint must plan on this host")
+        });
+        // Publish the released plan like an installed description so a unit test that only asks
+        // for a geometry value sees the plan.
+        publish_geometry(values);
+        values
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    panic!(
+        "forward open: no plan installed, so a model value has no source; open the checkpoint's          description before reading one"
+    )
 }
 
 /// A structurally complete tiny configuration for tests that must run without a checkpoint.
@@ -714,7 +729,7 @@ pub fn handles() -> KernelHandles {
     // A unit test that exercises a refusal or a diagnostic does not open a checkpoint. The
     // released description is still the one whose symbols and catalogue positions it names, so
     // install that plan once rather than reintroducing a symbol literal for the test's sake.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         if let Ok(plan) = EnginePlan::from_json(
             include_str!(
@@ -977,9 +992,25 @@ pub fn description() -> &'static Description {
     if let Some(description) = installed() {
         return description;
     }
-    let plan = plan_from_checkpoint(4, 0)
-        .expect("forward open: no plan installed and no released checkpoint plans here");
-    install(plan).expect("forward open: the released checkpoint plan installs")
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        // The vendored released document is the plan's own input, so a dependent crate's unit
+        // test resolves the released description without the 510 GB checkpoint on disk.
+        let plan = EnginePlan::from_json(
+            include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            ),
+            Target::Sm121,
+            4,
+            0,
+        )
+        .expect("forward open: the vendored released configuration plans");
+        install(plan).expect("forward open: the released plan installs")
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    panic!(
+        "forward open: no plan installed, so no description names the tensors or kernels this          stage reads"
+    )
 }
 
 /// The layer `block` claims a tensor whose name ends with `tail`.
@@ -1123,6 +1154,7 @@ pub fn mtp_claim(stage: usize, tail: &str) -> &'static str {
 ///
 /// # Errors
 /// No checkpoint, or a plan the forward refuses.
+#[cfg(any(test, feature = "test-support"))]
 pub fn install_released(world: usize, rank: usize) -> Result<&'static Description, ConfigError> {
     install(plan_from_checkpoint(world, rank)?)
 }
@@ -1216,7 +1248,7 @@ pub fn candidate_source_layer() -> usize {
                 })
             })
         })
-        .unwrap_or_else(|| description.values.candidate_source_layer)
+        .unwrap_or(description.values.candidate_source_layer)
 }
 
 /// The tap layers the draft stage reads, read from the draft block's part fact.

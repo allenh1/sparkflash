@@ -34,8 +34,8 @@ use sparkflash_ops::images::Image;
 use sparkflash_ops::launchers::{DEEPSEEK_INDEXER_MAX_POSITION, SparseIndexerLauncher};
 use sparkflash_ops::parity::{LayerPlan, ParityReport, Tolerance};
 use sparkflash_ops::plan::{
-    DType, GroupedFp8Body, KernelId, KernelPhase, Layout, Matrix, OpKind, OpPlan, PartGeometry,
-    Precision, StreamId,
+    DType, GroupedFp8Body, KernelId, KernelPhase, Layout, Matrix, ModelFamily, OpKind, OpPlan,
+    PartGeometry, Precision, StreamId,
 };
 use sparkflash_ops::resolver::PlanContext;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
@@ -510,7 +510,8 @@ fn a_deepseek_moe_gemm_at_tp1_is_refused_by_its_intermediate_width() {
     requirement.geometry.top_k = 6;
     let error = GroupedMoeGemmPlan::new(CTX, &requirement, 8, StreamId(0))
         .expect_err("the b12x kernel is compiled at 576");
-    assert!(error.to_string().contains("does not equal 576"), "{error}");
+    assert!(error.to_string().contains("intermediate 2304"), "{error}");
+    assert!(error.to_string().contains("576"), "{error}");
 }
 
 #[test]
@@ -766,7 +767,8 @@ fn norm_rope_activation_and_quantize_resolve_their_own_parts() {
         expected(Target::Sm121, Image::Qwen4Prefill, "q4p_moe_swiglu_fp8")
     );
 
-    let glm_mlp = synthetic(Part::Activation, 4096, 3072, 1, Precision::Bf16);
+    let mut glm_mlp = synthetic(Part::Activation, 4096, 3072, 1, Precision::Bf16);
+    glm_mlp.geometry.model = Some(ModelFamily::Glm);
     let activation =
         ActivationPlan::new(CTX, &glm_mlp, ActivationKind::SwiGlu, 1, 3072, StreamId(0))
             .expect("GLM SwiGLU");
@@ -894,6 +896,7 @@ fn the_combine_is_reachable_for_every_arm_shape() {
 
     let glm = synthetic(Part::MoeCombine, 4096, 0, 8, Precision::Bf16);
     let mut glm = glm;
+    glm.geometry.model = Some(ModelFamily::Glm);
     glm.geometry.top_k = 8;
     let combine =
         ExpertCombinePlan::new(CTX, &glm, 8, DType::F32, StreamId(0)).expect("GLM combine");

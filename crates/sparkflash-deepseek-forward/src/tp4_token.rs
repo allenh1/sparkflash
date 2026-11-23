@@ -207,6 +207,19 @@ pub struct Head {
     pub tie_break: String,
 }
 
+impl Head {
+    /// The head record for a run that refused before a plan was installed. It has no vocabulary
+    /// to name; the refusal text carries the reason.
+    #[must_use]
+    pub fn unopened() -> Self {
+        Self {
+            rule: "rank-sharded head rows all-gathered over tcp; every rank argmaxes the full vector; rank0 dumps full logits".to_string(),
+            vocab: 0,
+            tie_break: "lowest token id".to_string(),
+        }
+    }
+}
+
 impl Default for Head {
     fn default() -> Self {
         Self {
@@ -305,7 +318,8 @@ impl TokenEnvelope {
             step_ms: StepMs::default(),
             wall_ms: Vec::new(),
             reduce_calls_per_step: 0,
-            head: Head::default(),
+            // A refusal can happen before the plan installs; it must not read a model value.
+            head: Head::unopened(),
             logits_dump: None,
             error: Some(error),
             launch_census: Self::refusal_census(
@@ -397,12 +411,24 @@ impl TokenEnvelope {
                 self.rank, self.world
             ));
         }
-        if self.head.vocab != vocab() {
-            return Err(format!("head vocab {} is not {}", self.head.vocab, vocab()));
-        }
         match self.forward {
-            ForwardState::Run => self.validate_run(),
-            ForwardState::Refused => self.validate_refusal(),
+            ForwardState::Run => {
+                if self.head.vocab != vocab() {
+                    return Err(format!("head vocab {} is not {}", self.head.vocab, vocab()));
+                }
+                self.validate_run()
+            }
+            ForwardState::Refused => {
+                // A refusal can be written before the plan installs, so its head names no
+                // vocabulary and validating it must not read a model value.
+                if self.head.vocab != 0 {
+                    return Err(format!(
+                        "a refusal claims head vocab {}, but no head opened",
+                        self.head.vocab
+                    ));
+                }
+                self.validate_refusal()
+            }
             ForwardState::NotRun => Err(
                 "a not-run envelope is never written: the chain omits the file instead".to_string(),
             ),

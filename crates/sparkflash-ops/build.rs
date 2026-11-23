@@ -60,6 +60,12 @@ fn one(values: &BTreeSet<u64>, key: &str, field: &str) -> u64 {
     *values.iter().next().expect("one value")
 }
 
+/// One `&'static [usize]` literal for a generated rule.
+fn list(values: &BTreeSet<u64>) -> String {
+    let items: Vec<String> = values.iter().map(|value| format!("{value}usize")).collect();
+    format!("&[{}]", items.join(", "))
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={INSTANCES}");
@@ -337,20 +343,17 @@ fn generate() -> String {
         if let Some(head) = head_shapes.get(key) {
             // A head body is compiled for one (hidden, vocabulary) pair. Refuse to emit a looser
             // rule if a key ever names two pairs: the generated rule is an equality, not a bound.
-            assert_eq!(
-                head.len(),
-                1,
-                "sparkflash-ops: {key} names {} head shapes; one catalogue key is one compiled pair",
-                head.len()
-            );
-            let (hidden, vocab) = head.iter().next().expect("one head shape");
+            let hidden: BTreeSet<u64> = head.iter().map(|(hidden, _)| *hidden).collect();
+            let vocab: BTreeSet<u64> = head.iter().map(|(_, vocab)| *vocab).collect();
             let _ = writeln!(
                 generated,
                 "#[allow(dead_code)] // a generated rule exists for every catalogue key, used or not"
             );
             let _ = writeln!(
                 generated,
-                "pub(crate) const {name}: ShapeConstraint = ShapeConstraint::ANY\n    .hidden_equals({hidden})\n    .vocab_equals({vocab});"
+                "pub(crate) const {name}: ShapeConstraint = ShapeConstraint::ANY\n    .hidden_in({})\n    .vocab_in({});",
+                list(&hidden),
+                list(&vocab)
             );
             continue;
         }
@@ -386,7 +389,7 @@ fn generate() -> String {
                 let heads = one(&shapes.heads, key, "heads");
                 let hidden = one(&shapes.hidden, key, "hidden");
                 assert!(
-                    hidden % heads == 0,
+                    hidden.is_multiple_of(heads),
                     "sparkflash-ops: {key} has a {hidden}-wide tower over {heads} heads"
                 );
                 parts.push(format!(".heads_multiple({heads})"));
@@ -400,10 +403,7 @@ fn generate() -> String {
                 ));
             }
             if fields.contains(&"out_hidden") {
-                parts.push(format!(
-                    ".out_hidden_equals({})",
-                    one(&shapes.out_hidden, key, "out_hidden")
-                ));
+                parts.push(format!(".out_hidden_in({})", list(&shapes.out_hidden)));
             }
             let expression = if parts.is_empty() {
                 "ShapeConstraint::ANY".to_owned()
@@ -423,29 +423,29 @@ fn generate() -> String {
         if let Some(family) = family_of.get(key) {
             let mut parts: Vec<String> = Vec::new();
             if let Some(values) = hidden.get(key) {
-                parts.push(format!(".hidden_equals({})", one(values, key, "hidden")));
+                parts.push(format!(".hidden_in({})", list(values)));
             }
             if let Some(widths) = head_dim.get(key) {
-                parts.push(format!(
-                    ".head_dim_equals({})",
-                    one(widths, key, "head_dim")
-                ));
+                parts.push(format!(".head_dim_in({})", list(widths)));
             }
             if family == "select" {
                 if let Some(values) = index_topk.get(key) {
-                    parts.push(format!(".top_k_equals({})", one(values, key, "index_topk")));
+                    parts.push(format!(".top_k_in({})", list(values)));
                 }
                 if let Some(values) = index_heads.get(key) {
-                    parts.push(format!(".max_heads({})", one(values, key, "index_heads")));
+                    let max = values.iter().max().expect("one index head count");
+                    parts.push(format!(".max_heads({max})"));
                 }
             }
             if family == "csa2"
                 && let Some(values) = ratio.get(key)
             {
-                parts.push(format!(".min_ratio({})", one(values, key, "ratio")));
+                let min = values.iter().min().expect("one compression ratio");
+                parts.push(format!(".min_ratio({min})"));
             }
             if let Some(values) = positions.get(key) {
-                parts.push(format!(".positions(0, {})", one(values, key, "positions")));
+                let max = values.iter().max().expect("one position bound");
+                parts.push(format!(".positions(0, {max})"));
             }
             let expression = if parts.is_empty() {
                 "ShapeConstraint::ANY".to_owned()
@@ -462,55 +462,53 @@ fn generate() -> String {
             );
             continue;
         }
-        let unique = |values: &BTreeMap<String, BTreeSet<u64>>| -> Option<u64> {
-            let set = values.get(key)?;
-            (set.len() == 1).then(|| *set.iter().next().expect("one value"))
-        };
         let mut parts: Vec<String> = Vec::new();
         if let Some(names) = dims.get(key) {
             // The family names exactly the dimensions its sources fix, and the values the build
             // produced. A dimension the body takes at run time is named only with its bound.
             if names.contains("hidden")
-                && let Some(width) = unique(&hidden)
+                && let Some(widths) = hidden.get(key)
             {
-                parts.push(format!(".hidden_equals({width})"));
+                parts.push(format!(".hidden_in({})", list(widths)));
             }
             if let Some(multiple) = intermediate_multiple.get(key) {
                 parts.push(format!(".intermediate_multiple({multiple})"));
             } else if names.contains("intermediate")
                 && claims_intermediate.get(key).copied().unwrap_or(false)
-                && let Some(width) = unique(&intermediate)
+                && let Some(widths) = intermediate.get(key)
             {
-                parts.push(format!(".intermediate_equals({width})"));
+                parts.push(format!(".intermediate_in({})", list(widths)));
             }
             if names.contains("experts")
-                && let Some(count) = unique(&experts)
+                && let Some(counts) = experts.get(key)
             {
-                parts.push(format!(".experts_equals({count})"));
+                parts.push(format!(".experts_in({})", list(counts)));
             }
             if names.contains("top_k")
-                && let Some(count) = unique(&top_k)
+                && let Some(counts) = top_k.get(key)
             {
-                parts.push(format!(".top_k_equals({count})"));
+                parts.push(format!(".top_k_in({})", list(counts)));
             }
             if let Some(maximum) = max_top_k.get(key) {
                 parts.push(format!(".max_top_k({maximum})"));
             }
         } else {
             if claims_hidden.get(key).copied().unwrap_or(true)
-                && let Some(width) = unique(&hidden)
+                && let Some(widths) = hidden.get(key)
             {
-                parts.push(format!(".hidden_equals({width})"));
+                parts.push(format!(".hidden_in({})", list(widths)));
             }
             if let Some(multiple) = intermediate_multiple.get(key) {
                 parts.push(format!(".intermediate_multiple({multiple})"));
             } else if claims_intermediate.get(key).copied().unwrap_or(false)
-                && let Some(width) = unique(&intermediate)
+                && let Some(widths) = intermediate.get(key)
             {
-                parts.push(format!(".intermediate_equals({width})"));
+                parts.push(format!(".intermediate_in({})", list(widths)));
             }
-            if let Some(count) = unique(&streams) {
-                parts.push(format!(".streams_between({count}, {count})"));
+            if let Some(counts) = streams.get(key) {
+                let min = counts.iter().min().expect("one stream count");
+                let max = counts.iter().max().expect("one stream count");
+                parts.push(format!(".streams_between({min}, {max})"));
             }
             if let Some(triples) = shapes.get(key)
                 && !triples.is_empty()

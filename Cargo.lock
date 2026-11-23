@@ -2425,6 +2425,7 @@ dependencies = [
  "sparkflash-kernels",
  "sparkflash-kv",
  "sparkflash-model",
+ "sparkflash-model-deepseek-v41",
  "sparkflash-ops",
  "sparkflash-runtime",
  "sparkflash-vision",

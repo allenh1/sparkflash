@@ -18,16 +18,23 @@
 # group, send the served checks (scripts/served-gate.py), and stop every rank by its PID.
 #
 #   scripts/one-host-group.sh <arm> [world] --model ID --checkpoint DIR [--converted DIR]
-#                             [--long FILE] [--port PORT] [--apply]
+#                             [--tokenizer FILE] [--cubins DIR] [--long FILE] [--check CMD]
+#                             [--port PORT] [--apply]
 #
 # <arm> names the group the ranks form, which is the serve flag set they take:
-#   dense, glm, qwen   --tp4-rank: a tensor-parallel group, partials summed on the host seam
-#                      (SPARK_COMM_REDUCE=tcp), since one GPU has no NCCL peer of its own
+#   dense, glm, qwen, deepseek
+#                      --tp4-rank: a tensor-parallel group, partials summed on the host seam
+#                      (SPARK_COMM_REDUCE=tcp), since one GPU has no NCCL peer of its own.
+#                      DeepSeek also takes --cubins DIR (its device kernels) and --tokenizer
 #   inkling            --rank: the device arm's group, over --converted rank files
 #   dory               --recurrence-rank: the latent-recurrence ring (NCCL, --recurrence-net any)
 # world is 2 or 4 (default 2). Dory's ring takes world == its loop count and needs an NCCL
 # library the serve binary can load; NCCL also refuses two ranks on one GPU, so a one-GPU host
 # cannot form the ring and Dory's group is owed to scripts/owed-cluster-window.sh.
+#
+# --check CMD runs CMD once the group is ready, in place of the served checks, while the ranks are
+# still alive (the caller's comparison, for a checkpoint the served gate cannot speak). Its exit
+# status is the group's.
 #
 # The default is a dry run: the script prints the commands and touches nothing. --apply runs them.
 # It refuses to start when the host's available memory is below the ranks' weights plus a
@@ -47,12 +54,15 @@ if [ $# -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
   WORLD="$1"
   shift
 fi
-MODEL="" CHECKPOINT="" CONVERTED="" LONG="" PORT=8126 APPLY=0
+MODEL="" CHECKPOINT="" CONVERTED="" TOKENIZER="" CUBINS="" LONG="" CHECK_CMD="" PORT=8126 APPLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) MODEL="$2"; shift 2 ;;
     --checkpoint) CHECKPOINT="$2"; shift 2 ;;
     --converted) CONVERTED="$2"; shift 2 ;;
+    --tokenizer) TOKENIZER="$2"; shift 2 ;;
+    --cubins) CUBINS="$2"; shift 2 ;;
+    --check) CHECK_CMD="$2"; shift 2 ;;
     --long) LONG="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --apply) APPLY=1; shift ;;
@@ -73,9 +83,13 @@ PEERS="${PEERS%,}"
 # Each rank's group flags, and the weights one rank holds as a share of the checkpoint's.
 ENVIRONMENT=()
 case "$ARM" in
-  dense|glm|qwen)
+  dense|glm|qwen|deepseek)
     ENVIRONMENT=(SPARK_COMM_REDUCE=tcp)
-    group() { echo "--tp4-rank $1 --tp4-world-size $WORLD --tp4-peers $PEERS --tp4-base-port 29610 --tp4-control-port 29620"; }
+    [ -n "$CUBINS" ] && ENVIRONMENT+=(SPARKFLASH_CUBINS="$CUBINS")
+    group() {
+      echo "--tp4-rank $1 --tp4-world-size $WORLD --tp4-peers $PEERS --tp4-base-port 29610 --tp4-control-port 29620"
+      [ -n "$CUBINS" ] && echo --tp4-device "$CUBINS"
+    }
     SHARE="$WORLD" ;;
   inkling)
     [ -n "$CONVERTED" ] || { echo "one-host-group: inkling's group reads --converted DIR (its rank files)" >&2; exit 2; }
@@ -86,19 +100,22 @@ case "$ARM" in
     group() { echo "--recurrence-rank $1 --recurrence-peers $PEERS --recurrence-port 29801 --recurrence-net any"; }
     # Every rank of the ring holds the loop's weights; the loops, not the weights, are divided.
     SHARE=1 ;;
-  *) echo "one-host-group: no group for arm $ARM (dense, glm, qwen, inkling, dory)" >&2; exit 2 ;;
+  *) echo "one-host-group: no group for arm $ARM (dense, glm, qwen, deepseek, inkling, dory)" >&2; exit 2 ;;
 esac
 
-# The memory refusal: the ranks' weights, plus 6 GiB a rank for its caches, context and runtime.
+# The memory refusal: the ranks' weights, plus ONE_HOST_MEMORY_GIB a rank for its caches, context
+# and runtime (default 6). A caller that has measured a smaller working set sets it, or sets
+# ONE_HOST_SKIP_MEMORY=1 for a fixture whose tensors stay streamed.
+ALLOWANCE_GIB="${ONE_HOST_MEMORY_GIB:-6}"
 WEIGHTS_DIR="${CONVERTED:-$CHECKPOINT}"
 weight_bytes=$( (find -L "$WEIGHTS_DIR" -maxdepth 1 \( -name '*.safetensors' -o -name '*.bin' \) -exec du -kL {} + 2>/dev/null || true) | awk '{s += $1} END {print s * 1024}')
-need=$(( weight_bytes / SHARE * WORLD + WORLD * 6 * 1024 * 1024 * 1024 ))
+need=$(( weight_bytes / SHARE * WORLD + WORLD * ALLOWANCE_GIB * 1024 * 1024 * 1024 ))
 available=$( (awk '/^MemAvailable:/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || true) | awk '{print $1 + 0} END {if (NR == 0) print 0}')
 echo "one-host-group: $ARM at $WORLD ranks needs $((need >> 30)) GiB; $((available >> 30)) GiB available"
 
 serve_command() {
   local rank=$1
-  echo "${ENVIRONMENT[*]:-} $BIN serve --model $MODEL --checkpoint $CHECKPOINT --bind 127.0.0.1:$((PORT + rank * 10)) $(group "$rank")"
+  echo "${ENVIRONMENT[*]:-} $BIN serve --model $MODEL --checkpoint $CHECKPOINT${TOKENIZER:+ --tokenizer $TOKENIZER} --bind 127.0.0.1:$((PORT + rank * 10)) $(group "$rank")"
 }
 GATE=(python3 "$ROOT/scripts/served-gate.py")
 if [ -n "$LONG" ]; then
@@ -118,7 +135,7 @@ if [ "$APPLY" -eq 0 ]; then
 fi
 
 [ -x "$BIN" ] || { echo "one-host-group: no binary at $BIN; build sparkflash-cli or set SPARKFLASH_BIN" >&2; exit 2; }
-if [ "$available" -lt "$need" ]; then
+if [ "${ONE_HOST_SKIP_MEMORY:-0}" != "1" ] && [ "$available" -lt "$need" ]; then
   echo "one-host-group: refusing: $((need >> 30)) GiB needed, $((available >> 30)) GiB available" >&2
   exit 3
 fi
@@ -158,11 +175,19 @@ for _ in $(seq 1 450); do
 done
 [ "$ready" -eq 1 ] || { echo "one-host-group: rank 0 never listened; logs in $LOGS" >&2; exit 1; }
 status=0
-for check in "${CHECKS[@]}"; do
-  # shellcheck disable=SC2086
-  "${GATE[@]}" $check > "$LOGS/check.log" 2>&1 || status=1
+if [ -n "$CHECK_CMD" ]; then
+  # The caller's check runs while the group is up; the trap stops every rank afterwards.
+  bash -c "$CHECK_CMD" > "$LOGS/check.log" 2>&1 || status=1
   cat "$LOGS/check.log" >> "$LOGS/gate.log"
-  grep -E "VERDICT|FAIL" "$LOGS/check.log" || true
-done
-echo "one-host-group: $ARM at $WORLD ranks: served checks $([ $status -eq 0 ] && echo PASS || echo FAIL); logs in $LOGS"
+  grep -E "VERDICT|FAIL|PASS" "$LOGS/check.log" || true
+  echo "one-host-group: $ARM at $WORLD ranks: external check $([ $status -eq 0 ] && echo PASS || echo FAIL); logs in $LOGS"
+else
+  for check in "${CHECKS[@]}"; do
+    # shellcheck disable=SC2086
+    "${GATE[@]}" $check > "$LOGS/check.log" 2>&1 || status=1
+    cat "$LOGS/check.log" >> "$LOGS/gate.log"
+    grep -E "VERDICT|FAIL" "$LOGS/check.log" || true
+  done
+  echo "one-host-group: $ARM at $WORLD ranks: served checks $([ $status -eq 0 ] && echo PASS || echo FAIL); logs in $LOGS"
+fi
 exit $status

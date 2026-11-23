@@ -108,6 +108,7 @@ intermediate = 576
 padded = 640
 experts = 384
 top_k = 6
+plan_rows = 384
 
 [[instance]]
 source = "opt_moe_sm121.cu"
@@ -120,6 +121,7 @@ intermediate = 576
 padded = 640
 experts = 384
 top_k = 6
+plan_rows = 384
 
 [[instance]]
 source = "opt_moe_sm121.cu"
@@ -132,6 +134,7 @@ intermediate = 576
 padded = 640
 experts = 384
 top_k = 6
+plan_rows = 384
 
 [[instance]]
 source = "opt_moe_sm121.cu"
@@ -144,6 +147,7 @@ intermediate = 576
 padded = 640
 experts = 384
 top_k = 6
+plan_rows = 384
 
 [[instance]]
 source = "opt_moe_sm121.cu"
@@ -156,6 +160,7 @@ intermediate = 576
 padded = 640
 experts = 384
 top_k = 6
+plan_rows = 384
 
 [[instance]]
 source = "opt_moe_sm121.cu"
@@ -168,6 +173,7 @@ intermediate = 576
 padded = 640
 experts = 384
 top_k = 6
+plan_rows = 384
 
 [[instance]]
 source = "opt_moe_sm121.cu"
@@ -181,6 +187,7 @@ intermediate = 576
 padded = 640
 experts = 128
 top_k = 3
+plan_rows = 384
 
 [[instance]]
 source = "opt_moe_sm121.cu"
@@ -194,6 +201,7 @@ intermediate = 576
 padded = 640
 experts = 128
 top_k = 3
+plan_rows = 384
 
 [[instance]]
 source = "opt_moe_sm121.cu"
@@ -207,6 +215,7 @@ intermediate = 576
 padded = 640
 experts = 128
 top_k = 3
+plan_rows = 384
 
 [[instance]]
 source = "opt_moe_sm121.cu"
@@ -220,6 +229,7 @@ intermediate = 576
 padded = 640
 experts = 128
 top_k = 3
+plan_rows = 384
 
 # --- The layer seams -------------------------------------------------------------------------
 # The mHC seam bodies are compiled for the hidden width and the residual-stream count; the
@@ -895,6 +905,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 [[instance]]
 source = "opt_select_sm121.cu"
@@ -907,6 +918,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 [[instance]]
 source = "opt_select_sm121.cu"
@@ -919,6 +931,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 [[instance]]
 source = "opt_select_sm121.cu"
@@ -931,6 +944,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 [[instance]]
 source = "opt_select_sm121.cu"
@@ -943,6 +957,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 [[instance]]
 source = "opt_select_sm121.cu"
@@ -955,6 +970,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 [[instance]]
 source = "opt_select_sm121.cu"
@@ -967,6 +983,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 [[instance]]
 source = "opt_select_sm121.cu"
@@ -979,6 +996,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 [[instance]]
 source = "opt_select_sm121.cu"
@@ -991,6 +1009,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 [[instance]]
 source = "opt_select_sm121.cu"
@@ -1003,6 +1022,7 @@ index_heads = 32
 index_head_dim = 128
 index_topk = 512
 positions = 2097152
+score_blocks = 384
 
 
 # --- The second-shape build proof -------------------------------------------------------------
@@ -2470,3 +2490,2310 @@ hsi_blocks = 1024
 hsi_block_tokens = 8
 ring_capacity = 70
 positions = 1048576
+
+# --- The second shape (the proof checkpoint) ---------------------------------------------------
+# These rows compile the same entry symbols for a model whose width, heads, experts, top-k,
+# layers, compress ratios, Engram layers and drafter taps all differ from the released one.
+# They are a separate build per cubin (the suffix `_s2`); the run stages their cubins under
+# the released file names, so the forward loads them through the same handles. Entries are
+# unique per cubin, not globally, because a second shape exports the same symbols.
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_sm121"
+cubin = "opt_router_sm121_s2"
+family = "router"
+catalogue = "deepseek-router"
+hidden = 4096
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_e128k3_sm121"
+cubin = "opt_router_sm121_s2"
+family = "router"
+catalogue = "deepseek-router"
+hidden = 4096
+experts = 32
+top_k = 2
+
+[[instance]]
+source = "moe_router_sm121.cu"
+entry = "moe_router_sm121"
+cubin = "moe_router_sm121_s2"
+family = "router"
+catalogue = "deepseek-router"
+hidden = 4096
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_gate_up_sm121.cu"
+entry = "routed_gate_up_sm121"
+cubin = "routed_gate_up_sm121_s2"
+family = "routed"
+catalogue = "deepseek-moe"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_combine_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_dedup_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_dedup_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_combine_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_plan_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_k3_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_combine_k3_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_dedup_k3_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_combine_k3_sm121"
+cubin = "opt_moe_sm121_s2"
+family = "routed"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 128
+padded = 128
+
+[[instance]]
+source = "opt_seams_sm121.cu"
+entry = "opt_mhc_seam"
+cubin = "opt_seams_sm121_s2"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 4096
+hc = 2
+
+[[instance]]
+source = "opt_seams_sm121.cu"
+entry = "opt_mhc_post"
+cubin = "opt_seams_sm121_s2"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 4096
+hc = 2
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "mhc_entry_bf16"
+cubin = "layer_seams_sm121_s2"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 4096
+hc = 2
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "mhc_ffn_seams"
+cubin = "layer_seams_sm121_s2"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 4096
+hc = 2
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "w8a8_prologue_bf16_e4m3"
+cubin = "layer_seams_sm121_s2"
+family = "seams"
+catalogue = "deepseek-quantize"
+catalogue_hidden = false
+hidden = 4096
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "w8a8_prologue_e4m3"
+cubin = "layer_seams_sm121_s2"
+family = "seams"
+catalogue = "deepseek-quantize"
+catalogue_hidden = false
+hidden = 4096
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "mhc_attn_residual"
+cubin = "layer_seams_sm121_s2"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 4096
+hc = 2
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "mhc_ffn_epilogue"
+cubin = "layer_seams_sm121_s2"
+family = "seams"
+catalogue = "deepseek-hyperconnection"
+hidden = 4096
+hc = 2
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "shared_swiglu_f32"
+cubin = "layer_seams_sm121_s2"
+family = "seams"
+hidden = 4096
+
+[[instance]]
+source = "layer_seams_sm121.cu"
+entry = "rope_rotate_rows_bf16"
+cubin = "layer_seams_sm121_s2"
+family = "seams"
+catalogue = "deepseek-rope"
+hidden = 4096
+
+[[instance]]
+source = "kv_path_sm121.cu"
+entry = "rope_rotate_bf16"
+cubin = "kv_path_sm121_s2"
+family = "seams"
+catalogue = "deepseek-rope"
+hidden = 4096
+
+[[instance]]
+source = "kv_path_sm121.cu"
+entry = "kv_norm_rope_bf16"
+cubin = "kv_path_sm121_s2"
+family = "seams"
+catalogue = "deepseek-rope"
+hidden = 4096
+
+[[instance]]
+source = "kv_path_sm121.cu"
+entry = "window_quant_fp8_bf16"
+cubin = "kv_path_sm121_s2"
+family = "seams"
+catalogue = "deepseek-quantize"
+catalogue_hidden = false
+hidden = 4096
+
+[[instance]]
+source = "kv_path_sm121.cu"
+entry = "kv_append_bf16"
+cubin = "kv_path_sm121_s2"
+family = "seams"
+hidden = 4096
+
+[[instance]]
+source = "rmsnorm_sm121.cu"
+entry = "rmsnorm_sm121"
+cubin = "rmsnorm_sm121_s2"
+family = "seams"
+catalogue = "deepseek-rows-norm"
+hidden = 4096
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_taps"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_norm_quant"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_attn"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_logits"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_head_fp8"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_head_fp8t"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_logits_fp8"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_markov"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_fold_prob"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_pick_prob"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_embed_blocks"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_markov_seqs"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_markov_seqs_mma"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_fold_seqs"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_pick_seqs"
+cubin = "opt_draft_sm121_s2"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_taps_4096h2c2t_sm121"
+cubin = "opt_draft_taps_4096h2c2t_sm121_s2"
+family = "drafter"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_sm121"
+cubin = "cert_lm_head_sm121_s2"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 8192
+ranks = 4
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_batched_sm121"
+cubin = "cert_lm_head_sm121_s2"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 8192
+ranks = 4
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_sm121"
+cubin = "lm_head_reduce_sm121_s2"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 8192
+ranks = 4
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_batched_sm121"
+cubin = "lm_head_reduce_sm121_s2"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 8192
+ranks = 4
+
+[[instance]]
+source = "flash_mla_csa2_sm121.cu"
+entry = "flash_mla_csa2_sm121"
+cubin = "flash_mla_csa2_sm121_s2"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 4096
+window = 128
+heads = 32
+head_dim = 512
+kv_lora = 512
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 1048576
+
+[[instance]]
+source = "flash_mla_csa2_seq_sm121.cu"
+entry = "flash_mla_csa2_seq_sm121"
+cubin = "flash_mla_csa2_seq_sm121_s2"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 4096
+window = 128
+heads = 32
+head_dim = 512
+kv_lora = 512
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 1048576
+
+[[instance]]
+source = "flash_mla_csa2_seq_sm121.cu"
+entry = "flash_mla_csa2_seq_batched_sm121"
+cubin = "flash_mla_csa2_seq_sm121_s2"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 4096
+window = 128
+heads = 32
+head_dim = 512
+kv_lora = 512
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 1048576
+
+[[instance]]
+source = "flash_mla_csa2_ring_sm121.cu"
+entry = "flash_mla_csa2_ring_sm121"
+cubin = "flash_mla_csa2_ring_sm121_s2"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 4096
+window = 128
+heads = 32
+head_dim = 512
+kv_lora = 512
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 1048576
+
+[[instance]]
+source = "opt_attn_sm121.cu"
+entry = "opt_flash_mla_csa2_seq"
+cubin = "opt_attn_sm121_s2"
+family = "mla"
+catalogue = "deepseek-mla"
+hidden = 4096
+window = 128
+heads = 32
+head_dim = 512
+kv_lora = 512
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 1048576
+
+[[instance]]
+source = "ref_select_sm121.cu"
+entry = "ref_select_sm121"
+cubin = "ref_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_ref_select"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_ref_select_pre"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_ref_select_fast"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_rows"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_rows_bf16"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_rows_tab"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_scores"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_scores_rows"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_scores_seg"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_select_sm121.cu"
+entry = "opt_select_scores_segs"
+cubin = "opt_select_sm121_s2"
+family = "select"
+catalogue = "deepseek-indexer"
+score_blocks = 384
+hidden = 4096
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+positions = 1048576
+
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_4096e256k8_sm121"
+cubin = "opt_router_4096e256k8_sm121_s2"
+family = "router"
+hidden = 4096
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "opt_seams_sm121.cu"
+entry = "opt_mhc_seam_4096h2_sm121"
+cubin = "opt_mhc_seam_4096h2_sm121_s2"
+family = "seams"
+hidden = 4096
+hc = 2
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_seam"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_partials_rb1"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_partials_rb2"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_partials_rb4"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_tail"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_mhc_partials"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_mhc_post_partials"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_mhc_tail"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_seam_derive"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_post"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_kv"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn_scores"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn_softmax"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn_values"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_inv_rope"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_lm_head"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_argmax_fold"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_argmax_pick"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_build"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_rows"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_mma"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_exact"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_topc"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_prefetch_l2"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hc_pre_collapse"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_store_u32"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_embed_own"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_embed_stream"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_embed_table"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_engram_wkv"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_engram_wkv_s"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_rank_permute"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_prologue_bf16"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_shared_swiglu"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-activation"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_bf16w"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_bf16w_f32o"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_f32w_f32o"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_bf16w_f32o_ring"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_f32w_f32o_ring"
+cubin = "opt_rows_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_f32o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_rows_bf16o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_rowscale_f32o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_f32a_bf16o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_bf16a_fp8row_f32o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_head_fp8t_f32o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16w"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16w_f32o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_f32w_f32o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16a_bf16w"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16a_bf16w_f32o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16a_f32w_f32o"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_router_dots"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_router_topk"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_gate_up"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_down"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_combine"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-combine"
+catalogue_dims = ["hidden"]
+max_top_k = 64
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_bulk_fp4_pack"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_index_scores"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_bulk_attn"
+cubin = "opt_mma_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_f32o_t1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t2"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t2"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t2"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t2"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t4"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t4"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t4"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t4"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t8"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t8"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_f32o_t8"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t8"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t8"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_fp8a_bf16o_r8c2"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_fp8a_bf16o_r8c1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_fp8a_bf16o_r4c1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_bf16a_bf16o_r8c2"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_bf16a_bf16o_r8c1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_f32a_f32o_r4c2"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_f32a_f32o_r4c1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_mma_fp8a_bf16o_m1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_mma_bf16a_bf16o_m1"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_mma_bf16a_bf16o_m2"
+cubin = "opt_gemv_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rope_heads_bf16"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rmsnorm_bf16"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-norm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_lm_head"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_engram_wkv"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_kv_norm_rope"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_engram_gate_write"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_sum_ranks_bf16"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_pool_rows"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_k_norm_rows"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-norm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_bulk_engram_embed"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_bulk_engram_post"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_engram_post"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_group_pool"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_group_keys"
+cubin = "opt_misc_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "compressed_append_sm121.cu"
+entry = "compressed_append_sm121"
+cubin = "compressed_append_sm121_s2"
+family = "csa2"
+catalogue = "deepseek-csa2"
+hidden = 4096
+head_dim = 512
+ratio = 2
+positions = 1048576
+
+[[instance]]
+source = "compressed_append_sm121.cu"
+entry = "compressed_selected_fill_sm121"
+cubin = "compressed_append_sm121_s2"
+family = "csa2"
+catalogue = "deepseek-csa2"
+hidden = 4096
+head_dim = 512
+ratio = 2
+positions = 1048576
+
+[[instance]]
+source = "pool_group_sm121.cu"
+entry = "pool_group_f32"
+cubin = "pool_group_sm121_s2"
+family = "csa2"
+catalogue = "deepseek-csa2"
+hidden = 4096
+head_dim = 512
+ratio = 2
+positions = 1048576
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_group_append"
+cubin = "opt_misc_sm121_s2"
+family = "csa2"
+catalogue = "deepseek-csa2"
+hidden = 4096
+head_dim = 512
+ratio = 2
+positions = 1048576
+
+[[instance]]
+source = "compressed_append_sm121.cu"
+entry = "compressed_append_256_sm121"
+cubin = "compressed_append_256_sm121_s2"
+family = "csa2"
+hidden = 4096
+head_dim = 512
+ratio = 2
+positions = 1048576
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_warp_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_tile_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_par_k_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_split_k_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_split_k_combine_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_dense_m1_sm121.cu"
+entry = "b12x_mxfp8_dense_m1_sm121"
+cubin = "b12x_mxfp8_dense_m1_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_nf_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_nf_f32a_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_f32a_f32o_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_bf16w_sm121"
+cubin = "b12x_hostw_gemv_m1_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_bf16w_f32o_sm121"
+cubin = "b12x_hostw_gemv_m1_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_f32w_f32o_sm121"
+cubin = "b12x_hostw_gemv_m1_sm121_s2"
+family = "rows"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_bf16w_4096_sm121"
+cubin = "b12x_hostw_gemv_m1_4096_sm121_s2"
+family = "rows"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 128
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_4096v16384_sm121"
+cubin = "cert_lm_head_4096v16384_sm121_s2"
+family = "head"
+hidden = 4096
+vocab_per_rank = 8192
+ranks = 4
+
+[[instance]]
+source = "flash_mla_csa2_ring_sm121.cu"
+entry = "flash_mla_csa2_ring_32h256k_sm121"
+cubin = "flash_mla_csa2_ring_32h256k_sm121_s2"
+family = "mla"
+hidden = 4096
+window = 128
+heads = 32
+head_dim = 512
+kv_lora = 512
+index_heads = 32
+index_head_dim = 128
+index_topk = 512
+hsi_blocks = 2048
+hsi_block_tokens = 8
+ring_capacity = 134
+positions = 1048576
+
+# The vision tower at the second shape: only the merger copies out_hidden, and out_hidden is
+# the language width (4096 here) while the tower itself keeps the released 1024-wide geometry.
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_patchify"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+catalogue = "deepseek-vision-patch-embed"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_patchify_16"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+catalogue = "deepseek-vision-patch-embed"
+hidden = 1024
+heads = 16
+patch = 16
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_gemm"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_rmsnorm"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+catalogue = "deepseek-vision-norm"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_rope"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+catalogue = "deepseek-vision-position"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_attn"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+catalogue = "deepseek-vision-attention"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_swiglu"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+catalogue = "deepseek-vision-mlp"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_unfold"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+catalogue = "deepseek-vision-downsample"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_span_rows"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+catalogue = "deepseek-vision-merger"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_route"
+cubin = "opt_vision_sm121_s2"
+family = "vision"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_span_rows_4096_sm121"
+cubin = "opt_vision_span_rows_4096_sm121_s2"
+family = "vision"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6

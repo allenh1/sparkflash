@@ -95,6 +95,27 @@ Every step is checked the same way, so the harness comes first.
 DeepSeek's real proofs need the four-node group with DeepSeek loaded. Batch them: one baseline,
 then one comparison for each change that alters what is bound, loaded or launched.
 
+**Result (2026-11-23).** The fixture beside the test is
+`crates/sparkflash-deepseek-forward/tests/fixtures/second-shape/config.json`: 8 layers, 4,096
+wide, 32 heads, 64 routed experts at top-4, compression ratios `[0,0,2,2,2,2,1,1]`, Engram
+layers `[1,5]` and drafter taps `[3,7]` (two stages, top-2). Its tensors are written by
+`sparkflash-model-deepseek-v41`'s own writer (`write-synthetic-checkpoint`, the released
+formats) and its kernels by the second-shape rows in `kernels/instances.toml` (the same entry
+symbols in a separate cubin, so the forward's handles keep their names). `scripts/second-shape.py
+run` writes the checkpoint, runs the f32 host reference on three token-id prompts at temperature
+0, starts the four ranks through `scripts/one-host-group.sh deepseek 4 ... --check ...` and
+compares the greedy ids. All three prompts agree. The same plan opens at four ranks in
+`crates/sparkflash-ops/tests/second_shape.rs` and the forward binds only tensors the writer
+names in `crates/sparkflash-deepseek-forward/tests/second_shape.rs`.
+
+The four-rank arm is the host arm here because the proof host has one GPU and the device arm's
+per-layer collectives are NCCL enqueues, which need four devices; the device boot resolves the
+same second shape through the catalogue and loads the second-shape cubins under the released
+names, and `scripts/second-shape.py run --device` is the form for a four-GPU host. A second-shape
+run is not baseline-pinned (the baseline pins the released bytes); it sets
+`SPARKFLASH_UNPINNED_SECOND_SHAPE=1`, and the open manifest records every cubin it loads with its
+sha256, which is that run's integrity record.
+
 ## 4. The work
 
 ### A. Harness and inventory (first, one owner)
@@ -692,7 +713,7 @@ and `src/parts.rs` uses it for `(Part::Csa2Compression, Image::Deepseek)`. The h
 `ANY.hidden_equals(5120).min_ratio(1).positions(0, 1 << 21)` arm is gone.
 
 **The proof.** The three released cubins compiled to the baseline bytes under their instance
-defines on the GPU head (192.168.1.80, nvcc 13.0.88, CUDA 13.0, sm_121a), so neither
+defines on node0 (nvcc 13.0.88, CUDA 13.0, sm_121a), so neither
 disassembly nor launch output was needed:
 
 | released cubin | bytes | sha256 |

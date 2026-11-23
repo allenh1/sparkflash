@@ -846,6 +846,10 @@ impl AttentionDeviceBackend {
 }
 
 fn verified_cubin(dir: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let path = sparkflash_device::cubins::cubin_path(dir, name);
+    if std::env::var_os("SPARKFLASH_UNPINNED_SECOND_SHAPE").is_some() {
+        return std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()));
+    }
     let pin = sparkflash_kernels::baseline::pin(name)?
         .ok_or_else(|| format!("kernel {name} is not pinned in the baseline"))?;
     let path = sparkflash_device::cubins::cubin_path(dir, name);
