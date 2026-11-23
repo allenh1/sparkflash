@@ -496,8 +496,17 @@ extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_router_dots(
                                                  inner, tokens, inner, cols, 0u, 0u, 0u, 0u, 0u);
 }
 
-#define OMR_EXPERTS 384u
-#define OMR_TOPK 6u
+// The router and routed-expert shapes are instance arguments (kernels/instances.toml); the source
+// has no default for any of them.
+#if !defined(SPARK_INSTANCE_OPT_MMA_ROUTER_TOPK_EXPERTS) || \
+    !defined(SPARK_INSTANCE_OPT_MMA_ROUTER_TOPK_TOP_K)
+#error "opt_mma_sm121.cu: the router top-k instance macros are arguments; add the instance to kernels/instances.toml"
+#endif
+#define OMR_EXPERTS SPARK_INSTANCE_OPT_MMA_ROUTER_TOPK_EXPERTS
+#define OMR_TOPK SPARK_INSTANCE_OPT_MMA_ROUTER_TOPK_TOP_K
+static_assert(OMR_EXPERTS % 32u == 0u, "the experts are whole warps");
+static_assert(OMR_TOPK > 0u && OMR_TOPK <= OMR_EXPERTS, "top-k fits the expert count");
+#if defined(SPARK_INSTANCE_OPT_MMA_ROUTER_TOPK_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_mma_router_topk(
     const float *__restrict__ dots, const float *__restrict__ bias, uint32_t *__restrict__ ids,
     float *__restrict__ weights, const uint32_t tokens) {
@@ -551,6 +560,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_router_topk(
         }
     }
 }
+#endif
 
 // ---- Routed experts: grouped W4A8 GEMMs over a chunk's routed rows.
 //
@@ -577,9 +587,18 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_router_topk(
 #include "m4_common_sm121.cuh"
 #include "m4_activation_quant_sm121.cuh"
 
-#define OMM_HIDDEN 5120u
-#define OMM_INTER 576u
-#define OMM_TOPK 6u
+// The routed-expert shapes are instance arguments (kernels/instances.toml); no default.
+#if !defined(SPARK_INSTANCE_OPT_MMA_MOE_GATE_UP_HIDDEN) || \
+    !defined(SPARK_INSTANCE_OPT_MMA_MOE_GATE_UP_INTERMEDIATE) || \
+    !defined(SPARK_INSTANCE_OPT_MMA_MOE_GATE_UP_TOP_K)
+#error "opt_mma_sm121.cu: the routed-expert instance macros are arguments; add the instance to kernels/instances.toml"
+#endif
+#define OMM_HIDDEN SPARK_INSTANCE_OPT_MMA_MOE_GATE_UP_HIDDEN
+#define OMM_INTER SPARK_INSTANCE_OPT_MMA_MOE_GATE_UP_INTERMEDIATE
+#define OMM_TOPK SPARK_INSTANCE_OPT_MMA_MOE_GATE_UP_TOP_K
+static_assert(OMM_HIDDEN % 32u == 0u, "the hidden width is whole MX blocks");
+static_assert(OMM_INTER % 32u == 0u, "the intermediate width is whole MX blocks");
+static_assert(OMM_TOPK > 0u, "at least one routed slot");
 #define OMM_ROWS 64u
 #define OMM_GU_COLS 64u
 #define OMM_D_COLS 128u
@@ -615,6 +634,7 @@ __device__ __forceinline__ uint32_t omm_w_off(uint32_t col, uint32_t block) {
 }
 
 
+#if defined(SPARK_INSTANCE_OPT_MMA_MOE_GATE_UP_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_moe_gate_up(
     const uint64_t *__restrict__ gate_table, const uint64_t *__restrict__ up_table,
     const uint32_t *__restrict__ sorted, const uint32_t *__restrict__ items,
@@ -763,7 +783,9 @@ extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_moe_gate_up(
         out_codes[(uint64_t)routed * OMM_INTER + c0 + blk * 32u + lane] = spark_fp8_e4m3_encode(value * inv_scale);
     }
 }
+#endif
 
+#if defined(SPARK_INSTANCE_OPT_MMA_MOE_DOWN_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_moe_down(
     const uint64_t *__restrict__ down_table, const uint32_t *__restrict__ sorted,
     const uint32_t *__restrict__ items, const uint32_t *__restrict__ items_count,
@@ -896,7 +918,9 @@ extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_moe_down(
         }
     }
 }
+#endif
 
+#if defined(SPARK_INSTANCE_OPT_MMA_MOE_COMBINE_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_mma_moe_combine(
     const uint32_t *__restrict__ expert_ids, const __nv_bfloat16 *__restrict__ slot,
     float *__restrict__ delta_f32, __nv_bfloat16 *__restrict__ delta_bf16, const uint32_t tokens,
@@ -945,6 +969,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_moe_combine(
                                     *reinterpret_cast<const uint32_t *>(&p1));
     *reinterpret_cast<uint2 *>(delta_bf16 + out) = packed;
 }
+#endif
 
 // ---- The indexer over a chunk: the scores on the FP4 tensor cores.
 //

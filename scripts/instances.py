@@ -43,6 +43,10 @@ IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FAMILIES = {
     "router": ("hidden", "experts", "top_k"),
     "routed": ("hidden", "intermediate", "padded", "experts", "top_k"),
+    # The rows and bulk family: the multi-row decode twins, the bulk-prefill MMA bodies and the
+    # generic dense/GEMV projections. Every one of its sources takes the hidden width; the routed
+    # expert bodies also take the intermediate width, the expert count and the selected slots.
+    "rows": ("hidden", "intermediate", "experts", "top_k"),
 }
 ALLOWED = {
     "source",
@@ -51,8 +55,12 @@ ALLOWED = {
     "family",
     "catalogue",
     "catalogue_intermediate",
+    "catalogue_dims",
+    "intermediate_multiple",
+    "max_top_k",
     *{key for keys in FAMILIES.values() for key in keys},
 }
+CATALOGUE_DIMS = {"hidden", "intermediate", "experts", "top_k"}
 
 
 def load() -> list[dict]:
@@ -112,6 +120,36 @@ def load() -> list[dict]:
         catalogue = row.get("catalogue")
         if catalogue is not None and (not isinstance(catalogue, str) or not catalogue):
             raise SystemExit(f"{INSTANCES}: instance {number}: bad catalogue key")
+        dims = row.get("catalogue_dims")
+        if dims is not None:
+            if (
+                not isinstance(dims, list)
+                or not dims
+                or any(not isinstance(dim, str) or dim not in CATALOGUE_DIMS for dim in dims)
+                or len(set(dims)) != len(dims)
+            ):
+                raise SystemExit(
+                    f"{INSTANCES}: instance {number}: catalogue_dims is a non-empty subset of "
+                    f"{sorted(CATALOGUE_DIMS)}"
+                )
+            if catalogue is None:
+                raise SystemExit(
+                    f"{INSTANCES}: instance {number}: catalogue_dims needs a catalogue key"
+                )
+        intermediate_multiple = row.get("intermediate_multiple")
+        if intermediate_multiple is not None and (
+            not isinstance(intermediate_multiple, int)
+            or isinstance(intermediate_multiple, bool)
+            or intermediate_multiple <= 0
+        ):
+            raise SystemExit(
+                f"{INSTANCES}: instance {number}: intermediate_multiple is a positive integer"
+            )
+        max_top_k = row.get("max_top_k")
+        if max_top_k is not None and (
+            not isinstance(max_top_k, int) or isinstance(max_top_k, bool) or max_top_k <= 0
+        ):
+            raise SystemExit(f"{INSTANCES}: instance {number}: max_top_k is a positive integer")
         result.append(
             {
                 "source": f"kernels/{source}",
@@ -119,6 +157,8 @@ def load() -> list[dict]:
                 "cubin": cubin,
                 "family": family,
                 "catalogue": catalogue,
+                "catalogue_dims": dims,
+                "max_top_k": max_top_k,
                 "defines": defines,
                 "shapes": {key: row[key] for key in FAMILIES[family]},
             }

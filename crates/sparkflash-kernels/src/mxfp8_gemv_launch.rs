@@ -892,6 +892,7 @@ mod tests {
     fn constants() -> Consts {
         let mut table = Consts::parse(SOURCE);
         table.extend(m4_abi::header_source());
+        table.extend(crate::instances::B12X_MXFP8_GEMV_M1_SM121_DEFINES);
         table
     }
 

@@ -61,10 +61,54 @@
 #include "m4_activation_quant_sm121.cuh"
 #include "opt_sample_sm121.cuh"
 
+// The model shape is an instance argument (kernels/instances.toml), with no default. Every body in
+// this image that compiles a width in shares the one hidden argument; a cubin that names several
+// entries is one shape, and the static asserts below keep a mixed list from compiling.
+#if !defined(SPARK_INSTANCE_OPT_ROWS_MHC_SEAM_HIDDEN) &&     !defined(SPARK_INSTANCE_OPT_ROWS_LM_HEAD_HIDDEN) &&     !defined(SPARK_INSTANCE_OPT_HEAD_SCREEN_BUILD_HIDDEN) &&     !defined(SPARK_INSTANCE_OPT_ROWS_SHARED_SWIGLU_HIDDEN) &&     !defined(SPARK_INSTANCE_OPT_ROWS_EMBED_OWN_HIDDEN) &&     !defined(SPARK_INSTANCE_OPT_ROWS_HOSTW_BF16W_HIDDEN) &&     !defined(SPARK_INSTANCE_OPT_ROWS_MHC_PARTIALS_RB1_HIDDEN) &&     !defined(SPARK_INSTANCE_OPT_HEAD_SCREEN_EXACT_HIDDEN)
+#error "opt_rows_sm121.cu: no instance macros; every shape is an argument from kernels/instances.toml"
+#endif
+#if defined(SPARK_INSTANCE_OPT_ROWS_MHC_SEAM_HIDDEN)
+#define OR_ROWS_HIDDEN SPARK_INSTANCE_OPT_ROWS_MHC_SEAM_HIDDEN
+#elif defined(SPARK_INSTANCE_OPT_ROWS_LM_HEAD_HIDDEN)
+#define OR_ROWS_HIDDEN SPARK_INSTANCE_OPT_ROWS_LM_HEAD_HIDDEN
+#elif defined(SPARK_INSTANCE_OPT_HEAD_SCREEN_BUILD_HIDDEN)
+#define OR_ROWS_HIDDEN SPARK_INSTANCE_OPT_HEAD_SCREEN_BUILD_HIDDEN
+#elif defined(SPARK_INSTANCE_OPT_ROWS_SHARED_SWIGLU_HIDDEN)
+#define OR_ROWS_HIDDEN SPARK_INSTANCE_OPT_ROWS_SHARED_SWIGLU_HIDDEN
+#elif defined(SPARK_INSTANCE_OPT_ROWS_EMBED_OWN_HIDDEN)
+#define OR_ROWS_HIDDEN SPARK_INSTANCE_OPT_ROWS_EMBED_OWN_HIDDEN
+#elif defined(SPARK_INSTANCE_OPT_ROWS_HOSTW_BF16W_HIDDEN)
+#define OR_ROWS_HIDDEN SPARK_INSTANCE_OPT_ROWS_HOSTW_BF16W_HIDDEN
+#elif defined(SPARK_INSTANCE_OPT_ROWS_MHC_PARTIALS_RB1_HIDDEN)
+#define OR_ROWS_HIDDEN SPARK_INSTANCE_OPT_ROWS_MHC_PARTIALS_RB1_HIDDEN
+#else
+#define OR_ROWS_HIDDEN SPARK_INSTANCE_OPT_HEAD_SCREEN_EXACT_HIDDEN
+#endif
+#if defined(SPARK_INSTANCE_OPT_ROWS_LM_HEAD_HIDDEN)
+static_assert(SPARK_INSTANCE_OPT_ROWS_LM_HEAD_HIDDEN == OR_ROWS_HIDDEN,
+              "one cubin carries one hidden width");
+#endif
+#if defined(SPARK_INSTANCE_OPT_HEAD_SCREEN_BUILD_HIDDEN)
+static_assert(SPARK_INSTANCE_OPT_HEAD_SCREEN_BUILD_HIDDEN == OR_ROWS_HIDDEN,
+              "one cubin carries one hidden width");
+#endif
+#if defined(SPARK_INSTANCE_OPT_HEAD_SCREEN_EXACT_HIDDEN)
+static_assert(SPARK_INSTANCE_OPT_HEAD_SCREEN_EXACT_HIDDEN == OR_ROWS_HIDDEN,
+              "one cubin carries one hidden width");
+#endif
+#if defined(SPARK_INSTANCE_OPT_ROWS_SHARED_SWIGLU_HIDDEN)
+static_assert(SPARK_INSTANCE_OPT_ROWS_SHARED_SWIGLU_HIDDEN == OR_ROWS_HIDDEN,
+              "one cubin carries one hidden width");
+#endif
+#if defined(SPARK_INSTANCE_OPT_ROWS_MHC_PARTIALS_RB1_HIDDEN)
+static_assert(SPARK_INSTANCE_OPT_ROWS_MHC_PARTIALS_RB1_HIDDEN == OR_ROWS_HIDDEN,
+              "one cubin carries one hidden width");
+#endif
+
 // ---------------------------------------------------------------------------------------------
 // mHC seam and post
 // ---------------------------------------------------------------------------------------------
-#define OR_S_HIDDEN 5120u
+#define OR_S_HIDDEN OR_ROWS_HIDDEN
 #define OR_S_HC 4u
 #define OR_S_WIDTH (OR_S_HC * OR_S_HIDDEN)
 #define OR_S_ROWS 24u
@@ -392,6 +436,7 @@ __device__ __forceinline__ void or_seam_tail(const float *partials, const float 
 // Row y: stream + y*WIDTH, in_pre + y*in_pre_stride, mix_table + y*mix_stride, pre_mix_out + y*hc,
 // hc_rows + y*WIDTH, normed + y*dim, codes + y*dim, scales + y*dim/32, x_bf16 + y*dim,
 // partials + y*80*32, row_buf + y*dim, ticket + y.
+#if defined(SPARK_INSTANCE_OPT_ROWS_MHC_SEAM_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OR_S_THREADS) opt_rows_mhc_seam(
     const float *__restrict__ stream_all,
     const float *in_pre_all,
@@ -462,6 +507,7 @@ extern "C" __global__ void __launch_bounds__(OR_S_THREADS) opt_rows_mhc_seam(
                      if (lane == 0u) *ticket = 0u;
                  });
 }
+#endif
 
 // The decode seam in two launches, with opt_rows_mhc_seam's bits. opt_rows_mhc_partials_rb<RB>:
 // grid (80, ceil(rows / RB)), 256 threads; block (bx, g) loads its threads' fn_w values once for
@@ -562,6 +608,8 @@ __device__ __forceinline__ void or_seam_partials_rb(const float *__restrict__ st
     }
 }
 
+// The three instantiations' symbols: opt_rows_mhc_partials_rb1, opt_rows_mhc_partials_rb2 and
+// opt_rows_mhc_partials_rb4.
 #define OR_SEAM_PARTIALS_RB(RB)                                                                          \
     extern "C" __global__ void __launch_bounds__(OR_S_THREADS) opt_rows_mhc_partials_rb##RB(             \
         const float *__restrict__ stream_all, const float *in_pre_all, const float *__restrict__ fn_w,   \
@@ -570,11 +618,18 @@ __device__ __forceinline__ void or_seam_partials_rb(const float *__restrict__ st
         or_seam_partials_rb<RB>(stream_all, in_pre_all, fn_w, hc_rows_all, partials_all, row_buf_all,    \
                                 native_bf16, in_pre_stride, rows);                                       \
     }
+#if defined(SPARK_INSTANCE_OPT_ROWS_MHC_PARTIALS_RB1_HIDDEN)
 OR_SEAM_PARTIALS_RB(1)
+#endif
+#if defined(SPARK_INSTANCE_OPT_ROWS_MHC_PARTIALS_RB2_HIDDEN)
 OR_SEAM_PARTIALS_RB(2)
+#endif
+#if defined(SPARK_INSTANCE_OPT_ROWS_MHC_PARTIALS_RB4_HIDDEN)
 OR_SEAM_PARTIALS_RB(4)
+#endif
 
 #define OR_S_TAIL_THREADS 1024u
+#if defined(SPARK_INSTANCE_OPT_ROWS_MHC_TAIL_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OR_S_TAIL_THREADS) opt_rows_mhc_tail(
     const float *__restrict__ hc_base, const float *__restrict__ hc_scale, const uint8_t *__restrict__ norm_w,
     float *mix_table_all, float *pre_mix_out_all, float *__restrict__ normed_all, uint8_t *__restrict__ codes_all,
@@ -592,6 +647,7 @@ extern "C" __global__ void __launch_bounds__(OR_S_TAIL_THREADS) opt_rows_mhc_tai
                  x_bf16_all != nullptr ? x_bf16_all + (uint64_t)y * OR_S_HIDDEN : nullptr, norm_bf16, native_bf16,
                  quant_narrow, sinkhorn_iterations, norm_eps, hc_eps, tot, OR_S_BLOCKS, [](uint32_t) {});
 }
+#endif
 
 // The bulk chunk's seam, in two launches (not bit-identical to opt_rows_mhc_seam: the partial
 // sums run in another order). opt_bulk_mhc_partials: grid (40, ceil(rows / 32)), 128 threads;
@@ -772,6 +828,7 @@ __device__ __forceinline__ void or_bulk_partials(
     if (n > 0u) finish(n - 1u);
 }
 
+#if defined(SPARK_INSTANCE_OPT_BULK_MHC_PARTIALS_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OR_BULK_SEAM_THREADS) opt_bulk_mhc_partials(
     const float *__restrict__ stream_all, const float *in_pre_all, const float *__restrict__ fn_w,
     float *__restrict__ hc_rows_all, float *partials_all, float *row_buf_all, const uint32_t rows,
@@ -780,10 +837,12 @@ extern "C" __global__ void __launch_bounds__(OR_BULK_SEAM_THREADS) opt_bulk_mhc_
     or_bulk_partials<false>(stream_all, nullptr, nullptr, nullptr, 0u, in_pre_all, fn_w, hc_rows_all, partials_all,
                             row_buf_all, rows, native_bf16, in_pre_stride);
 }
+#endif
 
 // opt_bulk_mhc_post_partials: opt_rows_mhc_post into stream_out (which may be residual: a thread
 // reads its column of a row before writing it) fused with the next seam's partials, so the stream
 // is read once for both. Grid and block as opt_bulk_mhc_partials; no hc_rows copy.
+#if defined(SPARK_INSTANCE_OPT_BULK_MHC_POST_PARTIALS_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OR_BULK_SEAM_THREADS) opt_bulk_mhc_post_partials(
     const float *residual_all, const float *mix_all, const __nv_bfloat16 *__restrict__ delta_all,
     float *stream_out_all, const uint32_t mix_stride, const float *in_pre_all, const float *__restrict__ fn_w,
@@ -793,7 +852,9 @@ extern "C" __global__ void __launch_bounds__(OR_BULK_SEAM_THREADS) opt_bulk_mhc_
     or_bulk_partials<true>(residual_all, mix_all, delta_all, stream_out_all, mix_stride, in_pre_all, fn_w, nullptr,
                            partials_all, row_buf_all, rows, native_bf16, in_pre_stride);
 }
+#endif
 
+#if defined(SPARK_INSTANCE_OPT_BULK_MHC_TAIL_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OR_S_THREADS) opt_bulk_mhc_tail(
     const float *__restrict__ hc_base, const float *__restrict__ hc_scale, const uint8_t *__restrict__ norm_w,
     float *mix_table_all, float *pre_mix_out_all, float *__restrict__ normed_all, uint8_t *__restrict__ codes_all,
@@ -812,6 +873,7 @@ extern "C" __global__ void __launch_bounds__(OR_S_THREADS) opt_bulk_mhc_tail(
                  x_bf16_all != nullptr ? x_bf16_all + (uint64_t)y * OR_S_HIDDEN : nullptr, norm_bf16, native_bf16,
                  quant_narrow, sinkhorn_iterations, norm_eps, hc_eps, tot, OR_BULK_SEAM_BLOCKS, [](uint32_t) {});
 }
+#endif
 
 // opt_bulk_seam_derive: a sequence-parallel bulk seam's outputs for every row of the chunk from the
 // gathered bf16 normed rows (each rank's tail wrote its own rows' x_bf16): with normed_all set,
@@ -819,6 +881,7 @@ extern "C" __global__ void __launch_bounds__(OR_S_THREADS) opt_bulk_mhc_tail(
 // (bf16-exact) values.
 // Grid (OR_S_HIDDEN / 1024, rows), 128 threads; thread t owns 8 columns, four threads a 32-block.
 #define OR_DERIVE_THREADS 128u
+#if defined(SPARK_INSTANCE_OPT_BULK_SEAM_DERIVE_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OR_DERIVE_THREADS) opt_bulk_seam_derive(
     const __nv_bfloat16 *__restrict__ x_all, float *__restrict__ normed_all, uint8_t *__restrict__ codes_all,
     uint8_t *__restrict__ scales_all) {
@@ -856,8 +919,10 @@ extern "C" __global__ void __launch_bounds__(OR_DERIVE_THREADS) opt_bulk_seam_de
     *reinterpret_cast<uint2 *>(codes_all + y * OR_S_HIDDEN + column) = make_uint2(packed[0], packed[1]);
     if ((threadIdx.x & 3u) == 0u) scales_all[y * OR_S_QBLOCKS + column / 32u] = scale;
 }
+#endif
 
 // Row y: residual + y*WIDTH, mix + y*mix_stride, delta + y*dim, shared + y*dim, out + y*WIDTH.
+#if defined(SPARK_INSTANCE_OPT_ROWS_MHC_POST_HIDDEN)
 extern "C" __global__ void __launch_bounds__(128) opt_rows_mhc_post(
     const float *residual_all,
     const float *__restrict__ mix_all,
@@ -899,6 +964,7 @@ extern "C" __global__ void __launch_bounds__(128) opt_rows_mhc_post(
         stream_out[c * OR_S_HIDDEN + column] = value;
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // kv path: norm + rope (opt_kv_norm_rope), window quantise (window_quant_fp8_bf16) into the ring
@@ -1690,7 +1756,7 @@ extern "C" __global__ void opt_rows_inv_rope(
 // ---------------------------------------------------------------------------------------------
 // LM head per row (opt_lm_head arithmetic): block (chunk, y) scores 1024 entries of row y.
 // ---------------------------------------------------------------------------------------------
-#define OR_LM_HIDDEN 5120u
+#define OR_LM_HIDDEN OR_ROWS_HIDDEN
 #define OR_LM_THREADS 512u
 #define OR_LM_WARPS (OR_LM_THREADS / 32u)
 #define OR_LM_CHUNK 1024u
@@ -1712,6 +1778,7 @@ extern "C" __global__ void opt_rows_inv_rope(
 // so the maxima's argmax is a sample of softmax(logits / T) at the position row y produces. With
 // logits_out non-null every raw logit is also written ([rows][vocab]) for opt_rows_topc.
 #define OR_LM_ROWS 4u
+#if defined(SPARK_INSTANCE_OPT_ROWS_LM_HEAD_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_rows_lm_head(
     const __nv_bfloat16 *__restrict__ hidden_all,    // [rows][5120]
     const __nv_bfloat16 *__restrict__ w,
@@ -1804,6 +1871,7 @@ extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_rows_lm_head(
         block_argmax_all[(uint64_t)(row0 + y) * chunks + chunk] = idx == 0xffffffffu ? 0u : idx;
     }
 }
+#endif
 
 // Per row: fold the chunk maxima (lower chunk wins ties, as the host fold does: strictly greater
 // replaces) into one (value, local index) pair. Grid rows, 32 threads.
@@ -1915,7 +1983,7 @@ extern "C" __global__ void opt_rows_argmax_pick(
 // head (opt_mma_head_fp8t_f32o) and uses kernels/opt_mma_common_sm121.cuh's primitives; see that
 // header's attribution (b12x and NVIDIA Flare, Apache-2.0) and the root NOTICE file.
 
-#define OHS_HIDDEN 5120u
+#define OHS_HIDDEN OR_ROWS_HIDDEN
 #define OHS_KB (OHS_HIDDEN / 32u)     // K blocks of 32
 #define OHS_TILE 128u                 // entries a tile
 #define OHS_ROWS 32u                  // hidden rows a screen block (two MMA rows each)
@@ -1958,6 +2026,7 @@ __device__ __forceinline__ float ohs_block_sum(float v, float *s_red) {
 // tiles: K block b of entry v at ((v / 128 * 160 + b) * 128 + v % 128) * 32. coef[4 v] = {s, a, b, 0}
 // (the header's a and b, 1% high; a is infinite, or a NaN, for an entry the bound does not cover).
 // Entries past the slice get zero codes and coefficients. Grid vocab rounded up to 128, 256 threads.
+#if defined(SPARK_INSTANCE_OPT_HEAD_SCREEN_BUILD_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_head_screen_build(
     const __nv_bfloat16 *__restrict__ w, int8_t *__restrict__ codes, float *__restrict__ coef,
     const uint32_t vocab) {
@@ -2000,6 +2069,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_head_screen_build(
         *reinterpret_cast<float4 *>(coef + 4u * row) = make_float4(scale, a, b, 0.0f);
     }
 }
+#endif
 
 // The MMA row of digit d of hidden row y: rows 0 .. 7 of a 16-row MMA tile are the low digits of
 // eight hidden rows and rows 8 .. 15 their high digits, so one lane's accumulators hold both.
@@ -2011,6 +2081,7 @@ __device__ __forceinline__ uint32_t ohs_act_row(uint32_t y, uint32_t digit) {
 // H = 128 p1 + p0 (p0 in [-64, 63]) at act[ohs_act_row(y, digit)][5120]. meta[4 y] = {t, |h| high,
 // |h - t H| high, 0}; a row that is all zero, not finite or too large for the bound gets t = 0, zero
 // digits and an infinite norm, which keeps every entry. Grid rows, 256 threads.
+#if defined(SPARK_INSTANCE_OPT_HEAD_SCREEN_ROWS_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_head_screen_rows(
     const __nv_bfloat16 *__restrict__ hidden, int8_t *__restrict__ act, float *__restrict__ meta) {
     OPT_PDL_ENTRY();
@@ -2052,6 +2123,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_head_screen_rows(
         *reinterpret_cast<float4 *>(meta + 4u * y) = make_float4(t, hn, dn, 0.0f);
     }
 }
+#endif
 
 // Row y's noise arguments, as opt_rows_lm_head reads them: the scalar triple at position pos0 + y, or
 // {inv_t bits, position, seed low, seed high} from row_params[4 y ..].
@@ -2097,6 +2169,7 @@ __device__ __forceinline__ void ohs_mma(int32_t d[4], const uint32_t a[4], uint3
 // stage's 4 KB of codes are one contiguous read. Warp w owns entries 16 w .. 16 w + 15 of every
 // 16-row MMA tile the block's rows reach. Grid (ceil(rows / 32), tiles), 256 threads: a tile's row
 // blocks are adjacent in launch order.
+#if defined(SPARK_INSTANCE_OPT_HEAD_SCREEN_MMA_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_head_screen_mma(
     const int8_t *__restrict__ act, const float *__restrict__ meta, const int8_t *__restrict__ codes,
     const float *__restrict__ coef, float *__restrict__ upper, float *__restrict__ tile_lo,
@@ -2249,6 +2322,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_head_screen_mma(
         tile_lo[(uint64_t)(y0 + tid) * tiles + tile] = m;
     }
 }
+#endif
 
 // opt_rows_lm_head over the entries the screen keeps: block (g, chunk) scores entry v of the chunk
 // for row y only where !(upper[y][v] < T_y), T_y the best of tile_lo[y][..]. A score is that
@@ -2256,6 +2330,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_head_screen_mma(
 // tie rules; a chunk with nothing scored for a row reports -infinity and index 0. With
 // counts non-null, counts[y] gains the entries scored for row y. Grid (ceil(rows / 4), chunks), 512
 // threads.
+#if defined(SPARK_INSTANCE_OPT_HEAD_SCREEN_EXACT_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_head_screen_exact(
     const __nv_bfloat16 *__restrict__ hidden_all,    // [rows][5120]
     const __nv_bfloat16 *__restrict__ w,
@@ -2363,6 +2438,7 @@ extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_head_screen_exac
         block_argmax_all[(uint64_t)(row0 + y) * chunks + chunk] = idx == 0xffffffffu ? 0u : idx;
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Truncated sampling (top-k / top-p): one row's slice statistics for the host cut.
@@ -2528,6 +2604,7 @@ extern "C" __global__ void opt_rows_prefetch_l2(
 // Output row g k + r is source row g group_stride + r: the stream's four copies mixed by its pre_mix
 // row in ascending copy order and narrowed to bf16, the one-row kernel's arithmetic. Block (0, 0, 0)
 // zeroes *certified_count (when given), as every one-row launch did.
+#if defined(SPARK_INSTANCE_OPT_ROWS_HC_PRE_COLLAPSE_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_rows_hc_pre_collapse(
     const float *__restrict__ pre_mix_all, const float *__restrict__ stream_all,
     __nv_bfloat16 *__restrict__ out_all, uint32_t *__restrict__ certified_count,
@@ -2547,6 +2624,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_rows_hc_pre_collapse(
     }
     out_all[out * OR_S_HIDDEN + col] = __float2bfloat16_rn(acc);
 }
+#endif
 
 // dst[0] = value: a host-chosen id written in stream order, without a host copy.
 extern "C" __global__ void opt_rows_store_u32(uint32_t *__restrict__ dst, const uint32_t value) {
@@ -2561,6 +2639,7 @@ extern "C" __global__ void opt_rows_store_u32(uint32_t *__restrict__ dst, const 
 
 // Row r of `slot` is the embedding row of ids[r] when this rank owns it (ids[r] / vocab == rank);
 // the rows other ranks own come from their slots. grid rows, block 256.
+#if defined(SPARK_INSTANCE_OPT_ROWS_EMBED_OWN_HIDDEN)
 extern "C" __global__ void opt_rows_embed_own(const uint4 *__restrict__ embed, const uint32_t *__restrict__ ids, const uint32_t rank, const uint32_t vocab, uint4 *__restrict__ slot) {
     OPT_PDL_ENTRY();
     const uint32_t r = blockIdx.x;
@@ -2570,11 +2649,13 @@ extern "C" __global__ void opt_rows_embed_own(const uint4 *__restrict__ embed, c
     uint4 *dst = slot + (uint64_t)r * OR_E_WORDS;
     for (uint32_t i = threadIdx.x; i < OR_E_WORDS; i += blockDim.x) dst[i] = src[i];
 }
+#endif
 
 // Row r's stream: rows below n are ids[r]'s row from its owner's slot of the exchanged gather
 // (`[world][n][hidden]` bf16), rows from n on are `noise` (f32); each is widened to f32 and copied
 // over the hc axis, and the row's pre mix is the identity seed (begin_position's layout).
 // grid rows, block 256.
+#if defined(SPARK_INSTANCE_OPT_ROWS_EMBED_STREAM_HIDDEN)
 extern "C" __global__ void opt_rows_embed_stream(const uint2 *__restrict__ gather, const uint32_t *__restrict__ ids, const uint32_t n, const uint32_t vocab, const float4 *__restrict__ noise, float4 *__restrict__ stream, float *__restrict__ pre_mix) {
     OPT_PDL_ENTRY();
     const uint32_t r = blockIdx.x;
@@ -2595,10 +2676,12 @@ extern "C" __global__ void opt_rows_embed_stream(const uint2 *__restrict__ gathe
     }
     if (threadIdx.x < OR_S_HC) pre_mix[r * OR_S_HC + threadIdx.x] = threadIdx.x == 0u ? 1.0f : 0.0f;
 }
+#endif
 
 // opt_rows_embed_stream's rows from the whole embedding table on this rank (`[vocab][hidden]`
 // bf16) instead of an exchanged gather: rows below n are ids[r]'s row, rows from n on `noise`.
 // grid rows, block 256.
+#if defined(SPARK_INSTANCE_OPT_ROWS_EMBED_TABLE_HIDDEN)
 extern "C" __global__ void opt_rows_embed_table(const uint2 *__restrict__ table, const uint32_t *__restrict__ ids, const uint32_t n, const float4 *__restrict__ noise, float4 *__restrict__ stream, float *__restrict__ pre_mix) {
     OPT_PDL_ENTRY();
     const uint32_t r = blockIdx.x;
@@ -2618,6 +2701,7 @@ extern "C" __global__ void opt_rows_embed_table(const uint2 *__restrict__ table,
     }
     if (threadIdx.x < OR_S_HC) pre_mix[r * OR_S_HC + threadIdx.x] = threadIdx.x == 0u ? 1.0f : 0.0f;
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Engram wkv over up to 8 rows (opt_engram_wkv arithmetic per row, one weight read).
@@ -2893,6 +2977,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_rows_prologue_bf16(
 }
 
 // shared_swiglu_f32 with the PDL entry: out = silu(clamped gate) * clamped up, per element.
+#if defined(SPARK_INSTANCE_OPT_ROWS_SHARED_SWIGLU_HIDDEN)
 extern "C" __global__ void __launch_bounds__(256) opt_rows_shared_swiglu(
     const float *__restrict__ gate, const float *__restrict__ up, float *__restrict__ out,
     const float limit, const uint32_t inter) {
@@ -2908,6 +2993,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_rows_shared_swiglu(
     const float silu = __fdiv_rn(g, __fadd_rn(1.0f, expf(-g)));
     out[index] = __fmul_rn(silu, u);
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Host-weight GEMVs over rows
@@ -2915,6 +3001,16 @@ extern "C" __global__ void __launch_bounds__(256) opt_rows_shared_swiglu(
 // b12x_hostw_gemv_m1's body once per row (grid cols/32 x rows, one warp per block): row y reads
 // a_all + y * a_stride and writes out_all + y * out_stride elements, and its chain is the M = 1
 // kernel's own, so each row is bit-identical to that row's single-row launch.
+// The included host-weight body takes its reduction bound from its own instance macros; these
+// aliases compile its entry points with this image's hidden argument too.
+#if !defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_SM121_HIDDEN)
+#define SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_SM121_HIDDEN \
+    SPARK_INSTANCE_OPT_ROWS_HOSTW_BF16W_HIDDEN
+#define SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_F32O_SM121_HIDDEN \
+    SPARK_INSTANCE_OPT_ROWS_HOSTW_BF16W_F32O_HIDDEN
+#define SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_F32W_F32O_SM121_HIDDEN \
+    SPARK_INSTANCE_OPT_ROWS_HOSTW_F32W_F32O_HIDDEN
+#endif
 #include "b12x_hostw_gemv_m1_sm121.cu"
 
 template <typename W, bool k_out_f32>
@@ -2927,26 +3023,32 @@ __device__ __forceinline__ void or_hostw_rows(const float *a_all, const W *w, vo
                                         0u);
 }
 
+#if defined(SPARK_INSTANCE_OPT_ROWS_HOSTW_BF16W_HIDDEN)
 extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_bf16w(
     const float *a_all, const __nv_bfloat16 *__restrict__ w, void *out_all, const uint32_t cols,
     const uint32_t inner, const uint32_t a_stride, const uint32_t out_stride) {
     OPT_PDL_ENTRY();
     or_hostw_rows<__nv_bfloat16, false>(a_all, w, out_all, cols, inner, a_stride, out_stride);
 }
+#endif
 
+#if defined(SPARK_INSTANCE_OPT_ROWS_HOSTW_BF16W_F32O_HIDDEN)
 extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_bf16w_f32o(
     const float *a_all, const __nv_bfloat16 *__restrict__ w, void *out_all, const uint32_t cols,
     const uint32_t inner, const uint32_t a_stride, const uint32_t out_stride) {
     OPT_PDL_ENTRY();
     or_hostw_rows<__nv_bfloat16, true>(a_all, w, out_all, cols, inner, a_stride, out_stride);
 }
+#endif
 
+#if defined(SPARK_INSTANCE_OPT_ROWS_HOSTW_F32W_F32O_HIDDEN)
 extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_f32w_f32o(
     const float *a_all, const float *__restrict__ w, void *out_all, const uint32_t cols,
     const uint32_t inner, const uint32_t a_stride, const uint32_t out_stride) {
     OPT_PDL_ENTRY();
     or_hostw_rows<float, true>(a_all, w, out_all, cols, inner, a_stride, out_stride);
 }
+#endif
 
 // The f32-output forms into a ring of `ring_rows` positions of [cols] f32: row y writes the ring row
 // of its position at the lane offset, out_base + offset + (position % ring_rows) * cols, with
@@ -2964,6 +3066,7 @@ __device__ __forceinline__ void or_hostw_ring(const float *a_all, const W *w, ui
     spark_hw_gemv_m1_body<W, true>(a_all + y * a_stride, w, out, 1u, cols, inner, nullptr, 0u, 0u);
 }
 
+#if defined(SPARK_INSTANCE_OPT_ROWS_HOSTW_BF16W_F32O_RING_HIDDEN)
 extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_bf16w_f32o_ring(
     const float *a_all, const __nv_bfloat16 *__restrict__ w, uint8_t *out_base,
     const uint32_t cols, const uint32_t inner, const uint32_t a_stride, const uint64_t *row_tab,
@@ -2971,7 +3074,9 @@ extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_bf16w_f32o_ring(
     OPT_PDL_ENTRY();
     or_hostw_ring<__nv_bfloat16>(a_all, w, out_base, cols, inner, a_stride, row_tab, p0, ring_rows);
 }
+#endif
 
+#if defined(SPARK_INSTANCE_OPT_ROWS_HOSTW_F32W_F32O_RING_HIDDEN)
 extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_f32w_f32o_ring(
     const float *a_all, const float *__restrict__ w, uint8_t *out_base, const uint32_t cols,
     const uint32_t inner, const uint32_t a_stride, const uint64_t *row_tab, const uint32_t p0,
@@ -2979,3 +3084,4 @@ extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_f32w_f32o_ring(
     OPT_PDL_ENTRY();
     or_hostw_ring<float>(a_all, w, out_base, cols, inner, a_stride, row_tab, p0, ring_rows);
 }
+#endif
