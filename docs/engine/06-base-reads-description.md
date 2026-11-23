@@ -258,6 +258,104 @@ The other families repeat the same four steps: add the instances, convert the so
 no-default rule, point the build and baseline at `instance_groups()`, and give the instances a
 `catalogue` key. Nothing in the mechanism is router-specific.
 
+#### D.2 Attention and selection
+
+The attention and candidate-selection family follows D.1 with two new shape vocabularies:
+`mla` (the three CSA2 attention entries, the split-KV decode entry and D49's ring entry) and
+`select` (the reference and optimized candidate selection). Six sources are listed in
+`kernels/instances.toml`; `kernels/flash_mla_csa2_common_sm121.cuh` and
+`kernels/select_body_sm121.cuh` are bodies the listed entries include, so they carry no
+`[[instance]]` of their own.
+
+**Sources and entries.** `flash_mla_csa2_sm121.cu` (one entry), `flash_mla_csa2_seq_sm121.cu`
+(`flash_mla_csa2_seq_sm121` and `flash_mla_csa2_seq_batched_sm121`, one cubin),
+`flash_mla_csa2_ring_sm121.cu` (one released entry plus the proof entry),
+`opt_attn_sm121.cu` (`opt_flash_mla_csa2_seq`), `ref_select_sm121.cu` (one entry) and
+`opt_select_sm121.cu` (ten entries: `opt_ref_select`, `opt_ref_select_pre`,
+`opt_ref_select_fast`, `opt_select_rows`, `opt_select_rows_bf16`, `opt_select_rows_tab`,
+`opt_select_scores`, `opt_select_scores_rows`, `opt_select_scores_seg`,
+`opt_select_scores_segs`). All released cubin names and symbol sets are unchanged.
+
+**Shape keys.** An `mla` instance names `hidden`, `heads`, `head_dim`, `kv_lora`,
+`window`, `index_heads`, `index_head_dim`, `index_topk`, `hsi_blocks`,
+`hsi_block_tokens`, `ring_capacity` and `positions`. A `select` instance names `hidden`,
+`index_heads`, `index_head_dim`, `index_topk` and `positions`. `hidden` and `head_dim`
+are the part geometry the catalogue claims; the attention body reads the latent, heads, window
+and indexer numbers. Every released instance has `hidden = 5120`, `head_dim = 512`,
+`kv_lora = 512`, `heads = 64`, `window = 128`, `index_heads = 32`,
+`index_head_dim = 128`, `index_topk = 512`, `hsi_blocks = 2048`,
+`hsi_block_tokens = 8`, `ring_capacity = 134` and `positions = 2097152`; a `select`
+instance drops the fields it has no geometry for. The window scales, union capacity and the FP4
+scale counts are arithmetic on the arguments (`kv_lora / 32`, `index_topk + window`,
+`kv_lora / 2`), not second copies.
+
+**The sources.** Each converted source has the D.1 four rules. It fails with `#error` when no
+instance macro is defined, and each entry is gated on its own macros so a proof compile emits
+only its own symbol. The shared M4 header's geometry names are `#undef`/`#define`d from the
+entry's instance before the arithmetic header is included: the header's defaults still belong to
+the other families, and this source does not read them. Literal equality assertions became the
+bounds the bodies need (`kv_lora == 2 * threads`, `index_head_dim == 4 * warp_lanes`,
+`heads % index_heads == 0`, `ring_capacity >= window`); the fast select's `FAST_MAX_POS`,
+the segment body's `SR_DIM` and `SG_HEADS` come from the instance. The ring source keeps its
+released branch last in the preprocessor chain because the Rust constant readers parse every
+`#define` in the file and the last textual definition must be the released shape.
+
+**Generated catalogue keys.** `deepseek-mla` is carried by the five released MLA entries and
+generates
+
+```text
+CATALOGUE_DEEPSEEK_MLA = ANY.hidden_equals(5120).head_dim_equals(512).positions(0, 2097152)
+```
+
+`deepseek-indexer` is carried by the eleven released selection entries and generates
+
+```text
+CATALOGUE_DEEPSEEK_INDEXER = ANY.hidden_equals(5120).head_dim_equals(128)
+    .top_k_equals(512).max_heads(32).positions(0, 2097152)
+```
+
+Those two rules replace the hand-written `(MlaAttention, Deepseek)` and
+`(SparseIndexer, Deepseek)` arms of `shape_for`. The old MLA rule's `head_dim_multiple(16)`
+and `groups_between(1, MAX)` are gone: the compiled head width is exactly 512 and the group
+count is not a shape any listed body reads. The indexer rule keeps `max_heads(32)` because the
+selection bodies are runtime-generic over heads and 32 is the widest they address. The
+`Csa2Compression` rule is deliberately unchanged: its catalogue entries are served by
+`compressed_append_sm121.cu`, `opt_misc_sm121.cu` and `pool_group_sm121.cu`, which are not
+this family's sources and have no instance here.
+
+**Refusal.** `SparseIndexerLauncher::new` now refuses a DeepSeek selection launch whose rows
+reach past `DEEPSEEK_INDEXER_MAX_POSITION` (`1 << 21`), naming the symbol and the bound; the
+kernels' in-body bounds remain as the last line of defence. The catalogue rule refuses a model
+whose geometry is outside the built shape before a weight is read.
+
+**The proof.** The six released cubins compiled to the baseline bytes under their instance
+defines on the GPU head (192.168.1.80, nvcc 13.0.88, CUDA 13.0, sm_121a), so neither
+disassembly nor launch output was needed:
+
+| released cubin | bytes | sha256 |
+| --- | --- | --- |
+| `flash_mla_csa2_sm121` | 71,256 | `553a8982a06763436a6f2437c6bae8fc2d81f51c4033379c7aee0ea08f894388` |
+| `flash_mla_csa2_seq_sm121` | 121,560 | `c278bc97829a79e728c181bc451d331088e27af446c9920e2c00bf2c1b4ad8d9` |
+| `flash_mla_csa2_ring_sm121` | 48,800 | `6d346b2b6c3d7955c040a13852c306a979b15bcfcee38388e1e517fb5df27a0e` |
+| `opt_attn_sm121` | 78,544 | `274bc2f91f5407efe185f9368cd247ec0ca4ac3f6aa2826ac77df6b6a67465a2` |
+| `ref_select_sm121` | 28,264 | `b90baccac9937386c54c5fa69da88e41d759d3218ff2a1ac220dcfbba860f3e8` |
+| `opt_select_sm121` | 476,088 | `dd7240901db3beea39f1169567b29ec15e81a85f6d8c92d2412ed23f756b46c5` |
+
+The second shape is `flash_mla_csa2_ring_32h256k_sm121`, the ring body compiled for
+`heads = 32`, `index_heads = 16`, `index_topk = 256`, `window = 64`,
+`hsi_blocks = 1024`, `ring_capacity = 70` and `positions = 1048576`. It builds into its
+own cubin (48,928 bytes,
+`ad688dcc5b653d4a9c25829d05feda9438d3909aed75d445a62461e719f4fb66`), whose only kernel
+symbol is `flash_mla_csa2_ring_32h256k_sm121`; that symbol appears in neither the released ring
+cubin nor `baseline/kernel_baseline.txt`.
+
+**For the next family.** The two build-script readers now accept the `mla` and `select`
+families, and `crates/sparkflash-kernels/tests/kernel_instances.rs` checks their released
+values and proof. Consts readers of a converted source must extend their table with the generated
+`<CUBIN>_DEFINES` (as `m4_abi::consts`, the ring and sequence launch tests now do). Do not
+reorder a source's instance chain so that a second shape becomes the last textual definition of a
+name a Rust reader resolves.
+
 ## 5. Order
 
 1. A, alone.
