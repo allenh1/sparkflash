@@ -568,10 +568,13 @@ impl RowsState {
         let index_heads = device.index_n_heads;
         let index_cols = index_heads * device.index_head_dim;
         let head_width = device.head_width as usize;
+        let selected_stride = crate::plan::selected_stride();
+        let attn_heads = crate::plan::heads_per_rank();
+        let attn_max_attended = crate::plan::max_attended();
         let r = cap.max(R_MAX);
         // The drafter runs several sequences' blocks through the row buffers at once: they hold
         // that many rows even where a step holds R_MAX.
-        let d = r.max(super::draft::DRAFT_ROWS);
+        let d = r.max(super::draft::draft_rows());
         let moe_way = match share {
             Some((share, _)) if share.stride != d || r <= R_MAX => {
                 return refuse("a bulk share's ways hold the rows of a bulk state");
@@ -635,10 +638,10 @@ impl RowsState {
             shared_gate: alloc(2 * d * shared_local * 4)?,
             shared_swiglu: alloc(d * shared_local * 4)?,
             shared_out: alloc(d * dim * 4)?,
-            selected: alloc(r * SELECTED_STRIDE * 4)?,
-            attn_scores: alloc(R_MAX * ATTN_HEADS * ATTN_MAX_ATTENDED * 4)?,
-            attn_probs: alloc(R_MAX * ATTN_MAX_ATTENDED * ATTN_HEADS * 4)?,
-            attn_ssum: alloc(R_MAX * ATTN_HEADS * 4)?,
+            selected: alloc(r * selected_stride * 4)?,
+            attn_scores: alloc(R_MAX * attn_heads * attn_max_attended * 4)?,
+            attn_probs: alloc(R_MAX * attn_max_attended * attn_heads * 4)?,
+            attn_ssum: alloc(R_MAX * attn_heads * 4)?,
             masks: alloc(r * mask_bytes)?,
             seam_partials: alloc(d * SEAM_PARTIAL_FLOATS * 4)?,
             seam_row_buf: alloc(d * dim * 4)?,
@@ -782,9 +785,6 @@ impl RowsState {
     }
 }
 
-/// The selected list's row stride in u32 ids (`workspace.selected` is 2,048 B).
-const SELECTED_STRIDE: usize = 512;
-
 /// The pieces opt_select_scores_segs scores a step's segments in: each segment's rows in runs of
 /// at most SELECT_SEG_ROWS, as (first step row, rows). At most R_MAX of them.
 fn select_pieces(segs: &[super::lanes::Seg]) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -795,10 +795,9 @@ fn select_pieces(segs: &[super::lanes::Seg]) -> impl Iterator<Item = (usize, usi
     })
 }
 
-/// The split attention's heads a rank and slots a row (OR_A3_HEADS, OR_A_MAX_ATTENDED), and the
-/// slots a scores block takes (OR_A3_CHUNK).
-const ATTN_HEADS: usize = 16;
-const ATTN_MAX_ATTENDED: usize = 640;
+/// The split attention's slots a scores block takes (OR_A3_CHUNK, a kernel tile, not model
+/// geometry). The heads a rank and the slots a row are the plan's geometry
+/// (`heads_per_rank`, `max_attended`).
 const ATTN_SCORE_CHUNK: usize = 32;
 
 /// opt_select_scores_rows' positions a tile (SR_TILE), and the blocks a batched select's scores
@@ -1058,7 +1057,7 @@ impl DeviceLayer<'_> {
 
     /// Counts positions ..`end` as appended to the caches of layers `from..` without running those
     /// layers on them: a prefill's rows that stop after the encoder. Those layers' windows over them
-    /// hold stale rows, which only the decoder's warm-up rows read ([super::batch::DECODER_WARM]).
+    /// hold stale rows, which only the decoder's warm-up rows read ([super::batch::decoder_warm]).
     pub(super) fn skip_rows(&mut self, from: usize, end: usize) {
         for count in self.appended_rows.iter_mut().skip(from) {
             *count = end;
@@ -2547,6 +2546,7 @@ impl DeviceLayer<'_> {
         n: usize,
     ) -> Result<(), String> {
         let b = rows.b;
+        let selected_stride = crate::plan::selected_stride();
         let saved = self.buffers;
         // The row views replace the ring's three scratch pointers only: its other pointers are the
         // selected lane's, which the rows below may change.
@@ -2576,8 +2576,8 @@ impl DeviceLayer<'_> {
                 self.buffers.workspace.q_normed =
                     span(b.q_normed + (row * lora * 2) as u64, lora * 2);
                 self.buffers.workspace.selected = span(
-                    b.selected + (row * SELECTED_STRIDE * 4) as u64,
-                    SELECTED_STRIDE * 4,
+                    b.selected + (row * selected_stride * 4) as u64,
+                    selected_stride * 4,
                 );
                 if let Some(ring) = self.seam_ring.as_mut() {
                     ring.candidate_mask = Deviceptr(b.masks + (row * rows.mask_bytes) as u64);
@@ -2716,6 +2716,7 @@ impl DeviceLayer<'_> {
             return Err(Self::refusal("rows select"));
         };
         let b = rows.b;
+        let selected_stride = crate::plan::selected_stride();
         let n: usize = segs.iter().map(|seg| seg.n).sum();
         let keys =
             ring.index_keys.0 + (owner * self.max_positions * self.index_head_dim * 4) as u64;
@@ -2767,7 +2768,7 @@ impl DeviceLayer<'_> {
                 self.candidate_topk_blocks as u64,
                 self.candidate_block_size as u64,
                 stride as u64,
-                SELECTED_STRIDE as u64,
+                selected_stride as u64,
                 (rows.mask_bytes / 4) as u64,
                 (reach + reach.div_ceil(4)) as u64,
             ],
@@ -2803,6 +2804,7 @@ impl DeviceLayer<'_> {
             return Err(Self::refusal("rows select"));
         };
         let b = rows.b;
+        let selected_stride = crate::plan::selected_stride();
         let heads = self.index_n_heads;
         let index_cols = heads * self.index_head_dim;
         let row0 = seg.row0;
@@ -2862,7 +2864,7 @@ impl DeviceLayer<'_> {
             (1024, 1, 1),
             &[
                 select.scores_out.0,
-                b.selected + (row0 * SELECTED_STRIDE * 4) as u64,
+                b.selected + (row0 * selected_stride * 4) as u64,
                 if mask_mode == 1 { masks } else { 0 },
                 if mask_mode == 2 { masks } else { 0 },
                 select.scratch.0,
@@ -2874,7 +2876,7 @@ impl DeviceLayer<'_> {
                 self.candidate_topk_blocks as u64,
                 self.candidate_block_size as u64,
                 stride as u64,
-                SELECTED_STRIDE as u64,
+                selected_stride as u64,
                 (rows.mask_bytes / 4) as u64,
                 (reach + reach.div_ceil(4)) as u64,
             ],
@@ -3322,6 +3324,9 @@ impl DeviceLayer<'_> {
         n: usize,
     ) -> Result<(), String> {
         let b = rows.b;
+        let selected_stride = crate::plan::selected_stride();
+        let attn_heads = crate::plan::heads_per_rank();
+        let attn_max_attended = crate::plan::max_attended();
         let ratio = self
             .compress_ratio
             .get(layer)
@@ -3338,7 +3343,7 @@ impl DeviceLayer<'_> {
         let bulk_attn = rows
             .bulk
             .as_ref()
-            .filter(|_| n > R_MAX && self.heads_per_rank == 16)
+            .filter(|_| n > R_MAX && usize::try_from(self.heads_per_rank).ok() == Some(attn_heads))
             .map(|bulk| bulk.k.attn);
         let (cos, sin) = self.rows_rope_tables(layer)?;
         let q_row = (rows.q_cols * 2) as u64;
@@ -3346,7 +3351,9 @@ impl DeviceLayer<'_> {
         // attention runs every lane's rows in one launch with the row table.
         let segs = self.step_segs(p0, n);
         let table = self.row_table(rows, &segs).filter(|_| {
-            bulk_attn.is_none() && rows.kernels.attn_split.is_some() && self.heads_per_rank == 16
+            bulk_attn.is_none()
+                && rows.kernels.attn_split.is_some()
+                && usize::try_from(self.heads_per_rank).ok() == Some(attn_heads)
         });
         let last = segs.last().copied();
         for seg in Self::row_units(&segs, table) {
@@ -3371,18 +3378,20 @@ impl DeviceLayer<'_> {
                 )
             };
             let (row0, count) = (seg.row0 as u64, seg.n as u32);
-            let selected = b.selected + row0 * (SELECTED_STRIDE * 4) as u64;
+            let selected = b.selected + row0 * (selected_stride * 4) as u64;
             let attn_body = b.attn_body + row0 * q_row;
             let geometry = [seg.p0 as u64, ratio as u64, self.index_topk as u64];
-            let ring = [SELECTED_STRIDE as u64, self.kv_ring.rows() as u64];
+            let ring = [selected_stride as u64, self.kv_ring.rows() as u64];
             match (bulk_attn, rows.kernels.attn_split) {
-                (None, Some([scores, softmax, values])) if self.heads_per_rank == 16 => {
+                (None, Some([scores, softmax, values]))
+                    if usize::try_from(self.heads_per_rank).ok() == Some(attn_heads) =>
+                {
                     let attn_scores =
-                        b.attn_scores + row0 * (ATTN_HEADS * ATTN_MAX_ATTENDED * 4) as u64;
+                        b.attn_scores + row0 * (attn_heads * attn_max_attended * 4) as u64;
                     let attn_probs =
-                        b.attn_probs + row0 * (ATTN_MAX_ATTENDED * ATTN_HEADS * 4) as u64;
-                    let attn_ssum = b.attn_ssum + row0 * (ATTN_HEADS * 4) as u64;
-                    let chunks = ATTN_MAX_ATTENDED.div_ceil(ATTN_SCORE_CHUNK) as u32;
+                        b.attn_probs + row0 * (attn_max_attended * attn_heads * 4) as u64;
+                    let attn_ssum = b.attn_ssum + row0 * (attn_heads * 4) as u64;
+                    let chunks = attn_max_attended.div_ceil(ATTN_SCORE_CHUNK) as u32;
                     let mut args = vec![
                         b.q + row0 * q_row,
                         kv_fp4,
@@ -3401,7 +3410,7 @@ impl DeviceLayer<'_> {
                     args.extend(geometry);
                     args.push(table.unwrap_or(0));
                     self.cuda
-                        .launch(softmax, (ATTN_HEADS as u32, count, 1), (256, 1, 1), &args)?;
+                        .launch(softmax, (attn_heads as u32, count, 1), (256, 1, 1), &args)?;
                     let mut args = vec![
                         kv_fp4,
                         kv_scales,

@@ -22,11 +22,11 @@
 //!    bound arena's head shard (kernel-lead's direction, 2026-10-20: init-time derivation from the
 //!    arena, never a per-token weight H2D, and TailBind is not widened for it).
 //! 2. TailStage::screen normalises the hidden state of one position with rmsnorm_sm121 against the
-//!    arena's final-norm weight and screens the rank's own 32,320 vocabulary rows with
+//!    arena's final-norm weight and screens the plan's per-rank vocabulary shard with
 //!    cert_lm_head_sm121, returning the rank's f32 logits.
 //! 3. gather_logits moves those logits to every rank EXACTLY: each f32 is split into its two u16
 //!    halves, the words travel through the existing tcp all-gather (pure word movement, no
-//!    arithmetic, so no rounding), and every rank reassembles the full 129,280-entry vector and
+//!    arithmetic, so no rounding), and every rank reassembles the plan's full vocabulary and
 //!    takes the argmax with the lowest-id tie break.
 //!
 //! The tail is deliberately separate from the layer body: it is the last stage of every position
@@ -40,12 +40,18 @@ use std::path::{Path, PathBuf};
 
 use sparkflash_comm::transport::Transport;
 
-/// The hidden size of the released configuration.
-/// The full vocabulary of the released configuration.
-pub const VOCAB: usize = 129_280;
-/// The per-rank head shard width (VOCAB / 4).
-/// The certified head's screening blocks per output row (crate::plan::hidden() / 128).
-pub const BLOCKS_PER_ENTRY: usize = 40;
+/// The full vocabulary, read at open from the plan.
+#[must_use]
+pub fn vocab() -> usize {
+    crate::plan::vocab()
+}
+
+/// The certified head's screening blocks per output row, read at open from the plan's hidden
+/// width (one 128-value block each).
+#[must_use]
+pub fn blocks_per_entry() -> usize {
+    crate::plan::hidden().div_ceil(128)
+}
 /// The certified head's chunk width (one block per chunk).
 pub const CHUNK: u32 = sparkflash_kernels::cert_lm_head_launch::CHUNK;
 /// The per-rank screening chunk count (the certified-head side tensors' length).
@@ -64,7 +70,7 @@ pub fn logits_bytes_per_rank() -> usize {
 /// The BF16 bytes of one rank's derived head block-maxima side tensor.
 #[must_use]
 pub fn w_block_max_bytes() -> usize {
-    crate::plan::vocab_per_rank() * BLOCKS_PER_ENTRY * 2
+    crate::plan::vocab_per_rank() * blocks_per_entry() * 2
 }
 
 /// The bytes of one rank's side-buffer gather payload: the certified mask, the certified count,
@@ -163,7 +169,7 @@ pub fn argmax_of(full: Vec<f32>) -> Result<Logits, String> {
 /// # Errors
 /// A chunk that is not crate::plan::vocab_per_rank() long, or a chunk set that is not the full vocabulary.
 pub fn assemble_chunks(chunks: &[Vec<f32>]) -> Result<Logits, String> {
-    let mut full = Vec::with_capacity(VOCAB);
+    let mut full = Vec::with_capacity(crate::plan::vocab());
     for (rank, chunk) in chunks.iter().enumerate() {
         if chunk.len() != crate::plan::vocab_per_rank() {
             return Err(format!(
@@ -174,9 +180,10 @@ pub fn assemble_chunks(chunks: &[Vec<f32>]) -> Result<Logits, String> {
         }
         full.extend_from_slice(chunk);
     }
-    if full.len() != VOCAB {
+    let vocabulary = crate::plan::vocab();
+    if full.len() != vocabulary {
         return Err(format!(
-            "exact logit gather: {} ranks cover {} logits, the vocabulary is {VOCAB}",
+            "exact logit gather: {} ranks cover {} logits, the vocabulary is {vocabulary}",
             chunks.len(),
             full.len()
         ));
@@ -236,11 +243,12 @@ mod device {
         pub hidden: Deviceptr,
         /// The normalised hidden state, BF16.
         pub normed: Deviceptr,
-        /// The certified head's derived block-maxima side tensor, BF16 [32320][40].
+        /// The certified head's derived block-maxima side tensor, BF16
+        /// [vocab_per_rank][blocks_per_entry].
         pub w_block_max: Deviceptr,
-        /// This rank's f32 logits [32320].
+        /// This rank's f32 logits [vocab_per_rank].
         pub logits: Deviceptr,
-        /// The certified mask [32320].
+        /// The certified mask [vocab_per_rank].
         pub certified: Deviceptr,
         /// The certified count.
         pub certified_count: Deviceptr,
@@ -1268,7 +1276,7 @@ mod tests {
 
     #[test]
     fn the_argmax_breaks_ties_by_the_lowest_id_and_reports_the_margin() {
-        let mut values = vec![0.0f32; VOCAB];
+        let mut values = vec![0.0f32; crate::plan::vocab()];
         values[7] = 3.5;
         values[900] = 3.5;
         values[129_000] = 3.0;
@@ -1290,7 +1298,7 @@ mod tests {
             })
             .collect();
         let logits = assemble_chunks(&chunks).expect("assemble");
-        assert_eq!(logits.full.len(), VOCAB);
+        assert_eq!(logits.full.len(), crate::plan::vocab());
         assert_eq!(logits.argmax, 3 * crate::plan::vocab_per_rank() as u32);
         assert_eq!(logits.top1, 30.0);
         let short = vec![vec![0.0f32; crate::plan::vocab_per_rank()], vec![0.0f32; 1]];
@@ -1338,7 +1346,7 @@ mod tests {
             .map(|slot| slot.expect("slot"))
             .collect();
         for rank in 0..4 {
-            assert_eq!(assembled[rank].full.len(), VOCAB);
+            assert_eq!(assembled[rank].full.len(), crate::plan::vocab());
             for (full_rank, chunk) in expected.iter().enumerate() {
                 let base = full_rank * crate::plan::vocab_per_rank();
                 for (index, want) in chunk.iter().enumerate() {
@@ -1364,8 +1372,8 @@ mod tests {
         assert_eq!(chunks_per_rank(), 32);
         assert_eq!(super::w_block_max_bytes(), 2_585_600);
         assert_eq!(logits_bytes_per_rank(), 129_280);
-        assert_eq!(crate::plan::vocab_per_rank() * 4, VOCAB);
-        assert_eq!(BLOCKS_PER_ENTRY, 40);
+        assert_eq!(crate::plan::vocab_per_rank() * 4, crate::plan::vocab());
+        assert_eq!(blocks_per_entry(), 40);
         assert_eq!(CHUNK, 1024);
     }
 }

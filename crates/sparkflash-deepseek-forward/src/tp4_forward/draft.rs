@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The on-device DSpark drafter: the three `mtp.{s}` stages over a block of [`BLOCK`] rows, the
+//! The on-device DSpark drafter: the three `mtp.{s}` stages over a block of [`draft_block`] rows, the
 //! shared head and the Markov head, all on the device and tensor-parallel like the backbone.
 //!
 //! Each stage is a decoder block with the backbone's tensor names and geometry, so it runs on the
 //! multi-row step's kernels and buffers ([`RowsState`]): the same seams, GEMVs, rope, KV kernel,
 //! output projection, rank-split shared expert and one-shot reduces. What differs is the drafter's
 //! own (kernels/opt_draft_sm121.cu): the attention reads the stage's linear ring, which holds the
-//! main rows' KV at their positions and the block's own rows at `d..d + BLOCK`; the router and the
+//! main rows' KV at their positions and the block's own rows at `d..d + draft_block`; the router and the
 //! fused MoE are the top-3-of-128 instantiations; and the head adds the Markov bias one draft at a
 //! time, each step's argmax feeding the next step's bias (forward/mtp.rs dspark_forward_observed).
 //!
@@ -41,44 +41,58 @@ use sparkflash_kernels::moe_routed_device::{
 };
 use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt};
 
-/// The draft block: the anchor and four noise rows (`dspark_block_size`).
-pub(super) const BLOCK: usize = 5;
+/// The draft block's row count, read at open from the plan's `dspark_block_size`.
+pub(super) fn draft_block() -> usize {
+    crate::plan::dspark_block_size()
+}
 /// The most sequences one draft pass serves (opt_draft's OD_MAX_SEQS).
 pub(super) const MAX_SEQS: usize = 16;
 /// The most a pass serves through opt_draft_markov_seqs (OD_SIMT_SEQS), whose per-sequence state
 /// in registers spills past eight.
 const SIMT_SEQS: usize = 8;
-/// The rows of a pass over [MAX_SEQS] blocks.
-pub(super) const DRAFT_ROWS: usize = MAX_SEQS * BLOCK;
-/// u32 words between two sequences' ids: `[BLOCK + 1]` ids, then `[BLOCK + 1]` f32 probabilities.
-const IDS_STRIDE: usize = 2 * (BLOCK + 1);
+/// The rows of a pass over [MAX_SEQS] blocks, read at open.
+pub(super) fn draft_rows() -> usize {
+    MAX_SEQS * draft_block()
+}
+/// u32 words between two sequences' ids: `[block + 1]` ids, then `[block + 1]` f32 probabilities.
+fn draft_ids_stride() -> usize {
+    2 * (draft_block() + 1)
+}
 /// The pass parameters: `[MAX_SEQS]` anchors, then `[MAX_SEQS][inv_t bits, seed lo, seed hi, pos0]`.
 const PARAM_WORDS: usize = 5 * MAX_SEQS;
-/// The DSpark stages (`n_mtp_layers`).
-const STAGES: usize = 3;
-/// `dspark_n_routed_experts` / `dspark_n_activated_experts`.
-const EXPERTS: usize = 128;
-const TOP_K: usize = 3;
+/// The DSpark stages, read at open from the plan's `n_mtp_layers`.
+fn stage_count() -> usize {
+    crate::plan::n_mtp_layers()
+}
+/// The drafter's routed expert count and top-k, read at open from the plan.
+fn draft_experts() -> usize {
+    crate::plan::dspark_n_routed_experts()
+}
+fn draft_top_k() -> usize {
+    crate::plan::dspark_n_activated_experts()
+}
 /// opt_moe_sm121.cu's OPT_MOE_PLAN_MAX: the routed rows one dedup plan groups.
 const MOE_PLAN_MAX: usize = 384;
 /// opt_moe_sm121.cu's OptMoePlan (a count, then MOE_PLAN_MAX experts, one more start and
 /// MOE_PLAN_MAX rows, u32).
 const MOE_PLAN_BYTES: usize = (1 + MOE_PLAN_MAX + (MOE_PLAN_MAX + 1) + MOE_PLAN_MAX) * 4;
-const _: () = assert!(
-    DRAFT_ROWS * TOP_K <= MOE_PLAN_MAX,
-    "the dedup plan holds the drafter's routed rows"
-);
-/// The tap width: three target layers of `dim`.
-const TAPS: usize = 3;
+/// The tap width: the draft block's target layer count, read at open.
+fn draft_taps() -> usize {
+    crate::plan::tap_layers().len()
+}
 /// The head logits' blocks: one per GB10 SM (each strides over the vocabulary slice), so every SM
 /// streams the head; the 32 chunks of the slice left a third of them idle.
 const LOGITS_BLOCKS: u32 = 48;
 /// The most rows one opt_draft_logits launch scores (its OD_LM_GROUP).
 const LOGITS_GROUP: usize = 20;
-/// The Markov head's rank.
-const MARKOV_RANK: usize = 256;
-/// The expert intermediate rows on this rank (2304 / 4).
-const LOCAL_INTER: usize = 576;
+/// The Markov head's rank, read at open from the plan.
+fn markov_rank() -> usize {
+    crate::plan::dspark_markov_rank()
+}
+/// The expert intermediate rows on this rank, read at open from the plan's width over four ranks.
+fn local_inter() -> usize {
+    crate::plan::moe_inter_dim() / 4
+}
 /// The transport sequence range the draft argmax gathers use.
 const DRAFT_GATHER_SEQ: u64 = u64::MAX - 0xD_0000;
 
@@ -135,7 +149,7 @@ struct Stage {
     gate: u64,
     bias: u64,
     shared: [(u64, u64); 3],
-    /// `[gate, up, down][EXPERTS][weight, scales]`.
+    /// `[gate, up, down][draft_experts()][weight, scales]`.
     table: u64,
     ring_codes: u64,
     ring_scales: u64,
@@ -174,7 +188,7 @@ pub(super) struct DraftState {
     head_norm: u64,
     markov_head: u64,
     markov_embed: u64,
-    /// `[R_MAX][TAPS][dim]` f32: the rows' taps, written by the rows step's tap hook.
+    /// `[R_MAX][draft_taps()][dim]` f32: the rows' taps, written by the rows step's tap hook.
     pub(super) taps: u64,
     main_x: u64,
     /// `[world][R_MAX][dim / world]` f32: each rank's columns of main_proj for the rows, exchanged
@@ -184,19 +198,19 @@ pub(super) struct DraftState {
     main_scales: u64,
     h_codes: u64,
     h_scales: u64,
-    /// The dedup chain's row grouping (opt_moe_sm121.cu's OptMoePlan) and its `[DRAFT_ROWS *
-    /// TOP_K][dim]` f32 slot values.
+    /// The dedup chain's row grouping (opt_moe_sm121.cu's OptMoePlan) and its `[draft_rows() *
+    /// draft_top_k()][dim]` f32 slot values.
     moe_plan: u64,
     slot_val: u64,
     logits: u64,
-    /// Per sequence of a pass (`IDS_STRIDE` words apart; the one-block pass uses the first):
-    /// `[BLOCK + 1]` u32 ids (the anchor then the drafts), then `[BLOCK + 1]` f32: the draft's
+    /// Per sequence of a pass (`draft_ids_stride()` words apart; the one-block pass uses the first):
+    /// `[draft_block() + 1]` u32 ids (the anchor then the drafts), then `[draft_block() + 1]` f32: the draft's
     /// softmax probability of each draft (slot 0 unused).
     ids: u64,
     /// A several-sequence pass's parameters (`PARAM_WORDS`), written before its launches: the last
     /// pass that read them is done (its drafts were read back).
     params: HostMapped,
-    /// A several-sequence pass's row table (`[DRAFT_ROWS]` {lane offset, position} u64 pairs, as
+    /// A several-sequence pass's row table (`[draft_rows()]` {lane offset, position} u64 pairs, as
     /// opt_rows_kv reads it), written like `params`: the per-block launches then run once over
     /// every block.
     row_tab: HostMapped,
@@ -233,6 +247,18 @@ impl DraftState {
     ) -> Result<Self, String> {
         let cuda = device.cuda;
         let dim = device.dim;
+        // The dedup plan's row capacity is a kernel bound (OPT_MOE_PLAN_MAX). The block's routed
+        // rows are the plan's block size times its top-k; a plan that does not fit is refused here
+        // rather than by a compile-time literal.
+        let routed_rows = draft_rows() * draft_top_k();
+        if routed_rows > MOE_PLAN_MAX {
+            return Err(format!(
+                "draft: the block's {routed_rows} routed rows ({} sequences x block {} x top-{}) do not fit the dedup plan's {MOE_PLAN_MAX}",
+                MAX_SEQS,
+                draft_block(),
+                draft_top_k(),
+            ));
+        }
         let mut modules = Vec::new();
         let mut load = |file: &str, name: &'static str| -> Result<Kernel, String> {
             let (cubin, _sha) =
@@ -369,14 +395,14 @@ impl DraftState {
         };
         // The stage rings' rows (what a lane lays out), and the rows of this state's own rings:
         // fewer when lanes hold every sequence's rings instead.
-        let ring_rows = device.max_positions + BLOCK + 1;
-        let own_rows = device.sequence_rows + BLOCK + 1;
+        let ring_rows = device.max_positions + draft_block() + 1;
+        let own_rows = device.sequence_rows + draft_block() + 1;
         let latent = device.head_width as usize;
-        let mut stages = Vec::with_capacity(STAGES);
-        for stage in 0..STAGES {
-            let mut words = Vec::with_capacity(3 * EXPERTS * 2);
+        let mut stages = Vec::with_capacity(stage_count());
+        for stage in 0..stage_count() {
+            let mut words = Vec::with_capacity(3 * draft_experts() * 2);
             for leaf in ["w1", "w3", "w2"] {
-                for expert in 0..EXPERTS {
+                for expert in 0..draft_experts() {
                     let (weight, scales) = pair(
                         crate::plan::mtp_claim(stage, &format!("ffn.experts.{expert}.{leaf}"))
                             .to_owned(),
@@ -424,7 +450,7 @@ impl DraftState {
 
         // main_proj is stored row-major (it is replicated, not a B12x shard): tile it once here.
         let (proj_codes, proj_scales) = pair("mtp.0.main_proj".to_owned())?;
-        let inner = TAPS * dim;
+        let inner = draft_taps() * dim;
         let mut row_major = vec![0u8; dim * inner];
         cuda.copy_dtoh(&mut row_major, &Deviceptr(proj_codes))?;
         let tiled = sparkflash_device::arena::tile_b12x(&row_major, dim, inner)
@@ -436,7 +462,7 @@ impl DraftState {
         let vocab = crate::plan::vocab_per_rank();
         let chunks = crate::tp4_tail::chunks_per_rank();
         let markov_head = ptr(crate::plan::mtp_claim(2, "markov_head.head.weight").to_owned())?
-            + (device.tp_rank * vocab * MARKOV_RANK * 2) as u64;
+            + (device.tp_rank * vocab * markov_rank() * 2) as u64;
         let head_fp8 = if drafter.head_fp8() {
             // Whole 128-entry tiles, for the tiled copy.
             let entries = vocab.next_multiple_of(128);
@@ -453,19 +479,19 @@ impl DraftState {
             head_norm: ptr("mtp.2.norm.weight".to_owned())?,
             markov_head,
             markov_embed: ptr("mtp.2.markov_head.embed.weight".to_owned())?,
-            taps: alloc(r * TAPS * dim * 4)?,
+            taps: alloc(r * draft_taps() * dim * 4)?,
             main_x: alloc(r * dim * 4)?,
             seed_slices: alloc(r * dim * 4)?,
             main_codes: alloc(r * dim)?,
             main_scales: alloc(r * dim / 32)?,
-            h_codes: alloc(DRAFT_ROWS * TOP_K * LOCAL_INTER)?,
-            h_scales: alloc(DRAFT_ROWS * TOP_K * LOCAL_INTER / 32)?,
+            h_codes: alloc(draft_rows() * draft_top_k() * local_inter())?,
+            h_scales: alloc(draft_rows() * draft_top_k() * local_inter() / 32)?,
             moe_plan: alloc(MOE_PLAN_BYTES)?,
-            slot_val: alloc(DRAFT_ROWS * TOP_K * dim * 4)?,
-            logits: alloc(DRAFT_ROWS * vocab * 4)?,
-            ids: alloc(MAX_SEQS * IDS_STRIDE * 4)?,
+            slot_val: alloc(draft_rows() * draft_top_k() * dim * 4)?,
+            logits: alloc(draft_rows() * vocab * 4)?,
+            ids: alloc(MAX_SEQS * draft_ids_stride() * 4)?,
             params: cuda.alloc_host_mapped(PARAM_WORDS * 4, &mut 0)?,
-            row_tab: cuda.alloc_host_mapped(DRAFT_ROWS * 16, &mut 0)?,
+            row_tab: cuda.alloc_host_mapped(draft_rows() * 16, &mut 0)?,
             block_max: alloc(MAX_SEQS * chunks * 4)?,
             block_arg: alloc(MAX_SEQS * chunks * 4)?,
             block_sum: alloc(MAX_SEQS * chunks * 4)?,
@@ -497,7 +523,7 @@ impl DraftState {
         self.ring_rows
     }
 
-    /// `[BLOCK + 1]` u32: the draft's ids, the anchor then the k drafts.
+    /// `[draft_block() + 1]` u32: the draft's ids, the anchor then the k drafts.
     pub(super) fn ids(&self) -> u64 {
         self.ids
     }
@@ -527,10 +553,10 @@ fn logits_mma_rows() -> usize {
     sparkflash_model::active_profile().drafter.min_logits_rows()
 }
 
-/// [launch_opt] over the drafter's rows: up to [DRAFT_ROWS] stay on the GEMV, so a several-block
+/// [launch_opt] over the drafter's rows: up to [draft_rows()] stay on the GEMV, so a several-block
 /// pass keeps each row's bits; a bulk seed's rows take the GEMMs.
 fn draft_launch(cuda: &Cuda, kind: OptKind, args: &OptArgs) -> Result<(), String> {
-    super::rows::launch_opt_rows(cuda, kind, args, DRAFT_ROWS)
+    super::rows::launch_opt_rows(cuda, kind, args, draft_rows())
 }
 
 impl DeviceLayer<'_> {
@@ -603,7 +629,7 @@ impl DeviceLayer<'_> {
         // The taps are the rows state's (a bulk state has its own), and a bulk chunk's main rows
         // use that state's per-layer scratch (free once the layers ran).
         let taps = rows.taps.as_ref().map_or(draft.taps, |(_, taps, _)| *taps)
-            + (first * TAPS * dim * 4) as u64;
+            + (first * draft_taps() * dim * 4) as u64;
         let (main_x, main_codes, main_scales) = if rows.bulk.is_some() && n > R_MAX {
             (b.normed, b.act_codes, b.act_scales)
         } else {
@@ -636,7 +662,7 @@ impl DeviceLayer<'_> {
         };
         // The tiled weight: tile t's K-blocks at t * k_blocks * 1024 bytes, its scales at
         // t * k_blocks.
-        let k_blocks = TAPS * dim / 32;
+        let k_blocks = draft_taps() * dim / 32;
         launch_opt(
             self.cuda,
             OptKind::F32aF32o,
@@ -647,9 +673,9 @@ impl DeviceLayer<'_> {
                 ws: draft.main_proj.1 + (first_tile * k_blocks) as u64,
                 out,
                 cols: cols as u32,
-                inner: (TAPS * dim) as u32,
+                inner: (draft_taps() * dim) as u32,
                 tokens: n as u32,
-                a_tok_stride: (TAPS * dim) as u64,
+                a_tok_stride: (draft_taps() * dim) as u64,
                 out_tok_stride: out_stride as u64,
                 groups: 1,
                 a_grp_stride: 0,
@@ -751,6 +777,7 @@ impl DeviceLayer<'_> {
     /// drafter's own.
     fn stage_ring(&self, stage: &Stage, index: usize) -> (u64, u64) {
         self.draft_rings
+            .as_ref()
             .and_then(|rings| rings.get(index).copied())
             .unwrap_or((stage.ring_codes, stage.ring_scales))
     }
@@ -832,8 +859,8 @@ impl DeviceLayer<'_> {
         let b = rows.b;
         let dim = self.dim;
         let hc = self.hc_mult;
-        let n = BLOCK;
-        if d + n > self.max_positions || k == 0 || k > BLOCK {
+        let n = draft_block();
+        if d + n > self.max_positions || k == 0 || k > draft_block() {
             return Err(format!(
                 "draft: block at {d} with {k} drafts is outside the run"
             ));
@@ -909,7 +936,7 @@ impl DeviceLayer<'_> {
     }
 
     /// [Self::draft_block] for several sequences in one pass (each its own lane, at most
-    /// [MAX_SEQS], on the device exchange): block g is rows g * BLOCK.., and each step of the Markov
+    /// [MAX_SEQS], on the device exchange): block g is rows g * draft_block().., and each step of the Markov
     /// chain picks every block's draft. Every row's arithmetic is the one-block pass's, so each
     /// sequence's k drafts and probabilities are the ones it would draft alone.
     pub(super) fn draft_blocks(
@@ -930,10 +957,10 @@ impl DeviceLayer<'_> {
         if seqs == 0
             || seqs > draft.pass_seqs()
             || k == 0
-            || k > BLOCK
+            || k > draft_block()
             || blocks
                 .iter()
-                .any(|block| block.d + BLOCK > self.max_positions)
+                .any(|block| block.d + draft_block() > self.max_positions)
         {
             return Err(format!(
                 "draft: {seqs} blocks with {k} drafts are outside the pass or the run"
@@ -980,19 +1007,19 @@ impl DeviceLayer<'_> {
         };
         self.cuda.launch(
             draft.kernels.embed_blocks,
-            ((seqs * BLOCK) as u32, 1, 1),
+            ((seqs * draft_block()) as u32, 1, 1),
             (256, 1, 1),
             &[
                 gather,
                 anchors,
                 seqs as u64,
-                BLOCK as u64,
+                draft_block() as u64,
                 vocab as u64,
                 draft.noise,
                 b.stream,
                 b.pre_mix,
                 draft.ids,
-                IDS_STRIDE as u64,
+                draft_ids_stride() as u64,
                 u64::from(self.embed_table.is_some()),
             ],
         )?;
@@ -1002,12 +1029,12 @@ impl DeviceLayer<'_> {
             .map(|(g, block)| Seg {
                 lane: block.lane,
                 p0: block.d,
-                n: BLOCK,
-                row0: g * BLOCK,
+                n: draft_block(),
+                row0: g * draft_block(),
             })
             .collect();
         self.draft_stages(rows, draft, &segs)?;
-        self.draft_logits(rows, draft, tail, (seqs, k, BLOCK))?;
+        self.draft_logits(rows, draft, tail, (seqs, k, draft_block()))?;
         // [value, index, mass] per rank and block: 6 bf16 a block of the exchange.
         let slots = b.argmax_gather;
         for step in 0..k {
@@ -1018,7 +1045,7 @@ impl DeviceLayer<'_> {
                 &[
                     draft.logits,
                     draft.ids,
-                    IDS_STRIDE as u64,
+                    draft_ids_stride() as u64,
                     step as u64,
                     draft.markov_head,
                     draft.markov_embed,
@@ -1055,13 +1082,13 @@ impl DeviceLayer<'_> {
                     vocab as u64,
                     seqs as u64,
                     draft.ids,
-                    IDS_STRIDE as u64,
-                    (BLOCK + 1) as u64,
+                    draft_ids_stride() as u64,
+                    (draft_block() + 1) as u64,
                     step as u64,
                 ],
             )?;
         }
-        let mut bytes = vec![0u8; seqs * IDS_STRIDE * 4];
+        let mut bytes = vec![0u8; seqs * draft_ids_stride() * 4];
         self.cuda.copy_dtoh(&mut bytes, &Deviceptr(draft.ids))?;
         let word = |i: usize| {
             u32::from_le_bytes([
@@ -1073,11 +1100,11 @@ impl DeviceLayer<'_> {
         };
         Ok((0..seqs)
             .map(|g| {
-                let base = g * IDS_STRIDE;
+                let base = g * draft_ids_stride();
                 (
                     (1..=k).map(|i| word(base + i)).collect(),
                     (1..=k)
-                        .map(|i| f32::from_bits(word(base + BLOCK + 1 + i)))
+                        .map(|i| f32::from_bits(word(base + draft_block() + 1 + i)))
                         .collect(),
                 )
             })
@@ -1095,7 +1122,7 @@ impl DeviceLayer<'_> {
         };
         if off
             || blocks.len() < 2
-            || blocks.iter().map(|seg| seg.n).sum::<usize>() > DRAFT_ROWS
+            || blocks.iter().map(|seg| seg.n).sum::<usize>() > draft_rows()
             || blocks
                 .iter()
                 .enumerate()
@@ -1104,7 +1131,7 @@ impl DeviceLayer<'_> {
             return Ok(None);
         }
         let base = lanes.pointers(first.lane).draft;
-        let mut bytes = Vec::with_capacity(DRAFT_ROWS * 16);
+        let mut bytes = Vec::with_capacity(draft_rows() * 16);
         for seg in blocks {
             let rings = lanes.pointers(seg.lane).draft;
             let offset = rings[0].0.wrapping_sub(base[0].0);
@@ -1427,7 +1454,7 @@ impl DeviceLayer<'_> {
         };
         self.cuda.launch(
             draft.kernels.router,
-            ((EXPERTS / 8) as u32, groups as u32, 1),
+            ((draft_experts() / 8) as u32, groups as u32, 1),
             (256, 1, 1),
             &[
                 b.ffn_x,
@@ -1497,9 +1524,9 @@ impl DeviceLayer<'_> {
             },
         )
         .map_err(|error| format!("draft shared down: {error}"))?;
-        let matrix = (EXPERTS * 2 * 8) as u64;
+        let matrix = (draft_experts() * 2 * 8) as u64;
         if let Some([gate_up, down, combine]) = draft.kernels.dedup.filter(|_| n > 1) {
-            let routed = (n * TOP_K) as u32;
+            let routed = (n * draft_top_k()) as u32;
             // The grouping is hoisted here too (opt_moe_plan_sm121), like the serving path: the
             // dedup blocks read one plan instead of each rebuilding it. The in-block build stays
             // behind `diagnostics.moe_plan_in_cta=1` as the A/B arm, and the two produce the same
@@ -1519,7 +1546,7 @@ impl DeviceLayer<'_> {
                 let args: [u64; OPT_MOE_PLAN_ARGS] = [
                     b.moe_ids,
                     u64::from(routed),
-                    EXPERTS as u64,
+                    draft_experts() as u64,
                     draft.moe_plan,
                     0,
                 ];
@@ -1537,14 +1564,14 @@ impl DeviceLayer<'_> {
                 draft.h_codes,
                 draft.h_scales,
                 u64::from(routed),
-                EXPERTS as u64,
+                draft_experts() as u64,
                 u64::from(self.swiglu_limit.to_bits()),
                 draft.moe_plan,
                 plan_in,
             ];
             self.cuda.launch(
                 gate_up,
-                ((LOCAL_INTER / 32) as u32, routed, 1),
+                ((local_inter() / 32) as u32, routed, 1),
                 (128, 1, 1),
                 &args,
             )?;
@@ -1578,7 +1605,7 @@ impl DeviceLayer<'_> {
         }
         self.cuda.launch(
             draft.kernels.gate_up,
-            ((LOCAL_INTER / 32) as u32, (n * TOP_K) as u32, 1),
+            ((local_inter() / 32) as u32, (n * draft_top_k()) as u32, 1),
             (128, 1, 1),
             &[
                 stage.table,
@@ -1589,8 +1616,8 @@ impl DeviceLayer<'_> {
                 b.ffn_scales,
                 draft.h_codes,
                 draft.h_scales,
-                (n * TOP_K) as u64,
-                EXPERTS as u64,
+                (n * draft_top_k()) as u64,
+                draft_experts() as u64,
                 u64::from(self.swiglu_limit.to_bits()),
             ],
         )?;
@@ -1606,7 +1633,7 @@ impl DeviceLayer<'_> {
                 b.delta_f32,
                 b.delta_bf16,
                 n as u64,
-                EXPERTS as u64,
+                draft_experts() as u64,
                 b.shared_out,
             ],
         )
@@ -1798,7 +1825,7 @@ impl DeviceLayer<'_> {
                 (32, 1, 1),
                 &[draft.ids, u64::from(anchor)],
             )?;
-            let probs = draft.ids + ((BLOCK + 1) * 4) as u64;
+            let probs = draft.ids + ((draft_block() + 1) * 4) as u64;
             // [value, index, mass] per rank: 6 bf16 of the exchange.
             let gather = rows.b.argmax_gather;
             // The steps run as a one-sequence pass of the several-sequence kernel: its warps keep
@@ -1820,7 +1847,7 @@ impl DeviceLayer<'_> {
                     &[
                         draft.logits,
                         draft.ids,
-                        IDS_STRIDE as u64,
+                        draft_ids_stride() as u64,
                         step as u64,
                         draft.markov_head,
                         draft.markov_embed,
@@ -1872,7 +1899,7 @@ impl DeviceLayer<'_> {
                     false,
                 )?;
             }
-            let mut words = vec![0u8; (BLOCK + 1) * 8];
+            let mut words = vec![0u8; (draft_block() + 1) * 8];
             self.cuda.copy_dtoh(&mut words, &Deviceptr(draft.ids))?;
             let word = |i: usize| {
                 u32::from_le_bytes([
@@ -1885,7 +1912,7 @@ impl DeviceLayer<'_> {
             return Ok((
                 (1..=k).map(word).collect(),
                 (1..=k)
-                    .map(|i| f32::from_bits(word(BLOCK + 1 + i)))
+                    .map(|i| f32::from_bits(word(draft_block() + 1 + i)))
                     .collect(),
             ));
         }

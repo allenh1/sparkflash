@@ -29,11 +29,11 @@
 //!    the state of the positions another lane holds more of than its own, so sequences admitted
 //!    together with one system prompt prefill it once. A long prompt's chunks leave the decoders
 //!    some ticks of their own in between ([`DecodeShare`]). Chunks that end before the prompt's
-//!    last [`DECODER_WARM`] rows run only the encoder layers: the decoder layers keep nothing of
+//!    last [`decoder_warm`] rows run only the encoder layers: the decoder layers keep nothing of
 //!    their own but a window, which rebuilds over those last rows, so the logits, the drafter's
 //!    seeds and the windows decode reads are the full run's. A lane holding such skipped rows
 //!    resumes past them only where its windows are whole, else backs up into the new prompt's
-//!    last [`DECODER_WARM`] rows (SPARKFLASH_PREFILL_DECODER_SKIP=0 runs every layer);
+//!    last [`decoder_warm`] rows (SPARKFLASH_PREFILL_DECODER_SKIP=0 runs every layer);
 //! 3. runs one decode step over every decoding sequence. A lone sequence takes the speculative
 //!    step (draft, verify, accept); up to thirty-two (R_MAX / 2) take one speculative step together
 //!    (each drafts, in passes of up to sixteen, and the step's R_MAX rows go to the anchors and then
@@ -53,7 +53,7 @@
 //! and a lane's prefix is shared only up to the first image span the two prompts do not hold alike
 //! (the same place, grid and canvas key).
 
-use super::draft::{AnchorRow, BLOCK, DraftBlock, DraftState};
+use super::draft::{self, AnchorRow, DraftBlock, DraftState};
 use super::lanes::{NO_LANE, SLIDE_STEP, Seg, slide_floor};
 use super::rows::{R_MAX, RowsState};
 use super::sample::Sampler;
@@ -103,20 +103,23 @@ fn busy_exact_steps() -> usize {
         .max(1)
 }
 
-/// D7's encoder, layers 0..=20. They write every cache a row reads past its window (the compressed
-/// and index-K caches of layers 2, 8, 14 and 20) and the HSI pool the later layers select from, so
-/// every prompt row runs them. Layers 21..=39 keep only their window.
-pub(super) const ENCODER_LAYERS: usize = sparkflash_kv::layout::SWA_ENCODER_LAYERS;
+/// The layers that run every prompt row (the plan's encoder half). They write every cache a row
+/// reads past its window and the HSI pool the later layers select from, so every prompt row runs
+/// them. The rest keep only their window.
+pub(super) fn encoder_layers() -> usize {
+    crate::plan::encoder_layers()
+}
 
 /// The prompt rows at the end that run the decoder layers (SPARKFLASH_PREFILL_DECODER_SKIP=0: every
 /// row), so that the state the prompt leaves is the full run's. A decoder row whose window reaches
 /// back past the first decoder row is off, and each decoder layer carries that W - 1 rows further:
-/// the last layer's rows are the full run's from 19 (W - 1) rows on. The drafter's window (fed by
-/// layers 37-39) needs W more of them, and a resume reads both windows behind it.
-pub(super) const DECODER_WARM: usize = (sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW
-    - 1)
-    * (sparkflash_kv::layout::SWA_LAYERS - ENCODER_LAYERS)
-    + sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW;
+/// the last layer's rows are the full run's from the decoder extent on. The drafter's window needs
+/// W more of them, and a resume reads both windows behind it.
+pub(super) fn decoder_warm() -> usize {
+    let window = sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW as usize;
+    let decoder_layers = crate::plan::n_layers().saturating_sub(encoder_layers());
+    (window - 1) * decoder_layers + window
+}
 
 /// The least calibrated chain probability a draft needs for a verify row of a shared speculative
 /// step (SPARKFLASH_BATCH_SPEC_FLOOR); SPARKFLASH_BATCH_SPEC=0 gives several sequences the plain
@@ -290,7 +293,7 @@ struct Lane {
     /// The tick the lane was last given up (least recently used goes first).
     used: u64,
     /// The end of the last rows whose decoder layers a prefill skipped, 0 when none: the lane's
-    /// decoder windows are the full run's from [`DECODER_WARM`] rows past it.
+    /// decoder windows are the full run's from [`decoder_warm`] rows past it.
     skip_end: usize,
 }
 
@@ -378,7 +381,7 @@ pub(super) struct Batch<'b, 'a, 'r> {
     prefix_reuse_min_rows: usize,
     early: bool,
     exact_prefill: bool,
-    /// The prompt rows before the last [`DECODER_WARM`] stop after the encoder layers.
+    /// The prompt rows before the last [`decoder_warm`] stop after the encoder layers.
     decoder_skip: bool,
     busy_chunk: usize,
     busy_exact_steps: usize,
@@ -425,7 +428,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             Some(_) => device.engram_staging(R_MAX)?,
             None => None,
         };
-        let room = device.max_positions.saturating_sub(k + BLOCK + 2);
+        let room = device
+            .max_positions
+            .saturating_sub(k + draft::draft_block() + 2);
         Ok(Self {
             device,
             rows,
@@ -1182,7 +1187,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                     self.lanes[lane].skip_end,
                     start,
                     target,
-                    DECODER_WARM,
+                    decoder_warm(),
                 ));
             }
             // A lane whose window rings slid past the resume point cannot resume there (the rows
@@ -1198,10 +1203,15 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             // A long prompt's lane grows a tick's rows at a time as it prefills (its window rows
             // sliding back behind it), so placing it backs the first tick only; one that cannot
             // fit even alone is refused now, not at the end of its prefill.
-            let end = target + BLOCK + self.k + 2;
+            let end = target + draft::draft_block() + self.k + 2;
             let ahead = self.tick_rows(bulk, false);
             let fits = self.device.lane_fits(end, ahead);
-            if !fits || !self.grow(lane, end.min(start + ahead + BLOCK + self.k + 2))? {
+            if !fits
+                || !self.grow(
+                    lane,
+                    end.min(start + ahead + draft::draft_block() + self.k + 2),
+                )?
+            {
                 if fits && self.seqs.iter().any(|seq| !seq.done && seq.lane.is_some()) {
                     // It waits for a running sequence's memory.
                     return Ok(());
@@ -1258,17 +1268,18 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     }
 
     /// The layers prompt rows p..p+n of a prefill to `target` on `lane` (entered) run: all of them,
-    /// or the encoder's when the rows end before the last [`DECODER_WARM`]. Notes the choice on the
+    /// or the encoder's when the rows end before the last [`decoder_warm`]. Notes the choice on the
     /// lane; rows that skip the decoder layers still count as appended to their caches.
     fn prefill_layers(&mut self, lane: usize, p: usize, n: usize, target: usize) -> usize {
-        let decoder = !self.decoder_skip || runs_decoder(p, n, target, DECODER_WARM);
+        let decoder = !self.decoder_skip || runs_decoder(p, n, target, decoder_warm());
         let skip_end = &mut self.lanes[lane].skip_end;
         *skip_end = skip_end_after(*skip_end, p, n, decoder);
         if decoder {
             self.inputs.staged.len()
         } else {
-            self.device.skip_rows(ENCODER_LAYERS, p + n);
-            ENCODER_LAYERS
+            let encoder_layers = encoder_layers();
+            self.device.skip_rows(encoder_layers, p + n);
+            encoder_layers
         }
     }
 
@@ -1322,9 +1333,12 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let mut start = self.device.resume_boundary(shared.min(cap));
         let skip_end = self.lanes[src].skip_end;
         if self.decoder_skip {
-            start =
-                self.device
-                    .resume_boundary(decoder_resume(skip_end, start, target, DECODER_WARM));
+            start = self.device.resume_boundary(decoder_resume(
+                skip_end,
+                start,
+                target,
+                decoder_warm(),
+            ));
         }
         if start < seq.pos + ADOPT_MIN {
             return Ok(());
@@ -1478,7 +1492,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             .filter(|next| bulk && next.seq == id && next.p == p)
             .map_or(0, |next| next.n);
         let ahead = ahead.max(pending);
-        if !self.make_room(index, target.min(p + ahead) + BLOCK + self.k + 2)? {
+        if !self.make_room(
+            index,
+            target.min(p + ahead) + draft::draft_block() + self.k + 2,
+        )? {
             // Preempted: it waits for a lane again.
             return Ok(());
         }
@@ -1678,7 +1695,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         } else {
             1
         };
-        let split = self.decoder_skip.then_some(DECODER_WARM);
+        let split = self.decoder_skip.then_some(decoder_warm());
         let chunk = move |p: usize, slot: usize| {
             bulk_rows(
                 target - p,
@@ -1858,7 +1875,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 exchange,
             )?;
         }
-        // The chunks before the last DECODER_WARM rows stop after the encoder layers; the ones
+        // The chunks before the last decoder_warm() rows stop after the encoder layers; the ones
         // after them run every layer.
         let mut encoder_only = 0;
         for &(_, p, n, ..) in &slots {
@@ -1953,7 +1970,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let left = target - seq.pos;
         (!seq.done
             && seq.images.is_empty()
-            && whole_chunk_fits(left, budget, self.decoder_skip, DECODER_WARM, R_MAX))
+            && whole_chunk_fits(left, budget, self.decoder_skip, decoder_warm(), R_MAX))
         .then_some((left, lane, target))
     }
 
@@ -2122,13 +2139,13 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         };
         for index in decoding(&self.seqs) {
             let pos = self.seqs[index].pos;
-            if pos + self.k + BLOCK + 1 >= limit {
+            if pos + self.k + draft::draft_block() + 1 >= limit {
                 self.finish(index, DeviceFinish::Length, pos, Vec::new(), out)?;
                 continue;
             }
             // Older sequences get memory first: a step short of it preempts the newest.
             if !self.seqs[index].done {
-                self.make_room(index, pos + self.k + BLOCK + 2)?;
+                self.make_room(index, pos + self.k + draft::draft_block() + 2)?;
             }
         }
         let decoding = decoding(&self.seqs);
@@ -2179,7 +2196,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             seq.pos,
             1,
             0,
-            BLOCK + 1,
+            draft::draft_block() + 1,
             None,
         )?
         else {
@@ -2289,7 +2306,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 pos + 1,
                 depth,
                 1,
-                BLOCK + 1,
+                draft::draft_block() + 1,
                 None,
             )?,
             Some(reader) => self.device.engram_plan(
@@ -2299,7 +2316,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 pos,
                 n,
                 0,
-                BLOCK + 1,
+                draft::draft_block() + 1,
                 None,
             )?,
             None => None,
@@ -2843,7 +2860,7 @@ impl TogetherHost for Ticking<'_, '_, '_, '_> {
         let (Phase::Prefill { target, .. }, Some(lane)) = (seq.phase, seq.lane) else {
             return Ok(false);
         };
-        let positions = target + BLOCK + self.batch.k + 2;
+        let positions = target + draft::draft_block() + self.batch.k + 2;
         self.batch.grow(lane, positions)
     }
 }
@@ -2904,9 +2921,8 @@ impl Drop for Batch<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DECODER_WARM, DecodeShare, ENCODER_LAYERS, R_MAX, bulk_rows, common_prefix,
-        constraint_refusal, decoder_resume, reusable_shared, runs_decoder, share_rows,
-        skip_end_after,
+        DecodeShare, R_MAX, bulk_rows, common_prefix, constraint_refusal, decoder_resume,
+        decoder_warm, encoder_layers, reusable_shared, runs_decoder, share_rows, skip_end_after,
     };
     use sparkflash_api::constrained::TokenConstraint;
     use sparkflash_api::vocab::TokenBytes;
@@ -2966,7 +2982,8 @@ mod tests {
 
     #[test]
     fn the_rows_before_the_decoder_s_take_a_chunk_beside_them() {
-        let split = Some(DECODER_WARM);
+        let warm = decoder_warm();
+        let split = Some(warm);
         // A tick of three chunks, as the scheduler asks for them: the last of the tick gets no
         // split, so the split never adds a tick.
         let tick = |left: usize| {
@@ -2984,24 +3001,26 @@ mod tests {
         };
         // 4126 rows: the 30-row tail no longer takes a tick (and an expert pass) of its own, and
         // only the decoder's rows run its layers.
-        assert_eq!(tick(4126), [4126 - DECODER_WARM, DECODER_WARM]);
-        assert_eq!(tick(9000), [4096, 9000 - 4096 - DECODER_WARM, DECODER_WARM]);
+        assert_eq!(tick(4126), [4126 - warm, warm]);
+        assert_eq!(tick(9000), [4096, 9000 - 4096 - warm, warm]);
         // Three full chunks still fill the tick.
         assert_eq!(tick(12000), [4096, 4096, 3808]);
         // A prompt within a window or so of the decoder's rows stays one chunk.
-        assert_eq!(tick(DECODER_WARM + R_MAX), [DECODER_WARM + R_MAX]);
+        assert_eq!(tick(warm + R_MAX), [warm + R_MAX]);
         assert_eq!(tick(2000), [2000]);
     }
 
     #[test]
     fn only_the_prompt_s_last_rows_run_the_decoder_layers() {
-        // 19 decoder layers of a 128-row window, then the drafter's window.
-        assert_eq!(ENCODER_LAYERS, 21);
-        assert_eq!(DECODER_WARM, 19 * 127 + 128);
+        let warm = decoder_warm();
+        // The plan's encoder half is 21 layers of 40, leaving 19 decoder layers of a 128-row
+        // window plus the drafter's window.
+        assert_eq!(encoder_layers(), 21);
+        assert_eq!(warm, 19 * 127 + 128);
         // A 32K prompt in 4096-row chunks: the last chunk runs them.
         let target = 8 * 4096;
         let decoder: Vec<bool> = (0..8)
-            .map(|chunk| runs_decoder(chunk * 4096, 4096, target, DECODER_WARM))
+            .map(|chunk| runs_decoder(chunk * 4096, 4096, target, warm))
             .collect();
         assert_eq!(
             decoder,
@@ -3009,13 +3028,13 @@ mod tests {
         );
         // A short last chunk: the chunk before it reaches into the last rows too.
         let target = 8 * 4096 + 100;
-        assert!(runs_decoder(7 * 4096, 4096, target, DECODER_WARM));
-        assert!(!runs_decoder(6 * 4096, 4096, target, DECODER_WARM));
-        // Rows that end DECODER_WARM rows before the end skip them; one more row does not.
-        assert!(!runs_decoder(0, 1000, 1000 + DECODER_WARM, DECODER_WARM));
-        assert!(runs_decoder(0, 1001, 1000 + DECODER_WARM, DECODER_WARM));
+        assert!(runs_decoder(7 * 4096, 4096, target, warm));
+        assert!(!runs_decoder(6 * 4096, 4096, target, warm));
+        // Rows that end the warm extent before the end skip them; one more row does not.
+        assert!(!runs_decoder(0, 1000, 1000 + warm, warm));
+        assert!(runs_decoder(0, 1001, 1000 + warm, warm));
         // A prompt shorter than that runs every layer.
-        assert!(runs_decoder(0, 64, DECODER_WARM, DECODER_WARM));
+        assert!(runs_decoder(0, 64, warm, warm));
     }
 
     #[test]
@@ -3036,9 +3055,9 @@ mod tests {
 
     #[test]
     fn a_resume_reads_only_the_full_run_s_windows() {
-        let warm = DECODER_WARM;
+        let warm = decoder_warm();
         // A lane that never skipped resumes anywhere.
-        assert_eq!(decoder_resume(0, 100, 200, DECODER_WARM), 100);
+        assert_eq!(decoder_resume(0, 100, 200, warm), 100);
         // An agent's next turn: its last prompt's last rows and the decoded tokens ran every
         // layer, so the lane resumes where it stopped.
         let skip_end = 30_000;
@@ -3049,7 +3068,7 @@ mod tests {
             decoder_resume(skip_end, 10_000, 10_000 + warm, warm),
             10_000
         );
-        // A short new part after skipped rows backs up DECODER_WARM rows from the end, or to the
+        // A short new part after skipped rows backs up the warm extent from the end, or to the
         // start.
         assert_eq!(
             decoder_resume(skip_end, 20_000, 20_500, warm),
