@@ -588,11 +588,7 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
             block,
             stack_of(requirement.part),
             requirement,
-            plan.stored_format(requirement.part, block).or_else(|| {
-                architecture
-                    .stored_format(requirement.part)
-                    .map(WeightFormat::stored_format)
-            }),
+            plan.stored_format(requirement.part, block),
             shapes.get(&(stack_of(requirement.part), block, requirement.part)),
         );
     }
@@ -605,11 +601,7 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
                 block,
                 StackKind::Language,
                 requirement,
-                plan.stored_format(requirement.part, block).or_else(|| {
-                    architecture
-                        .stored_format(requirement.part)
-                        .map(WeightFormat::stored_format)
-                }),
+                plan.stored_format(requirement.part, block),
                 shapes.get(&(StackKind::Language, block, requirement.part)),
             );
         }
