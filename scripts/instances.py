@@ -43,6 +43,7 @@ IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FAMILIES = {
     "router": ("hidden", "experts", "top_k"),
     "routed": ("hidden", "intermediate", "padded", "experts", "top_k"),
+    "drafter": ("hidden", "hc", "taps", "latent", "window", "markov_rank"),
 }
 ALLOWED = {
     "source",

@@ -14,13 +14,13 @@
 #                share a cubin are compiled in one translation unit, so the released multi-symbol
 #                cubins keep their file names and symbol sets.
 #   family       the shape vocabulary: "router" needs hidden/experts/top_k, "routed" needs those
-#                plus intermediate/padded.
+#                plus intermediate/padded, "drafter" needs hidden/hc/taps/latent/window/markov_rank.
 #   catalogue    optional catalogue key; sparkflash-ops generates that part's exact shape rule
 #                from every instance carrying the same key.
 #   catalogue_intermediate
 #                optional; false keeps the key's generated rule from claiming an intermediate
 #                width (the MTP part has no such geometry even though its expert bodies take one).
-#   hidden, experts, top_k, intermediate, padded
+#   hidden, experts, top_k, intermediate, padded, hc, taps, latent, window, markov_rank
 #                the values one rank sees, as positive integers. They are passed to the compiler
 #                with the source's own suffix (u), not reinterpreted.
 #
@@ -203,6 +203,221 @@ intermediate = 576
 padded = 640
 experts = 128
 top_k = 3
+
+# --- The drafter -----------------------------------------------------------------------------
+# opt_draft is the DSpark MTP stage's own kernels. Every entry reads the same one-rank geometry:
+# 5120 hidden, four residual streams, three tap layers, the 512-wide attention latent, the 128-key
+# window and the 256-wide Markov head. The released cubin keeps all fifteen symbols.
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_taps"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_norm_quant"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_attn"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_logits"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_head_fp8"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_head_fp8t"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_logits_fp8"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_markov"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_fold_prob"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_pick_prob"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_embed_blocks"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_markov_seqs"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_markov_seqs_mma"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_fold_seqs"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_pick_seqs"
+cubin = "opt_draft_sm121"
+family = "drafter"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
+# The drafter's second-shape proof: a 4096-wide stream with two copies and two taps. It is
+# never in a released cubin and nothing loads it; it exists so a different shape compiles from the
+# same body. The latent, window and Markov rank are different as well (256, 64, 128), though the
+# tap body does not read them; the instance still names every family key.
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_taps_4096h2c2t_sm121"
+cubin = "opt_draft_taps_4096h2c2t_sm121"
+family = "drafter"
+hidden = 4096
+hc = 2
+taps = 2
+latent = 256
+window = 64
+markov_rank = 128
 
 # --- The second-shape build proof -------------------------------------------------------------
 # Not loaded by any arm and not in the baseline: a 4096-wide router with 256 experts and top-8.

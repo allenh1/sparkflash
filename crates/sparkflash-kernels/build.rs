@@ -159,8 +159,11 @@ fn read_instances() -> Vec<Instance> {
         let keys: &[&str] = match family.as_str() {
             "router" => &["hidden", "experts", "top_k"],
             "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"],
+            // The DSpark drafter's one-rank geometry: the stream width and its copies, the tap
+            // layers, the attention latent and window, and the Markov head's rank.
+            "drafter" => &["hidden", "hc", "taps", "latent", "window", "markov_rank"],
             other => panic!(
-                "sparkflash-kernels: instance {}: family {other:?} is not router or routed",
+                "sparkflash-kernels: instance {}: family {other:?} is not router, routed or drafter",
                 number + 1
             ),
         };

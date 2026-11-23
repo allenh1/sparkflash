@@ -54,9 +54,28 @@
 #include "opt_sample_sm121.cuh"
 #include "m4_activation_quant_sm121.cuh"
 
-#define OD_HIDDEN 5120u
-#define OD_HC 4u
-#define OD_TAPS 3u
+// The model shapes are instance arguments (kernels/instances.toml): the source has no default
+// width, stream count, tap count, attention latent, window or Markov rank. Each entry below is
+// gated on its own instance's macros, so the released cubin keeps exactly the symbols the forward
+// loads and a second shape can be built into a cubin of its own.
+#if     !defined(SPARK_INSTANCE_OPT_DRAFT_TAPS_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_ATTN_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_LOGITS_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_HEAD_FP8_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_HEAD_FP8T_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_LOGITS_FP8_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_MARKOV_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_FOLD_PROB_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_PICK_PROB_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_EMBED_BLOCKS_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_MARKOV_SEQS_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_MARKOV_SEQS_MMA_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_FOLD_SEQS_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_PICK_SEQS_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_TAPS_4096H2C2T_SM121_HIDDEN)
+#error "opt_draft_sm121.cu: no instance macros; every shape is an argument from kernels/instances.toml"
+#endif
 
 __device__ __forceinline__ float od_bf16lo(uint32_t w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float od_bf16hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
@@ -64,24 +83,62 @@ __device__ __forceinline__ float od_bf16hi(uint32_t w) { return __uint_as_float(
 
 
 
-// Row y: taps_all + y * 3 * 5120 + tap * 5120 = mean over the hc copies of stream_all + y * 4 * 5120.
-extern "C" __global__ void __launch_bounds__(256) opt_draft_taps(
-    const float *__restrict__ stream_all,  // [rows][4][5120]
-    float *__restrict__ taps_all,          // [rows][3][5120]
-    const uint32_t tap) {
-    OPT_PDL_ENTRY();
-    const uint32_t column = blockIdx.x * 256u + threadIdx.x;
-    if (column >= OD_HIDDEN) return;
-    const uint32_t y = blockIdx.y;
-    const float *stream = stream_all + (uint64_t)y * OD_HC * OD_HIDDEN;
-    float sum = 0.0f;
-#pragma unroll
-    for (uint32_t c = 0; c < OD_HC; ++c) sum += stream[c * OD_HIDDEN + column];
-    taps_all[(uint64_t)y * OD_TAPS * OD_HIDDEN + tap * OD_HIDDEN + column] = sum / (float)OD_HC;
-}
+// Row y: taps_all + y * TAPS * HIDDEN + tap * HIDDEN = mean over the hc copies of
+// stream_all + y * HC * HIDDEN.
+#define OD_TAPS_ENTRY(NAME)                                                                   \
+    extern "C" __global__ void __launch_bounds__(256) NAME(                                   \
+        const float *__restrict__ stream_all, float *__restrict__ taps_all,                   \
+        const uint32_t tap) {                                                                 \
+        OPT_PDL_ENTRY();                                                                      \
+        const uint32_t column = blockIdx.x * 256u + threadIdx.x;                              \
+        if (column >= OD_HIDDEN) return;                                                      \
+        const uint32_t y = blockIdx.y;                                                        \
+        const float *stream = stream_all + (uint64_t)y * OD_HC * OD_HIDDEN;                   \
+        float sum = 0.0f;                                                                     \
+        _Pragma("unroll")                                                                     \
+        for (uint32_t c = 0; c < OD_HC; ++c) sum += stream[c * OD_HIDDEN + column];           \
+        taps_all[(uint64_t)y * OD_TAPS * OD_HIDDEN + tap * OD_HIDDEN + column] =               \
+            sum / (float)OD_HC;                                                               \
+    }
 
-// Row y: x_all + y * 5120 normalised by weight, rounded to bf16, then quantised in 32-value blocks
-// (UE8M0 scale, E4M3 codes) into codes_all + y * 5120 and scales_all + y * 160.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_TAPS_HIDDEN) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_TAPS_HC) && defined(SPARK_INSTANCE_OPT_DRAFT_TAPS_TAPS)
+#define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_TAPS_HIDDEN
+#define OD_HC SPARK_INSTANCE_OPT_DRAFT_TAPS_HC
+#define OD_TAPS SPARK_INSTANCE_OPT_DRAFT_TAPS_TAPS
+static_assert(OD_HIDDEN % 32u == 0u, "the quantiser blocks are 32 wide");
+static_assert(OD_HC > 0u, "the stream count is positive");
+static_assert(OD_TAPS > 0u, "the tap count is positive");
+OD_TAPS_ENTRY(opt_draft_taps)
+#undef OD_TAPS
+#undef OD_HC
+#undef OD_HIDDEN
+#endif
+
+// The second-shape build proof (kernels/instances.toml): a 4096-wide stream with two copies and
+// two taps, into its own cubin. Nothing loads it; it shows the same body takes other values.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_TAPS_4096H2C2T_SM121_HIDDEN) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_TAPS_4096H2C2T_SM121_HC) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_TAPS_4096H2C2T_SM121_TAPS)
+#define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_TAPS_4096H2C2T_SM121_HIDDEN
+#define OD_HC SPARK_INSTANCE_OPT_DRAFT_TAPS_4096H2C2T_SM121_HC
+#define OD_TAPS SPARK_INSTANCE_OPT_DRAFT_TAPS_4096H2C2T_SM121_TAPS
+static_assert(OD_HIDDEN % 32u == 0u, "the quantiser blocks are 32 wide");
+static_assert(OD_HC > 0u, "the stream count is positive");
+static_assert(OD_TAPS > 0u, "the tap count is positive");
+OD_TAPS_ENTRY(opt_draft_taps_4096h2c2t_sm121)
+#undef OD_TAPS
+#undef OD_HC
+#undef OD_HIDDEN
+#endif
+
+#undef OD_TAPS_ENTRY
+
+// Row y: x_all + y * HIDDEN normalised by weight, rounded to bf16, then quantised in 32-value
+// blocks (UE8M0 scale, E4M3 codes) into codes_all + y * HIDDEN and scales_all + y * HIDDEN/32.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_HIDDEN)
+#define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_HIDDEN
+static_assert(OD_HIDDEN % 32u == 0u, "the quantiser blocks are 32 wide");
 extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
     const float *__restrict__ x_all,
     const __nv_bfloat16 *__restrict__ weight,
@@ -118,6 +175,8 @@ extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
         if (lane == 0u) scales[qb] = scale;
     }
 }
+#undef OD_HIDDEN
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Block attention. The stage ring is linear (slot = position): the main rows' KV at their own
@@ -127,17 +186,29 @@ extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
 // opt_rows_kv reads it: row y's {lane offset in bytes, position}) row y's block is rows
 // y - y % block_rows .. + block_rows, at its first row's position in the ring at row y's offset.
 // ---------------------------------------------------------------------------------------------
-#define OD_A_LATENT 512u
 #define OD_A_THREADS 256u
 #define OD_A_WARPS 8u
-#define OD_A_WINDOW 128u
-#define OD_A_MAX_KEYS 160u
-#define OD_A_WSCALES 16u
 
+#if defined(SPARK_INSTANCE_OPT_DRAFT_ATTN_HIDDEN) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_ATTN_HC) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_ATTN_TAPS) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_ATTN_LATENT) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_ATTN_WINDOW) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_ATTN_MARKOV_RANK)
+#define OD_A_LATENT SPARK_INSTANCE_OPT_DRAFT_ATTN_LATENT
+#define OD_A_WINDOW SPARK_INSTANCE_OPT_DRAFT_ATTN_WINDOW
+#define OD_A_WSCALES (OD_A_LATENT / 32u)
+#define OD_A_MAX_KEYS (OD_A_WINDOW + 32u)
+static_assert(OD_A_LATENT % 32u == 0u, "the KV scale blocks are 32 values");
+static_assert(OD_A_LATENT % 128u == 0u, "a lane holds latent/32 values, four to a float4");
+static_assert(OD_A_LATENT % OD_A_THREADS == 0u, "the latent divides the block");
+static_assert(OD_A_WINDOW > 0u, "the attention window is positive");
 
+// One slot of the ring: latent/32 E4M3 codes per lane, scaled by the slot's ue8m0 code.
 __device__ __forceinline__ void od_row16(const uint8_t *__restrict__ codes_base,
                                          const uint8_t *__restrict__ scales_base, uint32_t slot,
-                                         uint32_t lane, float k[16]) {
+                                         uint32_t lane, float k[OD_A_LATENT / 32u]) {
+    constexpr uint32_t VALUES = OD_A_LATENT / 32u;
     const uint4 codes = __ldg(reinterpret_cast<const uint4 *>(codes_base + (uint64_t)slot * OD_A_LATENT) + lane);
     const float scale = spark_ue8m0_decode(scales_base[(uint64_t)slot * OD_A_WSCALES + (lane >> 1)]);
     od_e4m3x4(codes.x, k);
@@ -145,7 +216,7 @@ __device__ __forceinline__ void od_row16(const uint8_t *__restrict__ codes_base,
     od_e4m3x4(codes.z, k + 8);
     od_e4m3x4(codes.w, k + 12);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) k[i] = __bfloat162float(__float2bfloat16_rn(k[i] * scale));
+    for (uint32_t i = 0; i < VALUES; ++i) k[i] = __bfloat162float(__float2bfloat16_rn(k[i] * scale));
 }
 
 extern "C" __global__ void __launch_bounds__(OD_A_THREADS) opt_draft_attn(
@@ -184,22 +255,26 @@ extern "C" __global__ void __launch_bounds__(OD_A_THREADS) opt_draft_attn(
     __shared__ __align__(16) float s_red[OD_A_WARPS][OD_A_LATENT];
     __shared__ float s_wmax[OD_A_WARPS];
     __shared__ float s_wsum[OD_A_WARPS];
-    s_q[t] = __bfloat162float(q[t]);
-    s_q[t + OD_A_THREADS] = __bfloat162float(q[t + OD_A_THREADS]);
-    __syncthreads();
-    float qv[16];
+    constexpr uint32_t CHUNKS = OD_A_LATENT / OD_A_THREADS;
+    constexpr uint32_t QUADS = OD_A_LATENT / 128u;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
+    for (uint32_t r = 0; r < CHUNKS; ++r) {
+        s_q[t + r * OD_A_THREADS] = __bfloat162float(q[t + r * OD_A_THREADS]);
+    }
+    __syncthreads();
+    float qv[OD_A_LATENT / 32u];
+#pragma unroll
+    for (uint32_t j = 0; j < QUADS; ++j) {
         const float4 v = reinterpret_cast<const float4 *>(s_q)[4u * lane + j];
         qv[4 * j] = v.x; qv[4 * j + 1] = v.y; qv[4 * j + 2] = v.z; qv[4 * j + 3] = v.w;
     }
     float wmax = -3.402823466e38f;
     for (uint32_t slot = warp; slot < keys; slot += OD_A_WARPS) {
-        float k[16];
+        float k[OD_A_LATENT / 32u];
         od_row16(codes, scales, slot, lane, k);
         float partial = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 16; ++i) partial = fmaf(qv[i], k[i], partial);
+        for (uint32_t i = 0; i < OD_A_LATENT / 32u; ++i) partial = fmaf(qv[i], k[i], partial);
         const float score = od_warp_sum(partial) * SPARK_M4_MLA_SCORE_SCALE;
         if (lane == 0u) s_scores[slot] = score;
         wmax = score > wmax ? score : wmax;
@@ -222,15 +297,15 @@ extern "C" __global__ void __launch_bounds__(OD_A_THREADS) opt_draft_attn(
 #pragma unroll
     for (uint32_t w = 0; w < OD_A_WARPS; ++w) ssum += s_wsum[w];
     ssum = ssum > 0.0f ? ssum : 1.0f;
-    float acc[16];
+    float acc[OD_A_LATENT / 32u];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+    for (uint32_t i = 0; i < OD_A_LATENT / 32u; ++i) acc[i] = 0.0f;
     for (uint32_t slot = warp; slot < keys; slot += OD_A_WARPS) {
         const float prob = s_scores[slot];
-        float v[16];
+        float v[OD_A_LATENT / 32u];
         od_row16(codes, scales, slot, lane, v);
 #pragma unroll
-        for (int i = 0; i < 16; ++i) acc[i] = fmaf(prob, v[i], acc[i]);
+        for (uint32_t i = 0; i < OD_A_LATENT / 32u; ++i) acc[i] = fmaf(prob, v[i], acc[i]);
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -239,7 +314,7 @@ extern "C" __global__ void __launch_bounds__(OD_A_THREADS) opt_draft_attn(
     }
     __syncthreads();
 #pragma unroll
-    for (uint32_t r = 0; r < 2; ++r) {
+    for (uint32_t r = 0; r < CHUNKS; ++r) {
         const uint32_t i = t + r * OD_A_THREADS;
         float total = s_red[0][i];
 #pragma unroll
@@ -247,6 +322,11 @@ extern "C" __global__ void __launch_bounds__(OD_A_THREADS) opt_draft_attn(
         out[i] = __float2bfloat16_rn(total / ssum);
     }
 }
+#undef OD_A_MAX_KEYS
+#undef OD_A_WSCALES
+#undef OD_A_WINDOW
+#undef OD_A_LATENT
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Head logits and the Markov step.
@@ -259,14 +339,16 @@ extern "C" __global__ void __launch_bounds__(OD_A_THREADS) opt_draft_attn(
 // A wider group spills, and so does opt_draft_logits with a loop over groups: it takes at most one
 // group a launch (draft.rs LOGITS_GROUP).
 #define OD_LM_GROUP 20u
-#define OD_MARKOV_RANK 256u
 
 // Warp w of block x scores vocabulary entry x * 16 + w of the slice, then every gridDim.x * 16
 // entries on, for every row: logits_all + y * vocab + entry. An entry's dot product is one warp's
 // whatever the grid, so the grid only sets how many SMs stream the head (one block per SM).
+#if defined(SPARK_INSTANCE_OPT_DRAFT_LOGITS_HIDDEN)
+#define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_LOGITS_HIDDEN
+static_assert(OD_HIDDEN % 256u == 0u, "a warp step is 256 values");
 extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits(
-    const __nv_bfloat16 *__restrict__ hidden_all,  // [rows][5120]
-    const __nv_bfloat16 *__restrict__ w,           // [vocab][5120], the rank's slice
+    const __nv_bfloat16 *__restrict__ hidden_all,  // [rows][HIDDEN]
+    const __nv_bfloat16 *__restrict__ w,           // [vocab][HIDDEN], the rank's slice
     float *__restrict__ logits_all,                // [rows][vocab]
     const uint32_t vocab,
     const uint32_t rows) {
@@ -278,25 +360,31 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits(
     const uint4 *hidden4 = reinterpret_cast<const uint4 *>(hidden_all);
     for (uint32_t entry = blockIdx.x * OD_LM_WARPS + warp; entry < vocab; entry += gridDim.x * OD_LM_WARPS) {
         const uint4 *row = reinterpret_cast<const uint4 *>(w + (uint64_t)entry * OD_HIDDEN);
-        uint4 wv[20];
+        uint4 wv[OD_HIDDEN / 256u];
 #pragma unroll
-        for (uint32_t i = 0; i < 20u; ++i) wv[i] = od_ldw(row + lane + 32u * i);
+        for (uint32_t i = 0; i < OD_HIDDEN / 256u; ++i) wv[i] = od_ldw(row + lane + 32u * i);
 #pragma unroll
         for (uint32_t y = 0; y < OD_LM_GROUP; ++y) {
             if (y < rows) {
                 const uint4 *h = hidden4 + y * per;
                 float acc = 0.0f;
 #pragma unroll
-                for (uint32_t i = 0; i < 20u; ++i) acc = od_dot8(wv[i], __ldg(h + lane + 32u * i), acc);
+                for (uint32_t i = 0; i < OD_HIDDEN / 256u; ++i) acc = od_dot8(wv[i], __ldg(h + lane + 32u * i), acc);
                 acc = od_warp_sum(acc);
                 if (lane == 0u) logits_all[(uint64_t)y * vocab + entry] = acc;
             }
         }
     }
 }
+#undef OD_HIDDEN
+#endif
 
-// Row v of w (bf16 [vocab][5120]) as E4M3 codes [vocab][5120] and ue8m0 scales [vocab][160], the
+// Row v of w (bf16 [vocab][HIDDEN]) as E4M3 codes [vocab][HIDDEN] and ue8m0 scales
+// [vocab][HIDDEN/32], the
 // activation quantiser's rule per 32-value block. Grid vocab, 256 threads (warp per block of 32).
+#if defined(SPARK_INSTANCE_OPT_DRAFT_HEAD_FP8_HIDDEN)
+#define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_HEAD_FP8_HIDDEN
+static_assert(OD_HIDDEN % 32u == 0u, "the quantiser blocks are 32 wide");
 extern "C" __global__ void __launch_bounds__(256) opt_draft_head_fp8(
     const __nv_bfloat16 *__restrict__ w, uint8_t *__restrict__ codes, uint8_t *__restrict__ scales) {
     // It reads nothing the previous kernel writes, but it must still wait: logits_fp8 waits only on
@@ -316,11 +404,16 @@ extern "C" __global__ void __launch_bounds__(256) opt_draft_head_fp8(
         if (lane == 0u) scales[row * (OD_HIDDEN / 32u) + b] = scale;
     }
 }
+#undef OD_HIDDEN
+#endif
 
 // opt_draft_head_fp8 into opt_mma_head_fp8t_f32o's tiles: entry v's codes of K block b at
 // ((v / 128 * 160 + b) * 128 + v % 128) * 32 and its scale at (v / 128 * 160 + b) * 128 + v % 128.
 // Grid vocab rounded up to 128 (the entries past the slice write zero codes and scale 0), 256
 // threads.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_HEAD_FP8T_HIDDEN)
+#define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_HEAD_FP8T_HIDDEN
+static_assert(OD_HIDDEN % 32u == 0u, "the quantiser blocks are 32 wide");
 extern "C" __global__ void __launch_bounds__(256) opt_draft_head_fp8t(
     const __nv_bfloat16 *__restrict__ w, uint8_t *__restrict__ codes, uint8_t *__restrict__ scales,
     const uint32_t vocab) {
@@ -346,6 +439,8 @@ extern "C" __global__ void __launch_bounds__(256) opt_draft_head_fp8t(
         if (lane == 0u) scales[at] = scale;
     }
 }
+#undef OD_HIDDEN
+#endif
 
 // 16 E4M3 codes dotted with 16 bf16 values (two uint4), sequential FMAs from zero.
 __device__ __forceinline__ float od_dot16_fp8(uint4 w, uint4 h0, uint4 h1) {
@@ -364,10 +459,13 @@ __device__ __forceinline__ float od_dot16_fp8(uint4 w, uint4 h0, uint4 h1) {
 
 // opt_draft_logits over the E4M3 copy (the same entry walk): lane l reads 16-byte chunks l + 32 i
 // (K-block chunk / 2).
+#if defined(SPARK_INSTANCE_OPT_DRAFT_LOGITS_FP8_HIDDEN)
+#define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_LOGITS_FP8_HIDDEN
+static_assert(OD_HIDDEN % 512u == 0u, "a lane step is 512 values");
 extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits_fp8(
-    const __nv_bfloat16 *__restrict__ hidden_all,  // [rows][5120]
-    const uint8_t *__restrict__ codes,             // [vocab][5120]
-    const uint8_t *__restrict__ scales,            // [vocab][160]
+    const __nv_bfloat16 *__restrict__ hidden_all,  // [rows][HIDDEN]
+    const uint8_t *__restrict__ codes,             // [vocab][HIDDEN]
+    const uint8_t *__restrict__ scales,            // [vocab][HIDDEN/32]
     float *__restrict__ logits_all,                // [rows][vocab]
     const uint32_t vocab,
     const uint32_t rows) {
@@ -380,12 +478,12 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits_fp8
     for (uint32_t entry = blockIdx.x * OD_LM_WARPS + warp; entry < vocab; entry += gridDim.x * OD_LM_WARPS) {
         const uint4 *row = reinterpret_cast<const uint4 *>(codes + (uint64_t)entry * OD_HIDDEN);
         const uint8_t *srow = scales + (uint64_t)entry * (OD_HIDDEN / 32u);
-        uint4 wv[10];
-        float sv[10];
+        uint4 wv[OD_HIDDEN / 512u];
+        float sv[OD_HIDDEN / 512u];
 #pragma unroll
-        for (uint32_t i = 0; i < 10u; ++i) wv[i] = od_ldw(row + lane + 32u * i);
+        for (uint32_t i = 0; i < OD_HIDDEN / 512u; ++i) wv[i] = od_ldw(row + lane + 32u * i);
 #pragma unroll
-        for (uint32_t i = 0; i < 10u; ++i) sv[i] = spark_ue8m0_decode(__ldg(srow + ((lane + 32u * i) >> 1)));
+        for (uint32_t i = 0; i < OD_HIDDEN / 512u; ++i) sv[i] = spark_ue8m0_decode(__ldg(srow + ((lane + 32u * i) >> 1)));
 #pragma unroll 1
         for (uint32_t y0 = 0; y0 < rows; y0 += OD_LM_GROUP) {
 #pragma unroll
@@ -395,7 +493,7 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits_fp8
                     const uint4 *h = hidden4 + y * per;
                     float acc = 0.0f;
 #pragma unroll
-                    for (uint32_t i = 0; i < 10u; ++i) {
+                    for (uint32_t i = 0; i < OD_HIDDEN / 512u; ++i) {
                         const uint32_t chunk = lane + 32u * i;
                         acc = fmaf(od_dot16_fp8(wv[i], __ldg(h + 2u * chunk), __ldg(h + 2u * chunk + 1u)), sv[i], acc);
                     }
@@ -406,12 +504,18 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits_fp8
         }
     }
 }
+#undef OD_HIDDEN
+#endif
 
 // Draft step i: logit(v) = logits_all[i][v] + markov_head[v] . markov_embed[ids[i]] over the rank's
 // slice (markov_head already offset to the slice's first row), block maxima over 1024 entries, ties
 // to the lower index (the reference's argmax). With inv_t != 0 the value is logit * inv_t plus the
 // serving sampler's noise at the position the step drafts (pos0 + step), opt_rows_lm_head's rule,
 // so the draft is a sample under the same noise the verify head will use.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_MARKOV_HIDDEN) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_MARKOV_MARKOV_RANK)
+#define OD_MARKOV_RANK SPARK_INSTANCE_OPT_DRAFT_MARKOV_MARKOV_RANK
+static_assert(OD_MARKOV_RANK % 256u == 0u, "a warp's dot covers 256 values");
 extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov(
     const float *__restrict__ logits_all,          // [rows][vocab]
     const uint32_t *__restrict__ ids,              // [block + 1] global ids
@@ -434,7 +538,17 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov(
     const uint32_t lane = t & 31u;
     const uint32_t warp = t >> 5;
     const uint32_t token = ids[step];
-    const uint4 e = __ldg(reinterpret_cast<const uint4 *>(markov_embed + (uint64_t)token * OD_MARKOV_RANK) + lane);
+    constexpr uint32_t SPANS = OD_MARKOV_RANK / 256u;
+    uint4 e[SPANS];
+    if constexpr (SPANS == 1u) {
+        e[0] = __ldg(reinterpret_cast<const uint4 *>(markov_embed + (uint64_t)token * OD_MARKOV_RANK) + lane);
+    } else {
+#pragma unroll
+        for (uint32_t s = 0; s < SPANS; ++s) {
+            e[s] = __ldg(reinterpret_cast<const uint4 *>(markov_embed + (uint64_t)token * OD_MARKOV_RANK) +
+                         s * 32u + lane);
+        }
+    }
     const float *logits = logits_all + (uint64_t)step * vocab;
     const uint32_t base = blockIdx.x * OD_LM_CHUNK;
     float best = -3.402823466e38f;
@@ -443,8 +557,18 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov(
     for (uint32_t r = warp; r < OD_LM_CHUNK; r += OD_LM_WARPS) {
         const uint32_t entry = base + r;
         if (entry >= vocab) break;
-        const uint4 h = od_ldw(reinterpret_cast<const uint4 *>(markov_head + (uint64_t)entry * OD_MARKOV_RANK) + lane);
-        const float bias = od_warp_sum(od_dot8(h, e, 0.0f));
+        float bias = 0.0f;
+        if constexpr (SPANS == 1u) {
+            const uint4 h = od_ldw(reinterpret_cast<const uint4 *>(markov_head + (uint64_t)entry * OD_MARKOV_RANK) + lane);
+            bias = od_warp_sum(od_dot8(h, e[0], 0.0f));
+        } else {
+#pragma unroll
+            for (uint32_t s = 0; s < SPANS; ++s) {
+                const uint4 h = od_ldw(reinterpret_cast<const uint4 *>(
+                    markov_head + (uint64_t)entry * OD_MARKOV_RANK) + s * 32u + lane);
+                bias += od_warp_sum(od_dot8(h, e[s], 0.0f));
+            }
+        }
         const float logit = logits[entry] + bias;
         const float value =
             inv_t == 0.0f ? logit : fmaf(logit, inv_t, opt_sample_gumbel(seed, pos0 + step, id_base + entry));
@@ -475,10 +599,13 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov(
         block_sum[blockIdx.x] = mass;
     }
 }
+#undef OD_MARKOV_RANK
+#endif
 
 // One step's chunk maxima and masses into this rank's slot of the gather: [value, index, mass],
 // the value and index by opt_rows_argmax_fold's rule (strictly greater replaces), the mass relative
 // to the value. One thread.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_FOLD_PROB_HIDDEN)
 extern "C" __global__ void opt_draft_fold_prob(
     const float *__restrict__ block_max,
     const uint32_t *__restrict__ block_arg,
@@ -498,10 +625,12 @@ extern "C" __global__ void opt_draft_fold_prob(
     slot[1] = index;
     slot[2] = __float_as_uint(mass);
 }
+#endif
 
 // The cross-rank pick over the exchanged slots ([world][value, index, mass]): opt_rows_argmax_pick's
 // winner (the first rank holding the greatest value), ids_out[0] its global id, probs_out[0] its
 // softmax probability over the whole vocabulary. One thread.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_PICK_PROB_HIDDEN)
 extern "C" __global__ void opt_draft_pick_prob(
     const uint32_t *__restrict__ gather,
     const uint32_t world,
@@ -523,6 +652,7 @@ extern "C" __global__ void opt_draft_pick_prob(
     ids_out[0] = index;
     probs_out[0] = 1.0f / mass;
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Several sequences' draft blocks in one pass: rows g * block .. g * block + block - 1 are sequence
@@ -540,6 +670,12 @@ extern "C" __global__ void opt_draft_pick_prob(
 // mix (opt_rows_embed_stream's rows), and the anchor lands in its sequence's ids[0]. With `table`
 // set, `gather` is the whole embedding table on this rank (`[vocab][hidden]`) and the anchor's row
 // is read from it. grid rows, block 256.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_EMBED_BLOCKS_HIDDEN) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_EMBED_BLOCKS_HC)
+#define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_EMBED_BLOCKS_HIDDEN
+#define OD_HC SPARK_INSTANCE_OPT_DRAFT_EMBED_BLOCKS_HC
+static_assert(OD_HIDDEN % 4u == 0u, "the stream copy is one float4 per quad");
+static_assert(OD_HC > 0u, "the stream count is positive");
 extern "C" __global__ void opt_draft_embed_blocks(
     const uint2 *__restrict__ gather,
     const uint32_t *__restrict__ anchors,  // [seqs]
@@ -576,11 +712,19 @@ extern "C" __global__ void opt_draft_embed_blocks(
     }
     if (threadIdx.x < OD_HC) pre_mix[r * OD_HC + threadIdx.x] = threadIdx.x == 0u ? 1.0f : 0.0f;
 }
+#undef OD_HC
+#undef OD_HIDDEN
+#endif
 
 // opt_draft_markov over `seqs` sequences, the Markov head's rows read once for all: sequence g's
 // step reads logits row g * rows_per_seq + step and the bias of its ids[step], takes its noise from
 // params + 4 g ([inv_t bits, seed lo, seed hi, pos0]) and writes its chunk value, index and mass at
 // g * gridDim.x + blockIdx.x.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_MARKOV_SEQS_HIDDEN) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_MARKOV_SEQS_MARKOV_RANK)
+#define OD_MARKOV_RANK SPARK_INSTANCE_OPT_DRAFT_MARKOV_SEQS_MARKOV_RANK
+// This body's warp dot is the whole head: 32 lanes of eight bf16 values.
+static_assert(OD_MARKOV_RANK == 256u, "one warp's dot covers the whole Markov head");
 extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seqs(
     const float *__restrict__ logits_all,          // [seqs * rows_per_seq][vocab]
     const uint32_t *__restrict__ ids,
@@ -676,6 +820,8 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seq
         block_sum[out] = mass;
     }
 }
+#undef OD_MARKOV_RANK
+#endif
 
 // opt_draft_markov_seqs with the biases on the tensor cores: the sixteen sequences' Markov
 // embeddings are the rows of A (m16n8k16 bf16, rows past `seqs` zero) and each n8 tile of the head
@@ -706,6 +852,10 @@ __device__ __forceinline__ void od_fold(float &best, uint32_t &best_i, float &su
     }
 }
 
+#if defined(SPARK_INSTANCE_OPT_DRAFT_MARKOV_SEQS_MMA_HIDDEN) && \
+    defined(SPARK_INSTANCE_OPT_DRAFT_MARKOV_SEQS_MMA_MARKOV_RANK)
+#define OD_MARKOV_RANK SPARK_INSTANCE_OPT_DRAFT_MARKOV_SEQS_MMA_MARKOV_RANK
+static_assert(OD_MARKOV_RANK % 32u == 0u, "the MMA spans are 32 values");
 extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seqs_mma(
     const float *__restrict__ logits_all,          // [seqs * rows_per_seq][vocab]
     const uint32_t *__restrict__ ids,
@@ -821,11 +971,14 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seq
         block_sum[out] = mass;
     }
 }
+#undef OD_MARKOV_RANK
+#endif
 
 // opt_draft_fold_prob for `seqs` sequences, a warp each (grid seqs, block 32, chunks <= 32): lane c
 // loads chunk c, the value and index are the first greatest (the strictly-greater-replaces fold),
 // and the mass sums the chunks in order, so each slot (slots + 3 g) holds the one-thread fold's
 // bits.
+#if defined(SPARK_INSTANCE_OPT_DRAFT_FOLD_SEQS_HIDDEN)
 extern "C" __global__ void opt_draft_fold_seqs(
     const float *__restrict__ block_max,
     const uint32_t *__restrict__ block_arg,
@@ -862,10 +1015,12 @@ extern "C" __global__ void opt_draft_fold_seqs(
         slots[3u * g + 2u] = __float_as_uint(mass);
     }
 }
+#endif
 
 // opt_draft_pick_prob for `seqs` sequences (grid seqs, one thread each): rank k's slots for
 // sequence g are gather + 3 (k * seqs + g); the pick lands in g's ids[step + 1] and its
 // probability in g's probabilities[step + 1].
+#if defined(SPARK_INSTANCE_OPT_DRAFT_PICK_SEQS_HIDDEN)
 extern "C" __global__ void opt_draft_pick_seqs(
     const uint32_t *__restrict__ gather,
     const uint32_t world,
@@ -894,3 +1049,4 @@ extern "C" __global__ void opt_draft_pick_seqs(
     mine[step + 1u] = index;
     reinterpret_cast<float *>(mine)[probs_offset + step + 1u] = 1.0f / mass;
 }
+#endif
