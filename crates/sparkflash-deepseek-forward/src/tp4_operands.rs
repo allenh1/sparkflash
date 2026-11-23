@@ -57,7 +57,6 @@ use serde_json::{Value, json};
 use sparkflash_device::resident::{
     CHAIN_LAYERS, HeaderEntry, MTP_LAYERS, OperandLayout, ResidentPlan,
 };
-use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::safetensors::{CheckpointIndex, SafeTensorsSource};
 
 /// The stage name in --run-stage.
@@ -332,7 +331,8 @@ fn evaluate(
     source: &str,
     expect_plan_hash: Option<u64>,
 ) -> Result<GateOutcome, String> {
-    let config = ModelConfig::v41_flash().map_err(|error| format!("model config: {error}"))?;
+    let config =
+        crate::plan::released_values().map_err(|error| format!("model config: {error}"))?;
     let geometry = crate::resident_weights::rank_attention_geometry(&config, rank, world)?;
     let planned: BTreeMap<&str, &sparkflash_device::resident::ResidentShard> = plan
         .shards()
@@ -501,7 +501,7 @@ fn evaluate(
         let layer0_b12x = layer0
             .iter()
             .filter(|leaf| {
-                plan.operand_layout(&format!("layers.0.attn.{leaf}.weight"))
+                plan.operand_layout(crate::plan::layer_claim(0, &format!("attn.{leaf}.weight")))
                     .is_some_and(|layout| layout.is_b12x())
             })
             .count();
@@ -714,29 +714,28 @@ mod tests {
                 ("wo_b", [5120, 8192], [160, 256]),
             ] {
                 entries.push(entry(
-                    &format!("layers.{layer}.attn.{name}.weight"),
+                    crate::plan::layer_claim(layer, &format!("attn.{name}.weight")),
                     "F8_E4M3",
                     &weight,
                 ));
                 entries.push(entry(
-                    &format!("layers.{layer}.attn.{name}.scale"),
+                    crate::plan::layer_claim(layer, &format!("attn.{name}.scale")),
                     "F8_E8M0",
                     &scale,
                 ));
             }
             entries.push(entry(
-                &format!("layers.{layer}.attn.q_norm.weight"),
+                &crate::plan::layer_claim(layer, "attn.q_norm.weight"),
                 "BF16",
                 &[1280],
             ));
             entries.push(entry(
-                &format!("layers.{layer}.attn.kv_norm.weight"),
+                &crate::plan::layer_claim(layer, "attn.kv_norm.weight"),
                 "BF16",
                 &[512],
             ));
         }
         for layer in 0..MTP_LAYERS {
-            let prefix = format!("mtp.{layer}.attn");
             for (name, weight, scale) in [
                 ("wq_a", [1280usize, 5120], [40usize, 160]),
                 ("wq_b", [32768, 1280], [1024, 40]),
@@ -745,14 +744,26 @@ mod tests {
                 ("wo_b", [5120, 8192], [160, 256]),
             ] {
                 entries.push(entry(
-                    &format!("{prefix}.{name}.weight"),
+                    crate::plan::mtp_claim(layer, &format!("attn.{name}.weight")),
                     "F8_E4M3",
                     &weight,
                 ));
-                entries.push(entry(&format!("{prefix}.{name}.scale"), "F8_E8M0", &scale));
+                entries.push(entry(
+                    crate::plan::mtp_claim(layer, &format!("attn.{name}.scale")),
+                    "F8_E8M0",
+                    &scale,
+                ));
             }
-            entries.push(entry(&format!("{prefix}.q_norm.weight"), "BF16", &[1280]));
-            entries.push(entry(&format!("{prefix}.kv_norm.weight"), "BF16", &[512]));
+            entries.push(entry(
+                crate::plan::mtp_claim(layer, "attn.q_norm.weight"),
+                "BF16",
+                &[1280],
+            ));
+            entries.push(entry(
+                crate::plan::mtp_claim(layer, "attn.kv_norm.weight"),
+                "BF16",
+                &[512],
+            ));
         }
         entries
     }

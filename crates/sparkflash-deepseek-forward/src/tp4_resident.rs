@@ -108,6 +108,27 @@ pub fn setup_for_chain(argv: &[&str]) -> Result<(RankSetup, Option<SafeTensorsSo
     Ok((setup, args.source))
 }
 
+/// The open description's plan for one chain rank, from the checkpoint the chain was given.
+///
+/// The checkpoint path is the same `--checkpoint` the resident setup read; a headers-only
+/// `--tensor-index` run has no `config.json`, so it falls back to the checkpoint the environment
+/// names and refuses when neither is present.
+///
+/// # Errors
+/// The resident arguments do not parse, no checkpoint's `config.json` is reachable, or the plan
+/// refuses the checkpoint at this world/rank.
+pub fn plan_for_chain(argv: &[&str]) -> Result<sparkflash_ops::engine_plan::EnginePlan, String> {
+    let args = ResidentArgs::parse(argv)?;
+    let dir = match args.source_path.as_deref() {
+        Some(path) => path.to_path_buf(),
+        None => crate::plan::checkpoint_dir().ok_or_else(|| {
+            "the chain was given a tensor index and no checkpoint config.json is reachable"
+                .to_string()
+        })?,
+    };
+    crate::plan::plan_from_path(&dir, args.world, args.rank)
+}
+
 /// The plan's by-name lookups, built once from the plan record.
 ///
 /// [ResidentPlan::shards] is one flat vector of every planned tensor: on the released checkpoint it
@@ -402,7 +423,7 @@ fn bind_in_arena(
     arena: &sparkflash_device::arena::ResidentArena,
     setup: &RankSetup,
     table: &std::collections::BTreeMap<String, (usize, usize)>,
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     rank: usize,
     world: usize,
     evidence_dir: &Path,
@@ -520,7 +541,7 @@ pub fn bind_device_sets_in_arena(
     setup: &RankSetup,
     source: &SafeTensorsSource,
     table: &std::collections::BTreeMap<String, (usize, usize)>,
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     rank: usize,
     world: usize,
     evidence_dir: &Path,
@@ -541,7 +562,7 @@ pub fn bind_device_sets_in_arena_with<T>(
     setup: &RankSetup,
     source: &SafeTensorsSource,
     table: &std::collections::BTreeMap<String, (usize, usize)>,
-    config: &sparkflash_engine::config::ModelConfig,
+    config: &crate::plan::ModelConfig,
     rank: usize,
     world: usize,
     evidence_dir: &Path,
@@ -569,7 +590,7 @@ pub fn bind_device_sets_in_arena(
     _setup: &RankSetup,
     _source: &SafeTensorsSource,
     _table: &std::collections::BTreeMap<String, (usize, usize)>,
-    _config: &sparkflash_engine::config::ModelConfig,
+    _config: &crate::plan::ModelConfig,
     _rank: usize,
     _world: usize,
     _evidence_dir: &Path,
@@ -584,7 +605,7 @@ pub fn bind_device_sets_in_arena_with<T>(
     _setup: &RankSetup,
     _source: &SafeTensorsSource,
     _table: &std::collections::BTreeMap<String, (usize, usize)>,
-    _config: &sparkflash_engine::config::ModelConfig,
+    _config: &crate::plan::ModelConfig,
     _rank: usize,
     _world: usize,
     _evidence_dir: &Path,

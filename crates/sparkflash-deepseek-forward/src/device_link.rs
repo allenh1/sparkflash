@@ -54,8 +54,8 @@ pub fn vision_enabled(cubins: &Path) -> bool {
 
 /// The rank that runs the vision tower: the owner of the image placeholder's embedding row.
 #[must_use]
-pub const fn tower_rank() -> usize {
-    sparkflash_vision::IMAGE_TOKEN_ID as usize / crate::tp4_tail::VOCAB_PER_RANK
+pub fn tower_rank() -> usize {
+    sparkflash_vision::IMAGE_TOKEN_ID as usize / crate::plan::vocab_per_rank()
 }
 
 /// A structured-output constraint a request carries: the schema, and the table that turns it into

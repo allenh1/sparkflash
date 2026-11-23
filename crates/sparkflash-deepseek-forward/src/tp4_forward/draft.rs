@@ -298,17 +298,26 @@ impl DraftState {
             .map_or(pass_seqs, |seqs| seqs.clamp(1, pass_seqs));
         let fold_seqs = load("opt_draft_sm121.cubin", "opt_draft_fold_seqs")?;
         let pick_seqs = load("opt_draft_sm121.cubin", "opt_draft_pick_seqs")?;
-        let router = load("opt_router_sm121.cubin", "opt_router_e128k3_sm121")?;
-        let gate_up = load("opt_moe_sm121.cubin", "opt_moe_gate_up_k3_sm121")?;
-        let down = load("opt_moe_sm121.cubin", "opt_moe_down_combine_k3_sm121")?;
+        let router = load("opt_router_sm121.cubin", crate::plan::handles().mtp_router)?;
+        let gate_up = load("opt_moe_sm121.cubin", crate::plan::handles().mtp_gate_up)?;
+        let down = load(
+            "opt_moe_sm121.cubin",
+            crate::plan::handles().mtp_down_combine,
+        )?;
         let (dedup, plan) = if drafter.moe_dedup() {
             (
                 Some([
-                    load("opt_moe_sm121.cubin", "opt_moe_gate_up_dedup_k3_sm121")?,
-                    load("opt_moe_sm121.cubin", "opt_moe_down_dedup_sm121")?,
-                    load("opt_moe_sm121.cubin", "opt_moe_combine_k3_sm121")?,
+                    load(
+                        "opt_moe_sm121.cubin",
+                        crate::plan::handles().mtp_gate_up_dedup,
+                    )?,
+                    load("opt_moe_sm121.cubin", crate::plan::handles().mtp_down_dedup)?,
+                    load("opt_moe_sm121.cubin", crate::plan::handles().mtp_combine)?,
                 ]),
-                Some(load("opt_moe_sm121.cubin", "opt_moe_plan_sm121")?),
+                Some(load(
+                    "opt_moe_sm121.cubin",
+                    crate::plan::handles().mtp_plan,
+                )?),
             )
         } else {
             (None, None)
@@ -365,11 +374,13 @@ impl DraftState {
         let latent = device.head_width as usize;
         let mut stages = Vec::with_capacity(STAGES);
         for stage in 0..STAGES {
-            let p = format!("mtp.{stage}");
             let mut words = Vec::with_capacity(3 * EXPERTS * 2);
             for leaf in ["w1", "w3", "w2"] {
                 for expert in 0..EXPERTS {
-                    let (weight, scales) = pair(format!("{p}.ffn.experts.{expert}.{leaf}"))?;
+                    let (weight, scales) = pair(
+                        crate::plan::mtp_claim(stage, &format!("ffn.experts.{expert}.{leaf}"))
+                            .to_owned(),
+                    )?;
                     words.push(weight);
                     words.push(scales);
                 }
@@ -379,31 +390,31 @@ impl DraftState {
             cuda.copy_htod(&Deviceptr(table), &table_bytes)?;
             stages.push(Stage {
                 attn_seam: [
-                    ptr(format!("{p}.hc_attn_fn"))?,
-                    ptr(format!("{p}.hc_attn_base"))?,
-                    ptr(format!("{p}.hc_attn_scale"))?,
-                    ptr(format!("{p}.attn_norm.weight"))?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_attn_fn").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_attn_base").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_attn_scale").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "attn_norm.weight").to_owned())?,
                 ],
                 ffn_seam: [
-                    ptr(format!("{p}.hc_ffn_fn"))?,
-                    ptr(format!("{p}.hc_ffn_base"))?,
-                    ptr(format!("{p}.hc_ffn_scale"))?,
-                    ptr(format!("{p}.ffn_norm.weight"))?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_ffn_fn").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_ffn_base").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "hc_ffn_scale").to_owned())?,
+                    ptr(crate::plan::mtp_claim(stage, "ffn_norm.weight").to_owned())?,
                 ],
-                wq_a: pair(format!("{p}.attn.wq_a"))?,
-                wkv: pair(format!("{p}.attn.wkv"))?,
-                q_norm: ptr(format!("{p}.attn.q_norm.weight"))?,
-                wq_b: pair(format!("{p}.attn.wq_b"))?,
-                kv_norm: ptr(format!("{p}.attn.kv_norm.weight"))?,
-                sink: ptr(format!("{p}.attn.attn_sink"))?,
-                wo_a: pair(format!("{p}.attn.wo_a"))?,
-                wo_b: pair(format!("{p}.attn.wo_b"))?,
-                gate: ptr(format!("{p}.ffn.gate.weight"))?,
-                bias: ptr(format!("{p}.ffn.gate.bias"))?,
+                wq_a: pair(crate::plan::mtp_claim(stage, "attn.wq_a").to_owned())?,
+                wkv: pair(crate::plan::mtp_claim(stage, "attn.wkv").to_owned())?,
+                q_norm: ptr(crate::plan::mtp_claim(stage, "attn.q_norm.weight").to_owned())?,
+                wq_b: pair(crate::plan::mtp_claim(stage, "attn.wq_b").to_owned())?,
+                kv_norm: ptr(crate::plan::mtp_claim(stage, "attn.kv_norm.weight").to_owned())?,
+                sink: ptr(crate::plan::mtp_claim(stage, "attn.attn_sink").to_owned())?,
+                wo_a: pair(crate::plan::mtp_claim(stage, "attn.wo_a").to_owned())?,
+                wo_b: pair(crate::plan::mtp_claim(stage, "attn.wo_b").to_owned())?,
+                gate: ptr(crate::plan::mtp_claim(stage, "ffn.gate.weight").to_owned())?,
+                bias: ptr(crate::plan::mtp_claim(stage, "ffn.gate.bias").to_owned())?,
                 shared: [
-                    pair(format!("{p}.ffn.shared_experts.w1"))?,
-                    pair(format!("{p}.ffn.shared_experts.w3"))?,
-                    pair(format!("{p}.ffn.shared_experts.w2"))?,
+                    pair(crate::plan::mtp_claim(stage, "ffn.shared_experts.w1").to_owned())?,
+                    pair(crate::plan::mtp_claim(stage, "ffn.shared_experts.w3").to_owned())?,
+                    pair(crate::plan::mtp_claim(stage, "ffn.shared_experts.w2").to_owned())?,
                 ],
                 table,
                 ring_codes: alloc(own_rows * latent)?,
@@ -422,9 +433,9 @@ impl DraftState {
         let main_proj_tiled = alloc(tiled.len())?;
         cuda.copy_htod(&Deviceptr(main_proj_tiled), &tiled)?;
 
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
-        let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
-        let markov_head = ptr("mtp.2.markov_head.head.weight".to_owned())?
+        let vocab = crate::plan::vocab_per_rank();
+        let chunks = crate::tp4_tail::chunks_per_rank();
+        let markov_head = ptr(crate::plan::mtp_claim(2, "markov_head.head.weight").to_owned())?
             + (device.tp_rank * vocab * MARKOV_RANK * 2) as u64;
         let head_fp8 = if drafter.head_fp8() {
             // Whole 128-entry tiles, for the tiled copy.
@@ -928,8 +939,8 @@ impl DeviceLayer<'_> {
                 "draft: {seqs} blocks with {k} drafts are outside the pass or the run"
             ));
         }
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
-        let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
+        let vocab = crate::plan::vocab_per_rank();
+        let chunks = crate::tp4_tail::chunks_per_rank();
         let mut words = [0u32; PARAM_WORDS];
         for (g, block) in blocks.iter().enumerate() {
             let (inv_t, seed) = block.sampler.draft_noise();
@@ -1635,7 +1646,7 @@ impl DeviceLayer<'_> {
             step_seq: 0,
         };
         sparkflash_kernels::rmsnorm_launch::launch(self.cuda, self.row_norm.1, &norm)?;
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
+        let vocab = crate::plan::vocab_per_rank();
         if let (Some((codes, scales)), Some((quant, mma))) =
             (draft.head_fp8, draft.kernels.head_tiled)
         {
@@ -1774,8 +1785,8 @@ impl DeviceLayer<'_> {
         (sampler, index0): (&super::sample::Sampler, usize),
     ) -> Result<Drafts, String> {
         self.draft_logits(rows, draft, tail, (1, k, 0))?;
-        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
-        let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
+        let vocab = crate::plan::vocab_per_rank();
+        let chunks = crate::tp4_tail::chunks_per_rank();
         let (inv_t, seed) = sampler.draft_noise();
         if let Some((world, rank)) = self.device_exchange() {
             // The whole Markov chain stays on the stream: each step's pick writes ids[step + 1],

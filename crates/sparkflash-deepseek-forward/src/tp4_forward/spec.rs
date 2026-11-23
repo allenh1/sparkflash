@@ -43,7 +43,7 @@ const SPEC_EMBED_SEQ: u64 = u64::MAX - 0xE_0000;
 
 /// What the spec loop needs from the forward loop's scope.
 pub(super) struct SpecInputs<'s> {
-    pub(super) config: &'s sparkflash_engine::config::ModelConfig,
+    pub(super) config: &'s crate::plan::ModelConfig,
     pub(super) tail: &'s crate::tp4_tail::TailStage,
     pub(super) transport: &'s dyn sparkflash_comm::transport::Transport,
     pub(super) engram: Option<&'s EngramReader>,
@@ -80,8 +80,8 @@ pub(super) fn gather_rows(
     tokens: &[u32],
 ) -> Result<Vec<f32>, String> {
     let n = tokens.len();
-    let row_bytes = HIDDEN * 2;
-    let mut local = vec![0u16; n * HIDDEN];
+    let row_bytes = crate::plan::hidden() * 2;
+    let mut local = vec![0u16; n * crate::plan::hidden()];
     let mut bytes = vec![0u8; row_bytes];
     for (i, &token) in tokens.iter().enumerate() {
         let (owner, row) = embedding_location(token);
@@ -90,7 +90,7 @@ pub(super) fn gather_rows(
                 &mut bytes,
                 &Deviceptr(inputs.embed.0 + (row * row_bytes) as u64),
             )?;
-            for (slot, word) in local[i * HIDDEN..(i + 1) * HIDDEN]
+            for (slot, word) in local[i * crate::plan::hidden()..(i + 1) * crate::plan::hidden()]
                 .iter_mut()
                 .zip(bytes.as_chunks::<2>().0)
             {
@@ -98,7 +98,7 @@ pub(super) fn gather_rows(
             }
         }
     }
-    let mut gathered = vec![0u16; inputs.world * n * HIDDEN];
+    let mut gathered = vec![0u16; inputs.world * n * crate::plan::hidden()];
     let call = counter.get();
     counter.set(call.wrapping_add(1));
     inputs
@@ -109,12 +109,12 @@ pub(super) fn gather_rows(
             SPEC_EMBED_SEQ.wrapping_sub(call % 0x1_0000),
         )
         .map_err(|error| format!("spec embedding all-gather: {error}"))?;
-    let mut out = Vec::with_capacity(n * HIDDEN);
+    let mut out = Vec::with_capacity(n * crate::plan::hidden());
     for (i, &token) in tokens.iter().enumerate() {
         let (owner, _) = embedding_location(token);
-        let at = (owner * n + i) * HIDDEN;
+        let at = (owner * n + i) * crate::plan::hidden();
         out.extend(
-            gathered[at..at + HIDDEN]
+            gathered[at..at + crate::plan::hidden()]
                 .iter()
                 .map(|&word| f32::from_bits(u32::from(word) << 16)),
         );
@@ -175,7 +175,7 @@ const ENGRAM_URING_ENTRIES: u32 = 512;
 
 impl EngramReader {
     pub(super) fn open(
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         source: &dyn sparkflash_engine::weights::WeightSource,
         tokenizer: &Path,
     ) -> Result<Self, String> {
@@ -241,8 +241,9 @@ impl EngramReader {
         };
         let mut slots = Vec::new();
         for layer in &config.engram_layer_ids {
-            let (codes, codes_at) = region(format!("layers.{layer}.engram.embed.weight"))?;
-            let (scales, scales_at) = region(format!("layers.{layer}.engram.embed.scale"))?;
+            let (codes, codes_at) = region(crate::plan::layer_claim(*layer, "engram.embed.weight").to_owned())?;
+            let (scales, scales_at) =
+                region(crate::plan::layer_claim(*layer, "engram.embed.scale").to_owned())?;
             slots.push((codes, codes_at, scales, scales_at));
         }
         Ok(Self {
@@ -1150,7 +1151,7 @@ impl DeviceLayer<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn engram_plan<'r>(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         reader: &'r EngramReader,
         history: &[u32],
         p0: usize,
@@ -1373,7 +1374,7 @@ impl DeviceLayer<'_> {
     /// The Engram entries of rows p0..p0+n, read and uploaded before returning.
     pub(super) fn engram_set_rows(
         &mut self,
-        config: &sparkflash_engine::config::ModelConfig,
+        config: &crate::plan::ModelConfig,
         reader: &EngramReader,
         history: &[u32],
         p0: usize,

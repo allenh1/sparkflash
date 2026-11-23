@@ -41,14 +41,22 @@ pub const SCHEMA: &str = "sparkflash-tp4-token/1";
 pub const STAGE: &str = "tp4-chain";
 /// The loop step every envelope names (the C4-token step of the campaign).
 pub const LOOP_STEP: &str = "C4-token";
-/// The released vocabulary the four ranks share.
-pub const VOCAB: usize = 129_280;
-/// The rank-sharded head width per rank (`VOCAB / 4`), read back for a sanity check.
-pub const VOCAB_PER_RANK: usize = VOCAB / 4;
-/// The four-rank arm's reduce count per decode step: two per layer over 40 layers.
-pub const REDUCE_CALLS_PER_STEP: usize = 80;
+/// The vocabulary the four ranks share, read at open from the plan.
+#[must_use]
+pub fn vocab() -> usize {
+    crate::plan::vocab()
+}
+/// The rank-sharded head width per rank (`vocab() / 4`), read back for a sanity check.
+/// The four-rank arm's reduce count per decode step, computed at open from the layer count.
+#[must_use]
+pub fn reduce_calls_per_step() -> usize {
+    2 * crate::plan::description().values().n_layers
+}
 /// The frozen stride of one position's logits block in the dump sidecar.
-pub const DUMP_BLOCK_BYTES: usize = VOCAB * 4;
+#[must_use]
+pub fn dump_block_bytes() -> usize {
+    vocab() * 4
+}
 
 /// How the forward/token stage describes itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,12 +128,13 @@ impl Tokens {
     /// Appends one position's consensus values.
     ///
     /// # Errors
-    /// A logits vector whose length is not [`VOCAB`], or a non-increasing position.
+    /// A logits vector whose length is not [`vocab()`], or a non-increasing position.
     pub fn push(&mut self, position: usize, logits: &[f32], token: u32) -> Result<(), String> {
-        if logits.len() != VOCAB {
+        if logits.len() != vocab() {
             return Err(format!(
-                "token evidence: position {position} has {} logits, expected {VOCAB}",
-                logits.len()
+                "token evidence: position {position} has {} logits, expected {}",
+                logits.len(),
+                vocab()
             ));
         }
         if let Some(last) = self.positions.last()
@@ -202,7 +211,7 @@ impl Default for Head {
     fn default() -> Self {
         Self {
             rule: "rank-sharded head rows all-gathered over tcp; every rank argmaxes the full vector; rank0 dumps full logits".to_string(),
-            vocab: VOCAB,
+            vocab: vocab(),
             tie_break: "lowest token id".to_string(),
         }
     }
@@ -388,8 +397,8 @@ impl TokenEnvelope {
                 self.rank, self.world
             ));
         }
-        if self.head.vocab != VOCAB {
-            return Err(format!("head vocab {} is not {VOCAB}", self.head.vocab));
+        if self.head.vocab != vocab() {
+            return Err(format!("head vocab {} is not {}", self.head.vocab, vocab()));
         }
         match self.forward {
             ForwardState::Run => self.validate_run(),
@@ -457,7 +466,7 @@ impl TokenEnvelope {
             // Ranks 1-3 may publish the same consensus ids without a dump: qa-lead's consumer
             // allows replica dumps to be omitted (their sidecars, when present, must be identical).
             if self.error.is_some()
-                || self.reduce_calls_per_step != REDUCE_CALLS_PER_STEP
+                || self.reduce_calls_per_step != reduce_calls_per_step()
                 || self.launch_census["routed_experts_down"] != serde_json::Value::Bool(true)
             {
                 return Err("forward=run replica without a dump still needs reduce_calls_per_step=80, routed_experts_down=true and no error".to_string());
@@ -467,8 +476,8 @@ impl TokenEnvelope {
         if dump.dtype != "f32-le" {
             return Err(format!("dump dtype {} is not f32-le", dump.dtype));
         }
-        if dump.vocab != VOCAB {
-            return Err(format!("dump vocab {} is not {VOCAB}", dump.vocab));
+        if dump.vocab != vocab() {
+            return Err(format!("dump vocab {} is not {}", dump.vocab, vocab()));
         }
         // A lean-head run (SPARKFLASH_LEAN_HEAD=1) dumps only the heads that read their logits
         // back: a subset of the token block's positions, never a position outside it.
@@ -500,10 +509,11 @@ impl TokenEnvelope {
         if dump.sha256.len() != 64 || dump.bin_sha256.len() != 64 {
             return Err("dump hashes are not 64-hex strings".to_string());
         }
-        if self.reduce_calls_per_step != REDUCE_CALLS_PER_STEP {
+        if self.reduce_calls_per_step != reduce_calls_per_step() {
             return Err(format!(
-                "reduce_calls_per_step {} is not {REDUCE_CALLS_PER_STEP}",
-                self.reduce_calls_per_step
+                "reduce_calls_per_step {} is not {}",
+                self.reduce_calls_per_step,
+                reduce_calls_per_step()
             ));
         }
         if self.launch_census["routed_experts_down"] != serde_json::Value::Bool(true) {
@@ -562,7 +572,7 @@ impl TokenEnvelope {
 /// meaning; the sidecar is the full f32-le vocabulary per position.
 ///
 /// # Errors
-/// Empty input, a logits vector whose length is not [`VOCAB`], or a write failure.
+/// Empty input, a logits vector whose length is not [`vocab()`], or a write failure.
 pub fn write_dump(
     dir: &Path,
     rank: usize,
@@ -597,11 +607,12 @@ pub fn write_dump(
     let mut rows: Vec<logits_dump::ComparedRow> = Vec::with_capacity(positions.len());
     let mut outputs = Vec::with_capacity(positions.len());
     for (index, logits) in logits.iter().enumerate() {
-        if logits.len() != VOCAB {
+        if logits.len() != vocab() {
             return Err(format!(
-                "token dump: position {} has {} logits, expected {VOCAB}",
+                "token dump: position {} has {} logits, expected {}",
                 positions[index],
-                logits.len()
+                logits.len(),
+                vocab()
             ));
         }
         let token = tokens[index];
@@ -642,7 +653,7 @@ pub fn write_dump(
         sha256,
         bin_sha256,
         dtype: "f32-le".to_string(),
-        vocab: VOCAB,
+        vocab: vocab(),
         positions: positions.to_vec(),
         rows: written,
     })
@@ -663,17 +674,18 @@ pub fn argmax_of(logits: &[f32]) -> usize {
 /// The SHA-256 of a full-vocabulary f32-le vector, matching the dump sidecar's encoding.
 ///
 /// # Errors
-/// A vector whose length is not [`VOCAB`].
+/// A vector whose length is not [`vocab()`].
 pub fn logits_sha256(logits: &[f32]) -> Result<String, String> {
     use sha2::{Digest, Sha256};
-    if logits.len() != VOCAB {
+    if logits.len() != vocab() {
         return Err(format!(
-            "logits sha256: {} values, expected {VOCAB}",
-            logits.len()
+            "logits sha256: {} values, expected {}",
+            logits.len(),
+            vocab()
         ));
     }
     let mut hasher = Sha256::new();
-    let mut block = Vec::with_capacity(DUMP_BLOCK_BYTES);
+    let mut block = Vec::with_capacity(dump_block_bytes());
     for value in logits {
         block.extend_from_slice(&value.to_le_bytes());
     }
@@ -686,7 +698,7 @@ mod tests {
     use super::*;
 
     fn synthetic_logits(winner: usize, second: usize) -> Vec<f32> {
-        let mut logits = vec![-1.0f32; VOCAB];
+        let mut logits = vec![-1.0f32; vocab()];
         logits[winner] = 7.5;
         logits[second] = 6.0;
         logits
@@ -714,7 +726,7 @@ mod tests {
             tokens_block,
             step_ms,
             vec![41.0, 29.0],
-            REDUCE_CALLS_PER_STEP,
+            reduce_calls_per_step(),
             dump,
             serde_json::json!({
                 "routed_experts_down": true,
@@ -784,13 +796,13 @@ mod tests {
         assert!((envelope.tokens.top1_margins[0] - 1.5).abs() < 1e-6);
         let dump = envelope.logits_dump.as_ref().expect("dump");
         assert_eq!(dump.dtype, "f32-le");
-        assert_eq!(dump.vocab, VOCAB);
+        assert_eq!(dump.vocab, vocab());
         assert_eq!(dump.rows, 2);
         assert_eq!(dump.positions, vec![129, 130]);
         assert!(dump.bin.ends_with(".jsonl.bin"));
         assert_eq!(
             std::fs::read(&dump.bin).expect("bin").len(),
-            2 * DUMP_BLOCK_BYTES
+            2 * dump_block_bytes()
         );
         // The frozen consumer's checks, run here so the writer-side validation cannot drift.
         let text = std::fs::read_to_string(&dump.path).expect("jsonl");
@@ -802,7 +814,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let mut offset = 0usize;
         for (index, row) in rows.iter().enumerate() {
-            assert_eq!(row["vocab"], VOCAB);
+            assert_eq!(row["vocab"], vocab());
             assert_eq!(row["logits_offset"], offset);
             assert_eq!(row["position"], serde_json::json!(129 + index));
             assert_eq!(
@@ -811,7 +823,7 @@ mod tests {
                     .expect("basename"),
                 Path::new(&dump.bin).file_name().expect("basename")
             );
-            offset += DUMP_BLOCK_BYTES;
+            offset += dump_block_bytes();
         }
     }
 
@@ -955,7 +967,7 @@ mod tests {
         assert!(rows[0]["fixture_id"].is_null());
         // No reference id, no equality: a replay row cannot claim the reference's token.
         assert_eq!(rows[0]["exact_token_equal"], false);
-        assert_eq!(rows[0]["vocab"], VOCAB);
+        assert_eq!(rows[0]["vocab"], vocab());
         assert_eq!(rows[0]["logits_offset"], 0);
         assert_eq!(
             dump.bin,
@@ -963,7 +975,7 @@ mod tests {
             "the sidecar is the dump path plus .bin"
         );
         let bin = std::fs::read(&dump.bin).expect("bin");
-        assert_eq!(bin.len(), DUMP_BLOCK_BYTES);
+        assert_eq!(bin.len(), dump_block_bytes());
         assert_eq!(
             f32::from_le_bytes(bin[42 * 4..43 * 4].try_into().expect("four bytes")),
             7.5
@@ -1020,9 +1032,9 @@ mod consumer_fixture_tests {
     use super::*;
 
     fn logits_with(winner: usize) -> Vec<f32> {
-        let mut logits = vec![-2.0f32; VOCAB];
+        let mut logits = vec![-2.0f32; vocab()];
         logits[winner] = 9.5;
-        logits[(winner + 1) % VOCAB] = 8.0;
+        logits[(winner + 1) % vocab()] = 8.0;
         logits
     }
 
@@ -1061,7 +1073,7 @@ mod consumer_fixture_tests {
                 consensus.clone(),
                 StepMs::from_samples(vec![41.0, 22.0]),
                 vec![47.8, 29.0],
-                REDUCE_CALLS_PER_STEP,
+                reduce_calls_per_step(),
                 if rank == 0 {
                     dump.clone()
                 } else {
@@ -1073,7 +1085,7 @@ mod consumer_fixture_tests {
                         sha256: String::new(),
                         bin_sha256: String::new(),
                         dtype: "f32-le".to_string(),
-                        vocab: VOCAB,
+                        vocab: vocab(),
                         positions: positions.to_vec(),
                         rows: positions.len(),
                     }
@@ -1109,7 +1121,7 @@ mod consumer_fixture_tests {
         let dump = envelopes[0].logits_dump.as_ref().expect("dump");
         assert_eq!(
             std::fs::read(&dump.bin).expect("bin").len(),
-            positions.len() * DUMP_BLOCK_BYTES
+            positions.len() * dump_block_bytes()
         );
     }
 
@@ -1128,7 +1140,7 @@ mod consumer_fixture_tests {
             tokens,
             StepMs::from_samples(vec![20.0]),
             vec![20.0],
-            REDUCE_CALLS_PER_STEP,
+            reduce_calls_per_step(),
             dump,
             serde_json::json!({"routed_experts_down": true}),
         );

@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use sparkflash_engine::config::ModelConfig;
+use crate::plan::ModelConfig;
 use sparkflash_engine::forward::attention::{
     AttentionProjectionBackend, AttentionSeamStep, AttnState, attention_seam_step_with_backend,
     reset_shared_attention,
@@ -49,11 +49,18 @@ use sparkflash_engine::weights::{WeightError, WeightSource};
 use sparkflash_kv::fp4::quantize_main_kv;
 
 /// The MLA latent width: one window row, one store row, one head's output.
-pub const MLA_LATENT: usize = 512;
 /// One engine window row's E4M3FN codes: one byte per latent channel.
-pub const WINDOW_CODE_BYTES: usize = MLA_LATENT;
+/// One engine window row's E4M3FN codes, computed at open from the plan.
+#[must_use]
+pub fn window_code_bytes() -> usize {
+    crate::plan::mla_latent()
+}
 /// One engine window row's E8M0 scales: one byte per 32-channel block.
-pub const WINDOW_SCALE_BYTES: usize = MLA_LATENT / 32;
+/// One engine window row's E8M0 scales, computed at open from the plan.
+#[must_use]
+pub fn window_scale_bytes() -> usize {
+    crate::plan::mla_latent() / 32
+}
 /// One compressed store row's packed FP4 codes: two codes per byte.
 pub const STORE_CODE_BYTES: usize = 256;
 /// One compressed store row's E4M3 group scales: one byte per 16-channel block.
@@ -227,7 +234,7 @@ impl ReferenceAttention {
         attention_seam_step_with_backend(
             &self.config,
             layer,
-            &format!("layers.{layer}"),
+            crate::plan::layer_root(layer),
             x,
             q_latent,
             position,
@@ -279,9 +286,9 @@ impl ReferenceAttention {
 pub struct StagedAttention {
     /// The window rows staged, oldest first.
     pub window_rows: usize,
-    /// The window codes: window_rows rows of [WINDOW_CODE_BYTES].
+    /// The window codes: window_rows rows of [window_code_bytes()].
     pub window_codes: Vec<u8>,
-    /// The window scales: window_rows rows of [WINDOW_SCALE_BYTES].
+    /// The window scales: window_rows rows of [window_scale_bytes()].
     pub window_scales: Vec<u8>,
     /// The compressed ids staged, ascending, as the kernel's selected values (expanded rows).
     pub selected: Vec<u32>,
@@ -330,14 +337,16 @@ pub fn stage_attention(
             ));
         }
     }
-    let mut window_codes = Vec::with_capacity(window.len() * WINDOW_CODE_BYTES);
-    let mut window_scales = Vec::with_capacity(window.len() * WINDOW_SCALE_BYTES);
+    let mut window_codes = Vec::with_capacity(window.len() * window_code_bytes());
+    let mut window_scales = Vec::with_capacity(window.len() * window_scale_bytes());
     for (index, (codes, scales)) in window.iter().enumerate() {
-        if codes.len() != WINDOW_CODE_BYTES || scales.len() != WINDOW_SCALE_BYTES {
+        if codes.len() != window_code_bytes() || scales.len() != window_scale_bytes() {
             return Err(format!(
-                "attention staging: window row {index} is {} code bytes and {} scale bytes, the engine row is {WINDOW_CODE_BYTES} and {WINDOW_SCALE_BYTES}",
+                "attention staging: window row {index} is {} code bytes and {} scale bytes, the engine row is {} and {}",
                 codes.len(),
-                scales.len()
+                scales.len(),
+                window_code_bytes(),
+                window_scale_bytes()
             ));
         }
         window_codes.extend_from_slice(codes);
@@ -367,11 +376,11 @@ pub fn stage_attention(
         }
         let values = seam
             .compressed_rows
-            .get(row * MLA_LATENT..(row + 1) * MLA_LATENT)
+            .get(row * crate::plan::mla_latent()..(row + 1) * crate::plan::mla_latent())
             .ok_or_else(|| {
                 format!(
                     "attention staging: compressed id {id} needs row {row} of {} stored",
-                    seam.compressed_rows.len() / MLA_LATENT
+                    seam.compressed_rows.len() / crate::plan::mla_latent()
                 )
             })?;
         if !values.iter().all(|value| value.is_finite()) {
@@ -508,14 +517,16 @@ impl AttentionStaging {
         let mut window_scales = std::mem::take(&mut self.window_scales);
         window_codes.clear();
         window_scales.clear();
-        window_codes.reserve(window.len() * WINDOW_CODE_BYTES);
-        window_scales.reserve(window.len() * WINDOW_SCALE_BYTES);
+        window_codes.reserve(window.len() * window_code_bytes());
+        window_scales.reserve(window.len() * window_scale_bytes());
         for (index, (codes, scales)) in window.iter().enumerate() {
-            if codes.len() != WINDOW_CODE_BYTES || scales.len() != WINDOW_SCALE_BYTES {
+            if codes.len() != window_code_bytes() || scales.len() != window_scale_bytes() {
                 return Err(format!(
-                    "attention staging: window row {index} is {} code bytes and {} scale bytes, the engine row is {WINDOW_CODE_BYTES} and {WINDOW_SCALE_BYTES}",
+                    "attention staging: window row {index} is {} code bytes and {} scale bytes, the engine row is {} and {}",
                     codes.len(),
-                    scales.len()
+                    scales.len(),
+                    window_code_bytes(),
+                    window_scale_bytes()
                 ));
             }
             window_codes.extend_from_slice(codes);
@@ -559,11 +570,11 @@ impl AttentionStaging {
             }
             let values = seam
                 .compressed_rows
-                .get(row * MLA_LATENT..(row + 1) * MLA_LATENT)
+                .get(row * crate::plan::mla_latent()..(row + 1) * crate::plan::mla_latent())
                 .ok_or_else(|| {
                     format!(
                         "attention staging: compressed id {id} needs row {row} of {} stored",
-                        seam.compressed_rows.len() / MLA_LATENT
+                        seam.compressed_rows.len() / crate::plan::mla_latent()
                     )
                 })?;
             if !values.iter().all(|value| value.is_finite()) {
@@ -690,12 +701,13 @@ pub fn twin_out(
     device_out: &[f32],
 ) -> Result<TwinStats, String> {
     let heads = sink.len();
-    let width = heads * MLA_LATENT;
+    let width = heads * crate::plan::mla_latent();
     if q.len() != width || device_out.len() != width {
         return Err(format!(
-            "attention twin: q {} and out {} values for {heads} heads of {MLA_LATENT}",
+            "attention twin: q {} and out {} values for {heads} heads of {}",
             q.len(),
-            device_out.len()
+            device_out.len(),
+            crate::plan::mla_latent()
         ));
     }
     if q.iter().chain(device_out).any(|value| !value.is_finite()) {
@@ -705,7 +717,7 @@ pub fn twin_out(
     let mut max_abs = 0f32;
     for head in 0..heads {
         let head_out = sparkflash_kernels::mla_ref::attention_with_sink_union(
-            &q[head * MLA_LATENT..(head + 1) * MLA_LATENT],
+            &q[head * crate::plan::mla_latent()..(head + 1) * crate::plan::mla_latent()],
             &staged.window_codes,
             &staged.window_scales,
             staged.window_rows,
@@ -716,14 +728,15 @@ pub fn twin_out(
                 .map_err(|_| format!("attention twin: position {position} does not fit a u32"))?,
             sink[head],
         );
-        if head_out.len() != MLA_LATENT {
+        if head_out.len() != crate::plan::mla_latent() {
             return Err(format!(
-                "attention twin: head {head} reference is {} values, one head is {MLA_LATENT}",
-                head_out.len()
+                "attention twin: head {head} reference is {} values, one head is {}",
+                head_out.len(),
+                crate::plan::mla_latent()
             ));
         }
-        let start = head * MLA_LATENT;
-        for slot in 0..MLA_LATENT {
+        let start = head * crate::plan::mla_latent();
+        for slot in 0..crate::plan::mla_latent() {
             let diff = (device_out[start + slot] - head_out[slot]).abs();
             if diff > max_abs {
                 max_abs = diff;
@@ -769,7 +782,7 @@ mod tests {
     }
 
     fn encoded_row(seed: u32) -> (Vec<u8>, Vec<u8>) {
-        let row = values(MLA_LATENT, seed);
+        let row = values(crate::plan::mla_latent(), seed);
         let encoded = engine_window_row(&row).expect("window row");
         (encoded.codes, encoded.scales)
     }
@@ -777,7 +790,7 @@ mod tests {
     /// One stored compressed row per index, as the seam would hand them over.
     fn stored_rows(count: usize, seed: u32) -> Vec<f32> {
         (0..count)
-            .flat_map(|index| values(MLA_LATENT, seed + index as u32))
+            .flat_map(|index| values(crate::plan::mla_latent(), seed + index as u32))
             .collect()
     }
 
@@ -802,17 +815,17 @@ mod tests {
         let window: Vec<(Vec<u8>, Vec<u8>)> = (0..3).map(encoded_row).collect();
         let staged = stage_attention(&window, &seam(0, 3, 3, &[], &[])).expect("staged");
         assert_eq!(staged.window_rows, 3);
-        assert_eq!(staged.window_codes.len(), 3 * WINDOW_CODE_BYTES);
-        assert_eq!(staged.window_scales.len(), 3 * WINDOW_SCALE_BYTES);
+        assert_eq!(staged.window_codes.len(), 3 * window_code_bytes());
+        assert_eq!(staged.window_scales.len(), 3 * window_scale_bytes());
         for (row, (codes, scales)) in window.iter().enumerate() {
-            let start = row * WINDOW_CODE_BYTES;
+            let start = row * window_code_bytes();
             assert_eq!(
-                &staged.window_codes[start..start + WINDOW_CODE_BYTES],
+                &staged.window_codes[start..start + window_code_bytes()],
                 codes
             );
-            let start = row * WINDOW_SCALE_BYTES;
+            let start = row * window_scale_bytes();
             assert_eq!(
-                &staged.window_scales[start..start + WINDOW_SCALE_BYTES],
+                &staged.window_scales[start..start + window_scale_bytes()],
                 scales
             );
         }
@@ -831,7 +844,7 @@ mod tests {
             stage_attention(&window, &seam(2, 128, 2, &[129, 130], &stored)).expect("staged");
         assert_eq!(staged.selected, vec![2u32, 4u32]);
         assert_eq!(staged.store_rows, 2);
-        let expected = quantize_main_kv(&values(MLA_LATENT, 6)).expect("codec");
+        let expected = quantize_main_kv(&values(crate::plan::mla_latent(), 6)).expect("codec");
         assert_eq!(
             &staged.kv_codes[2 * STORE_CODE_BYTES..3 * STORE_CODE_BYTES],
             &expected.data
@@ -840,7 +853,7 @@ mod tests {
             &staged.kv_scales[2 * STORE_SCALE_BYTES..3 * STORE_SCALE_BYTES],
             &expected.scales
         );
-        let expected = quantize_main_kv(&values(MLA_LATENT, 7)).expect("codec");
+        let expected = quantize_main_kv(&values(crate::plan::mla_latent(), 7)).expect("codec");
         assert_eq!(
             &staged.kv_codes[4 * STORE_CODE_BYTES..5 * STORE_CODE_BYTES],
             &expected.data
@@ -859,7 +872,7 @@ mod tests {
         let staged =
             stage_attention(&window, &seam(1, 128, 1, &[137, 138], &stored)).expect("staged");
         assert_eq!(staged.selected, vec![9u32, 10u32]);
-        let expected = quantize_main_kv(&values(MLA_LATENT, 12)).expect("codec");
+        let expected = quantize_main_kv(&values(crate::plan::mla_latent(), 12)).expect("codec");
         assert_eq!(
             &staged.kv_codes[9 * STORE_CODE_BYTES..10 * STORE_CODE_BYTES],
             &expected.data
@@ -882,12 +895,12 @@ mod tests {
         let stored = stored_rows(3, 17);
         let staged =
             stage_attention(&window, &seam(2, 128, 4, &[129, 130], &stored)).expect("staged");
-        let q = values(4 * MLA_LATENT, 23);
+        let q = values(4 * crate::plan::mla_latent(), 23);
         let sink = [0.25f32, -0.5, 0.125, 0.75];
-        let mut reference = vec![0.0f32; 4 * MLA_LATENT];
+        let mut reference = vec![0.0f32; 4 * crate::plan::mla_latent()];
         for head in 0..4 {
             let out = sparkflash_kernels::mla_ref::attention_with_sink_union(
-                &q[head * MLA_LATENT..(head + 1) * MLA_LATENT],
+                &q[head * crate::plan::mla_latent()..(head + 1) * crate::plan::mla_latent()],
                 &staged.window_codes,
                 &staged.window_scales,
                 staged.window_rows,
@@ -897,7 +910,8 @@ mod tests {
                 137,
                 sink[head],
             );
-            reference[head * MLA_LATENT..(head + 1) * MLA_LATENT].copy_from_slice(&out);
+            reference[head * crate::plan::mla_latent()..(head + 1) * crate::plan::mla_latent()]
+                .copy_from_slice(&out);
         }
         let stats = twin_out(&q, &sink, &staged, 137, &reference).expect("twin");
         assert_eq!(stats.mismatches, 0);
@@ -974,7 +988,7 @@ mod tests {
         staging.recycle(first);
         // Row 1 (id 129) changes between the two calls; a stale memo entry would hand back the old
         // codes, so the reference comparison below is what proves the check ran.
-        for value in &mut rows[MLA_LATENT..2 * MLA_LATENT] {
+        for value in &mut rows[crate::plan::mla_latent()..2 * crate::plan::mla_latent()] {
             *value = *value * 4.0 + 1.0;
         }
         let changed = staging

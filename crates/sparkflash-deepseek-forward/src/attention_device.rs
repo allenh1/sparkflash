@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use sparkflash_engine::config::ModelConfig;
+use crate::plan::ModelConfig;
 use sparkflash_engine::forward::attention::sparse_attention;
 use sparkflash_engine::forward::attention::{AttentionProjectionBackend, indexer_wq_b_chunked};
 
@@ -52,9 +52,13 @@ type PackedWeight = Arc<(Vec<u8>, Vec<u8>)>;
 const DENSE_KERNEL: &str = "b12x_mxfp8_dense_sm121";
 const WO_A_KERNEL: &str = "b12x_mxfp8_wo_a_sm121";
 /// The BF16-activation grouped wo_a cubin: the native path.
-const WO_A_NATIVE_KERNEL: &str = "b12x_bf16a_mxfp8w_wo_a_sm121";
+fn wo_a_native_symbol() -> &'static str {
+    crate::plan::handles().wo_a_native
+}
 const FLASH_MLA_KERNEL: &str = "flash_mla_csa2_sm121";
-const FLASH_MLA_SEQ_KERNEL: &str = "flash_mla_csa2_seq_sm121";
+fn flash_mla_seq_symbol() -> &'static str {
+    crate::plan::handles().flash_mla_seq
+}
 /// The CSA-union format value the m14 kernel expects.
 const FORMAT_CSA_UNION: u64 = 2;
 /// 64 heads x 512 latent x bf16.
@@ -356,9 +360,9 @@ impl AttentionDeviceBackend {
         let dir = cubin_dir.as_ref();
         let dense_bytes = verified_cubin(dir, DENSE_KERNEL)?;
         let wo_a_bytes = verified_cubin(dir, WO_A_KERNEL)?;
-        let wo_a_native_bytes = verified_cubin(dir, WO_A_NATIVE_KERNEL)?;
+        let wo_a_native_bytes = verified_cubin(dir, wo_a_native_symbol())?;
         let flash_bytes = verified_cubin(dir, FLASH_MLA_KERNEL)?;
-        let flash_seq_bytes = verified_cubin(dir, FLASH_MLA_SEQ_KERNEL)?;
+        let flash_seq_bytes = verified_cubin(dir, flash_mla_seq_symbol())?;
         let cuda = Cuda::load()?;
         let (dense_module, dense) = cuda.load_kernel(&dense_bytes, KernelId::Mxfp8Dense)?;
         let (wo_a_module, wo_a) = cuda.load_kernel(&wo_a_bytes, KernelId::Mxfp8WoA)?;

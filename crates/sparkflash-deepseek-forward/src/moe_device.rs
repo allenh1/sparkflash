@@ -24,7 +24,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use sparkflash_engine::config::ModelConfig;
+use crate::plan::ModelConfig;
 use sparkflash_engine::dtype::DType;
 use sparkflash_engine::forward::moe::{
     MoeDeviceBackend, MoeScratch, add_shared_expert, routed_forward,
@@ -50,15 +50,27 @@ use sparkflash_kernels::routed_gate_up_ref as gate_up_ref;
 use sparkflash_kernels::router_launch::{self, RouterLaunchParams};
 use sparkflash_kernels::{router_ref, swiglu_ref};
 
-const ROUTER: &str = "moe_router_sm121";
-const GATE_UP: &str = "routed_gate_up_sm121";
-const WEIGHTED: &str = "swiglu_mxfp8_quant_weighted_sm121";
+fn router_symbol() -> &'static str {
+    crate::plan::handles().moe_router
+}
+fn gate_up_symbol() -> &'static str {
+    crate::plan::handles().routed_gate_up
+}
+fn weighted_symbol() -> &'static str {
+    crate::plan::handles().weighted_swiglu
+}
 const COMBINE: &str = "b12x_mxfp4_moe_sm121";
 const DENSE: &str = "b12x_mxfp8_dense_sm121";
-const SWIGLU: &str = "swiglu_mxfp8_quant_sm121";
-const HEAD: &str = "cert_lm_head_sm121";
+fn swiglu_symbol() -> &'static str {
+    crate::plan::handles().swiglu
+}
+fn head_symbol() -> &'static str {
+    crate::plan::handles().lm_head
+}
 const HEAD_REDUCE: &str = "lm_head_reduce_sm121";
-const RMSNORM: &str = "rmsnorm_sm121";
+fn rmsnorm_symbol() -> &'static str {
+    crate::plan::handles().rmsnorm
+}
 const RANKS: usize = 4;
 
 /// The routed kernels a layer launches, by kind. The plan is one device router, then for each of
@@ -295,15 +307,15 @@ impl MoeDeviceBackendImpl {
     /// A missing/mis-pinned cubin or a driver failure.
     pub fn open(cubin_dir: impl AsRef<Path>) -> Result<Self, String> {
         let dir = cubin_dir.as_ref();
-        let router_bytes = verified(dir, ROUTER)?;
-        let gate_up_bytes = verified(dir, GATE_UP)?;
-        let weighted_bytes = verified(dir, WEIGHTED)?;
+        let router_bytes = verified(dir, router_symbol())?;
+        let gate_up_bytes = verified(dir, gate_up_symbol())?;
+        let weighted_bytes = verified(dir, weighted_symbol())?;
         let combine_bytes = verified(dir, COMBINE)?;
         let dense_bytes = verified(dir, DENSE)?;
-        let swiglu_bytes = verified(dir, SWIGLU)?;
-        let head_bytes = verified(dir, HEAD)?;
+        let swiglu_bytes = verified(dir, swiglu_symbol())?;
+        let head_bytes = verified(dir, head_symbol())?;
         let head_reduce_bytes = verified(dir, HEAD_REDUCE)?;
-        let rmsnorm_bytes = verified(dir, RMSNORM)?;
+        let rmsnorm_bytes = verified(dir, rmsnorm_symbol())?;
         let cuda = Cuda::load()?;
         let (router_module, router, router_topk_module, router_topk) =
             router_launch::load(&cuda, &router_bytes)?;
@@ -569,8 +581,8 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         let mut host_bytes = 0u64;
         let mut allocated = 0usize;
 
-        let gate_name = format!("{prefix}.ffn.gate.weight");
-        let bias_name = format!("{prefix}.ffn.gate.bias");
+        let gate_name = crate::plan::layer_claim(layer, "ffn.gate.weight");
+        let bias_name = crate::plan::layer_claim(layer, "ffn.gate.bias");
         let gate = source
             .read(&gate_name)
             .map_err(|error| read_err(&gate_name, error))?;
@@ -681,7 +693,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             Vec::new()
         };
 
-        let experts = read_experts(source, prefix, &table, dim, inter)?;
+        let experts = read_experts(source, layer, &table, dim, inter)?;
         let expert_bytes: usize = experts.iter().map(Expert::bytes).sum();
         staged_bytes += expert_bytes as u64;
         host_bytes += expert_bytes as u64;
@@ -1225,7 +1237,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         }
         let tokens = x.len() / dim;
         let staging_started = std::time::Instant::now();
-        let base = format!("{prefix}.ffn.shared_experts");
+        let base = crate::plan::layer_prefix(layer, "ffn.shared_experts");
         let w1 = read_spec(
             source,
             &format!("{base}.w1.weight"),
@@ -1945,14 +1957,14 @@ impl Expert {
 
 fn read_experts(
     source: &dyn WeightSource,
-    prefix: &str,
+    layer: usize,
     table: &[(usize, usize)],
     dim: usize,
     inter: usize,
 ) -> Result<Vec<Expert>, EngineError> {
     let mut experts = Vec::with_capacity(table.len());
     for (_, expert) in table {
-        let base = format!("{prefix}.ffn.experts.{expert}");
+        let base = crate::plan::layer_prefix(layer, &format!("ffn.experts.{expert}"));
         let w1 = read_len(source, &format!("{base}.w1.weight"), inter * (dim / 2))?;
         let s1 = read_len(
             source,
