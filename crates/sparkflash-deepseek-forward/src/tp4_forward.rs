@@ -3370,10 +3370,10 @@ impl AttentionBody {
         let config = request.config.ok_or_else(|| {
             "attention body: the loop was built without the model config".to_string()
         })?;
-        if head_width != mla_ref::crate::plan::mla_latent() {
+        if head_width != crate::plan::mla_latent() {
             return Err(format!(
                 "attention body: the q head width is {head_width}, the body's latent is {}",
-                mla_ref::crate::plan::mla_latent()
+                crate::plan::mla_latent()
             ));
         }
         let kernel_dir = request
@@ -3388,7 +3388,7 @@ impl AttentionBody {
             cuda.alloc(bytes, &mut allocated)
                 .map_err(|error| format!("attention body: {what} buffer: {error}"))
         };
-        let q_width = heads * mla_ref::crate::plan::mla_latent() * 2;
+        let q_width = heads * crate::plan::mla_latent() * 2;
         let index_blocks_staged = mla_ref::HSI_BLOCKS;
         let mut body = Self {
             module,
@@ -3397,11 +3397,11 @@ impl AttentionBody {
             head_width,
             q: alloc(q_width, "q")?,
             window_codes: alloc(
-                config.window_size * mla_ref::crate::plan::mla_latent(),
+                config.window_size * crate::plan::mla_latent(),
                 "window codes",
             )?,
             window_scales: alloc(
-                config.window_size * mla_ref::crate::plan::mla_latent() / 32,
+                config.window_size * crate::plan::mla_latent() / 32,
                 "window scales",
             )?,
             kv_codes: alloc(
@@ -3524,9 +3524,9 @@ impl AttentionBody {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        if staged.window_codes.len() != staged.window_rows * mla_ref::crate::plan::mla_latent()
+        if staged.window_codes.len() != staged.window_rows * crate::plan::mla_latent()
             || staged.window_scales.len()
-                != staged.window_rows * mla_ref::crate::plan::mla_latent() / 32
+                != staged.window_rows * crate::plan::mla_latent() / 32
         {
             return Err(format!(
                 "attention body: {} window rows staged as {} code and {} scale bytes",
@@ -3777,7 +3777,8 @@ fn run_layer_query_path(
         .b12x_geometry(&crate::plan::layer_claim(layer, "attn.wq_a.weight"))?;
     if (wq_a_cols, wq_a_inner) != (rank_width, crate::plan::hidden()) {
         return Err(format!(
-            "layer-0 query path: the plan's wq_a geometry is {wq_a_cols}x{wq_a_inner}, the model config says {rank_width}x{}", crate::plan::hidden()
+            "layer-0 query path: the plan's wq_a geometry is {wq_a_cols}x{wq_a_inner}, the model config says {rank_width}x{}",
+            crate::plan::hidden()
         ));
     }
     if wq_b_inner != rank_width {
@@ -3813,7 +3814,7 @@ fn run_layer_query_path(
     let (wq_b_weight, wq_b_scales) = bind
         .attention
         .pointers
-        .get(&crate::plan::layer_claim(layer, "attn.wq_b.weight"))
+        .get(crate::plan::layer_claim(layer, "attn.wq_b.weight"))
         .copied()
         .ok_or_else(|| "layer-0 query path: the bind has no wq_b pair".to_string())?;
     if wq_b_weight.0 == 0 || wq_b_scales.0 == 0 {
@@ -5139,7 +5140,8 @@ fn run_layer_moe_routed(
     let dim = config.dim;
     if world != 4 || experts != 384 || top_k != 6 || dim != crate::plan::hidden() {
         return Err(format!(
-            "MoE: this chain is the released four-rank shape (world 4, 384 experts, top-6, dim {}); got world {world}, {experts} experts, top-{top_k}, dim {dim}", crate::plan::hidden()
+            "MoE: this chain is the released four-rank shape (world 4, 384 experts, top-6, dim {}); got world {world}, {experts} experts, top-{top_k}, dim {dim}",
+            crate::plan::hidden()
         ));
     }
     if !inter.is_multiple_of(world) || inter / world != 576 {
@@ -8194,7 +8196,7 @@ fn run_layer_ffn_epilogue(
             let mut f32_only = vec![0.0f32; dim];
             moe::shared_expert_rows(
                 config,
-                &format!("layers.{layer}"),
+                crate::plan::layer_root(layer),
                 &seams.pre_ffn_hidden,
                 source,
                 limit,
@@ -11649,7 +11651,10 @@ impl<'a> DeviceLayer<'a> {
                 format!("layer device: hc_mult {hc_mult} does not fit the seam ABI")
             })?,
             u32::try_from(crate::plan::predictor_rows()).map_err(|_| {
-                format!("layer device: {} coefficient rows do not fit the seam ABI", crate::plan::predictor_rows())
+                format!(
+                    "layer device: {} coefficient rows do not fit the seam ABI",
+                    crate::plan::predictor_rows()
+                )
             })?,
         )
         .map_err(|error| format!("layer device: {error}"))?;
@@ -12503,12 +12508,12 @@ impl<'a> DeviceLayer<'a> {
             seam_scale_weights: None,
             seam_hc_pre_collapse: None,
             seam_latent: None,
-            kv_source_layers: config.kv_source_layers.clone(),
-            index_source_layers: config.index_source_layers.clone(),
+            kv_source_layers: crate::plan::layers_with_fact("kv_source", true),
+            index_source_layers: crate::plan::layers_with_fact("index_source", true),
             index_n_heads: config.index_n_heads,
             index_head_dim: config.index_head_dim,
             index_topk: config.index_topk,
-            candidate_source_layer: config.candidate_source_layer,
+            candidate_source_layer: crate::plan::candidate_source_layer(),
             candidate_topk_blocks: config.candidate_topk_blocks,
             candidate_block_size: config.candidate_block_size,
             ffn_seams_seen: 0,
@@ -14652,32 +14657,46 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                 runs.record($name, res)?;
             }};
         }
+        // The block's parts decide which stages run. A block without the attention part skips
+        // its sublayers; a block without the FFN part skips the feed-forward. The open already
+        // refused an unknown part by name, and refused the fused attention/FFN seam when the
+        // block carries the FFN without the attention part it covers.
+        let has_engram = crate::plan::block_has_part(layer, sparkflash_model::Part::Engram);
+        let has_attention =
+            crate::plan::block_has_part(layer, sparkflash_model::Part::MlaAttention);
+        let has_ffn = crate::plan::block_has_part(layer, sparkflash_model::Part::Moe);
         let outcome = (|| {
-            run_stage!("engram_write", self.engram_write(layer, position));
+            if has_engram {
+                run_stage!("engram_write", self.engram_write(layer, position));
+            }
             run_stage!("mhc_entry", self.mhc_entry(layer, position));
-            run_stage!("quantise_prologue", self.quantise_prologue(layer, position));
-            run_stage!(
-                "attention_projections",
-                self.attention_projections(layer, position)
-            );
-            run_stage!("query_path", self.query_path(layer, position));
-            run_stage!("kv_path", self.kv_path(layer, position));
-            run_stage!("reference_seam", self.reference_seam(layer, position));
-            run_stage!("ref_select", self.ref_select(layer, position));
-            run_stage!("stage_attention", self.stage_attention(layer, position));
-            run_stage!("attention_body", self.attention_body(layer, position));
-            run_stage!("attention_output", self.attention_output(layer, position));
-            run_stage!("all_reduce", self.all_reduce(layer, position));
-            run_stage!(
-                "attention_residual",
-                self.attention_residual(layer, position)
-            );
-            run_stage!("ffn_seams", self.ffn_seams(layer, position));
-            run_stage!("moe_router", self.moe_router(layer, position));
-            run_stage!("moe_routed", self.moe_routed(layer, position));
-            run_stage!("all_reduce_moe", self.all_reduce_moe(layer, position));
-            run_stage!("moe_shared", self.moe_shared(layer, position));
-            run_stage!("ffn_epilogue", self.ffn_epilogue(layer, position));
+            if has_attention {
+                run_stage!("quantise_prologue", self.quantise_prologue(layer, position));
+                run_stage!(
+                    "attention_projections",
+                    self.attention_projections(layer, position)
+                );
+                run_stage!("query_path", self.query_path(layer, position));
+                run_stage!("kv_path", self.kv_path(layer, position));
+                run_stage!("reference_seam", self.reference_seam(layer, position));
+                run_stage!("ref_select", self.ref_select(layer, position));
+                run_stage!("stage_attention", self.stage_attention(layer, position));
+                run_stage!("attention_body", self.attention_body(layer, position));
+                run_stage!("attention_output", self.attention_output(layer, position));
+                run_stage!("all_reduce", self.all_reduce(layer, position));
+                run_stage!(
+                    "attention_residual",
+                    self.attention_residual(layer, position)
+                );
+            }
+            if has_ffn {
+                run_stage!("ffn_seams", self.ffn_seams(layer, position));
+                run_stage!("moe_router", self.moe_router(layer, position));
+                run_stage!("moe_routed", self.moe_routed(layer, position));
+                run_stage!("all_reduce_moe", self.all_reduce_moe(layer, position));
+                run_stage!("moe_shared", self.moe_shared(layer, position));
+                run_stage!("ffn_epilogue", self.ffn_epilogue(layer, position));
+            }
             Ok(())
         })();
         probe::layer(self.cuda, layer, "layer_total", layer_timer);
@@ -15240,8 +15259,8 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         };
         quant.check_spans(
             self.buffers.workspace.kv_rotated.len,
-            sparkflash_kernels::kv_path_ref::window_code_bytes(),
-            sparkflash_kernels::kv_path_ref::window_scale_bytes(),
+            sparkflash_kernels::kv_path_ref::WINDOW_CODE_BYTES,
+            sparkflash_kernels::kv_path_ref::WINDOW_SCALE_BYTES,
         )?;
         kv::launch_window_quant(self.cuda, self.kv_quant_kernel.1, &quant)
             .map_err(|error| format!("layer device stage kv_path: window quantiser: {error}"))?;

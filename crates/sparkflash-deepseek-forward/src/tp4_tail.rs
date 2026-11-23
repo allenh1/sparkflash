@@ -269,7 +269,9 @@ mod device {
     /// (`diagnostics.head_screen`).
     const HEAD_SCREEN_DEFAULT: bool = true;
     /// The tiles of int8 codes a rank's head slice fills (kernels/opt_rows_sm121.cu, OHS_TILE).
-    const SCREEN_TILES: usize = crate::plan::vocab_per_rank().div_ceil(head_screen_ref::TILE);
+    fn screen_tiles() -> usize {
+        crate::plan::vocab_per_rank().div_ceil(head_screen_ref::TILE)
+    }
     /// The most hidden rows a step screens: the rows head's R_MAX.
     const SCREEN_ROWS: usize = 64;
     /// The rows the self test screens: two row blocks, the second partly filled.
@@ -298,9 +300,9 @@ mod device {
         rows: Kernel,
         mma: Kernel,
         exact: Kernel,
-        /// The codes, `[SCREEN_TILES][160][128][32]` int8.
+        /// The codes, `[screen_tiles()][160][128][32]` int8.
         codes: Deviceptr,
-        /// `[SCREEN_TILES * 128][4]` f32: each entry's scale and its two error coefficients.
+        /// `[screen_tiles() * 128][4]` f32: each entry's scale and its two error coefficients.
         coef: Deviceptr,
         /// A step's hidden rows as two int8 digits each, `[2 * SCREEN_ROWS][crate::plan::hidden()]`.
         act: Deviceptr,
@@ -308,7 +310,7 @@ mod device {
         meta: Deviceptr,
         /// `[SCREEN_ROWS][crate::plan::vocab_per_rank()]` f32: every logit's upper bound.
         upper: Deviceptr,
-        /// `[SCREEN_ROWS][SCREEN_TILES]` f32: each tile's best lower bound.
+        /// `[SCREEN_ROWS][screen_tiles()]` f32: each tile's best lower bound.
         tile_lo: Deviceptr,
         /// `[SCREEN_ROWS]` u32: the entries scored for each row (checked steps only).
         counts: Deviceptr,
@@ -348,7 +350,7 @@ mod device {
                 cuda.alloc(bytes, allocated)
                     .map_err(|error| format!("head screen {what}: {error}"))
             };
-            let entries = SCREEN_TILES * head_screen_ref::TILE;
+            let entries = screen_tiles() * head_screen_ref::TILE;
             let screen = Self {
                 codes: alloc(
                     head_screen_ref::table_bytes(crate::plan::vocab_per_rank()),
@@ -361,7 +363,7 @@ mod device {
                     SCREEN_ROWS * crate::plan::vocab_per_rank() * 4,
                     "upper bounds",
                 )?,
-                tile_lo: alloc(SCREEN_ROWS * SCREEN_TILES * 4, "tile bounds")?,
+                tile_lo: alloc(SCREEN_ROWS * screen_tiles() * 4, "tile bounds")?,
                 counts: alloc(SCREEN_ROWS * 4, "counts")?,
                 modules,
                 rows,
@@ -416,7 +418,7 @@ mod device {
                 crate::plan::vocab_per_rank(),
                 crate::plan::hidden(),
                 head_screen_ref::table_bytes(crate::plan::vocab_per_rank()),
-                SCREEN_ROWS * (crate::plan::vocab_per_rank() + SCREEN_TILES) * 4,
+                SCREEN_ROWS * (crate::plan::vocab_per_rank() + screen_tiles()) * 4,
                 SCREEN_ROWS,
                 if check {
                     " (diagnostic check also armed)"
@@ -466,7 +468,7 @@ mod device {
             )?;
             cuda.launch(
                 self.mma,
-                (n.div_ceil(32) as u32, SCREEN_TILES as u32, 1),
+                (n.div_ceil(32) as u32, screen_tiles() as u32, 1),
                 (256, 1, 1),
                 &[
                     self.act.0,
@@ -501,7 +503,7 @@ mod device {
                     block_arg,
                     crate::plan::vocab_per_rank() as u64,
                     n as u64,
-                    SCREEN_TILES as u64,
+                    screen_tiles() as u64,
                     if count { self.counts.0 } else { 0 },
                     noise[0],
                     noise[1],
@@ -647,7 +649,7 @@ mod device {
                 )?;
                 cuda.launch(
                     self.mma,
-                    (n.div_ceil(32) as u32, SCREEN_TILES as u32, 1),
+                    (n.div_ceil(32) as u32, screen_tiles() as u32, 1),
                     (256, 1, 1),
                     &[
                         self.act.0,
@@ -672,7 +674,7 @@ mod device {
                     act,
                     self.read_f32(cuda, self.meta, n * 4)?,
                     self.read_f32(cuda, self.upper, n * crate::plan::vocab_per_rank())?,
-                    self.read_f32(cuda, self.tile_lo, n * SCREEN_TILES)?,
+                    self.read_f32(cuda, self.tile_lo, n * screen_tiles())?,
                 ))
             })();
             cuda.free_buffers(&[&staged]);
@@ -685,7 +687,7 @@ mod device {
                 let m = &meta[row * 4..row * 4 + 4];
                 let upper = &upper[row * crate::plan::vocab_per_rank()
                     ..(row + 1) * crate::plan::vocab_per_rank()];
-                let tile_lo = &tile_lo[row * SCREEN_TILES..(row + 1) * SCREEN_TILES];
+                let tile_lo = &tile_lo[row * screen_tiles()..(row + 1) * screen_tiles()];
                 if host.usable != matches!(row, 0..=36 | 40) {
                     return Err(format!(
                         "row {row}: the reference's own cut is not the expected one"
@@ -723,7 +725,7 @@ mod device {
                         m[1], m[2], host.norm, host.dropped_norm
                     ));
                 }
-                let mut best = vec![(f32::NEG_INFINITY, 0.0f32); SCREEN_TILES];
+                let mut best = vec![(f32::NEG_INFINITY, 0.0f32); screen_tiles()];
                 for entry in 0..crate::plan::vocab_per_rank() {
                     let c = &coef[entry * 4..entry * 4 + 4];
                     let dot = head_screen_ref::integer_dot(
@@ -788,7 +790,8 @@ mod device {
             }
             eprintln!(
                 "head screen self test: {} entries' codes and {n} rows' bounds match \
-                 the reference", crate::plan::vocab_per_rank()
+                 the reference",
+                crate::plan::vocab_per_rank()
             );
             Ok(())
         }
@@ -1176,7 +1179,8 @@ mod device {
             let certified_count = u32::from_le_bytes(count_raw);
             if certified_count as usize > crate::plan::vocab_per_rank() {
                 return Err(format!(
-                    "tail certified count {certified_count} is larger than the rank vocabulary {}", crate::plan::vocab_per_rank()
+                    "tail certified count {certified_count} is larger than the rank vocabulary {}",
+                    crate::plan::vocab_per_rank()
                 ));
             }
             let mut max_raw = vec![0u8; chunks_per_rank() * 4];

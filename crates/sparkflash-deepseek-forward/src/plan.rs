@@ -838,6 +838,130 @@ pub fn install_released(world: usize, rank: usize) -> Result<&'static Descriptio
     install(plan_from_checkpoint(world, rank)?)
 }
 
+/// The description's language block for one layer.
+#[must_use]
+pub fn language_block(layer: usize) -> Option<&'static sparkflash_model::Block> {
+    let description = description();
+    description
+        .plan
+        .stacks()
+        .iter()
+        .find(|stack| stack.kind == sparkflash_model::StackKind::Language)?
+        .blocks
+        .iter()
+        .find(|block| block.index == layer)
+}
+
+/// Whether a language block carries a part instance.
+#[must_use]
+pub fn block_has_part(layer: usize, part: Part) -> bool {
+    language_block(layer).is_some_and(|block| block.parts.iter().any(|p| p.part == part))
+}
+
+/// One fact a language block's part instances carry.
+#[must_use]
+pub fn layer_fact(layer: usize, name: &str) -> Option<&'static FactValue> {
+    language_block(layer)?
+        .parts
+        .iter()
+        .find_map(|part| part.facts.get(name))
+}
+
+/// One boolean fact a language block's part instances carry.
+#[must_use]
+pub fn layer_fact_bool(layer: usize, name: &str) -> bool {
+    matches!(layer_fact(layer, name), Some(FactValue::Bool(true)))
+}
+
+/// The compression ratio of one layer, read from that block's part fact.
+#[must_use]
+pub fn layer_compress_ratio(layer: usize) -> Option<usize> {
+    layer_fact(layer, "compress_ratio")
+        .and_then(FactValue::as_integer)
+        .and_then(|ratio| usize::try_from(ratio).ok())
+        .filter(|ratio| *ratio > 0)
+}
+
+/// The layers whose block carries a fact switched on, in layer order.
+#[must_use]
+pub fn layers_with_fact(name: &str, value: bool) -> Vec<usize> {
+    let description = description();
+    let Some(stack) = description
+        .plan
+        .stacks()
+        .iter()
+        .find(|stack| stack.kind == sparkflash_model::StackKind::Language)
+    else {
+        return Vec::new();
+    };
+    stack
+        .blocks
+        .iter()
+        .filter(|block| {
+            block
+                .parts
+                .iter()
+                .find_map(|part| part.facts.get(name))
+                .is_some_and(|fact| matches!(fact, FactValue::Bool(flag) if *flag == value))
+        })
+        .map(|block| block.index)
+        .collect()
+}
+
+/// The candidate-pool source layer, read from the blocks' part facts.
+#[must_use]
+pub fn candidate_source_layer() -> usize {
+    let description = description();
+    description
+        .plan
+        .stacks()
+        .iter()
+        .find(|stack| stack.kind == sparkflash_model::StackKind::Language)
+        .and_then(|stack| {
+            stack.blocks.iter().find_map(|block| {
+                block.parts.iter().find_map(|part| {
+                    part.facts
+                        .get("candidate_source")
+                        .and_then(FactValue::as_integer)
+                        .and_then(|layer| usize::try_from(layer).ok())
+                })
+            })
+        })
+        .unwrap_or_else(|| description.values.candidate_source_layer)
+}
+
+/// The tap layers the draft stage reads, read from the draft block's part fact.
+#[must_use]
+pub fn tap_layers() -> Vec<usize> {
+    let description = description();
+    let Some(stack) = description
+        .plan
+        .stacks()
+        .iter()
+        .find(|stack| stack.kind == sparkflash_model::StackKind::Draft)
+    else {
+        return Vec::new();
+    };
+    stack
+        .blocks
+        .iter()
+        .find_map(|block| {
+            block
+                .parts
+                .iter()
+                .find_map(|part| match part.facts.get("tap_layers") {
+                    Some(FactValue::Integers(values)) => Some(
+                        values
+                            .iter()
+                            .filter_map(|value| usize::try_from(*value).ok())
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+        })
+        .unwrap_or_default()
+}
+
 /// Whether a part instance is one the forward has a block body for.
 ///
 /// The set is the language stack's parts the four-rank body runs. A named part outside it is
@@ -882,6 +1006,27 @@ pub fn check_language_parts(description: &Description) -> Result<(), ConfigError
                     return Err(format!(
                         "forward open: block {} carries the part {:?}, which this forward has no body for",
                         block.index, instance.part
+                    ));
+                }
+            }
+            let has = |part| block.parts.iter().any(|instance| instance.part == part);
+            // The fused attention-post/FFN seam is one body that spans the attention part and
+            // the MoE part. It is chosen only when the block carries both; a block that carries
+            // the MoE part without the attention part is refused by name because the fused body
+            // would read an attention post that does not exist.
+            if has(Part::Moe) && !has(Part::MlaAttention) {
+                return Err(format!(
+                    "forward open: block {} carries the MoE part but no MlaAttention part; the fused attention/FFN seam covers both, so the block is refused by name",
+                    block.index
+                ));
+            }
+            // A compression or indexer sublayer without the attention part it belongs to is
+            // refused for the same reason.
+            for sublayer in [Part::Csa2Compression, Part::SparseIndexer] {
+                if has(sublayer) && !has(Part::MlaAttention) {
+                    return Err(format!(
+                        "forward open: block {} carries the {sublayer:?} part but no MlaAttention part",
+                        block.index
                     ));
                 }
             }
@@ -994,6 +1139,38 @@ mod tests {
                 "{name}: {symbol} is not a catalogue symbol"
             );
         }
+    }
+
+    #[test]
+    fn the_per_layer_branches_read_part_facts() {
+        let Some(description) = released() else {
+            eprintln!("skipping: the released checkpoint is not on this host");
+            return;
+        };
+        let values = description.values();
+        assert_eq!(layers_with_fact("kv_source", true), values.kv_source_layers);
+        assert_eq!(
+            layers_with_fact("index_source", true),
+            values.index_source_layers
+        );
+        assert_eq!(
+            layers_with_fact("engram_member", true),
+            values.engram_layer_ids
+        );
+        for layer in 0..values.n_layers {
+            assert_eq!(
+                layer_compress_ratio(layer),
+                values.compress_ratios[layer]
+                    .checked_sub(0)
+                    .filter(|r| *r > 0),
+                "layer {layer}"
+            );
+            assert!(block_has_part(layer, Part::MlaAttention), "layer {layer}");
+            assert!(block_has_part(layer, Part::Moe), "layer {layer}");
+            assert!(block_has_part(layer, Part::RmsNorm), "layer {layer}");
+        }
+        assert_eq!(candidate_source_layer(), values.candidate_source_layer);
+        assert!(!tap_layers().is_empty());
     }
 
     #[test]

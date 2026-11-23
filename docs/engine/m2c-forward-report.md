@@ -113,6 +113,59 @@ Remaining model literals in non-test sources: the MTP draft's compile-time array
 (KV_ROTATED_BYTES/KV_LATENT_BYTES, MLA latent store bytes) are still consts used in fixed-size
 arrays. They are the next slice of "sizes computed at open" and are not claimed done here.
 
+
+## PR 4 — the layer body runs the block's parts
+
+Commit: 'forward: run the layer body from the block parts'
+
+What changed:
+
+* plan::block_has_part / layer_fact / layer_fact_bool / layer_compress_ratio /
+  layers_with_fact / candidate_source_layer / tap_layers read the per-layer branches from the
+  block's part instances and their facts instead of layer numbers.
+* the device layer walk runs each block's parts: a block without the Engram part skips the
+  Engram write, a block without MlaAttention skips the attention sublayers, a block without the
+  MoE part skips the FFN. On the released checkpoint every language block carries all three, so
+  the executed stage sequence is unchanged.
+* install refuses an unknown part by name, and refuses the fused attention/FFN seam when a
+  block carries the MoE part without the MlaAttention part it covers (and a compression or
+  indexer sublayer without the attention part it belongs to). The fused seam is chosen only for
+  the adjacency it covers.
+* the kv/index source lists used by the bind and the candidate source layer now come from the
+  blocks' kv_source / index_source / candidate_source facts.
+
+Commands run:
+
+    cargo fmt -p sparkflash-deepseek-forward
+    cargo check -p sparkflash-deepseek-forward --offline                  # pass
+    cargo check -p sparkflash-cli --offline                              # pass
+    cargo test -p sparkflash-deepseek-forward --lib plan::tests --offline -- --nocapture
+    # 4 passed (names, kernel handles, per-layer facts, every language part has a body)
+    cargo test -p sparkflash-deepseek-forward --lib --offline
+    # 302 passed; 0 failed; 1 ignored
+
+Comparison evidence: not measured, same cluster blocker. Speed A/B for PR 4 is blocked with
+it and is not claimed.
+
+## Remaining pinned-list entries after PR 4
+
+The part A branch recorded only the baseline and the plan-vs-manifest test; it did not land a
+count-pinning rule test. The counts below are this branch's own inventory, measured with
+grep over crates/sparkflash-deepseek-forward/src (the four-rank assumptions are left in place
+as milestone 3):
+
+| list | count | where |
+|---|---:|---|
+| direct sparkflash-model-deepseek-v41 dependency/import | 0 | Cargo.toml and all sources |
+| ModelConfig::v41_flash / v41_flash_cached constructors | 0 | all sources |
+| format!("layers...") tensor construction | 4 production-adjacent test fixtures (tp4_resident:1736, tp4_smoke:616/631/632/2513, layer_device:2075, tp4_forward:20167) | test-only |
+| format!("mtp...") tensor construction | 0 | |
+| kernel-symbol strings | 41 occurrences, mostly evidence/test strings; the production loaders for b12x_mxfp8_dense_sm121, b12x_mxfp8_wo_a_sm121, flash_mla_csa2_sm121, b12x_mxfp4_moe_sm121, lm_head_reduce_sm121, pool_group_sm121, engram_stream_convert_sm121, engram_write_sm121 and moe_routed_device_sm121 stay literal because the catalogue does not claim them | catalogue gap from part B |
+| literal 5120 | 91 occurrences, almost all in unit-test expected values and kernel-width comments | tests, not the open path |
+
+The dependency/import criterion is met. The symbol list is not empty because the catalogue
+does not carry nine symbols the forward still loads; that is the part B gap recorded under PR 2.
+
 ## Blockers
 
 1. **Four-rank manifest/launch/tick comparison.** The baseline is on the head node at

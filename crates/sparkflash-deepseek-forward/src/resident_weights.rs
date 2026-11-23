@@ -354,24 +354,21 @@ pub fn rank_attention_plan_shapes(
     world: usize,
 ) -> Result<BTreeMap<String, (usize, usize)>, String> {
     let mut map = rank_attention_geometry(config, rank, world)?;
-    for &layer in &config.kv_source_layers {
-        let prefix = crate::plan::layer_prefix(layer, "attn.compressor");
+    for layer in crate::plan::layers_with_fact("kv_source", true) {
         map.insert(
-            format!("{prefix}.wkv.weight"),
+            crate::plan::layer_claim(layer, "attn.compressor.wkv.weight").to_owned(),
             (config.head_dim, config.dim),
         );
-        let ratio = config.compress_ratios.get(layer).copied().unwrap_or(0);
-        if ratio > 1 {
+        if crate::plan::layer_compress_ratio(layer).is_some_and(|ratio| ratio > 1) {
             map.insert(
-                format!("{prefix}.wgate.weight"),
+                crate::plan::layer_claim(layer, "attn.compressor.wgate.weight").to_owned(),
                 (config.head_dim, config.dim),
             );
         }
     }
-    for &layer in &config.index_source_layers {
-        let prefix = crate::plan::layer_prefix(layer, "attn.indexer");
+    for layer in crate::plan::layers_with_fact("index_source", true) {
         map.insert(
-            format!("{prefix}.wq_b.weight"),
+            crate::plan::layer_claim(layer, "attn.indexer.wq_b.weight").to_owned(),
             (
                 config.index_n_heads * config.index_head_dim,
                 config.q_lora_rank,

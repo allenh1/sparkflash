@@ -3464,9 +3464,9 @@ impl DeviceLayer<'_> {
     fn rows_output(&mut self, rows: &RowsState, layer: usize, n: usize) -> Result<(), String> {
         let b = rows.b;
         let bind = self.attention.ok_or("rows output: no attention bind")?;
-        let lookup = |name: String| -> Result<(Deviceptr, Deviceptr), String> {
+        let lookup = |name: &str| -> Result<(Deviceptr, Deviceptr), String> {
             bind.pointers
-                .get(&name)
+                .get(name)
                 .copied()
                 .ok_or_else(|| format!("rows output: the bind has no {name}"))
         };

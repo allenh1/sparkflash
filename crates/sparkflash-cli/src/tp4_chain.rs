@@ -409,10 +409,10 @@ fn parse_token_ids(raw: &str, flag: &str) -> Result<Vec<u32>, String> {
         let id: u32 = part
             .parse()
             .map_err(|error| format!("{flag} {part}: {error}"))?;
-        if id as usize >= crate::tp4_token::VOCAB {
+        if id as usize >= crate::tp4_token::vocab() {
             return Err(format!(
                 "{flag} {id} is outside the {}-token vocabulary",
-                crate::tp4_token::VOCAB
+                crate::tp4_token::vocab()
             ));
         }
         ids.push(id);
@@ -441,7 +441,7 @@ fn combine_geometry_from_plan(
     let rows = weight
         .and_then(|shard| shard.shard_shape.first().copied())
         .filter(|rows| *rows > 0)
-        .unwrap_or(crate::tp4_forward::DEFAULT_COMBINE_ROWS);
+        .unwrap_or(crate::tp4_forward::default_combine_rows());
     let bytes = match (weight, scale) {
         (Some(weight), Some(scale)) => {
             match (
@@ -1997,7 +1997,7 @@ mod forward_args_tests {
         )
         .expect("minimal plan");
         let (rows, bytes) = combine_geometry_from_plan(&plan);
-        assert_eq!(rows, crate::tp4_forward::DEFAULT_COMBINE_ROWS);
+        assert_eq!(rows, crate::tp4_forward::default_combine_rows());
         assert!(bytes.is_none(), "the preflight must refuse, not guess");
     }
 }
