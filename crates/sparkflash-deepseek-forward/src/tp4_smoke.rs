@@ -424,7 +424,7 @@ impl SmokeArgs {
 
     /// The activation/payload element count for a synthetic checkpoint-less run.
     fn synthetic_elements(&self) -> usize {
-        self.payload_elements.unwrap_or(5120)
+        self.payload_elements.unwrap_or_else(crate::plan::hidden)
     }
 }
 

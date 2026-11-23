@@ -52,24 +52,58 @@ pub const STORED_COMBINE_KERNEL: &str = "b12x_mxfp4_moe_stored_sm121";
 /// The pre-padded kernel the single-node path uses; NOT launchable on the four-rank arena rows.
 pub const PRE_ADDED_COMBINE_KERNEL: &str = "b12x_mxfp4_moe_sm121";
 
-/// Values per output row in the stored plan layout (the checkpoint's `w2` K extent per rank).
-pub const STORED_ELEMENTS_PER_ROW: usize = 576;
+/// Values per output row in the stored plan layout: the plan's expert intermediate width over
+/// the four ranks (the checkpoint's `w2` K extent per rank).
+#[must_use]
+pub fn stored_elements_per_row() -> usize {
+    crate::plan::moe_inter_dim() / 4
+}
 /// Packed E2M1 bytes per stored row (two values per byte).
-pub const STORED_PACKED_BYTES_PER_ROW: usize = STORED_ELEMENTS_PER_ROW / 2;
+#[must_use]
+pub fn stored_packed_bytes_per_row() -> usize {
+    stored_elements_per_row() / 2
+}
 /// E8M0 scale bytes per stored row (one block scale per 32 values).
-pub const STORED_SCALE_BYTES_PER_ROW: usize = STORED_ELEMENTS_PER_ROW / 32;
+#[must_use]
+pub fn stored_scale_bytes_per_row() -> usize {
+    stored_elements_per_row() / 32
+}
 /// Total stored bytes per output row: packed payload + its scale row.
-pub const STORED_ROW_BYTES: usize = STORED_PACKED_BYTES_PER_ROW + STORED_SCALE_BYTES_PER_ROW;
+#[must_use]
+pub fn stored_row_bytes() -> usize {
+    stored_packed_bytes_per_row() + stored_scale_bytes_per_row()
+}
 
-/// Values per output row in the A8 pre-padded layout (the single-node loader's padding target).
-pub const PRE_ADDED_ELEMENTS_PER_ROW: usize = 640;
+/// Values per output row in the A8 pre-padded layout (the kernel's padded width, not a plan value).
+#[must_use]
+pub fn pre_added_elements_per_row() -> usize {
+    sparkflash_kernels::moe_routed_device::WIDTH_PADDED
+}
 /// Packed E2M1 bytes per pre-padded row.
-pub const PRE_ADDED_PACKED_BYTES_PER_ROW: usize = PRE_ADDED_ELEMENTS_PER_ROW / 2;
+#[must_use]
+pub fn pre_added_packed_bytes_per_row() -> usize {
+    pre_added_elements_per_row() / 2
+}
 /// E8M0 scale bytes per pre-padded row.
-pub const PRE_ADDED_SCALE_BYTES_PER_ROW: usize = PRE_ADDED_ELEMENTS_PER_ROW / 32;
+#[must_use]
+pub fn pre_added_scale_bytes_per_row() -> usize {
+    pre_added_elements_per_row() / 32
+}
 /// Total pre-padded bytes per output row.
-pub const PRE_ADDED_ROW_BYTES: usize =
-    PRE_ADDED_PACKED_BYTES_PER_ROW + PRE_ADDED_SCALE_BYTES_PER_ROW;
+#[must_use]
+pub fn pre_added_row_bytes() -> usize {
+    pre_added_packed_bytes_per_row() + pre_added_scale_bytes_per_row()
+}
+/// A8 activation bytes per pre-padded row (one E4M3 code per element).
+#[must_use]
+pub fn padded_activation_bytes() -> usize {
+    pre_added_elements_per_row()
+}
+/// A8 activation scale bytes per pre-padded row (one per 32 elements).
+#[must_use]
+pub fn padded_activation_scales() -> usize {
+    pre_added_elements_per_row() / 32
+}
 
 /// The stored kernel's pinned cubin size (kernel-lead's twenty-entry baseline measurement).
 pub const STORED_CUBIN_BYTES: usize = sparkflash_kernels::mxfp4_moe_stored_abi::CUBIN_BYTES;
@@ -197,8 +231,17 @@ pub fn stored_combine_launch_evidence(args: &StoredCombineArgs) -> serde_json::V
         ],
         "grid": grid,
         "block": {"x": 256, "y": 1, "z": 1},
-        "row_layout": "two separate tensors: 288-byte FP4 code rows and 18-byte E8M0 scale rows, 306 bytes per output row across both",
-        "act_layout": "A8 chain layout: 640-byte rows and a 20-byte ue8m0 grid",
+        "row_layout": format!(
+            "two separate tensors: {}-byte FP4 code rows and {}-byte E8M0 scale rows, {} bytes per output row across both",
+            stored_packed_bytes_per_row(),
+            stored_scale_bytes_per_row(),
+            stored_row_bytes(),
+        ),
+        "act_layout": format!(
+            "A8 chain layout: {}-byte rows and a {}-byte ue8m0 grid",
+            padded_activation_bytes(),
+            padded_activation_scales(),
+        ),
         "slot_acc": "f32 in/out; the kernel adds each rank's partials, the caller zeroes once",
     })
 }
@@ -296,8 +339,8 @@ impl CombineLayout {
     #[must_use]
     pub fn elements_per_row(self) -> usize {
         match self {
-            Self::Stored576 => STORED_ELEMENTS_PER_ROW,
-            Self::PreAdded640 => PRE_ADDED_ELEMENTS_PER_ROW,
+            Self::Stored576 => stored_elements_per_row(),
+            Self::PreAdded640 => pre_added_elements_per_row(),
         }
     }
 
@@ -305,8 +348,8 @@ impl CombineLayout {
     #[must_use]
     pub fn packed_bytes_per_row(self) -> usize {
         match self {
-            Self::Stored576 => STORED_PACKED_BYTES_PER_ROW,
-            Self::PreAdded640 => PRE_ADDED_PACKED_BYTES_PER_ROW,
+            Self::Stored576 => stored_packed_bytes_per_row(),
+            Self::PreAdded640 => pre_added_packed_bytes_per_row(),
         }
     }
 
@@ -314,8 +357,8 @@ impl CombineLayout {
     #[must_use]
     pub fn scale_bytes_per_row(self) -> usize {
         match self {
-            Self::Stored576 => STORED_SCALE_BYTES_PER_ROW,
-            Self::PreAdded640 => PRE_ADDED_SCALE_BYTES_PER_ROW,
+            Self::Stored576 => stored_scale_bytes_per_row(),
+            Self::PreAdded640 => pre_added_scale_bytes_per_row(),
         }
     }
 
@@ -375,7 +418,11 @@ impl CombineGeometry {
             })
             .ok_or_else(|| {
                 format!(
-                    "combine geometry: bound slices are {packed} packed + {scales} scale bytes per row, but the stored layout is {STORED_PACKED_BYTES_PER_ROW}+{STORED_SCALE_BYTES_PER_ROW} and the pre-added layout is {PRE_ADDED_PACKED_BYTES_PER_ROW}+{PRE_ADDED_SCALE_BYTES_PER_ROW}; the bind and the selector disagree"
+                    "combine geometry: bound slices are {packed} packed + {scales} scale bytes per row, but the stored layout is {}+{} and the pre-added layout is {}+{}; the bind and the selector disagree",
+                    stored_packed_bytes_per_row(),
+                    stored_scale_bytes_per_row(),
+                    pre_added_packed_bytes_per_row(),
+                    pre_added_scale_bytes_per_row()
                 )
             })?;
         Ok(Self { rows, layout })
@@ -550,7 +597,7 @@ impl fmt::Display for CombineRefusal {
         match self {
             Self::MissingStoredCubin { dir, expected } => write!(
                 f,
-                "stored-layout combine kernel unavailable: {expected} is not staged in {dir} (task-6 kernel). Refusing the four-rank combine rather than launching {PRE_ADDED_COMBINE_KERNEL} on stored 576-K rows, which would misindex every row after the first."
+                "stored-layout combine kernel unavailable: {expected} is not staged in {dir} (task-6 kernel). Refusing the four-rank combine rather than launching {PRE_ADDED_COMBINE_KERNEL} on stored rows, which would misindex every row after the first."
             ),
             Self::MissingStoredAbi { kernel } => write!(
                 f,
@@ -558,7 +605,11 @@ impl fmt::Display for CombineRefusal {
             ),
             Self::PreAddedKernelOnStoredRows { kernel } => write!(
                 f,
-                "pre-added combine kernel unusable on stored rows: the arena holds {STORED_PACKED_BYTES_PER_ROW}+{STORED_SCALE_BYTES_PER_ROW}-byte rows, so {kernel} must not launch (its {PRE_ADDED_PACKED_BYTES_PER_ROW}+{PRE_ADDED_SCALE_BYTES_PER_ROW}-byte row read would misindex)."
+                "pre-added combine kernel unusable on stored rows: the arena holds {}+{}-byte rows, so {kernel} must not launch (its {}+{}-byte row read would misindex).",
+                stored_packed_bytes_per_row(),
+                stored_scale_bytes_per_row(),
+                pre_added_packed_bytes_per_row(),
+                pre_added_scale_bytes_per_row()
             ),
             Self::ArenaIsNotStoredLayout { layout } => write!(
                 f,
@@ -607,6 +658,7 @@ impl CombineSelection {
     /// The evidence row for `sparkflash-tp4-token/1`'s `launch_census`.
     #[must_use]
     pub fn evidence(&self, geometry: CombineGeometry) -> serde_json::Value {
+        let hidden = crate::plan::hidden();
         match self {
             Self::LaunchStored(kernel) => serde_json::json!({
                 "stage": "moe_combine",
@@ -618,8 +670,17 @@ impl CombineSelection {
                 "launch_compatible": true,
                 "abi_ready": STORED_COMBINE_ABI_READY,
                 "cubin_pin": {"bytes": STORED_CUBIN_BYTES, "sha256": STORED_CUBIN_SHA256},
-                "row_layout": "two separate per-rank tensors: w2.weight [experts][5120][288] packed E2M1 codes and w2.scale [experts][5120][18] E8M0; 306 bytes per output row across both, not a stride",
-                "act_layout": "A8 chain layout: 640-byte activation rows and a 20-byte ue8m0 grid, unchanged from the incumbent combine",
+                "row_layout": format!(
+                    "two separate per-rank tensors: w2.weight [experts][{hidden}][{}] packed E2M1 codes and w2.scale [experts][{hidden}][{}] E8M0; {} bytes per output row across both, not a stride",
+                    stored_packed_bytes_per_row(),
+                    stored_scale_bytes_per_row(),
+                    stored_row_bytes(),
+                ),
+                "act_layout": format!(
+                    "A8 chain layout: {}-byte activation rows and a {}-byte ue8m0 grid, unchanged from the incumbent combine",
+                    padded_activation_bytes(),
+                    padded_activation_scales(),
+                ),
                 "kernel_args": "10 words, same order as the incumbent combine: act_fp8, act_scales, w_fp4 (stored codes), w_scales (stored scales), expert_ids, slot_acc, tokens, trace_ring, layer_id, step_seq",
             }),
             Self::Refused(refusal) => serde_json::json!({
@@ -680,8 +741,8 @@ mod tests {
 
     fn stored_bytes() -> (usize, usize) {
         (
-            ROWS * STORED_PACKED_BYTES_PER_ROW,
-            ROWS * STORED_SCALE_BYTES_PER_ROW,
+            ROWS * stored_packed_bytes_per_row(),
+            ROWS * stored_scale_bytes_per_row(),
         )
     }
 
@@ -695,14 +756,14 @@ mod tests {
 
     #[test]
     fn the_pinned_row_constants_are_the_two_layouts_the_arm_can_meet() {
-        assert_eq!(STORED_ELEMENTS_PER_ROW, 576);
-        assert_eq!(STORED_PACKED_BYTES_PER_ROW, 288);
-        assert_eq!(STORED_SCALE_BYTES_PER_ROW, 18);
-        assert_eq!(STORED_ROW_BYTES, 306);
-        assert_eq!(PRE_ADDED_ELEMENTS_PER_ROW, 640);
-        assert_eq!(PRE_ADDED_PACKED_BYTES_PER_ROW, 320);
-        assert_eq!(PRE_ADDED_SCALE_BYTES_PER_ROW, 20);
-        assert_eq!(PRE_ADDED_ROW_BYTES, 340);
+        assert_eq!(stored_elements_per_row(), 576);
+        assert_eq!(stored_packed_bytes_per_row(), 288);
+        assert_eq!(stored_scale_bytes_per_row(), 18);
+        assert_eq!(stored_row_bytes(), 306);
+        assert_eq!(pre_added_elements_per_row(), 640);
+        assert_eq!(pre_added_packed_bytes_per_row(), 320);
+        assert_eq!(pre_added_scale_bytes_per_row(), 20);
+        assert_eq!(pre_added_row_bytes(), 340);
     }
 
     #[test]
@@ -718,8 +779,8 @@ mod tests {
         // acceptance).
         let pre = CombineGeometry::from_shard_bytes(
             ROWS,
-            ROWS * PRE_ADDED_PACKED_BYTES_PER_ROW,
-            ROWS * PRE_ADDED_SCALE_BYTES_PER_ROW,
+            ROWS * pre_added_packed_bytes_per_row(),
+            ROWS * pre_added_scale_bytes_per_row(),
         )
         .expect("pre-added");
         assert_eq!(pre.layout(), CombineLayout::PreAdded640);

@@ -86,9 +86,9 @@ const ROUTED_LAUNCHES_PER_LAYER: usize = ROUTED_ROUTER_LAUNCHES
     + ROUTED_GATE_UP_LAUNCHES
     + ROUTED_WEIGHTED_LAUNCHES
     + ROUTED_COMBINE_LAUNCHES;
-const HEAD_VOCAB_PER_RANK: usize = 32_320;
 const SWIGLU_LIMIT_BITS: u64 = 10.0f32.to_bits() as u64;
-const PADDED: usize = 640;
+/// The routed kernels' own padded output width (kernel ABI, not a model shape).
+const PADDED: usize = sparkflash_kernels::moe_routed_device::WIDTH_PADDED;
 const QUANT_BLOCK: usize = 32;
 
 /// The shared expert's two E8M0 scale grids, as (w1/w3, w2): one block scale per 32x32 tile.
@@ -1532,7 +1532,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             return Ok(None);
         }
         let per_rank = vocab / RANKS;
-        if per_rank != HEAD_VOCAB_PER_RANK {
+        if per_rank != crate::plan::vocab_per_rank() {
             return Ok(None);
         }
         let started = std::time::Instant::now();
@@ -2465,7 +2465,7 @@ mod tests {
 
     #[test]
     fn the_head_rank_to_global_mapping_is_contiguous_and_pinned() {
-        let per_rank = 32_320usize;
+        let per_rank = crate::plan::vocab_per_rank();
         let mut best_value = f32::NEG_INFINITY;
         let mut best_index = 0u32;
         for rank in 0..4 {
@@ -2522,10 +2522,10 @@ mod tests {
 
     #[test]
     fn the_certified_head_shard_is_the_released_vocabulary_over_four() {
-        assert_eq!(HEAD_VOCAB_PER_RANK, 129_280 / 4);
+        assert_eq!(crate::plan::vocab_per_rank(), 129_280 / 4);
         assert_eq!(cert_lm_head_launch::CHUNK, 1024);
         assert_eq!(
-            HEAD_VOCAB_PER_RANK.div_ceil(cert_lm_head_launch::CHUNK as usize),
+            crate::plan::vocab_per_rank().div_ceil(cert_lm_head_launch::CHUNK as usize),
             32
         );
     }

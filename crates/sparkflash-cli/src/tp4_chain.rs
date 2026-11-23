@@ -587,14 +587,18 @@ fn open_transport(args: &ChainArgs) -> Result<TcpTransport, String> {
 const FORWARD_LOOP_PORT_OFFSET: u16 = 100;
 
 /// bf16 elements of ONE per-layer device collective: the two per-layer reduces (attention output
-/// and the routed MoE delta) are both the plan's dim, 5,120 bf16 = 10,240 B per call in the released
-/// config. This is layer_device's constant, not a second copy: the port's rungs and the warm-up must
-/// agree on the count or the warm-up does not warm the shape the loop enqueues.
-const REDUCE_PAYLOAD_ELEMENTS: usize = crate::layer_device::REDUCE_ELEMENTS;
+/// and the routed MoE delta) are both the plan's dim. This reads layer_device's open value, not a
+/// second copy: the port's rungs and the warm-up must agree on the count or the warm-up does not
+/// warm the shape the loop enqueues.
+fn reduce_payload_elements() -> usize {
+    crate::layer_device::reduce_elements()
+}
 
 /// Device scratch bytes for the communicator's setup warm-up: one payload's worth of bf16, the
 /// in-place buffer the three warm-up collectives reduce over. Setup only; freed after the run.
-const REDUCE_SCRATCH_BYTES: usize = REDUCE_PAYLOAD_ELEMENTS * 2;
+fn reduce_scratch_bytes() -> usize {
+    reduce_payload_elements() * 2
+}
 
 /// The per-process behaviour switches the bootstrap's agreement word carries.
 ///
@@ -1074,11 +1078,12 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
                                     },
                                 )?;
                                 let mut allocated = 0usize;
+                                let scratch_bytes = reduce_scratch_bytes();
                                 let scratch = cuda
-                                    .alloc(REDUCE_SCRATCH_BYTES, &mut allocated)
+                                    .alloc(scratch_bytes, &mut allocated)
                                     .map_err(|error| {
                                         format!(
-                                            "forward reduce bootstrap r{}: allocating the {REDUCE_SCRATCH_BYTES}-byte warm-up scratch: {error}",
+                                            "forward reduce bootstrap r{}: allocating the {scratch_bytes}-byte warm-up scratch: {error}",
                                             args.rank
                                         )
                                     })?;
@@ -1088,7 +1093,7 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
                                     args.rank,
                                     0, // the legacy default stream: every launch of this loop is on it
                                     scratch.0,
-                                    REDUCE_PAYLOAD_ELEMENTS,
+                                    reduce_payload_elements(),
                                     reduce_config,
                                 )
                                 .map_err(|error| {

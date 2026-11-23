@@ -358,7 +358,11 @@ impl RowsState {
     ) -> Result<(), String> {
         cuda.launch(
             self.kernels.hc_collapse,
-            (5120 / 256, k as u32, groups as u32),
+            (
+                (crate::plan::hidden() / 256) as u32,
+                k as u32,
+                groups as u32,
+            ),
             (256, 1, 1),
             &[pre_mix, stream, out, certified_count, stride as u64],
         )

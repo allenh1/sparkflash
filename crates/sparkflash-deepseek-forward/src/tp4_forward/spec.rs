@@ -307,6 +307,9 @@ fn finish_window(
 /// thread (the scope joins it).
 pub(super) struct Keepalive(Arc<KeepState>);
 
+/// The 4 KiB page the keepalive's O_DIRECT read touches: a host page size, not a model value.
+const PAGE_BYTES: usize = 4096;
+
 /// The keepalive thread's switch: armed, and the stop flag the disarmed thread waits on.
 struct KeepState {
     armed: std::sync::atomic::AtomicBool,
@@ -350,8 +353,8 @@ impl Keepalive {
         let worker = keep.clone();
         scope.spawn(move || {
             let mut page = vec![0u8; 8192];
-            let at = page.as_ptr().align_offset(4096);
-            let page = &mut page[at..at + 4096];
+            let at = page.as_ptr().align_offset(PAGE_BYTES);
+            let page = &mut page[at..at + PAGE_BYTES];
             let mut seed = 0x9E37_79B9_7F4A_7C15u64;
             loop {
                 if !worker.armed.load(Ordering::Acquire) {
@@ -366,7 +369,10 @@ impl Keepalive {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-                if let Err(error) = file.read_exact_at(page, (seed % (len - 4096)) & !4095) {
+                if let Err(error) = file.read_exact_at(
+                    page,
+                    (seed % (len - PAGE_BYTES as u64)) & !(PAGE_BYTES as u64 - 1),
+                ) {
                     eprintln!("engram keepalive: {error}; stopping");
                     return;
                 }
