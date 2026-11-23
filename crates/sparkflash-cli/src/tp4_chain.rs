@@ -409,18 +409,27 @@ fn parse_token_ids(raw: &str, flag: &str) -> Result<Vec<u32>, String> {
         let id: u32 = part
             .parse()
             .map_err(|error| format!("{flag} {part}: {error}"))?;
-        if id as usize >= crate::tp4_token::vocab() {
-            return Err(format!(
-                "{flag} {id} is outside the {}-token vocabulary",
-                crate::tp4_token::vocab()
-            ));
-        }
         ids.push(id);
     }
     if ids.is_empty() {
         return Err(format!("{flag} needs at least one token id"));
     }
     Ok(ids)
+}
+
+/// Refuses an id outside the vocabulary the open plan states.
+///
+/// The vocabulary is a model value read at open, so the flag parser cannot know it. The chain
+/// calls this once the plan is installed, before a token reaches the forward loop.
+fn check_token_ids(ids: &[u32], flag: &str, vocab: usize) -> Result<(), String> {
+    for id in ids {
+        if *id as usize >= vocab {
+            return Err(format!(
+                "{flag} {id} is outside the {vocab}-token vocabulary"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The routed down-projection geometry the bind actually built: the released plan stores one row per
@@ -906,6 +915,10 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
     let description =
         crate::plan::install(open_plan).map_err(|error| format!("forward open: {error}"))?;
     let config = description.values().clone();
+    // The vocabulary is known only after the plan opens; the flag parser checked the syntax.
+    let vocab = crate::tp4_token::vocab();
+    check_token_ids(&args.token_ids, "--token-ids", vocab)?;
+    check_token_ids(&args.reference_ids, "--forward-reference-ids", vocab)?;
     let table =
         crate::resident_weights::rank_attention_plan_shapes(&config, args.rank, args.world)?;
     let mut lines: Vec<String> = vec![format!(
@@ -1866,16 +1879,21 @@ mod forward_args_tests {
             .expect_err("reference ids need --forward");
         assert!(error.contains("only used by --forward"), "{error}");
 
-        let error = parse_with(&[
-            "--loop",
-            "--forward",
-            "--forward-preflight",
-            "--decode-steps",
-            "2",
-            "--forward-reference-ids",
-            "491,999999",
-        ])
-        .expect_err("outside the vocabulary");
+        // The vocabulary is checked after the plan opens; the parser accepts the pair.
+        assert!(
+            parse_with(&[
+                "--loop",
+                "--forward",
+                "--forward-preflight",
+                "--decode-steps",
+                "2",
+                "--forward-reference-ids",
+                "491,999999",
+            ])
+            .is_ok()
+        );
+        let error = check_token_ids(&[999999], "--forward-reference-ids", 129_280)
+            .expect_err("outside the vocabulary");
         assert!(error.contains("--forward-reference-ids 999999"), "{error}");
     }
 
@@ -1937,8 +1955,10 @@ mod forward_args_tests {
         let error =
             parse_with(&["--loop", "--forward", "--token-ids", "5,x"]).expect_err("garbage");
         assert!(error.contains("--token-ids x"), "{error}");
-        let error = parse_with(&["--loop", "--forward", "--token-ids", "129280"])
-            .expect_err("out of vocab");
+        // The vocabulary is a model value read at open, so the parser accepts the syntax and the
+        // chain refuses the id once the plan states the vocabulary.
+        assert!(parse_with(&["--loop", "--forward", "--token-ids", "129280"]).is_ok());
+        let error = check_token_ids(&[129280], "--token-ids", 129_280).expect_err("out of vocab");
         assert!(
             error.contains("outside the 129280-token vocabulary"),
             "{error}"

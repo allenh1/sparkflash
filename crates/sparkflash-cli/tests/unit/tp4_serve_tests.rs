@@ -1219,9 +1219,10 @@ fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
         released.replace("\"patch_size\": 14", "\"patch_size\": 16"),
     )
     .expect("the config");
-    let error = check_checkpoint_plan(dir.path(), 4, Availability::Catalogue)
-        .expect_err("a 16-patch tower is refused");
-    assert!(error.contains("vision patch 16"), "{error}");
+    // The vision family now compiles both patchify sides (14 and 16), so a 16-patch tower
+    // resolves against its own body rather than being refused.
+    check_checkpoint_plan(dir.path(), 4, Availability::Catalogue)
+        .expect("a 16-patch tower uses the compiled 16-patch body");
 }
 
 #[test]

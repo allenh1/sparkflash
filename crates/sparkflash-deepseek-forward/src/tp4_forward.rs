@@ -3494,7 +3494,6 @@ impl AttentionBody {
     ) -> Result<AttentionStep, String> {
         use sparkflash_engine::linalg;
         use sparkflash_kernels::flash_mla_csa2_seq_launch as seq;
-        use sparkflash_kernels::mla_ref;
 
         let config = request.config.ok_or_else(|| {
             "attention body: the loop was built without the model config".to_string()
