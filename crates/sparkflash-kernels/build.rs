@@ -159,8 +159,9 @@ fn read_instances() -> Vec<Instance> {
         let keys: &[&str] = match family.as_str() {
             "router" => &["hidden", "experts", "top_k"],
             "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"],
+            "head" => &["hidden", "vocab_per_rank", "ranks"],
             other => panic!(
-                "sparkflash-kernels: instance {}: family {other:?} is not router or routed",
+                "sparkflash-kernels: instance {}: family {other:?} is not router, routed or head",
                 number + 1
             ),
         };

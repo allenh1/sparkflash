@@ -182,9 +182,10 @@ const INKLING_CHAIN_FIRST_ROWS: usize = 9;
 /// obligation: a geometry that leaves it at zero is refused, not skipped.
 const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
     match (part, image) {
-        (Part::Embedding, Image::Deepseek) => {
-            ShapeConstraint::ANY.hidden_equals(5120).vocab_multiple(128)
-        }
+        // The head family's instances pin the released hidden width and vocabulary exactly:
+        // 129,280 rows is four 32,320-row shards over 5,120 hidden values. The vocab_multiple(128)
+        // rule admitted widths and vocabularies no head body was compiled for.
+        (Part::Embedding, Image::Deepseek) => CATALOGUE_DEEPSEEK_HEAD,
         // q4e_embed reads the table row at the runtime hidden width and copies it to f32
         // (`kernels/qwen4_exp_sm121.cu:318-331`); it has no vocabulary alignment. Inkling's
         // 201,024-row table is not a multiple of the Qwen release's 128, and the same body
@@ -194,9 +195,9 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             ShapeConstraint::ANY.hidden_equals(5120).hidden_multiple(2)
         }
         (Part::RmsNorm, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_multiple(2),
-        (Part::LmHead, Image::Deepseek) => {
-            ShapeConstraint::ANY.hidden_equals(5120).vocab_multiple(128)
-        }
+        // The certified head and its device reduction are compiled at the instance's hidden
+        // width and vocabulary shard, so the generated rule names that exact pair.
+        (Part::LmHead, Image::Deepseek) => CATALOGUE_DEEPSEEK_HEAD,
         // q4e_argmax_slices and q4e_argmax_prob_slices take the rank-local vocabulary width
         // as a runtime argument (`kernels/qwen4_exp_sm121.cu:336-397`); neither rounds it to
         // 128. The head screen is not the matrix projection, which is Part::DenseGemm.
@@ -5703,6 +5704,39 @@ mod tests {
             CATALOGUE_DEEPSEEK_MOE.accepts(&wrong_experts).is_err(),
             "an expert count no instance was built for is refused"
         );
+    }
+
+    #[test]
+    fn the_head_shape_rule_is_the_built_instance() {
+        // The certified head's instances name a 5120-wide hidden state and 32,320 entries a rank
+        // over four ranks, i.e. 129,280 rows. The generated rule is that exact pair, not the old
+        // hidden_equals(5120).vocab_multiple(128), which accepted widths and vocabularies no head
+        // body was compiled for.
+        assert_eq!(CATALOGUE_DEEPSEEK_HEAD.hidden_equals, Some(5120));
+        assert_eq!(CATALOGUE_DEEPSEEK_HEAD.vocab_equals, Some(129_280));
+        assert_eq!(CATALOGUE_DEEPSEEK_HEAD.vocab_multiple, 1);
+
+        let served = crate::PartGeometry {
+            hidden: 5120,
+            vocab: 129_280,
+            ..crate::PartGeometry::new()
+        };
+        assert_eq!(CATALOGUE_DEEPSEEK_HEAD.accepts(&served), Ok(()));
+        for wrong in [
+            crate::PartGeometry {
+                hidden: 4096,
+                ..served
+            },
+            crate::PartGeometry {
+                vocab: 131_072,
+                ..served
+            },
+        ] {
+            assert!(
+                CATALOGUE_DEEPSEEK_HEAD.accepts(&wrong).is_err(),
+                "a head shape no instance was built for is refused: {wrong:?}"
+            );
+        }
     }
 
     #[test]

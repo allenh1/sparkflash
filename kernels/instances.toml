@@ -14,7 +14,7 @@
 #                share a cubin are compiled in one translation unit, so the released multi-symbol
 #                cubins keep their file names and symbol sets.
 #   family       the shape vocabulary: "router" needs hidden/experts/top_k, "routed" needs those
-#                plus intermediate/padded.
+#                plus intermediate/padded, "head" needs hidden/vocab_per_rank/ranks.
 #   catalogue    optional catalogue key; sparkflash-ops generates that part's exact shape rule
 #                from every instance carrying the same key.
 #   catalogue_intermediate
@@ -204,6 +204,50 @@ padded = 640
 experts = 128
 top_k = 3
 
+# --- The certified head ----------------------------------------------------------------------
+# The certified screen and its device reduction are compiled for the released hidden width and
+# this rank's vocabulary shard. The reduction folds four shards, so the total vocabulary is
+# ranks * vocab_per_rank = 129,280. Both entries of a source share the source's released cubin.
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_sm121"
+cubin = "cert_lm_head_sm121"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 5120
+vocab_per_rank = 32320
+ranks = 4
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_batched_sm121"
+cubin = "cert_lm_head_sm121"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 5120
+vocab_per_rank = 32320
+ranks = 4
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_sm121"
+cubin = "lm_head_reduce_sm121"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 5120
+vocab_per_rank = 32320
+ranks = 4
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_batched_sm121"
+cubin = "lm_head_reduce_sm121"
+family = "head"
+catalogue = "deepseek-head"
+hidden = 5120
+vocab_per_rank = 32320
+ranks = 4
+
 # --- The second-shape build proof -------------------------------------------------------------
 # Not loaded by any arm and not in the baseline: a 4096-wide router with 256 experts and top-8.
 # It compiles from opt_router_sm121.cu alone, into its own cubin, so the released cubin's symbol
@@ -217,3 +261,15 @@ family = "router"
 hidden = 4096
 experts = 256
 top_k = 8
+
+# The head's second shape: the same bodies at a 4096-wide hidden state and a 16,384-entry rank
+# shard (65,536 total vocabulary over four ranks). It compiles from cert_lm_head_sm121.cu alone
+# into its own cubin, so the released cubin's bytes and symbol set stay pinned.
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_4096v16384_sm121"
+cubin = "cert_lm_head_4096v16384_sm121"
+family = "head"
+hidden = 4096
+vocab_per_rank = 16384
+ranks = 4

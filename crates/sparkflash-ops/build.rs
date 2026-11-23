@@ -56,6 +56,10 @@ fn generate() -> String {
     let mut hidden: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut intermediate: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut claims_intermediate: BTreeMap<String, bool> = BTreeMap::new();
+    // The head family's catalogue key names a compiled (hidden, vocabulary) pair: one rank's
+    // vocabulary shard times the four shards is the model's vocabulary. It has no expert or
+    // intermediate field, so it is collected separately from the routed shape triples.
+    let mut head_shapes: BTreeMap<String, BTreeSet<(u64, u64)>> = BTreeMap::new();
     for row in rows {
         let table = row
             .as_table()
@@ -72,6 +76,15 @@ fn generate() -> String {
         let Some(key) = table.get("catalogue").and_then(toml::Value::as_str) else {
             continue;
         };
+        let family = table
+            .get("family")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("sparkflash-ops: an instance has no family"));
+        if family == "head" {
+            let shape = (get("hidden"), get("ranks") * get("vocab_per_rank"));
+            head_shapes.entry(key.to_owned()).or_default().insert(shape);
+            continue;
+        }
         let shape = (get("hidden"), get("experts"), get("top_k"));
         keys.entry(key.to_owned()).or_default().insert(shape);
         hidden.entry(key.to_owned()).or_default().insert(shape.0);
@@ -92,7 +105,7 @@ fn generate() -> String {
         }
     }
     assert!(
-        !keys.is_empty(),
+        !keys.is_empty() || !head_shapes.is_empty(),
         "sparkflash-ops: no instance in {INSTANCES} names a catalogue key"
     );
 
@@ -137,6 +150,28 @@ fn generate() -> String {
             );
         }
         let _ = writeln!(generated, "    .routed_shapes(&[{shape_list}]);");
+    }
+    for (key, shapes) in &head_shapes {
+        // A head body is compiled for one (hidden, vocabulary) pair. Refuse to emit a looser
+        // rule if a key ever names two pairs: the generated rule is an equality, not a bound.
+        assert_eq!(
+            shapes.len(),
+            1,
+            "sparkflash-ops: {key} names {} head shapes; one catalogue key is one compiled pair",
+            shapes.len()
+        );
+        let (hidden, vocab) = shapes.iter().next().expect("one head shape");
+        let name = format!("CATALOGUE_{}", key.to_ascii_uppercase().replace('-', "_"));
+        let _ = writeln!(
+            generated,
+            "#[allow(dead_code)] // a generated rule exists for every catalogue key, used or not"
+        );
+        let _ = writeln!(
+            generated,
+            "pub(crate) const {name}: ShapeConstraint = ShapeConstraint::ANY"
+        );
+        let _ = writeln!(generated, "    .hidden_equals({hidden})");
+        let _ = writeln!(generated, "    .vocab_equals({vocab});");
     }
     generated
 }

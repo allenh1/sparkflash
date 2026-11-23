@@ -1257,7 +1257,7 @@ const ASSERT_COUNTS: [(&str, usize); 7] = [
     ("b12x_mxfp4_moe_sm121.cu", 12),
     ("flash_mla_csa2_sm121.cu", 17),
     ("b12x_mxfp8_wo_a_sm121.cu", 20),
-    ("cert_lm_head_sm121.cu", 9),
+    ("cert_lm_head_sm121.cu", 18),
 ];
 
 /// Why an assertion is not a conformance check, as a function so that the mutation test below runs
@@ -1582,6 +1582,14 @@ fn every_static_assert_in_the_milestone_holds_under_rust_too() {
         let stripped = crate::c_decl::strip_comments(source);
         let mut table = Consts::parse(&stripped);
         table.extend(COMMON_HEADER);
+        // The certified head's shapes are instance arguments now: resolve its bounds through
+        // the defines kernels/instances.toml gave the released compile group.
+        if name == "cert_lm_head_sm121.cu" {
+            // One cubin holds both released entries, so its define table is both entries'. The
+            // second-shape proof instance is a separate cubin and its own table.
+            table.extend(crate::instances::CERT_LM_HEAD_SM121_DEFINES);
+            table.extend(crate::instances::CERT_LM_HEAD_4096V16384_SM121_DEFINES);
+        }
         let asserts = crate::c_decl::static_asserts(&stripped);
         let expected = ASSERT_COUNTS
             .iter()
@@ -1610,9 +1618,9 @@ fn every_static_assert_in_the_milestone_holds_under_rust_too() {
         }
     }
     assert_eq!(
-        checked, 100,
+        checked, 109,
         "the milestone's static asserts must all be evaluated: 20 in the shared header plus 7, 15, \
-         12, 17, 20 and 9 in the six kernels (mega_mhc, dense, MoE, flash_mla, wo_a, cert). The MoE \
+         12, 17, 20 and 18 in the six kernels (mega_mhc, dense, MoE, flash_mla, wo_a, cert). The MoE \
          count rose from 10 to 12 with the split-K tiling: the 256-thread block identity and the \
          one-reducer-per-(slot, column) bound. D14 had raised it from 7 to 10 for the FP8 E4M3 \
          activation operand's byte width; flash_mla's rose from 13 to 15 with the engine window \
@@ -1871,6 +1879,8 @@ fn the_static_assert_reader_is_not_vacuous() {
     let lm_source = crate::c_decl::strip_comments(CERT_LM_HEAD);
     let mut kernel_table = Consts::parse(&lm_source);
     kernel_table.extend(&mutated);
+    kernel_table.extend(crate::instances::CERT_LM_HEAD_SM121_DEFINES);
+    kernel_table.extend(crate::instances::CERT_LM_HEAD_4096V16384_SM121_DEFINES);
     let lm_asserts = crate::c_decl::static_asserts(&lm_source);
     let kernel_failures: Vec<&crate::c_decl::StaticAssert> = lm_asserts
         .iter()

@@ -43,6 +43,9 @@ IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FAMILIES = {
     "router": ("hidden", "experts", "top_k"),
     "routed": ("hidden", "intermediate", "padded", "experts", "top_k"),
+    # The certified head and the device reduction: the hidden width, this rank's vocabulary
+    # shard, and the four rank shards the reduction folds. The total vocabulary is the product.
+    "head": ("hidden", "vocab_per_rank", "ranks"),
 }
 ALLOWED = {
     "source",

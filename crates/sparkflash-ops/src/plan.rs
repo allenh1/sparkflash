@@ -960,6 +960,8 @@ pub struct ShapeConstraint {
     pub gqa_groups: &'static [usize],
     /// Hidden width that must equal this, when named and nonzero.
     pub hidden_equals: Option<usize>,
+    /// Vocabulary rows that must equal this, when named and nonzero.
+    pub vocab_equals: Option<usize>,
     /// Intermediate width that must equal this, when named and nonzero.
     pub intermediate_equals: Option<usize>,
     /// Expert count that must equal this, when named and nonzero.
@@ -1041,6 +1043,7 @@ impl ShapeConstraint {
         min_ratio: 0,
         gqa_groups: &[],
         hidden_equals: None,
+        vocab_equals: None,
         intermediate_equals: None,
         experts_equals: None,
         top_k_equals: None,
@@ -1156,6 +1159,13 @@ impl ShapeConstraint {
     #[must_use]
     pub const fn hidden_equals(mut self, hidden: usize) -> Self {
         self.hidden_equals = Some(hidden);
+        self
+    }
+
+    /// Require the vocabulary to equal `vocab`.
+    #[must_use]
+    pub const fn vocab_equals(mut self, vocab: usize) -> Self {
+        self.vocab_equals = Some(vocab);
         self
     }
 
@@ -1430,6 +1440,7 @@ impl ShapeConstraint {
         multiple("experts", geometry.experts, self.experts_multiple)?;
         multiple("streams", geometry.streams, self.streams_multiple)?;
         equals("hidden", geometry.hidden, self.hidden_equals)?;
+        equals("vocab", geometry.vocab, self.vocab_equals)?;
         equals(
             "intermediate",
             geometry.intermediate,

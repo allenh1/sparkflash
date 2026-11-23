@@ -59,7 +59,15 @@ fn instances() -> Vec<Instance> {
                     .to_owned()
             };
             let mut shapes = BTreeMap::new();
-            for key in ["hidden", "experts", "top_k", "intermediate", "padded"] {
+            for key in [
+                "hidden",
+                "experts",
+                "top_k",
+                "intermediate",
+                "padded",
+                "vocab_per_rank",
+                "ranks",
+            ] {
                 if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                     assert!(value > 0, "{key} is positive");
                     shapes.insert(key.to_owned(), value as u64);
@@ -112,15 +120,16 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
             path.display()
         );
         assert!(
-            ["router", "routed"].contains(&instance.family.as_str()),
+            ["router", "routed", "head"].contains(&instance.family.as_str()),
             "{} names family {:?}",
             instance.entry,
             instance.family
         );
-        for key in if instance.family == "router" {
-            &["hidden", "experts", "top_k"][..]
-        } else {
-            &["hidden", "intermediate", "padded", "experts", "top_k"][..]
+        for key in match instance.family.as_str() {
+            "router" => &["hidden", "experts", "top_k"][..],
+            "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"][..],
+            "head" => &["hidden", "vocab_per_rank", "ranks"][..],
+            _ => unreachable!("the family was checked above"),
         } {
             assert!(
                 instance.shapes.contains_key(*key),
@@ -200,4 +209,55 @@ fn the_router_family_has_its_released_shapes_and_a_second_shape() {
             "the catalogue key {key} has no instance"
         );
     }
+}
+
+#[test]
+fn the_head_family_has_its_released_shape_and_a_second_shape() {
+    let rows = instances();
+    let heads: Vec<&Instance> = rows.iter().filter(|row| row.family == "head").collect();
+
+    // Both released entries of each source carry the released one-rank shape and share the
+    // source's cubin, so the released symbol sets are whole.
+    for entry in [
+        "cert_lm_head_sm121",
+        "cert_lm_head_batched_sm121",
+        "lm_head_reduce_sm121",
+        "lm_head_reduce_batched_sm121",
+    ] {
+        let row = heads
+            .iter()
+            .find(|row| row.entry == entry)
+            .unwrap_or_else(|| panic!("{entry} has no head instance"));
+        assert_eq!(row.shapes["hidden"], 5120, "{entry}");
+        assert_eq!(row.shapes["vocab_per_rank"], 32320, "{entry}");
+        assert_eq!(row.shapes["ranks"], 4, "{entry}");
+        assert!(row.catalogue.as_deref() == Some("deepseek-head"), "{entry}");
+    }
+    for source in ["cert_lm_head_sm121.cu", "lm_head_reduce_sm121.cu"] {
+        let cubins: BTreeSet<&str> = heads
+            .iter()
+            .filter(|row| row.source.ends_with(source) && row.catalogue.is_some())
+            .map(|row| row.cubin.as_str())
+            .collect();
+        assert_eq!(cubins.len(), 1, "{source} entries share one released cubin");
+    }
+
+    let second = heads
+        .iter()
+        .find(|row| row.entry == "cert_lm_head_4096v16384_sm121")
+        .expect("the head second-shape proof instance");
+    assert_eq!(second.shapes["hidden"], 4096);
+    assert_eq!(second.shapes["vocab_per_rank"], 16384);
+    assert_eq!(second.shapes["ranks"], 4);
+    assert_eq!(second.cubin, "cert_lm_head_4096v16384_sm121");
+    assert!(
+        second.catalogue.is_none(),
+        "the proof shape is not a released catalogue claim"
+    );
+    assert!(
+        !heads
+            .iter()
+            .any(|row| row.entry == second.entry && row.cubin == "cert_lm_head_sm121"),
+        "the proof has its own cubin"
+    );
 }

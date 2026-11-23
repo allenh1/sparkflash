@@ -57,9 +57,20 @@
 
 #include "m4_common_sm121.cuh"
 
-// The screen tile of specification 2.1, and one thread per entry of a 128-block chunk.
+// The model shapes are instance arguments (kernels/instances.toml): the hidden width and this
+// rank's vocabulary shard have no default, and every entry is gated on its own instance macros.
+// The total vocabulary is ranks * vocab_per_rank, arithmetic on the arguments rather than a
+// second copy of the model geometry. A build that names no head instance does not compile.
+#if !defined(SPARK_INSTANCE_CERT_LM_HEAD_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_HIDDEN)
+#error "cert_lm_head_sm121.cu: no instance macros; the hidden width and vocabulary shard are arguments from kernels/instances.toml"
+#endif
+
+// The screen tile of specification 2.1, and one thread per entry of a 128-block chunk. These are
+// the body's algorithm constants: the tile width a bound block covers, the eight entries a thread
+// screens per pass, and the six-row K8 verify batch. The model geometry is not among them.
 #define SPARK_M4_LM_HEAD_THREADS 128u
-#define SPARK_M4_LM_BLOCKS (SPARK_M4_HIDDEN / SPARK_M4_LM_SCREEN_TILE)
 #define SPARK_M4_LM_ENTRIES_PER_THREAD 8u
 #define SPARK_M4_LM_CHUNK (SPARK_M4_LM_HEAD_THREADS * SPARK_M4_LM_ENTRIES_PER_THREAD)
 // The argmax rule this file implements: when several entries tie at the maximum, the LOWEST entry
@@ -67,17 +78,18 @@
 // implements the same rule, and src/m4_abi.rs asserts the tie-break clause is present in both
 // reductions here, so the rule cannot be dropped by an edit that only compares values.
 #define SPARK_M4_LM_TIE_BREAK_BY_INDEX 1u
+#define SPARK_M4_LM_BATCH_ROWS 6u
 static_assert(SPARK_M4_LM_TIE_BREAK_BY_INDEX == 1u, "ties are broken by the lower entry index");
 
 static_assert(SPARK_M4_LM_SCREEN_TILE == 128u, "the screen tile is 128 hidden values");
-static_assert(SPARK_M4_HIDDEN % SPARK_M4_LM_SCREEN_TILE == 0u, "the hidden dimension tiles by 128");
-static_assert(SPARK_M4_LM_BLOCKS == 40u, "5120 hidden values are 40 screen blocks");
 static_assert(SPARK_M4_LM_HEAD_THREADS == SPARK_M4_LM_SCREEN_TILE, "one entry per thread per pass");
 static_assert(SPARK_M4_LM_CHUNK == 1024u, "a block owns 1024 vocabulary entries");
-static_assert(SPARK_M4_VOCAB_PER_RANK / SPARK_M4_LM_CHUNK >= 31u, "32,320 entries are 32 chunks");
-static_assert(SPARK_M4_VOCAB % SPARK_M4_VOCAB_PER_RANK == 0u, "the vocabulary shards across ranks");
+static_assert(SPARK_M4_VOCAB % SPARK_M4_LM_SCREEN_TILE == 0u,
+              "the screen tile divides the released vocabulary");
+static_assert(SPARK_M4_LM_BATCH_ROWS == 6u, "the six-row verify batch is the fixed shape");
 
-extern "C" __global__ void cert_lm_head_sm121(
+template <uint32_t CERT_HIDDEN, uint32_t CERT_VOCAB_PER_RANK, uint32_t CERT_RANKS>
+__device__ __forceinline__ void cert_lm_head_body(
     const __nv_bfloat16 *__restrict__ hidden,   // [hidden]
     const __nv_bfloat16 *__restrict__ w,        // [vocab][hidden] bf16, this rank's shard
     const __nv_bfloat16 *__restrict__ w_block_max, // [vocab][40] bf16, exact block row maxima
@@ -90,8 +102,9 @@ extern "C" __global__ void cert_lm_head_sm121(
     GpuTraceRing *__restrict__ trace_ring,
     const uint32_t layer_id,
     const uint64_t step_seq) {
+    constexpr uint32_t CERT_BLOCKS = CERT_HIDDEN / SPARK_M4_LM_SCREEN_TILE;
     const uint32_t lane = threadIdx.x;
-    __shared__ float s_h_abs[SPARK_M4_LM_BLOCKS];
+    __shared__ float s_h_abs[CERT_BLOCKS];
     __shared__ float s_thread_max[SPARK_M4_LM_HEAD_THREADS];
     __shared__ uint32_t s_thread_argmax[SPARK_M4_LM_HEAD_THREADS];
 
@@ -101,7 +114,7 @@ extern "C" __global__ void cert_lm_head_sm121(
     // One block of the hidden state's absolute sums, computed cooperatively once per block: every
     // thread accumulates its share and the reduction folds them. This is the only shared input the
     // bound needs, which is why the screen is cheap compared with the exact dot.
-    for (uint32_t block = 0; block < (uint32_t)SPARK_M4_LM_BLOCKS; ++block) {
+    for (uint32_t block = 0; block < (uint32_t)CERT_BLOCKS; ++block) {
         float local = 0.0f;
         for (uint32_t i = lane; i < (uint32_t)SPARK_M4_LM_SCREEN_TILE; i += SPARK_M4_LM_HEAD_THREADS) {
             const float value = __bfloat162float(hidden[block * SPARK_M4_LM_SCREEN_TILE + i]);
@@ -125,14 +138,14 @@ extern "C" __global__ void cert_lm_head_sm121(
         if (entry >= vocab) {
             continue;
         }
-        const __nv_bfloat16 *row = w + (uint64_t)entry * SPARK_M4_HIDDEN;
+        const __nv_bfloat16 *row = w + (uint64_t)entry * CERT_HIDDEN;
         float bound = 0.0f;
 #pragma unroll 8
-        for (uint32_t block = 0; block < (uint32_t)SPARK_M4_LM_BLOCKS; ++block) {
+        for (uint32_t block = 0; block < (uint32_t)CERT_BLOCKS; ++block) {
             // The load-time precompute selected this exact BF16 weight as the block's largest
             // magnitude, so this replaces the old 128-value scan without changing the value.
             const float row_max = __bfloat162float(
-                w_block_max[(uint64_t)entry * SPARK_M4_LM_BLOCKS + block]);
+                w_block_max[(uint64_t)entry * CERT_BLOCKS + block]);
             bound += s_h_abs[block] * row_max;
         }
         if (bound < running_max) {
@@ -143,7 +156,7 @@ extern "C" __global__ void cert_lm_head_sm121(
         } else {
             float acc = 0.0f;
 #pragma unroll 8
-            for (uint32_t i = 0; i < (uint32_t)SPARK_M4_HIDDEN; ++i) {
+            for (uint32_t i = 0; i < (uint32_t)CERT_HIDDEN; ++i) {
                 acc += __bfloat162float(hidden[i]) * __bfloat162float(row[i]);
             }
             logits[entry] = acc;
@@ -192,17 +205,78 @@ extern "C" __global__ void cert_lm_head_sm121(
     }
     (void)t_enter;
 }
+
+// The released screen: hidden 5120, this rank's 32,320-entry vocabulary shard, four rank shards.
+#if defined(SPARK_INSTANCE_CERT_LM_HEAD_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_SM121_HIDDEN > 0u, "the instance names a hidden width");
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_SM121_HIDDEN % SPARK_M4_LM_SCREEN_TILE == 0u,
+              "the hidden dimension tiles by the screen tile");
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_SM121_VOCAB_PER_RANK > 0u,
+              "the instance names this rank's vocabulary shard");
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_SM121_RANKS == 4u,
+              "the certified head shards over four ranks");
+extern "C" __global__ void cert_lm_head_sm121(
+    const __nv_bfloat16 *__restrict__ hidden,
+    const __nv_bfloat16 *__restrict__ w,
+    const __nv_bfloat16 *__restrict__ w_block_max,
+    float *__restrict__ logits,
+    uint8_t *__restrict__ certified,
+    unsigned int *__restrict__ certified_count,
+    float *__restrict__ block_max,
+    uint32_t *__restrict__ block_argmax,
+    const uint32_t vocab,
+    GpuTraceRing *__restrict__ trace_ring,
+    const uint32_t layer_id,
+    const uint64_t step_seq) {
+    cert_lm_head_body<SPARK_INSTANCE_CERT_LM_HEAD_SM121_HIDDEN,
+                      SPARK_INSTANCE_CERT_LM_HEAD_SM121_VOCAB_PER_RANK,
+                      SPARK_INSTANCE_CERT_LM_HEAD_SM121_RANKS>(
+        hidden, w, w_block_max, logits, certified, certified_count, block_max, block_argmax, vocab,
+        trace_ring, layer_id, step_seq);
+}
+#endif
+
+// The second-shape build proof (kernels/instances.toml): 4096 wide and a 16,384-entry rank shard,
+// into its own cubin. Nothing loads it; it proves the body takes the arguments rather than the
+// released literals.
+#if defined(SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_HIDDEN > 0u,
+              "the instance names a hidden width");
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_HIDDEN % SPARK_M4_LM_SCREEN_TILE == 0u,
+              "the hidden dimension tiles by the screen tile");
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_VOCAB_PER_RANK > 0u,
+              "the instance names this rank's vocabulary shard");
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_RANKS == 4u,
+              "the certified head shards over four ranks");
+extern "C" __global__ void cert_lm_head_4096v16384_sm121(
+    const __nv_bfloat16 *__restrict__ hidden,
+    const __nv_bfloat16 *__restrict__ w,
+    const __nv_bfloat16 *__restrict__ w_block_max,
+    float *__restrict__ logits,
+    uint8_t *__restrict__ certified,
+    unsigned int *__restrict__ certified_count,
+    float *__restrict__ block_max,
+    uint32_t *__restrict__ block_argmax,
+    const uint32_t vocab,
+    GpuTraceRing *__restrict__ trace_ring,
+    const uint32_t layer_id,
+    const uint64_t step_seq) {
+    cert_lm_head_body<SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_HIDDEN,
+                      SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_VOCAB_PER_RANK,
+                      SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_RANKS>(
+        hidden, w, w_block_max, logits, certified, certified_count, block_max, block_argmax, vocab,
+        trace_ring, layer_id, step_seq);
+}
+#endif
+
 // K8 batched certified head: one launch over the six-row verify batch. The weights and the exact
 // BF16 row maxima are read once and reused across the six hidden rows; each row keeps its own
 // running maximum, pruning flags, logits and block reductions. The arithmetic of every row is the
 // scalar kernel's arithmetic in the same order (bound blocks ascending, exact dot K ascending,
 // strict '<' pruning, strict '>' maximum with the lower-index tie break), so every per-row output
 // is BIT-IDENTICAL to cert_lm_head_sm121.
-#define SPARK_M4_LM_BATCH_ROWS 6u
-
-static_assert(SPARK_M4_LM_BATCH_ROWS == 6u, "the six-row verify batch is the fixed shape");
-
-extern "C" __global__ void cert_lm_head_batched_sm121(
+template <uint32_t CERT_HIDDEN, uint32_t CERT_VOCAB_PER_RANK, uint32_t CERT_RANKS>
+__device__ __forceinline__ void cert_lm_head_batched_body(
     const __nv_bfloat16 *__restrict__ hidden,   // [rows][hidden]
     const __nv_bfloat16 *__restrict__ w,        // [vocab][hidden] bf16, this rank's shard
     const __nv_bfloat16 *__restrict__ w_block_max_t, // [40][vocab] bf16, coalesced bound reads
@@ -215,8 +289,9 @@ extern "C" __global__ void cert_lm_head_batched_sm121(
     GpuTraceRing *__restrict__ trace_ring,
     const uint32_t layer_id,
     const uint64_t step_seq) {
+    constexpr uint32_t CERT_BLOCKS = CERT_HIDDEN / SPARK_M4_LM_SCREEN_TILE;
     const uint32_t lane = threadIdx.x;
-    __shared__ float s_h_abs[SPARK_M4_LM_BATCH_ROWS][SPARK_M4_LM_BLOCKS];
+    __shared__ float s_h_abs[SPARK_M4_LM_BATCH_ROWS][CERT_BLOCKS];
     __shared__ float s_thread_max[SPARK_M4_LM_BATCH_ROWS][SPARK_M4_LM_HEAD_THREADS];
     __shared__ uint32_t s_thread_argmax[SPARK_M4_LM_BATCH_ROWS][SPARK_M4_LM_HEAD_THREADS];
 
@@ -224,8 +299,8 @@ extern "C" __global__ void cert_lm_head_batched_sm121(
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
 
     for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
-        const __nv_bfloat16 *hidden_row = hidden + (uint64_t)r * SPARK_M4_HIDDEN;
-        for (uint32_t block = 0u; block < (uint32_t)SPARK_M4_LM_BLOCKS; ++block) {
+        const __nv_bfloat16 *hidden_row = hidden + (uint64_t)r * CERT_HIDDEN;
+        for (uint32_t block = 0u; block < (uint32_t)CERT_BLOCKS; ++block) {
             float local = 0.0f;
             for (uint32_t i = lane; i < (uint32_t)SPARK_M4_LM_SCREEN_TILE;
                  i += SPARK_M4_LM_HEAD_THREADS) {
@@ -256,14 +331,14 @@ extern "C" __global__ void cert_lm_head_batched_sm121(
         if (entry >= vocab) {
             continue;
         }
-        const __nv_bfloat16 *row = w + (uint64_t)entry * SPARK_M4_HIDDEN;
+        const __nv_bfloat16 *row = w + (uint64_t)entry * CERT_HIDDEN;
         float bound[SPARK_M4_LM_BATCH_ROWS];
 #pragma unroll
         for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
             bound[r] = 0.0f;
         }
 #pragma unroll 8
-        for (uint32_t block = 0u; block < (uint32_t)SPARK_M4_LM_BLOCKS; ++block) {
+        for (uint32_t block = 0u; block < (uint32_t)CERT_BLOCKS; ++block) {
             const float row_max =
                 __bfloat162float(w_block_max_t[(uint64_t)block * vocab + entry]);
 #pragma unroll
@@ -285,12 +360,12 @@ extern "C" __global__ void cert_lm_head_batched_sm121(
         }
         if (any_exact) {
 #pragma unroll 4
-            for (uint32_t i = 0u; i < (uint32_t)SPARK_M4_HIDDEN; ++i) {
+            for (uint32_t i = 0u; i < (uint32_t)CERT_HIDDEN; ++i) {
                 const float w_value = __bfloat162float(row[i]);
 #pragma unroll
                 for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
                     if (needs_exact[r]) {
-                        acc[r] += __bfloat162float(hidden[(uint64_t)r * SPARK_M4_HIDDEN + i]) *
+                        acc[r] += __bfloat162float(hidden[(uint64_t)r * CERT_HIDDEN + i]) *
                                   w_value;
                     }
                 }
@@ -348,3 +423,33 @@ extern "C" __global__ void cert_lm_head_batched_sm121(
     }
     (void)t_enter;
 }
+
+#if defined(SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_HIDDEN > 0u,
+              "the instance names a hidden width");
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_HIDDEN % SPARK_M4_LM_SCREEN_TILE == 0u,
+              "the hidden dimension tiles by the screen tile");
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_VOCAB_PER_RANK > 0u,
+              "the instance names this rank's vocabulary shard");
+static_assert(SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_RANKS == 4u,
+              "the certified head shards over four ranks");
+extern "C" __global__ void cert_lm_head_batched_sm121(
+    const __nv_bfloat16 *__restrict__ hidden,
+    const __nv_bfloat16 *__restrict__ w,
+    const __nv_bfloat16 *__restrict__ w_block_max_t,
+    float *__restrict__ logits,
+    uint8_t *__restrict__ certified,
+    unsigned int *__restrict__ certified_count,
+    float *__restrict__ block_max,
+    uint32_t *__restrict__ block_argmax,
+    const uint32_t vocab,
+    GpuTraceRing *__restrict__ trace_ring,
+    const uint32_t layer_id,
+    const uint64_t step_seq) {
+    cert_lm_head_batched_body<SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_HIDDEN,
+                              SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_VOCAB_PER_RANK,
+                              SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_RANKS>(
+        hidden, w, w_block_max_t, logits, certified, certified_count, block_max, block_argmax, vocab,
+        trace_ring, layer_id, step_seq);
+}
+#endif
