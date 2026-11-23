@@ -65,10 +65,16 @@ pub fn record_tensors(plan: &ResidentPlan, bound: &BTreeSet<String>, rank: usize
     if !sparkflash_kernels::open_manifest::enabled() {
         return;
     }
+    let mut matched = 0usize;
+    let mut unbound: Vec<&str> = Vec::new();
     for shard in plan.shards() {
         if !bound.contains(&shard.name) {
+            if unbound.len() < 3 {
+                unbound.push(shard.name.as_str());
+            }
             continue;
         }
+        matched += 1;
         sparkflash_kernels::open_manifest::record(&json!({
             "schema": SCHEMA,
             "kind": "tensor",
@@ -83,4 +89,9 @@ pub fn record_tensors(plan: &ResidentPlan, bound: &BTreeSet<String>, rank: usize
             "placement": shard.placement.as_str(),
         }));
     }
+    eprintln!(
+        "open-manifest: record_tensors rank={rank} world={world} shards={} bound={} matched={matched} first_unbound={unbound:?}",
+        plan.shards().len(),
+        bound.len(),
+    );
 }
