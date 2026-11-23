@@ -56,6 +56,12 @@ fn generate() -> String {
     let mut hidden: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut intermediate: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut claims_intermediate: BTreeMap<String, bool> = BTreeMap::new();
+    // The attention/selection vocabulary: the shape fields those parts expose, one set per key.
+    let mut families: BTreeMap<String, String> = BTreeMap::new();
+    let mut head_dim: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut index_topk: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut index_heads: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    let mut positions: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     for row in rows {
         let table = row
             .as_table()
@@ -72,24 +78,67 @@ fn generate() -> String {
         let Some(key) = table.get("catalogue").and_then(toml::Value::as_str) else {
             continue;
         };
-        let shape = (get("hidden"), get("experts"), get("top_k"));
-        keys.entry(key.to_owned()).or_default().insert(shape);
-        hidden.entry(key.to_owned()).or_default().insert(shape.0);
-        let claims = table
-            .get("catalogue_intermediate")
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(true);
-        *claims_intermediate.entry(key.to_owned()).or_insert(true) &= claims;
-        if let Some(width) = table.get("intermediate").and_then(toml::Value::as_integer) {
-            assert!(
-                width > 0,
-                "sparkflash-ops: {key} names a zero intermediate width"
+        let family = table
+            .get("family")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("sparkflash-ops: instance {key} has no family"));
+        if let Some(known) = families.insert(key.to_owned(), family.to_owned()) {
+            assert_eq!(
+                known, family,
+                "sparkflash-ops: catalogue key {key} is used by two shape vocabularies"
             );
-            intermediate
+        }
+        if family == "router" || family == "routed" {
+            let shape = (get("hidden"), get("experts"), get("top_k"));
+            keys.entry(key.to_owned()).or_default().insert(shape);
+            hidden.entry(key.to_owned()).or_default().insert(shape.0);
+            let claims = table
+                .get("catalogue_intermediate")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(true);
+            *claims_intermediate.entry(key.to_owned()).or_insert(true) &= claims;
+            if let Some(width) = table.get("intermediate").and_then(toml::Value::as_integer) {
+                assert!(
+                    width > 0,
+                    "sparkflash-ops: {key} names a zero intermediate width"
+                );
+                intermediate
+                    .entry(key.to_owned())
+                    .or_default()
+                    .insert(width as u64);
+            }
+            continue;
+        }
+        // MLA and selection instances: only the fields a ShapeConstraint can name. `head_dim` is
+        // the MLA head width; the indexer's own head width is `index_head_dim`.
+        keys.entry(key.to_owned()).or_default();
+        hidden
+            .entry(key.to_owned())
+            .or_default()
+            .insert(get("hidden"));
+        let width_key = if family == "select" {
+            "index_head_dim"
+        } else {
+            "head_dim"
+        };
+        head_dim
+            .entry(key.to_owned())
+            .or_default()
+            .insert(get(width_key));
+        if family == "select" {
+            index_topk
                 .entry(key.to_owned())
                 .or_default()
-                .insert(width as u64);
+                .insert(get("index_topk"));
+            index_heads
+                .entry(key.to_owned())
+                .or_default()
+                .insert(get("index_heads"));
         }
+        positions
+            .entry(key.to_owned())
+            .or_default()
+            .insert(get("positions"));
     }
     assert!(
         !keys.is_empty(),
@@ -102,6 +151,8 @@ fn generate() -> String {
     );
     for (key, shapes) in &keys {
         let name = format!("CATALOGUE_{}", key.to_ascii_uppercase().replace('-', "_"));
+        let family = families.get(key).map(String::as_str).unwrap_or("router");
+        let routed = family == "router" || family == "routed";
         let mut shape_list = String::new();
         for (index, (h, e, k)) in shapes.iter().enumerate() {
             if index > 0 {
@@ -136,7 +187,50 @@ fn generate() -> String {
                 widths.iter().next().expect("one width")
             );
         }
-        let _ = writeln!(generated, "    .routed_shapes(&[{shape_list}]);");
+        if routed {
+            let _ = writeln!(generated, "    .routed_shapes(&[{shape_list}]);");
+            continue;
+        }
+        // An MLA or selection rule names the exact compiled head width and, for the indexer, the
+        // exact candidate count and head ceiling the bodies are built for. A second shape moves
+        // those numbers only by adding an instance.
+        if let Some(widths) = head_dim.get(key)
+            && widths.len() == 1
+        {
+            let _ = writeln!(
+                generated,
+                "    .head_dim_equals({})",
+                widths.iter().next().expect("one width")
+            );
+        }
+        if let Some(values) = index_topk.get(key)
+            && values.len() == 1
+        {
+            let _ = writeln!(
+                generated,
+                "    .top_k_equals({})",
+                values.iter().next().expect("one value")
+            );
+        }
+        if let Some(values) = index_heads.get(key)
+            && values.len() == 1
+        {
+            let _ = writeln!(
+                generated,
+                "    .max_heads({})",
+                values.iter().next().expect("one value")
+            );
+        }
+        if let Some(values) = positions.get(key)
+            && values.len() == 1
+        {
+            let _ = writeln!(
+                generated,
+                "    .positions(0, {})",
+                values.iter().next().expect("one value")
+            );
+        }
+        generated.push_str(";\n");
     }
     generated
 }

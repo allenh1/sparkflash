@@ -31,6 +31,7 @@ use sparkflash_ops::error::OpError;
 use sparkflash_ops::gdn::gdn_scan_shape_for;
 use sparkflash_ops::gemm::{DenseGemmPlan, ExpertCombinePlan, GroupedMoeGemmPlan, MoeRoutingPlan};
 use sparkflash_ops::images::Image;
+use sparkflash_ops::launchers::{DEEPSEEK_INDEXER_MAX_POSITION, SparseIndexerLauncher};
 use sparkflash_ops::parity::{LayerPlan, ParityReport, Tolerance};
 use sparkflash_ops::plan::{
     DType, GroupedFp8Body, KernelId, KernelPhase, Layout, Matrix, OpKind, OpPlan, PartGeometry,
@@ -1405,4 +1406,27 @@ fn a_non_finite_device_value_never_passes_parity() {
     )
     .expect_err("NaN must fail");
     assert!(error.to_string().contains("at 0"));
+}
+#[test]
+fn the_deepseek_indexer_refuses_a_row_past_its_compiled_position_bound() {
+    let requirement = requirement(&arm(DEEPSEEK, 4), Part::SparseIndexer);
+    let resolved = CTX
+        .resolver()
+        .resolve(&requirement)
+        .expect("the DeepSeek indexer resolves");
+    SparseIndexerLauncher::new(
+        &requirement,
+        &resolved,
+        1,
+        DEEPSEEK_INDEXER_MAX_POSITION - 1,
+    )
+    .expect("the last compiled position is inside the bound");
+    let error =
+        SparseIndexerLauncher::new(&requirement, &resolved, 2, DEEPSEEK_INDEXER_MAX_POSITION)
+            .expect_err("a row past the compiled position bound is refused, not clamped");
+    let text = error.to_string();
+    assert!(
+        text.contains("reads at most") && text.contains("compressed"),
+        "the refusal names the symbol and its bound: {text}"
+    );
 }

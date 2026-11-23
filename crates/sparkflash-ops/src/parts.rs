@@ -201,13 +201,11 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // as a runtime argument (`kernels/qwen4_exp_sm121.cu:336-397`); neither rounds it to
         // 128. The head screen is not the matrix projection, which is Part::DenseGemm.
         (Part::LmHead, Image::Qwen4Exp) => ShapeConstraint::ANY,
-        // CSA2 / grouped-output LoRA MLA: the DeepSeek latent has output groups and a rope
-        // segment. The absorbed NoPE latent has neither, and is served by the GLM images.
-        (Part::MlaAttention, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(5120)
-            .head_dim_multiple(16)
-            .groups_between(1, usize::MAX)
-            .positions(0, 1 << 21),
+        // CSA2 / grouped-output LoRA MLA. The rule is the generated one: exactly the 5120-wide,
+        // 512-head-dimension MLA the instance list builds, inside the 2^21-position bound the
+        // selection bodies state. A width or head dimension no instance was built for is refused
+        // by name before a weight is read rather than launched on a body compiled for another shape.
+        (Part::MlaAttention, Image::Deepseek) => CATALOGUE_DEEPSEEK_MLA,
         (Part::MlaAttention, Image::GlmAttention | Image::GlmDecode) => ShapeConstraint::ANY
             .hidden_equals(4096)
             .head_dim_multiple(16)
@@ -217,11 +215,9 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .hidden_equals(5120)
             .min_ratio(1)
             .positions(0, 1 << 21),
-        (Part::SparseIndexer, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(5120)
-            .head_dim_equals(128)
-            .top_k_equals(512)
-            .max_heads(32),
+        // The DeepSeek indexer's compiled geometry: the 128-wide, 32-head score bodies and the
+        // 512-id candidate list the select bodies are built for. Generated from the instances.
+        (Part::SparseIndexer, Image::Deepseek) => CATALOGUE_DEEPSEEK_INDEXER,
         (Part::SparseIndexer, Image::Qwen4Attn) => ShapeConstraint::ANY
             .hidden_equals(2560)
             .head_dim_equals(128)
@@ -5702,6 +5698,59 @@ mod tests {
         assert!(
             CATALOGUE_DEEPSEEK_MOE.accepts(&wrong_experts).is_err(),
             "an expert count no instance was built for is refused"
+        );
+    }
+
+    #[test]
+    fn the_attention_and_indexer_shape_rules_are_the_built_instances() {
+        // kernels/instances.toml's two attention catalogue keys, read back through the generated
+        // constants. The MLA rule is the 5120-wide, 512-head-dimension part; the indexer rule is
+        // the 128-wide, 32-head, top-512 selection the bodies are compiled for.
+        assert_eq!(CATALOGUE_DEEPSEEK_MLA.hidden_equals, Some(5120));
+        assert_eq!(CATALOGUE_DEEPSEEK_MLA.head_dim_equals, Some(512));
+        assert_eq!(CATALOGUE_DEEPSEEK_MLA.max_positions, 1 << 21);
+        assert_eq!(CATALOGUE_DEEPSEEK_MLA.top_k_equals, None);
+        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.hidden_equals, Some(5120));
+        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.head_dim_equals, Some(128));
+        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.top_k_equals, Some(512));
+        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.max_heads, Some(32));
+        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.max_positions, 1 << 21);
+
+        let mla = crate::PartGeometry {
+            hidden: 5120,
+            head_dim: 512,
+            kv_lora: 512,
+            heads: 16,
+            positions: 1 << 20,
+            ..crate::PartGeometry::new()
+        };
+        assert_eq!(CATALOGUE_DEEPSEEK_MLA.accepts(&mla), Ok(()));
+        let wrong_head_dim = crate::PartGeometry {
+            head_dim: 64,
+            ..mla
+        };
+        assert!(
+            CATALOGUE_DEEPSEEK_MLA.accepts(&wrong_head_dim).is_err(),
+            "a head dimension no instance was built for is refused"
+        );
+
+        let indexer = crate::PartGeometry {
+            hidden: 5120,
+            head_dim: 128,
+            heads: 32,
+            top_k: 512,
+            ratio: 1,
+            positions: 1 << 20,
+            ..crate::PartGeometry::new()
+        };
+        assert_eq!(CATALOGUE_DEEPSEEK_INDEXER.accepts(&indexer), Ok(()));
+        let wider_indexer = crate::PartGeometry {
+            head_dim: 256,
+            ..indexer
+        };
+        assert!(
+            CATALOGUE_DEEPSEEK_INDEXER.accepts(&wider_indexer).is_err(),
+            "an index head width no instance was built for is refused"
         );
     }
 
