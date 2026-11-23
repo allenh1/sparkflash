@@ -155,16 +155,31 @@ Line numbers are the tree's at the start of this milestone.
   plan's format; the bind carries what a format needs (grid scales, row scales, tensor-wide
   scales); a seam ends in the activation form the next body reads, chosen at open. The loader
   arranges a tensor into the layout its resolved body reads, in one place.
-* **F3. The decodes GLM needs, first.** FP8 on 128 tiles and BF16 row-major, for the dense
-  projections, the shared expert and the routed experts, on prompt rows and token rows. Which
-  of the two existing bodies becomes the one copy for each operation is decided here and
-  written into this document with the measurement.
-* **F4. The rest, with their models.** NVFP4, packed BF16 and row-scaled MXFP8 follow the same
-  recipe when Qwen and Inkling move. They can start early if hands are free.
+* **F3. The recipe, with FP8 tiles as the worked example.** FP8 on 128 tiles, for the dense
+  projections, the shared expert and the routed experts, on prompt rows and token rows, with
+  both scale types (f32 and BF16) and both activation forms the tree has for it (BF16 rows, and
+  rows quantised per 128 columns). Which of the two existing bodies becomes the one copy for each
+  operation is decided here and written into this document with the measurement, and the steps
+  are written down for the families below.
+* **F4. The other decodes, in parallel once F3 has merged.** All of them are in this
+  milestone; none waits for its model.
+  * *BF16 row-major and packed BF16.* Packed carries its escape list through the bind and the
+    loader packs in the one place F2 made.
+  * *NVFP4.* Values, a scale per 16 and the tensor-wide scales (two for Qwen; the per-expert
+    amax and the outer denominator for Inkling) travel through the bind. Today's NVFP4 body is
+    separate because the tensor-wide scale rounds differently when folded in early: either it
+    becomes a decode of the shared body with the scale applied where it is applied today, or
+    the reason it cannot is written down with the measurement.
+  * *Row-scaled MXFP8.* The power-of-two scale per row and 32 columns; the base already decodes
+    this for Engram and the drafter head.
+* **Format varies by block.** Inkling's experts are NVFP4 in its first forty layers and
+  row-scaled MXFP8 in the last eight. The body is chosen for each block's part, not once for
+  the stack.
 * **One build.** The other images move onto the instance list as their bodies are used by the
   base. Not a goal of its own.
-* Done when the synthetic checkpoint, stored as FP8 tiles and again as BF16, agrees with the
-  host reference.
+* Done when the synthetic checkpoint agrees with the host reference stored each way: FP8 tiles
+  with each scale type, BF16, packed BF16, NVFP4 with each set of tensor-wide scales, row-scaled
+  MXFP8, and one variant whose expert format changes part-way up the stack.
 
 ### S. The seam
 
@@ -193,7 +208,7 @@ Line numbers are the tree's at the start of this milestone.
 2. R1 with R3 beside it; F1 beside both (other crates).
 3. R2 after R1. F2 after F1. S1 can start with R2: it is the rows path, which R1 barely
    touches.
-4. F3 after F2. S2, then S3, after S1.
+4. F3 after F2, then the F4 families in parallel. S2, then S3, after S1.
 5. S4 and the three comparison windows.
 
 The forward crate has one owner at a time for each of R, F2 and S; they touch different files
