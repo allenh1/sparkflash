@@ -52,6 +52,29 @@
 #include "m4_common_sm121.cuh"
 #include "select_body_sm121.cuh"
 
+// The model shapes are instance arguments (kernels/instances.toml). The released ten entries share
+// one shape; the proof entry at the bottom of the file compiles alone into its own cubin. A build
+// that names neither shape fails here instead of compiling a default.
+#if defined(SPARK_INSTANCE_OPT_SELECT_SCORES_SEGS_64D_SM121_HIDDEN)
+#define OPT_SELECT_INDEX_HEADS SPARK_INSTANCE_OPT_SELECT_SCORES_SEGS_64D_SM121_INDEX_HEADS
+#define OPT_SELECT_INDEX_HEAD_DIM SPARK_INSTANCE_OPT_SELECT_SCORES_SEGS_64D_SM121_INDEX_HEAD_DIM
+#define OPT_SELECT_POSITIONS SPARK_INSTANCE_OPT_SELECT_SCORES_SEGS_64D_SM121_POSITIONS
+#elif defined(SPARK_INSTANCE_OPT_REF_SELECT_HIDDEN)
+#define OPT_SELECT_INDEX_HEADS SPARK_INSTANCE_OPT_REF_SELECT_INDEX_HEADS
+#define OPT_SELECT_INDEX_HEAD_DIM SPARK_INSTANCE_OPT_REF_SELECT_INDEX_HEAD_DIM
+#define OPT_SELECT_POSITIONS SPARK_INSTANCE_OPT_REF_SELECT_POSITIONS
+#else
+#error "opt_select_sm121.cu: no instance macros; every shape is an argument from kernels/instances.toml"
+#endif
+
+// The indexer's head width and compiled position bound, from the instance. The reference body is
+// generic over both at run time; the fast select's radix capacity and the 32-head score body are
+// compiled for them.
+static_assert(OPT_SELECT_INDEX_HEAD_DIM > 0u && OPT_SELECT_INDEX_HEAD_DIM % 32u == 0u,
+              "the score body reads a whole number of 32-lane columns");
+static_assert(OPT_SELECT_INDEX_HEADS > 0u, "the score body addresses whole index heads");
+static_assert(OPT_SELECT_POSITIONS > 0u, "the fast select needs a positive position bound");
+
 // A named namespace around the whole file, kernels included (extern "C" keeps their symbols): the
 // build's combined probe compiles this beside ref_select_sm121.cu, whose helpers share these names.
 namespace opt_select {
@@ -98,17 +121,21 @@ __device__ __forceinline__ void opt_ref_select_body(
     q_index, keys, weights, out_ids, out_scores, mask_in, mask_out, n_pos, heads, head_dim, reach,  \
         topk, offset, mask_mode, topk_blocks, block_size, no_index, flags
 
+#if defined(SPARK_INSTANCE_OPT_REF_SELECT_HIDDEN)
 extern "C" __global__ void __launch_bounds__(BLOCK) opt_ref_select(OPT_SEL_PARAMS) {
     OPT_PDL_ENTRY();
     opt_ref_select_body(nullptr, OPT_SEL_ARGS);
 }
+#endif
 
 // The 18 ref_select words plus the scores opt_select_scores wrote.
+#if defined(SPARK_INSTANCE_OPT_REF_SELECT_PRE_HIDDEN)
 extern "C" __global__ void __launch_bounds__(BLOCK) opt_ref_select_pre(OPT_SEL_PARAMS,
                                                                       const float* __restrict__ pre) {
     OPT_PDL_ENTRY();
     opt_ref_select_body(pre, OPT_SEL_ARGS);
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // opt_ref_select_fast: opt_ref_select_pre's selection as a radix select instead of an O(n^2) rank.
@@ -131,7 +158,7 @@ extern "C" __global__ void __launch_bounds__(BLOCK) opt_ref_select_pre(OPT_SEL_P
 // ---------------------------------------------------------------------------------------------
 constexpr int FAST_BLOCK = 1024;
 // The model's 1M-token context at ratio 1, with room for the verify block.
-constexpr uint32_t FAST_MAX_POS = 1u << 21;
+constexpr uint32_t FAST_MAX_POS = OPT_SELECT_POSITIONS;
 
 __device__ __forceinline__ uint32_t order_key(float value) {
     uint32_t bits = __float_as_uint(value);
@@ -481,6 +508,7 @@ __device__ __forceinline__ void fast_select(const T* __restrict__ pre, uint32_t*
                    [&](uint32_t position, uint32_t, uint32_t slot) { emit(position, slot); });
 }
 
+#if defined(SPARK_INSTANCE_OPT_REF_SELECT_FAST_HIDDEN)
 extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_ref_select_fast(OPT_SEL_PARAMS,
                                                                             const float* __restrict__ pre,
                                                                             uint32_t* __restrict__ scratch) {
@@ -494,6 +522,7 @@ extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_ref_select_fast(OPT
     fast_select(pre, scratch, out_ids, out_scores, mask_in, mask_out, n_pos, reach, topk, offset, 1u,
                 mask_mode, topk_blocks, block_size, no_index);
 }
+#endif
 
 // The selects of a chunk's rows: row y is position p0 + y, which reaches the first
 // (p0 + y + 1) / ratio compressed positions (all of its scores). Its chosen positions land in
@@ -537,29 +566,36 @@ __device__ __forceinline__ void select_rows_body(
     selected, mask_in, mask_out, scratch, tokens, p0, ratio, topk, mask_mode, topk_blocks,         \
         block_size, score_stride, selected_stride, mask_stride, scratch_words
 
+#if defined(SPARK_INSTANCE_OPT_SELECT_ROWS_HIDDEN)
 extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows(
     const float* __restrict__ scores, OPT_SELECT_ROWS_PARAMS) {
     OPT_PDL_ENTRY();
     select_rows_body(scores, static_cast<const uint64_t*>(nullptr), OPT_SELECT_ROWS_ARGS);
 }
+#endif
 
+#if defined(SPARK_INSTANCE_OPT_SELECT_ROWS_BF16_HIDDEN)
 extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows_bf16(
     const uint16_t* __restrict__ scores, OPT_SELECT_ROWS_PARAMS) {
     OPT_PDL_ENTRY();
     select_rows_body(scores, static_cast<const uint64_t*>(nullptr), OPT_SELECT_ROWS_ARGS);
 }
+#endif
 
 // opt_select_rows over a step's rows from several sequences, each row's position from `row_tab`
 // (p0 unused).
+#if defined(SPARK_INSTANCE_OPT_SELECT_ROWS_TAB_HIDDEN)
 extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows_tab(
     const float* __restrict__ scores, const uint64_t* __restrict__ row_tab,
     OPT_SELECT_ROWS_PARAMS) {
     OPT_PDL_ENTRY();
     select_rows_body(scores, row_tab, OPT_SELECT_ROWS_ARGS);
 }
+#endif
 
 // One block per compressed position: warp w scores heads w, w+8, ... (a warp tree per dot, the
 // reference's bf16 rounds), then thread 0 folds the heads in ascending order. Grid (n_pos), 256.
+#if defined(SPARK_INSTANCE_OPT_SELECT_SCORES_HIDDEN)
 extern "C" __global__ void __launch_bounds__(BLOCK) opt_select_scores(
     const float* __restrict__ q_index, const float* __restrict__ keys,
     const float* __restrict__ weights, float* __restrict__ scores, uint32_t n_pos, uint32_t heads,
@@ -589,6 +625,7 @@ extern "C" __global__ void __launch_bounds__(BLOCK) opt_select_scores(
         scores[position] = round_bf16(sum);
     }
 }
+#endif
 
 // The scores of several rows' selects, opt_select_scores' chains exactly: row y (position p0 + y)
 // scores the first (p0 + y + 1) / ratio compressed positions into scores + y * score_stride, the
@@ -605,8 +642,9 @@ extern "C" __global__ void __launch_bounds__(BLOCK) opt_select_scores(
 constexpr uint32_t SR_TILE = 16;
 constexpr uint32_t SR_PAIR = 2;
 constexpr uint32_t SR_HPW = 8;
-constexpr uint32_t SR_DIM = 128;
+constexpr uint32_t SR_DIM = OPT_SELECT_INDEX_HEAD_DIM;
 constexpr uint32_t SR_DPL = SR_DIM / 32;
+#if defined(SPARK_INSTANCE_OPT_SELECT_SCORES_ROWS_HIDDEN)
 extern "C" __global__ void __launch_bounds__(BLOCK) opt_select_scores_rows(
     const float* __restrict__ q_index, const float* __restrict__ keys,
     const float* __restrict__ weights, float* __restrict__ scores, uint32_t p0, uint32_t ratio,
@@ -683,6 +721,7 @@ extern "C" __global__ void __launch_bounds__(BLOCK) opt_select_scores_rows(
         __syncthreads();
     }
 }
+#endif
 
 // opt_select_scores_rows' scores, bit for bit, for a 32-head indexer, with the rows of one segment
 // (one sequence's positions p0 .. p0 + rows - 1) sharing each key tile: the keys are read once a
@@ -704,7 +743,7 @@ extern "C" __global__ void __launch_bounds__(BLOCK) opt_select_scores_rows(
 // mask_in (mask_mode 1, a consumed candidate mask; row y's at mask_in + y * mask_stride words): a
 // position whose bit is clear in a row's mask is not scored for that row (the select overwrites
 // its score with -inf), and a tile no row needs is not read.
-constexpr uint32_t SG_HEADS = 32;
+constexpr uint32_t SG_HEADS = OPT_SELECT_INDEX_HEADS;
 constexpr uint32_t SG_TILE = 32;
 constexpr uint32_t SG_ROWS = 8;
 constexpr uint32_t SG_SLICE = 64;
@@ -867,6 +906,7 @@ __device__ __forceinline__ void scores_seg_body(
     }
 }
 
+#if defined(SPARK_INSTANCE_OPT_SELECT_SCORES_SEG_HIDDEN)
 extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scores_seg(
     const float* __restrict__ q_index, const float* __restrict__ keys,
     const float* __restrict__ weights, float* __restrict__ scores,
@@ -876,12 +916,14 @@ extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scor
     scores_seg_body(q_index, keys, weights, scores, mask_in, p0, ratio, score_stride, mask_stride,
                     rows, blockDim.x / (SG_SLICE * rows), blockIdx.x, gridDim.x);
 }
+#endif
 
 // opt_select_scores_seg over a step's rows from several sequences, in one launch: block row y
 // takes piece y of `pieces` ({row0, rows} words, rows <= SG_ROWS, one sequence's consecutive
 // positions), whose first position and lane offset are row_tab's at row0
 // (DeviceLayer::upload_row_table) and whose keys are at keys + that offset. A piece's scores are
 // opt_select_scores_seg's over its rows (its rows' at their step rows), with SG_ROWS / rows slices.
+#if defined(SPARK_INSTANCE_OPT_SELECT_SCORES_SEGS_HIDDEN)
 extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scores_segs(
     const float* __restrict__ q_index, const float* __restrict__ keys,
     const float* __restrict__ weights, float* __restrict__ scores,
@@ -901,5 +943,31 @@ extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scor
                     p0, ratio, score_stride, mask_stride, rows, SG_ROWS / rows, blockIdx.x,
                     gridDim.x);
 }
+#endif
+
+// The second-shape build proof (kernels/instances.toml): the segment score body compiled for a
+// 64-wide index head, a 2^20 position bound and a 256-id candidate list. It is never in the
+// released cubin, nothing loads it, and it is the shape the catalogue must not claim.
+#if defined(SPARK_INSTANCE_OPT_SELECT_SCORES_SEGS_64D_SM121_HIDDEN)
+extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scores_segs_64d_sm121(
+    const float* __restrict__ q_index, const float* __restrict__ keys,
+    const float* __restrict__ weights, float* __restrict__ scores,
+    const uint32_t* __restrict__ mask_in, const uint64_t* __restrict__ row_tab,
+    const uint32_t* __restrict__ pieces, uint32_t ratio, uint32_t score_stride,
+    uint32_t mask_stride) {
+    OPT_PDL_ENTRY();
+    const uint32_t row0 = pieces[2u * blockIdx.y], rows = pieces[2u * blockIdx.y + 1u];
+    if (rows == 0u || rows > SG_ROWS) return;
+    const uint64_t offset = row_tab[2u * row0];
+    const uint32_t p0 = static_cast<uint32_t>(row_tab[2u * row0 + 1u]);
+    scores_seg_body(q_index + static_cast<size_t>(row0) * SG_HEADS * SR_DIM,
+                    reinterpret_cast<const float*>(reinterpret_cast<const char*>(keys) + offset),
+                    weights + static_cast<size_t>(row0) * SG_HEADS,
+                    scores + static_cast<size_t>(row0) * score_stride,
+                    mask_in != nullptr ? mask_in + static_cast<size_t>(row0) * mask_stride : nullptr,
+                    p0, ratio, score_stride, mask_stride, rows, SG_ROWS / rows, blockIdx.x,
+                    gridDim.x);
+}
+#endif
 
 }  // namespace opt_select

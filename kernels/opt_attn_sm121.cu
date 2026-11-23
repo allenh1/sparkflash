@@ -39,14 +39,40 @@
 #define oa_e4m3x4 opt_e4m3x4
 #define oa_warp_sum opt_warp_sum
 
-#define OA_LATENT 512u
+// The model shapes are instance arguments (kernels/instances.toml). Every number below comes from
+// this entry's own instance; the shared M4 header's geometry defaults are redefined from it, so a
+// build that names no shape fails below instead of compiling the defaults.
+#if defined(SPARK_INSTANCE_OPT_FLASH_MLA_CSA2_SEQ_HIDDEN)
+#define OA_KV_LORA SPARK_INSTANCE_OPT_FLASH_MLA_CSA2_SEQ_KV_LORA
+#define OA_HEADS SPARK_INSTANCE_OPT_FLASH_MLA_CSA2_SEQ_HEADS
+#define OA_WINDOW_VALUE SPARK_INSTANCE_OPT_FLASH_MLA_CSA2_SEQ_WINDOW
+#define OA_INDEX_HEAD_DIM_VALUE SPARK_INSTANCE_OPT_FLASH_MLA_CSA2_SEQ_INDEX_HEAD_DIM
+#define OA_INDEX_TOPK SPARK_INSTANCE_OPT_FLASH_MLA_CSA2_SEQ_INDEX_TOPK
+#define OA_HSI_BLOCKS SPARK_INSTANCE_OPT_FLASH_MLA_CSA2_SEQ_HSI_BLOCKS
+#define OA_HSI_BLOCK_TOKENS SPARK_INSTANCE_OPT_FLASH_MLA_CSA2_SEQ_HSI_BLOCK_TOKENS
+#else
+#error "opt_attn_sm121.cu: no instance macros; every shape is an argument from kernels/instances.toml"
+#endif
+
+#undef SPARK_M4_HEADS
+#define SPARK_M4_HEADS OA_HEADS
+#undef SPARK_M4_INDEX_HEAD_DIM
+#define SPARK_M4_INDEX_HEAD_DIM OA_INDEX_HEAD_DIM_VALUE
+#undef SPARK_M4_HSI_BLOCKS
+#define SPARK_M4_HSI_BLOCKS OA_HSI_BLOCKS
+#undef SPARK_M4_HSI_BLOCK_TOKENS
+#define SPARK_M4_HSI_BLOCK_TOKENS OA_HSI_BLOCK_TOKENS
+
+#define OA_LATENT OA_KV_LORA
 #define OA_THREADS 256u
 #define OA_WARPS 8u
-#define OA_MAX_SELECTED 512u
-#define OA_MAX_ATTENDED 640u
-#define OA_WINDOW 128u
-#define OA_WSCALES 16u
-#define OA_KSCALES 32u
+#define OA_MAX_SELECTED OA_INDEX_TOPK
+#define OA_MAX_ATTENDED (OA_MAX_SELECTED + OA_WINDOW_VALUE)
+#define OA_WINDOW OA_WINDOW_VALUE
+// The engine window row carries one E8M0 scale per 32 channels and the FP4 store one E4M3 scale
+// per 16; both counts are layout facts derived from the latent, not second copies of it.
+#define OA_WSCALES (OA_LATENT / 32u)
+#define OA_KSCALES (OA_LATENT / 16u)
 #define OA_CSA_UNION 2u
 
 
@@ -93,6 +119,7 @@ __device__ __forceinline__ void oa_row16(uint32_t slot, uint32_t window_rows, ui
     }
 }
 
+#if defined(SPARK_INSTANCE_OPT_FLASH_MLA_CSA2_SEQ_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OA_THREADS) opt_flash_mla_csa2_seq(
     const __nv_bfloat16 *__restrict__ q,
     const uint8_t *__restrict__ kv_fp4,
@@ -245,3 +272,4 @@ extern "C" __global__ void __launch_bounds__(OA_THREADS) opt_flash_mla_csa2_seq(
         out[(uint64_t)head * OA_LATENT + i] = __float2bfloat16_rn(total / ssum);
     }
 }
+#endif

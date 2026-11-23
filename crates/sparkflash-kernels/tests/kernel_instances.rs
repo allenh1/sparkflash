@@ -59,7 +59,24 @@ fn instances() -> Vec<Instance> {
                     .to_owned()
             };
             let mut shapes = BTreeMap::new();
-            for key in ["hidden", "experts", "top_k", "intermediate", "padded"] {
+            for key in [
+                "hidden",
+                "experts",
+                "top_k",
+                "intermediate",
+                "padded",
+                "heads",
+                "head_dim",
+                "kv_lora",
+                "window",
+                "index_heads",
+                "index_head_dim",
+                "index_topk",
+                "hsi_blocks",
+                "hsi_block_tokens",
+                "ring_capacity",
+                "positions",
+            ] {
                 if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                     assert!(value > 0, "{key} is positive");
                     shapes.insert(key.to_owned(), value as u64);
@@ -111,17 +128,33 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
             instance.entry,
             path.display()
         );
-        assert!(
-            ["router", "routed"].contains(&instance.family.as_str()),
-            "{} names family {:?}",
-            instance.entry,
-            instance.family
-        );
-        for key in if instance.family == "router" {
-            &["hidden", "experts", "top_k"][..]
-        } else {
-            &["hidden", "intermediate", "padded", "experts", "top_k"][..]
-        } {
+        let keys: &[&str] = match instance.family.as_str() {
+            "router" => &["hidden", "experts", "top_k"],
+            "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"],
+            "mla" => &[
+                "hidden",
+                "heads",
+                "head_dim",
+                "kv_lora",
+                "window",
+                "index_heads",
+                "index_head_dim",
+                "index_topk",
+                "hsi_blocks",
+                "hsi_block_tokens",
+                "ring_capacity",
+                "positions",
+            ],
+            "select" => &[
+                "hidden",
+                "index_heads",
+                "index_head_dim",
+                "index_topk",
+                "positions",
+            ],
+            other => panic!("{} names family {other:?}", instance.entry),
+        };
+        for key in keys {
             assert!(
                 instance.shapes.contains_key(*key),
                 "{} ({}) has no {key}",
@@ -195,6 +228,59 @@ fn the_router_family_has_its_released_shapes_and_a_second_shape() {
         .filter_map(|row| row.catalogue.as_deref())
         .collect();
     for key in ["deepseek-router", "deepseek-moe", "deepseek-mtp"] {
+        assert!(
+            keys.contains(key),
+            "the catalogue key {key} has no instance"
+        );
+    }
+}
+#[test]
+fn the_attention_and_selection_families_have_their_released_shapes_and_a_second_shape() {
+    let rows = instances();
+    let mla: Vec<&Instance> = rows.iter().filter(|row| row.family == "mla").collect();
+    let released = mla
+        .iter()
+        .find(|row| row.cubin == "flash_mla_csa2_sm121")
+        .expect("the released base MLA entry");
+    assert_eq!(released.shapes["kv_lora"], 512);
+    assert_eq!(released.shapes["heads"], 64);
+    assert_eq!(released.shapes["head_dim"], 512);
+    assert_eq!(released.shapes["window"], 128);
+    assert_eq!(released.shapes["index_heads"], 32);
+    assert_eq!(released.shapes["index_head_dim"], 128);
+    assert_eq!(released.shapes["index_topk"], 512);
+    assert_eq!(released.shapes["hsi_blocks"], 2048);
+    assert_eq!(released.shapes["hsi_block_tokens"], 8);
+    assert_eq!(released.shapes["ring_capacity"], 134);
+
+    // The proof shape is the ring entry compiled for 32 query heads, a 256-id candidate list and
+    // a 64-token window. Its cubin is not a released stem, so the baseline must not name it.
+    let second = mla
+        .iter()
+        .find(|row| row.entry == "flash_mla_csa2_ring_32h256k_sm121")
+        .expect("the second-shape proof instance");
+    assert_eq!(second.shapes["heads"], 32);
+    assert_eq!(second.shapes["index_heads"], 16);
+    assert_eq!(second.shapes["index_topk"], 256);
+    assert_eq!(second.shapes["window"], 64);
+    assert_eq!(second.shapes["hsi_blocks"], 1024);
+    assert_ne!(second.cubin, released.cubin, "the proof has its own cubin");
+
+    let select: Vec<&Instance> = rows.iter().filter(|row| row.family == "select").collect();
+    let indexer = select
+        .iter()
+        .find(|row| row.cubin == "opt_select_sm121")
+        .expect("the released opt_select entries");
+    assert_eq!(indexer.shapes["index_heads"], 32);
+    assert_eq!(indexer.shapes["index_head_dim"], 128);
+    assert_eq!(indexer.shapes["index_topk"], 512);
+    assert_eq!(indexer.shapes["positions"], 1 << 21);
+
+    let keys: BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|row| row.catalogue.as_deref())
+        .collect();
+    for key in ["deepseek-mla", "deepseek-indexer"] {
         assert!(
             keys.contains(key),
             "the catalogue key {key} has no instance"
