@@ -632,9 +632,8 @@ Those two rules replace the hand-written `(MlaAttention, Deepseek)` and
 and `groups_between(1, MAX)` are gone: the compiled head width is exactly 512 and the group
 count is not a shape any listed body reads. The indexer rule keeps `max_heads(32)` because the
 selection bodies are runtime-generic over heads and 32 is the widest they address. The
-`Csa2Compression` rule is deliberately unchanged: its catalogue entries are served by
-`compressed_append_sm121.cu`, `opt_misc_sm121.cu` and `pool_group_sm121.cu`, which are not
-this family's sources and have no instance here.
+`Csa2Compression` rule is the next family's (D.8): its catalogue entries are served by
+`compressed_append_sm121.cu`, `opt_misc_sm121.cu` and `pool_group_sm121.cu`.
 
 **Refusal.** `SparseIndexerLauncher::new` now refuses a DeepSeek selection launch whose rows
 reach past `DEEPSEEK_INDEXER_MAX_POSITION` (`1 << 21`), naming the symbol and the bound; the
@@ -668,6 +667,47 @@ values and proof. Consts readers of a converted source must extend their table w
 `<CUBIN>_DEFINES` (as `m4_abi::consts`, the ring and sequence launch tests now do). Do not
 reorder a source's instance chain so that a second shape becomes the last textual definition of a
 name a Rust reader resolves.
+
+
+#### D.8 CSA2 compression
+
+**Sources and shapes.** `compressed_append_sm121.cu`, the compression entry of
+`opt_misc_sm121.cu` (`opt_rows_group_append`) and `pool_group_sm121.cu` now carry a
+`family = "csa2"` instance. The family's keys are `hidden`, `head_dim`, `ratio` and
+`positions`; the released values are 5,120, 512, 1 and 2,097,152 (the source's 2^21 position
+bound). The append body compiles its one shape, the latent width, from
+`SPARK_INSTANCE_<ENTRY>_HEAD_DIM`; its ratio, row count and store row stay runtime arguments.
+`opt_misc_sm121.cu` includes the append source, so its alias block maps the compression entry's
+macros onto the included source's, the same pattern D.2 uses.
+
+**The catalogue.** `crates/sparkflash-ops/build.rs` emits
+
+```text
+CATALOGUE_DEEPSEEK_CSA2 = ANY.hidden_equals(5120).head_dim_equals(512).min_ratio(1)
+    .positions(0, 2097152)
+```
+
+and `src/parts.rs` uses it for `(Part::Csa2Compression, Image::Deepseek)`. The hand-written
+`ANY.hidden_equals(5120).min_ratio(1).positions(0, 1 << 21)` arm is gone.
+
+**The proof.** The three released cubins compiled to the baseline bytes under their instance
+defines on the GPU head (192.168.1.80, nvcc 13.0.88, CUDA 13.0, sm_121a), so neither
+disassembly nor launch output was needed:
+
+| released cubin | bytes | sha256 |
+| --- | --- | --- |
+| `compressed_append_sm121` | 23,800 | `77026c93f196ca290203e37b62b56a4e83853d9c5ef1eba9a6b68b72f449f7da` |
+| `opt_misc_sm121` | 302,128 | `57c8aa68ef3ba12d46a3b3e78755879308373eed4ee1332299e01861122109c2` |
+| `pool_group_sm121` | 54,312 | `ed16a3a00d1150ea7b32de59c9dc7f44011faa8a8a45cb3ea518c1a84c6175b7` |
+
+The second shape is `compressed_append_256_sm121` (`hidden = 4096`, `head_dim = 256`,
+`ratio = 2`, `positions = 1048576`), built alone into
+`compressed_append_256_sm121.cubin`: 15,520 bytes,
+`1d91f6dbb854beab898fc869d64d24f464bd7e157162205f0b2d073666edd496`. Its only entry symbol is
+`compressed_append_256_sm121`, which is absent from the released `compressed_append_sm121`
+cubin and from `baseline/kernel_baseline.txt`. The full
+`crates/sparkflash-kernels/scripts/check-kernel-baseline.sh` run on the head reported every
+one of the recorded kernels `ok`.
 
 
 ## 5. Order
