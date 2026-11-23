@@ -105,6 +105,14 @@
 #include "m4_common_sm121.cuh"
 #include "b12x_common_sm121.cuh"
 
+// The widest reduction is an instance argument (kernels/instances.toml), with no default.
+#if !defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_F32A_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_F32A_F32O_SM121_HIDDEN)
+#error "b12x_mxfp8_gemv_m1_sm121.cu: no instance macros; every shape is an argument from kernels/instances.toml"
+#endif
+
 // The shared header's helpers, under the names this image used.
 #define spark_m4_gemv_load128 spark_b12x_load128
 #define spark_m4_gemv_pair_to_f32 spark_b12x_fp8x2_to_f32
@@ -114,10 +122,34 @@
 #define SPARK_M4_GEMV_THREADS 32u
 // K-blocks whose 32 weight bytes per lane are held in registers while the previous ones accumulate.
 #define SPARK_M4_GEMV_PIPELINE 6u
-// The longest reduction the shared activation row can hold: 5120 f32 = 20 KB of static shared
-// memory, which covers every dense shape the decode step serves (hidden 5120 is the widest). The
-// launch wrapper refuses a wider shape instead of letting the decode truncate.
-#define SPARK_M4_GEMV_MAX_INNER 5120u
+// The longest reduction the shared activation row can hold: hidden f32 = 20 KB of static shared
+// memory at the released 5120-wide shape. The launch wrapper refuses a wider shape instead of
+// letting the decode truncate.
+#if defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_SM121_HIDDEN)
+#define SPARK_M4_GEMV_MAX_INNER SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_SM121_HIDDEN
+#elif defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_SM121_HIDDEN)
+#define SPARK_M4_GEMV_MAX_INNER SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_SM121_HIDDEN
+#elif defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_F32A_SM121_HIDDEN)
+#define SPARK_M4_GEMV_MAX_INNER SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_F32A_SM121_HIDDEN
+#else
+#define SPARK_M4_GEMV_MAX_INNER SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_F32A_F32O_SM121_HIDDEN
+#endif
+#if defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_SM121_HIDDEN == SPARK_M4_GEMV_MAX_INNER,
+              "one cubin carries one reduction width");
+#endif
+#if defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_SM121_HIDDEN == SPARK_M4_GEMV_MAX_INNER,
+              "one cubin carries one reduction width");
+#endif
+#if defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_F32A_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_F32A_SM121_HIDDEN == SPARK_M4_GEMV_MAX_INNER,
+              "one cubin carries one reduction width");
+#endif
+#if defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_F32A_F32O_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_F32A_F32O_SM121_HIDDEN == SPARK_M4_GEMV_MAX_INNER,
+              "one cubin carries one reduction width");
+#endif
 // One lane's slice of a K-block: 32 contiguous E4M3 bytes, one per K value.
 #define SPARK_M4_GEMV_LANE_BYTES 32u
 #define SPARK_M4_GEMV_TILE_BYTES (SPARK_B12X_NTILE * SPARK_B12X_KTILE)
@@ -308,6 +340,7 @@ __device__ __forceinline__ void spark_m4_gemv_m1_body(
 }
 
 // The dense projections: contracted accumulate, coded activation, the pinned dense-family order.
+#if defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_SM121_HIDDEN)
 extern "C" __global__ void b12x_mxfp8_gemv_m1_sm121(
     const uint8_t *__restrict__ a_fp8, const uint8_t *__restrict__ a_scales,
     const uint8_t *__restrict__ w_fp8, const uint8_t *__restrict__ w_scales,
@@ -317,8 +350,10 @@ extern "C" __global__ void b12x_mxfp8_gemv_m1_sm121(
     spark_m4_gemv_m1_body<true, true, false>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols,
                                              inner, trace_ring, layer_id, step_seq);
 }
+#endif
 
 // The shared expert: the engine's rounded-multiply-then-rounded-add twin, coded activation.
+#if defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_SM121_HIDDEN)
 extern "C" __global__ void b12x_mxfp8_gemv_m1_nf_sm121(
     const uint8_t *__restrict__ a_fp8, const uint8_t *__restrict__ a_scales,
     const uint8_t *__restrict__ w_fp8, const uint8_t *__restrict__ w_scales,
@@ -328,8 +363,10 @@ extern "C" __global__ void b12x_mxfp8_gemv_m1_nf_sm121(
     spark_m4_gemv_m1_body<false, true, false>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols,
                                               inner, trace_ring, layer_id, step_seq);
 }
+#endif
 
 // The compressor seam: the engine's rounded-multiply-then-rounded-add twin, f32 activation row.
+#if defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_NF_F32A_SM121_HIDDEN)
 extern "C" __global__ void b12x_mxfp8_gemv_m1_nf_f32a_sm121(
     const uint8_t *__restrict__ a_fp8, const uint8_t *__restrict__ a_scales,
     const uint8_t *__restrict__ w_fp8, const uint8_t *__restrict__ w_scales,
@@ -339,10 +376,12 @@ extern "C" __global__ void b12x_mxfp8_gemv_m1_nf_f32a_sm121(
     spark_m4_gemv_m1_body<false, false, false>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols,
                                                inner, trace_ring, layer_id, step_seq);
 }
+#endif
 
 // The shared expert's f32-reference arm: f32 activation staging and the f32 accumulator stored as
 // f32. Its host twin keeps the row at f32 end to end (no quantise, no bf16 rounding), so this is the
 // only instantiation that must not round its output.
+#if defined(SPARK_INSTANCE_B12X_MXFP8_GEMV_M1_F32A_F32O_SM121_HIDDEN)
 extern "C" __global__ void b12x_mxfp8_gemv_m1_f32a_f32o_sm121(
     const uint8_t *__restrict__ a_fp8, const uint8_t *__restrict__ a_scales,
     const uint8_t *__restrict__ w_fp8, const uint8_t *__restrict__ w_scales,
@@ -352,3 +391,4 @@ extern "C" __global__ void b12x_mxfp8_gemv_m1_f32a_f32o_sm121(
     spark_m4_gemv_m1_body<false, false, true>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols,
                                               inner, trace_ring, layer_id, step_seq);
 }
+#endif

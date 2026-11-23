@@ -68,6 +68,16 @@
 #include "m4_common_sm121.cuh"
 #include "b12x_common_sm121.cuh"
 
+// The model shape is an instance argument (kernels/instances.toml): the widest reduction the
+// shared activation row can hold is compiled in, with no default. opt_rows_sm121.cu includes this
+// file and aliases its own host-weight entries onto these macros.
+#if !defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_F32O_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_F32W_F32O_SM121_HIDDEN) && \
+    !defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_4096_SM121_HIDDEN)
+#error "b12x_hostw_gemv_m1_sm121.cu: no instance macros; every shape is an argument from kernels/instances.toml"
+#endif
+
 // The shared header's helpers, under the names this image used.
 #define spark_hw_gemv_load128 spark_b12x_load128
 
@@ -76,9 +86,29 @@
 #define SPARK_HW_GEMV_THREADS 32u
 // K blocks whose 64/128 bytes per lane are held in registers while the previous ones accumulate.
 #define SPARK_HW_GEMV_PIPELINE 4u
-// The longest reduction the shared activation row can hold: 5120 f32 = 20 KB, the widest dense
-// shape the decode step serves. The launch wrapper refuses anything wider.
-#define SPARK_HW_GEMV_MAX_INNER 5120u
+// The longest reduction the shared activation row can hold: hidden f32 = 20 KB at the released
+// 5120-wide shape. The launch wrapper refuses anything wider.
+#if defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_SM121_HIDDEN)
+#define SPARK_HW_GEMV_MAX_INNER SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_SM121_HIDDEN
+#elif defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_F32O_SM121_HIDDEN)
+#define SPARK_HW_GEMV_MAX_INNER SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_F32O_SM121_HIDDEN
+#elif defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_F32W_F32O_SM121_HIDDEN)
+#define SPARK_HW_GEMV_MAX_INNER SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_F32W_F32O_SM121_HIDDEN
+#else
+#define SPARK_HW_GEMV_MAX_INNER SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_4096_SM121_HIDDEN
+#endif
+#if defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_SM121_HIDDEN == SPARK_HW_GEMV_MAX_INNER,
+              "one cubin carries one reduction width");
+#endif
+#if defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_F32O_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_F32O_SM121_HIDDEN == SPARK_HW_GEMV_MAX_INNER,
+              "one cubin carries one reduction width");
+#endif
+#if defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_F32W_F32O_SM121_HIDDEN)
+static_assert(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_F32W_F32O_SM121_HIDDEN == SPARK_HW_GEMV_MAX_INNER,
+              "one cubin carries one reduction width");
+#endif
 // One micro-tile: 32 outputs x 32 K values of the weight's own element type.
 #define SPARK_HW_GEMV_TILE_VALUES 1024u
 // One lane's values of a K block and their byte count, for the widest element type (f32).
@@ -252,6 +282,7 @@ __device__ __forceinline__ void spark_hw_gemv_m1_body(
 }
 
 // bf16 weights, bf16 output: the indexer's per-query weights projection.
+#if defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_SM121_HIDDEN)
 extern "C" __global__ void b12x_hostw_gemv_m1_bf16w_sm121(
     const float *__restrict__ a_row, const __nv_bfloat16 *__restrict__ w,
     void *__restrict__ out, const uint32_t rows, const uint32_t cols, const uint32_t inner,
@@ -259,8 +290,10 @@ extern "C" __global__ void b12x_hostw_gemv_m1_bf16w_sm121(
     spark_hw_gemv_m1_body<__nv_bfloat16, false>(a_row, w, out, rows, cols, inner, trace_ring,
                                                 layer_id, step_seq);
 }
+#endif
 
 // bf16 weights, f32 accumulators: the indexer's key projection and the ratio-1 compressor wkv.
+#if defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_F32O_SM121_HIDDEN)
 extern "C" __global__ void b12x_hostw_gemv_m1_bf16w_f32o_sm121(
     const float *__restrict__ a_row, const __nv_bfloat16 *__restrict__ w,
     void *__restrict__ out, const uint32_t rows, const uint32_t cols, const uint32_t inner,
@@ -268,8 +301,10 @@ extern "C" __global__ void b12x_hostw_gemv_m1_bf16w_f32o_sm121(
     spark_hw_gemv_m1_body<__nv_bfloat16, true>(a_row, w, out, rows, cols, inner, trace_ring,
                                                layer_id, step_seq);
 }
+#endif
 
 // f32 weights, f32 accumulators: the compressor's wkv and wgate at ratio > 1.
+#if defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_F32W_F32O_SM121_HIDDEN)
 extern "C" __global__ void b12x_hostw_gemv_m1_f32w_f32o_sm121(
     const float *__restrict__ a_row, const float *__restrict__ w, void *__restrict__ out,
     const uint32_t rows, const uint32_t cols, const uint32_t inner,
@@ -277,3 +312,16 @@ extern "C" __global__ void b12x_hostw_gemv_m1_f32w_f32o_sm121(
     spark_hw_gemv_m1_body<float, true>(a_row, w, out, rows, cols, inner, trace_ring, layer_id,
                                        step_seq);
 }
+#endif
+
+// The second-shape build proof (kernels/instances.toml): a 4096-wide reduction. Never in a released
+// cubin; it exists so a width other than 5120 compiles from the same body on every instance build.
+#if defined(SPARK_INSTANCE_B12X_HOSTW_GEMV_M1_BF16W_4096_SM121_HIDDEN)
+extern "C" __global__ void b12x_hostw_gemv_m1_bf16w_4096_sm121(
+    const float *__restrict__ a_row, const __nv_bfloat16 *__restrict__ w,
+    void *__restrict__ out, const uint32_t rows, const uint32_t cols, const uint32_t inner,
+    GpuTraceRing *__restrict__ trace_ring, const uint32_t layer_id, const uint64_t step_seq) {
+    spark_hw_gemv_m1_body<__nv_bfloat16, false>(a_row, w, out, rows, cols, inner, trace_ring,
+                                                layer_id, step_seq);
+}
+#endif

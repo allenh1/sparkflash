@@ -154,6 +154,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_rmsnorm_bf16(
 
 
 
+#if defined(SPARK_INSTANCE_OPT_LM_HEAD_HIDDEN)
 extern "C" __global__ void __launch_bounds__(OPT_LM_THREADS) opt_lm_head(
     const __nv_bfloat16 *__restrict__ hidden,
     const __nv_bfloat16 *__restrict__ w,
@@ -209,6 +210,7 @@ extern "C" __global__ void __launch_bounds__(OPT_LM_THREADS) opt_lm_head(
         block_argmax[blockIdx.x] = idx == 0xffffffffu ? 0u : idx;
     }
 }
+#endif
 
 // opt_engram_wkv: engram_wkv_sm121's ABI and grid (warp per output row, 8 rows per block) with
 //   sixteen-byte loads: lane l reads codes [16 l, 16 l + 16) of each 512-code step, the lane pair

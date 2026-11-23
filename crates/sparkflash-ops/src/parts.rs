@@ -190,7 +190,10 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // 201,024-row table is not a multiple of the Qwen release's 128, and the same body
         // embeds it.
         (Part::Embedding, Image::Qwen4Exp) => ShapeConstraint::ANY,
-        (Part::RmsNorm, Image::Deepseek) => CATALOGUE_DEEPSEEK_RMSNORM,
+        // DeepSeek's RMSNorm bodies are the rows family's opt_misc entries and the seams'
+        // standalone rmsnorm_sm121; the generated key claims the hidden width they were built
+        // for, and the source's even-width bound stays beside it.
+        (Part::RmsNorm, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROWS_NORM.hidden_multiple(2),
         (Part::RmsNorm, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_multiple(2),
         (Part::LmHead, Image::Deepseek) => {
             ShapeConstraint::ANY.hidden_equals(5120).vocab_multiple(128)
@@ -239,9 +242,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::KdaScan, Image::Qwen4Scan | Image::Qwen4Exp) => ShapeConstraint::ANY
             .head_pairs(KDA_SCAN_HEAD_PAIRS)
             .window_between(2, 9),
-        (Part::DenseMlp, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(5120)
-            .intermediate_multiple(16),
+        (Part::DenseMlp, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROWS_MLP,
         // GLM's bulk-prefill MLP is compiled for the 4096-wide release, like its DenseGemm
         // entry. A 2560-wide Qwen MLP must not match it and launch glm_prefill_* on a body
         // compiled for another width.
@@ -301,7 +302,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .max_top_k(64),
         // The shared dense projection. The b12x and q4p bodies are generic over the hidden and
         // intermediate widths, so this entry is not pinned to one model's 5120.
-        (Part::DenseGemm, Image::Deepseek) => ShapeConstraint::ANY,
+        (Part::DenseGemm, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROWS_GEMM,
         (Part::DenseGemm, Image::Qwen4Prefill) => ShapeConstraint::ANY.hidden_equals(2560),
         (Part::DenseGemm, Image::GlmPrefill) => ShapeConstraint::ANY.hidden_equals(4096),
         // q4e_gemv_bf16 / q4e_gemm_bf16 take rows and columns as runtime arguments: the GEMV
@@ -315,7 +316,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // geometry has no field for. It is the same body the Dory MLP entry names.
         (Part::DenseGemm, Image::Dory) => ShapeConstraint::ANY,
         (Part::DenseGemm, Image::GlmDecode) => ShapeConstraint::ANY.hidden_equals(4096),
-        (Part::Activation, Image::Deepseek) => ShapeConstraint::ANY.hidden_equals(5120),
+        (Part::Activation, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROWS_ACTIVATION,
         (Part::Activation, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_equals(2560),
         (Part::Activation, Image::Qwen4Prefill) => ShapeConstraint::ANY.hidden_equals(2560),
         (Part::Activation, Image::GlmMoe | Image::GlmDecode) => {
@@ -363,9 +364,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .hidden_equals(4096)
             .max_experts(512)
             .max_top_k(64),
-        (Part::MoeCombine, Image::Deepseek) => {
-            ShapeConstraint::ANY.hidden_equals(5120).max_top_k(64)
-        }
+        (Part::MoeCombine, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROWS_COMBINE,
         // The shared token combine is architecture-independent: it sums a runtime top-k over any
         // hidden width the token image serves. This is the entry the duplicate (Moe, Qwen4Moe)
         // pair was trying to provide.

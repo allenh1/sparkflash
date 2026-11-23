@@ -52,6 +52,7 @@ FAMILIES = {
     # The multi-row/bulk sources: every body is built for a hidden width; the routed-expert
     # bodies also name the intermediate width, the expert count and the selected slots.
     "rows": ("hidden", "intermediate", "experts", "top_k"),
+    "rows": ("hidden", "intermediate", "experts", "top_k"),
 }
 OPTIONAL = {"seams": ("hc",)}
 # The catalogue generator understands these dimensions as shape claims. A key may name a subset

@@ -287,7 +287,7 @@ The catalogue keys and the generated rules are:
 | `deepseek-hyperconnection` | the six mHC entries | `hidden_equals(5120).streams_between(4, 4)` |
 | `deepseek-rope` | `rope_rotate_bf16`, `kv_norm_rope_bf16`, `rope_rotate_rows_bf16` | `hidden_equals(5120)` |
 | `deepseek-quantize` | `w8a8_prologue_e4m3`, `w8a8_prologue_bf16_e4m3`, `window_quant_fp8_bf16` | `ANY` (`catalogue_hidden = false`) |
-| `deepseek-rmsnorm` | `rmsnorm_sm121` | `hidden_equals(5120)` |
+| `deepseek-rows-norm` | `rmsnorm_sm121` | `hidden_equals(5120)` (the rows family's `opt_rmsnorm_bf16` shares it) |
 
 `catalogue_hidden = false` is the runtime-width escape: the quantiser entries state that their
 body has no compiled hidden shape, and `sparkflash-ops/build.rs` then emits an open rule rather
@@ -372,6 +372,71 @@ window 64 and Markov rank 128 are named but not read by the tap body). It builds
 with the k3 routed rows, so a change to one must be made with the other in view; a new key would
 have to be named by `shape_for` in `parts.rs`. The released cubin stayed at the baseline bytes
 without a baseline edit, and the second-shape cubin is outside the baseline by construction.
+
+#### D.4 Rows and bulk
+
+The fourth family is the multi-row decode twins, the bulk-prefill MMA bodies and the generic
+dense/GEMV projections. Its sources are `opt_rows_sm121.cu`, `opt_mma_sm121.cu`,
+`opt_gemv_sm121.cu`, `opt_misc_sm121.cu`, `b12x_mxfp8_dense_sm121.cu`,
+`b12x_mxfp8_dense_m1_sm121.cu`, `b12x_mxfp8_gemv_m1_sm121.cu` and
+`b12x_hostw_gemv_m1_sm121.cu`. Every released entry symbol is one `[[instance]]` table with
+`family = "rows"`; the family's required keys are `hidden`, `intermediate`, `experts` and
+`top_k`, and the released values are 5120, 576, 384 and 6.
+
+**What the bodies compile in.** `opt_rows_sm121.cu` had three copies of the released hidden width
+(`OR_S_HIDDEN`, `OR_LM_HIDDEN`, `OHS_HIDDEN`); they are now one `OR_ROWS_HIDDEN` taken from the
+instance macros, and a mixed-shape line in one cubin fails a `static_assert`. `opt_mma_sm121.cu`
+takes `OMR_EXPERTS`/`OMR_TOPK` and `OMM_HIDDEN`/`OMM_INTER`/`OMM_TOPK` the same way, and
+`opt_misc_sm121.cu`'s `OPT_LM_HIDDEN` comes from the LM-head instance. The two b12x GEMVs had a
+literal `MAX_INNER 5120`; each is now its instance's `hidden`, so the second shape moves the
+shared-memory array and the wrapper's refusal bound together. The generic bodies
+(`opt_gemv_sm121.cu`, `b12x_mxfp8_dense_sm121.cu` and its M1 sibling) take their widths as
+runtime arguments; they are listed because they are released entries, and their macros are unused
+rather than defaulted. `b12x_hostw_gemv_m1_sm121.cu` is included by `opt_rows_sm121.cu`; the
+include aliases the included entry macros onto the rows entry macros, so the opt_rows cubin keeps
+the included symbols and one shape.
+
+**The catalogue.** Five keys are generated from the instance list and the dimensions the sources
+actually fix: `deepseek-rows-norm` (RmsNorm, hidden), `deepseek-rows-mlp` (DenseMlp, hidden and
+`intermediate_multiple = 16`, the runtime bound the MMA bodies state), `deepseek-rows-gemm`
+(DenseGemm, hidden), `deepseek-rows-activation` (Activation, hidden) and
+`deepseek-rows-combine` (MoeCombine, hidden, with `max_top_k = 64` — the combine's top-k is a
+runtime argument). The generated constants are `CATALOGUE_DEEPSEEK_ROWS_*`; the hand-written
+`hidden_equals(5120)`, `intermediate_multiple(16)` and `max_top_k(64)` rules for these parts are
+gone. MoePlan keeps `ShapeConstraint::ANY`: its released symbols come from `moe_plan_sm121.cu`
+and `opt_moe_sm121.cu`, which are not rows-family sources. The attention bodies inside
+`opt_rows_sm121.cu` and `opt_mma_sm121.cu` keep their own `OR_A_*`/`OBA_*` geometry; those
+constants are the attention family's, not this family's hidden/intermediate/expert arguments.
+
+**The proof.** All eight released rows cubins compile to the baseline bytes under their instance
+defines (nvcc 13.0.88, sm_121a), so neither `cuobjdump -sass` nor a launch comparison was needed:
+
+| released cubin | bytes | sha256 |
+| --- | --- | --- |
+| `b12x_mxfp8_dense_sm121` | 209,424 | `d751f2b65b076659ff0c4cc37542f8ae4899ec61b7f40c3d8223ba3181f9d350` |
+| `b12x_mxfp8_dense_m1_sm121` | 14,520 | `8fcd899dad03debc5292106e5f05e6c545f61fcc0d268789d6f4ce64509fb5ed` |
+| `b12x_mxfp8_gemv_m1_sm121` | 112,512 | `c33cd129f0003e1a4778bdced1fe788bf1f4a1be84fe8033c7989bc8d4bab469` |
+| `b12x_hostw_gemv_m1_sm121` | 73,848 | `ca1d8498830cddfcdb9a3f1a72e777cb0360a80e4ce7be18af514695bda6bc72` |
+| `opt_gemv_sm121` | 1,330,752 | `3111ba50858b93449823f23810d7fc75c8e77e76141958697c221123f240c973` |
+| `opt_misc_sm121` | 302,128 | `57c8aa68ef3ba12d46a3b3e78755879308373eed4ee1332299e01861122109c2` |
+| `opt_rows_sm121` | 1,021,528 | `cc9ee43f59a46321a056ccdd872067ead28d4d4f203b213e0ffa2859f1175a97` |
+| `opt_mma_sm121` | 506,560 | `fdb2c5d97d19ce696d98d0420910b3ae20e54df6a9c70347b5297da8aab69587` |
+
+The second shape is `b12x_hostw_gemv_m1_bf16w_4096_sm121` (hidden 4096), built alone into
+`b12x_hostw_gemv_m1_4096_sm121.cubin`: 27,440 bytes,
+`623c8d3205cacbc7b43cc5e7c552d6f1f3ace9e6cc8973defadcd45100529cc1`, one entry symbol and nothing
+else; it is absent from `b12x_hostw_gemv_m1_sm121.cubin` and from the baseline. The released
+host-weight cubin's three symbols are unchanged.
+
+**What the next family must know.** A source with an entry name that does not end in `_sm121` gets
+the define `SPARK_INSTANCE_<ENTRY>_<KEY>` without the suffix (`opt_rows_lm_head` becomes
+`SPARK_INSTANCE_OPT_ROWS_LM_HEAD_HIDDEN`); the work that converts a family must read the exact
+entry names from the list, not assume the source stem is the prefix. A source that `#include`s
+another instanced source (`opt_rows_sm121.cu` includes `b12x_hostw_gemv_m1_sm121.cu`) needs the
+alias block that D.2 uses, or the combined probe sees one family's macros in the other's entries.
+Finally, a generic body that reads a width at run time does not have to claim the released width:
+the generated rule should carry the source's multiple (DenseMlp's `intermediate_multiple = 16`)
+rather than an equality the body does not require.
 
 ## 5. Order
 
