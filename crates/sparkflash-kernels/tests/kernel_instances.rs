@@ -59,7 +59,18 @@ fn instances() -> Vec<Instance> {
                     .to_owned()
             };
             let mut shapes = BTreeMap::new();
-            for key in ["hidden", "experts", "top_k", "intermediate", "padded", "hc"] {
+            for key in [
+                "hidden",
+                "experts",
+                "top_k",
+                "intermediate",
+                "padded",
+                "hc",
+                "taps",
+                "latent",
+                "window",
+                "markov_rank",
+            ] {
                 if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                     assert!(value > 0, "{key} is positive");
                     shapes.insert(key.to_owned(), value as u64);
@@ -112,17 +123,20 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
             path.display()
         );
         assert!(
-            ["router", "routed", "seams"].contains(&instance.family.as_str()),
+            ["router", "routed", "seams", "drafter", "rows"].contains(&instance.family.as_str()),
             "{} names family {:?}",
             instance.entry,
             instance.family
         );
-        for key in match instance.family.as_str() {
-            "router" => &["hidden", "experts", "top_k"][..],
-            "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"][..],
-            "seams" => &["hidden"][..],
-            _ => unreachable!(),
-        } {
+        let keys: &[&str] = match instance.family.as_str() {
+            "router" => &["hidden", "experts", "top_k"],
+            "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"],
+            "seams" => &["hidden"],
+            "drafter" => &["hidden", "hc", "taps", "latent", "window", "markov_rank"],
+            "rows" => &["hidden", "intermediate", "experts", "top_k"],
+            other => panic!("{} names family {other}", instance.entry),
+        };
+        for key in keys {
             assert!(
                 instance.shapes.contains_key(*key),
                 "{} ({}) has no {key}",
@@ -264,13 +278,60 @@ fn the_seams_family_has_its_released_shapes_and_a_second_shape() {
         .expect("the released seams cubin");
     assert_ne!(second.cubin, released.cubin, "the proof has its own cubin");
 
-    let keys: BTreeSet<&str> = seams.iter().filter_map(|row| row.catalogue.as_deref()).collect();
+    let keys: BTreeSet<&str> = seams
+        .iter()
+        .filter_map(|row| row.catalogue.as_deref())
+        .collect();
     for key in [
         "deepseek-hyperconnection",
         "deepseek-rope",
         "deepseek-quantize",
         "deepseek-rmsnorm",
     ] {
-        assert!(keys.contains(key), "the catalogue key {key} has no seam instance");
+        assert!(
+            keys.contains(key),
+            "the catalogue key {key} has no seam instance"
+        );
     }
+}
+
+#[test]
+fn the_drafter_family_has_its_released_shape_and_a_second_shape() {
+    let rows = instances();
+    let drafter: Vec<&Instance> = rows.iter().filter(|row| row.family == "drafter").collect();
+    let released: Vec<&Instance> = drafter
+        .iter()
+        .copied()
+        .filter(|row| row.cubin == "opt_draft_sm121")
+        .collect();
+    assert_eq!(
+        released.len(),
+        15,
+        "the released drafter cubin carries fifteen entries"
+    );
+    for row in &released {
+        assert_eq!(row.shapes["hidden"], 5120);
+        assert_eq!(row.shapes["hc"], 4);
+        assert_eq!(row.shapes["taps"], 3);
+        assert_eq!(row.shapes["latent"], 512);
+        assert_eq!(row.shapes["window"], 128);
+        assert_eq!(row.shapes["markov_rank"], 256);
+        assert_eq!(row.catalogue.as_deref(), Some("deepseek-mtp"));
+    }
+
+    let second = drafter
+        .iter()
+        .find(|row| row.entry == "opt_draft_taps_4096h2c2t_sm121")
+        .expect("the second-shape proof instance");
+    assert_eq!(second.shapes["hidden"], 4096);
+    assert_eq!(second.shapes["hc"], 2);
+    assert_eq!(second.shapes["taps"], 2);
+    assert_ne!(
+        second.cubin, "opt_draft_sm121",
+        "the proof has its own cubin"
+    );
+    assert!(
+        second.catalogue.is_none(),
+        "the proof is not a catalogue shape"
+    );
 }

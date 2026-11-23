@@ -316,6 +316,63 @@ define a body shape. Add second-shape proofs for the runtime-width entries as th
 a future model changes a launch width, and keep `catalogue_hidden = false` for any entry whose
 width the kernel reads at run time.
 
+#### D.3 drafter
+
+The drafter is the third family moved: one source, `kernels/opt_draft_sm121.cu`, and the
+fifteen entry symbols the DeepSeek MTP stage loads from `opt_draft_sm121.cubin` — `opt_draft_taps`,
+`norm_quant`, `attn`, `logits`, `head_fp8`, `head_fp8t`, `logits_fp8`, `markov`,
+`fold_prob`, `pick_prob`, `embed_blocks`, `markov_seqs`, `markov_seqs_mma`, `fold_seqs`
+and `pick_seqs`.
+
+**Shape keys.** The `drafter` family takes six one-rank values. Every released entry lists all
+six so the compile group has one complete vocabulary; an entry reads only the ones its body uses.
+
+| key | released value | read by |
+| --- | --- | --- |
+| `hidden` | 5120 | taps, norm/quant, the head logits and quantisers, embed |
+| `hc` | 4 | taps, embed (the residual-stream copies) |
+| `taps` | 3 | taps |
+| `latent` | 512 | attention (the MLA head width; `latent / 32` ue8m0 scales) |
+| `window` | 128 | attention (`max keys = window + 32`) |
+| `markov_rank` | 256 | markov, markov_seqs, markov_seqs_mma |
+
+**The catalogue.** Every released instance carries `catalogue = "deepseek-mtp"`. The k3 routed
+expert instances already prove that key's `(hidden, experts, top-k)` set, so
+`sparkflash-ops/build.rs` treats a `drafter` row as a hidden-width contributor only: it adds
+`hidden` but does not invent an experts/top-k triple the drafter does not have. The generated
+`CATALOGUE_DEEPSEEK_MTP` is unchanged — `hidden_equals(5120)`, `routed_shapes = [(5120, 128, 3)]`,
+no intermediate width — and `(Part::Mtp, Image::Deepseek)` keeps using it. A geometry whose hidden
+width is not 5120 is refused by name by `ShapeConstraint::accepts`; there is no silent fallback.
+
+**The source.** The no-instance `#error` lists every entry's macros. Each entry defines the
+shape macros it reads from its own `SPARK_INSTANCE_*` values and `#undef`s them at the end of its
+block, so the released compile group can carry all fifteen entries and a proof compile can carry
+one. The local copies are gone: `hidden / 32` and `latent / 32` replace the quantiser widths,
+`window + 32` the attention key bound, `hidden / 256` and `hidden / 512` the logit-loop chunk
+counts. `markov` reads the rank in `rank / 256` warp spans. `markov_seqs` keeps its original
+one-warp dot and asserts `markov_rank == 256`, which is the bound that body really needs rather
+than a copy of a model constant.
+
+**The proof.** The released cubin compiled under the instance defines is byte-identical to the
+baseline; per-symbol `cuobjdump -sass` comparison shows all fifteen entries identical, so no
+launch-output comparison was needed.
+
+| released cubin | bytes | sha256 |
+| --- | --- | --- |
+| `opt_draft_sm121` | 631,856 | `12743980711ede547cfb32cee2a1ca0ab145228aeb98b73e2fd6b51a5005b161` |
+
+The second shape is `opt_draft_taps_4096h2c2t_sm121` (hidden 4096, hc 2, taps 2; latent 256,
+window 64 and Markov rank 128 are named but not read by the tap body). It builds alone into
+`opt_draft_taps_4096h2c2t_sm121.cubin` (5,976 bytes,
+`4a149c06d19c03ca86477d6b682b642415e1d0539ef7dadf86f898b5caaa854e`), contains only its own
+`STT_FUNC`, and appears in neither the released cubin nor `baseline/kernel_baseline.txt`.
+
+**For the next family.** `scripts/instances.py`, `sparkflash-kernels/build.rs` and
+`tests/kernel_instances.rs` now know the `drafter` vocabulary. The `deepseek-mtp` key is shared
+with the k3 routed rows, so a change to one must be made with the other in view; a new key would
+have to be named by `shape_for` in `parts.rs`. The released cubin stayed at the baseline bytes
+without a baseline edit, and the second-shape cubin is outside the baseline by construction.
+
 ## 5. Order
 
 1. A, alone.

@@ -46,8 +46,17 @@ FAMILIES = {
     # The layer seams: the hidden width is required; hc is the residual-stream count the
     # hyper-connection bodies are compiled for, omitted by the runtime-width seam entries.
     "seams": ("hidden",),
+    # The DSpark drafter's one-rank geometry: the stream width and its copies, the tap layers,
+    # the attention latent and window, and the Markov head's rank.
+    "drafter": ("hidden", "hc", "taps", "latent", "window", "markov_rank"),
+    # The multi-row/bulk sources: every body is built for a hidden width; the routed-expert
+    # bodies also name the intermediate width, the expert count and the selected slots.
+    "rows": ("hidden", "intermediate", "experts", "top_k"),
 }
 OPTIONAL = {"seams": ("hc",)}
+# The catalogue generator understands these dimensions as shape claims. A key may name a subset
+# with catalogue_dims; a key without it keeps the router/routed convention.
+CATALOGUE_DIMS = {"hidden", "intermediate", "experts", "top_k"}
 ALLOWED = {
     "source",
     "entry",
@@ -56,6 +65,9 @@ ALLOWED = {
     "catalogue",
     "catalogue_intermediate",
     "catalogue_hidden",
+    "catalogue_dims",
+    "intermediate_multiple",
+    "max_top_k",
     *{key for keys in FAMILIES.values() for key in keys},
     *{key for keys in OPTIONAL.values() for key in keys},
 }
@@ -122,6 +134,33 @@ def load() -> list[dict]:
         catalogue = row.get("catalogue")
         if catalogue is not None and (not isinstance(catalogue, str) or not catalogue):
             raise SystemExit(f"{INSTANCES}: instance {number}: bad catalogue key")
+        catalogue_hidden = row.get("catalogue_hidden")
+        if catalogue_hidden is not None and not isinstance(catalogue_hidden, bool):
+            raise SystemExit(f"{INSTANCES}: instance {number}: catalogue_hidden is a boolean")
+        dims = row.get("catalogue_dims")
+        if dims is not None:
+            if (
+                not isinstance(dims, list)
+                or not dims
+                or any(not isinstance(dim, str) or dim not in CATALOGUE_DIMS for dim in dims)
+                or len(set(dims)) != len(dims)
+            ):
+                raise SystemExit(
+                    f"{INSTANCES}: instance {number}: catalogue_dims is a non-empty subset of "
+                    f"{sorted(CATALOGUE_DIMS)}"
+                )
+            if catalogue is None:
+                raise SystemExit(
+                    f"{INSTANCES}: instance {number}: catalogue_dims needs a catalogue key"
+                )
+        for key in ("intermediate_multiple", "max_top_k"):
+            value = row.get(key)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            ):
+                raise SystemExit(
+                    f"{INSTANCES}: instance {number}: {key} is a positive integer"
+                )
         result.append(
             {
                 "source": f"kernels/{source}",
@@ -129,6 +168,10 @@ def load() -> list[dict]:
                 "cubin": cubin,
                 "family": family,
                 "catalogue": catalogue,
+                "catalogue_hidden": catalogue_hidden,
+                "catalogue_dims": dims,
+                "intermediate_multiple": row.get("intermediate_multiple"),
+                "max_top_k": row.get("max_top_k"),
                 "defines": defines,
                 "shapes": shapes,
             }
