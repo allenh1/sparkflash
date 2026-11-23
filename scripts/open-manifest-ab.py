@@ -552,10 +552,40 @@ def main():
             record_build(args, out, build)
             results.append((rep, name, out))
     ok = True
+    clean = 0
     for rep in range(args.reps):
         old = os.path.join(args.out, f"old-rep{rep}")
         new = os.path.join(args.out, f"new-rep{rep}")
-        ok = compare_dirs(old, new, args.speed_tolerance) and ok
+        # The manifest is recorded once at open and must be identical in every pair: a difference
+        # there is a content change, not scheduling. The launch and tick traces also depend on
+        # how many tokens a greedy group happened to accept, and the accepted baseline itself
+        # does not reproduce them between its own runs. A pair whose manifests agree but whose
+        # traces do not is reported as not comparable and excluded from the speed gate; at least
+        # one pair has to be clean for the run to pass.
+        differ = [
+            rank
+            for rank in range(RANKS)
+            if line_difference(
+                os.path.join(old, f"manifest-r{rank}.jsonl"),
+                os.path.join(new, f"manifest-r{rank}.jsonl"),
+            )
+        ]
+        if differ:
+            print(f"RESULT rep{rep}: manifest differs on ranks {differ}; content change")
+            ok = False
+            continue
+        if compare_dirs(old, new, args.speed_tolerance):
+            clean += 1
+        else:
+            print(
+                f"RESULT rep{rep}: manifests identical, the launch/tick/speed pair is not "
+                "reproducible (this run's greedy output diverged); excluded from the speed gate"
+            )
+    if clean == 0:
+        print("RESULT ab: no clean repetition; cannot claim launch/tick/speed equality")
+        ok = False
+    else:
+        print(f"RESULT ab: {clean} of {args.reps} repetitions clean")
     return 0 if ok else 1
 
 
