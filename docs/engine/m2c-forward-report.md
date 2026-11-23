@@ -147,31 +147,48 @@ Commands run:
 Comparison evidence: not measured, same cluster blocker. Speed A/B for PR 4 is blocked with
 it and is not claimed.
 
-## Remaining pinned-list entries after PR 4
+## The rule test and the remaining literals
 
-The part A branch recorded only the baseline and the plan-vs-manifest test; it did not land a
-count-pinning rule test. The counts below are this branch's own inventory, measured with
-grep over crates/sparkflash-deepseek-forward/src (the four-rank assumptions are left in place
-as milestone 3):
+Part A's inventory gate now lives in `crates/sparkflash-deepseek-forward/tests/source_inventory.rs`.
+It pins a ceiling per file, counted outside `#[cfg(test)]`, for `ModelConfig` mentions, `config.`
+reads, named model constants, released shape literals, concrete tensor-name strings and kernel
+symbol strings. The four-rank sites are a separate list. A model value written in the forward
+crate now has to raise a pin to exist, and the pins are the tip's counts.
 
-| list | count | where |
-|---|---:|---|
-| direct sparkflash-model-deepseek-v41 dependency/import | 0 | Cargo.toml and all sources |
-| ModelConfig::v41_flash / v41_flash_cached constructors | 0 | all sources |
-| format!("layers...") tensor construction | 4 production-adjacent test fixtures (tp4_resident:1736, tp4_smoke:616/631/632/2513, layer_device:2075, tp4_forward:20167) | test-only |
-| format!("mtp...") tensor construction | 0 | |
-| kernel-symbol strings | 41 occurrences, mostly evidence/test strings; the production loaders for b12x_mxfp8_dense_sm121, b12x_mxfp8_wo_a_sm121, flash_mla_csa2_sm121, b12x_mxfp4_moe_sm121, lm_head_reduce_sm121, pool_group_sm121, engram_stream_convert_sm121, engram_write_sm121 and moe_routed_device_sm121 stay literal because the catalogue does not claim them | catalogue gap from part B |
-| literal 5120 | 91 occurrences, almost all in unit-test expected values and kernel-width comments | tests, not the open path |
+After parts B and C the forward crate no longer depends on `sparkflash-model-deepseek-v41`, and
+every model value it reads comes from the installed plan: the compressor seam declines a layer
+whose cache it shares instead of naming a tensor the checkpoint does not carry, the MTP names
+resolve by the `mtp.<stage>.` the plan and checkpoint share, and the nine fallback symbols
+(`b12x_mxfp8_dense`, `b12x_mxfp8_wo_a`, `flash_mla_csa2`, `b12x_mxfp4_moe`, `lm_head_reduce`,
+`pool_group`, `engram_stream_convert`, `engram_write`, `moe_routed_device`) are catalogue
+entries loaded through `plan::handles()`. `Csa2Compression` is a generated rule from
+`kernels/instances.toml`, not `ShapeConstraint::ANY`, and its released cubins match the
+baseline hashes.
 
-The dependency/import criterion is met. The symbol list is not empty because the catalogue
-does not carry nine symbols the forward still loads; that is the part B gap recorded under PR 2.
+## Four-rank result (2026-11-23)
+
+The harness is now `scripts/open-manifest-ab.py` in this repo; it records and compares the open
+manifest, the launch trace, the tick trace and the served speed, alternated A/B between two
+builds. A window on the four-node group ran:
+
+| proof | result |
+|---|---|
+| open manifest | `open-check`: 66 model, 93,131 tensor and 189/197 kernel records per rank; each rank reports `shards=95822 bound=93131 matched=93131` |
+| manifest vs the accepted 2026-11-22 baseline | identical on every rank (93,386 / 93,386 / 93,386 / 93,394 lines) |
+| launch trace | identical after pointer normalization (254,743 / 254,743 / 254,743 / 255,332 lines), on both repetitions |
+| tick trace | identical after scheduler-placement filtering (253 model decisions) |
+| speed | decode 1 lane 100.72 -> 100.54, 8 lanes 28.79 -> 28.90, prefill 7,143 -> 7,150 tokens/s; draft acceptance 0.786 -> 0.786; all inside the 5% floor |
+| control | the baseline binary against the same 2026-11-22 baseline passes the same four comparisons |
+
+The manifest and the speed are the milestone's gate: equal model values, equal bound tensor
+set, equal kernel set, equal served rate. The launch and tick traces are equal for a
+repetition whose greedy output matches; the accepted baseline itself does not reproduce its own
+trace between two such repetitions, because cross-rank reduction order changes how many draft
+tokens a group accepts, so the recorder reports such a repetition as not comparable and requires
+at least one clean pair. The 2026-11-23 run had both pairs clean.
 
 ## Blockers
 
-1. **Four-rank manifest/launch/tick comparison.** The baseline is on node0 at
-   `/home/<user>/cluster-tests/20261122T202505Z`; the harness must run from
-   `/home/<user>/m2a-harness-prod` with its own `serve-four-node.sh`. No window was held at
-   the time of writing, and the primary agent is serving on the same ports/GPUs. Needs a scheduled
-   window (<55 min) and the saved restore command.
-2. **Speed A/B on the real four-rank DeepSeek group.** Same window; `scripts/speed-log.sh`
-   (baseline vs change, repeated) has not run.
+None for this part. The remaining work is milestone 2 B's follow-on (the doctor's Engram
+pack-layout check still reads the model crate's layer constant; it takes no plan or config) and
+milestone 3's four-rank drain.

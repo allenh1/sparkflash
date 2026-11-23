@@ -46,7 +46,7 @@ const BUDGET: &[(&str, Counts)] = &[
             config_reads: 40,
             model_constants: 0,
             shape_literals: 0,
-            tensor_names: 10,
+            tensor_names: 7,
             kernel_symbols: 0,
         },
     ),
@@ -57,7 +57,7 @@ const BUDGET: &[(&str, Counts)] = &[
             config_reads: 6,
             model_constants: 0,
             shape_literals: 0,
-            tensor_names: 8,
+            tensor_names: 2,
             kernel_symbols: 0,
         },
     ),
@@ -79,7 +79,7 @@ const BUDGET: &[(&str, Counts)] = &[
             config_reads: 16,
             model_constants: 0,
             shape_literals: 0,
-            tensor_names: 16,
+            tensor_names: 3,
             kernel_symbols: 0,
         },
     ),
@@ -112,7 +112,7 @@ const BUDGET: &[(&str, Counts)] = &[
             config_reads: 49,
             model_constants: 0,
             shape_literals: 0,
-            tensor_names: 55,
+            tensor_names: 42,
             kernel_symbols: 0,
         },
     ),
@@ -123,7 +123,7 @@ const BUDGET: &[(&str, Counts)] = &[
             config_reads: 0,
             model_constants: 0,
             shape_literals: 0,
-            tensor_names: 1,
+            tensor_names: 0,
             kernel_symbols: 2,
         },
     ),
@@ -134,7 +134,7 @@ const BUDGET: &[(&str, Counts)] = &[
             config_reads: 180,
             model_constants: 9,
             shape_literals: 1,
-            tensor_names: 79,
+            tensor_names: 73,
             kernel_symbols: 52,
         },
     ),
@@ -167,7 +167,7 @@ const BUDGET: &[(&str, Counts)] = &[
             config_reads: 0,
             model_constants: 0,
             shape_literals: 1,
-            tensor_names: 12,
+            tensor_names: 10,
             kernel_symbols: 6,
         },
     ),
@@ -211,7 +211,7 @@ const BUDGET: &[(&str, Counts)] = &[
             config_reads: 0,
             model_constants: 0,
             shape_literals: 0,
-            tensor_names: 4,
+            tensor_names: 2,
             kernel_symbols: 1,
         },
     ),
@@ -244,7 +244,7 @@ const BUDGET: &[(&str, Counts)] = &[
             config_reads: 0,
             model_constants: 0,
             shape_literals: 0,
-            tensor_names: 3,
+            tensor_names: 0,
             kernel_symbols: 1,
         },
     ),
@@ -480,11 +480,15 @@ fn count_file(source: &str) -> (Counts, usize) {
         }
     }
     for text in &strings {
-        if text.contains("layers.")
-            || text.contains("mtp.")
-            || text.contains("engram.")
-            || text.contains(".weight")
-            || text.contains(".scale")
+        // A format template that still holds a placeholder does not spell a tensor name; the
+        // count is about literals a reader could mistake for the plan's own name.
+        let concrete = !text.contains('{');
+        if concrete
+            && (text.contains("layers.")
+                || text.contains("mtp.")
+                || text.contains("engram.")
+                || text.contains(".weight")
+                || text.contains(".scale"))
         {
             counts.tensor_names += 1;
         }
