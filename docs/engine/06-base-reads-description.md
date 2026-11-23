@@ -258,6 +258,77 @@ The other families repeat the same four steps: add the instances, convert the so
 no-default rule, point the build and baseline at `instance_groups()`, and give the instances a
 `catalogue` key. Nothing in the mechanism is router-specific.
 
+#### D.2 vision
+
+The vision tower is the second family moved. `kernels/opt_vision_sm121.cu` exports ten entry
+symbols that the forward and the Inkling tower load by name from `opt_vision_sm121.cubin`:
+`opt_vision_patchify`, `opt_vision_patchify_16`, `opt_vision_gemm`, `opt_vision_rmsnorm`,
+`opt_vision_rope`, `opt_vision_attn`, `opt_vision_swiglu`, `opt_vision_unfold`,
+`opt_vision_span_rows` and `opt_vision_route`. `kernels/inkling_vision_sm121.cu` includes the
+source, so it is the one file outside the family that had to name the same shapes.
+
+**Shape keys.** The `vision` family takes seven values: `hidden` (1024), `heads` (16),
+`patch` (14 or 16), `intermediate` (2816), `out_hidden` (5120), `experts` (384) and
+`top_k` (6). The per-head width is arithmetic on the arguments (`hidden / heads`), and the body
+bounds it with `static_assert(head_dim == 64)` because the rope pair layout and the attention
+tiles are written for a 64-wide head; `qkv = 3 * hidden` and `unfold = 9 * hidden` are also
+arithmetic. The patchify body was already templated on its patch side, so it kept that form; the
+other entries define their shape macros from their own instance inside the entry's `#if` and
+`#undef` them after the body. Algorithm constants (the 128x128 GEMM tile, the 64-query/64-key
+attention tiles, the 32-value K step, the 1e-6 norm epsilon, the router's softplus threshold,
+norm epsilon and 1.5 scale) stay literals.
+
+**Instances.** The ten released entries live in `opt_vision_sm121`; the second-shape proof
+`opt_vision_span_rows_4096_sm121` is its own cubin. `opt_vision_gemm` and `opt_vision_route`
+prove no catalogue shape (the GEMM takes rows, columns and the reduction extent at run time; the
+route's experts/top-k are carried but no part rule claims them).
+
+**The catalogue.** `crates/sparkflash-ops/build.rs` emits one generated rule per key, claiming
+only the fields the part's bodies read:
+
+| key | fields claimed |
+| --- | --- |
+| `deepseek-vision-patch-embed` | hidden, patch sides 14 and 16 |
+| `deepseek-vision-position` | hidden, exact heads, head width |
+| `deepseek-vision-norm` | hidden |
+| `deepseek-vision-attention` | hidden, exact heads, head width |
+| `deepseek-vision-mlp` | hidden, intermediate |
+| `deepseek-vision-downsample` | hidden |
+| `deepseek-vision-merger` | hidden, out_hidden |
+
+Exact heads are `heads_multiple(n).max_heads(n)`; the values come from the instances. The
+non-shape facts (norm kind and epsilon, activation, position, downsample code, channels and
+temporal patch) stay beside the generated constant in `src/parts.rs`. The merger rule claims
+`out_hidden` (the 5120-wide span row the body copies) and no longer claims
+`merger_intermediate`: the two projection GEMMs take that width at run time, so no compiled body
+proves it. The Qwen refusal test still refuses on the width (1152 against the compiled 1024),
+even though the 16-patch body is now claimed.
+
+**The proof.** The released cubin compiles to the baseline bytes under the instance defines, so
+neither disassembly nor launch outputs were needed; the Inkling cubin, which composes the same
+bodies, also kept its baseline bytes:
+
+| released cubin | bytes | sha256 |
+| --- | --- | --- |
+| `opt_vision_sm121` | 320,072 | `15e75fc99d144ae0d6c8bf1da414321a60988e9fad67d12e1468ad05cac50c6f` |
+| `inkling_vision_sm121` (composed) | 345,000 | `5b7687fbd3149c167701d643d63510699283a7ded9d68fe6c9ef131ac294d77d` |
+
+The second shape built alone as `opt_vision_span_rows_4096_sm121.cubin` (6,000 bytes;
+`f360dce773125799222428a580b755ae7ef34694fc99d1a09c2c1065ff23d975`), contains only
+`opt_vision_span_rows_4096_sm121`, and is in neither the released cubin nor the baseline.
+
+**What the next family needs to know.** A `__device__ __forceinline__` body called from the
+entry changed code generation on nvcc 13.0.88 even when every shape folded to the same literal
+(the wrapper moved the loop bound and added a first-iteration guard). The released bytes came
+back only when each body stayed directly in its entry and the shapes entered as macros; the
+already-templated patchify body was the exception and stayed byte-identical. A source that is
+`#include`d by another family must also have that family name the shared instance's macros
+before the include, and must put its own aliases after it, because the converted source
+`#undef`s its per-entry macros. Finally, the vision host's `gemm` wrapper now refuses a
+reduction width that is not a positive multiple of 32, an output width that is not a positive
+multiple of 8, or strides that are not multiples of 8, by name before the launch instead of
+silently computing a truncated tile.
+
 ## 5. Order
 
 1. A, alone.
