@@ -59,7 +59,14 @@ fn instances() -> Vec<Instance> {
                     .to_owned()
             };
             let mut shapes = BTreeMap::new();
-            for key in ["hidden", "experts", "top_k", "intermediate", "padded"] {
+            for key in [
+                "hidden",
+                "experts",
+                "top_k",
+                "intermediate",
+                "padded",
+                "max_top_k",
+            ] {
                 if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                     assert!(value > 0, "{key} is positive");
                     shapes.insert(key.to_owned(), value as u64);
@@ -112,15 +119,15 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
             path.display()
         );
         assert!(
-            ["router", "routed"].contains(&instance.family.as_str()),
+            ["router", "routed", "rows"].contains(&instance.family.as_str()),
             "{} names family {:?}",
             instance.entry,
             instance.family
         );
-        for key in if instance.family == "router" {
-            &["hidden", "experts", "top_k"][..]
-        } else {
-            &["hidden", "intermediate", "padded", "experts", "top_k"][..]
+        for key in match instance.family.as_str() {
+            "router" => &["hidden", "experts", "top_k"][..],
+            "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"][..],
+            _ => &["hidden", "intermediate", "experts", "top_k"][..],
         } {
             assert!(
                 instance.shapes.contains_key(*key),
@@ -198,6 +205,47 @@ fn the_router_family_has_its_released_shapes_and_a_second_shape() {
         assert!(
             keys.contains(key),
             "the catalogue key {key} has no instance"
+        );
+    }
+}
+#[test]
+fn the_rows_family_has_its_released_shapes_and_a_second_shape() {
+    let rows = instances();
+    let family: Vec<&Instance> = rows.iter().filter(|row| row.family == "rows").collect();
+    assert!(!family.is_empty(), "the rows family has instances");
+    let released = family
+        .iter()
+        .find(|row| row.entry == "opt_rows_lm_head")
+        .expect("the released rows LM head");
+    assert_eq!(released.shapes["hidden"], 5120);
+    assert_eq!(released.cubin, "opt_rows_sm121");
+    assert_eq!(released.shapes["intermediate"], 576);
+    assert_eq!(released.shapes["experts"], 384);
+    assert_eq!(released.shapes["top_k"], 6);
+
+    let second = family
+        .iter()
+        .find(|row| row.entry == "b12x_hostw_gemv_m1_bf16w_4096_sm121")
+        .expect("the rows family's second-shape proof instance");
+    assert_eq!(second.shapes["hidden"], 4096);
+    assert_ne!(second.cubin, "b12x_hostw_gemv_m1_sm121");
+    assert!(
+        second.catalogue.is_none(),
+        "the proof claims no catalogue shape"
+    );
+
+    for key in [
+        "deepseek-rows-norm",
+        "deepseek-rows-mlp",
+        "deepseek-rows-gemm",
+        "deepseek-rows-activation",
+        "deepseek-rows-combine",
+    ] {
+        assert!(
+            family
+                .iter()
+                .any(|row| row.catalogue.as_deref() == Some(key)),
+            "the catalogue key {key} has no rows instance"
         );
     }
 }
