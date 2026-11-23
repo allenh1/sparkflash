@@ -203,6 +203,9 @@ fn read_instances() -> Vec<Instance> {
                 "index_topk",
                 "positions",
             ],
+            // CSA2 compression: the released hidden width, the latent width the append packs,
+            // the compression ratio and the position bound the claim states.
+            "csa2" => &["hidden", "head_dim", "ratio", "positions"],
             other => panic!(
                 "sparkflash-kernels: instance {}: family {other:?} is not a known family",
                 number + 1

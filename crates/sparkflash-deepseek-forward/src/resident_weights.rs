@@ -1496,7 +1496,10 @@ pub fn bind_rank_moe(
         serde_json::json!({
             "class": "routed_experts_down",
             "launch_compatible": false,
-            "reason": "b12x_mxfp4_moe_sm121 reads the A8 pre-padded 640-K row layout (320 packed bytes and 20 scale bytes per output row); this rank's unconverted plan stores the checkpoint's 288-byte rows and 18-byte grid",
+            "reason": format!(
+                "{} reads the A8 pre-padded 640-K row layout (320 packed bytes and 20 scale bytes per output row); this rank's unconverted plan stores the checkpoint's 288-byte rows and 18-byte grid",
+                crate::plan::handles().moe_fallback
+            ),
             "remaining": "either launch the stored-layout kernel variant (b12x_mxfp4_moe_stored_sm121) or run `sparkflash convert` once offline to pre-pad w2 to the 640-wide layout with no boot repack",
         })
     };
@@ -1510,7 +1513,10 @@ pub fn bind_rank_moe(
         serde_json::json!({
             "class": "shared_experts",
             "launch_compatible": true,
-            "note": "b12x_mxfp8_dense_sm121 is runtime-shaped: w1/w3 launch with cols=576, inner=5120 and w2 with cols=5120, inner=576, which is exactly the B12x arena slice shape",
+            "note": format!(
+                "{} is runtime-shaped: w1/w3 launch with cols=576, inner=5120 and w2 with cols=5120, inner=576, which is exactly the B12x arena slice shape",
+                crate::plan::handles().dense_fallback
+            ),
         }),
         serde_json::json!({
             "class": "router",

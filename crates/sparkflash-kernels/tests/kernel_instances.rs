@@ -85,6 +85,7 @@ fn instances() -> Vec<Instance> {
                 "hsi_block_tokens",
                 "ring_capacity",
                 "positions",
+                "ratio",
             ] {
                 if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                     assert!(value > 0, "{key} is positive");
@@ -140,6 +141,7 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
         assert!(
             [
                 "router", "routed", "seams", "drafter", "rows", "head", "vision", "mla", "select",
+                "csa2",
             ]
             .contains(&instance.family.as_str()),
             "{} names family {:?}",
@@ -183,6 +185,7 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
                 "index_topk",
                 "positions",
             ],
+            "csa2" => &["hidden", "head_dim", "ratio", "positions"],
             other => panic!("{} names family {other}", instance.entry),
         };
         for key in keys {
@@ -425,6 +428,61 @@ fn the_rows_family_has_its_released_shapes_and_a_second_shape() {
             "the catalogue key {key} has no rows instance"
         );
     }
+}
+
+#[test]
+fn the_csa2_family_has_its_released_shapes_and_a_second_shape() {
+    let rows = instances();
+    let family: Vec<&Instance> = rows.iter().filter(|row| row.family == "csa2").collect();
+    assert!(!family.is_empty(), "the csa2 family has instances");
+
+    let released = family
+        .iter()
+        .find(|row| row.entry == "compressed_append_sm121")
+        .expect("the released compression append");
+    assert_eq!(released.shapes["hidden"], 5120);
+    assert_eq!(released.shapes["head_dim"], 512);
+    assert_eq!(released.shapes["ratio"], 1);
+    assert_eq!(released.shapes["positions"], 1 << 21);
+    assert_eq!(released.cubin, "compressed_append_sm121");
+    assert_eq!(released.catalogue.as_deref(), Some("deepseek-csa2"));
+
+    for entry in [
+        "compressed_selected_fill_sm121",
+        "pool_group_f32",
+        "opt_rows_group_append",
+    ] {
+        let row = family
+            .iter()
+            .find(|row| row.entry == entry)
+            .unwrap_or_else(|| panic!("{entry} has no csa2 instance"));
+        assert_eq!(row.catalogue.as_deref(), Some("deepseek-csa2"), "{entry}");
+        assert_eq!(row.shapes["head_dim"], 512, "{entry}");
+    }
+
+    let second = family
+        .iter()
+        .find(|row| row.entry == "compressed_append_256_sm121")
+        .expect("the csa2 second-shape proof instance");
+    assert_eq!(second.shapes["hidden"], 4096);
+    assert_eq!(second.shapes["head_dim"], 256);
+    assert_eq!(second.shapes["ratio"], 2);
+    assert_eq!(second.shapes["positions"], 1 << 20);
+    assert_eq!(second.cubin, "compressed_append_256_sm121");
+    assert_ne!(second.cubin, released.cubin, "the proof has its own cubin");
+    assert!(
+        second.catalogue.is_none(),
+        "the proof shape is not a released catalogue claim"
+    );
+    let baseline = pins().expect("the baseline parses");
+    assert!(
+        !baseline.iter().any(|pin| pin.name == second.cubin),
+        "the proof cubin is not in the baseline"
+    );
+    assert!(
+        baseline.iter().any(|pin| pin.name == released.cubin),
+        "the released cubin keeps its baseline pin"
+    );
 }
 
 #[test]

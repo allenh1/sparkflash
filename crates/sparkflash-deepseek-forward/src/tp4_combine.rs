@@ -50,7 +50,9 @@ use sparkflash_kernels::cuda_driver::Deviceptr;
 pub const STORED_COMBINE_KERNEL: &str = "b12x_mxfp4_moe_stored_sm121";
 
 /// The pre-padded kernel the single-node path uses; NOT launchable on the four-rank arena rows.
-pub const PRE_ADDED_COMBINE_KERNEL: &str = "b12x_mxfp4_moe_sm121";
+pub fn pre_added_combine_kernel() -> &'static str {
+    crate::plan::handles().moe_fallback
+}
 
 /// Values per output row in the stored plan layout (the checkpoint's `w2` K extent per rank).
 pub const STORED_ELEMENTS_PER_ROW: usize = 576;
@@ -330,7 +332,7 @@ impl CombineLayout {
     pub fn kernel(self) -> &'static str {
         match self {
             Self::Stored576 => STORED_COMBINE_KERNEL,
-            Self::PreAdded640 => PRE_ADDED_COMBINE_KERNEL,
+            Self::PreAdded640 => pre_added_combine_kernel(),
         }
     }
 }
@@ -472,7 +474,7 @@ impl CombineKernelSet {
         Self {
             dir: Some(dir.to_path_buf()),
             stored: cubin(STORED_COMBINE_KERNEL),
-            pre_added: cubin(PRE_ADDED_COMBINE_KERNEL),
+            pre_added: cubin(pre_added_combine_kernel()),
             scanned: true,
         }
     }
@@ -550,7 +552,8 @@ impl fmt::Display for CombineRefusal {
         match self {
             Self::MissingStoredCubin { dir, expected } => write!(
                 f,
-                "stored-layout combine kernel unavailable: {expected} is not staged in {dir} (task-6 kernel). Refusing the four-rank combine rather than launching {PRE_ADDED_COMBINE_KERNEL} on stored 576-K rows, which would misindex every row after the first."
+                "stored-layout combine kernel unavailable: {expected} is not staged in {dir} (task-6 kernel). Refusing the four-rank combine rather than launching {} on stored 576-K rows, which would misindex every row after the first.",
+                pre_added_combine_kernel()
             ),
             Self::MissingStoredAbi { kernel } => write!(
                 f,
@@ -755,7 +758,8 @@ mod tests {
     fn a_present_pre_added_cubin_is_never_substituted_for_the_missing_stored_one() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
-            dir.path().join(format!("{PRE_ADDED_COMBINE_KERNEL}.cubin")),
+            dir.path()
+                .join(format!("{}.cubin", pre_added_combine_kernel())),
             b"pre-added",
         )
         .expect("write");
@@ -775,7 +779,7 @@ mod tests {
     #[test]
     fn a_pre_added_geometry_is_refused_even_when_both_cubins_are_present() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for kernel in [STORED_COMBINE_KERNEL, PRE_ADDED_COMBINE_KERNEL] {
+        for kernel in [STORED_COMBINE_KERNEL, pre_added_combine_kernel()] {
             std::fs::write(dir.path().join(format!("{kernel}.cubin")), b"x").expect("write");
         }
         let kernels = CombineKernelSet::scan(dir.path());

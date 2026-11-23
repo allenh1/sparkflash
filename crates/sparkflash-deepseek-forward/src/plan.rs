@@ -575,6 +575,55 @@ pub struct KernelHandles {
     pub gemv: &'static str,
     /// The compressed-cache append.
     pub compressed_append: &'static str,
+    /// The non-split MXFP8 dense fallback body.
+    pub dense_fallback: &'static str,
+    /// The untiled MXFP8 wo_a fallback body.
+    pub wo_a_fallback: &'static str,
+    /// The non-sequence CSA2 attention fallback.
+    pub flash_mla_fallback: &'static str,
+    /// The pre-padded A8 routed-expert combine fallback.
+    pub moe_fallback: &'static str,
+    /// The device head reduction beside the certified screen.
+    pub head_reduce: &'static str,
+    /// The compressor's ratio-axis pooling cubin.
+    pub pool_group: &'static str,
+    /// The stream dtype conversion cubin (narrow and widen entries).
+    pub engram_stream_convert: &'static str,
+    /// The Engram gate write cubin.
+    pub engram_write: &'static str,
+    /// The routed-expert staging/combine cubin.
+    pub moe_routed_device: &'static str,
+}
+
+/// Artifact stems whose entry symbol is not the cubin's name.
+///
+/// The catalogue names entry symbols, while the pinned loader addresses a cubin by its stem.
+/// Four staged cubins export a symbol of a different name; the table is the one place that
+/// records the difference, and [artifact_stem] still requires the plan to claim the symbol.
+const CUBIN_STEMS: &[(&str, &str)] = &[
+    ("pool_group_f32", "pool_group_sm121"),
+    ("engram_narrow_bf16", "engram_stream_convert_sm121"),
+    ("engram_write_bf16", "engram_write_sm121"),
+    ("moe_routed_combine_sm121", "moe_routed_device_sm121"),
+];
+
+/// The cubin stem for a symbol the plan's catalogue claims under `part`.
+fn artifact_stem(part: Part, name: &'static str) -> Result<&'static str, ConfigError> {
+    let symbol = description()
+        .symbols(None, part)
+        .iter()
+        .copied()
+        .find(|symbol| *symbol == name)
+        .ok_or_else(|| {
+            format!(
+                "the plan's {part:?} catalogue entry does not claim {name} (it claims {:?})",
+                description().symbols(None, part)
+            )
+        })?;
+    Ok(CUBIN_STEMS
+        .iter()
+        .find_map(|(known, stem)| (*known == symbol).then_some(*stem))
+        .unwrap_or(symbol))
 }
 
 impl KernelHandles {
@@ -607,6 +656,15 @@ impl KernelHandles {
             router_opt: symbol_at(None, Part::MoeRouter, 2)?,
             gemv: symbol_at(None, Part::DenseGemm, 1)?,
             compressed_append: symbol_at(None, Part::Csa2Compression, 0)?,
+            dense_fallback: artifact_stem(Part::DenseGemm, "b12x_mxfp8_dense_sm121")?,
+            wo_a_fallback: artifact_stem(Part::DenseGemm, "b12x_mxfp8_wo_a_sm121")?,
+            flash_mla_fallback: artifact_stem(Part::MlaAttention, "flash_mla_csa2_sm121")?,
+            moe_fallback: artifact_stem(Part::Moe, "b12x_mxfp4_moe_sm121")?,
+            head_reduce: artifact_stem(Part::LmHead, "lm_head_reduce_sm121")?,
+            pool_group: artifact_stem(Part::Csa2Compression, "pool_group_f32")?,
+            engram_stream_convert: artifact_stem(Part::Engram, "engram_narrow_bf16")?,
+            engram_write: artifact_stem(Part::Engram, "engram_write_bf16")?,
+            moe_routed_device: artifact_stem(Part::MoeCombine, "moe_routed_combine_sm121")?,
         })
     }
 }

@@ -649,7 +649,7 @@ where
     for (name, dtype) in shards {
         dtypes.insert(name, dtype);
     }
-    LAYER0_ATTENTION_OPERANDS
+    layer0_attention_operands()
         .iter()
         .map(|(name, _kernel, _needs_b12x)| {
             let dtype = dtypes.get(name).copied().unwrap_or("absent");
@@ -678,7 +678,7 @@ pub fn attention_plan_from_plan(
     plan: &sparkflash_device::resident::ResidentPlan,
 ) -> Vec<AttentionOperandPlan> {
     use sparkflash_device::resident::OperandLayout;
-    LAYER0_ATTENTION_OPERANDS
+    layer0_attention_operands()
         .iter()
         .map(|(name, _kernel, _needs_b12x)| {
             let dtype = plan
@@ -838,12 +838,16 @@ pub fn attention_operand_census(
 /// docs/archive/build/native-kernel-arithmetic-audit.md section 2.1). The native kernel for wq_a, wkv, wq_b
 /// and wo_b; the D37 bf16a dense family computes a different model (audit Appendix A) and is not
 /// native for any of them.
-pub const NATIVE_DENSE_KERNEL: &str = "b12x_mxfp8_dense_sm121";
+pub fn native_dense_kernel() -> &'static str {
+    crate::plan::handles().dense_fallback
+}
 
 /// The BF16-activation wo_a kernel: the checkpoint's native rule for exactly that projection (D39
 /// task-29 note: the released forward dequantises wo_a to bf16 and runs a bf16 grouped einsum with
 /// no activation quantiser, so this variant removes only the quantisation native does not perform).
-pub const NATIVE_WO_A_KERNEL: &str = "b12x_bf16a_mxfp8w_wo_a_sm121";
+pub fn native_wo_a_kernel() -> &'static str {
+    crate::plan::handles().wo_a_native
+}
 
 /// One layer-0 attention operand the loop must launch, with the kernel the native arithmetic
 /// selects for it.
@@ -852,13 +856,16 @@ pub const NATIVE_WO_A_KERNEL: &str = "b12x_bf16a_mxfp8w_wo_a_sm121";
 /// The bind marks a B12x operand by a scale pointer distinct from the weight pointer; a stored
 /// (BF16) operand repeats the weight pointer, which is exactly the case the four-rank arm cannot
 /// launch today because it has no per-layer repack staging.
-pub const LAYER0_ATTENTION_OPERANDS: [(&str, &str, bool); 5] = [
-    ("layers.0.attn.wq_a.weight", NATIVE_DENSE_KERNEL, true),
-    ("layers.0.attn.wkv.weight", NATIVE_DENSE_KERNEL, true),
-    ("layers.0.attn.wq_b.weight", NATIVE_DENSE_KERNEL, true),
-    ("layers.0.attn.wo_a.weight", NATIVE_WO_A_KERNEL, true),
-    ("layers.0.attn.wo_b.weight", NATIVE_DENSE_KERNEL, true),
-];
+pub fn layer0_attention_operands() -> [(&'static str, &'static str, bool); 5] {
+    let dense = native_dense_kernel();
+    [
+        ("layers.0.attn.wq_a.weight", dense, true),
+        ("layers.0.attn.wkv.weight", dense, true),
+        ("layers.0.attn.wq_b.weight", dense, true),
+        ("layers.0.attn.wo_a.weight", native_wo_a_kernel(), true),
+        ("layers.0.attn.wo_b.weight", dense, true),
+    ]
+}
 
 /// Whether a bound operand is B12x (distinct scale pointer) or stored (repeated weight pointer).
 #[must_use]
@@ -882,12 +889,12 @@ pub fn attention_stage_census(
     planned: &[AttentionOperandPlan],
     plan: Option<&sparkflash_device::resident::ResidentPlan>,
 ) -> serde_json::Value {
-    let mut rows = Vec::with_capacity(LAYER0_ATTENTION_OPERANDS.len());
+    let mut rows = Vec::with_capacity(layer0_attention_operands().len());
     let mut launchable = 0usize;
     let mut blocked = Vec::new();
     let mut inconsistent = Vec::new();
     let mut disagreements = Vec::new();
-    for (name, kernel, needs_b12x) in LAYER0_ATTENTION_OPERANDS {
+    for (name, kernel, needs_b12x) in layer0_attention_operands() {
         let pair = pointers.get(name).copied();
         let bound_kind = pair.map(bound_operand_kind);
         let plan_row = planned.iter().find(|row| row.name == name);
@@ -1867,8 +1874,9 @@ impl KernelCache {
     ) -> Result<(sparkflash_kernels::cuda_driver::Kernel, String), String> {
         use sparkflash_kernels::bf16a_mxfp8w_wo_a_launch as wo_a_launch;
 
-        let (cubin, digest) = cached_cubin(&kernel_dir.join(format!("{NATIVE_WO_A_KERNEL}.cubin")))
-            .map_err(|error| format!("{context}: read wo_a cubin: {error}"))?;
+        let (cubin, digest) =
+            cached_cubin(&kernel_dir.join(format!("{}.cubin", native_wo_a_kernel())))
+                .map_err(|error| format!("{context}: read wo_a cubin: {error}"))?;
         let kernel = self.kernel_for(&digest, wo_a_launch::KERNEL, || {
             let (module, kernel) = wo_a_launch::load(cuda, &cubin)?;
             Ok((digest.clone(), module, kernel))
@@ -2236,7 +2244,7 @@ impl NativeDenseParity {
             "stage": stage,
             "operand": operand,
             "weight": weight_name,
-            "kernel": NATIVE_DENSE_KERNEL,
+            "kernel": native_dense_kernel(),
             "activation": {
                 "f32_sha256": sha256_hex(&f32_le_bytes(activation)),
                 "f32_values": activation.len(),
@@ -2281,7 +2289,7 @@ impl NativeDenseParity {
             .join(format!("tp4-native-dense-parity-r{}.json", request.rank));
         let cubin_sha256 = request
             .kernel_cubin_dir
-            .and_then(|dir| fs::read(dir.join(format!("{NATIVE_DENSE_KERNEL}.cubin"))).ok())
+            .and_then(|dir| fs::read(dir.join(format!("{}.cubin", native_dense_kernel()))).ok())
             .map(|bytes| sha256_hex(&bytes));
         let status = if self
             .entries
@@ -2301,7 +2309,7 @@ impl NativeDenseParity {
             "world": request.world,
             "layer": layer,
             "position": position,
-            "kernel": NATIVE_DENSE_KERNEL,
+            "kernel": native_dense_kernel(),
             "cubin_sha256": cubin_sha256,
             "status": status,
             "note": "One-shot, rank-0 diagnostic (default off). Each operand re-runs the single-node chain's dense launch construction (Mxfp8DenseParams::new with a zero trace ring, step_seq 0, then mxfp8_dense_launch::launch) on the loop's exact activation codes/scales and the arena's exact B12x weight bytes, compares the bf16 words with the loop's production output, and runs sparkflash_kernels::mxfp8_ref::dense_gemm on the same bytes. wq_a and wkv are replicated at TP4 so their comparison is the literal loop-vs-chain launch; wq_b is a row shard and wo_b an inner shard, so their shard launches are compared on the shard bytes, and no world-1 full-inner bit-equality is claimed for wo_b: the f32 cross-rank reduce order is a designed TP4 non-associativity.",
@@ -2383,7 +2391,7 @@ fn native_dense_parity_checks(
     let kernel_dir = request
         .kernel_cubin_dir
         .ok_or_else(|| "the loop has no kernel cubin directory".to_string())?;
-    let cubin = fs::read(kernel_dir.join(format!("{NATIVE_DENSE_KERNEL}.cubin")))
+    let cubin = fs::read(kernel_dir.join(format!("{}.cubin", native_dense_kernel())))
         .map_err(|error| format!("read dense cubin: {error}"))?;
     let cubin_sha256 = sha256_hex(&cubin);
     let (module, kernel) = mxfp8_dense_launch::load(cuda, &cubin)?;
@@ -2901,7 +2909,7 @@ impl Layer0Projections {
         serde_json::json!({
             "stage": "layer0-attention-projections",
             "kernel": sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
-            "arithmetic_family": NATIVE_DENSE_KERNEL,
+            "arithmetic_family": native_dense_kernel(),
             "cubin_sha256": self.cubin_sha256,
             "launches": self.launches,
             "rows": 1,
@@ -2989,7 +2997,7 @@ impl Layer0QueryPath {
         serde_json::json!({
             "stage": "layer0-query-path-q-norm-wq-b-rope",
             "kernel": sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
-            "arithmetic_family": NATIVE_DENSE_KERNEL,
+            "arithmetic_family": native_dense_kernel(),
             "cubin_sha256": self.cubin_sha256,
             "launches": 1,
             "q_norm": {
@@ -3994,7 +4002,7 @@ impl Layer0AttentionOutput {
         serde_json::json!({
             "stage": "layer0-attention-output-wo-a-wo-b-reduce",
             "wo_a": {
-                "kernel": NATIVE_WO_A_KERNEL,
+                "kernel": native_wo_a_kernel(),
                 "cubin_sha256": self.wo_a_cubin_sha256,
                 "launches": 1,
                 "grid": [self.groups, 4, 1],
@@ -4015,7 +4023,7 @@ impl Layer0AttentionOutput {
             },
             "wo_b": {
                 "kernel": sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
-                "arithmetic_family": NATIVE_DENSE_KERNEL,
+                "arithmetic_family": native_dense_kernel(),
                 "cubin_sha256": self.wo_b_cubin_sha256,
                 "launches": 1,
                 "rows": 1,
@@ -12008,7 +12016,7 @@ impl<'a> DeviceLayer<'a> {
             Some(dir) => {
                 let (stage_cubin, _sha) = load_pinned_addition(
                     dir,
-                    "moe_routed_device_sm121",
+                    crate::plan::handles().moe_routed_device,
                     "layer device routed data path",
                 )?;
                 let stage = cuda.load_moe_routed_stage(&stage_cubin)?;
@@ -13731,8 +13739,11 @@ impl<'a> DeviceLayer<'a> {
     /// The cubin is pinned (`baseline/kernel_baseline.txt`, `pool_group_sm121`) and staged beside the
     /// other thirty, so this is the same verified read every stage kernel goes through.
     fn attach_seam_pool(&mut self, kernel_dir: &std::path::Path) -> Result<(), String> {
-        let (cubin, _sha) =
-            load_pinned_addition(kernel_dir, "pool_group_sm121", "layer device pool")?;
+        let (cubin, _sha) = load_pinned_addition(
+            kernel_dir,
+            crate::plan::handles().pool_group,
+            "layer device pool",
+        )?;
         let (_module, kernel) = self
             .cuda
             .load_pool_group(&cubin)
@@ -13762,7 +13773,7 @@ impl<'a> DeviceLayer<'a> {
         // The rest of the compressor chain's symbols: the f32 <-> bf16 conversions and the norm.
         let (convert_cubin, _sha) = load_pinned_addition(
             kernel_dir,
-            "engram_stream_convert_sm121",
+            crate::plan::handles().engram_stream_convert,
             "layer device seam convert",
         )?;
         let (_m, narrow) =
@@ -14126,9 +14137,13 @@ impl<'a> DeviceLayer<'a> {
             crate::plan::handles().engram_gate_write,
             context,
         )?;
-        let (write_cubin, _) = load_pinned_addition(kernel_dir, "engram_write_sm121", context)?;
-        let (convert_cubin, _) =
-            load_pinned_addition(kernel_dir, "engram_stream_convert_sm121", context)?;
+        let (write_cubin, _) =
+            load_pinned_addition(kernel_dir, crate::plan::handles().engram_write, context)?;
+        let (convert_cubin, _) = load_pinned_addition(
+            kernel_dir,
+            crate::plan::handles().engram_stream_convert,
+            context,
+        )?;
         let (embed_module, embed) = engram_embed_launch::load(cuda, &embed_cubin)
             .map_err(|error| format!("{context}: embed: {error}"))?;
         let (wkv_module, wkv) = engram_wkv_launch::load(cuda, &wkv_cubin)
@@ -19496,7 +19511,7 @@ pub fn expected_argv_fragment() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tp4_combine::{CombineKernelSet, PRE_ADDED_COMBINE_KERNEL, STORED_COMBINE_KERNEL};
+    use crate::tp4_combine::{CombineKernelSet, STORED_COMBINE_KERNEL, pre_added_combine_kernel};
 
     /// WS4's dump switch names exactly one layer, and anything that is not a layer number dumps
     /// nothing: the point of the instrument is one step's routing, not a log a decode tick.
@@ -20798,7 +20813,7 @@ mod tests {
 
         let b12x = (Deviceptr(0x1000), Deviceptr(0x2000));
         let mut pointers = BTreeMap::new();
-        for (name, _kernel, _) in LAYER0_ATTENTION_OPERANDS {
+        for (name, _kernel, _) in layer0_attention_operands() {
             pointers.insert(name.to_string(), b12x);
         }
         let census = attention_stage_census(&pointers, &planned, Some(&plan));
@@ -20830,7 +20845,7 @@ mod tests {
     fn the_plan_dtype_is_the_authoritative_layout_and_the_bind_is_corroborated() {
         // The released plan says all five layer-0 attention projections are F8_E4M3 (kernel-lead's
         // header read: wq_a/wkv included, with E8M0 scale grids): all five are B12x-launchable.
-        let fixture: Vec<(&str, &str)> = LAYER0_ATTENTION_OPERANDS
+        let fixture: Vec<(&str, &str)> = layer0_attention_operands()
             .iter()
             .map(|(name, _kernel, _)| (*name, "F8_E4M3"))
             .collect();
@@ -20843,7 +20858,7 @@ mod tests {
 
         let b12x = (Deviceptr(0x1000), Deviceptr(0x2000));
         let mut pointers = BTreeMap::new();
-        for (name, _kernel, _) in LAYER0_ATTENTION_OPERANDS {
+        for (name, _kernel, _) in layer0_attention_operands() {
             pointers.insert(name.to_string(), b12x);
         }
         let census = attention_stage_census(&pointers, &plan, None);
@@ -20941,7 +20956,7 @@ mod tests {
         std::fs::write(
             kernels
                 .path()
-                .join(format!("{PRE_ADDED_COMBINE_KERNEL}.cubin")),
+                .join(format!("{}.cubin", pre_added_combine_kernel())),
             b"pre-added",
         )
         .expect("write");
@@ -21189,7 +21204,7 @@ mod tests {
             sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
             "the projections stage records the symbol it actually launched"
         );
-        assert_eq!(json["arithmetic_family"], NATIVE_DENSE_KERNEL);
+        assert_eq!(json["arithmetic_family"], native_dense_kernel());
         assert_eq!(json["activation_quant"]["block"], 32);
         assert_eq!(
             json["activation_quant"]["code_bytes"],
@@ -21232,7 +21247,7 @@ mod tests {
             sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
             "the query path records the symbol it actually launched"
         );
-        assert_eq!(json["arithmetic_family"], NATIVE_DENSE_KERNEL);
+        assert_eq!(json["arithmetic_family"], native_dense_kernel());
         assert_eq!(json["wq_b"]["activation_quant"]["code_bytes"], 1280);
         assert_eq!(json["wq_b"]["activation_quant"]["scale_bytes"], 40);
 
@@ -21261,12 +21276,12 @@ mod tests {
             reduced_bf16: vec![0u8; crate::plan::hidden() * 2],
         };
         let json = output.to_json();
-        assert_eq!(json["wo_a"]["kernel"], NATIVE_WO_A_KERNEL);
+        assert_eq!(json["wo_a"]["kernel"], native_wo_a_kernel());
         assert_eq!(
             json["wo_b"]["kernel"],
             sparkflash_kernels::mxfp8_gemv_launch::KERNEL
         );
-        assert_eq!(json["wo_b"]["arithmetic_family"], NATIVE_DENSE_KERNEL);
+        assert_eq!(json["wo_b"]["arithmetic_family"], native_dense_kernel());
         assert_eq!(json["wo_b"]["activation_quant"]["code_bytes"], 2048);
         assert_eq!(json["wo_b"]["activation_quant"]["scale_bytes"], 64);
         assert!(

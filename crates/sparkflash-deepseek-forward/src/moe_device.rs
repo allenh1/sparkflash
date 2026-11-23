@@ -59,15 +59,21 @@ fn gate_up_symbol() -> &'static str {
 fn weighted_symbol() -> &'static str {
     crate::plan::handles().weighted_swiglu
 }
-const COMBINE: &str = "b12x_mxfp4_moe_sm121";
-const DENSE: &str = "b12x_mxfp8_dense_sm121";
+fn combine_symbol() -> &'static str {
+    crate::plan::handles().moe_fallback
+}
+fn dense_symbol() -> &'static str {
+    crate::plan::handles().dense_fallback
+}
 fn swiglu_symbol() -> &'static str {
     crate::plan::handles().swiglu
 }
 fn head_symbol() -> &'static str {
     crate::plan::handles().lm_head
 }
-const HEAD_REDUCE: &str = "lm_head_reduce_sm121";
+fn head_reduce_symbol() -> &'static str {
+    crate::plan::handles().head_reduce
+}
 fn rmsnorm_symbol() -> &'static str {
     crate::plan::handles().rmsnorm
 }
@@ -310,11 +316,11 @@ impl MoeDeviceBackendImpl {
         let router_bytes = verified(dir, router_symbol())?;
         let gate_up_bytes = verified(dir, gate_up_symbol())?;
         let weighted_bytes = verified(dir, weighted_symbol())?;
-        let combine_bytes = verified(dir, COMBINE)?;
-        let dense_bytes = verified(dir, DENSE)?;
+        let combine_bytes = verified(dir, combine_symbol())?;
+        let dense_bytes = verified(dir, dense_symbol())?;
         let swiglu_bytes = verified(dir, swiglu_symbol())?;
         let head_bytes = verified(dir, head_symbol())?;
-        let head_reduce_bytes = verified(dir, HEAD_REDUCE)?;
+        let head_reduce_bytes = verified(dir, head_reduce_symbol())?;
         let rmsnorm_bytes = verified(dir, rmsnorm_symbol())?;
         let cuda = Cuda::load()?;
         let (router_module, router, router_topk_module, router_topk) =

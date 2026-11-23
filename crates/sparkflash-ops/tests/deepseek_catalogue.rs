@@ -39,26 +39,6 @@ use sparkflash_ops::CATALOGUE;
 /// if the symbol is no longer named by the forward, so the table cannot go stale.
 const ALLOWED_UNCATALOGUED: &[(&str, &str)] = &[
     (
-        "b12x_mxfp4_moe_sm121",
-        "the forward's dense expert fallback; the baseline workload's routed path loads the stored form (b12x_mxfp4_moe_stored_sm121), and the manifest records what was loaded",
-    ),
-    (
-        "b12x_mxfp8_dense_sm121",
-        "the forward's non-split dense fallback; the baseline binds the split/tile form and the manifest records only loaded symbols",
-    ),
-    (
-        "b12x_mxfp8_wo_a_sm121",
-        "the forward's untiled wo_a fallback; the baseline loads b12x_bf16a_mxfp8w_wo_a_sm121",
-    ),
-    (
-        "flash_mla_csa2_sm121",
-        "the forward's non-sequence CSA2 fallback; the baseline loads the seq entry",
-    ),
-    (
-        "lm_head_reduce_sm121",
-        "the forward's uncertified head reduce; the baseline loads the certified head",
-    ),
-    (
         "opt_draft_markov_seqs",
         "the forward's non-MMA Markov fallback; the baseline loads opt_draft_markov_seqs_mma",
     ),

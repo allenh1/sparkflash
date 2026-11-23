@@ -103,6 +103,9 @@ fn generate() -> String {
     let mut index_topk: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut index_heads: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut positions: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    // The compression ratio a CSA2 instance proves. The source takes the ratio at run time, so
+    // the catalogue carries the minimum the released instances name rather than an equality.
+    let mut ratio: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let mut claims_intermediate: BTreeMap<String, bool> = BTreeMap::new();
     let mut claims_hidden: BTreeMap<String, bool> = BTreeMap::new();
     let mut dims: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -158,7 +161,7 @@ fn generate() -> String {
             let _ = (positive("experts"), positive("top_k"));
             continue;
         }
-        if family == "mla" || family == "select" {
+        if family == "mla" || family == "select" || family == "csa2" {
             family_of.insert(key.clone(), family.to_owned());
             let width_key = if family == "select" {
                 "index_head_dim"
@@ -182,6 +185,14 @@ fn generate() -> String {
                         panic!("sparkflash-ops: {key} has no positive integer index_heads")
                     }),
                 );
+            }
+            if family == "csa2" {
+                ratio
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(positive("ratio").unwrap_or_else(|| {
+                        panic!("sparkflash-ops: {key} has no positive integer ratio")
+                    }));
             }
             positions
                 .entry(key.clone())
@@ -222,7 +233,13 @@ fn generate() -> String {
                 names.iter().all(|name| {
                     matches!(
                         name.as_str(),
-                        "hidden" | "intermediate" | "experts" | "top_k"
+                        "hidden"
+                            | "head_dim"
+                            | "intermediate"
+                            | "experts"
+                            | "top_k"
+                            | "ratio"
+                            | "positions"
                     )
                 }) && !names.is_empty(),
                 "sparkflash-ops: {key} names catalogue dimensions outside hidden/intermediate/experts/top_k"
@@ -421,6 +438,11 @@ fn generate() -> String {
                 if let Some(values) = index_heads.get(key) {
                     parts.push(format!(".max_heads({})", one(values, key, "index_heads")));
                 }
+            }
+            if family == "csa2"
+                && let Some(values) = ratio.get(key)
+            {
+                parts.push(format!(".min_ratio({})", one(values, key, "ratio")));
             }
             if let Some(values) = positions.get(key) {
                 parts.push(format!(".positions(0, {})", one(values, key, "positions")));

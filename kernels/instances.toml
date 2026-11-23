@@ -2175,15 +2175,65 @@ intermediate = 576
 experts = 384
 top_k = 6
 
+# The CSA2 compression family. The latent width is the only shape the append body compiles
+# against; the ratio, store position and the released hidden width are catalogue claims the
+# source reads at run time. The released entries share each source's own cubin.
+[[instance]]
+source = "compressed_append_sm121.cu"
+entry = "compressed_append_sm121"
+cubin = "compressed_append_sm121"
+family = "csa2"
+catalogue = "deepseek-csa2"
+hidden = 5120
+head_dim = 512
+ratio = 1
+positions = 2097152
+
+[[instance]]
+source = "compressed_append_sm121.cu"
+entry = "compressed_selected_fill_sm121"
+cubin = "compressed_append_sm121"
+family = "csa2"
+catalogue = "deepseek-csa2"
+hidden = 5120
+head_dim = 512
+ratio = 1
+positions = 2097152
+
+[[instance]]
+source = "pool_group_sm121.cu"
+entry = "pool_group_f32"
+cubin = "pool_group_sm121"
+family = "csa2"
+catalogue = "deepseek-csa2"
+hidden = 5120
+head_dim = 512
+ratio = 1
+positions = 2097152
+
 [[instance]]
 source = "opt_misc_sm121.cu"
 entry = "opt_rows_group_append"
 cubin = "opt_misc_sm121"
-family = "rows"
+family = "csa2"
+catalogue = "deepseek-csa2"
 hidden = 5120
-intermediate = 576
-experts = 384
-top_k = 6
+head_dim = 512
+ratio = 1
+positions = 2097152
+
+# The Csa2Compression second shape: a narrower latent width, its own cubin and no catalogue
+# claim. It proves the append body is compiled from its instance rather than the released
+# literal, and it must not appear in the released cubin or the baseline.
+[[instance]]
+source = "compressed_append_sm121.cu"
+entry = "compressed_append_256_sm121"
+cubin = "compressed_append_256_sm121"
+family = "csa2"
+hidden = 4096
+head_dim = 256
+ratio = 2
+positions = 1048576
 
 # b12x_mxfp8_dense_sm121.cu
 [[instance]]
