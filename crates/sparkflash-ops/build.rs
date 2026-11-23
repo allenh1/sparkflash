@@ -258,7 +258,11 @@ fn generate() -> String {
                 .or_default()
                 .insert(width as u64);
         }
-        if let Some(count) = positive("hc") {
+        // The residual-stream count is a seams shape: the drafter's copies are its own compile
+        // geometry and the Mtp part has no stream field to check.
+        if family != "drafter"
+            && let Some(count) = positive("hc")
+        {
             streams.entry(key.clone()).or_default().insert(count);
         }
         if let Some(value) = positive("experts") {
