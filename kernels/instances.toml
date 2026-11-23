@@ -14,7 +14,8 @@
 #                share a cubin are compiled in one translation unit, so the released multi-symbol
 #                cubins keep their file names and symbol sets.
 #   family       the shape vocabulary: "router" needs hidden/experts/top_k, "routed" needs those
-#                plus intermediate/padded.
+#                plus intermediate/padded, and "vision" needs hidden/heads/patch/intermediate/
+#                out_hidden/experts/top_k.
 #   catalogue    optional catalogue key; sparkflash-ops generates that part's exact shape rule
 #                from every instance carrying the same key.
 #   catalogue_intermediate
@@ -204,6 +205,155 @@ padded = 640
 experts = 128
 top_k = 3
 
+# --- The vision tower ------------------------------------------------------------------------
+# The DeepSeek-V4.1-Flash vision tower (DECISIONS.md D59/D84/D85) is 1024 wide with 16 query
+# heads of 64, a 2816-wide SwiGLU, a 3x3 unfold and a 5120-wide aligner; rank 3 runs all of it.
+# The released image is kernels/opt_vision_sm121.cu, whose ten entries load by name from
+# opt_vision_sm121.cubin. The patchify body is compiled at both patch sides it exports: 14 for
+# DeepSeek's and GLM's towers and 16 for Qwen's.
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_patchify"
+cubin = "opt_vision_sm121"
+family = "vision"
+catalogue = "deepseek-vision-patch-embed"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_patchify_16"
+cubin = "opt_vision_sm121"
+family = "vision"
+catalogue = "deepseek-vision-patch-embed"
+hidden = 1024
+heads = 16
+patch = 16
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
+# opt_vision_gemm takes its row, column and reduction extents at run time and reads no model
+# geometry, so it proves no catalogue shape.
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_gemm"
+cubin = "opt_vision_sm121"
+family = "vision"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_rmsnorm"
+cubin = "opt_vision_sm121"
+family = "vision"
+catalogue = "deepseek-vision-norm"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_rope"
+cubin = "opt_vision_sm121"
+family = "vision"
+catalogue = "deepseek-vision-position"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_attn"
+cubin = "opt_vision_sm121"
+family = "vision"
+catalogue = "deepseek-vision-attention"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_swiglu"
+cubin = "opt_vision_sm121"
+family = "vision"
+catalogue = "deepseek-vision-mlp"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_unfold"
+cubin = "opt_vision_sm121"
+family = "vision"
+catalogue = "deepseek-vision-downsample"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
+# The aligner's row copy is the only merger body with a compiled width; the two projection GEMMs
+# take their widths at run time.
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_span_rows"
+cubin = "opt_vision_sm121"
+family = "vision"
+catalogue = "deepseek-vision-merger"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
+# The image-token experts' re-route with bias_vl: 384 experts, top-6, in the vision cubin.
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_route"
+cubin = "opt_vision_sm121"
+family = "vision"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 5120
+experts = 384
+top_k = 6
+
 # --- The second-shape build proof -------------------------------------------------------------
 # Not loaded by any arm and not in the baseline: a 4096-wide router with 256 experts and top-8.
 # It compiles from opt_router_sm121.cu alone, into its own cubin, so the released cubin's symbol
@@ -217,3 +367,19 @@ family = "router"
 hidden = 4096
 experts = 256
 top_k = 8
+
+# The vision tower's second shape: the span-row copy at a 4096-wide aligner. It is not loaded by
+# any arm and not in the baseline; it builds alone into its own cubin so the released
+# opt_vision_sm121.cubin keeps its symbol set and bytes.
+[[instance]]
+source = "opt_vision_sm121.cu"
+entry = "opt_vision_span_rows_4096_sm121"
+cubin = "opt_vision_span_rows_4096_sm121"
+family = "vision"
+hidden = 1024
+heads = 16
+patch = 14
+intermediate = 2816
+out_hidden = 4096
+experts = 384
+top_k = 6

@@ -59,7 +59,16 @@ fn instances() -> Vec<Instance> {
                     .to_owned()
             };
             let mut shapes = BTreeMap::new();
-            for key in ["hidden", "experts", "top_k", "intermediate", "padded"] {
+            for key in [
+                "hidden",
+                "experts",
+                "top_k",
+                "intermediate",
+                "padded",
+                "heads",
+                "patch",
+                "out_hidden",
+            ] {
                 if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                     assert!(value > 0, "{key} is positive");
                     shapes.insert(key.to_owned(), value as u64);
@@ -112,15 +121,23 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
             path.display()
         );
         assert!(
-            ["router", "routed"].contains(&instance.family.as_str()),
+            ["router", "routed", "vision"].contains(&instance.family.as_str()),
             "{} names family {:?}",
             instance.entry,
             instance.family
         );
-        for key in if instance.family == "router" {
-            &["hidden", "experts", "top_k"][..]
-        } else {
-            &["hidden", "intermediate", "padded", "experts", "top_k"][..]
+        for key in match instance.family.as_str() {
+            "router" => &["hidden", "experts", "top_k"][..],
+            "routed" => &["hidden", "intermediate", "padded", "experts", "top_k"][..],
+            _ => &[
+                "hidden",
+                "heads",
+                "patch",
+                "intermediate",
+                "out_hidden",
+                "experts",
+                "top_k",
+            ][..],
         } {
             assert!(
                 instance.shapes.contains_key(*key),
@@ -198,6 +215,59 @@ fn the_router_family_has_its_released_shapes_and_a_second_shape() {
         assert!(
             keys.contains(key),
             "the catalogue key {key} has no instance"
+        );
+    }
+}
+
+#[test]
+fn the_vision_family_has_its_released_shape_and_a_second_shape() {
+    let rows = instances();
+    let vision: Vec<&Instance> = rows.iter().filter(|row| row.family == "vision").collect();
+    let released: Vec<&&Instance> = vision
+        .iter()
+        .filter(|row| row.cubin == "opt_vision_sm121")
+        .collect();
+    assert_eq!(
+        released.len(),
+        10,
+        "the released vision image's ten entries"
+    );
+    assert_eq!(released[0].shapes["hidden"], 1024);
+    assert_eq!(released[0].shapes["heads"], 16);
+    assert_eq!(released[0].shapes["intermediate"], 2816);
+    assert_eq!(released[0].shapes["out_hidden"], 5120);
+    assert_eq!(released[0].shapes["experts"], 384);
+    assert_eq!(released[0].shapes["top_k"], 6);
+    let sides: BTreeSet<u64> = released.iter().map(|row| row.shapes["patch"]).collect();
+    assert_eq!(sides, BTreeSet::from([14, 16]), "both patchify bodies");
+
+    let second = vision
+        .iter()
+        .find(|row| row.entry == "opt_vision_span_rows_4096_sm121")
+        .expect("the second-shape proof instance");
+    assert_eq!(second.shapes["out_hidden"], 4096);
+    assert_eq!(second.shapes["hidden"], 1024);
+    assert_ne!(
+        second.cubin, "opt_vision_sm121",
+        "the proof has its own cubin"
+    );
+
+    let keys: BTreeSet<&str> = vision
+        .iter()
+        .filter_map(|row| row.catalogue.as_deref())
+        .collect();
+    for key in [
+        "deepseek-vision-patch-embed",
+        "deepseek-vision-position",
+        "deepseek-vision-norm",
+        "deepseek-vision-attention",
+        "deepseek-vision-mlp",
+        "deepseek-vision-downsample",
+        "deepseek-vision-merger",
+    ] {
+        assert!(
+            keys.contains(key),
+            "the catalogue key {key} has no vision instance"
         );
     }
 }

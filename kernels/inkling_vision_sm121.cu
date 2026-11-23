@@ -42,7 +42,36 @@
 //   The layer scale's residual over rows of 1024: x = bf16(x + bf16(gamma * h)). One thread two
 //   values, grid ceil(m * 512 / 256), 256 threads.
 
+// opt_vision_sm121.cu takes its model shapes as instance arguments (kernels/instances.toml,
+// docs/engine/06-base-reads-description.md D.2). Inkling composes the same 1024-wide, 16-head,
+// 64-wide DeepSeek bodies and its cubin has always carried their symbols, so it names the
+// released DeepSeek instance's values here. The tokens are identical to the released instance's
+// defines, which is why the composed cubin keeps its bytes and full symbol set.
+#define SPARK_INSTANCE_OPT_VISION_PATCHIFY_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_PATCHIFY_PATCH 14u
+#define SPARK_INSTANCE_OPT_VISION_PATCHIFY_16_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_PATCHIFY_16_PATCH 16u
+#define SPARK_INSTANCE_OPT_VISION_GEMM_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_RMSNORM_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_ROPE_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_ROPE_HEADS 16u
+#define SPARK_INSTANCE_OPT_VISION_ATTN_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_ATTN_HEADS 16u
+#define SPARK_INSTANCE_OPT_VISION_SWIGLU_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_SWIGLU_INTERMEDIATE 2816u
+#define SPARK_INSTANCE_OPT_VISION_UNFOLD_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_SPAN_ROWS_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_SPAN_ROWS_OUT_HIDDEN 5120u
+#define SPARK_INSTANCE_OPT_VISION_ROUTE_HIDDEN 1024u
+#define SPARK_INSTANCE_OPT_VISION_ROUTE_EXPERTS 384u
+#define SPARK_INSTANCE_OPT_VISION_ROUTE_TOP_K 6u
+
 #include "opt_vision_sm121.cu"
+
+// Inkling's own bodies below are written against the shared tower's width names. The shared
+// source undefines its per-entry shape macros after each entry, so these come after the include.
+#define OV_DIM SPARK_INSTANCE_OPT_VISION_RMSNORM_HIDDEN
+#define OV_QKV (3u * OV_DIM)
 
 #define IV_PATCH 20u
 #define IV_K (3u * IV_PATCH * IV_PATCH)

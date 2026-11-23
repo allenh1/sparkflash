@@ -43,6 +43,17 @@ IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FAMILIES = {
     "router": ("hidden", "experts", "top_k"),
     "routed": ("hidden", "intermediate", "padded", "experts", "top_k"),
+    # The vision tower's one-rank shape: its width, query heads and patch side, the MLP and
+    # aligner widths, and the expert count the image-token route selects over.
+    "vision": (
+        "hidden",
+        "heads",
+        "patch",
+        "intermediate",
+        "out_hidden",
+        "experts",
+        "top_k",
+    ),
 }
 ALLOWED = {
     "source",
