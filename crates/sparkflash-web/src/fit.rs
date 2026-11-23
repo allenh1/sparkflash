@@ -466,17 +466,9 @@ fn scan_gaps(
     tensors: Option<&TensorIndex>,
 ) -> Result<(), Vec<String>> {
     let profile = profile_for_model_type(&architecture.family);
-    // The console judges the width it launches a family on; a narrower or wider hypothetical
-    // group is not a configuration it offers. The scan at that width is the rank-count authority:
-    // a world the kernels were not built for is an unresolved row it reports.
-    if let Some(profile) = profile
-        && world != profile.world_size
-    {
-        return Err(vec![format!(
-            "the {} engine at TP={world} (the console launches it at TP={})",
-            profile.label, profile.world_size
-        )]);
-    }
+    // The scan below is the rank-count authority, at every width: a world the kernels were not
+    // built for is an unresolved row it reports, and the console shows that row rather than a list
+    // of widths the registry carries.
     // A checkpoint no device arm reads may still be executable by the shared CPU host
     // reference. It is judged by that backend's own gate, not by the kernel catalogue: the
     // catalogue answers what a device kernel exists for, which is a different question.
@@ -1229,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_runs_only_at_its_deployed_width() {
+    fn deepseek_runs_at_four_and_its_scan_refuses_one() {
         let fit = judge(
             &Evidence {
                 config: Some(DEEPSEEK),
@@ -1250,10 +1242,14 @@ mod tests {
             "{tp4:#?}"
         );
         assert!(!tp4.notes.is_empty());
+        // One rank is a world the released kernels were not built for, and the row says which
+        // shape is missing rather than naming a width the registry advertises.
         let tp1 = of(&fit, 1);
         assert_eq!(tp1.verdict, Verdict::Missing);
         assert!(
-            tp1.reasons.iter().any(|reason| reason.contains("TP=4")),
+            tp1.reasons
+                .iter()
+                .any(|reason| reason.contains("not built")),
             "{tp1:#?}"
         );
     }
