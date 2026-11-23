@@ -190,9 +190,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // 201,024-row table is not a multiple of the Qwen release's 128, and the same body
         // embeds it.
         (Part::Embedding, Image::Qwen4Exp) => ShapeConstraint::ANY,
-        (Part::RmsNorm, Image::Deepseek) => {
-            ShapeConstraint::ANY.hidden_equals(5120).hidden_multiple(2)
-        }
+        (Part::RmsNorm, Image::Deepseek) => CATALOGUE_DEEPSEEK_RMSNORM,
         (Part::RmsNorm, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_multiple(2),
         (Part::LmHead, Image::Deepseek) => {
             ShapeConstraint::ANY.hidden_equals(5120).vocab_multiple(128)
@@ -323,7 +321,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::Activation, Image::GlmMoe | Image::GlmDecode) => {
             ShapeConstraint::ANY.hidden_equals(4096)
         }
-        (Part::Rope, Image::Deepseek) => ShapeConstraint::ANY.hidden_equals(5120),
+        (Part::Rope, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROPE,
         (Part::Rope, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_equals(2560),
         // Inkling's four new arithmetic families. The relative-attention entry serves both the
         // 1,024-token sliding layers and the eight full layers, so the window is a documented
@@ -348,6 +346,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::MoeCombine, Image::Inkling) => ShapeConstraint::ANY
             .hidden_equals(INKLING_HIDDEN)
             .max_top_k(64),
+        (Part::Quantize, Image::Deepseek) => CATALOGUE_DEEPSEEK_QUANTIZE,
         (Part::Quantize, _) => ShapeConstraint::ANY,
         // Only the GLM decode image exports a LayerNorm body; RMSNorm is a different part and
         // the resolver must never fall back to it.
@@ -390,9 +389,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // The one-shot collective is the TP4 kernel the slot ABI pins.
         (Part::Collective, Image::Rocenante) => ShapeConstraint::ANY.world_equals(4),
         (Part::Collective, Image::Qwen4Exp) => ShapeConstraint::ANY.world_min(2),
-        (Part::HyperConnection, Image::Deepseek) => ShapeConstraint::ANY
-            .hidden_equals(5120)
-            .streams_between(4, 4),
+        (Part::HyperConnection, Image::Deepseek) => CATALOGUE_DEEPSEEK_HYPERCONNECTION,
         (Part::HyperConnection, Image::Qwen4Exp) => ShapeConstraint::ANY
             .hidden_multiple(256)
             .streams_between(2, 5),
