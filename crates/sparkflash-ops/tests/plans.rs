@@ -1433,3 +1433,39 @@ fn the_deepseek_indexer_refuses_a_row_past_its_compiled_position_bound() {
         "the refusal names the symbol and its bound: {text}"
     );
 }
+#[test]
+fn every_released_deepseek_part_resolves_at_the_format_its_tensors_state() {
+    use sparkflash_model::format::StoredFormat;
+
+    let plan = arm(DEEPSEEK, 4);
+    // Every requirement in both passes, not only the served set: the released DeepSeek plan is
+    // the format seam's largest consumer, and a part whose format no body decodes must be caught
+    // here rather than at boot.
+    let failures = CTX.resolver().boot_check(&plan).err().unwrap_or_default();
+    assert!(
+        failures.is_empty(),
+        "the released DeepSeek plan asks for formats the catalogue does not carry: {failures:?}"
+    );
+
+    // CSA2's compressor tensors are owned by the kv-source layers (2, 8, 14, 20) and read by the
+    // layers those sources serve. A served layer claims no compressor tensor of its own, so its
+    // format must still be the compressor's bf16, not the dense MXFP8 class.
+    let mut compressed = 0;
+    for layer in plan.layers() {
+        for requirement in &layer.requirements {
+            if requirement.part == Part::Csa2Compression {
+                compressed += 1;
+                assert_eq!(
+                    requirement.format,
+                    StoredFormat::BF16,
+                    "layer {}: the compressor's tensors are bf16",
+                    layer.index
+                );
+            }
+        }
+    }
+    assert!(
+        compressed > 4,
+        "the released plan compresses {compressed} layers"
+    );
+}

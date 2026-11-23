@@ -57,6 +57,13 @@ type PartKey = (Part, Option<usize>);
 type FormatTotals = BTreeMap<PartKey, Vec<(WeightFormat, usize)>>;
 /// The stored format of each part instance.
 type PartFormats = BTreeMap<PartKey, StoredFormat>;
+/// The format a part reads where a block claims no tensor of its own.
+///
+/// A tensor can be shared. CSA2's compressor is owned by the kv-source layer and read by the
+/// layers that source serves, so those layers schedule a [Part::Csa2Compression] but claim no
+/// tensor of their own. The format there is still the compressor's, stated by the layout at the
+/// owning block; it is not the dense class and must not be invented as one.
+type SharedFormats = BTreeMap<Part, StoredFormat>;
 
 /// The operand precision this run uses for each class of weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +249,7 @@ pub struct EnginePlan {
     tp: TpPlan,
     precision: PrecisionPolicy,
     formats: PartFormats,
+    shared_formats: SharedFormats,
     globals: Vec<PartRequirement>,
     layers: Vec<LayerExecution>,
     model_facts: BTreeMap<String, FactValue>,
@@ -320,9 +328,10 @@ impl EnginePlan {
         // The layout states each part's stored dtype. That dtype, not the part's kind, decides
         // the operand precision: a block mixer stored in f32 and an attention stored in bf16 are
         // both exact even beside NVFP4 experts.
-        let formats = stored_formats(&architecture);
+        let (formats, shared_formats) = stored_formats(&architecture);
         let model = ModelFamily::of(&architecture.family, &architecture.architectures);
-        let mut globals = global_requirements(&architecture, &tp, precision, &formats)?;
+        let mut globals =
+            global_requirements(&architecture, &tp, precision, &formats, &shared_formats)?;
         for requirement in &mut globals {
             requirement.geometry.model = Some(model);
         }
@@ -339,7 +348,13 @@ impl EnginePlan {
             let mut roles = step.roles();
             let mut requirements = Vec::new();
             for (_, part) in &roles {
-                let format = format_for(&architecture, &formats, *part, Some(layer.index));
+                let format = format_for(
+                    &architecture,
+                    &formats,
+                    &shared_formats,
+                    *part,
+                    Some(layer.index),
+                );
                 requirements.push(PartRequirement {
                     part: *part,
                     geometry: geometry_for(*part, layer, &architecture, &tp)?,
@@ -363,7 +378,13 @@ impl EnginePlan {
                 } else {
                     StepRole::Ffn
                 };
-                let format = format_for(&architecture, &formats, *part, Some(layer.index));
+                let format = format_for(
+                    &architecture,
+                    &formats,
+                    &shared_formats,
+                    *part,
+                    Some(layer.index),
+                );
                 roles.push((role, *part));
                 requirements.push(PartRequirement {
                     part: *part,
@@ -390,6 +411,7 @@ impl EnginePlan {
             tp,
             precision,
             formats,
+            shared_formats,
             globals,
             layers,
             model_facts,
@@ -492,9 +514,19 @@ impl EnginePlan {
     /// `block` is the layout block the part belongs to, or `None` for a global part (including
     /// the draft stage and the vision tower, whose tensors are not decoder blocks). The value is
     /// the format the layout's stored dtypes agree on; it is never inferred from the part kind.
+    /// A block that claims no tensor of its own takes the format the layout states for the same
+    /// part elsewhere (a tensor shared from another block), then the architecture's class.
     #[must_use]
     pub fn stored_format(&self, part: Part, block: Option<usize>) -> Option<StoredFormat> {
-        self.formats.get(&(part, block)).copied()
+        self.formats
+            .get(&(part, block))
+            .copied()
+            .or_else(|| self.shared_formats.get(&part).copied())
+            .or_else(|| {
+                self.architecture
+                    .stored_format(part)
+                    .map(WeightFormat::stored_format)
+            })
     }
 
     /// The model-wide facts the plan carries, named as the open manifest names them.
@@ -610,13 +642,14 @@ pub trait EngineBuilder {
 /// so a router's bf16 row does not describe the experts beside it. A scale or index tensor that
 /// names no arithmetic is skipped; an f32 part keeps f32 only when no sibling tensor states a
 /// narrower format.
-fn stored_formats(architecture: &Architecture) -> PartFormats {
+fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
     let mut totals = FormatTotals::new();
+    let mut shared_totals: BTreeMap<Part, Vec<(WeightFormat, usize)>> = BTreeMap::new();
     let Ok(Some(layout)) = sparkflash_model::layout::matching(architecture) else {
-        return BTreeMap::new();
+        return (BTreeMap::new(), BTreeMap::new());
     };
     let Ok(tensors) = layout.tensors(architecture) else {
-        return BTreeMap::new();
+        return (BTreeMap::new(), BTreeMap::new());
     };
     for tensor in tensors {
         let block = match tensor.stack {
@@ -648,25 +681,52 @@ fn stored_formats(architecture: &Architecture) -> PartFormats {
             .shape
             .iter()
             .fold(1usize, |product, dim| product.saturating_mul(*dim));
-        let total = totals.entry((tensor.part, block)).or_default();
-        if let Some((_, weight)) = total.iter_mut().find(|(held, _)| *held == format) {
-            *weight = weight.saturating_add(elements);
-        } else {
-            total.push((format, elements));
-        }
+        add_format(
+            totals.entry((tensor.part, block)).or_default(),
+            format,
+            elements,
+        );
+        // The same tensor counted without its block: a part that reads it from another block
+        // (CSA2's shared compressor) takes this format rather than the dense class.
+        add_format(
+            shared_totals.entry(tensor.part).or_default(),
+            format,
+            elements,
+        );
     }
     // A part's format is the one its claimed bytes mostly use: a router's bf16 row beside 256
     // NVFP4 experts does not make the block bf16. An exact tie keeps the later declaration, so a
     // part that states two same-sized classes is reported by the last one the layout names.
-    totals
+    let formats = totals
         .into_iter()
-        .filter_map(|(key, formats)| {
-            formats
-                .into_iter()
-                .max_by_key(|(_, weight)| *weight)
-                .map(|(format, _)| (key, format.stored_format()))
+        .filter_map(|(key, entries)| {
+            winning_format(entries).map(|format| (key, format.stored_format()))
         })
-        .collect()
+        .collect();
+    let shared = shared_totals
+        .into_iter()
+        .filter_map(|(part, entries)| {
+            winning_format(entries).map(|format| (part, format.stored_format()))
+        })
+        .collect();
+    (formats, shared)
+}
+
+/// Add one tensor's format to a (format, claimed elements) tally.
+fn add_format(entries: &mut Vec<(WeightFormat, usize)>, format: WeightFormat, elements: usize) {
+    if let Some((_, weight)) = entries.iter_mut().find(|(held, _)| *held == format) {
+        *weight = weight.saturating_add(elements);
+    } else {
+        entries.push((format, elements));
+    }
+}
+
+/// The format the most claimed bytes use.
+fn winning_format(entries: Vec<(WeightFormat, usize)>) -> Option<WeightFormat> {
+    entries
+        .into_iter()
+        .max_by_key(|(_, weight)| *weight)
+        .map(|(format, _)| format)
 }
 
 /// The model-wide facts the open manifest names, read from the typed architecture and the
@@ -1223,17 +1283,24 @@ fn layout_format(dtype: LayoutDtype, architecture: &Architecture) -> Option<Weig
     }
 }
 
+/// The format a part instance reads: the block's own tensors, else the format the layout claims
+/// for the same part elsewhere (a tensor the block shares), else the architecture's class.
 fn format_for(
     architecture: &Architecture,
     formats: &PartFormats,
+    shared: &SharedFormats,
     part: Part,
     block: Option<usize>,
 ) -> Option<StoredFormat> {
-    formats.get(&(part, block)).copied().or_else(|| {
-        architecture
-            .stored_format(part)
-            .map(WeightFormat::stored_format)
-    })
+    formats
+        .get(&(part, block))
+        .copied()
+        .or_else(|| shared.get(&part).copied())
+        .or_else(|| {
+            architecture
+                .stored_format(part)
+                .map(WeightFormat::stored_format)
+        })
 }
 
 fn global_requirements(
@@ -1241,6 +1308,7 @@ fn global_requirements(
     tp: &TpPlan,
     precision: PrecisionPolicy,
     formats: &PartFormats,
+    shared: &SharedFormats,
 ) -> Result<Vec<PartRequirement>, PlanError> {
     let hidden = architecture.hidden_size;
     let vocab = architecture.vocab_size;
@@ -1255,7 +1323,7 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            format: format_for(architecture, formats, Part::Embedding, None)
+            format: format_for(architecture, formats, shared, Part::Embedding, None)
                 .unwrap_or_else(|| format_of_precision(precision.dense)),
         },
         PartRequirement {
@@ -1267,7 +1335,7 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            format: format_for(architecture, formats, Part::RmsNorm, None)
+            format: format_for(architecture, formats, shared, Part::RmsNorm, None)
                 .unwrap_or_else(|| format_of_precision(precision.dense)),
         },
         PartRequirement {
@@ -1280,7 +1348,7 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            format: format_for(architecture, formats, Part::LmHead, None)
+            format: format_for(architecture, formats, shared, Part::LmHead, None)
                 .unwrap_or_else(|| format_of_precision(precision.dense)),
         },
     ];
@@ -1304,7 +1372,7 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            format: format_for(architecture, formats, Part::Mtp, None)
+            format: format_for(architecture, formats, shared, Part::Mtp, None)
                 .unwrap_or_else(|| format_of_precision(precision.mtp)),
         });
     }
@@ -1344,7 +1412,8 @@ fn global_requirements(
                 geometry,
                 // A vision part with no tensor of its own (a rotary-only position scheme) has
                 // no stored dtype to read; the tower's arithmetic is bf16.
-                format: format_for(architecture, formats, part, None).unwrap_or(StoredFormat::BF16),
+                format: format_for(architecture, formats, shared, part, None)
+                    .unwrap_or(StoredFormat::BF16),
             });
         };
         push(Part::VisionPatchEmbed, base);
