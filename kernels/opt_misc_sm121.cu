@@ -645,6 +645,19 @@ extern "C" __global__ void __launch_bounds__(256) opt_rows_engram_post(
 // Without a table group g is the one at first position (g0 + g) * ratio of the bases' own lane.
 // Each kernel is the single-group launch's arithmetic, so every group is bit-identical to the
 // per-row chain's.
+// The included compressor source carries its own instance macros (D.2). The group append is
+// this cubin's compression entry, so its instance is the one that supplies the included released
+// entries' shape; the proof cubin is a separate compile and never reaches this include.
+#if defined(SPARK_INSTANCE_OPT_ROWS_GROUP_APPEND_HEAD_DIM)
+#define SPARK_INSTANCE_COMPRESSED_APPEND_SM121_HIDDEN \
+    SPARK_INSTANCE_OPT_ROWS_GROUP_APPEND_HIDDEN
+#define SPARK_INSTANCE_COMPRESSED_APPEND_SM121_HEAD_DIM \
+    SPARK_INSTANCE_OPT_ROWS_GROUP_APPEND_HEAD_DIM
+#define SPARK_INSTANCE_COMPRESSED_APPEND_SM121_RATIO \
+    SPARK_INSTANCE_OPT_ROWS_GROUP_APPEND_RATIO
+#define SPARK_INSTANCE_COMPRESSED_APPEND_SM121_POSITIONS \
+    SPARK_INSTANCE_OPT_ROWS_GROUP_APPEND_POSITIONS
+#endif
 #include "compressed_append_sm121.cu"
 
 __device__ __forceinline__ void opt_group_at(const uint64_t *__restrict__ tab, const uint32_t g0,

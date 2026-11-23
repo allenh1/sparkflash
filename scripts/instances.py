@@ -91,11 +91,14 @@ FAMILIES = {
         "index_topk",
         "positions",
     ),
+    # CSA2 compression: the released hidden width, the latent width the append packs, the
+    # compression ratio and the position bound the claim states.
+    "csa2": ("hidden", "head_dim", "ratio", "positions"),
 }
 OPTIONAL = {"seams": ("hc",)}
 # The catalogue generator understands these dimensions as shape claims. A key may name a subset
 # with catalogue_dims; a key without it keeps the router/routed convention.
-CATALOGUE_DIMS = {"hidden", "intermediate", "experts", "top_k"}
+CATALOGUE_DIMS = {"hidden", "head_dim", "intermediate", "experts", "top_k", "ratio", "positions"}
 ALLOWED = {
     "source",
     "entry",

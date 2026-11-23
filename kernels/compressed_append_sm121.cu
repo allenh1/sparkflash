@@ -40,10 +40,23 @@
 
 #include "m4_common_sm121.cuh"
 
-#define REF_DIM 512u
+// The instance conversion (D.1): the compression body's one compile-time shape is the latent
+// width it packs. Every released entry takes its ratio, row count and store row at run time, so
+// the instance list records those as catalogue claims and names only this width as code.
+#if defined(SPARK_INSTANCE_COMPRESSED_APPEND_256_SM121_HEAD_DIM)
+#define REF_DIM SPARK_INSTANCE_COMPRESSED_APPEND_256_SM121_HEAD_DIM
+#define REF_WRITE_ENTRY compressed_append_256_sm121
+#elif defined(SPARK_INSTANCE_COMPRESSED_APPEND_SM121_HEAD_DIM)
+#define REF_DIM SPARK_INSTANCE_COMPRESSED_APPEND_SM121_HEAD_DIM
+#define REF_WRITE_ENTRY compressed_append_sm121
+#else
+#error "compressed_append_sm121.cu: no instance macros; the latent width comes from kernels/instances.toml"
+#endif
 #define REF_SCALE_GROUP 16u
-#define REF_CODE_BYTES 256u
-#define REF_SCALE_BYTES 32u
+#define REF_CODE_BYTES (REF_DIM / 2u)
+#define REF_SCALE_BYTES (REF_DIM / REF_SCALE_GROUP)
+static_assert(REF_DIM % REF_SCALE_GROUP == 0, "the latent width must be a whole number of scale groups");
+static_assert(REF_DIM % 2u == 0, "two E2M1 codes pack into one byte");
 #define REF_E2M1_MAX 6.0f
 #define REF_E4M3_MAX 448.0f
 #define REF_AMAX_FLOOR 0.01171875f
@@ -128,7 +141,7 @@ __device__ __forceinline__ unsigned ref_e4m3_encode(float value) {
 
 // One block (256 threads) per completed compressed row. Thread 0..31 stage the 32 group scales;
 // then thread t packs code bytes t (channels 2t and 2t+1), low nibble first.
-extern "C" __global__ void compressed_append_sm121(
+extern "C" __global__ void REF_WRITE_ENTRY(
     const float* __restrict__ latent,
     unsigned char* __restrict__ codes,
     unsigned char* __restrict__ scales,
@@ -176,7 +189,9 @@ extern "C" __global__ void compressed_append_sm121(
 }
 
 // The selected list: one thread keeps the host order exactly (at most 512 ids), so the id vector
-// the body reads is the host id vector mapped, not a reordered one.
+// the body reads is the host id vector mapped, not a reordered one. Only the released width emits
+// this entry; the proof shape's cubin carries just its own append symbol.
+#if defined(SPARK_INSTANCE_COMPRESSED_APPEND_SM121_HEAD_DIM)
 extern "C" __global__ void compressed_selected_fill_sm121(
     const unsigned* __restrict__ ids,
     unsigned n_ids,
@@ -201,3 +216,4 @@ extern "C" __global__ void compressed_selected_fill_sm121(
         *out_count = picked;
     }
 }
+#endif
