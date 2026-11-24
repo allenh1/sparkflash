@@ -590,10 +590,12 @@ World 1 agrees (`second-shape: VERDICT PASS`, `external check PASS`). Worlds 2 a
 two ranks all three prompts differ from the third generated token on; at four ranks prompt 1
 differs from its third token while prompts 0 and 2 agree. The released path at the same tip
 passes at one, two and four ranks with the ids recorded for the device window, so the harness and
-the split are sound; the difference is the row-scaled E4M3 expert sum, whose four per-rank partials
-round differently from the reference's one ascending sum where the released E2M1 values happen to
-regroup exactly. **The family is not done.** The host arm is green only at one rank, and no device
-kernel has read this format.
+the split are sound. The difference is the row-scaled E4M3 expert sum: measured on layer 0 of this
+checkpoint, the four rank partials of `routed_forward` differ from the reference's single global
+sum by at most 1.75e-10 absolute (4.7e-7 relative; 3,803 of 4,096 f32 values differ in bits). The
+released E2M1 arm regroups without changing its bits; E4M3 codes do not, and this fixture's logits
+are close enough that the rounding flips a greedy token. **The family is not done.** The host arm
+is green only at one rank, and no device kernel has read this format.
 
 Open items. (1) The routed-expert launch: `moe_device::ffn` binds and arranges `MXFP8_ROW_32` and
 then refuses it by name because the staged operand and the gate/up and combine launches are still
