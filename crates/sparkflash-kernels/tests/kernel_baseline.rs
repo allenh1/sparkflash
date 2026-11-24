@@ -162,10 +162,36 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .map(|file| file.trim_end_matches(".cu"))
         .collect();
     sorted_probed.sort_unstable();
+    // The NVFP4 prefill source is probed for syntax but is not a baseline kernel: every cubin it
+    // has is an instance build (`nvfp4_prefill_sm121_i512` and its siblings), so there is no stem
+    // cubin for the baseline to compile and pin. It is named here rather than in the script so the
+    // exemption is one statement with a reason, and the assertion below keeps it strict: the source
+    // must be probed, must exist, and must not appear in the manifest.
+    const PROBED_NOT_BASELINED: &[&str] = &["nvfp4_prefill_sm121"];
+    let mut expected_probed = sorted_listed
+        .iter()
+        .map(|name| (*name).to_owned())
+        .chain(PROBED_NOT_BASELINED.iter().map(|name| (*name).to_owned()))
+        .collect::<Vec<String>>();
+    expected_probed.sort_unstable();
     assert_eq!(
-        sorted_probed, sorted_listed,
-        "build.rs PROBED_KERNELS ({probed:?}) and the baseline list ({listed:?}) must name the same kernels"
+        sorted_probed
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<String>>(),
+        expected_probed,
+        "build.rs PROBED_KERNELS ({probed:?}) and the baseline list ({listed:?}) plus the named exceptions must cover the same kernels"
     );
+    for name in PROBED_NOT_BASELINED {
+        assert!(
+            !listed.contains(name),
+            "{name} is an instance-only source and must stay out of the baseline list"
+        );
+        assert!(
+            crate_dir.join(format!("../../kernels/{name}.cu")).is_file(),
+            "{name}.cu must exist under kernels/"
+        );
+    }
     assert_eq!(
         declared,
         probed.len(),
@@ -203,6 +229,9 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .filter(|file| {
             !listed.contains(&file.trim_end_matches(".cu"))
                 && !model_images.iter().any(|name| name == file)
+                && !PROBED_NOT_BASELINED
+                    .iter()
+                    .any(|name| *file == format!("{name}.cu"))
                 && *file != "rocenante_oneshot_sm121.cu"
         })
         .collect();
