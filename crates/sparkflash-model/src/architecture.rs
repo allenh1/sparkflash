@@ -2978,6 +2978,9 @@ struct DeclaredFormat {
     group_size: Option<usize>,
 }
 
+/// The values one NVFP4 group scale covers.
+const NVFP4_GROUP: usize = 16;
+
 impl DeclaredFormat {
     fn named(name: String) -> Self {
         Self {
@@ -2987,12 +2990,22 @@ impl DeclaredFormat {
     }
 
     /// The format this declaration describes, with its own group width when it has one.
+    ///
+    /// `block` is the release's `weight_block_size`, which is the dense class's block. An NVFP4
+    /// expert's group is its own: the declaration's group when it states one, else NVFP4's
+    /// 16 values. Taking the dense block made a DeepSeek-layout checkpoint with 32 x 32 dense
+    /// scales and `expert_dtype: nvfp4-*` plan its experts at a 32-value group that no NVFP4
+    /// body reads, while the reference read them at 16.
     fn format(&self, block: Option<usize>, scale: Option<&str>) -> WeightFormat {
         let format = WeightFormat::from_name(Some(&self.name), block, scale);
         match (format, self.group_size) {
             (WeightFormat::NvFp4 { wide, .. }, Some(group_size)) => {
                 WeightFormat::NvFp4 { group_size, wide }
             }
+            (WeightFormat::NvFp4 { wide, .. }, None) => WeightFormat::NvFp4 {
+                group_size: NVFP4_GROUP,
+                wide,
+            },
             (format, _) => format,
         }
     }
@@ -4952,6 +4965,36 @@ mod tests {
         let without_patch = without_out.replace("\"patch_size\": 16,", "");
         let error = Architecture::from_json(&without_patch).expect_err("a missing patch side");
         assert!(error.to_string().contains("patch_size"), "{error}");
+    }
+
+    /// A release whose dense class is a 32 x 32 grid and whose experts are NVFP4 keeps NVFP4's own
+    /// 16-value group for the experts: `weight_block_size` is the dense class's block.
+    #[test]
+    fn an_nvfp4_expert_keeps_its_own_group_beside_a_32_block_dense_class() {
+        for (name, wide) in [
+            ("nvfp4-qwen", crate::format::NvFp4Wide::Qwen),
+            ("nvfp4-inkling", crate::format::NvFp4Wide::Inkling),
+        ] {
+            let text = format!(
+                r#"{{
+                "model_type": "made_up_moe", "architectures": ["MadeUpForCausalLM"],
+                "hidden_size": 256, "vocab_size": 512, "num_hidden_layers": 2,
+                "num_attention_heads": 4, "num_key_value_heads": 4, "head_dim": 64,
+                "intermediate_size": 512, "max_position_embeddings": 1024,
+                "quantization_config": {{
+                    "quant_method": "fp8", "activation_scheme": "dynamic",
+                    "weight_block_size": [32, 32], "scale_fmt": "ue8m0",
+                    "expert_dtype": "{name}"
+                }}
+            }}"#
+            );
+            let architecture = Architecture::from_json(&text).expect("the release parses");
+            assert_eq!(
+                architecture.quantization.expert_format,
+                WeightFormat::NvFp4 { group_size: 16, wide },
+                "{name}"
+            );
+        }
     }
 
     /// A multimodal release that nests its language model (Hy4-flash's shape, with made-up small
