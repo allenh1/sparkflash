@@ -369,6 +369,19 @@ impl MoeRoutedGeometry {
         self.inter / self.world
     }
 
+    /// The dedup down body's thread count: two of a 32-column tile's local chunks a thread, so one
+    /// thread for every two of this rank's intermediate columns.
+    ///
+    /// The instance compiles its launch bounds from the same number
+    /// (`OPT_MOE_DD_THREADS = OPT_MOE_INTER / 2`), so it is the plan's per-rank intermediate that
+    /// states it. The released intermediate of 576 gives the released 288; a build for a narrower
+    /// shape states its own, and a launch of the released block against it is refused by the
+    /// driver before a thread runs.
+    #[must_use]
+    pub fn dedup_down_threads(&self) -> usize {
+        self.local_inter() / 2
+    }
+
     /// The gate/up/SwiGLU operand's columns: [`Self::local_inter`] plus the build's padding.
     #[must_use]
     pub fn padded(&self) -> usize {
@@ -1945,7 +1958,7 @@ impl MoeRoutedDevice {
             // Two 32-column tiles per block (OPT_MOE_DD_TILES), two of a tile's local chunks a
             // thread.
             ((self.plan.geometry().dim / 64) as u32, groups, 1),
-            (288, 1, 1),
+            (self.plan.geometry().dedup_down_threads() as u32, 1, 1),
             &[down.0, plan, self.codes.0, self.scales.0, self.slot_acc.0],
         )
         .map_err(|error| format!("moe_routed dedup: down: {error}"))?;
@@ -2916,6 +2929,19 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{cubin}: {error}"));
             assert_eq!(geometry.padded, padded, "{cubin}");
             assert_eq!(geometry.local_inter(), inter / world, "{cubin}");
+        }
+        // The dedup down body's block is half this rank's intermediate, the same number the
+        // instance compiles its launch bounds from. The released 576 gives 288; the second shape's
+        // three splits give their own, and a launch that states the released block is refused by
+        // the driver before a thread runs.
+        for &(dim, inter, world, experts, top_k, _, cubin) in ROUTED_DEVICE_GEOMETRIES {
+            let geometry = MoeRoutedGeometry::new(dim, inter, world, experts, top_k)
+                .unwrap_or_else(|error| panic!("{cubin}: {error}"));
+            assert_eq!(
+                geometry.dedup_down_threads(),
+                inter / world / 2,
+                "{cubin}: the dedup down block is half the rank's intermediate"
+            );
         }
         // The run stages a cubin a rank count, so the list must cover the three worlds the second
         // shape is measured at.
