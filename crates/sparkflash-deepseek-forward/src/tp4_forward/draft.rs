@@ -467,7 +467,11 @@ impl DraftState {
 
         let vocab = crate::plan::vocab_per_rank();
         let chunks = crate::tp4_tail::chunks_per_rank();
-        let markov_head = ptr(crate::plan::mtp_claim(2, "markov_head.head.weight").to_owned())?
+        // The Markov head, the head norm and the Markov embedding are the last DSpark stage's
+        // tensors, as the host reference derives them; the stage is the plan's, not the released
+        // model's three-stage index.
+        let last = crate::plan::mtp_last_stage()?;
+        let markov_head = ptr(crate::plan::mtp_claim(last, "markov_head.head.weight").to_owned())?
             + (device.tp_rank * vocab * markov_rank() * 2) as u64;
         let head_fp8 = if drafter.head_fp8() {
             // Whole 128-entry tiles, for the tiled copy.
@@ -482,9 +486,9 @@ impl DraftState {
             stages,
             main_proj: (main_proj_tiled, proj_scales),
             main_norm: ptr("mtp.0.main_norm.weight".to_owned())?,
-            head_norm: ptr("mtp.2.norm.weight".to_owned())?,
+            head_norm: ptr(crate::plan::mtp_claim(last, "norm.weight").to_owned())?,
             markov_head,
-            markov_embed: ptr("mtp.2.markov_head.embed.weight".to_owned())?,
+            markov_embed: ptr(crate::plan::mtp_claim(last, "markov_head.embed.weight").to_owned())?,
             taps: alloc(r * draft_taps() * dim * 4)?,
             main_x: alloc(r * dim * 4)?,
             seed_slices: alloc(r * dim * 4)?,
@@ -1646,7 +1650,8 @@ impl DeviceLayer<'_> {
     }
 
     /// forward_head's shared part (model.py:1137-1149) for the first `k` pass rows of each of
-    /// `groups` blocks `stride` rows apart: hc_pre with the last stage's FFN pre mix, mtp.2.norm and
+    /// `groups` blocks `stride` rows apart: hc_pre with the last stage's FFN pre mix, that stage's
+    /// norm and
     /// the shared head over the rank's vocabulary slice, block g's row r's logits at draft.logits
     /// row g k + r.
     fn draft_logits(

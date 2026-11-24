@@ -112,3 +112,47 @@ fn the_second_shape_values_reach_the_forward() {
     );
     assert_ne!(values.dim, 5120, "the fixture is a second shape");
 }
+
+#[test]
+fn the_draft_blocks_last_stage_is_the_plans() {
+    // The released model has three DSpark stages and its Markov head is claimed on stage two; the
+    // synthetic second shape has two. The window that found this read stage two's markov head out
+    // of a two-stage plan and panicked at open. The stage is the plan's last, and the tensors the
+    // draft block reads at the last stage are claimed there.
+    let dir = fixture();
+    for world in [1usize, 2, 4] {
+        let plan = sparkflash_deepseek_forward::plan::plan_from_path(&dir, world, 0)
+            .unwrap_or_else(|error| panic!("world {world}: {error}"));
+        sparkflash_deepseek_forward::plan::install(plan).expect("the plan installs");
+        let stages = sparkflash_deepseek_forward::plan::n_mtp_layers();
+        assert!(
+            stages >= 1,
+            "world {world}: the plan states {stages} stages"
+        );
+        let last = sparkflash_deepseek_forward::plan::mtp_last_stage()
+            .unwrap_or_else(|error| panic!("world {world}: {error}"));
+        assert_eq!(last, stages - 1, "world {world}: the last stage");
+        for tail in [
+            "norm.weight",
+            "markov_head.head.weight",
+            "markov_head.embed.weight",
+            "confidence_head.proj.weight",
+        ] {
+            assert!(
+                sparkflash_deepseek_forward::plan::mtp_claim_result(last, tail).is_ok(),
+                "world {world}: the last stage claims no {tail}"
+            );
+        }
+        for tail in ["main_proj.weight", "main_proj.scale", "main_norm.weight"] {
+            assert!(
+                sparkflash_deepseek_forward::plan::mtp_claim_result(0, tail).is_ok(),
+                "world {world}: the first stage claims no {tail}"
+            );
+        }
+        assert!(
+            sparkflash_deepseek_forward::plan::mtp_claim_result(2, "markov_head.head.weight")
+                .is_err(),
+            "world {world}: a {stages}-stage plan answered for the released stage two"
+        );
+    }
+}
