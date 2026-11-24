@@ -706,3 +706,115 @@ fn verified_constructor_requires_the_reference_digest() {
     assert_eq!(unverified.compressed_vocab_size(), COMPRESSED_VOCAB_SIZE);
     assert_eq!(unverified.lookup(), verified.lookup());
 }
+
+/// The released configuration, as the checkpoint describes it.
+fn released_config() -> sparkflash_model_deepseek_v41::config::ModelConfig {
+    sparkflash_model_deepseek_v41::config::ModelConfig::from_released_json(include_str!(
+        "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+    ))
+    .expect("the released config parses")
+}
+
+/// The configuration-driven hash the host reference and the device arm both run
+/// (`ngram_hashes_mapped`, over the map `compressed_token_map` builds) gives the reference's
+/// columns for the released configuration at every live position of every scenario. This is what
+/// keeps released DeepSeek's Engram rows where they were when the device moved off the constant
+/// tables, and it checks the NumPy multiplier port against the reference's own output.
+#[test]
+fn the_configuration_hash_matches_the_reference_for_the_released_model() {
+    use sparkflash_model_deepseek_v41::forward::engram::{
+        HASH_SENTINEL, check_token_map, ngram_hashes_mapped,
+    };
+    let config = released_config();
+    let token_map = sparkflash_engram::compress::compressed_token_map_json(tokenizer_path())
+        .expect("the map builds");
+    check_token_map(&config, &token_map).expect("the released map fits the released config");
+    assert_eq!(token_map.as_slice(), shared_compressor().lookup());
+    let cases = load_hash_cases();
+    for scenario in cases["cases"].as_array().expect("cases must be an array") {
+        let name = scenario["name"].as_str().expect("scenario name");
+        let mut history = Vec::new();
+        let mut expected = Vec::new();
+        for (step, expected_step) in scenario["steps"]
+            .as_array()
+            .expect("steps must be an array")
+            .iter()
+            .zip(scenario["expected"].as_array().expect("expected array"))
+        {
+            let ids = step["ids"].as_array().expect("ids must be an array");
+            let mask = step["mask"].as_array();
+            for (index, id) in ids.iter().enumerate() {
+                let live = mask.is_none_or(|mask| mask[index].as_bool().expect("mask bool"));
+                history.push(if live {
+                    id.as_u64().expect("id must be an integer") as u32
+                } else {
+                    HASH_SENTINEL
+                });
+            }
+            expected.extend(expected_step.as_array().expect("positions array").iter());
+        }
+        for start in [0, history.len() / 2, history.len() - 1] {
+            let mut columns = Vec::new();
+            ngram_hashes_mapped(&config, Some(&token_map), &history, start, &mut columns)
+                .expect("the hash");
+            assert_eq!(columns.len(), (history.len() - start) * 2 * HASH_COLUMNS);
+            for (offset, row) in columns.chunks(2 * HASH_COLUMNS).enumerate() {
+                let position = start + offset;
+                if history[position] == HASH_SENTINEL {
+                    assert!(
+                        row.iter().all(|&id| id == HASH_SENTINEL),
+                        "{name}: dead {position}"
+                    );
+                    continue;
+                }
+                let want: Vec<u32> = expected[position]
+                    .as_array()
+                    .expect("layers array")
+                    .iter()
+                    .flat_map(|layer| layer.as_array().expect("columns array"))
+                    .map(|id| id.as_u64().expect("column must be an integer") as u32)
+                    .collect();
+                assert_eq!(row, want, "{name}: position {position} from start {start}");
+            }
+        }
+    }
+}
+
+/// The same hash equals the constant tables' [hash_history] on random histories (raw ids past
+/// the vocabulary and dead ids included), so the two agree beyond the goldens' few scenarios.
+#[test]
+fn the_configuration_hash_equals_the_constant_tables_on_random_histories() {
+    use sparkflash_model_deepseek_v41::forward::engram::{HASH_SENTINEL, ngram_hashes_mapped};
+    let config = released_config();
+    let compressor = shared_compressor();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for trial in 0..64 {
+        let len = 1 + (next() % 96) as usize;
+        let history: Vec<u32> = (0..len)
+            .map(|_| match next() % 64 {
+                0 => HASH_SENTINEL,
+                1 => RAW_VOCAB_SIZE as u32 + (next() % 1000) as u32,
+                _ => (next() % RAW_VOCAB_SIZE as u64) as u32,
+            })
+            .collect();
+        let start = (next() % len as u64) as usize;
+        let mut want = Vec::new();
+        hash_history(compressor, &history, start, HASH_SENTINEL, &mut want);
+        let mut got = Vec::new();
+        ngram_hashes_mapped(
+            &config,
+            Some(compressor.lookup()),
+            &history,
+            start,
+            &mut got,
+        )
+        .expect("the hash");
+        assert_eq!(got, want, "trial {trial}: {len} ids from {start}");
+    }
+}

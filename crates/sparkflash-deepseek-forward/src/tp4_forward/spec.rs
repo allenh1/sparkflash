@@ -137,8 +137,9 @@ pub(super) struct EngramReader {
     /// cache.
     direct: Option<u64>,
     /// The tokenizer's compressed token map: the n-grams are hashed over compressed ids
-    /// (engram.py's token map), never over raw ones.
-    compressor: sparkflash_engram::compress::TokenizerCompressor,
+    /// (engram.py's token map), never over raw ones. Its class count is the configuration's
+    /// engram_compressed_vocab_size, checked at open.
+    token_map: Vec<u32>,
     /// Entries already read, by (file, byte): the tables are weights, so an n-gram seen again (or a
     /// redrafted row) costs a copy instead of a device read.
     cache: Mutex<EntryCache>,
@@ -182,9 +183,12 @@ impl EngramReader {
         use std::os::fd::AsRawFd as _;
         // The layers and hash width are the open plan's facts: the reader opens the tables the
         // plan's Engram parts claim, and the forward sizes its hash rows from the same facts.
-        let compressor =
-            sparkflash_engram::compress::TokenizerCompressor::from_tokenizer_json(tokenizer)
-                .map_err(|error| format!("engram reader: {}: {error}", tokenizer.display()))?;
+        // The map is the host reference's: the same builder, checked against the same
+        // configuration, hashed by the same function (engram_plan), at every shape.
+        let token_map = sparkflash_engram::compress::compressed_token_map_json(tokenizer)
+            .map_err(|error| format!("engram reader: {}: {error}", tokenizer.display()))?;
+        sparkflash_engine::forward::engram::check_token_map(config, &token_map)
+            .map_err(|error| format!("engram reader: {}: {error}", tokenizer.display()))?;
         let direct = sparkflash_model::active_profile()
             .diagnostics
             .engram_direct
@@ -241,7 +245,7 @@ impl EngramReader {
         Ok(Self {
             slots,
             direct: direct.then_some(align),
-            compressor,
+            token_map,
             cache: Mutex::new(std::collections::HashMap::new()),
             cached: sparkflash_model::active_profile()
                 .diagnostics
@@ -1186,13 +1190,16 @@ impl DeviceLayer<'_> {
         let mut per_slot: Vec<Vec<ReadJob<'_>>> = vec![Vec::new(); slots];
         let mut hashes = Vec::new();
         let mut skips = Vec::with_capacity(n * slots);
-        sparkflash_engram::hash::hash_history(
-            &reader.compressor,
+        // The host reference's hash over the configuration's layout (its primes, offsets,
+        // multipliers, orders and layers), so every shape hashes as the reference does.
+        sparkflash_engine::forward::engram::ngram_hashes_mapped(
+            config,
+            Some(&reader.token_map),
             &history[..p0 + n],
             p0,
-            sparkflash_engine::forward::engram::HASH_SENTINEL,
             &mut hashes,
-        );
+        )
+        .map_err(|error| format!("engram set: {error}"))?;
         for row in 0..n {
             let position = p0 + row;
             for (slot, slot_jobs) in per_slot.iter_mut().enumerate() {
@@ -1661,7 +1668,13 @@ impl DeviceLayer<'_> {
         let b = rows.b;
         let (dim, hc) = (self.dim, self.hc_mult);
         if let Some(dir) = dump.as_deref() {
-            self.rows_dump(dir, "embed", &[("stream", b.stream, n * hc * dim * 4)], p0, n)?;
+            self.rows_dump(
+                dir,
+                "embed",
+                &[("stream", b.stream, n * hc * dim * 4)],
+                p0,
+                n,
+            )?;
         }
         for (layer, weights) in staged.iter().enumerate() {
             self.set_seam_weights(*weights);
@@ -1750,7 +1763,8 @@ fn rows_dump_dir() -> Result<Option<std::path::PathBuf>, String> {
         return Ok(None);
     }
     let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).map_err(|error| format!("rows dump {}: {error}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("rows dump {}: {error}", dir.display()))?;
     Ok(Some(dir))
 }
 
@@ -2205,11 +2219,7 @@ mod tests {
         EngramReader {
             slots: Vec::new(),
             direct,
-            compressor: sparkflash_engram::compress::TokenizerCompressor::from_lookup(
-                vec![0; 3],
-                sparkflash_engram::layout::COMPRESSED_VOCAB_SIZE,
-            )
-            .expect("lookup"),
+            token_map: vec![0; 3],
             cache: Mutex::new(std::collections::HashMap::new()),
             cached: true,
             shard: true,

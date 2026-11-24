@@ -33,3 +33,7 @@ anyhow = { workspace = true }
 tokenizers = "0.23"
 deepseek-recipe-core = { workspace = true }
 deepseek-recipe-encoding = { workspace = true }
+
+[dev-dependencies]
+# host-reference builds the Engram token map with the same builder the device arm uses.
+sparkflash-engram = { workspace = true }

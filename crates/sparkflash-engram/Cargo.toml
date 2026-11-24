@@ -49,6 +49,9 @@ io-uring = ["dep:io-uring"]
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+# The configuration-driven hash every shape runs (the host reference's and the device arm's) is
+# pinned to this crate's released goldens in tests/engram_hash.rs.
+sparkflash-model-deepseek-v41 = { workspace = true }
 
 # pack-engram is a thin wrapper so the packer is usable without the CLI crate.
 [[bin]]

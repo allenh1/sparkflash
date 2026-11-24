@@ -51,9 +51,11 @@
 //!   own closed forms and by a second written-out copy of the chain in the tests, not by a reference
 //!   output. Read [numpy_rng] before treating an id as reference-verified.
 //! - The compressed token map. build_compressed_token_map (engram.py:17-61) needs the tokenizer's
-//!   normalizer chain (spec section 8 item 7). The ids handed to [ngram_hashes] are taken to be already
-//!   compressed, and engram_pad_id is used as the pad where the reference pads with
-//!   token_map[engram_pad_id] (engram.py:147).
+//!   normalizer chain (spec section 8 item 7), which lives in
+//!   sparkflash_engram::compress::compressed_token_map. [ngram_hashes_mapped] takes that map and
+//!   compresses raw ids itself, padding with token_map[engram_pad_id] (engram.py:147); the engine
+//!   holds one through InferenceEngine::set_engram_token_map. Without a map, [ngram_hashes] takes the
+//!   ids handed in as already compressed and pads with engram_pad_id.
 //! - The table read. [engram_forward] pages the rows a chunk looks up through
 //!   [WeightSource::read_ranges] when the source supports it (the CLI's loader does), so the
 //!   released 98 GB tables are read a few rows at a time rather than refused; a source that only
@@ -437,6 +439,39 @@ pub fn ngram_hashes(
     start_pos: usize,
     out: &mut Vec<u32>,
 ) -> Result<(), EngineError> {
+    ngram_hashes_mapped(cfg, None, tokens, start_pos, out)
+}
+
+/// [ngram_hashes] over raw tokenizer ids: each id goes through `token_map` first (the
+/// reference's `token_map[input_ids]`, engram.py:166) and the pad is `token_map[engram_pad_id]`
+/// (engram.py:147). With `None` the ids are taken as already compressed and the pad is
+/// engram_pad_id itself, which is [ngram_hashes].
+///
+/// A raw id past the end of the map takes the pad, as the device compressor's `compress` does
+/// (`sparkflash_engram::compress::TokenizerCompressor::compress`). The map comes from
+/// `sparkflash_engram::compress::compressed_token_map` and is checked with [check_token_map];
+/// this is the one hash both the host reference and the device arm run, at every shape.
+///
+/// # Errors
+///
+/// As [ngram_hashes], and [EngineError::Shape] when the map does not reach engram_pad_id.
+pub fn ngram_hashes_mapped(
+    cfg: &ModelConfig,
+    token_map: Option<&[u32]>,
+    tokens: &[u32],
+    start_pos: usize,
+    out: &mut Vec<u32>,
+) -> Result<(), EngineError> {
+    let pad = match token_map {
+        None => cfg.engram_pad_id,
+        Some(map) => *map
+            .get(cfg.engram_pad_id as usize)
+            .ok_or_else(|| pad_missing(cfg, map))?,
+    };
+    let compress = |id: u32| match token_map {
+        None => id,
+        Some(map) => map.get(id as usize).copied().unwrap_or(pad),
+    };
     if start_pos > tokens.len() {
         return Err(EngineError::Shape {
             what: "engram hashes".to_owned(),
@@ -469,12 +504,12 @@ pub fn ngram_hashes(
         for (shift, slot) in window.iter_mut().enumerate() {
             let before_start = position < shift;
             let source = if before_start {
-                cfg.engram_pad_id
+                pad
             } else {
                 tokens[position - shift]
             };
             blocked = blocked || before_start || source == HASH_SENTINEL;
-            *slot = if blocked { cfg.engram_pad_id } else { source };
+            *slot = if blocked { pad } else { compress(source) };
         }
         // engram.py:179-184: multiply, XOR the look-backs together, reduce each running value modulo
         // that order's prime, then shift it into the layer's own bucket range.
@@ -493,6 +528,48 @@ pub fn ngram_hashes(
         }
     }
     Ok(())
+}
+
+/// The number of classes a dense token map uses (its largest id plus one).
+#[must_use]
+pub fn token_map_classes(token_map: &[u32]) -> usize {
+    token_map.iter().max().map_or(0, |&id| id as usize + 1)
+}
+
+/// Refuses a token map the configuration cannot hash with: one whose class count is not
+/// engram_compressed_vocab_size (every multiplier is drawn below a bound divided by it, so a
+/// map of another size moves every bucket), or that has no entry for engram_pad_id.
+///
+/// # Errors
+///
+/// [EngineError::Shape] naming the disagreement.
+pub fn check_token_map(cfg: &ModelConfig, token_map: &[u32]) -> Result<(), EngineError> {
+    let classes = token_map_classes(token_map);
+    if classes != cfg.engram_compressed_vocab_size {
+        return Err(EngineError::Shape {
+            what: "engram token map".to_owned(),
+            detail: format!(
+                "the tokenizer's map has {classes} classes but the configuration's \
+                 engram_compressed_vocab_size is {}",
+                cfg.engram_compressed_vocab_size
+            ),
+        });
+    }
+    if token_map.len() <= cfg.engram_pad_id as usize {
+        return Err(pad_missing(cfg, token_map));
+    }
+    Ok(())
+}
+
+fn pad_missing(cfg: &ModelConfig, token_map: &[u32]) -> EngineError {
+    EngineError::Shape {
+        what: "engram token map".to_owned(),
+        detail: format!(
+            "the map's {} ids do not reach engram_pad_id {}",
+            token_map.len(),
+            cfg.engram_pad_id
+        ),
+    }
 }
 
 /// Reads and dequantises one Engram table into rows x width values.

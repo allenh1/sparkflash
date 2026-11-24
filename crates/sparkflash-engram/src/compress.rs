@@ -303,32 +303,8 @@ impl TokenizerCompressor {
             });
         }
 
-        let normalizer = build_normalizer()?;
-        let mut keys: HashMap<String, u32> = HashMap::new();
-        let mut lookup = Vec::with_capacity(vocab_size);
-        for token_id in 0..vocab_size as u32 {
-            let text = tokenizer
-                .decode(&[token_id], false)
-                .map_err(|source| EngramError::Decode { token_id, source })?;
-            let key = if text.contains('\u{fffd}') {
-                // a partial UTF-8 byte token: nothing to normalise, key it by its raw form
-                tokenizer
-                    .id_to_token(token_id)
-                    .ok_or(EngramError::MissingToken { token_id })?
-            } else {
-                let normalized = normalize_str(&normalizer, &text)?;
-                if normalized.is_empty() {
-                    text
-                } else {
-                    normalized
-                }
-            };
-            let next_id = keys.len() as u32;
-            let new_id = *keys.entry(key).or_insert(next_id);
-            lookup.push(new_id);
-        }
-
-        let compressed_vocab_size = keys.len() as u32;
+        let lookup = compressed_token_map(tokenizer)?;
+        let compressed_vocab_size = lookup.iter().max().map_or(0, |&id| id + 1);
         if compressed_vocab_size != COMPRESSED_VOCAB_SIZE {
             return Err(EngramError::CompressedVocabSize {
                 got: compressed_vocab_size,
@@ -432,6 +408,58 @@ impl TokenizerCompressor {
     pub fn raw_vocab_size(&self) -> usize {
         self.lookup.len()
     }
+}
+
+/// [`compressed_token_map`] over a HuggingFace `tokenizer.json`.
+///
+/// # Errors
+/// Fails when the file cannot be loaded, or as [`compressed_token_map`].
+pub fn compressed_token_map_json(path: impl AsRef<Path>) -> Result<Vec<u32>, EngramError> {
+    let path = path.as_ref();
+    let tokenizer = Tokenizer::from_file(path).map_err(|source| EngramError::TokenizerLoad {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    compressed_token_map(&tokenizer)
+}
+
+/// The compressed id of every raw id of `tokenizer` (its whole vocabulary, added tokens
+/// included), dense from 0 in order of first appearance: `build_compressed_token_map` from the
+/// reference's engram.py, with no size check.
+///
+/// The released compressor ([`TokenizerCompressor::from_tokenizer`]) and the configuration-driven
+/// hash (`ngram_hashes_mapped` in the DeepSeek forward, which every shape uses) both take their
+/// map from here, so one tokenizer always gives one map. The class count is the configuration's
+/// `engram_compressed_vocab_size`, which the caller checks.
+///
+/// # Errors
+/// Fails when a token cannot be decoded or normalised.
+pub fn compressed_token_map(tokenizer: &Tokenizer) -> Result<Vec<u32>, EngramError> {
+    let vocab_size = tokenizer.get_vocab_size(true);
+    let normalizer = build_normalizer()?;
+    let mut keys: HashMap<String, u32> = HashMap::new();
+    let mut lookup = Vec::with_capacity(vocab_size);
+    for token_id in 0..vocab_size as u32 {
+        let text = tokenizer
+            .decode(&[token_id], false)
+            .map_err(|source| EngramError::Decode { token_id, source })?;
+        let key = if text.contains('\u{fffd}') {
+            // a partial UTF-8 byte token: nothing to normalise, key it by its raw form
+            tokenizer
+                .id_to_token(token_id)
+                .ok_or(EngramError::MissingToken { token_id })?
+        } else {
+            let normalized = normalize_str(&normalizer, &text)?;
+            if normalized.is_empty() {
+                text
+            } else {
+                normalized
+            }
+        };
+        let next_id = keys.len() as u32;
+        lookup.push(*keys.entry(key).or_insert(next_id));
+    }
+    Ok(lookup)
 }
 
 /// SHA-256 of a file, read in 1 MiB chunks so memory stays bounded for a large tokenizer.

@@ -20,6 +20,11 @@
 //! compared against; it shares the loader, the model config and the token list, so a difference
 //! is arithmetic, not a prompt.
 //!
+//! `--tokenizer FILE` hashes the Engram n-grams over that tokenizer's compressed map, as the
+//! reference and the device arm do; a configuration with Engram layers is refused without one.
+//! `--ids-compressed` is the opt-out: the prompts' ids are hashed as already compressed, which is
+//! only right for synthetic ids.
+//!
 //! A fourth argument, `DUMP_DIR`, also writes the first prompt's prefill boundary table there:
 //! one little-endian f32 file a layer and tensor (`L<layer>-<name>.f32`) and `shapes.json`
 //! naming each file's shape, for a layer-by-layer comparison with a device arm's dump.
@@ -34,28 +39,60 @@ use sparkflash_weights::safetensors::SafeTensorsSource;
 /// The largest single tensor the reference will materialise.
 const TENSOR_LIMIT: usize = 512 * 1024 * 1024;
 
+const USAGE: &str = "usage: host-reference CHECKPOINT PROMPTS.json MAX_TOKENS [DUMP_DIR] \
+                     [--tokenizer FILE | --ids-compressed]";
+
 fn main() -> Result<(), String> {
+    let mut positional = Vec::new();
+    let mut tokenizer = None;
+    let mut ids_compressed = false;
     let mut args = std::env::args().skip(1);
-    let checkpoint = args
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tokenizer" => tokenizer = Some(args.next().ok_or(USAGE)?),
+            "--ids-compressed" => ids_compressed = true,
+            flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}; {USAGE}")),
+            _ => positional.push(arg),
+        }
+    }
+    let mut positional = positional.into_iter();
+    let checkpoint = positional.next().ok_or(USAGE)?;
+    let prompts = positional.next().ok_or(USAGE)?;
+    let max_tokens: usize = positional
         .next()
-        .ok_or("usage: host-reference CHECKPOINT PROMPTS.json MAX_TOKENS")?;
-    let prompts = args
-        .next()
-        .ok_or("usage: host-reference CHECKPOINT PROMPTS.json MAX_TOKENS")?;
-    let max_tokens: usize = args
-        .next()
-        .ok_or("usage: host-reference CHECKPOINT PROMPTS.json MAX_TOKENS")?
+        .ok_or(USAGE)?
         .parse()
         .map_err(|error| format!("max tokens: {error}"))?;
-    let dump = args.next();
+    let dump = positional.next();
+    if positional.next().is_some() {
+        return Err(USAGE.to_owned());
+    }
     let dir = Path::new(&checkpoint);
     let text = std::fs::read_to_string(dir.join("config.json"))
         .map_err(|error| format!("{}: {error}", dir.join("config.json").display()))?;
     let config = ModelConfig::from_json(&text).map_err(|error| format!("config: {error}"))?;
     let source = SafeTensorsSource::open(dir, &dir.join("model.safetensors.index.json"))
         .map_err(|error| format!("checkpoint: {error}"))?;
-    let engine = InferenceEngine::new(config.clone(), Box::new(source), TENSOR_LIMIT)
+    let mut engine = InferenceEngine::new(config.clone(), Box::new(source), TENSOR_LIMIT)
         .map_err(|error| format!("engine: {error}"))?;
+    match (tokenizer, ids_compressed) {
+        (Some(_), true) => return Err("--tokenizer and --ids-compressed disagree".to_owned()),
+        (Some(path), false) => {
+            let map = sparkflash_engram::compress::compressed_token_map_json(&path)
+                .map_err(|error| format!("{path}: {error}"))?;
+            engine
+                .set_engram_token_map(map)
+                .map_err(|error| format!("{path}: {error}"))?;
+        }
+        (None, false) if !config.engram_layer_ids.is_empty() => {
+            return Err(format!(
+                "the configuration has Engram layers {:?}: pass --tokenizer FILE to hash over its \
+                 compressed map (--ids-compressed hashes the ids as they are)",
+                config.engram_layer_ids
+            ));
+        }
+        (None, _) => {}
+    }
     let prompts: Vec<Vec<u32>> = serde_json::from_str(
         &std::fs::read_to_string(&prompts).map_err(|error| format!("{prompts}: {error}"))?,
     )
@@ -113,8 +150,7 @@ fn write_boundary(
             };
             let name = format!("L{:02}-{}.f32", row.layer(), tensor.name());
             let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            std::fs::write(dir.join(&name), bytes)
-                .map_err(|error| format!("{name}: {error}"))?;
+            std::fs::write(dir.join(&name), bytes).map_err(|error| format!("{name}: {error}"))?;
             shapes.insert(name, serde_json::json!(tensor.shape()));
         }
     }

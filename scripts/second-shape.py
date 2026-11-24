@@ -880,8 +880,17 @@ def run_test(args: argparse.Namespace) -> int:
     prompts_file = out / "prompts.json"
     global_file = out / "host-reference.json"
     prompts_file.write_text(json.dumps(PROMPTS))
+    # The reference hashes Engram n-grams over the tokenizer's compressed map, as the device does.
+    tokenizer = args.tokenizer or str(Path(args.released) / "tokenizer.json")
     result = run(
-        [args.reference, str(checkpoint), str(prompts_file), str(args.max_tokens)],
+        [
+            args.reference,
+            str(checkpoint),
+            str(prompts_file),
+            str(args.max_tokens),
+            "--tokenizer",
+            tokenizer,
+        ],
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -891,7 +900,6 @@ def run_test(args: argparse.Namespace) -> int:
     global_ids = json.loads(global_file.read_text())
     print(f"second-shape: host reference {result.stdout.strip()}")
 
-    tokenizer = args.tokenizer or str(Path(args.released) / "tokenizer.json")
     worlds = [int(world) for world in args.world.split(",") if world.strip()]
     if not worlds:
         fail("--world names no rank count")

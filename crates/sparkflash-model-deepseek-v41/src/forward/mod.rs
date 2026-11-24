@@ -288,6 +288,9 @@ pub struct InferenceEngine {
     /// The exact f32 gather for row-sharded attention/head weights (batch 18). `None` means the
     /// source serves whole tensors and every projection runs as it always has.
     gather: Option<crate::parallel_tp::BitGatherHandle>,
+    /// The Engram compressed token map ([Self::set_engram_token_map]). `None` hashes the ids as
+    /// already compressed, which is what the synthetic-id tests feed.
+    engram_token_map: Option<Vec<u32>>,
 }
 
 /// The layer window one sequence step runs. The end is inclusive; the default is the whole model.
@@ -344,6 +347,7 @@ impl InferenceEngine {
             sampler: SamplerOptions::default(),
             tp: None,
             gather: None,
+            engram_token_map: None,
         })
     }
 
@@ -390,6 +394,7 @@ impl InferenceEngine {
             sampler: SamplerOptions::default(),
             tp: Some(runtime),
             gather: None,
+            engram_token_map: None,
         })
     }
 
@@ -412,6 +417,20 @@ impl InferenceEngine {
     /// The MTP/DSpark stage (`prefill_with_taps`/`decode_with_taps` and the dspark block) reads its
     /// own attention weights whole and is not wired to this seam, so a sharded source must not be
     /// used on a path that runs those taps: the TP=4 host driver never does.
+    /// Hashes raw tokenizer ids through `token_map` from now on, as the reference does
+    /// (engram.py:166): the map comes from
+    /// `sparkflash_engram::compress::compressed_token_map` over the checkpoint's tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError::Shape] when the map's class count is not engram_compressed_vocab_size or it
+    /// does not reach engram_pad_id ([engram::check_token_map]).
+    pub fn set_engram_token_map(&mut self, token_map: Vec<u32>) -> Result<(), EngineError> {
+        engram::check_token_map(&self.config, &token_map)?;
+        self.engram_token_map = Some(token_map);
+        Ok(())
+    }
+
     #[must_use]
     pub fn with_bit_gather(mut self, gather: Box<dyn crate::parallel_tp::BitGather>) -> Self {
         self.gather = Some(crate::parallel_tp::BitGatherHandle::new(gather));
@@ -1277,7 +1296,13 @@ impl InferenceEngine {
         history.extend_from_slice(&state.tokens);
         history.extend_from_slice(tokens);
         let mut hashes = Vec::new();
-        engram::ngram_hashes(config, &history, start_pos, &mut hashes)?;
+        engram::ngram_hashes_mapped(
+            config,
+            self.engram_token_map.as_deref(),
+            &history,
+            start_pos,
+            &mut hashes,
+        )?;
 
         // The embedding lookup, one row per token (model.py:1253-1255). The rows are widened from
         // the stored BF16 table on the release path, so a decode step touches only its own rows.
@@ -2097,7 +2122,13 @@ impl InferenceEngine {
             });
         }
         let mut hashes = Vec::new();
-        engram::ngram_hashes(config, &[token], 0, &mut hashes)?;
+        engram::ngram_hashes_mapped(
+            config,
+            self.engram_token_map.as_deref(),
+            &[token],
+            0,
+            &mut hashes,
+        )?;
         let mut hidden = vec![0.0f32; width];
         for copy in 0..hc {
             hidden[copy * dim..(copy + 1) * dim].copy_from_slice(embedding);

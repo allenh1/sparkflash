@@ -100,7 +100,7 @@
     "engram_n_heads": 8,
     "engram_head_dim": 256,
     "engram_pad_token_id": 2,
-    "engram_compressed_vocab_size": 2048,
+    "engram_compressed_vocab_size": 99092,
     "num_nextn_predict_layers": 2,
     "dspark_block_size": 2,
     "dspark_noise_token_id": 32767,

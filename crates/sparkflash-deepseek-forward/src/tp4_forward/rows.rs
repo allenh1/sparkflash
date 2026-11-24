@@ -3446,11 +3446,9 @@ impl DeviceLayer<'_> {
         // Each sequence attends its own lane's window ring and compressed store: the split
         // attention runs every lane's rows in one launch with the row table.
         let segs = self.step_segs(p0, n);
-        let table = self.row_table(rows, &segs).filter(|_| {
-            bulk_attn.is_none()
-                && rows.kernels.attn_split.is_some()
-                && fixed_heads
-        });
+        let table = self
+            .row_table(rows, &segs)
+            .filter(|_| bulk_attn.is_none() && rows.kernels.attn_split.is_some() && fixed_heads);
         let last = segs.last().copied();
         for seg in Self::row_units(&segs, table) {
             self.enter_seg(&seg)?;
@@ -3479,8 +3477,7 @@ impl DeviceLayer<'_> {
             let geometry = [seg.p0 as u64, ratio as u64, self.index_topk as u64];
             let ring = [selected_stride as u64, self.kv_ring.rows() as u64];
             match (bulk_attn, rows.kernels.attn_split) {
-                (None, Some([scores, softmax, values])) if fixed_heads =>
-                {
+                (None, Some([scores, softmax, values])) if fixed_heads => {
                     let attn_scores =
                         b.attn_scores + row0 * (attn_heads * attn_max_attended * 4) as u64;
                     let attn_probs =
