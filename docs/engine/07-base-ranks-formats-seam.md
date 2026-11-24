@@ -179,6 +179,28 @@ those ids. The measurement stands as it is: at two ranks the device arm cannot r
 routed experts because their shape is not built, and R3's rank-count and padding instances are
 what unblock it.
 
+Three more windows, each on the same synthetic checkpoint and the same host, narrowed it:
+
+* **The per-world instances build.** After the world-suffixed rows (134 cubins: 36 `_s2`,
+  14 `_s2w2`, 14 `_s2w1`) the harness staged 14 cubins for two ranks and 36 for four, and the
+  kernel ladder's hash step passed unchanged (`all kernels match the recorded baseline` over
+  51 kernels): relaxing the rank asserts moved no released cubin's bytes.
+* **The one-host group is the wrong vehicle.** The same run then refused before a forward with
+  `SPARK_COMM_REDUCE=tcp is a host-arm exchange, but this run takes the device arm, whose
+  per-layer collectives are NCCL enqueues`. `scripts/one-host-group.sh` pins that variable for
+  the deepseek arm, so the device group is the one the deployed launcher starts,
+  `scripts/serve-four-node.sh`, and `second-shape.py` now drives it when `SPARK_NODES` names the
+  nodes. The launcher takes `SPARK_WORLD` (1, 2 or 4) rather than asserting four, and forwards
+  `SPARKFLASH_UNPINNED_SECOND_SHAPE` to every rank, which a staged second-shape cubin needs.
+* **The four-node group forms and the workers die.** At world 4 all four ranks started, the run
+  header reported `reduce=nccl`, the device opened, and the three workers exited about two
+  seconds into the plan builder with no error line - the last line is
+  `layers.0.attn_norm.weight: planned as no stated format, the plan builder writes BF16` - after
+  which rank 0 reported a closed control channel. At world 1, one rank on the head node, the
+  arm refused cleanly at exit 2 with `deepseek_ptx is not loadable under runtime availability`
+  for every part, so at one rank the DeepSeek image is judged unloadable and the reason lies
+  earlier in the open. Neither is a shape refusal any more, and both are being traced.
+
 ## 4. The work
 
 ### R. Ranks
