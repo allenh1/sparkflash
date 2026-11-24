@@ -2484,6 +2484,33 @@ padded = 640
 experts = 384
 top_k = 6
 
+# The routed stage/combine pair the device-layer routed path launches. One cubin holds both entry
+# symbols, so both rows state the released geometry; the stage copies an expert slice and the
+# combine orders the token's routed slots by global expert id.
+[[instance]]
+source = "moe_routed_device_sm121.cu"
+entry = "moe_expert_stage_sm121"
+cubin = "moe_routed_device_sm121"
+family = "routed"
+format = "mx-fp4"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "moe_routed_device_sm121.cu"
+entry = "moe_routed_combine_sm121"
+cubin = "moe_routed_device_sm121"
+family = "routed"
+format = "bf16"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
 [[instance]]
 source = "b12x_mxfp8_wo_a_sm121.cu"
 entry = "b12x_mxfp8_wo_a_sm121"
@@ -9159,3 +9186,202 @@ hidden = 4608
 intermediate = 2304
 experts = 384
 top_k = 8
+
+# --- The routed device at the second shape's four, one and two ranks ---------------------------
+# The four-rank copy is here because the routed stage/combine pair had no instance at any
+# geometry: the released build compiled them from the shared header's constants. The one- and
+# two-rank copies widen the per-rank expert intermediate (512 and 256) while hidden, experts and
+# top-k stay 4096, 64 and 4. A cubin is one compiled shape, so each rank count needs its own copy;
+# the run stages it under the released file name. The router and the two MXFP4 bodies are
+# world-independent in shape, but the staging still needs a cubin a rank count, because it copies
+# the released file name and refuses a missing build.
+
+[[instance]]
+source = "moe_routed_device_sm121.cu"
+entry = "moe_expert_stage_sm121"
+cubin = "moe_routed_device_sm121_s2"
+family = "routed"
+format = "mx-fp4"
+hidden = 4096
+intermediate = 128
+padded = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "moe_routed_device_sm121.cu"
+entry = "moe_routed_combine_sm121"
+cubin = "moe_routed_device_sm121_s2"
+family = "routed"
+format = "bf16"
+hidden = 4096
+intermediate = 128
+padded = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "moe_routed_device_sm121.cu"
+entry = "moe_expert_stage_sm121"
+cubin = "moe_routed_device_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+hidden = 4096
+intermediate = 512
+padded = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "moe_routed_device_sm121.cu"
+entry = "moe_routed_combine_sm121"
+cubin = "moe_routed_device_sm121_s2w1"
+family = "routed"
+format = "bf16"
+hidden = 4096
+intermediate = 512
+padded = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "b12x_mxfp4_moe_sm121.cu"
+entry = "b12x_mxfp4_moe_sm121"
+cubin = "b12x_mxfp4_moe_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+padded = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "b12x_mxfp4_moe_stored_sm121.cu"
+entry = "b12x_mxfp4_moe_stored_sm121"
+cubin = "b12x_mxfp4_moe_stored_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+padded = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "moe_router_sm121.cu"
+entry = "moe_router_sm121"
+cubin = "moe_router_sm121_s2w1"
+family = "router"
+format = "bf16"
+catalogue = "deepseek-router"
+hidden = 4096
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_sm121"
+cubin = "opt_router_sm121_s2w1"
+family = "router"
+format = "bf16"
+catalogue = "deepseek-router"
+hidden = 4096
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_e128k3_sm121"
+cubin = "opt_router_sm121_s2w1"
+family = "router"
+format = "bf16"
+catalogue = "deepseek-router"
+hidden = 4096
+experts = 32
+top_k = 2
+
+[[instance]]
+source = "moe_routed_device_sm121.cu"
+entry = "moe_expert_stage_sm121"
+cubin = "moe_routed_device_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+hidden = 4096
+intermediate = 256
+padded = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "moe_routed_device_sm121.cu"
+entry = "moe_routed_combine_sm121"
+cubin = "moe_routed_device_sm121_s2w2"
+family = "routed"
+format = "bf16"
+hidden = 4096
+intermediate = 256
+padded = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "b12x_mxfp4_moe_sm121.cu"
+entry = "b12x_mxfp4_moe_sm121"
+cubin = "b12x_mxfp4_moe_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+padded = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "b12x_mxfp4_moe_stored_sm121.cu"
+entry = "b12x_mxfp4_moe_stored_sm121"
+cubin = "b12x_mxfp4_moe_stored_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+padded = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "moe_router_sm121.cu"
+entry = "moe_router_sm121"
+cubin = "moe_router_sm121_s2w2"
+family = "router"
+format = "bf16"
+catalogue = "deepseek-router"
+hidden = 4096
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_sm121"
+cubin = "opt_router_sm121_s2w2"
+family = "router"
+format = "bf16"
+catalogue = "deepseek-router"
+hidden = 4096
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "opt_router_sm121.cu"
+entry = "opt_router_e128k3_sm121"
+cubin = "opt_router_sm121_s2w2"
+family = "router"
+format = "bf16"
+catalogue = "deepseek-router"
+hidden = 4096
+experts = 32
+top_k = 2

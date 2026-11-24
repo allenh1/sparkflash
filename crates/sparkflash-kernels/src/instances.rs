@@ -42,6 +42,7 @@ pub fn consts_for_source(source: &str, name: &str) -> crate::c_decl::Consts {
         "b12x_mxfp4_moe_stored_sm121.cu" => {
             table.extend(B12X_MXFP4_MOE_STORED_SM121_DEFINES);
         }
+        "moe_routed_device_sm121.cu" => table.extend(MOE_ROUTED_DEVICE_SM121_DEFINES),
         "b12x_mxfp8_wo_a_sm121.cu" => table.extend(B12X_MXFP8_WO_A_SM121_DEFINES),
         _ => {}
     }

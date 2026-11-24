@@ -54,14 +54,29 @@ pub const TOPK_BLOCK: (u32, u32, u32) = (router_abi::TOPK_THREADS, 1, 1);
 /// # Errors
 /// tokens == 0 is refused rather than launched as a zero-sized grid.
 pub fn grid(tokens: u32) -> Result<(u32, u32, u32), String> {
-    if tokens == 0 {
+    grid_at(tokens, router_abi::N_ROUTED)
+}
+
+/// The stage-one grid for `tokens` tokens over `n_routed` experts:
+/// `(n_routed / experts-per-block, ceil(tokens / 8), 1)`.
+///
+/// The released grid is [grid]; a second-shape build routes over fewer experts and its kernel's
+/// partition loop is sized by the compiled expert count, so the released grid would launch blocks
+/// whose expert index is past the gate weight and the score row.
+///
+/// # Errors
+/// Zero tokens or zero experts is refused rather than launched as a zero-sized grid.
+pub fn grid_at(tokens: u32, n_routed: u32) -> Result<(u32, u32, u32), String> {
+    if tokens == 0 || n_routed == 0 {
         return Err(
-            "the router routes at least one token, so the grid is not zero-sized".to_owned(),
+            "the router routes at least one token over at least one expert, so the grid is not \
+             zero-sized"
+                .to_owned(),
         );
     }
     let token_blocks = tokens.div_ceil(router_abi::TOKENS_PER_BLOCK);
     Ok((
-        router_abi::N_ROUTED / router_abi::EXPERTS_PER_BLOCK,
+        n_routed.div_ceil(router_abi::EXPERTS_PER_BLOCK),
         token_blocks,
         1,
     ))
@@ -169,7 +184,26 @@ pub fn launch(
     topk: Kernel,
     params: &RouterLaunchParams,
 ) -> Result<(), String> {
-    cuda.launch(router, grid(params.tokens)?, BLOCK, &params.words())?;
+    launch_at(cuda, router, topk, params, router_abi::N_ROUTED)
+}
+
+/// Launches stage one, then stage two, at one instance's routed expert count.
+///
+/// # Errors
+/// As [launch], plus a zero expert count.
+pub fn launch_at(
+    cuda: &Cuda,
+    router: Kernel,
+    topk: Kernel,
+    params: &RouterLaunchParams,
+    n_routed: u32,
+) -> Result<(), String> {
+    cuda.launch(
+        router,
+        grid_at(params.tokens, n_routed)?,
+        BLOCK,
+        &params.words(),
+    )?;
     cuda.launch(
         topk,
         topk_grid(params.tokens)?,

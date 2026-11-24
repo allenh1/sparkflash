@@ -38,12 +38,12 @@
 //    contents are undefined.
 //
 // 2. `moe_routed_combine_sm121` - the host arm's post-stored-combine epilogue, on device:
-//      for each token, order the six routed slots by ascending GLOBAL expert id (a selection sort
+//      for each token, order the top_k routed slots by ascending GLOBAL expert id (a selection sort
 //      over the ids the router wrote, stable on equal ids: the first minimum in ascending slot
 //      order wins);
 //      round each slot's f32 rank accumulator to bf16 - the expert's w2 output dtype,
 //      model.py:851-852 returns `self.w2(x.to(dtype))` - and widen it back;
-//      add the six values in that order in f32 starting from 0.0f, with __fadd_rn;
+//      add the top_k values in that order in f32 starting from 0.0f, with __fadd_rn;
 //      write the f32 total (the routed sum the shared expert add consumes, "moe_delta") and its
 //      bf16 narrow (the pre-reduce payload the bf16 all-reduce consumes).
 //    The two roundings are the references' own bit arithmetic, transcribed below; the per-slot round
@@ -69,6 +69,34 @@
 #define spark_moe_routed_round_slot_bits opt_round_slot_bits
 #define spark_moe_routed_narrow_bits opt_narrow_bits
 
+// The routed geometry this image is built for. kernels/instances.toml states it for the released
+// four-rank build and for the second shape at four, one and two ranks; the per-rank intermediate
+// width divides by the world, so a geometry is an instance argument, not one of the shared
+// header's released constants. Both entries of this image are one compile group and must state the
+// same geometry.
+#if !defined(SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_HIDDEN) ||          \
+    !defined(SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_INTERMEDIATE) ||   \
+    !defined(SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_PADDED) ||         \
+    !defined(SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_TOP_K)
+#error "moe_routed_device_sm121.cu: the routed geometry is an instance argument; add the moe_routed_device_sm121 instance to kernels/instances.toml"
+#endif
+#if !defined(SPARK_INSTANCE_MOE_ROUTED_COMBINE_SM121_HIDDEN) ||        \
+    !defined(SPARK_INSTANCE_MOE_ROUTED_COMBINE_SM121_INTERMEDIATE) || \
+    !defined(SPARK_INSTANCE_MOE_ROUTED_COMBINE_SM121_PADDED) ||       \
+    !defined(SPARK_INSTANCE_MOE_ROUTED_COMBINE_SM121_TOP_K)
+#error "moe_routed_device_sm121.cu: the routed geometry is an instance argument; add the moe_routed_device_sm121 instance to kernels/instances.toml"
+#endif
+static_assert(SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_HIDDEN ==
+                  SPARK_INSTANCE_MOE_ROUTED_COMBINE_SM121_HIDDEN,
+              "the two entries of one cubin must state one hidden width");
+static_assert(SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_TOP_K ==
+                  SPARK_INSTANCE_MOE_ROUTED_COMBINE_SM121_TOP_K,
+              "the two entries of one cubin must state one top-k");
+#define SPARK_MOE_ROUTED_HIDDEN SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_HIDDEN
+#define SPARK_MOE_ROUTED_TOP_K SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_TOP_K
+#define SPARK_MOE_ROUTED_INTERMEDIATE SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_INTERMEDIATE
+#define SPARK_MOE_ROUTED_PADDED SPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_PADDED
+
 // 256 threads: the staging kernel copies one row per block and the combine kernel owns one 256-wide
 // column tile per block. Both are launch-geometry constants, pinned by the Rust ABI module.
 #define SPARK_MOE_ROUTED_THREADS 256u
@@ -84,16 +112,20 @@
 // takes. The two fallbacks keep a geometry change from becoming a misaligned access.
 #define SPARK_MOE_ROUTED_COPY_ALIGN 16u
 // The routed-row ceiling one stage call may gather, and the size of the host-side staging plan. It is
-// a capacity bound, not a model constant: the released decode is one token (six rows) and a batch of
-// `MAX_ROUTED_ROWS / 6` tokens still fits.
+// a capacity bound, not a model constant: the released decode is one token (top-6 rows) and a batch
+// of `MAX_ROUTED_ROWS / 6` tokens still fits, which also covers the second shape's top-4.
 #define SPARK_MOE_ROUTED_MAX_ROWS 384u
 
-static_assert(SPARK_M4_MOE_TOP_K == 6u,
-              "moe_routed_combine_sm121 orders the router's six routed slots by expert id");
-static_assert(SPARK_M4_HIDDEN % SPARK_MOE_ROUTED_TILE_COLS == 0u,
+static_assert(SPARK_MOE_ROUTED_TOP_K > 0u && SPARK_MOE_ROUTED_TOP_K <= 32u,
+              "moe_routed_combine_sm121 orders the router's routed slots by expert id");
+static_assert(SPARK_MOE_ROUTED_HIDDEN % SPARK_MOE_ROUTED_TILE_COLS == 0u,
               "the combine kernel tiles the hidden row by its block width");
-static_assert(SPARK_MOE_ROUTED_MAX_ROWS >= SPARK_M4_MOE_TOP_K,
+static_assert(SPARK_MOE_ROUTED_MAX_ROWS >= SPARK_MOE_ROUTED_TOP_K,
               "at least one token's routed rows fit the staging plan");
+static_assert(SPARK_MOE_ROUTED_PADDED >= SPARK_MOE_ROUTED_INTERMEDIATE,
+              "the staged activation row holds the rank's real intermediate width");
+static_assert(SPARK_MOE_ROUTED_INTERMEDIATE % SPARK_M4_QUANT_BLOCK == 0u,
+              "the weighted SwiGLU row is a whole number of 32-column scale blocks");
 static_assert(SPARK_MOE_ROUTED_COPY_ALIGN % 4u == 0u,
               "the typed copy fallback is a whole number of 32-bit words");
 
@@ -149,9 +181,10 @@ __device__ __forceinline__ void spark_moe_routed_copy(const uint8_t *__restrict_
 // never learns an address or an id.
 //
 // `expert_ids` is `[rows]` in routed-row order (row = token * top_k + slot), which is
-// `workspace.moe_ids` at the released top-6 geometry. Every id is a global expert index in
+// `workspace.moe_ids` at the released top-6 geometry and `workspace.moe_ids` at the second shape's
+// top-4. Every id is a global expert index in
 // `[0, experts)`; the pinned router (kernels/moe_router_sm121.cu, `moe_router_topk_sm121`) selects
-// six DISTINCT ids from `[0, n_routed)` by scanning that range, so an out-of-range id is a corrupted
+// top_k DISTINCT ids from `[0, n_routed)` by scanning that range, so an out-of-range id is a corrupted
 // workspace rather than a routing outcome. The clamp to 0 is therefore unreachable for the pinned
 // producer; it exists because `table[id]` is an address, and a corrupted id must not become an
 // arbitrary device read. The Rust launcher refuses `experts` different from the table's expert count.
@@ -199,9 +232,9 @@ extern "C" __global__ void moe_expert_stage_sm121(
 // numbered in ascending expert-id order (`moe_slots` sorts and dedups the selection before mapping),
 // so ordering by slot index and ordering by global id are the same permutation. This kernel takes the
 // ids because the device path never builds the host slot map, and sorts by the id directly - the same
-// six rows in the same order, hence the same sequence of f32 additions.
+// top_k rows in the same order, hence the same sequence of f32 additions.
 //
-// One thread owns one hidden column of one token, so the six-deep ordered add chain per column is the
+// One thread owns one hidden column of one token, so the top-k-deep ordered add chain per column is the
 // reference's order and nothing is reassociated. Both outputs are written from the same `total`: the
 // f32 row (the pre-shared-expert routed sum, "moe_delta") and its bf16 payload word row.
 extern "C" __global__ void moe_routed_combine_sm121(
@@ -216,10 +249,10 @@ extern "C" __global__ void moe_routed_combine_sm121(
     if (token >= tokens || column >= hidden) {
         return;
     }
-    uint32_t ids[SPARK_M4_MOE_TOP_K];
+    uint32_t ids[SPARK_MOE_ROUTED_TOP_K];
 #pragma unroll
-    for (uint32_t slot = 0u; slot < (uint32_t)SPARK_M4_MOE_TOP_K; ++slot) {
-        ids[slot] = expert_ids[(uint64_t)token * SPARK_M4_MOE_TOP_K + slot];
+    for (uint32_t slot = 0u; slot < (uint32_t)SPARK_MOE_ROUTED_TOP_K; ++slot) {
+        ids[slot] = expert_ids[(uint64_t)token * SPARK_MOE_ROUTED_TOP_K + slot];
     }
     // Selection sort by ascending expert id, first minimum in ascending slot order: exactly
     // mxfp4_ref::moe_combine_slot_order. A bitmask is the "used" set, so the whole loop stays in
@@ -227,19 +260,19 @@ extern "C" __global__ void moe_routed_combine_sm121(
     uint32_t used = 0u;
     float total = 0.0f;
 #pragma unroll
-    for (uint32_t position = 0u; position < (uint32_t)SPARK_M4_MOE_TOP_K; ++position) {
-        uint32_t best = SPARK_M4_MOE_TOP_K;
+    for (uint32_t position = 0u; position < (uint32_t)SPARK_MOE_ROUTED_TOP_K; ++position) {
+        uint32_t best = SPARK_MOE_ROUTED_TOP_K;
 #pragma unroll
-        for (uint32_t slot = 0u; slot < (uint32_t)SPARK_M4_MOE_TOP_K; ++slot) {
+        for (uint32_t slot = 0u; slot < (uint32_t)SPARK_MOE_ROUTED_TOP_K; ++slot) {
             if (((used >> slot) & 1u) != 0u) {
                 continue;
             }
-            if (best == (uint32_t)SPARK_M4_MOE_TOP_K || ids[slot] < ids[best]) {
+            if (best == (uint32_t)SPARK_MOE_ROUTED_TOP_K || ids[slot] < ids[best]) {
                 best = slot;
             }
         }
         used |= 1u << best;
-        const uint64_t index = ((uint64_t)token * SPARK_M4_MOE_TOP_K + best) * hidden + column;
+        const uint64_t index = ((uint64_t)token * SPARK_MOE_ROUTED_TOP_K + best) * hidden + column;
         // The expert's bf16 output, widened: the reference adds the widened bf16 value.
         const float expert_output =
             __uint_as_float(spark_moe_routed_round_slot_bits(slot_acc[index]) << 16);

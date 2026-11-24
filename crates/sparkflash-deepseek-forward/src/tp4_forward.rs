@@ -7636,10 +7636,12 @@ struct SharedExpertDeviceLayer {
 
 /// The routed MoE geometry the arm asserts at open.
 ///
-/// The released four-rank shape is the only one the routed kernels are launched for (world 4, 384
-/// experts, top-6, 576 rows per rank), so a config that disagrees refuses at open rather than stage
-/// a weight whose slice shape is wrong. The routed expert slices are arena pointers, not copies:
-/// the arm holds them and every token's six experts index into them.
+/// This is the config's split of `moe_inter_dim` over the world; whether a kernel build exists for
+/// the resulting shape is the instance question `MoeRoutedGeometry::new` answers, not this one.
+/// The released shape (world 4, 384 experts, top-6, 576 rows per rank) and the second shape (worlds
+/// 1, 2 and 4, 64 experts, top-4, 128/256/512 rows per rank) both pass here, and any other shape
+/// refuses at open naming how it fails to split. The routed expert slices are arena pointers, not
+/// copies: the arm holds them and every routed row indexes into them.
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoutedGeometry {
@@ -7659,11 +7661,12 @@ struct RoutedGeometry {
 
 #[cfg(feature = "cuda")]
 impl RoutedGeometry {
-    /// The released routed shape, refused by name for any other config.
+    /// The config's routed split, refused by name when it cannot be staged at all.
     ///
     /// # Errors
-    /// A world other than four, a routed/activated expert count or width that is not the released
-    /// one, or an intermediate width that does not split into whole 32-value blocks.
+    /// A zero world, an intermediate width that does not split over the world, a dim/inter/local
+    /// width that is not a whole number of 32-value blocks, or a top-k that does not fit the routed
+    /// expert count.
     fn new(config: &crate::plan::ModelConfig, world: usize) -> Result<Self, String> {
         let dim = config.dim;
         let inter = config.moe_inter_dim;
@@ -16443,9 +16446,21 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             step_seq,
         };
         if let Some((_, kernel, ticket)) = self.opt_router {
+            // One block a group of OPT_ROUTER_EXPERTS_PER_BLOCK experts: 48 blocks at the released
+            // 384, eight at the second shape's 64. A released grid here would have every block past
+            // the expert count score a gate row that is not in the expert's weight and write a
+            // score column past the row.
+            let blocks = u32::try_from(
+                experts / sparkflash_kernels::moe_routed_device::OPT_ROUTER_EXPERTS_PER_BLOCK,
+            )
+            .map_err(|_| {
+                format!(
+                    "layer device stage moe_router: {experts} experts do not fit the router grid"
+                )
+            })?;
             self.cuda.launch(
                 kernel,
-                (48, 1, 1),
+                (blocks, 1, 1),
                 (256, 1, 1),
                 &[
                     x.device,
@@ -16459,7 +16474,12 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                 ],
             )?;
         } else {
-            sparkflash_kernels::router_launch::launch(self.cuda, kernels.1, kernels.3, &params)?;
+            let n_routed = u32::try_from(experts).map_err(|_| {
+                format!("layer device stage moe_router: {experts} experts do not fit a launch word")
+            })?;
+            sparkflash_kernels::router_launch::launch_at(
+                self.cuda, kernels.1, kernels.3, &params, n_routed,
+            )?;
         }
         // Measurement only (SPARKFLASH_ROUTE_DUMP=<file>, rank 0): one line per (position, layer)
         // with the routed ids, for the expert-overlap estimate of a multi-row verify.
