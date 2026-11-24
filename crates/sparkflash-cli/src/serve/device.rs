@@ -766,7 +766,8 @@ impl Live {
                     },
                     DEVICE_FABRIC,
                 );
-                self.send(EngineEvent::TokenIds(std::mem::take(&mut self.ids)));
+                let ids = std::mem::take(&mut self.ids);
+                self.send(EngineEvent::TokenIds(ids));
                 if let EngineEvent::Finished { usage, .. } = &mut event {
                     usage.completion_tokens_details.reasoning_tokens = self.reasoning_tokens;
                     usage.prompt_tokens_details.cached_tokens = outcome.cached_tokens;
