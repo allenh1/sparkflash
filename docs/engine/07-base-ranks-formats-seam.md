@@ -505,9 +505,13 @@ the serving arm's activated rows. The Inkling check reads one released expert's 
 `model.llm.embed` row; it compares `inkling_nvfp4_expert_matvec` against the tile's rows form on
 both projections, with `amax / denominator` applied at the output by both. Each prints max
 absolute/relative difference, max ULP distance, bit-equal count, and median launch milliseconds
-for the serving arm and the tile over `--repeat` runs. The commands run only in the lead's
-window; nothing in this repository changes the catalogue or the scan row until the device arm has
-run the synthetic variant.
+for the serving arm and the tile over `--repeat` runs. The bar is the accumulation-order
+allowance, not a decode tolerance: the arms read the same stored bytes, so only the f32 order of
+their sums may differ (about 1e-6 relative); the harness fails above 1e-3 relative, three orders
+of magnitude above that noise and three below a two-percent band. A swapped convention, a per-16
+scale on the wrong block or an amax/denominator applied twice is a failure. The commands run only
+in the lead's window; nothing in this repository changes the catalogue or the scan row until the
+device arm has run the synthetic variant.
 
 What a later F4 family must do differently: it inherits the two convention names, the `Group`
 plane and the `SPM_W_FP4` mode; it must not re-use one name for both, and it must not fold the

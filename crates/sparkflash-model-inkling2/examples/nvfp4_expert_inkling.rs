@@ -26,7 +26,13 @@
 //! release's `amax / outer_scale_denominator`, applied to the output by both bodies.
 //!
 //! The harness prints max absolute/relative difference, max ULP distance and bit-equal count for
-//! each projection, then median launch milliseconds over `--repeat`.
+//! each projection, then median launch milliseconds over `--repeat`. The bar is the
+//! accumulation-order allowance: the two arms read the same stored bytes, so the only permitted
+//! difference is the f32 order of their sums on a long dot product (about 1e-6 relative). The
+//! harness fails above 1e-3 relative - three orders of magnitude above that noise and three below
+//! a two-percent band - and it is not a tolerance for decode disagreement: a swapped convention, a
+//! per-16 scale on the wrong block or an amax/denominator applied twice is a failure, not a number
+//! to report.
 //!
 //! Usage, after `scripts/build-cubins.sh`:
 //! ```
@@ -141,8 +147,10 @@ fn compare(name: &str, serving: &[f32], candidate: &[f32]) -> Result<(), String>
         "{name}: values={} bit_equal={equal} max_abs={max_abs:.6e} max_rel={max_rel:.6e} max_ulp={max_ulp}",
         serving.len()
     );
-    if max_rel > 0.02 {
-        return Err(format!("{name}: max_rel {max_rel:.6e} exceeds 2%"));
+    if max_rel > 1e-3 {
+        return Err(format!(
+            "{name}: max_rel {max_rel:.6e} exceeds the 1e-3 accumulation-order allowance"
+        ));
     }
     Ok(())
 }
