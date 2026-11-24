@@ -640,6 +640,77 @@ NCCL directory before it writes the checkpoint or starts a rank, with tests in
 and no token were produced, the group was never started, and production was restored in the same
 5m13s the group was down (`/readyz` 200, four ranks, the release binary unchanged).
 
+**Result (2026-11-24, world 1 on one GPU: PASS).** Tip `8b2787d5` (binary built on the one-GPU
+host from that tip), the released stored format, a fresh checkpoint and a fresh world-1 reference:
+
+```
+second-shape: host reference [[6653,32022,10645,30694,10417,1244,26249,25845],
+                              [24615,28321,20995,5303,18514,31436,24024,27836],
+                              [27251,21027,27746,10720,3156,14751,31482,15660]]
+second-shape: world 1: expected host-reference-w1.json; equals global reference: yes
+second-shape: prompt 0 ok (8 tokens) / prompt 1 ok / prompt 2 ok
+second-shape: VERDICT PASS
+second-shape: world 1 PASS: the device group agreed with host-reference-w1.json
+```
+
+The device arm at one rank produces the host reference's eight ids on every prompt, through the
+served path: bulk prompt chunks, the rows decode, the drafter (`accept_length` 1.0 on random
+weights) and the one-rank group. It was rerun at `9ecd80e2` with the same ids. What made it agree
+was the Engram hash, not a device kernel: the host reference hashed n-grams over raw token ids,
+and the device over the tokenizer's compressed map, so both arms were self-consistent and
+different. There is now one configuration-driven hash and one token map
+(`sparkflash_engram::compress::compressed_token_map`, `forward::engram::ngram_hashes_mapped`), read
+by the host reference (`--tokenizer`), the one-rank host arm (`tp4_host.rs`) and the device
+(`tp4_forward/spec.rs`). The released Engram rows are unchanged: the configuration hash equals the
+released constant tables on the goldens and on 64 random histories
+(`sparkflash-engram/tests/engram_hash.rs`, 17 pass). A token map whose class count is not
+`engram_compressed_vocab_size`, or that misses the pad id, is refused at open, and a bucket past
+the table is refused by name rather than skipped (`9ecd80e2`). The fixture's
+`engram_compressed_vocab_size` is now the map's 99,092 classes.
+
+Worlds 2 and 4 cannot be proved on one GPU. The device arm's collectives are NCCL with one
+process a GPU, so a 2- or 4-rank device group needs that many nodes (`SPARK_NODES`), and the run
+records `a 4-rank device group needs 4 SPARK_NODES and SPARK_PEERS addresses`. The 4-rank host arm
+on the same host passed and equals the global reference. The 2-rank host arm lost its port to the
+world-1 group that was still stopping; the harness now waits for the port before every group
+(`wait_port_free`). Worlds 2 and 4 of the device arm are the cluster's.
+
+**The stored-format sweep at world 1 (2026-11-24).** The eight non-released variants were written
+and run on the device arm at world 1 (`fp8-f32`, `fp8-bf16`, `bf16`, `packed-bf16`, `nvfp4-qwen`,
+`nvfp4-inkling`, `mx-fp8-row`, `nvfp4-qwen@0-3,mx-fp8-row@4-7`). Every one is refused at open, by
+name, before a launch; none produced a wrong id:
+
+| variant | first refusal |
+|---|---|
+| fp8-f32, fp8-bf16 | `mla_attention ... FP8 (tile scale, one scale per 128 values)`: `deepseek_ptx exports no symbol decoding` it, prefill and decode passes; `moe` likewise |
+| bf16, packed-bf16 | `mla_attention ... FP8-BF16 (tile scale, 128)`: the layout states the MLA projections as `f8e4m3`, and with no FP8 class in the checkpoint `layout_format` falls back to a 128 tile |
+| nvfp4-qwen, nvfp4-inkling | `mtp` and `moe ... NVFP4`: no DeepSeek symbol decodes it, and the other images refuse the shape (`qwen4_prefill_sm121: routed shape (4096, 64, 4) is not one of ...`) |
+| mx-fp8-row | `mtp ... MXFP8 (power-of-two grid, 32-tile)`: the MTP part is read as the grid, not the row form (`is_row_scale` is checked for `Part::Moe` only) |
+| joint | the NVFP4 refusal |
+
+What the sweep showed about the F4 device paths recorded below: every F4 family's device launch
+is in `moe_device.rs` (`MoeDeviceBackendImpl::ffn_nvfp4`, `ffn_mxfp8_row`), and that backend is
+used only by the CLI's `device-chain` stage (`sparkflash-cli/src/device_chain.rs`), which uploads
+weights per call and runs the SwiGLU on the host. The served arm (`serve` at any world) runs the
+routed experts through `rows_moe_routed` -> `MoeRoutedDevice` (MXFP4 only), prompt chunks and decode
+rows alike, and the MTP stage through the drafter. No served launch reads a non-released format,
+so F3 and every F4 family are still open on the device arm. The served route they need, in the
+order the sweep's refusals fall:
+
+1. **Routed experts.** One served route at `rows_moe_routed` for any non-released block format:
+   the shared plan (`moe_plan`, already loaded by the base) groups the step's slots by expert;
+   the shared tile's routed mode (`shared_prefill_mma_body<FMT, true, ...>`, the mode Qwen's FP8
+   experts and GLM's serve on) runs gate and up into slot rows, `rows.swiglu` applies the base's
+   clamp, down applies the routing weight into slot partials, and one combine adds the top-k
+   partials and the shared expert's addend into the delta. Weight modes: FP8 tiles (f32 and bf16
+   scales, existing), NVFP4 (existing `SPM_W_FP4`; the routed mode must read the group plane and
+   the per-matrix tensor-wide factor from the expert table), row-scaled MXFP8 (a new decode of the
+   same body: E4M3 times one power of two a row per 32, exact in the BF16 tile) and BF16.
+2. **The MTP stage's experts**, the same route from the drafter.
+3. **The dense projections** (attention, indexer, shared expert, MTP projections) for the FP8 tile
+   and BF16 classes, and the layout's dense-class dtypes for the MLA tensors.
+4. **The catalogue claims** for each symbol, so the open resolves them.
+
 ## 4. The work
 
 ### R. Ranks
