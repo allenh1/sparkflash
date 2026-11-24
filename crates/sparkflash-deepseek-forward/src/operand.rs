@@ -19,7 +19,8 @@
 //! module is the one place they are derived:
 //!
 //! * [ScalePlanes] - what the bind must carry beside the values: a block (grid) scale plane, a
-//!   row scale plane, a tensor-wide factor, and a packed tensor's escape list. The sizes come
+//!   row scale plane, a per-group plane, a tensor-wide convention, and a packed tensor's escape
+//!   list. The sizes come
 //!   from the format's block and kind, never from a dtype string or a byte count of a tensor the
 //!   caller happened to read.
 //! * [arrange] - how the loader lays a tensor out for the body that reads it: as stored, in the
@@ -90,6 +91,9 @@ impl ActivationForm {
     }
 }
 
+/// The empty escape list the bind carries for a packed tensor before the loader fills it.
+const NO_ESCAPES: &[u32] = &[];
+
 /// The scale planes a format's tensors carry, sized for one operand geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalePlanes {
@@ -115,6 +119,19 @@ impl ScalePlanes {
     /// The planes one `rows` x `cols` tensor of `format` carries.
     #[must_use]
     pub const fn of(format: StoredFormat, rows: usize, cols: usize) -> Self {
+        if format.is_unscaled() {
+            return Self {
+                grid_bytes: 0,
+                row_bytes: 0,
+                group_bytes: 0,
+                tensor_wide: NvFp4Wide::None,
+                escapes: if format.layout() as u8 == FormatLayout::Packed as u8 {
+                    Some(NO_ESCAPES)
+                } else {
+                    None
+                },
+            };
+        }
         let block = if format.block() == 0 {
             1
         } else {
@@ -142,7 +159,15 @@ impl ScalePlanes {
             row_bytes: row_entries as u64 * bytes,
             group_bytes: group_entries as u64 * bytes,
             tensor_wide: format.tensor_wide(),
-            escapes: None,
+            // A packed tensor's escape list is the one plane it carries: the values are unscaled,
+            // and the list is loaded with the tensor rather than sized from its geometry. The
+            // empty list here is the bind's statement that the plane exists; `arrange` fills it
+            // from the store it is handed.
+            escapes: if format.layout() as u8 == FormatLayout::Packed as u8 {
+                Some(NO_ESCAPES)
+            } else {
+                None
+            },
         }
     }
 
@@ -163,37 +188,65 @@ pub struct Arranged {
     pub bytes: Vec<u8>,
     /// The layout the bytes are in.
     pub layout: FormatLayout,
+    /// The escape list the arrangement read, empty for a layout that has none.
+    pub escapes: Vec<u32>,
 }
 
 /// One stored tensor laid out for its resolved body: the one place the arrangement happens.
 ///
 /// A row-major format is handed over as stored; the 32 x 32 tiling is DeepSeek's B12x
-/// permutation (padding zeroed); the packed word form is already the body's order and is passed
-/// through, its escape list travelling with it ([ScalePlanes::escapes]).
+/// permutation (padding zeroed); the packed word form is unpacked here into the BF16 rows the
+/// body already reads, its escape list resolving what the packed words do not carry.
 ///
 /// # Errors
-/// The bytes do not hold exactly `rows * cols` values of the format, or a layout this build does
-/// not arrange.
+/// The store is not the length the format and its escape list describe, the values are not the
+/// layout's, or a layout this build does not arrange.
 pub fn arrange(
     format: StoredFormat,
     stored: &[u8],
     rows: usize,
     cols: usize,
+    escapes: &[u32],
 ) -> Result<Arranged, String> {
-    let per_byte = format.values().values_per_byte();
-    let expected = rows.saturating_mul(cols).div_ceil(per_byte);
-    if stored.len() != expected {
-        return Err(format!(
-            "a {rows} x {cols} {} tensor is {expected} bytes, the store holds {}",
-            format.name(),
-            stored.len()
-        ));
-    }
     match format.layout() {
-        FormatLayout::RowMajor | FormatLayout::Packed => Ok(Arranged {
-            bytes: stored.to_vec(),
-            layout: format.layout(),
-        }),
+        FormatLayout::Packed => {
+            if format.values() != FormatValues::Bf16 {
+                return Err(format!(
+                    "the packed word form is a BF16 arrangement; {} is {} values",
+                    format.name(),
+                    format.values().name()
+                ));
+            }
+            let bytes = sparkflash_model::packed_bf16::unpack(rows, cols, stored, escapes)
+                .map_err(|error| {
+                    format!(
+                        "a {rows} x {cols} {} tensor does not match its escape list: {error}",
+                        format.name()
+                    )
+                })?;
+            Ok(Arranged {
+                bytes,
+                layout: FormatLayout::RowMajor,
+                escapes: escapes.to_vec(),
+            })
+        }
+        FormatLayout::RowMajor => {
+            let expected = rows
+                .saturating_mul(cols)
+                .saturating_mul(format.values().bytes_per_value());
+            if stored.len() != expected {
+                return Err(format!(
+                    "a {rows} x {cols} {} tensor is {expected} bytes, the store holds {}",
+                    format.name(),
+                    stored.len()
+                ));
+            }
+            Ok(Arranged {
+                bytes: stored.to_vec(),
+                layout: FormatLayout::RowMajor,
+                escapes: Vec::new(),
+            })
+        }
         FormatLayout::Tile32 => {
             if format.values() != FormatValues::Fp8E4M3 {
                 return Err(format!(
@@ -202,10 +255,19 @@ pub fn arrange(
                     format.values().name()
                 ));
             }
+            let expected = rows.saturating_mul(cols);
+            if stored.len() != expected {
+                return Err(format!(
+                    "a {rows} x {cols} {} tensor is {expected} bytes, the store holds {}",
+                    format.name(),
+                    stored.len()
+                ));
+            }
             let tiled = sparkflash_kernels::mxfp8_ref::b12x_tile_weights(stored, rows, cols);
             Ok(Arranged {
                 bytes: tiled,
                 layout: FormatLayout::Tile32,
+                escapes: Vec::new(),
             })
         }
     }
@@ -376,18 +438,20 @@ mod tests {
 
     #[test]
     fn arranging_a_row_major_format_is_the_identity() {
-        let bytes: Vec<u8> = (0..16u8).collect();
-        let arranged = arrange(StoredFormat::BF16, &bytes, 4, 4).expect("an identity arrangement");
+        let bytes: Vec<u8> = (0..32u8).collect();
+        let arranged =
+            arrange(StoredFormat::BF16, &bytes, 4, 4, &[]).expect("an identity arrangement");
         assert_eq!(arranged.bytes, bytes);
         assert_eq!(arranged.layout, FormatLayout::RowMajor);
+        assert!(arranged.escapes.is_empty());
     }
 
     #[test]
     fn arranging_a_tiled_format_permutes_and_pads_but_loses_nothing() {
         // No zero in the store, so the padding the tiling adds is the only zero in the result.
         let bytes: Vec<u8> = (0..(33 * 32) as u32).map(|v| (v % 255) as u8 + 1).collect();
-        let arranged =
-            arrange(StoredFormat::MXFP8_TILED_32, &bytes, 33, 32).expect("the tile arrangement");
+        let arranged = arrange(StoredFormat::MXFP8_TILED_32, &bytes, 33, 32, &[])
+            .expect("the tile arrangement");
         assert_eq!(
             arranged.bytes.len(),
             64 * 32,
@@ -402,7 +466,72 @@ mod tests {
 
     #[test]
     fn a_short_store_is_refused_by_the_format() {
-        assert!(arrange(StoredFormat::BF16, &[0u8; 4], 4, 4).is_err());
+        assert!(arrange(StoredFormat::BF16, &[0u8; 4], 4, 4, &[]).is_err());
+        assert!(arrange(StoredFormat::MXFP8_TILED_32, &[0u8; 4], 4, 4, &[]).is_err());
+    }
+
+    #[test]
+    fn an_unscaled_packed_tensor_carries_only_its_escape_list() {
+        let planes = ScalePlanes::of(StoredFormat::PACKED_BF16, 4096, 5120);
+        assert_eq!(planes.grid_bytes, 0);
+        assert_eq!(planes.row_bytes, 0);
+        assert_eq!(planes.tensor_wide, NvFp4Wide::None);
+        assert_eq!(planes.total_bytes(), 0);
+        assert!(
+            planes.escapes.is_some(),
+            "the bind carries the escape plane"
+        );
+        assert!(
+            ScalePlanes::of(StoredFormat::BF16, 4096, 5120)
+                .escapes
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn arranging_the_packed_form_is_the_bf16_rows_it_stands_for() {
+        let (rows, cols) = (3usize, 512usize);
+        let mut bytes = Vec::with_capacity(rows * cols * 2);
+        for index in 0..rows * cols {
+            let value = 0.25 + (index % 19) as f32 * 0.125;
+            let bits = (value.to_bits() >> 16) as u16;
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        let (packed, escapes) = sparkflash_model::packed_bf16::pack(rows, cols, &bytes)
+            .expect("the form takes the shape");
+        let arranged = arrange(StoredFormat::PACKED_BF16, &packed, rows, cols, &escapes)
+            .expect("the packed arrangement");
+        assert_eq!(arranged.bytes, bytes, "the body reads the same BF16 rows");
+        assert_eq!(arranged.layout, FormatLayout::RowMajor);
+        assert_eq!(arranged.escapes, escapes);
+        // A store that is not the escape list's byte length is refused before any body sees it.
+        let short = &packed[..packed.len() - 16];
+        assert!(arrange(StoredFormat::PACKED_BF16, short, rows, cols, &escapes).is_err());
+        let mut wrong = escapes.clone();
+        wrong[1] = u32::MAX;
+        assert!(arrange(StoredFormat::PACKED_BF16, &packed, rows, cols, &wrong).is_err());
+    }
+
+    #[test]
+    fn the_bf16_body_is_chosen_for_both_names_of_the_one_arithmetic() {
+        let claimed = ["bf16_dense_body"];
+        let formats = |symbol: &str| match symbol {
+            "bf16_dense_body" => Some(StoredFormat::BF16),
+            _ => None,
+        };
+        for format in [StoredFormat::BF16, StoredFormat::PACKED_BF16] {
+            assert_eq!(
+                choose(Part::DenseMlp, format, &claimed, &formats),
+                Some("bf16_dense_body"),
+                "{} names the BF16 arithmetic",
+                format.name()
+            );
+        }
+        assert_eq!(
+            StoredFormat::from_name("packed-bf16"),
+            Some(StoredFormat::PACKED_BF16)
+        );
+        assert_eq!(StoredFormat::PACKED_BF16.name(), "PACKED-BF16");
     }
 
     #[test]

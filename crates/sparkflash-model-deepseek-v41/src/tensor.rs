@@ -79,6 +79,11 @@ pub struct TensorPlan {
     dense_format: Option<StoredFormat>,
     /// The routed experts' stored format; the released row-scaled MXFP4 when unset.
     expert_format: Option<StoredFormat>,
+    /// The dense and expert weights this plan stores in a format, by tensor name. The writer
+    /// packs exactly these where the format's layout is the packed word form; a plain BF16 tensor
+    /// (an embedding, a norm, a router) is not one of them, and the Engram table keeps its own
+    /// grid rather than the dense class's.
+    scaled_weights: BTreeMap<String, StoredFormat>,
 }
 
 impl TensorPlan {
@@ -142,6 +147,7 @@ impl TensorPlan {
     /// release's scale is one f32 or bf16 a tile, and the released expert's is one byte a row per
     /// 32 values along the contraction.
     fn scaled(&mut self, name: &str, format: StoredFormat, out: usize, r#in: usize) {
+        self.scaled_weights.insert(format!("{name}.weight"), format);
         let values = match format.values() {
             FormatValues::Fp8E4M3 => DType::F8E4M3,
             FormatValues::Fp4E2M1 => DType::F4E2M1,
@@ -161,24 +167,34 @@ impl TensorPlan {
             vec![out.div_ceil(block), r#in.div_ceil(block)]
         };
         self.insert(format!("{name}.weight"), values, vec![out, r#in]);
-        self.insert(format!("{name}.scale"), scale, shape);
-        // A tensor-wide convention names its own companions. They are per tensor, not per
-        // block: one f32 each, read once beside the matrix they scale.
-        match format.tensor_wide() {
-            sparkflash_model::format::NvFp4Wide::None => {}
-            sparkflash_model::format::NvFp4Wide::Qwen => {
-                self.plain(&format!("{name}.weight_scale_2"), DType::F32, vec![1]);
-                self.plain(&format!("{name}.input_scale"), DType::F32, vec![1]);
-            }
-            sparkflash_model::format::NvFp4Wide::Inkling => {
-                self.plain(&format!("{name}.weight_amax"), DType::F32, vec![1]);
-                self.plain(
-                    &format!("{name}.weight_outer_scale_denominator"),
-                    DType::F32,
-                    vec![1],
-                );
+        // An unscaled format has no plane to write. The weight still travels through this method
+        // so the plan states its format, not only its dtype.
+        if !format.is_unscaled() {
+            self.insert(format!("{name}.scale"), scale, shape);
+            // A tensor-wide convention names its own companions. They are per tensor, not per
+            // block: one f32 each, read once beside the matrix they scale.
+            match format.tensor_wide() {
+                sparkflash_model::format::NvFp4Wide::None => {}
+                sparkflash_model::format::NvFp4Wide::Qwen => {
+                    self.plain(&format!("{name}.weight_scale_2"), DType::F32, vec![1]);
+                    self.plain(&format!("{name}.input_scale"), DType::F32, vec![1]);
+                }
+                sparkflash_model::format::NvFp4Wide::Inkling => {
+                    self.plain(&format!("{name}.weight_amax"), DType::F32, vec![1]);
+                    self.plain(
+                        &format!("{name}.weight_outer_scale_denominator"),
+                        DType::F32,
+                        vec![1],
+                    );
+                }
             }
         }
+    }
+
+    /// The format this plan stores `weight_name` in, or `None` for a plain tensor.
+    #[must_use]
+    pub fn weight_format(&self, weight_name: &str) -> Option<StoredFormat> {
+        self.scaled_weights.get(weight_name).copied()
     }
 
     fn plain(&mut self, name: &str, dtype: DType, shape: Vec<usize>) {

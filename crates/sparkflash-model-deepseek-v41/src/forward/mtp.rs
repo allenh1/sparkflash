@@ -102,11 +102,18 @@ fn read_dense(
     grid: ScaleGrid,
     limit: usize,
 ) -> Result<Vec<f32>, EngineError> {
-    let scale_name = name.replace("weight", "scale");
-    let mut weight = linalg::decode_by_name(src, name, limit)?;
-    let scales = linalg::decode_by_name(src, &scale_name, limit)?;
-    linalg::apply_scales(&mut weight, rows, cols, &scales, grid)?;
-    Ok(weight)
+    use crate::forward::weight_view::WeightView;
+    // The dense class is coded on the released grid or an unquantized BF16 row; the reader
+    // applies a scale plane only when the source carries one.
+    let view = WeightView::read_optional_scale(
+        src,
+        name.trim_end_matches(".weight"),
+        rows,
+        cols,
+        grid,
+        limit,
+    )?;
+    view.to_f32(rows, cols)
 }
 
 /// One position's Markov bias: head @ embed, the logits_bias of model.py:1084-1085.

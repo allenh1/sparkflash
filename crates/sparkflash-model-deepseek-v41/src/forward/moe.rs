@@ -437,9 +437,12 @@ fn compute_routed_batched(
         let base = format!("{prefix}.ffn.experts.{expert}");
         // The batched body reads the packed F4 expert store on the checkpoint's own grid; any
         // other stored expert format takes the generic path, which materialises the weight.
-        let w1 = WeightView::read_dense(src, &format!("{base}.w1"), inter, dim, grid, limit)?;
-        let w3 = WeightView::read_dense(src, &format!("{base}.w3"), inter, dim, grid, limit)?;
-        let w2 = WeightView::read_dense(src, &format!("{base}.w2"), dim, inter, grid, limit)?;
+        let w1 =
+            WeightView::read_optional_scale(src, &format!("{base}.w1"), inter, dim, grid, limit)?;
+        let w3 =
+            WeightView::read_optional_scale(src, &format!("{base}.w3"), inter, dim, grid, limit)?;
+        let w2 =
+            WeightView::read_optional_scale(src, &format!("{base}.w2"), dim, inter, grid, limit)?;
         if w1.f4_parts().is_none() || w3.f4_parts().is_none() || w2.f4_parts().is_none() {
             return Ok(false);
         }
@@ -1462,7 +1465,7 @@ fn read_weight<'a>(
     // source is coded, so a routed expert is never materialised as f32 on the release path.
     name.clear();
     write!(name, "{base}.{leaf}").expect("a String cannot fail to be written to");
-    let mut view = WeightView::read_dense(
+    let mut view = WeightView::read_optional_scale(
         src,
         name,
         geometry.rows,

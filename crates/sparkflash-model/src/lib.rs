@@ -47,6 +47,7 @@ pub mod ledger;
 pub mod numerics;
 pub mod numerics_coverage;
 pub mod numerics_monitors;
+pub mod packed_bf16;
 pub mod parts;
 pub mod prof;
 pub mod profile;

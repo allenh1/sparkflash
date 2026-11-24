@@ -59,8 +59,9 @@ MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 EOS = 1
 PROMPTS = [[100, 101, 102, 103], [200, 201, 202], [300, 301, 302, 303, 304, 305]]
 # The stored formats the checkpoint can be written in: the fixture's released 32 x 32 power-of-two
-# grid, or FP8 on 128 x 128 tiles with the inverse scale stored f32 or bf16. The variant is the
-# checkpoint's own declaration - the writer, the reference and the group all read this one file.
+# grid, FP8 on 128 x 128 tiles with the inverse scale stored f32 or bf16, or an unquantized
+# BF16 dense class in its row-major or packed arrangement. The variant is the checkpoint's own
+# declaration - the writer, the reference and the group all read this one file.
 STORED_FORMATS = {
     "released": None,
     "fp8-f32": {"quant_method": "fp8", "scale_fmt": "f32", "expert_dtype": "fp8"},
@@ -69,6 +70,15 @@ STORED_FORMATS = {
     # power-of-two grid, and only the routed experts change format.
     "nvfp4-qwen": {"expert_dtype": "nvfp4-qwen"},
     "nvfp4-inkling": {"expert_dtype": "nvfp4-inkling"},
+    # The dense class unquantized: BF16 rows as stored, and the same rows in the packed word
+    # form (the escape list travels beside them). The routed experts keep their released fp4
+    # arithmetic, which is the format the expert bodies in the tree read.
+    "bf16": {"quant_method": "bf16", "scale_fmt": "ue8m0", "expert_dtype": "fp4"},
+    "packed-bf16": {
+        "quant_method": "packed-bf16",
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+    },
 }
 # The block an FP8 tile release stores: one inverse scale a 128 x 128 tile.
 TILE_BLOCK = 128
@@ -92,7 +102,10 @@ def variant_config(name: str, out: Path) -> Path:
         quantization = document["quantization_config"]
         quantization.update(declared)
         if "quant_method" in declared:
-            quantization["weight_block_size"] = [TILE_BLOCK, TILE_BLOCK]
+            # A tile release states its 128 x 128 block; an unquantized BF16 class has no
+            # scale plane at all, so it keeps the fixture's 32 x 32 declaration.
+            block = 32 if declared["quant_method"] in ("bf16", "packed-bf16") else TILE_BLOCK
+            quantization["weight_block_size"] = [block, block]
     path = out / f"config-{name}.json"
     path.write_text(json.dumps(document, indent=2))
     return path

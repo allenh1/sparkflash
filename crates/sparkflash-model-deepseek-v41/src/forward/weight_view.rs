@@ -127,6 +127,36 @@ fn read<'a>(
     limit: usize,
 ) -> Result<WeightView<'a>, EngineError> {
     let spec = checked_spec(source, weight_name, limit)?;
+    // The packed word form is a BF16 matrix in another arrangement: the checkpoint stores the
+    // packed rows beside an escape list, and this is the one place a reader unpacks them back to
+    // the BF16 rows every body reads. The bytes, not a dtype word, say which arrangement it is;
+    // the arithmetic stays BF16.
+    if spec.dtype == DType::U8 {
+        let escape_name = format!("{}.escape", weight_name.trim_end_matches(".weight"));
+        if source.contains(&escape_name) {
+            let packed = read_bytes(source, weight_name)?;
+            let escape_bytes = read_bytes(source, &escape_name)?;
+            if !escape_bytes.len().is_multiple_of(4) {
+                return Err(EngineError::Shape {
+                    what: "packed bf16 weight".to_owned(),
+                    detail: format!(
+                        "{escape_name} holds {} bytes, not whole u32 escape entries",
+                        escape_bytes.len()
+                    ),
+                });
+            }
+            let escapes: Vec<u32> = escape_bytes
+                .chunks(4)
+                .map(|entry| u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]))
+                .collect();
+            let rows_out = sparkflash_model::packed_bf16::unpack(rows, cols, &packed, &escapes)
+                .map_err(|detail| EngineError::Shape {
+                    what: "packed bf16 weight".to_owned(),
+                    detail: format!("{weight_name}: {detail}"),
+                })?;
+            return Ok(WeightView::Bf16(Cow::Owned(rows_out)));
+        }
+    }
     let elements = expected_elements(rows, cols)?;
     if spec.elements() != elements as u128 {
         return Err(EngineError::Shape {
@@ -218,6 +248,19 @@ fn read<'a>(
     }
 }
 
+/// Multiplies decoded values by a raw E8M0 grid.
+fn apply_grid(
+    values: &mut [f32],
+    rows: usize,
+    cols: usize,
+    scale_bytes: &[u8],
+    grid: ScaleGrid,
+) -> Result<(), EngineError> {
+    let entries = grid.len(rows, cols);
+    let scales = crate::quant::decode(DType::F8E8M0, scale_bytes, entries)?;
+    linalg::apply_scales(values, rows, cols, &scales, grid)
+}
+
 impl<'a> WeightView<'a> {
     /// The raw F4-E2M1 codes and E8M0 scales when this view is a packed F4 expert weight.
     pub(crate) fn f4_parts(&self) -> Option<(&[u8], &[u8])> {
@@ -287,12 +330,10 @@ impl<'a> WeightView<'a> {
     ) -> Result<WeightView<'a>, EngineError> {
         let weight_name = format!("{name}.weight");
         let scale_name = format!("{name}.scale");
-        let scale = if source.contains(&scale_name) {
-            Some(scale_name.as_str())
-        } else {
-            None
-        };
-        Self::read_impl(source, &weight_name, scale, rows, cols, grid, limit)
+        if source.contains(&scale_name) {
+            return Self::read_dense(source, name, rows, cols, grid, limit);
+        }
+        Self::read_impl(source, &weight_name, None, rows, cols, grid, limit)
     }
 
     /// Reads a plain (unscaled) weight, e.g. a BF16 head or embedding matrix.
@@ -372,6 +413,47 @@ impl<'a> WeightView<'a> {
                 batch,
             ),
         }
+    }
+
+    /// The weight as f32 values, for a caller that needs the matrix rather than a product.
+    ///
+    /// Every arm decodes to the same values the materialised path holds: a BF16 word widens, an
+    /// E8M0 grid multiplies, an E4M3 or E2M1 code decodes first. It is the fallback for a stage
+    /// whose arithmetic is a plain f32 matmul; the fused stages take [Self::matmul] instead.
+    ///
+    /// # Errors
+    /// [EngineError::Shape] when the bytes, the grid or the declared geometry disagree.
+    pub(crate) fn to_f32(&self, rows: usize, cols: usize) -> Result<Vec<f32>, EngineError> {
+        let elements = rows.checked_mul(cols).ok_or_else(|| EngineError::Shape {
+            what: "weight view".to_owned(),
+            detail: "rows times cols overflows".to_owned(),
+        })?;
+        let values = match self {
+            Self::F32(values) => return Ok(values.clone()),
+            Self::Bf16(data) => crate::quant::decode(DType::BF16, data.as_ref(), elements)?,
+            Self::Bf16Scaled { data, scales, grid } => {
+                let mut values = crate::quant::decode(DType::BF16, data.as_ref(), elements)?;
+                apply_grid(&mut values, rows, cols, scales.as_ref(), *grid)?;
+                values
+            }
+            Self::Coded {
+                dtype,
+                codes,
+                scales,
+                grid,
+            } => {
+                let mut values = crate::quant::decode(*dtype, codes.as_ref(), elements)?;
+                apply_grid(&mut values, rows, cols, scales.as_ref(), *grid)?;
+                values
+            }
+        };
+        if values.len() != elements {
+            return Err(EngineError::Shape {
+                what: "weight view".to_owned(),
+                detail: format!("decoded {} values for {rows}x{cols}", values.len()),
+            });
+        }
+        Ok(values)
     }
 
     /// Whether this weight can run as one block-diagonal grouped matmul.

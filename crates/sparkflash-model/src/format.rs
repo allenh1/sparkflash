@@ -68,6 +68,16 @@ impl FormatValues {
             Self::Bf16 | Self::F32 | Self::Fp8E4M3 => 1,
         }
     }
+
+    /// The bytes one value occupies in a stored tensor.
+    #[must_use]
+    pub const fn bytes_per_value(self) -> usize {
+        match self {
+            Self::Bf16 => 2,
+            Self::F32 => 4,
+            Self::Fp8E4M3 | Self::Fp4E2M1 => 1,
+        }
+    }
 }
 
 /// The values one scale plane holds.

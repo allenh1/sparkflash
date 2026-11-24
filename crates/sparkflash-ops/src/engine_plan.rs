@@ -697,16 +697,31 @@ fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
     // A part's format is the one its claimed bytes mostly use: a router's bf16 row beside 256
     // NVFP4 experts does not make the block bf16. An exact tie keeps the later declaration, so a
     // part that states two same-sized classes is reported by the last one the layout names.
+    //
+    // The packed word form is the one arrangement the release's format word cannot express: the
+    // configuration says `packed-bf16`, and every BF16 format the layout resolved is that same
+    // arithmetic in the packed layout. The device loader must arrange it before a body reads it.
+    let packed = architecture
+        .quantization
+        .method
+        .as_deref()
+        .is_some_and(|method| method.eq_ignore_ascii_case("packed-bf16"));
+    let arranged = |format: WeightFormat| {
+        let stored = format.stored_format();
+        if packed && stored.values() == sparkflash_model::format::FormatValues::Bf16 {
+            stored.with_layout(sparkflash_model::format::FormatLayout::Packed)
+        } else {
+            stored
+        }
+    };
     let formats = totals
         .into_iter()
-        .filter_map(|(key, entries)| {
-            winning_format(entries).map(|format| (key, format.stored_format()))
-        })
+        .filter_map(|(key, entries)| winning_format(entries).map(|format| (key, arranged(format))))
         .collect();
     let shared = shared_totals
         .into_iter()
         .filter_map(|(part, entries)| {
-            winning_format(entries).map(|format| (part, format.stored_format()))
+            winning_format(entries).map(|format| (part, arranged(format)))
         })
         .collect();
     (formats, shared)
