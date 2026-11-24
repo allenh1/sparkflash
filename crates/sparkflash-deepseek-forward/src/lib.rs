@@ -35,6 +35,8 @@ pub mod layer_device;
 pub mod logits_dump;
 #[cfg(feature = "cuda")]
 pub mod moe_device;
+#[cfg(feature = "cuda")]
+pub mod nvfp4_prefill;
 pub mod open_manifest;
 pub mod operand;
 pub mod plan;

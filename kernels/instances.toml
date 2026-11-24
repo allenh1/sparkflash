@@ -5213,3 +5213,363 @@ intermediate = 2816
 out_hidden = 4096
 experts = 384
 top_k = 6
+
+# --- NVFP4 routed experts on the shared bulk-prefill tile -----------------------------------
+# The body is shared_prefill_mma_sm121.cuh's SPM_W_FP4 mode; these entries are the wrappers that
+# name the two tensor-wide conventions and the prompt/rows forms. The synthetic second shape runs
+# at hidden 4096 with a per-rank intermediate of 256 (TP2) and 128 (TP4); the full 512 row is the
+# released-geometry claim. The wrapper takes cols/inner/tokens as launch words, so the three
+# intermediate rows only pin the builds the device arm stages.
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i512"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_i512"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i512"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_i512"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i512"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_i512"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i512"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_i512"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i256"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_i256"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i256"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_i256"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i256"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_i256"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i256"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_i256"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i128"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_i128"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i128"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_i128"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i128"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_i128"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_i128"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_i128"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+# Qwen3.8-Flash-Next's released routed-expert geometry (models/layouts/qwen38.toml).
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_qwen"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 2560
+intermediate = 640
+experts = 512
+top_k = 10
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_qwen"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 2560
+intermediate = 640
+experts = 512
+top_k = 10
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_qwen"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 2560
+intermediate = 640
+experts = 512
+top_k = 10
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_qwen"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 2560
+intermediate = 640
+experts = 512
+top_k = 10
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_qwen"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 2560
+intermediate = 640
+experts = 512
+top_k = 10
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_qwen"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 2560
+intermediate = 640
+experts = 512
+top_k = 10
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_qwen"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 2560
+intermediate = 640
+experts = 512
+top_k = 10
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_qwen"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 2560
+intermediate = 640
+experts = 512
+top_k = 10

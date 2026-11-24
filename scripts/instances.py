@@ -116,6 +116,8 @@ FORMATS = {
     "mx-fp8-tiled",
     "mx-fp8-row",
     "nvfp4",
+    "nvfp4-qwen",
+    "nvfp4-inkling",
     "mx-fp4",
     "mx-fp4-row",
     "mx-fp4-grid",
