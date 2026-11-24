@@ -1587,6 +1587,24 @@ mod tests {
             )
         }
 
+        /// A row-scaled MXFP8 routed expert weight `[rows, cols]` with a `1.0` `PerRow32`
+        /// plane: one scale a row, every 32 values along K.
+        fn expert_row(self, base: &str, rows: usize, cols: usize, values: &[f32]) -> Self {
+            let scales = [rows, cols / 32];
+            self.with(
+                &format!("{base}.weight"),
+                DType::F8E4M3,
+                &[rows, cols],
+                fp8_bytes(values),
+            )
+            .with(
+                &format!("{base}.scale"),
+                DType::F8E8M0,
+                &scales,
+                unit_scales(scales),
+            )
+        }
+
         /// The gate weight, which the checkpoint stores BF16 and unquantised.
         fn gate(self, prefix: &str, n_routed: usize, dim: usize, values: &[f32]) -> Self {
             self.with(
@@ -2853,6 +2871,143 @@ mod tests {
             "out[0] is {} against the clamped {clamped}",
             out[0]
         );
+    }
+
+    /// The row-scaled E4M3 expert sum is not regrouping-invariant: a rank split rounds
+    /// differently from the single global sum, while the released E2M1 arm regroups exactly.
+    /// This is the measured property the world-to-world reference policy rests on.
+    #[test]
+    fn the_row_scaled_expert_split_rounds_where_the_released_arm_regroups_exactly() {
+        const DIM: usize = 128;
+        const INTER: usize = 128;
+        const EXPERTS: usize = 4;
+        const TOP_K: usize = 2;
+        fn config(row: bool, world: usize) -> ModelConfig {
+            let mut config = ModelConfig::tiny();
+            config.dim = DIM;
+            config.moe_inter_dim = INTER / world;
+            config.n_routed_experts = EXPERTS;
+            config.n_activated_experts = TOP_K;
+            config.expert_dtype = if row { "mx-fp8-row" } else { "fp4" }.to_owned();
+            config
+        }
+        fn weights(row: bool, count: usize) -> Vec<f32> {
+            (0..count)
+                .map(|index| {
+                    if row {
+                        ((index % 17) as f32 - 8.0) * 0.05
+                    } else {
+                        [-1.0, -0.5, 0.0, 0.5, 1.0][index % 5]
+                    }
+                })
+                .collect()
+        }
+        fn source(prefix: &str, row: bool, world: usize, rank: usize) -> Hand {
+            let width = INTER / world;
+            let gate = weights(row, EXPERTS * DIM);
+            let mut hand = Hand::default().gate(prefix, EXPERTS, DIM, &gate).bias(
+                prefix,
+                EXPERTS,
+                &vec![0.0; EXPERTS],
+            );
+            for expert in 0..EXPERTS {
+                let base = format!("{prefix}.ffn.experts.{expert}");
+                let w1 = weights(row, INTER * DIM);
+                let w3 = weights(row, INTER * DIM);
+                // The released control makes the down projection a one-hot select, so both the
+                // full sum and the split have exactly one term and the regrouping is exact.
+                let w2: Vec<f32> = if row {
+                    weights(row, DIM * INTER)
+                } else {
+                    (0..DIM * INTER)
+                        .map(|index| if index % INTER == 0 { 1.0 } else { 0.0 })
+                        .collect()
+                };
+                let mut r1 = Vec::with_capacity(width * DIM);
+                let mut r3 = Vec::with_capacity(width * DIM);
+                let mut r2 = Vec::with_capacity(DIM * width);
+                for line in 0..width {
+                    let start = (rank * width + line) * DIM;
+                    r1.extend_from_slice(&w1[start..start + DIM]);
+                    r3.extend_from_slice(&w3[start..start + DIM]);
+                }
+                for line in 0..DIM {
+                    let start = line * INTER + rank * width;
+                    r2.extend_from_slice(&w2[start..start + width]);
+                }
+                hand = if row {
+                    hand.expert_row(&format!("{base}.w1"), width, DIM, &r1)
+                        .expert_row(&format!("{base}.w3"), width, DIM, &r3)
+                        .expert_row(&format!("{base}.w2"), DIM, width, &r2)
+                } else {
+                    hand.expert(&format!("{base}.w1"), width, DIM, &r1)
+                        .expert(&format!("{base}.w3"), width, DIM, &r3)
+                        .expert(&format!("{base}.w2"), DIM, width, &r2)
+                };
+            }
+            hand
+        }
+        fn run(row: bool, world: usize) -> Vec<f32> {
+            let x: Vec<f32> = (0..DIM)
+                .map(|index| {
+                    if row {
+                        0.3 + 0.001 * index as f32
+                    } else {
+                        0.25
+                    }
+                })
+                .collect();
+            let mut sum = vec![0.0f32; DIM];
+            for rank in 0..world {
+                let config = config(row, world);
+                let hand = source("layers.0", row, world, rank);
+                let mut scratch = MoeScratch::for_config(&config);
+                let mut out = vec![0.0f32; DIM];
+                routed_forward(&config, "layers.0", &x, &hand, BIG, &mut scratch, &mut out)
+                    .expect("the routed body runs");
+                for (total, value) in sum.iter_mut().zip(out.iter()) {
+                    *total += value;
+                }
+            }
+            sum
+        }
+        let released = run(false, 1);
+        for world in [2usize, 4] {
+            let split = run(false, world);
+            assert_eq!(
+                released
+                    .iter()
+                    .zip(split.iter())
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count(),
+                0,
+                "the released E2M1 arm regroups exactly at {world} ranks"
+            );
+        }
+        let row = run(true, 1);
+        let magnitude = row.iter().map(|value| value.abs()).fold(0.0f32, f32::max);
+        for world in [2usize, 4] {
+            let split = run(true, world);
+            let differing = row
+                .iter()
+                .zip(split.iter())
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let max_abs = row
+                .iter()
+                .zip(split.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let relative = max_abs / magnitude.max(f32::MIN_POSITIVE);
+            assert!(
+                differing > 0,
+                "the row-scaled split rounds at {world} ranks"
+            );
+            assert!(
+                relative <= 1.0e-5,
+                "the row-scaled regrouping band at {world} ranks is {relative:e}"
+            );
+        }
     }
 
     /// A chunk's rows are the whole block's output: the block is zero when every expert is zero,

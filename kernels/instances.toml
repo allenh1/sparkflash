@@ -4099,7 +4099,7 @@ intermediate = 128
 [[instance]]
 source = "opt_mma_sm121.cu"
 entry = "opt_mma_fp8_rowscale_f32o"
-cubin = "opt_mma_sm121_s2_tp2"
+cubin = "opt_mma_sm121_s2w2"
 family = "rows"
 format = "mx-fp8-row"
 catalogue = "deepseek-moe"
@@ -4111,7 +4111,7 @@ intermediate = 256
 [[instance]]
 source = "opt_mma_sm121.cu"
 entry = "opt_mma_router_topk"
-cubin = "opt_mma_sm121_s2_tp2"
+cubin = "opt_mma_sm121_s2w2"
 family = "rows"
 format = "bf16"
 hidden = 4096
@@ -4122,7 +4122,7 @@ intermediate = 256
 [[instance]]
 source = "opt_mma_sm121.cu"
 entry = "opt_mma_moe_gate_up"
-cubin = "opt_mma_sm121_s2_tp2"
+cubin = "opt_mma_sm121_s2w2"
 family = "rows"
 format = "mx-fp4"
 hidden = 4096
@@ -4133,7 +4133,7 @@ intermediate = 256
 [[instance]]
 source = "opt_mma_sm121.cu"
 entry = "opt_mma_fp8_rowscale_f32o"
-cubin = "opt_mma_sm121_s2_tp1"
+cubin = "opt_mma_sm121_s2w1"
 family = "rows"
 format = "mx-fp8-row"
 catalogue = "deepseek-moe"
@@ -4145,7 +4145,7 @@ intermediate = 512
 [[instance]]
 source = "opt_mma_sm121.cu"
 entry = "opt_mma_router_topk"
-cubin = "opt_mma_sm121_s2_tp1"
+cubin = "opt_mma_sm121_s2w1"
 family = "rows"
 format = "bf16"
 hidden = 4096
@@ -4156,7 +4156,7 @@ intermediate = 512
 [[instance]]
 source = "opt_mma_sm121.cu"
 entry = "opt_mma_moe_gate_up"
-cubin = "opt_mma_sm121_s2_tp1"
+cubin = "opt_mma_sm121_s2w1"
 family = "rows"
 format = "mx-fp4"
 hidden = 4096

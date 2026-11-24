@@ -586,23 +586,30 @@ reference. The reference's greedy ids are
  [25626, 8511, 2658, 12093, 30760, 21890, 17708, 12438]]
 ```
 
-World 1 agrees (`second-shape: VERDICT PASS`, `external check PASS`). Worlds 2 and 4 do not: at
-two ranks all three prompts differ from the third generated token on; at four ranks prompt 1
-differs from its third token while prompts 0 and 2 agree. The released path at the same tip
-passes at one, two and four ranks with the ids recorded for the device window, so the harness and
-the split are sound. The difference is the row-scaled E4M3 expert sum: measured on layer 0 of this
+World 1 is the anchor and agrees exactly (`second-shape: VERDICT PASS`, `external check PASS`).
+At two ranks all three prompts part from the third generated token on; at four ranks prompt 1
+parts from its third token while prompts 0 and 2 agree. The released path at the same tip passes
+at one, two and four ranks with the ids recorded for the device window, so the harness and the
+split are sound. The difference is the row-scaled E4M3 expert sum: measured on layer 0 of this
 checkpoint, the four rank partials of `routed_forward` differ from the reference's single global
 sum by at most 1.75e-10 absolute (4.7e-7 relative; 3,803 of 4,096 f32 values differ in bits). The
 released E2M1 arm regroups without changing its bits; E4M3 codes do not, and this fixture's logits
-are close enough that the rounding flips a greedy token. **The family is not done.** The host arm
-is green only at one rank, and no device kernel has read this format.
+are close enough that the rounding flips a greedy token. The worlds 2 and 4 runs are therefore
+**blocked on the reference policy**, not claimed as passes: device(W) must equal host(W) exactly,
+and host(W) against host(1) may differ only at a greedy tie inside the measured band. The
+property is committed as a test beside the routed forward
+(`the_row_scaled_expert_split_rounds_where_the_released_arm_regroups_exactly`): the released
+format regroups with zero differing bits at two and four ranks, the row format does not, and the
+relative band is bounded. **The family is not done.**
 
-Open items. (1) The routed-expert launch: `moe_device::ffn` binds and arranges `MXFP8_ROW_32` and
-then refuses it by name because the staged operand and the gate/up and combine launches are still
-packed E2M1; the body above reads the arrangement, but the launch is not wired. (2) The TP2/TP4
-sum: the row-scaled host arm must be made to agree, by matching the reference's accumulation
-grouping or by a body whose per-rank partial is exact. (3) The device proof is to run in the
-lead's window:
+The device launch is wired: when the block's stored format is `MXFP8_ROW_32`, `moe_device::ffn`
+takes the plan's arranged expert tensors and calls `ffn_mxfp8_row`, which gathers each expert's
+routed slots, launches `opt_mma_fp8_rowscale_f32o` for gate and up over each rank's intermediate
+slice, applies the reference's SwiGLU and routing weight on the host, quantises those rows, and
+launches the down projection over a gathered `[dim, width]` slice, adding the rank partials in
+rank order. The cubin rows use the harness's per-world names (`opt_mma_sm121_s2`, `_s2w2`,
+`_s2w1`) so `stage_cubins` picks them up. **No device kernel has read this format**: the verdict
+is pending the lead's window with:
 
 ```
 python3 scripts/second-shape.py run \
@@ -614,10 +621,11 @@ python3 scripts/second-shape.py run \
   --stored-format mx-fp8-row --world 2,4 --port 8133
 ```
 
-with the cubin build in the window (the three new instance rows compile `opt_mma_sm121.cu` three
-more times, once per rank width). (4) The joint mid-stack variant (NVFP4 below a layer boundary,
-this format above) is not started; it needs this host proof green and the branch rebased onto the
-NVFP4 merge.
+with the cubin build in the window (the new instance groups compile `opt_mma_sm121.cu` once per
+rank width). Open items: the device verdict; the device body's tensor-core accumulation against
+the host's per-element sum at the same split (the exact-id bar above); and the joint mid-stack
+variant (NVFP4 below a layer boundary, this format above), which is not started and needs this
+launch proved first.
 
 ### S. The seam
 
