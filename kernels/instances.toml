@@ -7156,6 +7156,61 @@ ratio = 2
 positions = 1048576
 
 [[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w1"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_warp_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w1"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_tile_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w1"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_batched_perrow_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w1"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_batched_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w1"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
 source = "b12x_mxfp8_dense_sm121.cu"
 entry = "b12x_mxfp8_dense_sm121"
 cubin = "b12x_mxfp8_dense_sm121_s2w1"
@@ -8757,6 +8812,61 @@ hidden = 4096
 head_dim = 512
 ratio = 2
 positions = 1048576
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_warp_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_tile_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_batched_perrow_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_batched_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2w2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
 
 [[instance]]
 source = "b12x_mxfp8_dense_sm121.cu"

@@ -538,6 +538,16 @@ impl EnginePlan {
             })
     }
 
+    /// The stored arrangement of the dense class: what the loader states for an E4M3 dense weight.
+    ///
+    /// This is the architecture's own dense class, not a part aggregate. DeepSeek's dense body is
+    /// the MLA output projection and the MoE layers' shared expert, so its E4M3 tensors are claimed
+    /// by `MlaAttention` and `Moe` and a `DenseMlp` lookup finds no tensor to describe them.
+    #[must_use]
+    pub fn dense_stored_format(&self) -> StoredFormat {
+        stored_arrangement(self.architecture.quantization.dense_format)
+    }
+
     /// The stored format of one layer's shared expert, when the plan has one and states it.
     ///
     /// A shared expert is stored on the MoE part's `ffn.shared_experts.*` tensors, but it is a
@@ -737,11 +747,11 @@ fn stored_formats(
                             }
                         })
                     }
-                    _ => layout_format(tensor.dtype, architecture).map(WeightFormat::stored_format),
+                    _ => layout_format(tensor.dtype, architecture).map(stored_arrangement),
                 }
             }
         } else {
-            layout_format(tensor.dtype, architecture).map(WeightFormat::stored_format)
+            layout_format(tensor.dtype, architecture).map(stored_arrangement)
         };
         let elements = tensor
             .shape
@@ -754,8 +764,7 @@ fn stored_formats(
         // format without borrowing a dense-MLP part the layer does not carry.
         if tensor.role == "shared_expert"
             && let Some(block) = tensor.block
-            && let Some(format) =
-                layout_format(tensor.dtype, architecture).map(WeightFormat::stored_format)
+            && let Some(format) = layout_format(tensor.dtype, architecture).map(stored_arrangement)
         {
             add_format(
                 shared_expert_totals.entry(block).or_default(),
@@ -1368,6 +1377,21 @@ fn is_row_scale(weight: &[usize], scale: &[usize]) -> bool {
         return false;
     };
     rows == scale_rows && cols == scale_cols.saturating_mul(32)
+}
+
+/// The stored arrangement a class format is read in.
+///
+/// The declaration names the arithmetic; the arrangement is how the bytes lie for the body that
+/// reads them. A 32 x 32 power-of-two block grid is the B12x micro-tile the released dense bodies
+/// consume, so a plain `mxfp8` class states the tiled arrangement and the loader tiles it. A
+/// row-scaled class (one scale a row) and an FP8 tile class keep the arrangement the file stores.
+fn stored_arrangement(format: WeightFormat) -> StoredFormat {
+    let stored = format.stored_format();
+    if matches!(format, WeightFormat::MxFp8 { .. }) {
+        stored.with_layout(sparkflash_model::format::FormatLayout::Tile32)
+    } else {
+        stored
+    }
 }
 
 fn layout_format(dtype: LayoutDtype, architecture: &Architecture) -> Option<WeightFormat> {
