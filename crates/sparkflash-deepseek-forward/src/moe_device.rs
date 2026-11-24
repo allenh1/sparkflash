@@ -49,6 +49,7 @@ use sparkflash_kernels::routed_gate_up_launch::{self, GateUpLaunchParams};
 use sparkflash_kernels::routed_gate_up_ref as gate_up_ref;
 use sparkflash_kernels::router_launch::{self, RouterLaunchParams};
 use sparkflash_kernels::{router_ref, swiglu_ref};
+use sparkflash_model::format::StoredFormat;
 
 fn router_symbol() -> &'static str {
     crate::plan::handles().moe_router
@@ -98,11 +99,9 @@ const PADDED: usize = sparkflash_kernels::moe_routed_device::WIDTH_PADDED;
 const QUANT_BLOCK: usize = 32;
 
 /// The shared expert's two E8M0 scale grids, as (w1/w3, w2): one block scale per 32x32 tile.
-fn shared_scale_shapes(inter: usize, dim: usize) -> ([usize; 2], [usize; 2]) {
-    (
-        [inter / QUANT_BLOCK, dim / QUANT_BLOCK],
-        [dim / QUANT_BLOCK, inter / QUANT_BLOCK],
-    )
+fn shared_scale_shapes(inter: usize, dim: usize, format: StoredFormat) -> ([usize; 2], [usize; 2]) {
+    let block = format.block().max(1);
+    ([inter / block, dim / block], [dim / block, inter / block])
 }
 
 type SharedScaleGrids = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -116,24 +115,15 @@ pub fn read_shared_scale_grids(
     base: &str,
     inter: usize,
     dim: usize,
+    format: StoredFormat,
 ) -> Result<SharedScaleGrids, EngineError> {
-    let (up_scale_shape, down_scale_shape) = shared_scale_shapes(inter, dim);
-    let s1 = read_spec(
-        source,
-        &format!("{base}.w1.scale"),
-        DType::F8E8M0,
-        &up_scale_shape,
-    )?;
-    let s3 = read_spec(
-        source,
-        &format!("{base}.w3.scale"),
-        DType::F8E8M0,
-        &up_scale_shape,
-    )?;
-    let s2 = read_spec(
+    let (up_scale_shape, down_scale_shape) = shared_scale_shapes(inter, dim, format);
+    let s1 = read_scale_spec(source, &format!("{base}.w1.scale"), format, &up_scale_shape)?;
+    let s3 = read_scale_spec(source, &format!("{base}.w3.scale"), format, &up_scale_shape)?;
+    let s2 = read_scale_spec(
         source,
         &format!("{base}.w2.scale"),
-        DType::F8E8M0,
+        format,
         &down_scale_shape,
     )?;
     Ok((s1, s3, s2))
@@ -1244,25 +1234,11 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         let tokens = x.len() / dim;
         let staging_started = std::time::Instant::now();
         let base = crate::plan::layer_prefix(layer, "ffn.shared_experts");
-        let w1 = read_spec(
-            source,
-            &format!("{base}.w1.weight"),
-            DType::F8E4M3,
-            &[inter, dim],
-        )?;
-        let (s1, s3, s2) = read_shared_scale_grids(source, base, inter, dim)?;
-        let w3 = read_spec(
-            source,
-            &format!("{base}.w3.weight"),
-            DType::F8E4M3,
-            &[inter, dim],
-        )?;
-        let w2 = read_spec(
-            source,
-            &format!("{base}.w2.weight"),
-            DType::F8E4M3,
-            &[dim, inter],
-        )?;
+        let format = shared_format()?;
+        let w1 = read_spec(source, &format!("{base}.w1.weight"), format, &[inter, dim])?;
+        let (s1, s3, s2) = read_shared_scale_grids(source, base, inter, dim, format)?;
+        let w3 = read_spec(source, &format!("{base}.w3.weight"), format, &[inter, dim])?;
+        let w2 = read_spec(source, &format!("{base}.w2.weight"), format, &[dim, inter])?;
         let w1_packed = pack_b12x(&w1, inter, dim);
         let w3_packed = pack_b12x(&w3, inter, dim);
         let w2_packed = pack_b12x(&w2, dim, inter);
@@ -1459,7 +1435,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         let rows = x.len() / dim;
         let eps = config.norm_eps as f32;
         let started = std::time::Instant::now();
-        let weight = read_spec(source, "norm.weight", DType::BF16, &[dim])?;
+        let weight = read_spec(source, "norm.weight", StoredFormat::BF16, &[dim])?;
         let x_bf16: Vec<u8> = x
             .iter()
             .flat_map(|value| bf16_bits(*value).to_le_bytes())
@@ -1549,7 +1525,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             let head = Arc::new(read_spec(
                 source,
                 "head.weight",
-                DType::BF16,
+                StoredFormat::BF16,
                 &[vocab, dim],
             )?);
             self.head_weight = Some(Arc::clone(&head));
@@ -2009,21 +1985,81 @@ fn read_experts(
 fn read_spec(
     source: &dyn WeightSource,
     name: &str,
-    dtype: DType,
+    format: StoredFormat,
     shape: &[usize],
 ) -> Result<Vec<u8>, EngineError> {
     let spec = source.spec(name).map_err(|error| read_err(name, error))?;
+    let dtype = values_dtype(format);
     if spec.dtype != dtype || spec.shape != shape {
         return Err(err(
             name,
             format!(
-                "declared {:?} {:?}, expected {:?} {:?}",
-                spec.dtype, spec.shape, dtype, shape
+                "declared {:?} {:?}, the plan's {} operand is {:?} {:?}",
+                spec.dtype,
+                spec.shape,
+                format.describe(),
+                dtype,
+                shape
             ),
         ));
     }
     let elements = shape.iter().product::<usize>();
     read_len(source, name, dtype.storage_bytes(elements))
+}
+
+/// The storage dtype a format's values need in the checkpoint's file.
+///
+/// This is the bind's arrangement of the format, not a producer's name: the plan states the
+/// format, and the file's dtype word is only compared against it.
+const fn values_dtype(format: StoredFormat) -> DType {
+    match format.values() {
+        sparkflash_model::format::FormatValues::Bf16 => DType::BF16,
+        sparkflash_model::format::FormatValues::F32 => DType::F32,
+        sparkflash_model::format::FormatValues::Fp8E4M3 => DType::F8E4M3,
+        sparkflash_model::format::FormatValues::Fp4E2M1 => DType::F4E2M1,
+    }
+}
+
+/// Reads one block scale plane after checking the dtype and shape its format implies.
+fn read_scale_spec(
+    source: &dyn WeightSource,
+    name: &str,
+    format: StoredFormat,
+    shape: &[usize],
+) -> Result<Vec<u8>, EngineError> {
+    let spec = source.spec(name).map_err(|error| read_err(name, error))?;
+    let dtype = scales_dtype(format);
+    if spec.dtype != dtype || spec.shape != shape {
+        return Err(err(
+            name,
+            format!(
+                "declared {:?} {:?}, the plan's {} scale plane is {:?} {:?}",
+                spec.dtype,
+                spec.shape,
+                format.describe(),
+                dtype,
+                shape
+            ),
+        ));
+    }
+    let elements = shape.iter().product::<usize>();
+    read_len(source, name, dtype.storage_bytes(elements))
+}
+
+/// The dense class's format, from the open description: the shared expert and the projections
+/// are read in it, and a release that stores the class another way states it there.
+fn shared_format() -> Result<StoredFormat, EngineError> {
+    Ok(crate::plan::description().values().dense_format())
+}
+
+/// The storage dtype a format's block scale plane needs in the file.
+const fn scales_dtype(format: StoredFormat) -> DType {
+    match format.scale_values() {
+        sparkflash_model::format::ScaleValues::Ue8m0 => DType::F8E8M0,
+        sparkflash_model::format::ScaleValues::E4M3 => DType::U8,
+        sparkflash_model::format::ScaleValues::Bf16 => DType::BF16,
+        sparkflash_model::format::ScaleValues::F32 => DType::F32,
+    }
 }
 
 fn read_len(
@@ -2330,7 +2366,11 @@ mod tests {
     #[test]
     fn the_shared_scale_reads_pin_the_32x32_grid_shapes() {
         let (inter, dim) = (2304usize, 5120usize);
-        assert_eq!(shared_scale_shapes(inter, dim), ([72, 160], [160, 72]));
+        let format = StoredFormat::MXFP8_32;
+        assert_eq!(
+            shared_scale_shapes(inter, dim, format),
+            ([72, 160], [160, 72])
+        );
         let mut source = GridSource::default();
         for (name, shape) in [
             ("layers.0.ffn.shared_experts.w1.scale", [72usize, 160]),
@@ -2350,7 +2390,7 @@ mod tests {
                 .insert(name.to_string(), vec![0u8; shape[0] * shape[1]]);
         }
         let (s1, s3, s2) =
-            read_shared_scale_grids(&source, "layers.0.ffn.shared_experts", inter, dim)
+            read_shared_scale_grids(&source, "layers.0.ffn.shared_experts", inter, dim, format)
                 .expect("literal grids");
         assert_eq!(
             (s1.len(), s3.len(), s2.len()),
@@ -2366,8 +2406,9 @@ mod tests {
                 shape: vec![160, 72],
             },
         );
-        let error = read_shared_scale_grids(&source, "layers.0.ffn.shared_experts", inter, dim)
-            .expect_err("a swapped w1/w2 grid must be refused");
+        let error =
+            read_shared_scale_grids(&source, "layers.0.ffn.shared_experts", inter, dim, format)
+                .expect_err("a swapped w1/w2 grid must be refused");
         assert!(error.to_string().contains("declared"), "{error}");
     }
 

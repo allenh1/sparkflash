@@ -150,7 +150,7 @@ pub const fn format_of_precision(precision: Precision) -> StoredFormat {
         Precision::Fp8E4M3 => StoredFormat::FP8_E4M3_TILE_128,
         Precision::MxFp8 => StoredFormat::MXFP8_32,
         Precision::NvFp4 => StoredFormat::NVFP4_16,
-        Precision::MxFp4 => StoredFormat::MXFP4_32,
+        Precision::MxFp4 => StoredFormat::MXFP4_ROW_32,
     }
 }
 

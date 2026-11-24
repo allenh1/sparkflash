@@ -381,7 +381,7 @@ pub fn convert_rank_with_source(
         if planned.placement != Placement::Resident {
             continue;
         }
-        let b12x = b12x_layout(planned);
+        let b12x = b12x_layout(planned).map(|(cols, inner, _block)| (cols, inner));
         let moe_pad = if pad_moe_640 {
             moe_padded_640_layout(planned)
         } else {

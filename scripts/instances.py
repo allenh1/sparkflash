@@ -117,6 +117,9 @@ FORMATS = {
     "mx-fp8-row",
     "nvfp4",
     "mx-fp4",
+    "mx-fp4-row",
+    "mx-fp4-grid",
+    "fp8-bf16",
 }
 ALLOWED = {
     "source",

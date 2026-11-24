@@ -76,13 +76,15 @@ fn stored_format_constant(token: &str, key: &str) -> &'static str {
         "bf16" => "StoredFormat::BF16",
         "f32" => "StoredFormat::F32",
         "fp8" => "StoredFormat::FP8_E4M3_TILE_128",
+        "fp8-bf16" => "StoredFormat::FP8_E4M3_TILE_128_BF16",
         "mx-fp8" => "StoredFormat::MXFP8_32",
         "mx-fp8-tiled" => "StoredFormat::MXFP8_TILED_32",
         "mx-fp8-row" => "StoredFormat::MXFP8_ROW_32",
         "nvfp4" => "StoredFormat::NVFP4_16",
-        "mx-fp4" => "StoredFormat::MXFP4_32",
+        "mx-fp4" | "mx-fp4-row" => "StoredFormat::MXFP4_ROW_32",
+        "mx-fp4-grid" => "StoredFormat::MXFP4_32",
         other => panic!(
-            "sparkflash-ops: {key} states format {other:?}; the instance list names bf16, f32, fp8, mx-fp8, mx-fp8-tiled, mx-fp8-row, nvfp4 or mx-fp4"
+            "sparkflash-ops: {key} states format {other:?}; the instance list names bf16, f32, fp8, fp8-bf16, mx-fp8, mx-fp8-tiled, mx-fp8-row, nvfp4, mx-fp4 or mx-fp4-grid"
         ),
     }
 }

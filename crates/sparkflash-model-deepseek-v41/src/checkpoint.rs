@@ -37,6 +37,17 @@ fn matrix_width(columns: usize) -> f32 {
     1.0 / (columns.max(1) as f32).sqrt()
 }
 
+/// One stored inverse scale, as a block-scale tensor holds it.
+///
+/// The values vary from block to block and are exactly representable in f32 and bf16, so a decode
+/// that reads the wrong grid entry changes the number it multiplies by: a shape-only test would
+/// not notice, and an all-ones grid would hide the index entirely.
+fn scale_at(index: usize, shape: &[usize]) -> f32 {
+    let cols = shape.get(1).copied().unwrap_or(1).max(1);
+    let (row, col) = (index / cols, index % cols);
+    0.5 + 0.5 * (((row * 13 + col * 7) % 7) as f32) / 7.0
+}
+
 /// The f32 value of one element that is not FP8/FP4 coded.
 fn value_at(spec: &TensorSpec, rng: &mut TensorRng) -> f32 {
     let name = spec.name.as_str();
@@ -73,9 +84,13 @@ fn synthetic_bytes(spec: &TensorSpec, seed: u64) -> Result<Vec<u8>, String> {
             }
         }
         DType::F32 => {
-            for _ in 0..elements {
+            for index in 0..elements {
                 let value = if spec.name.ends_with("weight_scale_inv") {
                     matrix_width(spec.shape.last().copied().unwrap_or(1)) * (0.5 + rng.unit())
+                } else if spec.name.ends_with(".scale") {
+                    // A tile or row inverse scale: one positive value a block, varying block to
+                    // block so a body that indexes the grid wrongly reads a different number.
+                    scale_at(index, &spec.shape)
                 } else {
                     value_at(spec, &mut rng)
                 };
@@ -83,8 +98,13 @@ fn synthetic_bytes(spec: &TensorSpec, seed: u64) -> Result<Vec<u8>, String> {
             }
         }
         DType::BF16 => {
-            for _ in 0..elements {
-                let bits = quant::f32_to_bf16_bits(value_at(spec, &mut rng));
+            for index in 0..elements {
+                let value = if spec.name.ends_with(".scale") {
+                    scale_at(index, &spec.shape)
+                } else {
+                    value_at(spec, &mut rng)
+                };
+                let bits = quant::f32_to_bf16_bits(value);
                 out.extend_from_slice(&bits.to_le_bytes());
             }
         }

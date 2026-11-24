@@ -189,6 +189,11 @@ pub struct HeaderEntry {
     pub dtype: String,
     /// The stored shape.
     pub shape: Vec<usize>,
+    /// The stored format the plan resolved for this tensor, when it states one.
+    ///
+    /// The bind's authority: a tensor's operand layout is derived from its format, not from the
+    /// dtype word, and a tensor with no stated format binds as stored bytes.
+    pub format: Option<sparkflash_model::format::StoredFormat>,
 }
 
 impl HeaderEntry {
@@ -199,7 +204,15 @@ impl HeaderEntry {
             name: name.into(),
             dtype: dtype.into(),
             shape,
+            format: None,
         }
+    }
+
+    /// The same entry with the format the execution plan resolved for it.
+    #[must_use]
+    pub fn with_format(mut self, format: Option<sparkflash_model::format::StoredFormat>) -> Self {
+        self.format = format;
+        self
     }
 
     /// The stored byte length implied by the dtype and shape.
@@ -351,6 +364,8 @@ pub struct ResidentShard {
     pub rule: Option<ShardRule>,
     /// The safetensors dtype word.
     pub dtype: String,
+    /// The stored format the plan resolved for this tensor, when it states one.
+    pub format: Option<sparkflash_model::format::StoredFormat>,
     /// The stored shape.
     pub stored_shape: Vec<usize>,
     /// The stored byte length.
@@ -379,6 +394,8 @@ pub enum OperandLayout {
         cols: usize,
         /// Reduction width (the kernel's `inner`; the checkpoint's second stored dimension).
         inner: usize,
+        /// The values one scale covers along each axis, from the stored format.
+        block: usize,
         /// The tiled weight bytes, padding included (`mxfp8_ref::b12x_buffer_bytes`).
         weight_bytes: u64,
         /// The scale-grid bytes (`ceil(cols/32) * ceil(inner/32)`).
@@ -400,11 +417,12 @@ impl ResidentShard {
     pub fn operand_layout(&self) -> OperandLayout {
         use crate::arena::b12x_layout;
         match b12x_layout(self) {
-            Some((cols, inner)) => OperandLayout::B12x {
+            Some((cols, inner, block)) => OperandLayout::B12x {
                 cols,
                 inner,
+                block,
                 weight_bytes: sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes(cols, inner) as u64,
-                scale_bytes: (cols.div_ceil(32) * inner.div_ceil(32)) as u64,
+                scale_bytes: (cols.div_ceil(block) * inner.div_ceil(block)) as u64,
             },
             None => OperandLayout::Stored {
                 dtype: self.dtype.clone(),
@@ -558,6 +576,7 @@ impl ResidentPlan {
                 group: classification.group,
                 placement: classification.placement,
                 rule: classification.rule,
+                format: entry.format,
                 dtype: entry.dtype,
                 stored_shape: entry.shape,
                 stored_bytes,
@@ -1205,6 +1224,7 @@ mod tests {
             OperandLayout::B12x {
                 cols: 1280,
                 inner: 5120,
+                block: 32,
                 weight_bytes: 1280 * 5120,
                 scale_bytes: 40 * 160,
             },
@@ -1218,6 +1238,7 @@ mod tests {
             OperandLayout::B12x {
                 cols: 512,
                 inner: 5120,
+                block: 32,
                 weight_bytes: 512 * 5120,
                 scale_bytes: 16 * 160,
             }
@@ -1230,6 +1251,7 @@ mod tests {
             OperandLayout::B12x {
                 cols: 5120,
                 inner: 2048,
+                block: 32,
                 weight_bytes: 5120 * 2048,
                 scale_bytes: 160 * 64,
             },

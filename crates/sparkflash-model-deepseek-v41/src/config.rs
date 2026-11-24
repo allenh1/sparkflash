@@ -51,6 +51,91 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+/// The block a release that does not state one uses: the released power-of-two grid.
+fn default_weight_block() -> usize {
+    32
+}
+
+/// The scale values a release that does not state them uses.
+fn default_weight_scale() -> String {
+    "ue8m0".to_owned()
+}
+
+use sparkflash_model::format::{FormatLayout, StoredFormat};
+use sparkflash_weights::linalg::ScaleGrid;
+
+impl ModelConfig {
+    /// The dense projections' stored format, as the checkpoint declares it.
+    ///
+    /// A dense body that reads the 32 x 32 B12x tiling takes the same arithmetic in that layout;
+    /// a 128-tile release is row-major as stored.
+    #[must_use]
+    pub fn dense_format(&self) -> StoredFormat {
+        self.declared_format(&self.dtype, self.weight_block, &self.weight_scale)
+    }
+
+    /// The routed experts' stored format, as the checkpoint declares it.
+    #[must_use]
+    pub fn expert_format(&self) -> StoredFormat {
+        let block = if self.expert_dtype.contains("fp4") {
+            32
+        } else {
+            self.weight_block
+        };
+        self.declared_format(&self.expert_dtype, block, &self.weight_scale)
+    }
+
+    fn declared_format(&self, method: &str, block: usize, scale: &str) -> StoredFormat {
+        let format = sparkflash_model::architecture::WeightFormat::from_name(
+            Some(method),
+            Some(block),
+            Some(scale),
+        )
+        .stored_format();
+        if format.values() == sparkflash_model::format::FormatValues::Fp8E4M3
+            && format.has_scale(sparkflash_model::format::ScaleKind::PowerOfTwoGrid)
+        {
+            format.with_layout(FormatLayout::Tile32)
+        } else {
+            format
+        }
+    }
+
+    /// The scale grid a dense weight's companion grid follows.
+    ///
+    /// The reference and the served host twin multiply a decoded code by its grid entry through
+    /// this one value, so a release stored on another grid is read on that grid.
+    #[must_use]
+    pub fn dense_grid(&self) -> Option<ScaleGrid> {
+        grid_of(self.dense_format())
+    }
+
+    /// The scale grid a routed expert's companion grid follows.
+    #[must_use]
+    pub fn expert_grid(&self) -> Option<ScaleGrid> {
+        grid_of(self.expert_format())
+    }
+}
+
+/// The [ScaleGrid] one stored format's scales index by.
+///
+/// A row scale is one plane a row (the fp4 expert arrangement), a 32-value block is the released
+/// dense grid, and any other square block is a tile. An unscaled format has no grid.
+#[must_use]
+pub fn grid_of(format: StoredFormat) -> Option<ScaleGrid> {
+    use sparkflash_model::format::ScaleKind;
+    if format.is_unscaled() {
+        return None;
+    }
+    if format.has_scale(ScaleKind::Row) {
+        return Some(ScaleGrid::PerRow32);
+    }
+    match format.block() {
+        32 => Some(ScaleGrid::Block32),
+        side => Some(ScaleGrid::Tile(side)),
+    }
+}
+
 /// The runtime configuration carried in this crate.
 pub const V41_FLASH_RUNTIME_CONFIG: &str =
     include_str!("../config/deepseek_v41_flash.runtime.json");
@@ -160,8 +245,14 @@ pub struct ModelConfig {
     pub engram_head_dim: usize,
     /// The dense weight format, as the config spells it (`fp8`).
     pub dtype: String,
-    /// The expert weight format (`fp4`).
+    /// The expert weight format (`fp4`, or `fp8` for a release that stores the experts as tiles).
     pub expert_dtype: String,
+    /// The block one weight scale covers: 32 for a power-of-two grid, 128 for a tile.
+    #[serde(default = "default_weight_block")]
+    pub weight_block: usize,
+    /// The scale plane's values, as the config spells them (`ue8m0`, `f32` or `bf16`).
+    #[serde(default = "default_weight_scale")]
+    pub weight_scale: String,
     /// RoPE base for the compressor.
     pub compress_rope_theta: f64,
     /// Per-layer compression ratio, over `n_layers + n_mtp_layers` entries.
@@ -354,6 +445,8 @@ impl ModelConfig {
             engram_head_dim: 8,
             dtype: "fp8".to_string(),
             expert_dtype: "fp4".to_string(),
+            weight_block: 32,
+            weight_scale: "ue8m0".to_string(),
             compress_rope_theta: 160_000.0,
             compress_ratios: vec![2, 2, 0],
             image_token_id: 127,
@@ -857,24 +950,81 @@ mod released {
             &quant.quant_method,
             "fp8",
         )?;
-        require(
-            "quantization_config.expert_dtype",
-            &quant.expert_dtype,
-            "fp4",
-        )?;
-        require("quantization_config.scale_fmt", &quant.scale_fmt, "ue8m0")?;
         require_flag("text_config.attention_bias", text.attention_bias, false)?;
         require_flag(
             "text_config.tie_word_embeddings",
             text.tie_word_embeddings,
             false,
         )?;
-        if quant.weight_block_size != [32, 32] {
+        // The stored format is the document's: a 32 x 32 power-of-two grid (the released MXFP8)
+        // or a 128 x 128 tile whose inverse scale is f32 or bf16. Anything else is refused by
+        // name rather than read as one of the two.
+        let [block_n, block_m] = quant.weight_block_size;
+        if block_n != block_m || !matches!(block_n, 32 | 128) {
             return Err(ConfigError::Invalid {
                 field: "quantization_config.weight_block_size",
                 detail: format!(
-                    "the plan describes 32x32 UE8M0 scales, the released document says {:?}",
+                    "a weight scale covers a square 32 x 32 or 128 x 128 block, the document says {:?}",
                     quant.weight_block_size
+                ),
+            });
+        }
+        let dense = sparkflash_model::architecture::WeightFormat::from_name(
+            Some(&quant.quant_method),
+            Some(block_n),
+            Some(&quant.scale_fmt),
+        )
+        .stored_format();
+        let tile = dense.has_scale(sparkflash_model::format::ScaleKind::Tile);
+        let dense_ok = match dense.values() {
+            sparkflash_model::format::FormatValues::Fp8E4M3 => {
+                dense.has_scale(sparkflash_model::format::ScaleKind::Tile)
+                    || dense.has_scale(sparkflash_model::format::ScaleKind::PowerOfTwoGrid)
+            }
+            _ => false,
+        };
+        if !dense_ok || (tile && dense.block() != 128) || (!tile && dense.block() != 32) {
+            return Err(ConfigError::Invalid {
+                field: "quantization_config.quant_method",
+                detail: format!(
+                    "the dense format is E4M3 on a {} x {} block with {} scales, the document says \
+                     quant_method {:?}, scale_fmt {:?}",
+                    block_n,
+                    block_m,
+                    dense.scale_values().name(),
+                    quant.quant_method,
+                    quant.scale_fmt
+                ),
+            });
+        }
+        let expert_block = if quant.expert_dtype.contains("fp4") {
+            32
+        } else {
+            block_n
+        };
+        let expert = sparkflash_model::architecture::WeightFormat::from_name(
+            Some(&quant.expert_dtype),
+            Some(expert_block),
+            Some(&quant.scale_fmt),
+        )
+        .stored_format();
+        let expert_ok = match expert.values() {
+            sparkflash_model::format::FormatValues::Fp4E2M1 => {
+                expert.has_scale(sparkflash_model::format::ScaleKind::Row) && expert.block() == 32
+            }
+            sparkflash_model::format::FormatValues::Fp8E4M3 => {
+                expert.has_scale(sparkflash_model::format::ScaleKind::Tile) && expert.block() == 128
+            }
+            _ => false,
+        };
+        if !expert_ok {
+            return Err(ConfigError::Invalid {
+                field: "quantization_config.expert_dtype",
+                detail: format!(
+                    "the expert format is E2M1 with a power-of-two scale a 32-value block or E4M3 \
+                     with a 128 x 128 tile scale, the document says expert_dtype {:?} with {:?} \
+                     scales",
+                    quant.expert_dtype, quant.scale_fmt
                 ),
             });
         }
@@ -942,6 +1092,8 @@ mod released {
             // released document states in its quantisation block.
             dtype: quant.quant_method.clone(),
             expert_dtype: quant.expert_dtype.clone(),
+            weight_block: block_n,
+            weight_scale: quant.scale_fmt.clone(),
             compress_rope_theta: text.compress_rope_theta,
             compress_ratios: text.compress_ratios,
             image_token_id,

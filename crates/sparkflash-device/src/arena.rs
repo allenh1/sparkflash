@@ -501,7 +501,7 @@ impl ResidentArena {
                 ));
             }
             let (layout, b12x) = match b12x_layout(planned) {
-                Some((cols, inner)) => (TensorLayout::B12x, Some((cols, inner))),
+                Some((cols, inner, _block)) => (TensorLayout::B12x, Some((cols, inner))),
                 None => (TensorLayout::Stored, None),
             };
             tensors.push(ArenaTensor {
@@ -547,7 +547,7 @@ impl ResidentArena {
                 continue;
             }
             let (layout, b12x) = match b12x_layout(planned) {
-                Some((cols, inner)) => (TensorLayout::B12x, Some((cols, inner))),
+                Some((cols, inner, _block)) => (TensorLayout::B12x, Some((cols, inner))),
                 None => (TensorLayout::Stored, None),
             };
             let payload = match b12x {
@@ -815,25 +815,65 @@ impl ResidentArena {
 /// The choice keys off the name and the dtype, not only the group, so a future FP8 tensor in a B12x
 /// group cannot be tiled blindly: its name must be a .weight and its dtype must be F8_E4M3.
 #[must_use]
-pub fn b12x_layout(planned: &ResidentShard) -> Option<(usize, usize)> {
-    if planned.dtype != "F8_E4M3" || !planned.name.ends_with(".weight") {
+pub fn b12x_layout(planned: &ResidentShard) -> Option<(usize, usize, usize)> {
+    if !planned.name.ends_with(".weight") {
         return None;
     }
-    let tiled_group = matches!(
-        planned.group,
-        ResidentGroup::AttentionReplicated
-            | ResidentGroup::AttentionColumn
-            | ResidentGroup::AttentionRow
-            | ResidentGroup::SharedColumn
-            | ResidentGroup::SharedRow
-    );
-    if !tiled_group {
-        return None;
-    }
+    // The plan's format decides the arrangement. A tensor the plan states no format for (a
+    // fixture's header dump, a name outside its claims) is judged by its file declaration alone,
+    // which is the arrangement the released arm has always bound.
+    let block = match planned.format {
+        Some(format) => {
+            if !reads_b12x(Some(format)) {
+                return None;
+            }
+            format.block()
+        }
+        None => {
+            if !released_tiled_operand(&planned.dtype, planned.group) {
+                return None;
+            }
+            32
+        }
+    };
     match planned.shard_shape.as_slice() {
-        [cols, inner] if *cols > 0 && *inner > 0 => Some((*cols, *inner)),
+        [cols, inner] if *cols > 0 && *inner > 0 => Some((*cols, *inner, block)),
         _ => None,
     }
+}
+
+/// The same question asked of a tensor the plan states no format for.
+///
+/// A tensor outside the plan's claims (a header dump's extra name, a fixture) has only its file
+/// declaration: E4M3 codes in a tiled group. It is a separate, narrower predicate so the format-
+/// carrying path above cannot fall back to it by accident.
+#[must_use]
+pub fn released_tiled_operand(dtype: &str, group: ResidentGroup) -> bool {
+    dtype == "F8_E4M3"
+        && matches!(
+            group,
+            ResidentGroup::AttentionReplicated
+                | ResidentGroup::AttentionColumn
+                | ResidentGroup::AttentionRow
+                | ResidentGroup::SharedColumn
+                | ResidentGroup::SharedRow
+        )
+}
+
+/// Whether a stored format is read as the 32 x 32 B12x tiling: E4M3 codes with one power-of-two
+/// scale a 32-value block, in the tiled layout a B12x-weight GEMM walks.
+///
+/// This is the one predicate the arena's upload, the attention bind and the forward's operand
+/// census share. It reads the format the plan resolved, never a dtype word: a release stored the
+/// same arithmetic row-major is not a B12x operand, and one stored tiled is, whatever it is called.
+#[must_use]
+pub fn reads_b12x(format: Option<sparkflash_model::format::StoredFormat>) -> bool {
+    use sparkflash_model::format::{FormatLayout, FormatValues, ScaleKind};
+    matches!(format, Some(format)
+        if format.values() == FormatValues::Fp8E4M3
+            && format.block() == 32
+            && format.layout() == FormatLayout::Tile32
+            && format.has_scale(ScaleKind::PowerOfTwoGrid))
 }
 
 /// Repacks one stored FP8 weight into the B12x micro-tile order the dense kernel walks.
@@ -1518,6 +1558,18 @@ mod tests {
         );
     }
 
+    /// The format a test shard's dtype word stands for: the released tiled-MXFP8 for E4M3 codes,
+    /// bf16 and f32 for the unscaled words, and none for a scale plane (its weight sizes it).
+    fn format_of(dtype: &str) -> Option<sparkflash_model::format::StoredFormat> {
+        use sparkflash_model::format::StoredFormat;
+        match dtype {
+            "F8_E4M3" => Some(StoredFormat::MXFP8_TILED_32),
+            "BF16" => Some(StoredFormat::BF16),
+            "F32" => Some(StoredFormat::F32),
+            _ => None,
+        }
+    }
+
     #[test]
     fn the_b12x_layout_policy_tiles_only_dense_fp8_weights() {
         let planned =
@@ -1527,6 +1579,7 @@ mod tests {
                 placement: Placement::Resident,
                 rule: Some(crate::shard::ShardRule::Column),
                 dtype: dtype.to_string(),
+                format: format_of(dtype),
                 stored_shape: shape.to_vec(),
                 stored_bytes: 0,
                 shard_bytes: 0,
@@ -1540,7 +1593,7 @@ mod tests {
                 ResidentGroup::AttentionColumn,
                 &[64, 32]
             )),
-            Some((64, 32))
+            Some((64, 32, 32))
         );
         assert_eq!(
             b12x_layout(&planned(
@@ -1549,7 +1602,7 @@ mod tests {
                 ResidentGroup::SharedColumn,
                 &[32, 64]
             )),
-            Some((32, 64))
+            Some((32, 64, 32))
         );
         assert_eq!(
             b12x_layout(&planned(

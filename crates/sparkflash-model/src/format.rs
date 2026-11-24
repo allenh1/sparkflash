@@ -27,8 +27,13 @@
 //! The checkpoint's `quantization_config` names a format in [WeightFormat]; the layout reader
 //! turns every tensor's declaration into one [StoredFormat], and that value is what the plan, the
 //! catalogue key and the bind carry. Nothing downstream reads a producer's dtype name again.
+//!
+//! The scale plane's own values are part of the format ([ScaleValues]): an FP8 128-tile release
+//! stores its inverse scales as f32 or as bf16, and the two are different bytes the body reads
+//! with different instructions. A format that named only "a tile scale" would let a body be handed
+//! the other one.
 
-use crate::architecture::WeightFormat;
+use crate::architecture::{ScaleDType, WeightFormat};
 
 /// The values a stored format keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -61,6 +66,57 @@ impl FormatValues {
         match self {
             Self::Fp4E2M1 => 2,
             Self::Bf16 | Self::F32 | Self::Fp8E4M3 => 1,
+        }
+    }
+}
+
+/// The values one scale plane holds.
+///
+/// A block scale is one plane with one set of values: DeepSeek's power-of-two grid is a `ue8m0`
+/// byte a block, NVFP4's group scale is an E4M3 byte a group, and an FP8 128-tile release stores
+/// its inverse scale as f32 or as bf16. The tensor-wide factor is always f32
+/// ([ScaleKind::TensorWide]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScaleValues {
+    /// One unsigned power-of-two exponent byte a block (`ue8m0`, E8M0).
+    Ue8m0,
+    /// One E4M3 code a block (NVFP4's group scale).
+    E4M3,
+    /// One IEEE bfloat16 a block.
+    Bf16,
+    /// One IEEE binary32 a block.
+    F32,
+}
+
+impl ScaleValues {
+    /// The name a ledger or an evidence row prints.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ue8m0 => "ue8m0",
+            Self::E4M3 => "e4m3",
+            Self::Bf16 => "bf16",
+            Self::F32 => "f32",
+        }
+    }
+
+    /// The bytes one scale occupies.
+    #[must_use]
+    pub const fn bytes(self) -> usize {
+        match self {
+            Self::Ue8m0 | Self::E4M3 => 1,
+            Self::Bf16 => 2,
+            Self::F32 => 4,
+        }
+    }
+
+    /// The scale values a checkpoint declares, when it declares them.
+    #[must_use]
+    pub const fn of(scale: ScaleDType) -> Self {
+        match scale {
+            ScaleDType::F32 => Self::F32,
+            ScaleDType::Bf16 => Self::Bf16,
+            ScaleDType::E4M3 => Self::E4M3,
         }
     }
 }
@@ -131,11 +187,30 @@ pub struct StoredFormat {
     values: FormatValues,
     block: usize,
     scales: &'static [ScaleKind],
+    scale_values: ScaleValues,
     layout: FormatLayout,
 }
 
+/// Whether a scale list carries a tile scale. A const predicate, because the format's implied
+/// scale values are computed in a const constructor.
+const fn has_tile(scales: &[ScaleKind]) -> bool {
+    let mut index = 0;
+    while index < scales.len() {
+        if scales[index] as u8 == ScaleKind::Tile as u8 {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 impl StoredFormat {
-    /// A format from its parts.
+    /// A format from its parts, taking the scale values its class implies.
+    ///
+    /// The implication is the release each scale kind came from: a power-of-two grid is a
+    /// `ue8m0` byte, NVFP4's group scale is an E4M3 byte, an unscaled format has no plane,
+    /// and an FP8 tile scale is f32 unless the declaration says otherwise
+    /// ([Self::with_scale_values]).
     #[must_use]
     pub const fn new(
         values: FormatValues,
@@ -143,10 +218,17 @@ impl StoredFormat {
         scales: &'static [ScaleKind],
         layout: FormatLayout,
     ) -> Self {
+        let scale_values = match values {
+            // A 4-bit group scale is E4M3 (NVFP4); a 4-bit block or row scale is a power of two.
+            FormatValues::Fp4E2M1 if has_tile(scales) => ScaleValues::E4M3,
+            FormatValues::Fp8E4M3 if has_tile(scales) => ScaleValues::F32,
+            _ => ScaleValues::Ue8m0,
+        };
         Self {
             values,
             block,
             scales,
+            scale_values,
             layout,
         }
     }
@@ -155,9 +237,13 @@ impl StoredFormat {
     pub const BF16: Self = Self::new(FormatValues::Bf16, 1, NONE, FormatLayout::RowMajor);
     /// IEEE binary32, row-major.
     pub const F32: Self = Self::new(FormatValues::F32, 1, NONE, FormatLayout::RowMajor);
-    /// FP8 E4M3 with one inverse scale a 128 x 128 tile, row-major.
+    /// FP8 E4M3 with one inverse scale a 128 x 128 tile, row-major, stored f32.
     pub const FP8_E4M3_TILE_128: Self =
         Self::new(FormatValues::Fp8E4M3, 128, TILE, FormatLayout::RowMajor);
+    /// The same arithmetic with the tile scale stored bf16 (GLM's and Qwen's releases).
+    pub const FP8_E4M3_TILE_128_BF16: Self =
+        Self::new(FormatValues::Fp8E4M3, 128, TILE, FormatLayout::RowMajor)
+            .with_scale_values(ScaleValues::Bf16);
     /// MXFP8: E4M3 codes with one power-of-two scale a 32-value block, row-major.
     pub const MXFP8_32: Self = Self::new(FormatValues::Fp8E4M3, 32, GRID, FormatLayout::RowMajor);
     /// MXFP8 in the 32 x 32 tiling DeepSeek's dense and attention bodies read.
@@ -177,7 +263,17 @@ impl StoredFormat {
         GROUP_AND_TENSOR,
         FormatLayout::RowMajor,
     );
-    /// MXFP4: E2M1 codes with one power-of-two scale a 32-value block, row-major.
+    /// MXFP4 in the expert arrangement: E2M1 codes with one power-of-two scale a row, every 32
+    /// values along the contraction. This is the form every fp4 expert body in the tree reads, so
+    /// it is the one a declaration's `mx-fp4` means.
+    pub const MXFP4_ROW_32: Self = Self::new(
+        FormatValues::Fp4E2M1,
+        32,
+        ROW_AND_GRID,
+        FormatLayout::RowMajor,
+    );
+    /// MXFP4 on a two-dimensional 32-value block grid. No body in the tree reads this form; a
+    /// release that stores one is refused by name rather than decoded as the expert arrangement.
     pub const MXFP4_32: Self = Self::new(FormatValues::Fp4E2M1, 32, GRID, FormatLayout::RowMajor);
     /// The packed bf16 form: the same arithmetic as [Self::BF16], in the packed word layout.
     pub const PACKED_BF16: Self = Self::new(FormatValues::Bf16, 1, NONE, FormatLayout::Packed);
@@ -198,6 +294,46 @@ impl StoredFormat {
     #[must_use]
     pub const fn scales(self) -> &'static [ScaleKind] {
         self.scales
+    }
+
+    /// The values the block scale plane holds.
+    #[must_use]
+    pub const fn scale_values(self) -> ScaleValues {
+        self.scale_values
+    }
+
+    /// This format's scale plane in other values: the same arithmetic, stored another way.
+    ///
+    /// It is not the same arithmetic: a body that decodes f32 scales cannot read bf16 ones, so
+    /// [Self::same_arithmetic] tells them apart.
+    #[must_use]
+    pub const fn with_scale_values(self, scale_values: ScaleValues) -> Self {
+        Self {
+            scale_values,
+            ..self
+        }
+    }
+
+    /// The bytes one scale of this format occupies.
+    #[must_use]
+    pub const fn scale_bytes(self) -> usize {
+        self.scale_values.bytes()
+    }
+
+    /// The number of block scales a `rows` x `cols` tensor of this format stores.
+    ///
+    /// The three arrangements a stored tensor can have: a 2-D block grid, one scale a row (one
+    /// plane the values and one the scale kind), and one factor for the whole matrix.
+    #[must_use]
+    pub const fn scale_count(self, rows: usize, cols: usize) -> usize {
+        if self.is_unscaled() {
+            return 0;
+        }
+        let block = if self.block == 0 { 1 } else { self.block };
+        if self.has_row() {
+            return rows * cols.div_ceil(block);
+        }
+        rows.div_ceil(block) * cols.div_ceil(block)
     }
 
     /// Whether the format carries no scale plane at all (bf16 or f32 values).
@@ -243,6 +379,7 @@ impl StoredFormat {
     pub const fn same_arithmetic(self, other: Self) -> bool {
         self.values as u8 == other.values as u8
             && self.block == other.block
+            && self.scale_values as u8 == other.scale_values as u8
             && self.scales.len() == other.scales.len()
             && {
                 let mut index = 0;
@@ -266,10 +403,17 @@ impl StoredFormat {
             (FormatValues::Bf16, _) => "BF16",
             (FormatValues::F32, _) => "F32",
             (FormatValues::Fp8E4M3, _) if self.has_row() => "MXFP8-ROW",
+            (FormatValues::Fp8E4M3, _)
+                if self.has_scale(ScaleKind::Tile)
+                    && self.scale_values as u8 == ScaleValues::Bf16 as u8 =>
+            {
+                "FP8-BF16"
+            }
             (FormatValues::Fp8E4M3, _) if self.has_scale(ScaleKind::Tile) => "FP8",
             (FormatValues::Fp8E4M3, _) => "MXFP8",
             (FormatValues::Fp4E2M1, _) if self.has_scale(ScaleKind::TensorWide) => "NVFP4",
-            (FormatValues::Fp4E2M1, _) => "MXFP4",
+            (FormatValues::Fp4E2M1, _) if self.has_row() => "MXFP4",
+            (FormatValues::Fp4E2M1, _) => "MXFP4-GRID",
         }
     }
 
@@ -321,10 +465,14 @@ impl StoredFormat {
             WeightFormat::Bf16 => Self::BF16,
             WeightFormat::F32 => Self::F32,
             WeightFormat::Fp8Tile {
-                block_n, block_m, ..
+                block_n,
+                block_m,
+                scale_dtype,
+                ..
             } => {
                 let block = if block_n >= block_m { block_n } else { block_m };
                 Self::new(FormatValues::Fp8E4M3, block, TILE, FormatLayout::RowMajor)
+                    .with_scale_values(ScaleValues::of(scale_dtype))
             }
             WeightFormat::NvFp4 { group_size } => Self::new(
                 FormatValues::Fp4E2M1,
@@ -335,9 +483,12 @@ impl StoredFormat {
             WeightFormat::MxFp8 { block } => {
                 Self::new(FormatValues::Fp8E4M3, block, GRID, FormatLayout::RowMajor)
             }
-            WeightFormat::MxFp4 { block } => {
-                Self::new(FormatValues::Fp4E2M1, block, GRID, FormatLayout::RowMajor)
-            }
+            WeightFormat::MxFp4 { block } => Self::new(
+                FormatValues::Fp4E2M1,
+                block,
+                ROW_AND_GRID,
+                FormatLayout::RowMajor,
+            ),
         }
     }
 
@@ -351,14 +502,18 @@ impl StoredFormat {
         match name.to_ascii_lowercase().as_str() {
             "bf16" | "bfloat16" => Some(Self::BF16),
             "f32" | "float32" => Some(Self::F32),
-            "fp8" | "fp8-e4m3" | "fp8-tile" | "e4m3-tile" => Some(Self::FP8_E4M3_TILE_128),
+            "fp8" | "fp8-e4m3" | "fp8-tile" | "e4m3-tile" | "fp8-f32" => {
+                Some(Self::FP8_E4M3_TILE_128)
+            }
+            "fp8-bf16" | "fp8-tile-bf16" => Some(Self::FP8_E4M3_TILE_128_BF16),
             "mxfp8" | "mx-fp8" => Some(Self::MXFP8_32),
             "mxfp8-tiled" | "mx-fp8-tiled" => Some(Self::MXFP8_TILED_32),
             "mxfp8-row" | "mx-fp8-row" | "mxfp8-rowscale" | "mx-fp8-rowscale" => {
                 Some(Self::MXFP8_ROW_32)
             }
             "nvfp4" => Some(Self::NVFP4_16),
-            "mxfp4" | "mx-fp4" => Some(Self::MXFP4_32),
+            "mxfp4" | "mx-fp4" | "mxfp4-row" | "mx-fp4-row" => Some(Self::MXFP4_ROW_32),
+            "mx-fp4-grid" | "mxfp4-grid" => Some(Self::MXFP4_32),
             "packed" | "packed-bf16" => Some(Self::PACKED_BF16),
             _ => None,
         }
@@ -402,7 +557,20 @@ mod tests {
         );
         assert_eq!(
             StoredFormat::of(WeightFormat::MxFp4 { block: 32 }),
-            StoredFormat::MXFP4_32
+            StoredFormat::MXFP4_ROW_32
+        );
+        assert_eq!(
+            StoredFormat::of(WeightFormat::Fp8Tile {
+                block_m: 128,
+                block_n: 128,
+                scale_dtype: crate::architecture::ScaleDType::Bf16,
+                dynamic_activations: true,
+            }),
+            StoredFormat::FP8_E4M3_TILE_128_BF16
+        );
+        assert!(
+            !StoredFormat::FP8_E4M3_TILE_128.same_arithmetic(StoredFormat::FP8_E4M3_TILE_128_BF16),
+            "an f32 tile scale and a bf16 one are different bytes a body reads"
         );
         assert_eq!(
             StoredFormat::of(WeightFormat::NvFp4 { group_size: 16 }),
@@ -414,7 +582,7 @@ mod tests {
     fn an_unusual_block_or_group_travels_rather_than_being_read_at_a_default() {
         let wide = StoredFormat::of(WeightFormat::MxFp4 { block: 64 });
         assert_eq!(wide.block(), 64);
-        assert!(!wide.same_arithmetic(StoredFormat::MXFP4_32));
+        assert!(!wide.same_arithmetic(StoredFormat::MXFP4_ROW_32));
         let group = StoredFormat::of(WeightFormat::NvFp4 { group_size: 32 });
         assert_eq!(group.block(), 32);
         assert!(group.has_scale(ScaleKind::TensorWide));
@@ -451,6 +619,8 @@ mod tests {
             StoredFormat::MXFP8_ROW_32,
             StoredFormat::NVFP4_16,
             StoredFormat::MXFP4_32,
+            StoredFormat::MXFP4_ROW_32,
+            StoredFormat::FP8_E4M3_TILE_128_BF16,
             StoredFormat::PACKED_BF16,
         ] {
             // A name states the arithmetic, not the layout: the 32-tile and row-scaled forms
@@ -474,7 +644,15 @@ mod tests {
         );
         assert_eq!(
             StoredFormat::from_name("mx-fp4"),
+            Some(StoredFormat::MXFP4_ROW_32)
+        );
+        assert_eq!(
+            StoredFormat::from_name("mx-fp4-grid"),
             Some(StoredFormat::MXFP4_32)
+        );
+        assert_eq!(
+            StoredFormat::from_name("fp8-bf16"),
+            Some(StoredFormat::FP8_E4M3_TILE_128_BF16)
         );
         assert_eq!(StoredFormat::from_name("nope"), None);
     }

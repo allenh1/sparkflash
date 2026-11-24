@@ -672,11 +672,17 @@ fn every_released_document_boot_checks_or_is_an_explicit_refusal() {
                     "{}: {error}",
                     document.name
                 );
+                // The refusal is keyed on the stored format, so it names the format the
+                // catalogue cannot decode as well as the precision no body accepts; the wording
+                // is either "no symbol accepting bf16 in the <pass> pass" or "<image> exports no
+                // symbol decoding BF16 (...)".
+                let message = error.to_string();
                 assert!(
-                    error.to_string().contains(&format!(
+                    message.contains(&format!(
                         "no symbol accepting bf16 in the {} pass",
                         error.phase.name()
-                    )),
+                    )) || (message.contains("exports no symbol decoding BF16")
+                        && message.contains(&format!("in the {} pass", error.phase.name()))),
                     "{}: {error}",
                     document.name
                 );

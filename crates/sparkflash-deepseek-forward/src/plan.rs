@@ -165,6 +165,17 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
         engram_head_dim: opt_int(facts, "engram_head_dim").unwrap_or(0),
         dtype: text(facts, "dtype")?,
         expert_dtype: text(facts, "expert_dtype")?,
+        // The block and the scale values are the plan's own statement of its linear format, not
+        // facts the released manifest records: read them from the resolved format.
+        weight_block: plan
+            .stored_format(sparkflash_model::Part::DenseMlp, None)
+            .map_or(32, |format| format.block()),
+        weight_scale: plan
+            .stored_format(sparkflash_model::Part::DenseMlp, None)
+            .map_or_else(
+                || "ue8m0".to_owned(),
+                |format| format.scale_values().name().to_owned(),
+            ),
         compress_rope_theta: float(facts, "compress_rope_theta")?,
         compress_ratios,
         image_token_id: u32::try_from(opt_int(facts, "image_token_id").unwrap_or(0))
@@ -326,6 +337,8 @@ pub fn tiny_values() -> ModelConfig {
         engram_head_dim: 8,
         dtype: "fp8".to_owned(),
         expert_dtype: "fp4".to_owned(),
+        weight_block: 32,
+        weight_scale: "ue8m0".to_owned(),
         compress_rope_theta: 160_000.0,
         compress_ratios: vec![2, 2, 0],
         image_token_id: 127,
@@ -351,6 +364,9 @@ pub struct Description {
     tensors: BTreeMap<String, usize>,
     claims: BTreeMap<(usize, Part), Vec<String>>,
     symbols: BTreeMap<(Option<usize>, Part), Vec<&'static str>>,
+    /// Each part instance's operand: its stored format, the activation form its seam ends in and
+    /// the body the plan claims for it. Built once, per block and part, at open.
+    operands: BTreeMap<(Option<usize>, Part), crate::operand::Operand>,
     /// The draft block's tap layers, read from its part facts once at open.
     tap_layers: Box<[usize]>,
 }
@@ -399,6 +415,35 @@ impl Description {
                 .or_default()
                 .extend(entry.symbols.iter().copied());
         }
+        // The operand of every part instance, per block: the format the plan resolved for it,
+        // the activation form that format's seam ends in, and the catalogue body that decodes it.
+        // A format no claimed body decodes stays without a body here, which the scan shows.
+        let mut operands = BTreeMap::new();
+        for stack in plan.stacks() {
+            for block in &stack.blocks {
+                for instance in &block.parts {
+                    let Some(stored) = plan.stored_format(instance.part, Some(block.index)) else {
+                        continue;
+                    };
+                    let claimed = symbols
+                        .get(&(Some(block.index), instance.part))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let operand = crate::operand::Operand {
+                        stored,
+                        activation: crate::operand::ActivationForm::of(stored)
+                            .unwrap_or(crate::operand::ActivationForm::Bf16Rows),
+                        body: crate::operand::choose(
+                            instance.part,
+                            stored,
+                            claimed,
+                            &sparkflash_ops::parts::built_format,
+                        ),
+                    };
+                    operands.insert((Some(block.index), instance.part), operand);
+                }
+            }
+        }
         let tap_layers = plan
             .stacks()
             .iter()
@@ -426,6 +471,7 @@ impl Description {
             tensors,
             claims,
             symbols,
+            operands,
             tap_layers,
         })
     }
@@ -497,6 +543,12 @@ impl Description {
     #[must_use]
     pub fn layer_tensor_owned(&self, block: usize, part: Part, tail: &str) -> String {
         self.layer_tensor_name(block, part, tail).to_owned()
+    }
+
+    /// One part instance's operand, when the plan states its format.
+    #[must_use]
+    pub fn operand(&self, block: Option<usize>, part: Part) -> Option<&crate::operand::Operand> {
+        self.operands.get(&(block, part))
     }
 
     /// The catalogue symbols of one part instance, in catalogue order.
@@ -1032,6 +1084,21 @@ pub fn description() -> &'static Description {
     panic!(
         "forward open: no plan installed, so no description names the tensors or kernels this          stage reads"
     )
+}
+
+/// The installed plan's operand for one part instance.
+///
+/// The format, activation form and body were decided at open, per block and part. A caller that
+/// needs to know what a part's tensors are stored as asks here rather than comparing a dtype word
+/// or a byte count of a tensor it read.
+///
+/// # Panics
+/// No description is installed. The open path installs before any stage reads a part.
+#[must_use]
+pub fn operand(block: Option<usize>, part: Part) -> &'static crate::operand::Operand {
+    description().operand(block, part).unwrap_or_else(|| {
+        panic!("forward open: the plan states no format for {part:?} at {block:?}")
+    })
 }
 
 /// The layer `block` claims a tensor whose name ends with `tail`.
