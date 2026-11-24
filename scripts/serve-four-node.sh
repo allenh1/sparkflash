@@ -122,6 +122,11 @@ case "$WORLD" in
     *) die "SPARK_WORLD must be 1, 2 or 4, got '$WORLD'" ;;
 esac
 [ "${#NODES[@]}" -eq "$WORLD" ] || die "SPARK_NODES needs exactly $WORLD addresses in rank order (world $WORLD), got ${#NODES[@]}"
+# The group's ranks: rank r runs on NODES[r], for r below the world. Every mode that walks the
+# ranks walks this list, so a one- or two-rank group never reads a node past its last.
+RANKS=()
+for ((_rank = 0; _rank < WORLD; _rank++)); do RANKS+=("$_rank"); done
+unset _rank
 # The Inkling-2 device group takes its own flags (`--rank R --peer host:port,... --world 4
 # --converted DIR`); every other group is a `--tp4-rank` group.
 case "$MODEL" in
@@ -342,7 +347,7 @@ print_plan() {
     printf 'serve-four-node: nodes %s\n' "$NODES_RAW"
     printf 'serve-four-node: peers %s\n' "$PEERS"
     local rank
-    for rank in 0 1 2 3; do
+    for rank in "${RANKS[@]}"; do
         if is_local "$rank"; then
             printf 'serve-four-node: rank %s -> %s (this node)\n' "$rank" "${NODES[$rank]}"
             printf '  bash -c "%s"\n' "$(start_line "$rank")"
@@ -377,7 +382,7 @@ case "$MODE" in
         local_plan="$LOG_ROOT/$RUN_ID/local-commands.txt"
         mkdir -p "$LOG_ROOT/$RUN_ID"
         print_plan > "$local_plan"
-        for rank in 0 1 2 3; do
+        for rank in "${RANKS[@]}"; do
             remote "$rank" "$(start_line "$rank") echo \$!" \
                 | sed "s/^/rank $rank pid /"
         done
@@ -385,7 +390,7 @@ case "$MODE" in
         # first second. Otherwise an argument or startup error is reported as a successful launch.
         sleep 2
         failed=0
-        for rank in 0 1 2 3; do
+        for rank in "${RANKS[@]}"; do
             if ! remote "$rank" "pgrep -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
                 printf 'serve-four-node: rank %s exited immediately\n' "$rank" >&2
                 remote "$rank" "tail -n 25 '$LOG_ROOT/$RUN_ID/rank$rank.log'" >&2 || true
@@ -393,7 +398,7 @@ case "$MODE" in
             fi
         done
         if [ "$failed" != 0 ]; then
-            for rank in 0 1 2 3; do
+            for rank in "${RANKS[@]}"; do
                 remote "$rank" "pkill -TERM -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
             done
             die "one or more ranks failed to start"
@@ -402,7 +407,7 @@ case "$MODE" in
         printf 'serve-four-node: rank 0 health endpoint http://%s/health\n' "$HTTP_BIND"
         ;;
     stop)
-        for rank in 0 1 2 3; do
+        for rank in "${RANKS[@]}"; do
             # SIGTERM is the drain signal: rank 0 turns /readyz 503, finishes in-flight requests and
             # exits 0. The pattern is the exact rank flag (`--tp4-rank R` or `--rank R`), so no
             # other serve process is matched.
@@ -413,7 +418,7 @@ case "$MODE" in
         printf 'serve-four-node: in-flight requests drain for up to %s ms\n' "$DRAIN_TIMEOUT_MS"
         ;;
     status)
-        for rank in 0 1 2 3; do
+        for rank in "${RANKS[@]}"; do
             if remote "$rank" "pgrep -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
                 printf 'serve-four-node: rank %s running on %s\n' "$rank" "${NODES[$rank]}"
             else
