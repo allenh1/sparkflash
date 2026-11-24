@@ -2304,6 +2304,16 @@ impl WeightSource for RankWeights {
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        // A packed weight is not a byte range of its stored tensor: it is unpacked and sliced by
+        // rows and columns, so it bypasses the resident cache (which holds stored slices).
+        if let Some(escape) = self.packed_escape(name)
+            && let Some(rule) = self.plan.rule(name)
+        {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            let bytes = self.read_packed(name, &escape, rule)?;
+            self.read_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            return Ok(bytes);
+        }
         if let Some(cache) = &self.cache
             && let Some(bytes) = cache.get(name)
         {
@@ -2312,14 +2322,7 @@ impl WeightSource for RankWeights {
         }
         match self.plan.rule(name) {
             None => self.source.read(name),
-            Some(rule) => {
-                if let Some(escape) = self.packed_escape(name) {
-                    self.read_calls.fetch_add(1, Ordering::Relaxed);
-                    let bytes = self.read_packed(name, &escape, rule)?;
-                    self.read_bytes
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    return Ok(bytes);
-                }
+            Some(_) => {
                 let shard = self
                     .plan
                     .read(&self.source, name)
@@ -2333,6 +2336,10 @@ impl WeightSource for RankWeights {
     }
 
     fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+        // A packed weight's stored bytes are not its logical rows; the reader unpacks them.
+        if self.packed_escape(name).is_some() {
+            return Ok(None);
+        }
         Ok(self
             .cache
             .as_ref()
