@@ -203,6 +203,104 @@ across blocks takes the format of the tensor rather than the block's class. The 
 the format and names a format with no body as "not built". The forward's own dtype checks are
 F2's work and are untouched here.
 
+**Result (2026-11-23, F2).** The forward no longer reads a dtype word to decide what a tensor is.
+A stored format now carries the scale plane's own values (`ScaleValues`: `ue8m0`, `e4m3`, `f32`,
+`bf16`), so an FP8 128-tile release stored with f32 inverse scales and the same release with bf16
+ones are two formats a body cannot be handed for one another; and `mx-fp4` now means the arrangement
+every fp4 expert body in the tree reads - one power-of-two scale a row, every 32 values along the
+contraction - with the two-dimensional block grid kept as its own `MXFP4-GRID` name that no release
+declares. That correction is what makes the bind's row-scale plane the right size for the released
+experts: the block grid it used to name is smaller than the stored grid.
+
+The three consequences of a format are derived in one place, `sparkflash_deepseek_forward::operand`,
+and `Description` indexes the result per block and per part at open:
+
+* `ScalePlanes` sizes what the bind carries beside the values - a block (grid) plane, a row plane, a
+  tensor-wide factor and a packed tensor's escape list - from the format's block and kind, never from
+  a byte count of a tensor the caller happened to read;
+* `arrange` is the loader's one arrangement: as stored, the 32 x 32 B12x permutation, or the packed
+  word form, and it refuses a store that is not the format's byte length;
+* `ActivationForm` and `choose` decide the form a seam ends in and the body that reads it, per block
+  and per part. A format no claimed catalogue symbol decodes has no body, which the scan shows as
+  "not built" rather than launching the nearest one.
+
+The four files the section names ask the format now. `tp4_operands` states each projection's format
+from the configuration and checks the scale plane's size against the weight's block instead of the
+`F8_E8M0` word; `resident_weights`'s mhc_seam table is a list of formats and the bind compares the
+shard's; `moe_device::read_spec` takes the format and compares the file against the dtype that format
+implies, its scale-plane reader likewise; and the arena's `b12x_layout` and `tp4_forward`'s
+shared-expert gather decide from `reads_b12x(format)`, the shipped bytes' own declaration remaining
+the predicate only for a tensor the plan states no format for (a header dump, a fixture). The
+production entry builder states every tensor's format from the plan, so the device bind reads it.
+
+Two things are deliberately not in this step. The device bodies still read the released arithmetic
+only: a tile-format part resolves to no DeepSeek-image symbol, so its scan row says not built, and
+the F3 recipe below names the body that would serve it. And the Engram table keeps its own ue8m0
+grid in the writer (model.py:345 is its format, not the linear class's) while the layout's explicit
+E4M3 branch still reports the release's linear class for it; that one scan row is F4's to close, and
+no body reads it through the plan's format today.
+
+**Result (2026-11-23, F3).** FP8 on 128 x 128 tiles is the worked example: the dense projections,
+the shared expert and the routed experts, on prompt rows and token rows, with f32 and bf16 inverse
+scales, and with BF16 rows and rows quantised per 128 columns. **The one copy is
+`kernels/shared_prefill_mma_sm121.cuh`**: `shared_prefill_mma_body<SPM_W_FP8, ...>` for BF16 rows,
+`shared_prefill_q8_body` for rows quantised per 128 columns, and `shared_prefill_mma_rows_body` for
+the few-row (token) end of the same tile - one header, one 128-row x 128-column tile and one typed
+scale (`ScaleT`: `float` for GLM, `__nv_bfloat16` for Qwen). `opt_mma_bf16_body` was the other
+candidate and is refused: its weight modes are the B12x E4M3 tiling with a ue8m0 scale a 32 values,
+row-major bf16/f32, and row-scaled FP8. None of them reads a 128 x 128 tile scale, and adding that
+mode is the third copy D95 and D96 removed.
+
+The measurements behind the choice are the ones on record. D96 moved Qwen's FP8 experts onto this
+tile and measured GLM's FP8 prefill at 594 tok/s against Qwen's 463-467 on the token kernels; D101
+measured the same body on GLM's bulk chunk at 979-993 tok/s against 81 tok/s on the token path for a
+6.6k-token prompt, with the drafter's acceptance at 24 % against 90 % while the chunk was detached.
+D95 records why V4.1's own `opt_mma_moe_*` cannot take this format at all: ue8m0 powers of two
+against an arbitrary bf16 tile scale, packed E2M1 weights, and compile-time shapes. On the token end
+the same tile body is the few-rows form, so no second kernel family is introduced; the DeepSeek
+plan's `opt_mma_bf16a_*` bodies keep serving the released MXFP8 arithmetic.
+
+The steps, for the F4 families to follow:
+
+1. **State the format.** Declare it (values, block, scale values, block width) and add it to
+   `WeightFormat`/`StoredFormat` if it is a new arrangement; the layout reader converts it once, and
+   `same_arithmetic` must tell apart anything the body's instruction differs on.
+2. **Make the plan's tensors agree.** `TensorPlan::scaled` writes the values dtype, the scale dtype
+   and the grid's shape from the format, so the store and the plan cannot disagree; a tensor with its
+   own model fact (the Engram table's ue8m0 grid) states its format explicitly.
+3. **Teach the reference the grid, not a default.** Every read takes the grid the format implies
+   (`ModelConfig::dense_grid`/`expert_grid`), so a release stored another way is read on its own
+   grid; a scale dtype the fused path does not read falls to the materialised decode, exact for any
+   grid.
+4. **Let the seam decide once.** `ScalePlanes::of` sizes the bind's planes, `arrange` produces the
+   body's layout, `ActivationForm::of` fixes what the seam before the part emits, and `choose` picks
+   the body from the plan's claimed symbols by the format each build recorded.
+5. **Bind what the format needs.** The grid plane, the row plane, the tensor-wide factor and the
+   packed escape list; a body that needs one the bind does not carry is refused by name at open.
+6. **Pick the body the tree already has.** The shared tile header for a 128-tile format (BF16 rows on
+   the decode end, per-128 quantised rows on the prompt end), or give an existing body the decode. A
+   new body needs its reason and its measurement written here.
+7. **Prove it on the synthetic checkpoint.** `scripts/second-shape.py run ... --stored-format
+   fp8-f32` (or `fp8-bf16`) writes the same fixture in that format, runs the host reference over it
+   and compares the group's greedy ids at one, two and four ranks.
+
+Proof of this step, run on this host (`/tmp/sf-f3` for f32 scales, `/tmp/sf-f3b` for bf16): the
+second-shape fixture declared as `fp8`, `weight_block_size: [128, 128]`, `scale_fmt: f32` (then
+`bf16`) and `expert_dtype: fp8`, written by the crate's own writer, compared against the host
+reference at one, two and four ranks: `second-shape: VERDICT PASS` and
+`external check PASS` at every world, both scale types. The reference's greedy ids are the same for
+both scale types and for all three worlds:
+
+```
+[[6653, 28875, 30803, 7797, 30906, 14034, 26554, 23093],
+ [14371, 20678, 29812, 23985, 1458, 3459, 20210, 7815],
+ [7084, 149, 12756, 20718, 22229, 27765, 24326, 8911]]
+```
+
+The released path is unchanged: the same code reads the released 32-block MXFP8 checkpoint through
+`Block32`/`PerRow32` exactly as before, and the released proof (`scripts/second-shape.py` with no
+`--stored-format`) still passes at one, two and four ranks.
+
 ### S. The seam
 
 * **S1. Blocks become steps, decided at open (rows path).** For each block the engine builds a

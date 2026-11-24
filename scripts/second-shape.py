@@ -58,6 +58,16 @@ MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 # The end-of-sequence id the configuration names; the host reference stops after writing it.
 EOS = 1
 PROMPTS = [[100, 101, 102, 103], [200, 201, 202], [300, 301, 302, 303, 304, 305]]
+# The stored formats the checkpoint can be written in: the fixture's released 32 x 32 power-of-two
+# grid, or FP8 on 128 x 128 tiles with the inverse scale stored f32 or bf16. The variant is the
+# checkpoint's own declaration - the writer, the reference and the group all read this one file.
+STORED_FORMATS = {
+    "released": None,
+    "fp8-f32": {"quant_method": "fp8", "scale_fmt": "f32", "expert_dtype": "fp8"},
+    "fp8-bf16": {"quant_method": "fp8", "scale_fmt": "bf16", "expert_dtype": "fp8"},
+}
+# The block an FP8 tile release stores: one inverse scale a 128 x 128 tile.
+TILE_BLOCK = 128
 
 
 def fail(message: str) -> "NoReturn":
@@ -68,6 +78,19 @@ def fail(message: str) -> "NoReturn":
 def run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
     print("second-shape:", " ".join(command), flush=True)
     return subprocess.run(command, check=False, **kwargs)
+
+
+def variant_config(name: str, out: Path) -> Path:
+    """Write the fixture's configuration with the variant's stored format, and return its path."""
+    document = json.loads(FIXTURE.read_text())
+    declared = STORED_FORMATS[name]
+    if declared is not None:
+        quantization = document["quantization_config"]
+        quantization.update(declared)
+        quantization["weight_block_size"] = [TILE_BLOCK, TILE_BLOCK]
+    path = out / f"config-{name}.json"
+    path.write_text(json.dumps(document, indent=2))
+    return path
 
 
 def stage_cubins(released: Path, built: Path, out: Path) -> None:
@@ -156,8 +179,9 @@ def run_test(args: argparse.Namespace) -> int:
     cubins = out / "cubins"
     if checkpoint.exists():
         shutil.rmtree(checkpoint)
+    config = variant_config(args.stored_format, out)
     result = run(
-        [args.writer, str(FIXTURE), str(checkpoint), "7", "4"],
+        [args.writer, str(config), str(checkpoint), "7", "4"],
     )
     if result.returncode != 0:
         fail("the synthetic checkpoint did not write")
@@ -257,6 +281,12 @@ def main() -> int:
         "--world",
         default="4",
         help="comma-separated rank counts to run (default 4; the proof runs 1,2,4)",
+    )
+    run_parser.add_argument(
+        "--stored-format",
+        default="released",
+        choices=sorted(STORED_FORMATS),
+        help="how the checkpoint stores its weights (default released: the fixture's own declaration)",
     )
     run_parser.add_argument("--port", type=int, default=8126)
     run_parser.add_argument("--max-tokens", type=int, default=8)
