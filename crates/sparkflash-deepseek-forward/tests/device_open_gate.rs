@@ -95,6 +95,7 @@ fn the_second_shape_opens_from_its_own_plan_at_one_two_and_four_ranks() {
         check_head(&mut gate);
         check_streams(&mut gate, world);
         check_parts(&mut gate, &plan, world);
+        check_routed_dedup(&mut gate, &plan, world);
         check_wo_a(&mut gate, &dir, world, &written, &plan);
         check_draft(&mut gate, world);
         check_prefill(&mut gate, world);
@@ -111,7 +112,6 @@ fn the_second_shape_opens_from_its_own_plan_at_one_two_and_four_ranks() {
     );
 }
 
-/// The certified head's buffer and the screen's block count, at the plan's width.
 /// The row kernels are built for one stream count; the plan must state it, or the embedding
 /// gather writes rows of a width no kernel reads.
 fn check_streams(gate: &mut Refusals, world: usize) {
@@ -125,6 +125,7 @@ fn check_streams(gate: &mut Refusals, world: usize) {
     });
 }
 
+/// The certified head's buffer and the screen's block count, at the plan's width.
 fn check_head(gate: &mut Refusals) {
     let hidden = plan::hidden();
     let blocks = hidden / lm_head_ref::SCREEN_TILE;
@@ -185,6 +186,118 @@ fn check_head(gate: &mut Refusals) {
             )
         },
     );
+}
+
+/// The instance catalogue the build compiles from, read so the gate can compare what one cubin was
+/// compiled for with what the plan states. A body's launch bounds and its operand strides come
+/// from these values, so a row built for another shape answers a launch the driver refuses.
+const INSTANCES: &str = include_str!("../../../kernels/instances.toml");
+
+/// One `[[instance]]` row's key/value pairs.
+fn instance_rows() -> Vec<std::collections::BTreeMap<String, String>> {
+    let mut rows = Vec::new();
+    let mut row: Option<std::collections::BTreeMap<String, String>> = None;
+    for line in INSTANCES.lines() {
+        let line = line.trim();
+        if line == "[[instance]]" {
+            rows.extend(row.take());
+            row = Some(std::collections::BTreeMap::new());
+            continue;
+        }
+        let Some(current) = row.as_mut() else {
+            continue;
+        };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        current.insert(key.trim().to_owned(), value.to_owned());
+    }
+    rows.extend(row);
+    rows
+}
+
+/// The routed dedup down body's block is the plan's, not the released 288: the instance compiles
+/// its launch bounds from one rank's intermediate, so the cubin the plan selects must be one built
+/// for that intermediate, and the block must be half of it.
+fn check_routed_dedup(gate: &mut Refusals, plan: &EnginePlan, world: usize) {
+    let rows = instance_rows();
+    for layer in plan.layers() {
+        let Some(requirement) = layer
+            .requirements
+            .iter()
+            .find(|requirement| requirement.part == Part::Moe)
+        else {
+            continue;
+        };
+        if requirement.geometry.experts == 0 {
+            continue;
+        }
+        // The plan names an image; the staged cubin for this world is that image's build, and the
+        // catalogue states which one from the world's suffix.
+        if !plan
+            .symbols()
+            .iter()
+            .any(|entry| entry.part == Part::Moe && !entry.symbols.is_empty())
+        {
+            gate.require("routed dedup block", false, || {
+                format!("layer {}: the plan names no MoE image", layer.index)
+            });
+            continue;
+        }
+        let geometry = MoeRoutedGeometry::new(
+            requirement.geometry.hidden,
+            plan::moe_inter_dim(),
+            world,
+            requirement.geometry.experts,
+            requirement.geometry.top_k,
+        );
+        let geometry = match gate.report("routed dedup block", geometry) {
+            Some(geometry) => geometry,
+            None => continue,
+        };
+        let local = geometry.local_inter();
+        let block = geometry.dedup_down_threads();
+        let suffix = match world {
+            1 => "_s2w1",
+            2 => "_s2w2",
+            4 => "_s2",
+            _ => "",
+        };
+        let built = rows.iter().find(|row| {
+            row.get("entry").map(String::as_str) == Some("opt_moe_down_dedup_sm121")
+                && row
+                    .get("cubin")
+                    .is_some_and(|cubin| cubin.ends_with(suffix))
+                && !suffix.is_empty()
+        });
+        gate.require("routed dedup block", built.is_some(), || {
+            format!(
+                "layer {}: kernels/instances.toml has no opt_moe_down_dedup_sm121 row whose cubin \
+                 ends {suffix} for world {world}",
+                layer.index
+            )
+        });
+        let Some(built) = built else { continue };
+        let compiled = built
+            .get("intermediate")
+            .and_then(|value| value.parse::<usize>().ok());
+        gate.require("routed dedup block", compiled == Some(local), || {
+            format!(
+                "layer {}: the plan states {local} intermediate columns a rank and the world's \
+                 dedup down cubin was compiled for {compiled:?}; the launch would state a block \
+                 its launch bounds refuse",
+                layer.index
+            )
+        });
+        gate.require("routed dedup block", block * 2 == local, || {
+            format!(
+                "layer {}: the dedup down block is {block}, not half the {local} intermediate \
+                 columns a rank holds",
+                layer.index
+            )
+        });
+    }
 }
 
 /// Every part the plan executes: its stated format, its selected symbols, the shared expert's own

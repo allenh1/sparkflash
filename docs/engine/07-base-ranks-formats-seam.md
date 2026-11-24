@@ -469,12 +469,49 @@ directory holds `libnccl.so.2`, not `libnccl.so` (the loader's first name, prese
 nodes), so step 0's literal check was satisfied by the `.so.2`; the harness was SIGTERMed at the
 refusal, so no world issued a `VERDICT`; no worker ran.
 
+**Result (2026-11-24, the tenth window, world 1, the dedup down block).** Tip `204a256` (binary
+`3dcd68a3`), world 1 only, a fresh checkpoint and a fresh world-1 reference (the shape's config
+changed), the same 85 cubins. Setup completed at 4,597 ms (layer seams 248, tail 3,398, layer
+device open 4,200, attachments 4,222), the head's host arm produced
+
+```
+[[24319, 14482, 27568, 20871, 10699, 19197, 5245, 24450],
+ [2230, 19981, 7902, 23487, 13332, 10093, 23350, 20839],
+ [18661, 1217, 25908, 3469, 27591, 27897, 27916, 23008]]
+```
+
+which equals the dev-box reference, and the first prefill then died at the routed dedup down
+launch:
+
+```
+sparkflash serve: device_failure epoch_ms=... the device loop failed, exiting: moe_routed dedup:
+down: cuLaunchKernel failed: 1
+```
+
+The gate/up dedup launch before it succeeded, so the plan, the cubin and the readers were all
+right up to that point. The down body's thread count is half one rank's intermediate columns
+(`OPT_MOE_DD_THREADS = OPT_MOE_INTER / 2`), the instance compiles its launch bounds from the same
+number, and the launch passed the released literal 288 - correct for the released 576, refused by
+the driver for this shape's 512 (its cubin is built for 256 threads). The block is now the plan's:
+`MoeRoutedGeometry::dedup_down_threads()`, half `local_inter()`. The other launches in that path
+state constants the instances do not vary (`OPT_MOE_GU_THREADS` 128, `OPT_MOE_D_THREADS` 256), so
+this was the one instance-dependent block in the file.
+
+Deviations: the worker check by address failed on the head's stale known-hosts entry and was made
+by the nodes' own names, which is what the launcher uses; the harness hung past its 150 s window
+after the refusal and was SIGTERMed, so its collect and stop were run by hand; the cluster's
+`/v1/cluster/stats` reports an empty node list before and after (a pre-existing fault), so the 4/4
+restore is proven by the process list and the launcher's own status. Downtime 7m16s (stop
+14:59:59Z, launch 15:06:44Z, `readyz` 200 at 15:07:15Z), production back on the same release
+binary (`5a299b15`) and serving.
+
 **The device-open gate (2026-11-24).** `crates/sparkflash-deepseek-forward/tests/device_open_gate.rs`
 builds the second shape's plan at worlds 1, 2 and 4 and walks every part the device opens: the
 stored format each part states and the kernel symbols the plan names for it, the shared expert's
 own format, one rank's `wo_a` rows in the B12x operand the body reads, the routed geometry an
 instance was built for, the head's block-maxima buffer at the plan's width, the screen's certified
-width and the setting that turns it off, the hidden-stream count the rows kernels are built for,
+width and the setting that turns it off, the hidden-stream count the rows kernels are built for, the routed dedup body's block against
+the intermediate its cubin was compiled for,
 every DSpark stage's tensors including the last stage's Markov head, the depth authority, and the
 NVFP4 prefill candidate and its pin. It collects every
 refusal and reports them in one run, naming the part. The gate is plan-driven: it does not list
@@ -491,6 +528,7 @@ named case at all three worlds, and the passing tree produces none:
 | an unstated depth falls back to 5 | `DSpark depth` |
 | the Markov head reads the released stage two | `drafter stage claims` |
 | the plan states 2 hidden streams, the rows kernels are built for 4 | `embedding gather streams` |
+| the dedup down block is the released 288 | `routed dedup block` |
 
 The gate cannot be compiled on the pre-fix tree `1ef7a6ca` verbatim: the plan answers it asks for
 (`shared_expert_format`, `dense_stored_format`, `blocks_per_row`, `mtp_last_stage`, `draft_depth`)
