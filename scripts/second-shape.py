@@ -260,6 +260,63 @@ def run_test(args: argparse.Namespace) -> int:
             f"--prompts {prompts_file} --expected {expected_file} --max-tokens {args.max_tokens} "
             f"--ready-timeout 60"
         )
+        # The device arm takes NCCL collectives, so its group is the one the deployed launcher
+        # starts: one process a node over ssh. SPARK_NODES names the nodes in rank order; the first
+        # `world` of them are the group. Without it the device group runs on one host, which is the
+        # host arm's exchange and is refused by the device run header.
+        nodes = os.environ.get("SPARK_NODES")
+        if args.device and nodes:
+            node_list = nodes.split()[:world]
+            peer_list = (os.environ.get("SPARK_PEERS") or nodes).split()[:world]
+            if len(node_list) != world or len(peer_list) != world:
+                fail(f"a {world}-rank device group needs {world} SPARK_NODES and SPARK_PEERS addresses")
+            group_env = {
+                **os.environ,
+                "SPARKFLASH_BIN": args.binary,
+                "SPARKFLASH_CHECKPOINT": str(checkpoint),
+                "SPARKFLASH_TOKENIZER": tokenizer,
+                "SPARKFLASH_CUBINS": str(staged),
+                "SPARKFLASH_LOG_ROOT": str(out / f"logs-{world}"),
+                "SPARK_NODES": " ".join(node_list),
+                "SPARK_PEERS": " ".join(peer_list),
+                "SPARK_WORLD": str(world),
+                "SPARK_LOCAL_RANKS": "0",
+                "SPARKFLASH_HTTP_BIND": f"0.0.0.0:{args.port}",
+                # The second shape's cubins are built from the instance list, not pinned in the
+                # released baseline; the open manifest records their hashes.
+                "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
+            }
+            launcher = str(ROOT / "scripts/serve-four-node.sh")
+            started = False
+            agreed = 1
+            try:
+                if run([launcher, "launch"], env=group_env).returncode != 0:
+                    fail(f"the {world}-rank device group did not start")
+                started = True
+                wait_ready(url)
+                agreed = run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "compare",
+                        "--url",
+                        url,
+                        "--prompts",
+                        str(prompts_file),
+                        "--expected",
+                        str(expected_file),
+                        "--max-tokens",
+                        str(args.max_tokens),
+                        "--ready-timeout",
+                        "60",
+                    ]
+                ).returncode
+            finally:
+                if started:
+                    run([launcher, "stop"], env=group_env)
+            if agreed != 0:
+                fail(f"the {world}-rank device group did not agree with the host reference")
+            continue
         result = run(
             [
                 str(ROOT / "scripts/one-host-group.sh"),
