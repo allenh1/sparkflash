@@ -1211,8 +1211,16 @@ impl DeviceLayer<'_> {
                 let table_rows = config
                     .engram_rows(layer)
                     .ok_or("engram set: no table height")?;
-                let skip = ids.contains(&sparkflash_engine::forward::engram::HASH_SENTINEL)
-                    || ids.iter().any(|&id| id as usize >= table_rows);
+                // A dead token's row is all sentinels and takes no part. A bucket past the table
+                // means the hash layout and the table disagree, which once left Engram silently
+                // unread at another shape, so it is refused rather than skipped.
+                let skip = ids.contains(&sparkflash_engine::forward::engram::HASH_SENTINEL);
+                if !skip && let Some(&id) = ids.iter().find(|&&id| id as usize >= table_rows) {
+                    return Err(format!(
+                        "engram set: layer {layer} position {position}: bucket {id} is past the \
+                         {table_rows}-row table"
+                    ));
+                }
                 if !by_row {
                     engram.skip[slot * engram.positions + position] = skip;
                 }
