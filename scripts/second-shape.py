@@ -111,14 +111,22 @@ def variant_config(name: str, out: Path) -> Path:
     return path
 
 
-def stage_cubins(released: Path, built: Path, out: Path) -> None:
-    """Every released cubin, then the second shape's over its released name."""
+def stage_cubins(released: Path, built: Path, out: Path, world: int) -> None:
+    """Every released cubin, then the world's second-shape cubins over their released names.
+
+    A shape that divides by the world has one cubin a world: the four-rank build is
+    `<stem>_s2`, the two- and one-rank builds are `<stem>_s2w2` and `<stem>_s2w1`, because
+    the compiled shape is not the same (the expert intermediate and the vocabulary shard scale
+    with the world). The loader keeps the released file names, so each world stages into its own
+    directory and the suffix never reaches it.
+    """
     out.mkdir(parents=True, exist_ok=True)
     for cubin in released.glob("*.cubin"):
         shutil.copy2(cubin, out / cubin.name)
+    suffix = "_s2.cubin" if world == 4 else f"_s2w{world}.cubin"
     staged = 0
-    for cubin in built.glob("*_s2.cubin"):
-        target = out / (cubin.name[: -len("_s2.cubin")] + ".cubin")
+    for cubin in built.glob(f"*{suffix}"):
+        target = out / (cubin.name[: -len(suffix)] + ".cubin")
         shutil.copy2(cubin, target)
         staged += 1
     # The NVFP4 wrappers are a new body, not a second shape of a released cubin: their instance
@@ -127,8 +135,11 @@ def stage_cubins(released: Path, built: Path, out: Path) -> None:
         shutil.copy2(cubin, out / cubin.name)
         staged += 1
     if staged == 0:
-        fail(f"no second-shape cubins under {built}; run scripts/build-cubins.sh first")
-    print(f"second-shape: staged {staged} second-shape cubins under {out}")
+        fail(
+            f"no second-shape cubins for {world} ranks under {built}; "
+            "run scripts/build-cubins.sh first"
+        )
+    print(f"second-shape: staged {staged} second-shape cubins for {world} ranks under {out}")
 
 
 def wait_ready(url: str, seconds: int = 600) -> None:
@@ -215,11 +226,9 @@ def run_test(args: argparse.Namespace) -> int:
         )
         if result.returncode != 0:
             fail("the cubins did not build")
-    if args.device:
-        if not args.released_cubins:
-            fail("--device needs --released-cubins: the staged directory keeps the released names")
-        built = Path(args.built) if args.built else out / "built"
-        stage_cubins(Path(args.released_cubins), built, cubins)
+    built = Path(args.built) if args.built else out / "built"
+    if args.device and not args.released_cubins:
+        fail("--device needs --released-cubins: the staged directory keeps the released names")
 
     prompts_file = out / "prompts.json"
     expected_file = out / "host-reference.json"
@@ -240,6 +249,12 @@ def run_test(args: argparse.Namespace) -> int:
         fail("--world names no rank count")
     for world in worlds:
         url = f"http://127.0.0.1:{args.port}"
+        # A shape that divides by the world has a cubin a world; stage this world's own directory
+        # so the loader's released file names resolve to the build for this rank count.
+        staged = cubins
+        if args.device:
+            staged = out / f"cubins-w{world}"
+            stage_cubins(Path(args.released_cubins), built, staged, world)
         compare_cmd = (
             f"{sys.executable} {Path(__file__).resolve()} compare --url {url} "
             f"--prompts {prompts_file} --expected {expected_file} --max-tokens {args.max_tokens} "
@@ -256,7 +271,7 @@ def run_test(args: argparse.Namespace) -> int:
                 str(checkpoint),
                 "--tokenizer",
                 tokenizer,
-                *(("--cubins", str(cubins)) if args.device else ()),
+                *(("--cubins", str(staged)) if args.device else ()),
                 "--port",
                 str(args.port),
                 "--check",

@@ -152,6 +152,33 @@ four, or a format other than the released ones. What that leaves open:
 * **F4** follows the same bar: a family is done when the device arm reads the synthetic
   checkpoint stored its way, not when the host arm does.
 
+**Result (2026-11-23, the device arm at two ranks).** The synthetic second-shape checkpoint
+(2.8 GB, the released `mx-fp4` row-scaled expert format, hidden 4096, 64 experts, top-4,
+intermediate 512, vocabulary 32,768) was opened on the device arm at two ranks on one host
+(`scripts/second-shape.py run --device --world 2,4`, tip `536a8a5`, 36 second-shape cubins,
+release binary `9a60bb02`). The group refused at open, before a launch:
+
+```
+cannot execute deepseek_v41 at TP2: moe on sm121 at MXFP4 (row scale + power-of-two grid,
+one scale per 32 values, row-major) in the prefill pass: deepseek_ptx: intermediate 256 is
+not one of the shapes the kernel was built for ([128, 576])
+```
+
+The two-rank split halves the 512-wide expert intermediate to 256, and the instance list has
+rows at 128 and 576 only. World 4 was not attempted, because the harness stops at the first
+disagreeing world. The host reference for the same checkpoint gave
+
+```
+[[6653, 20427, 12813, 422, 9389, 6388, 16395, 6405],
+ [25425, 11040, 11559, 23442, 29453, 17940, 5192, 25888],
+ [30169, 105, 2323, 11724, 1353, 885, 3013, 30683]]
+```
+
+which is a different prompt set from F3's three-prompt reference, so it is not comparable to
+those ids. The measurement stands as it is: at two ranks the device arm cannot reach the
+routed experts because their shape is not built, and R3's rank-count and padding instances are
+what unblock it.
+
 ## 4. The work
 
 ### R. Ranks

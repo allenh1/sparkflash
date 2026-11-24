@@ -5573,3 +5573,3192 @@ hidden = 2560
 intermediate = 640
 experts = 512
 top_k = 10
+
+
+# --- The second shape at one and two ranks ------------------------------------------------
+# A per-rank width divides by the world, so the same fixture at one and two ranks is a
+# different instance: every per-rank expert intermediate and vocabulary shard widens, and the
+# head and its reduction are built for that rank count. These copies leave every released
+# cubin's bytes alone; the _s2w<ranks> suffix is a separate cubin a rank count stages.
+
+[[instance]]
+source = "routed_gate_up_sm121.cu"
+entry = "routed_gate_up_sm121"
+cubin = "routed_gate_up_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_combine_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_dedup_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_dedup_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_combine_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "bf16"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_plan_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "bf16"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_k3_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_combine_k3_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_dedup_k3_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_combine_k3_sm121"
+cubin = "opt_moe_sm121_s2w1"
+family = "routed"
+format = "bf16"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 512
+padded = 512
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_sm121"
+cubin = "cert_lm_head_sm121_s2w1"
+family = "head"
+format = "bf16"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 32768
+ranks = 1
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_batched_sm121"
+cubin = "cert_lm_head_sm121_s2w1"
+family = "head"
+format = "bf16"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 32768
+ranks = 1
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_sm121"
+cubin = "lm_head_reduce_sm121_s2w1"
+family = "head"
+format = "bf16"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 32768
+ranks = 1
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_batched_sm121"
+cubin = "lm_head_reduce_sm121_s2w1"
+family = "head"
+format = "bf16"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 32768
+ranks = 1
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_seam"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_partials_rb1"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_partials_rb2"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_partials_rb4"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_tail"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_mhc_partials"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_mhc_post_partials"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_mhc_tail"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_seam_derive"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_post"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_kv"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn_scores"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn_softmax"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn_values"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_inv_rope"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_lm_head"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_argmax_fold"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_argmax_pick"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_build"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_rows"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_mma"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_exact"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_topc"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_prefetch_l2"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hc_pre_collapse"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_store_u32"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_embed_own"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_embed_stream"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_embed_table"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_engram_wkv"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_engram_wkv_s"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_rank_permute"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_prologue_bf16"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_shared_swiglu"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-activation"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_bf16w"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_bf16w_f32o"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_f32w_f32o"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_bf16w_f32o_ring"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_f32w_f32o_ring"
+cubin = "opt_rows_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_f32o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_rows_bf16o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_rowscale_f32o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-row"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_f32a_bf16o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_bf16a_fp8row_f32o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-row"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_head_fp8t_f32o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-row"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16w"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16w_f32o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_f32w_f32o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16a_bf16w"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16a_bf16w_f32o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16a_f32w_f32o"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_router_dots"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_router_topk"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_gate_up"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp4"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_down"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp4"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_combine"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-combine"
+catalogue_dims = ["hidden"]
+max_top_k = 64
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_bulk_fp4_pack"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_index_scores"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_bulk_attn"
+cubin = "opt_mma_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_f32o_t1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t2"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t2"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t2"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t2"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t4"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t4"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t4"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t4"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t8"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t8"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_f32o_t8"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t8"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t8"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_fp8a_bf16o_r8c2"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_fp8a_bf16o_r8c1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_fp8a_bf16o_r4c1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_bf16a_bf16o_r8c2"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_bf16a_bf16o_r8c1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_f32a_f32o_r4c2"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_f32a_f32o_r4c1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_mma_fp8a_bf16o_m1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_mma_bf16a_bf16o_m1"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_mma_bf16a_bf16o_m2"
+cubin = "opt_gemv_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rope_heads_bf16"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rmsnorm_bf16"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-norm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_lm_head"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_engram_wkv"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_kv_norm_rope"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_engram_gate_write"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_sum_ranks_bf16"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_pool_rows"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_k_norm_rows"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "f32"
+catalogue = "deepseek-rows-norm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_bulk_engram_embed"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_bulk_engram_post"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_engram_post"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_group_pool"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_group_keys"
+cubin = "opt_misc_sm121_s2w1"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_warp_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_tile_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_par_k_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_split_k_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_split_k_combine_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_dense_m1_sm121.cu"
+entry = "b12x_mxfp8_dense_m1_sm121"
+cubin = "b12x_mxfp8_dense_m1_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_nf_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_nf_f32a_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_f32a_f32o_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_bf16w_sm121"
+cubin = "b12x_hostw_gemv_m1_sm121_s2w1"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_bf16w_f32o_sm121"
+cubin = "b12x_hostw_gemv_m1_sm121_s2w1"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_f32w_f32o_sm121"
+cubin = "b12x_hostw_gemv_m1_sm121_s2w1"
+family = "rows"
+format = "f32"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_bf16w_4096_sm121"
+cubin = "b12x_hostw_gemv_m1_4096_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_4096v16384_sm121"
+cubin = "cert_lm_head_4096v16384_sm121_s2w1"
+family = "head"
+format = "bf16"
+hidden = 4096
+vocab_per_rank = 32768
+ranks = 1
+
+[[instance]]
+source = "routed_gate_up_sm121.cu"
+entry = "routed_gate_up_sm121"
+cubin = "routed_gate_up_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_combine_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_dedup_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_dedup_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_combine_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "bf16"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_plan_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "bf16"
+catalogue = "deepseek-moe"
+plan_rows = 384
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_k3_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_down_combine_k3_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_gate_up_dedup_k3_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "opt_moe_sm121.cu"
+entry = "opt_moe_combine_k3_sm121"
+cubin = "opt_moe_sm121_s2w2"
+family = "routed"
+format = "bf16"
+catalogue = "deepseek-mtp"
+catalogue_intermediate = false
+plan_rows = 384
+hidden = 4096
+experts = 32
+top_k = 2
+intermediate = 256
+padded = 256
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_sm121"
+cubin = "cert_lm_head_sm121_s2w2"
+family = "head"
+format = "bf16"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 16384
+ranks = 2
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_batched_sm121"
+cubin = "cert_lm_head_sm121_s2w2"
+family = "head"
+format = "bf16"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 16384
+ranks = 2
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_sm121"
+cubin = "lm_head_reduce_sm121_s2w2"
+family = "head"
+format = "bf16"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 16384
+ranks = 2
+
+[[instance]]
+source = "lm_head_reduce_sm121.cu"
+entry = "lm_head_reduce_batched_sm121"
+cubin = "lm_head_reduce_sm121_s2w2"
+family = "head"
+format = "bf16"
+catalogue = "deepseek-head"
+hidden = 4096
+vocab_per_rank = 16384
+ranks = 2
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_seam"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_partials_rb1"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_partials_rb2"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_partials_rb4"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_tail"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_mhc_partials"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_mhc_post_partials"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_mhc_tail"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_bulk_seam_derive"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_mhc_post"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_kv"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn_scores"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn_softmax"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_attn_values"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "mx-fp8"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_inv_rope"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_lm_head"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_argmax_fold"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_argmax_pick"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_build"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_rows"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_mma"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_head_screen_exact"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_topc"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_prefetch_l2"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hc_pre_collapse"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_store_u32"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_embed_own"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_embed_stream"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_embed_table"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_engram_wkv"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_engram_wkv_s"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_rank_permute"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_prologue_bf16"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_shared_swiglu"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-activation"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_bf16w"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_bf16w_f32o"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_f32w_f32o"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_bf16w_f32o_ring"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_rows_sm121.cu"
+entry = "opt_rows_hostw_f32w_f32o_ring"
+cubin = "opt_rows_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_f32o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_rows_bf16o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_rowscale_f32o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-row"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_f32a_bf16o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_bf16a_fp8row_f32o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-row"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_head_fp8t_f32o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-row"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16w"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16w_f32o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_f32w_f32o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16a_bf16w"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16a_bf16w_f32o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_hostw_bf16a_f32w_f32o"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_router_dots"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_router_topk"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_gate_up"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp4"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_down"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp4"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_combine"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-combine"
+catalogue_dims = ["hidden"]
+max_top_k = 64
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_bulk_fp4_pack"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_index_scores"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_bulk_attn"
+cubin = "opt_mma_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_f32o_t1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t2"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t2"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t2"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t2"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t4"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t4"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t4"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t4"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_bf16a_bf16o_t8"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_bf16o_t8"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_fp8a_f32o_t8"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_f32o_t8"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_f32a_bf16o_t8"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_fp8a_bf16o_r8c2"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_fp8a_bf16o_r8c1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_fp8a_bf16o_r4c1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_bf16a_bf16o_r8c2"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_bf16a_bf16o_r8c1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_f32a_f32o_r4c2"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_rows_f32a_f32o_r4c1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_mma_fp8a_bf16o_m1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_mma_bf16a_bf16o_m1"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_gemv_sm121.cu"
+entry = "opt_gemv_mma_bf16a_bf16o_m2"
+cubin = "opt_gemv_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rope_heads_bf16"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rmsnorm_bf16"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-norm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_lm_head"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_engram_wkv"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_kv_norm_rope"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_engram_gate_write"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_sum_ranks_bf16"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_pool_rows"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_k_norm_rows"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "f32"
+catalogue = "deepseek-rows-norm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_bulk_engram_embed"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_bulk_engram_post"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_engram_post"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_group_pool"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_group_keys"
+cubin = "opt_misc_sm121_s2w2"
+family = "rows"
+format = "f32"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_warp_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_tile_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_par_k_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_split_k_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_dense_sm121.cu"
+entry = "b12x_mxfp8_dense_split_k_combine_sm121"
+cubin = "b12x_mxfp8_dense_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_dense_m1_sm121.cu"
+entry = "b12x_mxfp8_dense_m1_sm121"
+cubin = "b12x_mxfp8_dense_m1_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_nf_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_nf_f32a_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_mxfp8_gemv_m1_sm121.cu"
+entry = "b12x_mxfp8_gemv_m1_f32a_f32o_sm121"
+cubin = "b12x_mxfp8_gemv_m1_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-tiled"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_bf16w_sm121"
+cubin = "b12x_hostw_gemv_m1_sm121_s2w2"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_bf16w_f32o_sm121"
+cubin = "b12x_hostw_gemv_m1_sm121_s2w2"
+family = "rows"
+format = "bf16"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_f32w_f32o_sm121"
+cubin = "b12x_hostw_gemv_m1_sm121_s2w2"
+family = "rows"
+format = "f32"
+catalogue = "deepseek-rows-gemm"
+catalogue_dims = ["hidden"]
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "b12x_hostw_gemv_m1_sm121.cu"
+entry = "b12x_hostw_gemv_m1_bf16w_4096_sm121"
+cubin = "b12x_hostw_gemv_m1_4096_sm121_s2w2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "cert_lm_head_sm121.cu"
+entry = "cert_lm_head_4096v16384_sm121"
+cubin = "cert_lm_head_4096v16384_sm121_s2w2"
+family = "head"
+format = "bf16"
+hidden = 4096
+vocab_per_rank = 16384
+ranks = 2
