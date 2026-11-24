@@ -81,6 +81,8 @@ fn stored_format_constant(token: &str, key: &str) -> &'static str {
         "mx-fp8-tiled" => "StoredFormat::MXFP8_TILED_32",
         "mx-fp8-row" => "StoredFormat::MXFP8_ROW_32",
         "nvfp4" => "StoredFormat::NVFP4_16",
+        "nvfp4-qwen" => "StoredFormat::NVFP4_QWEN_16",
+        "nvfp4-inkling" => "StoredFormat::NVFP4_INKLING_16",
         "mx-fp4" | "mx-fp4-row" => "StoredFormat::MXFP4_ROW_32",
         "mx-fp4-grid" => "StoredFormat::MXFP4_32",
         other => panic!(

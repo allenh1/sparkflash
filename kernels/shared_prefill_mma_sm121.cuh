@@ -83,6 +83,10 @@
 // The weight formats the tile body serves.
 #define SPM_W_BF16 0
 #define SPM_W_FP8 1
+// E2M1 codes with one E4M3 scale a 16-value group, dequantised into the tile's BF16 weight
+// words. kWide selects where the convention's tensor-wide factor is applied: 1 folds it into the
+// group scale at the load (Qwen), 2 applies it to the output (Inkling), 0 carries none.
+#define SPM_W_FP4 2
 
 // A dense GEMM block's (column tile, row tile) for the grid's (x column tiles, y row tiles): the
 // linear block order walks GLM_RASTER row tiles down each column tile before moving on, so the
@@ -160,7 +164,7 @@ __device__ __forceinline__ float spm_scale(const ScaleT value) {
 // The activation is f32 split into bf16 head and remainder; the output is f32.
 template <int kFormat, bool kRoutedMoe, bool kLow, typename ScaleT = float,
           int kTableStride = 2, int kTableOffset = 0, bool kSlotRows = false,
-          bool kOutSlotRows = false>
+          bool kOutSlotRows = false, int kWide = 0>
 __device__ __forceinline__ void shared_prefill_mma_body(
     const float *__restrict__ a, const uint8_t *__restrict__ w, const void *__restrict__ ws,
     const unsigned long long *__restrict__ table, const int4 *__restrict__ items,
@@ -168,8 +172,12 @@ __device__ __forceinline__ void shared_prefill_mma_body(
     uint64_t a_tok_stride, uint64_t out_tok_stride, uint64_t a_grp_stride,
     uint64_t out_grp_stride, uint64_t w_grp_stride = 0, uint64_t ws_grp_stride = 0,
     const int *__restrict__ sorted = nullptr, uint32_t topk = 1,
-    const float *__restrict__ route = nullptr, uint32_t route_stride = 0) {
+    const float *__restrict__ route = nullptr, uint32_t route_stride = 0,
+    float wide = 1.0f) {
     constexpr bool kFp8 = kFormat == SPM_W_FP8;
+    constexpr bool kFp4 = kFormat == SPM_W_FP4;
+    constexpr bool kFoldWide = kFp4 && kWide == 1;
+    constexpr bool kOutWide = kFp4 && kWide == 2;
     __shared__ __align__(16) __nv_bfloat16 s_ah[GLM_BM * OB_LD];
     __shared__ __align__(16) __nv_bfloat16 s_al[kLow ? GLM_BM * OB_LD : 1];
     __shared__ __align__(16) __nv_bfloat16 s_w[GLM_BN * OB_LD];
@@ -259,6 +267,16 @@ __device__ __forceinline__ void shared_prefill_mma_body(
                 rw[0] = __ldg(reinterpret_cast<const uint4 *>(src));
                 rs = spm_scale<ScaleT>(
                     __ldg(&ws_grp[(col >> 7) * (inner >> 7) + (kb >> 2)]));
+            } else if constexpr (kFp4) {
+                // One 32-column stage of one output row: 16 packed E2M1 codes (8 bytes) for this
+                // half, and one E4M3 group scale for those 16 values.
+                const uint8_t *src = w_grp + (col * inner + kb * 32u + w_half * 16u) / 2u;
+                const uint2 packed = __ldg(reinterpret_cast<const uint2 *>(src));
+                rw[0] = make_uint4(packed.x, packed.y, 0u, 0u);
+                const uint8_t *scale_row =
+                    reinterpret_cast<const uint8_t *>(ws_grp) + col * (inner / 16u);
+                rs = spark_fp8_e4m3_decode(scale_row[kb * 2u + w_half]);
+                if constexpr (kFoldWide) rs *= wide;
             } else {
                 const uint8_t *src = w_grp + (col * inner + kb * 32u + w_half * 16u) * 2u;
                 rw[0] = __ldg(reinterpret_cast<const uint4 *>(src));
@@ -302,6 +320,20 @@ __device__ __forceinline__ void shared_prefill_mma_body(
             *reinterpret_cast<uint4 *>(dst + 8) =
                 make_uint4(ob_e4m3x2(r.z, 1.0f), ob_e4m3x2(r.z >> 16, 1.0f),
                            ob_e4m3x2(r.w, 1.0f), ob_e4m3x2(r.w >> 16, 1.0f));
+        } else if constexpr (kFp4) {
+            // E2M1 * E4M3 is exact in BF16, so the group scale folded into the staged word is
+            // the release's own product. Qwen's weight global joins it here; Inkling's joins the
+            // output below.
+            const float scale = rs;
+            const uint32_t words[2] = {rw[0].x, rw[0].y};
+#pragma unroll
+            for (uint32_t byte = 0; byte < 8u; ++byte) {
+                const uint8_t code = (uint8_t)(words[byte >> 2] >> (8u * (byte & 3u)));
+                dst[2u * byte] = __float2bfloat16_rn(
+                    spark_fp4_e2m1_decode(code & 0x0Fu) * scale);
+                dst[2u * byte + 1u] = __float2bfloat16_rn(
+                    spark_fp4_e2m1_decode(code >> 4) * scale);
+            }
         } else {
             *reinterpret_cast<uint4 *>(dst) = rw[0];
             *reinterpret_cast<uint4 *>(dst + 8) = rw[1];
@@ -415,6 +447,9 @@ __device__ __forceinline__ void shared_prefill_mma_body(
                 float2 v = make_float2(accum[0][mt][nt][2u * half],
                                        accum[0][mt][nt][2u * half + 1u]);
                 if (scaled) v = make_float2(__fmul_rn(v.x, weight), __fmul_rn(v.y, weight));
+                if constexpr (kOutWide) {
+                    v = make_float2(__fmul_rn(v.x, wide), __fmul_rn(v.y, wide));
+                }
                 *reinterpret_cast<float2 *>(out + o) = v;
             }
         }
@@ -511,7 +546,7 @@ __device__ __forceinline__ void shared_prefill_mma_rows_chain(
 template <bool kScaled, class Stage>
 __device__ __forceinline__ void shared_prefill_mma_rows_body(
     Stage &stage, const float *__restrict__ a, float *__restrict__ out, uint32_t cols,
-    uint32_t inner, uint32_t tokens) {
+    uint32_t inner, uint32_t tokens, float out_scale = 1.0f) {
     __shared__ __align__(16) unsigned char tile[4][8u * SPM_ROWS_STRIDE];
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5;
@@ -529,7 +564,8 @@ __device__ __forceinline__ void shared_prefill_mma_rows_body(
         const uint32_t token = g + 8u * half;
         if (token >= tokens) continue;
         *reinterpret_cast<float2 *>(out + (unsigned long long)token * cols + n0 + 2u * q) =
-            make_float2(acc[2u * half], acc[2u * half + 1u]);
+            make_float2(__fmul_rn(acc[2u * half], out_scale),
+                        __fmul_rn(acc[2u * half + 1u], out_scale));
     }
 }
 
@@ -579,6 +615,42 @@ struct SpmRowsFp8 {
     }
 };
 
+
+// An E2M1 weight row's 32-column K block, dequantised by its 16-value E4M3 group scale into the
+// bf16 words the prompt tile stages. A lane's four bytes are eight codes and lie in one group:
+// parts 0 and 1 are the stage's low 16 values, parts 2 and 3 its high 16.
+struct SpmRowsFp4 {
+    const uint8_t *w;
+    const uint8_t *ws;
+    uint32_t inner;
+    float fold;
+    bool fold_wide;
+    __device__ __forceinline__ float operator()(uint32_t kb, uint32_t n0, unsigned char *tile,
+                                                bool live) const {
+        const uint32_t lane = threadIdx.x & 31u;
+        const uint32_t r = lane >> 2;
+        const uint32_t part = lane & 3u;
+        uint32_t codes = 0u;
+        if (live) {
+            codes = __ldg(reinterpret_cast<const uint32_t *>(
+                w + (unsigned long long)(n0 + r) * (inner / 2u) + kb * 16u + part * 4u));
+        }
+        const uint32_t row = n0 + r;
+        const uint32_t group = kb * 2u + (part >> 1);
+        float scale = live ? spark_fp8_e4m3_decode(ws[row * (inner / 16u) + group]) : 0.0f;
+        if (fold_wide) scale *= fold;
+        __nv_bfloat16 *dst = reinterpret_cast<__nv_bfloat16 *>(tile + r * SPM_ROWS_STRIDE +
+                                                              16u * part);
+#pragma unroll
+        for (uint32_t byte = 0; byte < 4u; ++byte) {
+            const uint8_t code = (uint8_t)(codes >> (8u * byte));
+            dst[2u * byte] = __float2bfloat16_rn(spark_fp4_e2m1_decode(code & 0x0Fu) * scale);
+            dst[2u * byte + 1u] =
+                __float2bfloat16_rn(spark_fp4_e2m1_decode(code >> 4) * scale);
+        }
+        return 1.0f;
+    }
+};
 
 // A bf16x2 of two f32 (lo in the low half), each rounded as __float2bfloat16_rn rounds it, and
 // the two halves of one back as f32.

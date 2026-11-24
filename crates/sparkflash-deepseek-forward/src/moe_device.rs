@@ -284,6 +284,7 @@ struct Kernels {
 pub struct MoeDeviceBackendImpl {
     cuda: Cuda,
     kernels: Kernels,
+    nvfp4: Option<crate::nvfp4_prefill::Nvfp4Kernels>,
     stats: MoeDeviceStats,
     launches_by_layer: Vec<usize>,
     diagnose_layer0: bool,
@@ -325,8 +326,10 @@ impl MoeDeviceBackendImpl {
         let (head_module, head) = cert_lm_head_launch::load(&cuda, &head_bytes)?;
         let (head_reduce_module, head_reduce) = head_reduce::load(&cuda, &head_reduce_bytes)?;
         let (rmsnorm_module, rmsnorm) = rmsnorm_launch::load(&cuda, &rmsnorm_bytes)?;
+        let nvfp4 = crate::nvfp4_prefill::Nvfp4Kernels::load(dir, &cuda)?;
         Ok(Self {
             cuda,
+            nvfp4,
             kernels: Kernels {
                 router,
                 router_topk,
@@ -373,6 +376,240 @@ impl MoeDeviceBackendImpl {
             head_weight: None,
             head_block_max: None,
         })
+    }
+
+    /// One layer's routed experts in a stored NVFP4 convention, on the shared bulk-prefill tile.
+    ///
+    /// The tile body reads one expert matrix at a time, so this path gathers the slots that chose
+    /// an expert into contiguous f32 rows, launches gate and up on the prompt tile (or its
+    /// few-row form for eight rows or fewer), applies the SwiGLU and routing weight on the host,
+    /// and launches down. The activations are the reference's f32 rows; the weight decode is the
+    /// shared body's SPM_W_FP4 mode. It is a correctness path for the synthetic device proof, not
+    /// a throughput path.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_nvfp4(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        x: &[f32],
+        source: &dyn WeightSource,
+        table: &[(usize, usize)],
+        weights: &[f32],
+        local_ids: &[u32],
+        tokens: usize,
+        topk: usize,
+        dim: usize,
+        inter: usize,
+        out: &mut [f32],
+    ) -> Result<(), EngineError> {
+        use sparkflash_model::format::NvFp4Wide;
+        let Some(kernels) = self.nvfp4.as_ref() else {
+            return Err(err(
+                "device routed MoE",
+                "the checkpoint stores NVFP4 experts, but no NVFP4 cubin is staged".to_owned(),
+            ));
+        };
+        let format = config.expert_format();
+        let qwen = format.tensor_wide() == NvFp4Wide::Qwen;
+        let mut allocated = 0usize;
+        let mut ptrs = Vec::new();
+        let started = std::time::Instant::now();
+        for &(local, expert) in table {
+            let base = crate::plan::layer_prefix(layer, &format!("ffn.experts.{expert}"));
+            let w1 = read_spec(source, &format!("{base}.w1.weight"), format, &[inter, dim])?;
+            let s1 = read_scale_spec(
+                source,
+                &format!("{base}.w1.scale"),
+                format,
+                &[inter, dim / 16],
+            )?;
+            let w3 = read_spec(source, &format!("{base}.w3.weight"), format, &[inter, dim])?;
+            let s3 = read_scale_spec(
+                source,
+                &format!("{base}.w3.scale"),
+                format,
+                &[inter, dim / 16],
+            )?;
+            let w2 = read_spec(source, &format!("{base}.w2.weight"), format, &[dim, inter])?;
+            let s2 = read_scale_spec(
+                source,
+                &format!("{base}.w2.scale"),
+                format,
+                &[dim, inter / 16],
+            )?;
+            let wide1 = nvfp4_wide(source, &format!("{base}.w1"), format)?;
+            let wide3 = nvfp4_wide(source, &format!("{base}.w3"), format)?;
+            let wide2 = nvfp4_wide(source, &format!("{base}.w2"), format)?;
+            let gate_planes = crate::operand::ScalePlanes::of(format, inter, dim);
+            let down_planes = crate::operand::ScalePlanes::of(format, dim, inter);
+            if gate_planes.group_bytes != s1.len() as u64
+                || gate_planes.group_bytes != s3.len() as u64
+                || down_planes.group_bytes != s2.len() as u64
+                || gate_planes.tensor_wide != format.tensor_wide()
+            {
+                return Err(err(
+                    "NVFP4 expert bind",
+                    format!(
+                        "{base}: the plan sizes a {} group plane and two {:?} factors, the store has {} / {} / {} bytes",
+                        gate_planes.group_bytes,
+                        format.tensor_wide(),
+                        s1.len(),
+                        s3.len(),
+                        s2.len()
+                    ),
+                ));
+            }
+
+            let slots: Vec<usize> = local_ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| **id as usize == local)
+                .map(|(slot, _)| slot)
+                .collect();
+            if slots.is_empty() {
+                continue;
+            }
+            let count = slots.len();
+            let mut a = Vec::with_capacity(count * dim);
+            for &slot in &slots {
+                let token = slot / topk;
+                a.extend_from_slice(&x[token * dim..(token + 1) * dim]);
+            }
+            let a_d = self.cuda.alloc(a.len() * 4, &mut allocated).map_err(drv)?;
+            ptrs.push(a_d);
+            let mut a_bytes = Vec::with_capacity(a.len() * 4);
+            for value in &a {
+                a_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            self.cuda.copy_htod(&a_d, &a_bytes).map_err(drv)?;
+
+            let rows = count <= 8;
+            let grid = if rows {
+                ((inter as u32).div_ceil(32), 1, 1)
+            } else {
+                (
+                    (inter as u32).div_ceil(128),
+                    (count as u32).div_ceil(128),
+                    1,
+                )
+            };
+            let block = if rows { (128, 1, 1) } else { (256, 1, 1) };
+            let mut branches = Vec::with_capacity(2 * count * inter);
+            for (w, s, wide) in [(&w1, &s1, wide1), (&w3, &s3, wide3)] {
+                let w_d = self.cuda.alloc(w.len(), &mut allocated).map_err(drv)?;
+                let s_d = self.cuda.alloc(s.len(), &mut allocated).map_err(drv)?;
+                let out_d = self
+                    .cuda
+                    .alloc(count * inter * 4, &mut allocated)
+                    .map_err(drv)?;
+                ptrs.push(w_d);
+                ptrs.push(s_d);
+                ptrs.push(out_d);
+                self.cuda.copy_htod(&w_d, w).map_err(drv)?;
+                self.cuda.copy_htod(&s_d, s).map_err(drv)?;
+                let params = crate::nvfp4_prefill::Nvfp4PrefillParams {
+                    w: w_d,
+                    ws: s_d,
+                    wide,
+                    a: a_d,
+                    out: out_d,
+                    cols: inter as u32,
+                    inner: dim as u32,
+                    tokens: count as u32,
+                };
+                let kernel = if rows {
+                    kernels.rows_gate_up(qwen)
+                } else {
+                    kernels.prompt_gate_up(qwen)
+                };
+                self.cuda
+                    .launch(kernel, grid, block, &params.words())
+                    .map_err(drv)?;
+                let mut bytes = vec![0u8; count * inter * 4];
+                self.cuda.copy_dtoh(&mut bytes, &out_d).map_err(drv)?;
+                branches.extend(
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|chunk| f32::from_le_bytes(*chunk)),
+                );
+            }
+            let (gate, up) = branches.split_at_mut(count * inter);
+            let limit = config.swiglu_limit as f32;
+            let mut activated = Vec::with_capacity(count * inter);
+            for row in 0..count {
+                let route = weights[slots[row]];
+                for column in 0..inter {
+                    let g = gate[row * inter + column];
+                    let u = up[row * inter + column];
+                    let value = if limit > 0.0 {
+                        sparkflash_weights::linalg::silu(g.min(limit)) * u.clamp(-limit, limit)
+                    } else {
+                        sparkflash_weights::linalg::silu(g) * u
+                    };
+                    activated.push(value * route);
+                }
+            }
+            let act_bytes: Vec<u8> = activated
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            let act_d = self
+                .cuda
+                .alloc(act_bytes.len(), &mut allocated)
+                .map_err(drv)?;
+            ptrs.push(act_d);
+            self.cuda.copy_htod(&act_d, &act_bytes).map_err(drv)?;
+            let w_d = self.cuda.alloc(w2.len(), &mut allocated).map_err(drv)?;
+            let s_d = self.cuda.alloc(s2.len(), &mut allocated).map_err(drv)?;
+            let out_d = self
+                .cuda
+                .alloc(count * dim * 4, &mut allocated)
+                .map_err(drv)?;
+            ptrs.push(w_d);
+            ptrs.push(s_d);
+            ptrs.push(out_d);
+            self.cuda.copy_htod(&w_d, &w2).map_err(drv)?;
+            self.cuda.copy_htod(&s_d, &s2).map_err(drv)?;
+            let grid = if rows {
+                ((dim as u32).div_ceil(32), 1, 1)
+            } else {
+                ((dim as u32).div_ceil(128), (count as u32).div_ceil(128), 1)
+            };
+            let params = crate::nvfp4_prefill::Nvfp4PrefillParams {
+                w: w_d,
+                ws: s_d,
+                wide: wide2,
+                a: act_d,
+                out: out_d,
+                cols: dim as u32,
+                inner: inter as u32,
+                tokens: count as u32,
+            };
+            let kernel = if rows {
+                kernels.rows_down(qwen)
+            } else {
+                kernels.prompt_down(qwen)
+            };
+            self.cuda
+                .launch(kernel, grid, block, &params.words())
+                .map_err(drv)?;
+            let mut bytes = vec![0u8; count * dim * 4];
+            self.cuda.copy_dtoh(&mut bytes, &out_d).map_err(drv)?;
+            for (row, &slot) in slots.iter().enumerate() {
+                let token = slot / topk;
+                for column in 0..dim {
+                    let at = (row * dim + column) * 4;
+                    out[token * dim + column] +=
+                        f32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+                }
+            }
+        }
+        self.cuda.free_buffers(&ptrs.iter().collect::<Vec<_>>());
+        self.stats.device_us += started.elapsed().as_micros() as u64;
+        let _ = tokens;
+        Ok(())
     }
 
     /// Prints the per-stage layer-0 diagnostics (router, gate/up, weighted operand, combine) in
@@ -688,6 +925,26 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         } else {
             Vec::new()
         };
+
+        if config.expert_format().has_group() {
+            let mut weight_bytes = vec![0u8; rows * 4];
+            self.cuda
+                .copy_dtoh(&mut weight_bytes, &weights_d)
+                .map_err(drv)?;
+            let weights: Vec<f32> = weight_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
+                .collect();
+            self.ffn_nvfp4(
+                config, layer, x, source, &table, &weights, &local_ids, tokens, top_k, dim, inter,
+                out,
+            )?;
+            self.stats.routed_launches += 0;
+            self.stats.launches += 0;
+            return Ok(true);
+        }
 
         let experts = read_experts(source, layer, &table, dim, inter)?;
         let expert_bytes: usize = experts.iter().map(Expert::bytes).sum();
@@ -2052,11 +2309,49 @@ fn shared_format() -> Result<StoredFormat, EngineError> {
     Ok(crate::plan::description().values().dense_format())
 }
 
+/// The one f32 an NVFP4 convention multiplies a matrix by.
+///
+/// Qwen's weight global is `weight_scale_2`; `input_scale` is the activation's static global
+/// and is read but not applied to the weight. Inkling's is `amax / outer_scale_denominator`.
+fn nvfp4_wide(
+    source: &dyn WeightSource,
+    name: &str,
+    format: StoredFormat,
+) -> Result<f32, EngineError> {
+    use sparkflash_model::format::NvFp4Wide;
+    let scalar = |suffix: &str| -> Result<f32, EngineError> {
+        let tensor = format!("{name}.{suffix}");
+        let bytes = source
+            .read(&tensor)
+            .map_err(|error| read_err(&tensor, error))?;
+        let word: [u8; 4] = bytes.as_slice().try_into().map_err(|_| {
+            err(
+                &tensor,
+                format!("expected one f32, got {} bytes", bytes.len()),
+            )
+        })?;
+        Ok(f32::from_le_bytes(word))
+    };
+    match format.tensor_wide() {
+        NvFp4Wide::None => Ok(1.0),
+        NvFp4Wide::Qwen => {
+            let weight = scalar("weight_scale_2")?;
+            let _activation = scalar("input_scale")?;
+            Ok(weight)
+        }
+        NvFp4Wide::Inkling => {
+            let amax = scalar("weight_amax")?;
+            let denominator = scalar("weight_outer_scale_denominator")?;
+            Ok(amax / denominator)
+        }
+    }
+}
+
 /// The storage dtype a format's block scale plane needs in the file.
 const fn scales_dtype(format: StoredFormat) -> DType {
     match format.scale_values() {
         sparkflash_model::format::ScaleValues::Ue8m0 => DType::F8E8M0,
-        sparkflash_model::format::ScaleValues::E4M3 => DType::U8,
+        sparkflash_model::format::ScaleValues::E4M3 => DType::F8E4M3,
         sparkflash_model::format::ScaleValues::Bf16 => DType::BF16,
         sparkflash_model::format::ScaleValues::F32 => DType::F32,
     }

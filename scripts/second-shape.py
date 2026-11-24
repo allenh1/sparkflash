@@ -108,6 +108,11 @@ def stage_cubins(released: Path, built: Path, out: Path) -> None:
         target = out / (cubin.name[: -len("_s2.cubin")] + ".cubin")
         shutil.copy2(cubin, target)
         staged += 1
+    # The NVFP4 wrappers are a new body, not a second shape of a released cubin: their instance
+    # names are already the names the launch asks for, so they are staged as they are built.
+    for cubin in built.glob("nvfp4_prefill_sm121_*.cubin"):
+        shutil.copy2(cubin, out / cubin.name)
+        staged += 1
     if staged == 0:
         fail(f"no second-shape cubins under {built}; run scripts/build-cubins.sh first")
     print(f"second-shape: staged {staged} second-shape cubins under {out}")
