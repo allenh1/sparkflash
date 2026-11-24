@@ -1421,6 +1421,21 @@ fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize)
                 .as_ref()
                 .ok_or_else(|| "the checkpoint source was not opened".to_string())?;
             let _ = source.preload_headers();
+            // The plan states each tensor's stored format, so it must be opened here rather
+            // than read from the process's installed description: the chain loads its headers
+            // before it installs the open, and an uninstalled description silently made every
+            // format `None`, which the mhc_seam bind then refused by name. Opening the plan from
+            // the same checkpoint this loader reads makes the format answer independent of the
+            // caller's install order.
+            let plan =
+                crate::plan::plan_from_path(path, args.world, args.rank).map_err(|error| {
+                    format!(
+                        "plan {} at TP{} rank {}: {error}",
+                        path.display(),
+                        args.world,
+                        args.rank
+                    )
+                })?;
             let index_path = path.join("model.safetensors.index.json");
             let index = CheckpointIndex::load(&index_path)
                 .map_err(|error| format!("read the checkpoint index: {error}"))?;
@@ -1432,8 +1447,7 @@ fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize)
                 let tensor = header
                     .tensor(name)
                     .map_err(|error| format!("{name}: {error}"))?;
-                let format = crate::plan::installed()
-                    .and_then(|description| tensor_format(description.plan(), &tensor.dtype));
+                let format = tensor_format(&plan, &tensor.dtype);
                 entries.push(
                     HeaderEntry::new(name.to_string(), tensor.dtype.clone(), tensor.shape.clone())
                         .with_format(format),
