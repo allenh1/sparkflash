@@ -156,6 +156,8 @@ struct Stage {
     shared: [(u64, u64); 3],
     /// `[gate, up, down][draft_experts()][weight, scales]`.
     table: u64,
+    /// The stage's index: its layer on the format route.
+    index: usize,
     ring_codes: u64,
     ring_scales: u64,
 }
@@ -236,6 +238,9 @@ pub(super) struct DraftState {
     ring_rows: usize,
     allocations: Vec<Deviceptr>,
     gathers: Cell<u64>,
+    /// The stages' routed experts on the format route, when the release stores them in a format
+    /// the released MXFP4 bodies do not read (one route layer a stage).
+    routed_format: Option<sparkflash_kernels::routed_format::RoutedFormatDevice>,
 }
 
 impl DraftState {
@@ -449,6 +454,7 @@ impl DraftState {
                     pair(crate::plan::mtp_prefix(stage, "ffn.shared_experts.w2").to_owned())?,
                 ],
                 table,
+                index: stage,
                 ring_codes: alloc(own_rows * latent)?,
                 ring_scales: alloc(own_rows * latent / 32)?,
             });
@@ -480,8 +486,10 @@ impl DraftState {
         } else {
             None
         };
+        let routed_format = open_routed_format(device, arena, kernel_dir)?;
         let r = R_MAX;
         Ok(Self {
+            routed_format,
             kernels,
             stages,
             main_proj: (main_proj_tiled, proj_scales),
@@ -545,11 +553,130 @@ impl DraftState {
 
     /// Frees the drafter's buffers (the modules drop with the state).
     pub(super) fn release(self, cuda: &Cuda) {
+        if let Some(route) = self.routed_format {
+            route.release(cuda);
+        }
         let borrowed: Vec<&Deviceptr> = self.allocations.iter().collect();
         cuda.free_buffers(&borrowed);
         cuda.free_host_mapped(&self.params);
         cuda.free_host_mapped(&self.row_tab);
     }
+}
+
+/// The drafter's format route, when its stages' expert format is not the released MXFP4.
+///
+/// A stage's experts take the class's format (the ranges a joint declaration states are the
+/// backbone's). The entries are the backbone's: the format's gate/up and down claimed on the MoE
+/// part, the shared plan and SwiGLU, and the drafter's own top-k combine, which sums slot
+/// partials as the route lays them out.
+fn open_routed_format(
+    device: &DeviceLayer<'_>,
+    arena: &sparkflash_device::arena::ResidentArena,
+    kernel_dir: &Path,
+) -> Result<Option<sparkflash_kernels::routed_format::RoutedFormatDevice>, String> {
+    use sparkflash_kernels::routed_format::{
+        FormatEntries, RoutedFormatDevice, RoutedFormatGeometry, SharedKernels, matrix_words,
+    };
+    use sparkflash_model::format::StoredFormat;
+    let description = crate::plan::description();
+    let format = description.values().expert_format();
+    if format.same_arithmetic(StoredFormat::MXFP4_ROW_32) {
+        return Ok(None);
+    }
+    let cuda = device.cuda;
+    let what = format!(
+        "draft: the stages store their experts as {}",
+        format.describe()
+    );
+    let load = |file: &str, name: &'static str| -> Result<Kernel, String> {
+        let (cubin, _sha) = cached_cubin(&kernel_dir.join(file))
+            .map_err(|error| format!("{what}, which only the format route reads: {error}"))?;
+        // The modules stay loaded for the process, as every by-name load here does.
+        cuda.load_named(&cubin, name)
+            .map(|(_module, kernel)| kernel)
+            .map_err(|error| format!("{what}: load {name}: {error}"))
+    };
+    // The MoE part claims the format entries; any backbone block's instance names them.
+    let entry = |prefix: &str| -> Result<&'static str, String> {
+        (0..description.values().n_layers)
+            .find_map(|block| {
+                description
+                    .symbol_decoding(Some(block), sparkflash_model::Part::Moe, prefix, format)
+                    .ok()
+            })
+            .ok_or_else(|| format!("{what}: the plan claims no `{prefix}*` entry decoding it"))
+    };
+    let entries = FormatEntries {
+        gate_up: load(
+            "routed_format_sm121.cubin",
+            entry("routed_format_gate_up_")?,
+        )?,
+        down: load("routed_format_sm121.cubin", entry("routed_format_down_")?)?,
+    };
+    let plan_image = sparkflash_kernels::images::moe_plan_cubin();
+    if plan_image.is_empty() {
+        return Err(format!(
+            "{what}: this build embeds no routed-expert plan cubin"
+        ));
+    }
+    let (_plan_module, plan) = cuda
+        .load_named(plan_image, "moe_plan")
+        .map_err(|error| format!("{what}: load moe_plan: {error}"))?;
+    let shared = SharedKernels {
+        plan,
+        plan_threads: sparkflash_model::active_profile().plan.block_threads(),
+        swiglu: load("opt_rows_sm121.cubin", "opt_rows_shared_swiglu")?,
+        combine: load("opt_moe_sm121.cubin", crate::plan::handles().mtp_combine)?,
+        widen: load("routed_format_sm121.cubin", "routed_format_widen_sm121")?,
+    };
+    let ptr = |name: &str| -> Result<Deviceptr, String> {
+        arena
+            .device_ptr(name)
+            .ok_or_else(|| format!("{what}: the arena holds no {name}"))
+    };
+    let wide = format.tensor_wide();
+    let mut table = Vec::new();
+    for stage in 0..stage_count() {
+        for expert in 0..draft_experts() {
+            for leaf in ["w1", "w3", "w2"] {
+                let base = crate::plan::mtp_prefix(stage, &format!("ffn.experts.{expert}.{leaf}"))
+                    .to_owned();
+                let factor = match wide.leaves() {
+                    None => 0.0,
+                    Some(leaves) => {
+                        let mut values = [0f32; 2];
+                        for (value, leaf) in values.iter_mut().zip(leaves) {
+                            let mut word = [0u8; 4];
+                            cuda.copy_dtoh(&mut word, &ptr(&format!("{base}.{leaf}"))?)
+                                .map_err(|error| format!("{what}: factor read: {error}"))?;
+                            *value = f32::from_le_bytes(word);
+                        }
+                        wide.factor(values[0], values[1])
+                    }
+                };
+                table.extend(matrix_words(
+                    ptr(&format!("{base}.weight"))?,
+                    ptr(&format!("{base}.scale"))?,
+                    factor,
+                ));
+            }
+        }
+    }
+    RoutedFormatDevice::open(
+        cuda,
+        RoutedFormatGeometry {
+            dim: device.dim,
+            local_inter: local_inter(),
+            experts: draft_experts(),
+            top_k: draft_top_k(),
+        },
+        shared,
+        vec![Some(entries); stage_count()],
+        &table,
+        draft_rows(),
+        device.swiglu_limit,
+    )
+    .map(Some)
 }
 
 fn span(device: u64, len: usize) -> DeviceSpan {
@@ -1534,6 +1661,21 @@ impl DeviceLayer<'_> {
             },
         )
         .map_err(|error| format!("draft shared down: {error}"))?;
+        if let Some(route) = draft.routed_format.as_ref() {
+            return route.run(
+                self.cuda,
+                stage.index,
+                n,
+                &sparkflash_kernels::routed_format::RoutedFormatRows {
+                    x: b.seam_row,
+                    ids: b.moe_ids,
+                    weights: b.moe_weights,
+                    delta_f32: b.delta_f32,
+                    delta_bf16: b.delta_bf16,
+                    addend: b.shared_out,
+                },
+            );
+        }
         let matrix = (draft_experts() * 2 * 8) as u64;
         if let Some([gate_up, down, combine]) = draft.kernels.dedup.filter(|_| n > 1) {
             let routed = (n * draft_top_k()) as u32;
