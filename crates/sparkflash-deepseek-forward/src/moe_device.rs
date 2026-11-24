@@ -424,6 +424,7 @@ impl MoeDeviceBackendImpl {
         topk: usize,
         dim: usize,
         inter: usize,
+        format: StoredFormat,
         out: &mut [f32],
     ) -> Result<(), EngineError> {
         use sparkflash_model::format::NvFp4Wide;
@@ -433,7 +434,6 @@ impl MoeDeviceBackendImpl {
                 "the checkpoint stores NVFP4 experts, but no NVFP4 cubin is staged".to_owned(),
             ));
         };
-        let format = config.expert_format();
         let qwen = format.tensor_wide() == NvFp4Wide::Qwen;
         let mut allocated = 0usize;
         let mut ptrs = Vec::new();
@@ -1161,7 +1161,18 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             Vec::new()
         };
 
-        if config.expert_format().has_group() {
+        // The plan states this block's expert format; the bind and the launch read that one
+        // statement. A block the plan does not state is refused by name.
+        let Some(routed_format) = crate::plan::description()
+            .operand(Some(layer), sparkflash_model::Part::Moe)
+            .map(|operand| operand.stored)
+        else {
+            return Err(err(
+                "device routed MoE bind",
+                format!("the plan states no expert format for block {layer}"),
+            ));
+        };
+        if routed_format.has_scale(sparkflash_model::format::ScaleKind::Group) {
             let mut weight_bytes = vec![0u8; rows * 4];
             self.cuda
                 .copy_dtoh(&mut weight_bytes, &weights_d)
@@ -1173,7 +1184,18 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                 .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
             self.ffn_nvfp4(
-                config, layer, x, source, &table, &weights, &local_ids, tokens, top_k, dim, inter,
+                config,
+                layer,
+                x,
+                source,
+                &table,
+                &weights,
+                &local_ids,
+                tokens,
+                top_k,
+                dim,
+                inter,
+                routed_format,
                 out,
             )?;
             self.stats.routed_launches += 0;
@@ -1181,11 +1203,6 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             return Ok(true);
         }
 
-        // The plan states the routed experts' format for this block; the bind reads the planes
-        // that format names. A plan that states none falls back to the configuration's class.
-        let routed_format = crate::plan::description()
-            .operand(Some(layer), sparkflash_model::Part::Moe)
-            .map_or(StoredFormat::MXFP4_ROW_32, |operand| operand.stored);
         let experts = read_experts(source, layer, &table, dim, inter, routed_format)?;
         if routed_format.same_arithmetic(StoredFormat::MXFP8_ROW_32) {
             let mut weight_bytes = vec![0u8; rows * 4];

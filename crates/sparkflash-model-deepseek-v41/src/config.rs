@@ -92,6 +92,30 @@ impl ModelConfig {
         self.declared_format(&self.expert_dtype, block, &self.weight_scale)
     }
 
+    /// The per-layer expert formats a joint declaration states, when it states ranges.
+    ///
+    /// `expert_dtype: "nvfp4-qwen@0-3,mx-fp8-row@4-7"` is one format a range; a plain
+    /// `expert_dtype` is no list and every layer takes [Self::expert_format].
+    #[must_use]
+    pub fn expert_formats(&self) -> Option<Vec<sparkflash_model::format::BlockPartFormat>> {
+        sparkflash_model::format::block_part_formats(&self.expert_dtype)
+    }
+
+    /// The routed experts' format for one backbone layer.
+    ///
+    /// `None` is a layer the declaration's ranges do not cover, which the bind refuses by name
+    /// rather than reading the nearest arithmetic.
+    #[must_use]
+    pub fn expert_format_at(&self, layer: usize) -> Option<StoredFormat> {
+        match self.expert_formats() {
+            Some(formats) => formats
+                .into_iter()
+                .find(|format| format.covers(layer))
+                .map(|format| format.format),
+            None => Some(self.expert_format()),
+        }
+    }
+
     fn declared_format(&self, method: &str, block: usize, scale: &str) -> StoredFormat {
         // The packed form is the same arithmetic as BF16 in the one arrangement F2 made: the
         // checkpoint states it by name because no dtype word can say which layout the bytes are
@@ -546,6 +570,28 @@ impl ModelConfig {
                 ),
             );
         }
+        if let Some(ranges) = self.expert_formats() {
+            for range in &ranges {
+                if range.first > range.last || range.last >= self.n_layers {
+                    return bad(
+                        "quantization_config.expert_dtype",
+                        format!(
+                            "the range {}..={} is outside the {} backbone layers",
+                            range.first, range.last, self.n_layers
+                        ),
+                    );
+                }
+            }
+            for layer in 0..self.n_layers {
+                if !ranges.iter().any(|range| range.covers(layer)) {
+                    return bad(
+                        "quantization_config.expert_dtype",
+                        format!("the ranges name no expert format for layer {layer}"),
+                    );
+                }
+            }
+        }
+
         for (field, ids) in [
             ("kv_source_layers", &self.kv_source_layers),
             ("index_source_layers", &self.index_source_layers),
@@ -1041,23 +1087,28 @@ mod released {
             Some(&quant.scale_fmt),
         )
         .stored_format();
-        let expert_ok = match expert.values() {
+        let acceptable = |format: sparkflash_model::format::StoredFormat| match format.values() {
             sparkflash_model::format::FormatValues::Fp4E2M1 => {
-                (expert.has_scale(sparkflash_model::format::ScaleKind::Row) && expert.block() == 32)
-                    || (expert.has_scale(sparkflash_model::format::ScaleKind::Group)
-                        && expert.block() == 16
-                        && expert.has_scale(sparkflash_model::format::ScaleKind::TensorWide))
+                (format.has_scale(sparkflash_model::format::ScaleKind::Row) && format.block() == 32)
+                    || (format.has_scale(sparkflash_model::format::ScaleKind::Group)
+                        && format.block() == 16
+                        && format.has_scale(sparkflash_model::format::ScaleKind::TensorWide))
             }
             sparkflash_model::format::FormatValues::Fp8E4M3 => {
-                (expert.has_scale(sparkflash_model::format::ScaleKind::Tile)
-                    && expert.block() == 128)
-                    || (expert.has_scale(sparkflash_model::format::ScaleKind::Row)
-                        && expert.block() == 32
-                        && !expert.has_scale(sparkflash_model::format::ScaleKind::Tile))
+                (format.has_scale(sparkflash_model::format::ScaleKind::Tile)
+                    && format.block() == 128)
+                    || (format.has_scale(sparkflash_model::format::ScaleKind::Row)
+                        && format.block() == 32
+                        && !format.has_scale(sparkflash_model::format::ScaleKind::Tile))
             }
-            sparkflash_model::format::FormatValues::Bf16 => expert.is_unscaled(),
+            sparkflash_model::format::FormatValues::Bf16 => format.is_unscaled(),
             _ => false,
         };
+        let ranges = sparkflash_model::format::block_part_formats(&quant.expert_dtype);
+        let expert_ok = acceptable(expert)
+            && ranges
+                .as_ref()
+                .is_none_or(|ranges| ranges.iter().all(|range| acceptable(range.format)));
         if !expert_ok {
             return Err(ConfigError::Invalid {
                 field: "quantization_config.expert_dtype",

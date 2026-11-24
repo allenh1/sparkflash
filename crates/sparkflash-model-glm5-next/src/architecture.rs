@@ -190,6 +190,7 @@ pub fn tiny_architecture() -> Architecture {
                 dynamic_activations: true,
             },
             // GLM names no expert format; its experts are the dense FP8 tiles.
+            expert_formats: Vec::new(),
             expert_format: WeightFormat::Fp8Tile {
                 block_m: 8,
                 block_n: 8,
