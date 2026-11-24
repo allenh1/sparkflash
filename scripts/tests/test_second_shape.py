@@ -28,6 +28,7 @@ import os
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -222,6 +223,37 @@ class DeviceEnvTest(unittest.TestCase):
         self.assertEqual(env["SPARKFLASH_CUBINS"], "/out/cubins-w2")
         self.assertEqual(env["SPARK_NODES"], "worker-0 worker-1")
         self.assertEqual(env["SPARK_WORLD"], "2")
+
+    def test_a_device_run_refuses_without_an_nccl_library(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SPARKFLASH_NCCL_LIB", None)
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    second_shape.require_nccl_library()
+        self.assertIn("SPARKFLASH_NCCL_LIB", stderr.getvalue())
+
+    def test_a_device_run_takes_the_nccl_library_from_the_operator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(os.environ, {"SPARKFLASH_NCCL_LIB": directory}):
+                self.assertEqual(second_shape.require_nccl_library(), Path(directory))
+                env = second_shape.env_for_world(
+                    types.SimpleNamespace(binary="sparkflash", port=8126),
+                    Path("/out"),
+                    Path("/out/checkpoint"),
+                    "/out/tokenizer.json",
+                    Path("/out/cubins-w1"),
+                    1,
+                    ["worker-0"],
+                    ["peer-0"],
+                )
+                self.assertEqual(env["SPARKFLASH_NCCL_LIB"], directory)
+
+    def test_a_device_run_refuses_a_path_that_is_not_a_directory(self):
+        with mock.patch.dict(os.environ, {"SPARKFLASH_NCCL_LIB": "/nonexistent/nccl"}):
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit):
+                    second_shape.require_nccl_library()
+        self.assertIn("not a directory", stderr.getvalue())
 
 
 if __name__ == "__main__":
