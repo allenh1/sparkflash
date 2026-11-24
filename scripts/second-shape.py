@@ -72,6 +72,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -134,6 +135,20 @@ def run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 class WorldFailure(Exception):
     """A failure confined to one world; the run records it and continues to the next world."""
+
+
+def wait_port_free(port: int, seconds: int = 90) -> None:
+    """Wait until nothing listens on the port. A stopped group can hold its socket for a few
+    seconds after `stop` returns, and the next world's group would then fail to bind it."""
+    deadline = time.monotonic() + seconds
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1)
+            if probe.connect_ex(("127.0.0.1", port)) != 0:
+                return
+        if time.monotonic() > deadline:
+            raise WorldFailure(f"port {port} is still held {seconds} s after the last group stopped")
+        time.sleep(1)
 
 
 def config_digest(config: bytes) -> str:
@@ -679,6 +694,7 @@ def run_world(
         capture = compare_command(
             url, prompts_file, dump=expected_file, max_tokens=args.max_tokens
         )
+        wait_port_free(args.port)
         result = run(
             [
                 str(ROOT / "scripts/one-host-group.sh"),
@@ -759,6 +775,7 @@ def run_world(
         started = False
         agreed = 1
         try:
+            wait_port_free(args.port)
             result = run([launcher, "launch"], env=group_env)
             started = True
             if result.returncode != 0:
@@ -804,6 +821,7 @@ def run_world(
         expected=expected_for_check,
         max_tokens=args.max_tokens,
     )
+    wait_port_free(args.port)
     result = run(
         [
             str(ROOT / "scripts/one-host-group.sh"),
