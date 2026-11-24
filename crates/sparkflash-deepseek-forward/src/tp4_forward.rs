@@ -13006,9 +13006,12 @@ impl<'a> DeviceLayer<'a> {
             return Ok(false);
         }
         let base = opt.scratch.0;
+        // One block a 256 / hc column slice (OPT_S_COLS): 80 at the released 5120 and hc 4, 64
+        // at 4096. A wider grid has the blocks past the hidden size write past the partials.
+        let blocks = self.dim / (256 / self.hc_mult);
         self.cuda.launch(
             opt.seam,
-            (80, 1, 1),
+            (blocks as u32, 1, 1),
             (256, 1, 1),
             &[
                 stream,

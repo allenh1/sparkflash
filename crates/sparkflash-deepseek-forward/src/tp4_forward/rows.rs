@@ -403,6 +403,17 @@ impl RowsState {
         if device.dim != crate::plan::hidden() || device.hc_mult != crate::plan::hc_mult() {
             return refuse("the row kernels hold the plan dim and hc only");
         }
+        if device.dim % 128 != 0
+            || device.routed_geometry.experts
+                % sparkflash_kernels::moe_routed_device::OPT_ROUTER_EXPERTS_PER_BLOCK
+                != 0
+        {
+            return Err(format!(
+                "rows: hidden {} is not whole 128-column blocks or {} experts are not whole \
+                 router blocks",
+                device.dim, device.routed_geometry.experts
+            ));
+        }
         if !device.opt_seams_active()
             || device.opt_rope.is_none()
             || device.opt_router.is_none()
@@ -817,6 +828,11 @@ const ATTN_SCORE_CHUNK: usize = 32;
 /// spread over (each strides over its row's tiles).
 const SELECT_SCORE_TILE: usize = 16;
 
+/// opt_rows_mhc_seam's and its partials' column block (OR_S_COLS): one block a 64-column slice
+/// of the hidden size, so the grid is hidden / 64 wide (80 at the released 5120, 64 at 4096). A
+/// wider grid has the blocks past the hidden size write their partials into the next row's.
+const SEAM_COLS: usize = 64;
+
 /// The batched score launch's block cap, read from the select instance entry that built the body.
 fn select_score_blocks() -> usize {
     sparkflash_kernels::instances::capacities::OPT_SELECT_SM121_SCORE_BLOCKS
@@ -1157,7 +1173,7 @@ impl DeviceLayer<'_> {
         {
             self.cuda.launch(
                 *kernel,
-                (20, count as u32, 1),
+                (self.dim.div_ceil(256) as u32, count as u32, 1),
                 (256, 1, 1),
                 &[
                     own(b.stream, stream_bytes),
@@ -1836,7 +1852,7 @@ impl DeviceLayer<'_> {
             // tails one block a row (no tickets).
             self.cuda.launch(
                 bulk.k.seam_partials,
-                (40, n.div_ceil(32) as u32, 1),
+                ((self.dim / 128) as u32, n.div_ceil(32) as u32, 1),
                 (128, 1, 1),
                 &[
                     stream,
@@ -1868,7 +1884,7 @@ impl DeviceLayer<'_> {
             };
             self.cuda.launch(
                 kernel,
-                (80, n.div_ceil(per) as u32, 1),
+                ((self.dim / SEAM_COLS) as u32, n.div_ceil(per) as u32, 1),
                 (256, 1, 1),
                 &[
                     stream,
@@ -1910,7 +1926,7 @@ impl DeviceLayer<'_> {
         }
         self.cuda.launch(
             rows.kernels.seam,
-            (80, n as u32, 1),
+            ((self.dim / SEAM_COLS) as u32, n as u32, 1),
             (256, 1, 1),
             &[
                 stream,
@@ -1984,7 +2000,7 @@ impl DeviceLayer<'_> {
         let b = rows.b;
         self.cuda.launch(
             bulk.k.post_partials,
-            (40, n.div_ceil(32) as u32, 1),
+            ((self.dim / 128) as u32, n.div_ceil(32) as u32, 1),
             (128, 1, 1),
             &[
                 post[0],
@@ -2062,7 +2078,7 @@ impl DeviceLayer<'_> {
     ) -> Result<(), String> {
         self.cuda.launch(
             rows.kernels.post,
-            (40, n as u32, 1),
+            ((self.dim / 128) as u32, n as u32, 1),
             (128, 1, 1),
             &[
                 residual,
@@ -3679,10 +3695,14 @@ impl DeviceLayer<'_> {
             self.bulk_router(rows, bulk, gate.0, bias.0, n)?;
             self.vision_route(layer, bulk.dots, true, b.moe_ids, b.moe_weights)?;
         } else {
-            // Groups of eight rows (gridDim.y): each group's blocks re-read the gate from L2.
+            // Groups of eight rows (gridDim.y): each group's blocks re-read the gate from L2. One
+            // block a group of OPT_ROUTER_EXPERTS_PER_BLOCK experts: a block past the expert count
+            // would score a gate row outside the weight and write past its row's score columns.
+            let blocks = self.routed_geometry.experts
+                / sparkflash_kernels::moe_routed_device::OPT_ROUTER_EXPERTS_PER_BLOCK;
             self.cuda.launch(
                 router_kernel,
-                (48, n.div_ceil(8) as u32, 1),
+                (blocks as u32, n.div_ceil(8) as u32, 1),
                 (256, 1, 1),
                 &[
                     b.ffn_x,
