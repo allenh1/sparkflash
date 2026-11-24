@@ -26,11 +26,16 @@
 # Usage:
 #   scripts/serve-four-node.sh print     print the four commands (default; no network access)
 #   scripts/serve-four-node.sh launch    start four ranks over ssh, one per node
+#   scripts/serve-four-node.sh collect   copy every node's run log directory to ONE_HOST_LOGS
 #   scripts/serve-four-node.sh stop      send SIGTERM to every rank (the graceful-drain signal)
 #   scripts/serve-four-node.sh status    report whether each rank process is running
 #
 # Environment (required for launch; print only needs the paths):
 #   SPARK_NODES            4 node addresses in rank order (space separated)
+#   SPARKFLASH_RUN_ID      run directory under SPARKFLASH_LOG_ROOT (default a UTC stamp;
+#                          collect must repeat the launch's value)
+#   ONE_HOST_LOGS          collect destination (default SPARKFLASH_LOG_ROOT/RUN_ID-collected);
+#                          each node's files land under node-<rank>/
 #   SPARKFLASH_CHECKPOINT  sharded checkpoint directory, same path on every node
 #   SPARKFLASH_TOKENIZER   tokenizer.json path, same path on every node
 # Device path (what makes it fast; leave SPARKFLASH_CUBINS unset for the CPU reference engine):
@@ -131,7 +136,7 @@ case "$GROUP_FORM" in
         # The Inkling arm carries its kernels in the binary; a cubin directory here would be
         # accepted and never read.
         [ -z "$CUBINS" ] || die "SPARKFLASH_CUBINS is the V4.1 kernel directory; the --rank group's kernels are built into the binary, so unset it"
-        [ -n "$CONVERTED_DIR" ] || [ "$MODE" = stop ] || [ "$MODE" = status ] \
+        [ -n "$CONVERTED_DIR" ] || [ "$MODE" = stop ] || [ "$MODE" = status ] || [ "$MODE" = collect ] \
             || die "SPARKFLASH_GROUP_FORM=rank needs SPARKFLASH_CONVERTED_DIR: the --rank group boots from its converted rank files"
         ;;
     *) die "SPARKFLASH_GROUP_FORM must be tp4 or rank, got '$GROUP_FORM'" ;;
@@ -140,7 +145,7 @@ if [ -n "$CONCURRENCY" ]; then
     case "$CONCURRENCY" in ''|*[!0-9]*|0) die "SPARKFLASH_CONCURRENCY must be a positive lane count, got '$CONCURRENCY'" ;; esac
     [ -n "$MODEL" ] || die "SPARKFLASH_CONCURRENCY sets a packed group's lanes; the V4.1 engine reads SPARKFLASH_LANES"
 fi
-# Only a start reads the weights; stop and status work without them.
+# Only a start reads the weights; collect, stop and status work without them.
 if [ "$MODE" = print ] || [ "$MODE" = launch ]; then
     [ -n "$CHECKPOINT" ] || die "SPARKFLASH_CHECKPOINT is required"
     [ -n "$TOKENIZER" ] || die "SPARKFLASH_TOKENIZER is required"
@@ -416,7 +421,32 @@ case "$MODE" in
             fi
         done
         ;;
+    collect)
+        # Every worker writes its own log on its own node. A head-only read keeps rank 0's file
+        # and has already hidden a worker failure, so pull the whole run directory from each node
+        # and keep it under node-<rank>/. An unreachable node is named and does not fail the
+        # command: losing a log is not a reason to lose the result that was just measured.
+        DEST="${ONE_HOST_LOGS:-$LOG_ROOT/$RUN_ID-collected}"
+        mkdir -p "$DEST"
+        missed=()
+        for rank in $(seq 0 $((WORLD - 1))); do
+            node="${NODES[$rank]}"
+            mkdir -p "$DEST/node-$rank"
+            archive="$(mktemp "${TMPDIR:-/tmp}/serve-four-node-collect.XXXXXX")"
+            if remote "$rank" "tar -C $(printf '%q' "$LOG_ROOT") -cf - $(printf '%q' "$RUN_ID")" >"$archive" 2>/dev/null \
+                && tar -C "$DEST/node-$rank" --strip-components=1 -xf "$archive" 2>/dev/null; then
+                printf 'serve-four-node: collected rank %s logs from %s\n' "$rank" "$node"
+            else
+                printf 'serve-four-node: could not collect rank %s logs from %s\n' "$rank" "$node" >&2
+                missed+=("$node")
+            fi
+            rm -f "$archive"
+        done
+        if [ "${#missed[@]}" -gt 0 ]; then
+            printf 'serve-four-node: could not collect logs from: %s\n' "${missed[*]}" >&2
+        fi
+        ;;
     *)
-        die "unknown mode '$MODE' (expected print, launch, stop or status)"
+        die "unknown mode '$MODE' (expected print, launch, collect, stop or status)"
         ;;
 esac

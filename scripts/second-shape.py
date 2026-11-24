@@ -33,9 +33,29 @@ parts, all on one host:
         [--port 8126]
     scripts/second-shape.py run ... --device --released-cubins DIR
     scripts/second-shape.py compare --url URL --prompts FILE --expected FILE [--model ID]
+    scripts/second-shape.py compare --url URL --prompts FILE --dump FILE
+
+The reference for a world is that world's own split. A format whose accumulation is not
+regrouping-invariant (row-scaled MXFP8 / E4M3) has a served answer that depends on the split:
+the per-rank partial sums differ from one global sum in the low f32 bits. The run therefore
+writes the global host reference once, then starts the host arm at each world and captures that
+world's ids as `host-reference-w{W}.json`. World 1 is compared with the global
+`host-reference.json` and must equal it; the device group at world W is compared with that
+world's file, exactly. Each world's file is also reported against the global one, with the
+prompts that differ and the top-2 logprob gap at the first divergence, but that drift never
+fails the run. Token ids are never compared with a tolerance.
 
 The host arm runs on a CPU host; `--device` needs a GPU host. `compare` is what `--check`
-calls while the group is up; it is also usable alone against a group someone else started.
+calls while the group is up; it is also usable alone against a group someone else started. With
+`--dump` it writes the served ids as the same JSON list of lists the host reference writes and
+exits 0; a sidecar beside the dump records the top-2 alternatives each position saw.
+
+For a four-node device run (SPARK_NODES set), `--out` must be an absolute directory that exists
+and is writable on every node at the same path: the checkpoint, the world's staged cubins and,
+when it is not under the checkpoint, the tokenizer are copied there with
+`scripts/sync-nodes.py` when `SPARK_SYNC=1` (`SPARK_SSH_NAMES` optionally names the trusted SSH
+name for each node). After the group, `scripts/serve-four-node.sh collect` gathers every node's
+rank logs under `<out>/logs-{world}/` before the ranks stop.
 """
 
 from __future__ import annotations
@@ -43,6 +63,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -160,45 +181,117 @@ def wait_ready(url: str, seconds: int = 600) -> None:
     fail(f"the group at {url} never became ready")
 
 
-def generated_ids(choice: dict) -> list[int]:
+def parse_token_id(token: object) -> int:
+    if isinstance(token, str) and token.startswith("token_id:"):
+        try:
+            return int(token[len("token_id:") :])
+        except ValueError:
+            pass
+    fail(f"the server did not return token ids (got {token!r})")
+
+
+def request_completion(
+    args: argparse.Namespace, prompt: list[int]
+) -> tuple[list[int], list[list[list[float]]]]:
+    """One greedy completion, its ids, and the top-2 alternatives each generated position saw."""
+    body = json.dumps(
+        {
+            "model": args.model,
+            "prompt": prompt,
+            "max_tokens": args.max_tokens,
+            "temperature": 0.0,
+            # The engine's Top(n) selection includes the served token; asking for two
+            # alternatives leaves the served token plus its nearest rival, which is the gap.
+            "logprobs": 2,
+            "return_tokens_as_token_ids": True,
+        }
+    ).encode()
+    request = urllib.request.Request(
+        args.url + "/v1/completions",
+        data=body,
+        headers={"content-type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=600) as answer:
+        reply = json.loads(answer.read())
+    choice = reply["choices"][0]
     logprobs = choice.get("logprobs") or {}
     tokens = logprobs.get("tokens") or []
+    positions = logprobs.get("top_logprobs") or []
     ids: list[int] = []
-    for token in tokens:
-        if isinstance(token, str) and token.startswith("token_id:"):
-            ids.append(int(token[len("token_id:") :]))
-        else:
-            fail(f"the server did not return token ids (got {token!r})")
-    return ids
+    tops: list[list[list[float]]] = []
+    for index, token in enumerate(tokens):
+        ids.append(parse_token_id(token))
+        alternatives: list[list[float]] = []
+        if index < len(positions) and isinstance(positions[index], dict):
+            for alternative, value in positions[index].items():
+                alternatives.append([float(parse_token_id(alternative)), float(value)])
+        # Descending logprob; the first entry is the served token, the second its nearest rival.
+        alternatives.sort(key=lambda entry: entry[1], reverse=True)
+        tops.append(alternatives)
+    # The server may generate past the end-of-sequence marker; the reference stops there.
+    if EOS in ids:
+        cut = ids.index(EOS) + 1
+        ids = ids[:cut]
+        tops = tops[:cut]
+    return ids, tops
+
+
+def first_divergence(got: list[int], want: list[int]) -> int:
+    for index, (left, right) in enumerate(zip(got, want)):
+        if left != right:
+            return index
+    return min(len(got), len(want))
+
+
+def report_divergence(
+    got: list[int],
+    want: list[int],
+    tops: list[list[list[float]]],
+    *,
+    want_label: str = "reference",
+    got_label: str = "device",
+) -> None:
+    position = first_divergence(got, want)
+    print(f"  first divergence at position {position}")
+    if position < len(want):
+        print(f"    {want_label} token {want[position]}")
+    if position < len(got):
+        print(f"    {got_label} token {got[position]}")
+    alternatives = tops[position] if position < len(tops) else []
+    if len(alternatives) >= 2:
+        (top_token, top_logprob), (second_token, second_logprob) = alternatives[:2]
+        print(
+            f"    top-2 at position {position}: token {int(top_token)} "
+            f"{top_logprob:.9g} over token {int(second_token)} {second_logprob:.9g}; "
+            f"gap {top_logprob - second_logprob:.9g}"
+        )
+    else:
+        print(f"    top-2 at position {position}: the server returned fewer than two alternatives")
 
 
 def compare(args: argparse.Namespace) -> int:
     prompts = json.loads(Path(args.prompts).read_text())
-    expected = json.loads(Path(args.expected).read_text())
     wait_ready(args.url, args.ready_timeout)
+    if args.dump:
+        captured: list[list[int]] = []
+        gaps: list[list[list[list[float]]]] = []
+        for index, prompt in enumerate(prompts):
+            ids, tops = request_completion(args, prompt)
+            captured.append(ids)
+            gaps.append(tops)
+            print(f"second-shape: prompt {index} captured ({len(ids)} tokens)")
+        Path(args.dump).write_text(json.dumps(captured, indent=2) + "\n")
+        Path(str(args.dump) + ".top2.json").write_text(json.dumps(gaps) + "\n")
+        print(f"second-shape: wrote {len(captured)} prompt(s) to {args.dump}")
+        return 0
+    if not args.expected:
+        fail("--expected is required unless --dump is set")
+    expected = json.loads(Path(args.expected).read_text())
+    if len(expected) != len(prompts):
+        fail(f"{args.expected} holds {len(expected)} prompt(s), {args.prompts} holds {len(prompts)}")
     passed = True
     for index, prompt in enumerate(prompts):
-        body = json.dumps(
-            {
-                "model": args.model,
-                "prompt": prompt,
-                "max_tokens": args.max_tokens,
-                "temperature": 0.0,
-                "logprobs": 1,
-                "return_tokens_as_token_ids": True,
-            }
-        ).encode()
-        request = urllib.request.Request(
-            args.url + "/v1/completions",
-            data=body,
-            headers={"content-type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=600) as answer:
-            reply = json.loads(answer.read())
-        got = generated_ids(reply["choices"][0])
-        # The server may generate past the end-of-sequence marker; the reference stops there.
-        if EOS in got:
-            got = got[: got.index(EOS) + 1]
+        got, tops = request_completion(args, prompt)
         want = expected[index]
         status = "ok" if got == want else "MISMATCH"
         if got != want:
@@ -207,11 +300,142 @@ def compare(args: argparse.Namespace) -> int:
         if got != want:
             print(f"  reference {want}")
             print(f"  device    {got}")
+            report_divergence(got, want, tops)
     print(f"second-shape: VERDICT {'PASS' if passed else 'FAIL'}")
     return 0 if passed else 1
 
 
+def differing_prompts(expected: list[list[int]], global_ids: list[list[int]]) -> list[int]:
+    """Indexes of prompts whose ids differ, including a prompt only one side wrote."""
+    count = max(len(expected), len(global_ids))
+    differing = []
+    for index in range(count):
+        left = expected[index] if index < len(expected) else None
+        right = global_ids[index] if index < len(global_ids) else None
+        if left != right:
+            differing.append(index)
+    return differing
+
+
+def report_world(
+    world: int,
+    expected_file: Path,
+    expected: list[list[int]],
+    global_ids: list[list[int]],
+    tops: list[list[list[list[float]]]],
+) -> list[int]:
+    """Print the world's drift from the global reference and return the differing prompts."""
+    differing = differing_prompts(expected, global_ids)
+    equals = "yes" if not differing else "no"
+    print(
+        f"second-shape: world {world}: expected {expected_file.name}; "
+        f"equals global reference: {equals}"
+    )
+    for index in differing:
+        print(f"  prompt {index} differs")
+        # The expected ids are the host arm's output at this world; the global ids are the
+        # single-process sum. The top-2 gap below is the host arm's own at the divergence.
+        got = expected[index] if index < len(expected) else []
+        want = global_ids[index] if index < len(global_ids) else []
+        world_tops = tops[index] if index < len(tops) else []
+        report_divergence(got, want, world_tops, want_label="global", got_label="host")
+    return differing
+
+
+def tree_bytes(paths: list[str]) -> int:
+    """Bytes the lead would send: regular files under every path, symlinks as links."""
+    total = 0
+    for root in paths:
+        if os.path.islink(root) or os.path.isfile(root):
+            total += os.lstat(root).st_size
+            continue
+        for directory, _dirs, files in os.walk(root):
+            for name in files:
+                candidate = os.path.join(directory, name)
+                total += 0 if os.path.islink(candidate) else os.lstat(candidate).st_size
+    return total
+
+
+def human_bytes(count: int) -> str:
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1000:
+            return f"{value:.0f} {unit}"
+        value /= 1000
+    return f"{value:.1f} TB"
+
+
+def sync_to_nodes(nodes: list[str], paths: list[str]) -> None:
+    """Copy the paths to every node at the same absolute path, then print each node and size."""
+    names = os.environ.get("SPARK_SSH_NAMES", "").split()
+    if names and len(names) < len(nodes):
+        fail(f"SPARK_SSH_NAMES names {len(names)} node(s); the group needs {len(nodes)}")
+    command = [sys.executable, "-I", str(ROOT / "scripts/sync-nodes.py")]
+    for index, node in enumerate(nodes):
+        # The destination may be a fast-network address; HostKeyAlias checks the key already
+        # trusted for the node's SSH name, so no new host key is written.
+        alias = names[index] if names else node.rpartition("@")[2]
+        command += ["--host", f"{node},{alias}"]
+    for path in paths:
+        command += ["--path", path]
+    command += ["--ssh-arg=-o", "--ssh-arg=BatchMode=yes"]
+    if run(command).returncode != 0:
+        fail("the checkpoint, cubins or tokenizer did not reach every node")
+    size = tree_bytes(paths)
+    for node in nodes:
+        print(f"second-shape: synced {node}: {size} bytes ({human_bytes(size)})")
+
+
+def compare_command(
+    url: str,
+    prompts: Path,
+    *,
+    expected: Path | None = None,
+    dump: Path | None = None,
+    max_tokens: int,
+) -> str:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "compare",
+        "--url",
+        url,
+        "--prompts",
+        str(prompts),
+        "--max-tokens",
+        str(max_tokens),
+        "--ready-timeout",
+        "60",
+    ]
+    if expected is not None:
+        command += ["--expected", str(expected)]
+    if dump is not None:
+        command += ["--dump", str(dump)]
+    return shlex.join(command)
+
+
+def host_group_env(logs: Path, binary: str) -> dict[str, str]:
+    return {
+        **os.environ,
+        "SPARKFLASH_BIN": binary,
+        "ONE_HOST_LOGS": str(logs),
+        # The fixture streams its 2.8 GB checkpoint; the default 6 GiB a rank reserve
+        # would refuse a host whose page cache is holding the released model.
+        "ONE_HOST_SKIP_MEMORY": "1",
+        # The second shape's cubins are built from the instance list, not pinned in the
+        # released baseline; the open manifest records their hashes.
+        "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
+    }
+
+
 def run_test(args: argparse.Namespace) -> int:
+    all_nodes = os.environ.get("SPARK_NODES", "").split()
+    four_node = args.device and bool(all_nodes)
+    if four_node and not os.path.isabs(args.out):
+        fail(
+            "a four-node device run needs an absolute --out that every node shares at the same "
+            f"path; got {args.out}"
+        )
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     checkpoint = out / "checkpoint"
@@ -236,7 +460,7 @@ def run_test(args: argparse.Namespace) -> int:
         fail("--device needs --released-cubins: the staged directory keeps the released names")
 
     prompts_file = out / "prompts.json"
-    expected_file = out / "host-reference.json"
+    global_file = out / "host-reference.json"
     prompts_file.write_text(json.dumps(PROMPTS))
     result = run(
         [args.reference, str(checkpoint), str(prompts_file), str(args.max_tokens)],
@@ -245,7 +469,8 @@ def run_test(args: argparse.Namespace) -> int:
     )
     if result.returncode != 0:
         fail("the host reference failed")
-    expected_file.write_text(result.stdout)
+    global_file.write_text(result.stdout)
+    global_ids = json.loads(global_file.read_text())
     print(f"second-shape: host reference {result.stdout.strip()}")
 
     tokenizer = args.tokenizer or str(Path(args.released) / "tokenizer.json")
@@ -254,34 +479,94 @@ def run_test(args: argparse.Namespace) -> int:
         fail("--world names no rank count")
     for world in worlds:
         url = f"http://127.0.0.1:{args.port}"
+        # The expected file for this world is the host arm's own output at this split. It is
+        # captured from a live group before any device arm is launched.
+        expected_file = out / f"host-reference-w{world}.json"
+        tops_file = Path(str(expected_file) + ".top2.json")
+        capture = compare_command(
+            url, prompts_file, dump=expected_file, max_tokens=args.max_tokens
+        )
+        result = run(
+            [
+                str(ROOT / "scripts/one-host-group.sh"),
+                "deepseek",
+                str(world),
+                "--model",
+                MODEL,
+                "--checkpoint",
+                str(checkpoint),
+                "--tokenizer",
+                tokenizer,
+                "--port",
+                str(args.port),
+                "--check",
+                capture,
+                "--apply",
+            ],
+            env=host_group_env(out / f"logs-host-ref-{world}", args.binary),
+        )
+        if result.returncode != 0:
+            fail(f"the {world}-rank host arm could not write its reference")
+        expected = json.loads(expected_file.read_text())
+        tops = json.loads(tops_file.read_text())
+        differing = report_world(world, expected_file, expected, global_ids, tops)
+        if world == 1 and differing:
+            prompts = ", ".join(str(index) for index in differing)
+            fail(
+                "the one-rank host arm does not equal the global reference at prompt(s) "
+                f"{prompts}"
+            )
+
         # A shape that divides by the world has a cubin a world; stage this world's own directory
         # so the loader's released file names resolve to the build for this rank count.
         staged = cubins
         if args.device:
             staged = out / f"cubins-w{world}"
             stage_cubins(Path(args.released_cubins), built, staged, world)
-        compare_cmd = (
-            f"{sys.executable} {Path(__file__).resolve()} compare --url {url} "
-            f"--prompts {prompts_file} --expected {expected_file} --max-tokens {args.max_tokens} "
-            f"--ready-timeout 60"
-        )
+
+        # The device arm is held to the split's own file at every world; world 1's file is
+        # checked against the global reference above, so the anchor is not lost.
+        if args.device:
+            expected_for_check = expected_file
+        else:
+            expected_for_check = global_file if world == 1 else expected_file
         # The device arm takes NCCL collectives, so its group is the one the deployed launcher
         # starts: one process a node over ssh. SPARK_NODES names the nodes in rank order; the first
         # `world` of them are the group. Without it the device group runs on one host, which is the
         # host arm's exchange and is refused by the device run header.
-        nodes = os.environ.get("SPARK_NODES")
-        if args.device and nodes:
-            node_list = nodes.split()[:world]
-            peer_list = (os.environ.get("SPARK_PEERS") or nodes).split()[:world]
+        if args.device and all_nodes:
+            node_list = all_nodes[:world]
+            peers = os.environ.get("SPARK_PEERS") or " ".join(all_nodes)
+            peer_list = peers.replace(",", " ").split()[:world]
             if len(node_list) != world or len(peer_list) != world:
-                fail(f"a {world}-rank device group needs {world} SPARK_NODES and SPARK_PEERS addresses")
+                fail(
+                    f"a {world}-rank device group needs {world} SPARK_NODES and SPARK_PEERS "
+                    "addresses"
+                )
+            if os.environ.get("SPARK_SYNC") == "1":
+                tokenizer_file = str(Path(tokenizer).resolve())
+                sync_paths = [str(checkpoint), str(staged)]
+                checkpoint_prefix = str(checkpoint) + os.sep
+                if tokenizer_file != str(checkpoint) and not tokenizer_file.startswith(
+                    checkpoint_prefix
+                ):
+                    sync_paths.append(tokenizer_file)
+                print(
+                    f"second-shape: syncing {len(sync_paths)} path(s) to the first {world} node(s)"
+                )
+                sync_to_nodes(node_list, sync_paths)
+            else:
+                print("second-shape: node sync skipped (set SPARK_SYNC=1 to distribute the run)")
             group_env = {
                 **os.environ,
                 "SPARKFLASH_BIN": args.binary,
                 "SPARKFLASH_CHECKPOINT": str(checkpoint),
                 "SPARKFLASH_TOKENIZER": tokenizer,
                 "SPARKFLASH_CUBINS": str(staged),
-                "SPARKFLASH_LOG_ROOT": str(out / f"logs-{world}"),
+                "SPARKFLASH_LOG_ROOT": str(out / f"logs-serve-{world}"),
+                # Collect needs the launch's run directory; a generated stamp would differ.
+                "SPARKFLASH_RUN_ID": f"w{world}",
+                "ONE_HOST_LOGS": str(out / f"logs-{world}"),
                 "SPARK_NODES": " ".join(node_list),
                 "SPARK_PEERS": " ".join(peer_list),
                 "SPARK_WORLD": str(world),
@@ -295,9 +580,10 @@ def run_test(args: argparse.Namespace) -> int:
             started = False
             agreed = 1
             try:
-                if run([launcher, "launch"], env=group_env).returncode != 0:
-                    fail(f"the {world}-rank device group did not start")
+                result = run([launcher, "launch"], env=group_env)
                 started = True
+                if result.returncode != 0:
+                    fail(f"the {world}-rank device group did not start")
                 wait_ready(url)
                 agreed = run(
                     [
@@ -309,7 +595,7 @@ def run_test(args: argparse.Namespace) -> int:
                         "--prompts",
                         str(prompts_file),
                         "--expected",
-                        str(expected_file),
+                        str(expected_for_check),
                         "--max-tokens",
                         str(args.max_tokens),
                         "--ready-timeout",
@@ -318,10 +604,25 @@ def run_test(args: argparse.Namespace) -> int:
                 ).returncode
             finally:
                 if started:
+                    # Pull every worker's own log before the ranks stop; a head-only read keeps
+                    # rank 0's file and has already hidden a worker failure.
+                    run([launcher, "collect"], env=group_env)
                     run([launcher, "stop"], env=group_env)
             if agreed != 0:
-                fail(f"the {world}-rank device group did not agree with the host reference")
+                fail(
+                    f"the {world}-rank device group did not agree with "
+                    f"{expected_for_check.name}"
+                )
             continue
+
+        # One host: the host arm itself is the check when no device arm is asked for. World 1 is
+        # held to the global reference; every other world to its own split's file.
+        check = compare_command(
+            url,
+            prompts_file,
+            expected=expected_for_check,
+            max_tokens=args.max_tokens,
+        )
         result = run(
             [
                 str(ROOT / "scripts/one-host-group.sh"),
@@ -337,25 +638,14 @@ def run_test(args: argparse.Namespace) -> int:
                 "--port",
                 str(args.port),
                 "--check",
-                compare_cmd,
+                check,
                 "--apply",
             ],
-            env={
-                **os.environ,
-                "SPARKFLASH_BIN": args.binary,
-                "ONE_HOST_LOGS": str(out / f"logs-{world}"),
-                # The fixture streams its 2.8 GB checkpoint; the default 6 GiB a rank reserve
-                # would refuse a host whose page cache is holding the released model.
-                "ONE_HOST_SKIP_MEMORY": "1",
-                # The second shape's cubins are built from the instance list, not pinned in the
-                # released baseline; the open manifest records their hashes.
-                "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
-            },
+            env=host_group_env(out / f"logs-{world}", args.binary),
         )
         if result.returncode != 0:
-            fail(f"the {world}-rank group did not agree with the host reference")
+            fail(f"the {world}-rank group did not agree with {expected_for_check.name}")
     return 0
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -395,7 +685,11 @@ def main() -> int:
     compare_parser = subs.add_parser("compare")
     compare_parser.add_argument("--url", required=True)
     compare_parser.add_argument("--prompts", required=True)
-    compare_parser.add_argument("--expected", required=True)
+    compare_parser.add_argument("--expected", help="the ids to compare with (required without --dump)")
+    compare_parser.add_argument(
+        "--dump",
+        help="write the served ids as a JSON list of lists, plus FILE.top2.json, and exit 0",
+    )
     compare_parser.add_argument("--model", default=MODEL)
     compare_parser.add_argument("--max-tokens", type=int, default=8)
     compare_parser.add_argument("--ready-timeout", type=int, default=600)
