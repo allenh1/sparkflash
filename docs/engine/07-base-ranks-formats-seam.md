@@ -132,6 +132,20 @@ Line numbers are the tree's at the start of this milestone.
   agrees with the host reference. On one GPU that is the device arm at one rank, which needs
   R3; two and four ranks run on the four-node group with `scripts/second-shape.py run --device`.
 
+### The reference is taken at the world's own split
+
+The global `host-reference.json` is a single-process sum, and comparing every rank count with
+it is valid only when the format's arithmetic is regrouping-invariant. It is not for row-scaled
+MXFP8/E4M3: on the synthetic fixture's layer 0 the per-rank partial sums differ from the global
+sum by 1.75e-10 absolute and 4.7e-7 relative, 3803 of the 4096 bits of the f32 result, and that
+difference flips one greedy tie. World 1 therefore stays exact against the global reference,
+which is the same single sum. World W is compared against the host arm's own output at world W
+(`host-reference-w{W}.json`), never against the global file, and the device group at W is held
+to that file exactly. Drift between a world's reference and the global one is printed with the
+prompts that differ and the top-2 logprob gap at the first divergence rather than tolerated,
+because a difference that moves a token is the failure the rule exists to attribute; token ids
+are never compared with a tolerance.
+
 ### 3.1 Where the proof stands (review of `1ef7a6ca`, 2026-11-23)
 
 Every result recorded below under R1, R2, F1, F2 and F3, and the second shape of milestone 2,

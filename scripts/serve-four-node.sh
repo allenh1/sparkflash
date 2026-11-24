@@ -26,11 +26,16 @@
 # Usage:
 #   scripts/serve-four-node.sh print     print the four commands (default; no network access)
 #   scripts/serve-four-node.sh launch    start four ranks over ssh, one per node
+#   scripts/serve-four-node.sh collect   copy every node's run log directory to ONE_HOST_LOGS
 #   scripts/serve-four-node.sh stop      send SIGTERM to every rank (the graceful-drain signal)
 #   scripts/serve-four-node.sh status    report whether each rank process is running
 #
 # Environment (required for launch; print only needs the paths):
 #   SPARK_NODES            4 node addresses in rank order (space separated)
+#   SPARKFLASH_RUN_ID      run directory under SPARKFLASH_LOG_ROOT (default a UTC stamp;
+#                          collect must repeat the launch's value)
+#   ONE_HOST_LOGS          collect destination (default SPARKFLASH_LOG_ROOT/RUN_ID-collected);
+#                          each node's files land under node-<rank>/
 #   SPARKFLASH_CHECKPOINT  sharded checkpoint directory, same path on every node
 #   SPARKFLASH_TOKENIZER   tokenizer.json path, same path on every node
 # Device path (what makes it fast; leave SPARKFLASH_CUBINS unset for the CPU reference engine):
@@ -117,6 +122,11 @@ case "$WORLD" in
     *) die "SPARK_WORLD must be 1, 2 or 4, got '$WORLD'" ;;
 esac
 [ "${#NODES[@]}" -eq "$WORLD" ] || die "SPARK_NODES needs exactly $WORLD addresses in rank order (world $WORLD), got ${#NODES[@]}"
+# The group's ranks: rank r runs on NODES[r], for r below the world. Every mode that walks the
+# ranks walks this list, so a one- or two-rank group never reads a node past its last.
+RANKS=()
+for ((_rank = 0; _rank < WORLD; _rank++)); do RANKS+=("$_rank"); done
+unset _rank
 # The Inkling-2 device group takes its own flags (`--rank R --peer host:port,... --world 4
 # --converted DIR`); every other group is a `--tp4-rank` group.
 case "$MODEL" in
@@ -131,7 +141,7 @@ case "$GROUP_FORM" in
         # The Inkling arm carries its kernels in the binary; a cubin directory here would be
         # accepted and never read.
         [ -z "$CUBINS" ] || die "SPARKFLASH_CUBINS is the V4.1 kernel directory; the --rank group's kernels are built into the binary, so unset it"
-        [ -n "$CONVERTED_DIR" ] || [ "$MODE" = stop ] || [ "$MODE" = status ] \
+        [ -n "$CONVERTED_DIR" ] || [ "$MODE" = stop ] || [ "$MODE" = status ] || [ "$MODE" = collect ] \
             || die "SPARKFLASH_GROUP_FORM=rank needs SPARKFLASH_CONVERTED_DIR: the --rank group boots from its converted rank files"
         ;;
     *) die "SPARKFLASH_GROUP_FORM must be tp4 or rank, got '$GROUP_FORM'" ;;
@@ -140,7 +150,7 @@ if [ -n "$CONCURRENCY" ]; then
     case "$CONCURRENCY" in ''|*[!0-9]*|0) die "SPARKFLASH_CONCURRENCY must be a positive lane count, got '$CONCURRENCY'" ;; esac
     [ -n "$MODEL" ] || die "SPARKFLASH_CONCURRENCY sets a packed group's lanes; the V4.1 engine reads SPARKFLASH_LANES"
 fi
-# Only a start reads the weights; stop and status work without them.
+# Only a start reads the weights; collect, stop and status work without them.
 if [ "$MODE" = print ] || [ "$MODE" = launch ]; then
     [ -n "$CHECKPOINT" ] || die "SPARKFLASH_CHECKPOINT is required"
     [ -n "$TOKENIZER" ] || die "SPARKFLASH_TOKENIZER is required"
@@ -337,7 +347,7 @@ print_plan() {
     printf 'serve-four-node: nodes %s\n' "$NODES_RAW"
     printf 'serve-four-node: peers %s\n' "$PEERS"
     local rank
-    for rank in 0 1 2 3; do
+    for rank in "${RANKS[@]}"; do
         if is_local "$rank"; then
             printf 'serve-four-node: rank %s -> %s (this node)\n' "$rank" "${NODES[$rank]}"
             printf '  bash -c "%s"\n' "$(start_line "$rank")"
@@ -372,7 +382,7 @@ case "$MODE" in
         local_plan="$LOG_ROOT/$RUN_ID/local-commands.txt"
         mkdir -p "$LOG_ROOT/$RUN_ID"
         print_plan > "$local_plan"
-        for rank in 0 1 2 3; do
+        for rank in "${RANKS[@]}"; do
             remote "$rank" "$(start_line "$rank") echo \$!" \
                 | sed "s/^/rank $rank pid /"
         done
@@ -380,7 +390,7 @@ case "$MODE" in
         # first second. Otherwise an argument or startup error is reported as a successful launch.
         sleep 2
         failed=0
-        for rank in 0 1 2 3; do
+        for rank in "${RANKS[@]}"; do
             if ! remote "$rank" "pgrep -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
                 printf 'serve-four-node: rank %s exited immediately\n' "$rank" >&2
                 remote "$rank" "tail -n 25 '$LOG_ROOT/$RUN_ID/rank$rank.log'" >&2 || true
@@ -388,7 +398,7 @@ case "$MODE" in
             fi
         done
         if [ "$failed" != 0 ]; then
-            for rank in 0 1 2 3; do
+            for rank in "${RANKS[@]}"; do
                 remote "$rank" "pkill -TERM -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
             done
             die "one or more ranks failed to start"
@@ -397,7 +407,7 @@ case "$MODE" in
         printf 'serve-four-node: rank 0 health endpoint http://%s/health\n' "$HTTP_BIND"
         ;;
     stop)
-        for rank in 0 1 2 3; do
+        for rank in "${RANKS[@]}"; do
             # SIGTERM is the drain signal: rank 0 turns /readyz 503, finishes in-flight requests and
             # exits 0. The pattern is the exact rank flag (`--tp4-rank R` or `--rank R`), so no
             # other serve process is matched.
@@ -408,7 +418,7 @@ case "$MODE" in
         printf 'serve-four-node: in-flight requests drain for up to %s ms\n' "$DRAIN_TIMEOUT_MS"
         ;;
     status)
-        for rank in 0 1 2 3; do
+        for rank in "${RANKS[@]}"; do
             if remote "$rank" "pgrep -f '[s]parkflash[^ ]* serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
                 printf 'serve-four-node: rank %s running on %s\n' "$rank" "${NODES[$rank]}"
             else
@@ -416,7 +426,32 @@ case "$MODE" in
             fi
         done
         ;;
+    collect)
+        # Every worker writes its own log on its own node. A head-only read keeps rank 0's file
+        # and has already hidden a worker failure, so pull the whole run directory from each node
+        # and keep it under node-<rank>/. An unreachable node is named and does not fail the
+        # command: losing a log is not a reason to lose the result that was just measured.
+        DEST="${ONE_HOST_LOGS:-$LOG_ROOT/$RUN_ID-collected}"
+        mkdir -p "$DEST"
+        missed=()
+        for rank in $(seq 0 $((WORLD - 1))); do
+            node="${NODES[$rank]}"
+            mkdir -p "$DEST/node-$rank"
+            archive="$(mktemp "${TMPDIR:-/tmp}/serve-four-node-collect.XXXXXX")"
+            if remote "$rank" "tar -C $(printf '%q' "$LOG_ROOT") -cf - $(printf '%q' "$RUN_ID")" >"$archive" 2>/dev/null \
+                && tar -C "$DEST/node-$rank" --strip-components=1 -xf "$archive" 2>/dev/null; then
+                printf 'serve-four-node: collected rank %s logs from %s\n' "$rank" "$node"
+            else
+                printf 'serve-four-node: could not collect rank %s logs from %s\n' "$rank" "$node" >&2
+                missed+=("$node")
+            fi
+            rm -f "$archive"
+        done
+        if [ "${#missed[@]}" -gt 0 ]; then
+            printf 'serve-four-node: could not collect logs from: %s\n' "${missed[*]}" >&2
+        fi
+        ;;
     *)
-        die "unknown mode '$MODE' (expected print, launch, stop or status)"
+        die "unknown mode '$MODE' (expected print, launch, collect, stop or status)"
         ;;
 esac
