@@ -111,7 +111,7 @@ pub(super) fn launch_opt_rows(
 }
 
 /// The mix table's coefficient rows (pre 4, post 4, comb 16).
-const MIX_ROWS: usize = 24;
+pub(super) const MIX_ROWS: usize = 24;
 /// Steps of more rows than this take the staged Engram wkv kernel (at 8 rows or fewer the plain
 /// kernel is already at the weight stream's DRAM rate and the staging only costs).
 const ENGRAM_STAGED_FROM: usize = 8;

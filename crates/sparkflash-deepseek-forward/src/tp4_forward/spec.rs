@@ -1658,41 +1658,73 @@ impl DeviceLayer<'_> {
     ) -> Result<(), String> {
         sparkflash_kernels::cuda_driver::stage_timing_forward("prefill", n);
         let dump = rows_dump_dir()?;
+        let b = rows.b;
+        let (dim, hc) = (self.dim, self.hc_mult);
         if let Some(dir) = dump.as_deref() {
-            self.rows_dump_stream(rows, dir, "embed", p0, n)?;
+            self.rows_dump(dir, "embed", &[("stream", b.stream, n * hc * dim * 4)], p0, n)?;
         }
         for (layer, weights) in staged.iter().enumerate() {
             self.set_seam_weights(*weights);
-            self.run_layer_rows(rows, layer, p0, n)?;
-            if let Some(dir) = dump.as_deref() {
-                self.rows_dump_stream(rows, dir, &format!("L{layer:02}"), p0, n)?;
-            }
+            let Some(dir) = dump.as_deref() else {
+                self.run_layer_rows(rows, layer, p0, n)?;
+                continue;
+            };
+            let name = format!("L{layer:02}");
+            self.run_layer_attn(rows, layer, p0, n)?;
+            self.rows_dump(
+                dir,
+                &name,
+                &[
+                    ("attn_normed", b.normed, n * dim * 4),
+                    ("attn_mix", b.attn_mix, n * super::rows::MIX_ROWS * 4),
+                    ("attn_out_bf16", b.attn_out, n * dim * 2),
+                    ("attn_reduced_bf16", b.reduced, n * dim * 2),
+                ],
+                p0,
+                n,
+            )?;
+            self.run_layer_ffn(rows, layer, p0, n)?;
+            self.rows_dump(
+                dir,
+                &name,
+                &[
+                    ("ffn_mix", b.ffn_mix, n * super::rows::MIX_ROWS * 4),
+                    ("ffn_x_bf16", b.ffn_x, n * dim * 2),
+                    ("moe_reduced_bf16", b.moe_reduced, n * dim * 2),
+                    ("stream", b.stream, n * hc * dim * 4),
+                ],
+                p0,
+                n,
+            )?;
         }
         self.wait_collectives()?;
         Ok(())
     }
 
-    /// The rows' stream (`[n][hc][dim]` f32) as `<dir>/<name>-stream.f32`, after the device has
-    /// finished every launch queued so far. A diagnostic: it stalls the step at each call.
-    fn rows_dump_stream(
+    /// Each `(suffix, buffer, bytes)` of the rows as `<dir>/<name>-<suffix>.bin`, after the device
+    /// has finished every launch queued so far. A diagnostic: it stalls the step at each call.
+    fn rows_dump(
         &self,
-        rows: &RowsState,
         dir: &std::path::Path,
         name: &str,
+        buffers: &[(&str, u64, usize)],
         p0: usize,
         n: usize,
     ) -> Result<(), String> {
         self.wait_collectives()?;
         self.cuda.synchronize()?;
-        let mut bytes = vec![0u8; n * self.hc_mult * self.dim * 4];
-        self.cuda
-            .copy_dtoh(&mut bytes, &Deviceptr(rows.b.stream))
-            .map_err(|error| format!("rows dump {name}: {error}"))?;
-        let path = dir.join(format!("{name}-stream.f32"));
-        std::fs::write(&path, &bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+        for &(suffix, buffer, len) in buffers {
+            let mut bytes = vec![0u8; len];
+            self.cuda
+                .copy_dtoh(&mut bytes, &Deviceptr(buffer))
+                .map_err(|error| format!("rows dump {name}-{suffix}: {error}"))?;
+            let path = dir.join(format!("{name}-{suffix}.bin"));
+            std::fs::write(&path, &bytes)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+        }
         println!(
-            "sparkflash serve: rows dump {} rows={n} p0={p0} hc={} dim={}",
-            path.display(),
+            "sparkflash serve: rows dump {}/{name} rows={n} p0={p0} hc={} dim={}",
+            dir.display(),
             self.hc_mult,
             self.dim
         );
