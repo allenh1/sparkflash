@@ -109,7 +109,14 @@ read -r -a NODES <<< "$NODES_RAW"
 read -r -a LOCAL_RANKS <<< "${SPARK_LOCAL_RANKS:-}"
 die() { printf 'serve-four-node: %s\n' "$*" >&2; exit 1; }
 
-[ "${#NODES[@]}" -eq 4 ] || die "SPARK_NODES needs exactly 4 addresses in rank order, got ${#NODES[@]}"
+# The group's rank count. Four is the deployed shape; two and one are the synthetic checkpoint's
+# other worlds, where the same launcher starts the same process on each of the first `world` nodes.
+WORLD="${SPARK_WORLD:-4}"
+case "$WORLD" in
+    1|2|4) ;;
+    *) die "SPARK_WORLD must be 1, 2 or 4, got '$WORLD'" ;;
+esac
+[ "${#NODES[@]}" -eq "$WORLD" ] || die "SPARK_NODES needs exactly $WORLD addresses in rank order (world $WORLD), got ${#NODES[@]}"
 # The Inkling-2 device group takes its own flags (`--rank R --peer host:port,... --world 4
 # --converted DIR`); every other group is a `--tp4-rank` group.
 case "$MODEL" in
@@ -139,7 +146,8 @@ if [ "$MODE" = print ] || [ "$MODE" = launch ]; then
     [ -n "$TOKENIZER" ] || die "SPARKFLASH_TOKENIZER is required"
 fi
 for rank in ${LOCAL_RANKS[@]+"${LOCAL_RANKS[@]}"}; do
-    case "$rank" in 0|1|2|3) ;; *) die "SPARK_LOCAL_RANKS entries must be ranks 0-3, got '$rank'" ;; esac
+    case "$rank" in ''|*[!0-9]*) die "SPARK_LOCAL_RANKS entries must be ranks, got '$rank'" ;; esac
+    [ "$rank" -lt "$WORLD" ] || die "SPARK_LOCAL_RANKS entry $rank is not a rank of a $WORLD-rank group"
 done
 PEERS="$(IFS=,; printf '%s' "${NODES[*]}")"
 if [ -n "${SPARK_PEERS:-}" ]; then
@@ -147,7 +155,7 @@ if [ -n "${SPARK_PEERS:-}" ]; then
     # value, so an operator who copies that value back here is the common case; it used to be
     # read as a single address and refused with "got 1".
     read -r -a PEER_LIST <<< "${SPARK_PEERS//,/ }"
-    [ "${#PEER_LIST[@]}" -eq 4 ] || die "SPARK_PEERS needs exactly 4 addresses in rank order, got ${#PEER_LIST[@]}"
+    [ "${#PEER_LIST[@]}" -eq "$WORLD" ] || die "SPARK_PEERS needs exactly $WORLD addresses in rank order (world $WORLD), got ${#PEER_LIST[@]}"
     PEERS="$(IFS=,; printf '%s' "${PEER_LIST[*]}")"
 fi
 # The exchange's control plane reads its own table. Derived after the collectives' table so the
@@ -242,7 +250,11 @@ rank_env() {
     # SPARKFLASH_NUMERICS_* are diagnostics too (the coverage and monitor dumps): a rank that
     # wrote its dump while its peers did not is a suite with missing inputs, and leaving them out
     # made a GLM coverage sweep produce no file at all (the recorders are constructed per rank).
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|DENSE|SPEC|DRAFT|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE|LAUNCH_TRACE|OPEN_MANIFEST|NUMERICS)' || true); do
+    # SPARKFLASH_UNPINNED_SECOND_SHAPE is the one escape a synthetic second-shape run needs: its
+    # cubins are compiled for the fixture's shapes and staged under the released names, so they are
+    # not the bytes the baseline pins. It must reach every rank (a rank that refused the staged
+    # cubin while its peers loaded it is the same split as a rank that stood down).
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|DENSE|SPEC|DRAFT|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE|LAUNCH_TRACE|OPEN_MANIFEST|NUMERICS|UNPINNED_SECOND_SHAPE)' || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0
@@ -264,10 +276,10 @@ rank_command() {
         for peer in ${PEERS//,/ }; do
             peer_ports+="${peer_ports:+,}$peer:$BASE_PORT"
         done
-        printf ' --converted %s --peer %s --world 4 --rank %s --control-port %s' \
+        printf ' --converted %s --peer %s --world %s --rank %s --control-port %s' \
             "$CONVERTED_DIR" "$peer_ports" "$rank" "$CONTROL_PORT"
     else
-        printf ' --tp4-rank %s --tp4-world-size 4 --tp4-peers %s' "$rank" "$PEERS"
+        printf ' --tp4-rank %s --tp4-world-size %s --tp4-peers %s' "$rank" "$WORLD" "$PEERS"
         printf ' --tp4-base-port %s --tp4-control-port %s' "$BASE_PORT" "$CONTROL_PORT"
         [ -n "$CUBINS" ] && printf ' --tp4-device %s' "$CUBINS"
     fi

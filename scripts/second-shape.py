@@ -111,14 +111,22 @@ def variant_config(name: str, out: Path) -> Path:
     return path
 
 
-def stage_cubins(released: Path, built: Path, out: Path) -> None:
-    """Every released cubin, then the second shape's over its released name."""
+def stage_cubins(released: Path, built: Path, out: Path, world: int) -> None:
+    """Every released cubin, then the world's second-shape cubins over their released names.
+
+    A shape that divides by the world has one cubin a world: the four-rank build is
+    `<stem>_s2`, the two- and one-rank builds are `<stem>_s2w2` and `<stem>_s2w1`, because
+    the compiled shape is not the same (the expert intermediate and the vocabulary shard scale
+    with the world). The loader keeps the released file names, so each world stages into its own
+    directory and the suffix never reaches it.
+    """
     out.mkdir(parents=True, exist_ok=True)
     for cubin in released.glob("*.cubin"):
         shutil.copy2(cubin, out / cubin.name)
+    suffix = "_s2.cubin" if world == 4 else f"_s2w{world}.cubin"
     staged = 0
-    for cubin in built.glob("*_s2.cubin"):
-        target = out / (cubin.name[: -len("_s2.cubin")] + ".cubin")
+    for cubin in built.glob(f"*{suffix}"):
+        target = out / (cubin.name[: -len(suffix)] + ".cubin")
         shutil.copy2(cubin, target)
         staged += 1
     # The NVFP4 wrappers are a new body, not a second shape of a released cubin: their instance
@@ -127,8 +135,11 @@ def stage_cubins(released: Path, built: Path, out: Path) -> None:
         shutil.copy2(cubin, out / cubin.name)
         staged += 1
     if staged == 0:
-        fail(f"no second-shape cubins under {built}; run scripts/build-cubins.sh first")
-    print(f"second-shape: staged {staged} second-shape cubins under {out}")
+        fail(
+            f"no second-shape cubins for {world} ranks under {built}; "
+            "run scripts/build-cubins.sh first"
+        )
+    print(f"second-shape: staged {staged} second-shape cubins for {world} ranks under {out}")
 
 
 def wait_ready(url: str, seconds: int = 600) -> None:
@@ -215,11 +226,9 @@ def run_test(args: argparse.Namespace) -> int:
         )
         if result.returncode != 0:
             fail("the cubins did not build")
-    if args.device:
-        if not args.released_cubins:
-            fail("--device needs --released-cubins: the staged directory keeps the released names")
-        built = Path(args.built) if args.built else out / "built"
-        stage_cubins(Path(args.released_cubins), built, cubins)
+    built = Path(args.built) if args.built else out / "built"
+    if args.device and not args.released_cubins:
+        fail("--device needs --released-cubins: the staged directory keeps the released names")
 
     prompts_file = out / "prompts.json"
     expected_file = out / "host-reference.json"
@@ -240,11 +249,74 @@ def run_test(args: argparse.Namespace) -> int:
         fail("--world names no rank count")
     for world in worlds:
         url = f"http://127.0.0.1:{args.port}"
+        # A shape that divides by the world has a cubin a world; stage this world's own directory
+        # so the loader's released file names resolve to the build for this rank count.
+        staged = cubins
+        if args.device:
+            staged = out / f"cubins-w{world}"
+            stage_cubins(Path(args.released_cubins), built, staged, world)
         compare_cmd = (
             f"{sys.executable} {Path(__file__).resolve()} compare --url {url} "
             f"--prompts {prompts_file} --expected {expected_file} --max-tokens {args.max_tokens} "
             f"--ready-timeout 60"
         )
+        # The device arm takes NCCL collectives, so its group is the one the deployed launcher
+        # starts: one process a node over ssh. SPARK_NODES names the nodes in rank order; the first
+        # `world` of them are the group. Without it the device group runs on one host, which is the
+        # host arm's exchange and is refused by the device run header.
+        nodes = os.environ.get("SPARK_NODES")
+        if args.device and nodes:
+            node_list = nodes.split()[:world]
+            peer_list = (os.environ.get("SPARK_PEERS") or nodes).split()[:world]
+            if len(node_list) != world or len(peer_list) != world:
+                fail(f"a {world}-rank device group needs {world} SPARK_NODES and SPARK_PEERS addresses")
+            group_env = {
+                **os.environ,
+                "SPARKFLASH_BIN": args.binary,
+                "SPARKFLASH_CHECKPOINT": str(checkpoint),
+                "SPARKFLASH_TOKENIZER": tokenizer,
+                "SPARKFLASH_CUBINS": str(staged),
+                "SPARKFLASH_LOG_ROOT": str(out / f"logs-{world}"),
+                "SPARK_NODES": " ".join(node_list),
+                "SPARK_PEERS": " ".join(peer_list),
+                "SPARK_WORLD": str(world),
+                "SPARK_LOCAL_RANKS": "0",
+                "SPARKFLASH_HTTP_BIND": f"0.0.0.0:{args.port}",
+                # The second shape's cubins are built from the instance list, not pinned in the
+                # released baseline; the open manifest records their hashes.
+                "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
+            }
+            launcher = str(ROOT / "scripts/serve-four-node.sh")
+            started = False
+            agreed = 1
+            try:
+                if run([launcher, "launch"], env=group_env).returncode != 0:
+                    fail(f"the {world}-rank device group did not start")
+                started = True
+                wait_ready(url)
+                agreed = run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "compare",
+                        "--url",
+                        url,
+                        "--prompts",
+                        str(prompts_file),
+                        "--expected",
+                        str(expected_file),
+                        "--max-tokens",
+                        str(args.max_tokens),
+                        "--ready-timeout",
+                        "60",
+                    ]
+                ).returncode
+            finally:
+                if started:
+                    run([launcher, "stop"], env=group_env)
+            if agreed != 0:
+                fail(f"the {world}-rank device group did not agree with the host reference")
+            continue
         result = run(
             [
                 str(ROOT / "scripts/one-host-group.sh"),
@@ -256,7 +328,7 @@ def run_test(args: argparse.Namespace) -> int:
                 str(checkpoint),
                 "--tokenizer",
                 tokenizer,
-                *(("--cubins", str(cubins)) if args.device else ()),
+                *(("--cubins", str(staged)) if args.device else ()),
                 "--port",
                 str(args.port),
                 "--check",

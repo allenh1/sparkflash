@@ -31,6 +31,7 @@
 //!
 //! # Example
 //!
+//!     use sparkflash_model::format::StoredFormat;
 //!     use sparkflash_model::Part;
 //!     use sparkflash_ops::engine_plan::PartRequirement;
 //!     use sparkflash_ops::gemm::DenseGemmPlan;
@@ -47,7 +48,7 @@
 //!             intermediate: 4096,
 //!             ..PartGeometry::new()
 //!         },
-//!         precision: Precision::MxFp8,
+//!         format: StoredFormat::MXFP8_32,
 //!     };
 //!     let plain = DenseGemmPlan::new(
 //!         context,

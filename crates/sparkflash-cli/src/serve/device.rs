@@ -222,6 +222,31 @@ impl DeviceServeOptions {
     fn positions(&self) -> usize {
         self.max_model_len + POSITION_HEADROOM
     }
+
+    /// The loadability policy this device run's boot gate must use.
+    ///
+    /// The gate reads the arm's own kernel directory (`--tp4-device DIR`), not
+    /// `SPARKFLASH_CUBINS`: a direct launch that names the directory is a complete
+    /// statement of where the run's cubins are, and an operator who passes the flag
+    /// should not also have to repeat it in the environment. The launcher exports
+    /// `SPARKFLASH_CUBINS` for the same reason, so both routes now answer alike.
+    fn availability(&self) -> sparkflash_ops::resolver::Availability {
+        sparkflash_ops::resolver::Availability::runtime(true)
+    }
+
+    /// The pre-boot plan gate for this device run: resolve the checkpoint at this group's
+    /// world against the cubin directory the flag names.
+    ///
+    /// # Errors
+    /// The plan does not open, or a required part has no loadable implementation.
+    fn boot_check(&self, checkpoint: Option<&std::path::Path>, world: usize) -> Result<(), String> {
+        match checkpoint {
+            Some(checkpoint) => {
+                super::check_checkpoint_plan(checkpoint, world, self.availability())
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 /// One admitted request, from the driver to rank 0's link.
@@ -1300,13 +1325,7 @@ pub(super) fn run(
         std::env::set_var("SPARKFLASH_DSPARK", "1");
         std::env::set_var(MAX_SEQ_LEN_ENV, device.max_model_len.to_string());
     }
-    if let Some(checkpoint) = options.checkpoint.as_deref()
-        && let Err(message) = super::check_checkpoint_plan(
-            checkpoint,
-            tp4.world_size,
-            sparkflash_ops::resolver::Availability::runtime_env(),
-        )
-    {
+    if let Err(message) = device.boot_check(options.checkpoint.as_deref(), tp4.world_size) {
         eprintln!("sparkflash serve: {message}");
         return ExitCode::from(EXIT_REFUSED);
     }
@@ -1851,6 +1870,37 @@ mod tests {
         let (reasoning, content) = drain(&mut answers);
         assert_eq!(reasoning, "Use ");
         assert_eq!(content, "`cargo test`");
+    }
+
+    #[test]
+    fn the_boot_gate_reads_the_cubin_directory_the_device_flag_names() {
+        // A direct `--tp4-device DIR` launch (the world-1 command) need not also export
+        // SPARKFLASH_CUBINS. The gate must take the directory from the flag, or the DeepSeek
+        // run-time image is judged unloadable and the run refuses before it opens a cubin.
+        // SAFETY: this test is the only reader of the variable in this process.
+        unsafe { std::env::remove_var(sparkflash_ops::parts::CUBIN_DIR_ENV) };
+        let dir = tempfile::tempdir().expect("a temporary checkpoint");
+        std::fs::write(
+            dir.path().join(crate::serve::CHECKPOINT_CONFIG_NAME),
+            include_str!(
+                "../../../sparkflash-deepseek-forward/tests/fixtures/second-shape/config.json"
+            ),
+        )
+        .expect("the second-shape configuration");
+        let device = DeviceServeOptions {
+            cubins: PathBuf::from("/nonexistent/cubins-w1"),
+            max_model_len: DEFAULT_MAX_MODEL_LEN,
+            evidence_dir: dir.path().join("evidence"),
+        };
+        assert!(
+            device
+                .availability()
+                .loadable(sparkflash_kernels::images::Image::Deepseek),
+            "the flag's directory makes the DeepSeek image loadable without the environment"
+        );
+        device.boot_check(Some(dir.path()), 1).expect(
+            "the second shape's TP1 plan resolves against the cubins the device flag names",
+        );
     }
 
     #[test]

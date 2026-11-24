@@ -275,11 +275,11 @@ fn the_seams_family_has_its_released_shapes_and_a_second_shape() {
     let rows = instances();
     let seams: Vec<&Instance> = rows
         .iter()
-        .filter(|row| row.family == "seams" && !row.cubin.ends_with("_s2"))
+        .filter(|row| row.family == "seams" && !row.cubin.contains("_s2"))
         .collect();
     assert!(
         rows.iter()
-            .any(|row| row.family == "seams" && row.cubin.ends_with("_s2")),
+            .any(|row| row.family == "seams" && row.cubin.contains("_s2")),
         "the seams family has a second-shape build"
     );
     assert!(!seams.is_empty(), "the seams family has instances");
@@ -499,7 +499,7 @@ fn the_head_family_has_its_released_shape_and_a_second_shape() {
     let rows = instances();
     let heads: Vec<&Instance> = rows
         .iter()
-        .filter(|row| row.family == "head" && !row.cubin.ends_with("_s2"))
+        .filter(|row| row.family == "head" && !row.cubin.contains("_s2"))
         .collect();
 
     // Both released entries of each source carry the released one-rank shape and share the

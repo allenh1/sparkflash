@@ -152,6 +152,84 @@ four, or a format other than the released ones. What that leaves open:
 * **F4** follows the same bar: a family is done when the device arm reads the synthetic
   checkpoint stored its way, not when the host arm does.
 
+**Result (2026-11-23, the device arm at two ranks).** The synthetic second-shape checkpoint
+(2.8 GB, the released `mx-fp4` row-scaled expert format, hidden 4096, 64 experts, top-4,
+intermediate 512, vocabulary 32,768) was opened on the device arm at two ranks on one host
+(`scripts/second-shape.py run --device --world 2,4`, tip `536a8a5`, 36 second-shape cubins,
+release binary `9a60bb02`). The group refused at open, before a launch:
+
+```
+cannot execute deepseek_v41 at TP2: moe on sm121 at MXFP4 (row scale + power-of-two grid,
+one scale per 32 values, row-major) in the prefill pass: deepseek_ptx: intermediate 256 is
+not one of the shapes the kernel was built for ([128, 576])
+```
+
+The two-rank split halves the 512-wide expert intermediate to 256, and the instance list has
+rows at 128 and 576 only. World 4 was not attempted, because the harness stops at the first
+disagreeing world. The host reference for the same checkpoint gave
+
+```
+[[6653, 20427, 12813, 422, 9389, 6388, 16395, 6405],
+ [25425, 11040, 11559, 23442, 29453, 17940, 5192, 25888],
+ [30169, 105, 2323, 11724, 1353, 885, 3013, 30683]]
+```
+
+which is a different prompt set from F3's three-prompt reference, so it is not comparable to
+those ids. The measurement stands as it is: at two ranks the device arm cannot reach the
+routed experts because their shape is not built, and R3's rank-count and padding instances are
+what unblock it.
+
+Three more windows, each on the same synthetic checkpoint and the same host, narrowed it:
+
+* **The per-world instances build.** After the world-suffixed rows (134 cubins: 36 `_s2`,
+  14 `_s2w2`, 14 `_s2w1`) the harness staged 14 cubins for two ranks and 36 for four, and the
+  kernel ladder's hash step passed unchanged (`all kernels match the recorded baseline` over
+  51 kernels): relaxing the rank asserts moved no released cubin's bytes.
+* **The one-host group is the wrong vehicle.** The same run then refused before a forward with
+  `SPARK_COMM_REDUCE=tcp is a host-arm exchange, but this run takes the device arm, whose
+  per-layer collectives are NCCL enqueues`. `scripts/one-host-group.sh` pins that variable for
+  the deepseek arm, so the device group is the one the deployed launcher starts,
+  `scripts/serve-four-node.sh`, and `second-shape.py` now drives it when `SPARK_NODES` names the
+  nodes. The launcher takes `SPARK_WORLD` (1, 2 or 4) rather than asserting four, and forwards
+  `SPARKFLASH_UNPINNED_SECOND_SHAPE` to every rank, which a staged second-shape cubin needs.
+* **The four-node group forms and the workers die.** At world 4 all four ranks started, the run
+  header reported `reduce=nccl`, the device opened, and the three workers exited about two
+  seconds into the plan builder with no error line - the last line is
+  `layers.0.attn_norm.weight: planned as no stated format, the plan builder writes BF16` - after
+  which rank 0 reported a closed control channel. At world 1, one rank on the head node, the
+  arm refused cleanly at exit 2 with `deepseek_ptx is not loadable under runtime availability`
+  for every part, so at one rank the DeepSeek image is judged unloadable and the reason lies
+  earlier in the open. Neither is a shape refusal any more.
+
+**Cause (2026-11-24, both refusals traced on the source, no window).** They were two separate
+defects, and neither was in the kernels or the formats.
+
+* **The four-rank workers exited in the plan builder.** The chain builds its rank plan
+  (`setup_for_chain` → `load_entries`) before `plan::install`, and `load_entries` read each
+  tensor's format from `crate::plan::installed()`, which was still empty. Every
+  `HeaderEntry.format` was therefore `None` and the `mhc_seam` bind refused
+  `layers.0.attn_norm.weight` by name, on all four ranks. The worker did not exit silently: the
+  error propagated through the resident chain, the worker printed it and returned exit 2, and
+  rank 0, seeing the control socket close, reported only the generic closed-channel line, which
+  is what the window recorded. The header loader now opens the checkpoint's plan itself and
+  resolves formats from it, so the order of install and load cannot change the answer
+  (`tp4_resident.rs`, and a regression test in `tests/checkpoint_formats.rs` that fails with
+  `format: None` on the old code).
+* **The one-rank run judged the DeepSeek image unloadable.** The direct world-1 command passed
+  `--tp4-device cubins-w1` but did not export `SPARKFLASH_CUBINS`, and the pre-boot gate asked
+  `Availability::runtime_env()`, which reads only the environment, so every part reported
+  `deepseek_ptx is not loadable under runtime availability` (`resolver.rs`, raised through
+  `parts.rs`). No cubin was missing: fourteen `_s2w1.cubin` files were built and staged. World 4
+  never showed this because `scripts/serve-four-node.sh` does export `SPARKFLASH_CUBINS`. The gate
+  now takes its cubin directory from the flag the run was started with, and the launcher and the
+  direct command answer alike (`serve/device.rs`, with a test that fails if the gate falls back
+  to the environment).
+
+Both fixes are on `r3/device-arm` and none of them has run on a GPU yet: the next window
+confirms them. A worker's own log is written on the worker's node, so a group-level read of the
+head node sees only rank 0 and hides the cause; the harness now collects every node's log, and a
+window that reads only `rank0.log` is not a window.
+
 ## 4. The work
 
 ### R. Ranks

@@ -206,7 +206,11 @@ __device__ __forceinline__ void spark_lm_reduce_warp_best(float *value, uint32_t
     ((SPARK_LM_REDUCE_VOCAB_PER_RANK + SPARK_LM_REDUCE_CHUNK - 1u) / SPARK_LM_REDUCE_CHUNK)
 #define SPARK_LM_REDUCE_BLOCKS (SPARK_LM_REDUCE_RANKS * SPARK_LM_REDUCE_CHUNKS_PER_RANK)
 
-static_assert(SPARK_LM_REDUCE_RANKS == 4u, "the reduction folds four rank shards");
+// One, two or four shards: the world divides the released four, and 4 % ranks == 0 admits exactly
+// those three. The count is an instance argument, so a world the list has no row for does not
+// compile rather than folding a wrong number of shards.
+static_assert(4u % SPARK_LM_REDUCE_RANKS == 0u,
+              "the reduction folds the one, two or four rank shards the world gives it");
 static_assert(SPARK_LM_REDUCE_VOCAB_PER_RANK > 0u,
               "the instance names this rank's vocabulary shard");
 static_assert(SPARK_LM_REDUCE_CHUNKS_PER_RANK * SPARK_LM_REDUCE_CHUNK >=
@@ -381,7 +385,11 @@ static_assert(SPARK_LM_REDUCE_BATCH_ROWS == 6u, "the verifier batch is six rows"
     ((SPARK_LM_REDUCE_VOCAB_PER_RANK + SPARK_LM_REDUCE_CHUNK - 1u) / SPARK_LM_REDUCE_CHUNK)
 #define SPARK_LM_REDUCE_BLOCKS (SPARK_LM_REDUCE_RANKS * SPARK_LM_REDUCE_CHUNKS_PER_RANK)
 
-static_assert(SPARK_LM_REDUCE_RANKS == 4u, "the reduction folds four rank shards");
+// One, two or four shards: the world divides the released four, and 4 % ranks == 0 admits exactly
+// those three. The count is an instance argument, so a world the list has no row for does not
+// compile rather than folding a wrong number of shards.
+static_assert(4u % SPARK_LM_REDUCE_RANKS == 0u,
+              "the reduction folds the one, two or four rank shards the world gives it");
 static_assert(SPARK_LM_REDUCE_VOCAB_PER_RANK > 0u,
               "the instance names this rank's vocabulary shard");
 static_assert(SPARK_LM_REDUCE_CHUNKS_PER_RANK * SPARK_LM_REDUCE_CHUNK >=

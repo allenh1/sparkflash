@@ -213,8 +213,8 @@ static_assert(SPARK_INSTANCE_CERT_LM_HEAD_SM121_HIDDEN % SPARK_M4_LM_SCREEN_TILE
               "the hidden dimension tiles by the screen tile");
 static_assert(SPARK_INSTANCE_CERT_LM_HEAD_SM121_VOCAB_PER_RANK > 0u,
               "the instance names this rank's vocabulary shard");
-static_assert(SPARK_INSTANCE_CERT_LM_HEAD_SM121_RANKS == 4u,
-              "the certified head shards over four ranks");
+static_assert(4u % SPARK_INSTANCE_CERT_LM_HEAD_SM121_RANKS == 0u,
+              "the certified head shards over the one, two or four ranks the world gives it");
 extern "C" __global__ void cert_lm_head_sm121(
     const __nv_bfloat16 *__restrict__ hidden,
     const __nv_bfloat16 *__restrict__ w,
@@ -246,8 +246,8 @@ static_assert(SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_HIDDEN % SPARK_M4_LM_
               "the hidden dimension tiles by the screen tile");
 static_assert(SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_VOCAB_PER_RANK > 0u,
               "the instance names this rank's vocabulary shard");
-static_assert(SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_RANKS == 4u,
-              "the certified head shards over four ranks");
+static_assert(4u % SPARK_INSTANCE_CERT_LM_HEAD_4096V16384_SM121_RANKS == 0u,
+              "the certified head shards over the one, two or four ranks the world gives it");
 extern "C" __global__ void cert_lm_head_4096v16384_sm121(
     const __nv_bfloat16 *__restrict__ hidden,
     const __nv_bfloat16 *__restrict__ w,
@@ -431,8 +431,8 @@ static_assert(SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_HIDDEN % SPARK_M4_LM_SCR
               "the hidden dimension tiles by the screen tile");
 static_assert(SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_VOCAB_PER_RANK > 0u,
               "the instance names this rank's vocabulary shard");
-static_assert(SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_RANKS == 4u,
-              "the certified head shards over four ranks");
+static_assert(4u % SPARK_INSTANCE_CERT_LM_HEAD_BATCHED_SM121_RANKS == 0u,
+              "the certified head shards over the one, two or four ranks the world gives it");
 extern "C" __global__ void cert_lm_head_batched_sm121(
     const __nv_bfloat16 *__restrict__ hidden,
     const __nv_bfloat16 *__restrict__ w,
