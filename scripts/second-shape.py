@@ -547,6 +547,26 @@ def host_group_env(logs: Path, binary: str) -> dict[str, str]:
     }
 
 
+def require_nccl_library() -> Path:
+    """The NCCL library a device group loads, checked before the run starts.
+
+    The launcher's rank bootstrap loads NCCL before it opens any communicator and refuses on
+    every rank when it cannot. A window that reaches that point has spent its downtime on a
+    missing environment variable, so the path is the operator's and is named, never guessed.
+    """
+    value = os.environ.get("SPARKFLASH_NCCL_LIB", "")
+    if not value:
+        fail(
+            "a device run needs SPARKFLASH_NCCL_LIB pointing at the directory that holds "
+            "libnccl.so; the launcher refuses at the NCCL bootstrap before any layer without "
+            "it (for example the production install's target/deps/nccl)"
+        )
+    path = Path(value)
+    if not path.is_dir():
+        fail(f"SPARKFLASH_NCCL_LIB={value} is not a directory")
+    return path
+
+
 def env_for_world(
     args: argparse.Namespace,
     out: Path,
@@ -573,6 +593,8 @@ def env_for_world(
         "SPARK_WORLD": str(world),
         "SPARK_LOCAL_RANKS": "0",
         "SPARKFLASH_HTTP_BIND": f"0.0.0.0:{args.port}",
+        # The launcher loads NCCL before any layer; the path is the operator's, carried here.
+        "SPARKFLASH_NCCL_LIB": os.environ.get("SPARKFLASH_NCCL_LIB", ""),
         # The certified head screen is built for the released 5,120-value rows (160 blocks of
         # 32); this shape serves its full 4,096-value rows (128 blocks) through that head.
         "SPARKFLASH_HEAD_SCREEN": "0",
@@ -767,6 +789,8 @@ def run_world(
 
 
 def run_test(args: argparse.Namespace) -> int:
+    if args.device:
+        require_nccl_library()
     all_nodes = os.environ.get("SPARK_NODES", "").split()
     four_node = args.device and bool(all_nodes)
     if four_node and not os.path.isabs(args.out):

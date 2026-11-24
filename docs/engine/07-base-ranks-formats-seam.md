@@ -475,6 +475,28 @@ its top-2 file exist and the hash matches. `checkpoint.plan` does the same for t
 `SPARKFLASH_UNPINNED_SECOND_SHAPE=1`, so the 4,096-wide shape does not run a screen built for
 5,120. Unit tests are in `scripts/tests/test_second_shape.py`.
 
+**Result (2026-11-24, the seventh window, world 1, no device execution).** Tip `12ae67b` (binary
+`be85d598`), world 1 only, the same checkpoint and the 85 cubins from the sixth window. The host
+arm passed in 6 s and the world-1 reference equals the global one. The device group then refused
+at the bootstrap before setup began:
+
+```
+tp4-chain: forward reduce bootstrap r0: NCCL bootstrap failed before any communicator was
+opened: rank(s) [0] could not load the NCCL library before the bootstrap gather; refusing on
+every rank before any communicator is opened (a peer that entered NCCL init here would wait
+for a rank that never joins); aborting this rank before any layer - a bootstrap failure must
+not reach a layer
+```
+
+The launch environment carried no `SPARKFLASH_NCCL_LIB`, and the test tree's own
+`target/deps/nccl` does not exist; the production install's `target/deps/nccl` does. The plan
+gate could not catch this: it walks the plan and never resolves a library, and the brief for the
+window did not export the variable. The harness now refuses a device run that cannot name its
+NCCL directory before it writes the checkpoint or starts a rank, with tests in
+`scripts/tests/test_second_shape.py`; the next brief exports the production path. No device id
+and no token were produced, the group was never started, and production was restored in the same
+5m13s the group was down (`/readyz` 200, four ranks, the release binary unchanged).
+
 ## 4. The work
 
 ### R. Ranks
