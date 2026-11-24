@@ -4667,19 +4667,24 @@ mod tests {
         let pinned = [
             // DeepSeek's layout resolves the Engram, compressor, indexer, target, scale-grid,
             // draft-noise and vision-token arrays into layout_vars, so its parse carries those
-            // entries.
-            0x4632_a934_d263_eaa1,
+            // entries; the joint declaration adds the per-block expert formats, which is the one
+            // field that moved this digest from 0x4632_a934_d263_eaa1 (measured 2026-11-24, and
+            // the only difference in the {:#?} text).
+            0xcf23_f963_2748_5934,
             // Dory's layout supplies layout_vars (the attention and MLP widths), so its
-            // parse carries those four facts and does not hash at the field's default.
-            0xd4f9_c4d2_70fa_cf05,
-            0x0d35_642d_b843_4b20,
+            // parse carries those four facts and does not hash at the field's default. Its
+            // digest moved with the DeepSeek one, by the same joint expert-format field.
+            0xd96e_8b8c_c35c_0cd0,
+            // GLM, Inkling and the two Qwen releases carry the same joint expert-format field, so
+            // all four digests moved with DeepSeek's on the same measurement.
+            0xf412_f70b_154f_43b3,
             // Inkling's layout learns the tower's rotary-plus-grid position, LayerNorm and
             // erf-GELU wiring, its relative-attention switches, and its [vars] resolve the MTP
             // and convolution shape facts.
-            0xb805_2c12_749f_d1bf,
-            0xe179_2f8b_9972_febb,
-            0x6989_36fa_e0f3_fa07,
-            0x2c46_752a_34ed_5194,
+            0xbd42_c066_93ef_621a,
+            0xaa4c_55d5_0a90_dc5e,
+            0xf1eb_7c37_44b7_d05a,
+            0x9440_176c_7d30_7627,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");
