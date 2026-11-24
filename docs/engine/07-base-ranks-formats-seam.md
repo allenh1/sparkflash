@@ -675,6 +675,49 @@ on the same host passed and equals the global reference. The 2-rank host arm los
 world-1 group that was still stopping; the harness now waits for the port before every group
 (`wait_port_free`). Worlds 2 and 4 of the device arm are the cluster's.
 
+**Result (2026-11-24, worlds 2 and 4 on the four-node group: the groups serve, the ids part at
+host near-ties).** Tip `e660e4bc` (binary `4ecb4f85` on every node), the released stored format,
+the same checkpoint bytes as the world-1 PASS (the shard set hashes alike on node0 and the one-GPU
+host), production stopped 17m18s for the build and the first runs and 2m01s for the dump window,
+restored to the same binary both times. Both worlds open, bind and serve (boot 8.7 s at two ranks,
+6.7 s at four), and both per-world host references equal the global one. The device ids:
+
+```
+world 2: prompt 0 ok; prompt 1 parts at position 4 (18514 -> 7464, host top-2 gap 0.0052);
+         prompt 2 parts at position 6 (31482 -> 9663, gap 0.0154)
+world 4: prompt 0 ok; prompt 1 parts at position 2 (20995 -> 10378, gap 0.0359); prompt 2 ok
+```
+
+Every divergence is to the host's own second choice. `SPARKFLASH_EXCHANGE=nccl` gives the same
+world-2 ids, so the direct-RDMA exchange is not the cause. The argmax gather carries full f32 bits
+on both paths, so the pick is not the cause either. Rank 0's rows dump of the warm-up pass
+(`SPARKFLASH_ROWS_DUMP`, 40 rows) against the one-GPU host's world-1 dump of the same pass:
+
+| boundary | world 2 vs world 1 (rel L2) | world 4 vs world 1 |
+|---|---|---|
+| layer 0 normed input | 0 (bit-identical) | 0 |
+| layer 0 attention after the reduce | 2.9e-3, max one BF16 ulp of the operand | 2.7e-3 |
+| layer 0 MoE after the reduce | 3.0e-3, max one ulp | 2.8e-3 |
+| layer 1 normed input / attention | 9.3e-4 / 3.5e-2 | 8.9e-4 / 3.6e-2 |
+| layer 7 stream | 2.5e-2 | 2.6e-2 |
+
+Layer 0 is the reduce's rounding and nothing else: the largest difference is 3.9e-3 on values
+near 0.5 (one ulp), and the elements past nine ulps are cancelling sums of 1.3% of the RMS. From
+layer 1 the attention turns a 1e-3 input difference into a 3.5e-2 output difference at both
+worlds alike, and the stream ends 2.5% from world 1. So there is no world-specific device fault.
+The split's BF16 reduce is the only difference, the attention amplifies it, and this fixture's
+near-uniform logits (top-2 gaps of 0.005 to 0.04 at a logprob near -8.2) flip on it.
+
+The host arm cannot follow: at world W it splits only the routed experts and reduces them once
+(`parallel_tp.rs`, "only the routed experts are split"), while the served layout splits attention
+by head and the shared expert by intermediate and reduces twice a layer. The two arms also
+differ at world 1, systematically: on prompt 1's prefill the layer-0 attention output is 5.3%
+from the host's (relative L2, with the normed input equal to 4.6e-6), the FFN 2.3%, and the final
+stream 4.2%. So the world-1 PASS shows the ids agree where the margins hold, not that the two
+arms' bits agree, and an exact-id bar between them at W > 1 is a property of the fixture's
+margins, not of the implementation. Worlds 2 and 4 are recorded as **not passed, no fault
+found**; the bar they are held to is the open decision.
+
 **The stored-format sweep at world 1 (2026-11-24).** The eight non-released variants were written
 and run on the device arm at world 1 (`fp8-f32`, `fp8-bf16`, `bf16`, `packed-bf16`, `nvfp4-qwen`,
 `nvfp4-inkling`, `mx-fp8-row`, `nvfp4-qwen@0-3,mx-fp8-row@4-7`). Every one is refused at open, by
