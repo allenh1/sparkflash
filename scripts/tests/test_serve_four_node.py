@@ -72,6 +72,23 @@ class PrintPlanTests(unittest.TestCase):
         self.assertIn("/models/ckpt", result.stdout)
         self.assertIn("/models/tokenizer.json", result.stdout)
 
+    def test_the_rank_group_names_its_world_rank_and_control_port(self) -> None:
+        """Inkling's --rank group: five flags, five values (the world was once dropped, which
+        shifted the rank into --world and left --control-port empty on every rank)."""
+        result = run_script(
+            "print",
+            env=base_env(SPARKFLASH_MODEL="inkling2", SPARKFLASH_CONVERTED_DIR="/conv"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.strip().startswith("ssh -n")]
+        self.assertEqual(len(lines), 4, result.stdout)
+        peers = "10.0.0.1:29601,10.0.0.2:29601,10.0.0.3:29601,10.0.0.4:29601"
+        for rank, line in enumerate(lines):
+            self.assertIn(
+                f"--converted /conv --peer {peers} --world 4 --rank {rank} --control-port 29701",
+                line,
+            )
+
     def test_rank_zero_owns_http_and_workers_stay_on_loopback(self) -> None:
         result = run_script("print")
         lines = [line for line in result.stdout.splitlines() if line.strip().startswith("ssh -n")]

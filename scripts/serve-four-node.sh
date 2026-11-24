@@ -287,7 +287,7 @@ rank_command() {
             peer_ports+="${peer_ports:+,}$peer:$BASE_PORT"
         done
         printf ' --converted %s --peer %s --world %s --rank %s --control-port %s' \
-            "$CONVERTED_DIR" "$peer_ports" "$rank" "$CONTROL_PORT"
+            "$CONVERTED_DIR" "$peer_ports" "$WORLD" "$rank" "$CONTROL_PORT"
     else
         printf ' --tp4-rank %s --tp4-world-size %s --tp4-peers %s' "$rank" "$WORLD" "$PEERS"
         printf ' --tp4-base-port %s --tp4-control-port %s' "$BASE_PORT" "$CONTROL_PORT"
