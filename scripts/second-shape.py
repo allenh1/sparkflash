@@ -370,12 +370,20 @@ def sync_to_nodes(nodes: list[str], paths: list[str]) -> None:
     names = os.environ.get("SPARK_SSH_NAMES", "").split()
     if names and len(names) < len(nodes):
         fail(f"SPARK_SSH_NAMES names {len(names)} node(s); the group needs {len(nodes)}")
+    # A rank that runs on this host already has the paths: the copy would go over ssh to itself,
+    # which the lead Spark does not trust, and it would be the same bytes the harness just wrote.
+    local = {int(rank) for rank in os.environ.get("SPARK_LOCAL_RANKS", "").split() if rank}
     command = [sys.executable, "-I", str(ROOT / "scripts/sync-nodes.py")]
     for index, node in enumerate(nodes):
+        if index in local:
+            continue
         # The destination may be a fast-network address; HostKeyAlias checks the key already
         # trusted for the node's SSH name, so no new host key is written.
         alias = names[index] if names else node.rpartition("@")[2]
         command += ["--host", f"{node},{alias}"]
+    if len(command) == 2:
+        print("second-shape: every rank runs on this host; nothing to copy")
+        return
     for path in paths:
         command += ["--path", path]
     command += ["--ssh-arg=-o", "--ssh-arg=BatchMode=yes"]
