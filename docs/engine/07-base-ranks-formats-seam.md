@@ -199,7 +199,36 @@ Three more windows, each on the same synthetic checkpoint and the same host, nar
   which rank 0 reported a closed control channel. At world 1, one rank on the head node, the
   arm refused cleanly at exit 2 with `deepseek_ptx is not loadable under runtime availability`
   for every part, so at one rank the DeepSeek image is judged unloadable and the reason lies
-  earlier in the open. Neither is a shape refusal any more, and both are being traced.
+  earlier in the open. Neither is a shape refusal any more.
+
+**Cause (2026-11-24, both refusals traced on the source, no window).** They were two separate
+defects, and neither was in the kernels or the formats.
+
+* **The four-rank workers exited in the plan builder.** The chain builds its rank plan
+  (`setup_for_chain` → `load_entries`) before `plan::install`, and `load_entries` read each
+  tensor's format from `crate::plan::installed()`, which was still empty. Every
+  `HeaderEntry.format` was therefore `None` and the `mhc_seam` bind refused
+  `layers.0.attn_norm.weight` by name, on all four ranks. The worker did not exit silently: the
+  error propagated through the resident chain, the worker printed it and returned exit 2, and
+  rank 0, seeing the control socket close, reported only the generic closed-channel line, which
+  is what the window recorded. The header loader now opens the checkpoint's plan itself and
+  resolves formats from it, so the order of install and load cannot change the answer
+  (`tp4_resident.rs`, and a regression test in `tests/checkpoint_formats.rs` that fails with
+  `format: None` on the old code).
+* **The one-rank run judged the DeepSeek image unloadable.** The direct world-1 command passed
+  `--tp4-device cubins-w1` but did not export `SPARKFLASH_CUBINS`, and the pre-boot gate asked
+  `Availability::runtime_env()`, which reads only the environment, so every part reported
+  `deepseek_ptx is not loadable under runtime availability` (`resolver.rs`, raised through
+  `parts.rs`). No cubin was missing: fourteen `_s2w1.cubin` files were built and staged. World 4
+  never showed this because `scripts/serve-four-node.sh` does export `SPARKFLASH_CUBINS`. The gate
+  now takes its cubin directory from the flag the run was started with, and the launcher and the
+  direct command answer alike (`serve/device.rs`, with a test that fails if the gate falls back
+  to the environment).
+
+Both fixes are on `r3/device-arm` and none of them has run on a GPU yet: the next window
+confirms them. A worker's own log is written on the worker's node, so a group-level read of the
+head node sees only rank 0 and hides the cause; the harness now collects every node's log, and a
+window that reads only `rank0.log` is not a window.
 
 ## 4. The work
 
