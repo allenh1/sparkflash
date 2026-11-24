@@ -191,6 +191,9 @@ fn the_plan_reproduces_the_deepseek_baseline_manifest() {
         ("b12x_mxfp8_wo_a_sm121", Part::DenseGemm),
         ("flash_mla_csa2_sm121", Part::MlaAttention),
         ("lm_head_reduce_sm121", Part::LmHead),
+        // The row-scaled MXFP8 expert body the plan chooses for a checkpoint that stores its
+        // routed experts one ue8m0 scale a row every 32 columns (F4).
+        ("opt_mma_fp8_rowscale_f32o", Part::Moe),
     ]
     .into_iter()
     .map(|(symbol, _part)| symbol)
@@ -210,6 +213,7 @@ fn the_plan_reproduces_the_deepseek_baseline_manifest() {
         ("b12x_mxfp8_wo_a_sm121", Part::DenseGemm),
         ("flash_mla_csa2_sm121", Part::MlaAttention),
         ("lm_head_reduce_sm121", Part::LmHead),
+        ("opt_mma_fp8_rowscale_f32o", Part::Moe),
     ] {
         assert!(
             baseline_symbols.contains(symbol) || plan_symbols.contains(symbol),
