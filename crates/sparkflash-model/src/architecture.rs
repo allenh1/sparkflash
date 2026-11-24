@@ -739,10 +739,13 @@ pub enum WeightFormat {
         /// Whether activations are quantized per block at run time.
         dynamic_activations: bool,
     },
-    /// E2M1 codes grouped with per-group E4M3 scales and a global scale.
+    /// E2M1 codes grouped with per-group E4M3 scales and tensor-wide factors.
     NvFp4 {
         /// Elements a scale covers.
         group_size: usize,
+        /// Which tensor-wide convention the release stores: Qwen's two globals or Inkling's
+        /// per-expert amax and outer denominator.
+        wide: crate::format::NvFp4Wide,
     },
     /// E4M3 codes with one power-of-two `ue8m0` scale a block.
     MxFp8 {
@@ -787,6 +790,11 @@ impl WeightFormat {
         if name.contains("nvfp4") {
             return Self::NvFp4 {
                 group_size: block.unwrap_or(16),
+                wide: if name.contains("inkling") {
+                    crate::format::NvFp4Wide::Inkling
+                } else {
+                    crate::format::NvFp4Wide::Qwen
+                },
             };
         }
         if name.contains("mxfp4") {
@@ -810,6 +818,7 @@ impl WeightFormat {
             } else {
                 Self::NvFp4 {
                     group_size: block.unwrap_or(16),
+                    wide: crate::format::NvFp4Wide::Qwen,
                 }
             };
         }
@@ -1506,6 +1515,11 @@ impl Architecture {
             let format = match (compute.as_str(), output.as_str()) {
                 ("nvfp4", _) => WeightFormat::NvFp4 {
                     group_size: block.unwrap_or(16),
+                    wide: if self.inkling.is_some() {
+                        crate::format::NvFp4Wide::Inkling
+                    } else {
+                        crate::format::NvFp4Wide::Qwen
+                    },
                 },
                 ("mxfp8", _) => WeightFormat::MxFp8 {
                     block: block.unwrap_or(32),
@@ -1513,6 +1527,11 @@ impl Architecture {
                 (_, "uint8") if read_key(group, "weight_scale_format").is_some() => {
                     WeightFormat::NvFp4 {
                         group_size: block.unwrap_or(16),
+                        wide: if self.inkling.is_some() {
+                            crate::format::NvFp4Wide::Inkling
+                        } else {
+                            crate::format::NvFp4Wide::Qwen
+                        },
                     }
                 }
                 (_, "float8_e4m3fn")
@@ -2947,7 +2966,9 @@ impl DeclaredFormat {
     fn format(&self, block: Option<usize>, scale: Option<&str>) -> WeightFormat {
         let format = WeightFormat::from_name(Some(&self.name), block, scale);
         match (format, self.group_size) {
-            (WeightFormat::NvFp4 { .. }, Some(group_size)) => WeightFormat::NvFp4 { group_size },
+            (WeightFormat::NvFp4 { wide, .. }, Some(group_size)) => {
+                WeightFormat::NvFp4 { group_size, wide }
+            }
             (format, _) => format,
         }
     }
@@ -4149,7 +4170,10 @@ mod tests {
         assert_eq!(architecture.quantization.expert.as_deref(), Some("NVFP4"));
         assert_eq!(
             architecture.quantization.expert_format,
-            WeightFormat::NvFp4 { group_size: 32 },
+            WeightFormat::NvFp4 {
+                group_size: 32,
+                wide: crate::format::NvFp4Wide::Qwen
+            },
             "the group's own group_size, not weight_block_size or a default 16"
         );
         // A group whose targets are dense projections is not an expert format.
@@ -4621,10 +4645,10 @@ mod tests {
             // Inkling's layout learns the tower's rotary-plus-grid position, LayerNorm and
             // erf-GELU wiring, its relative-attention switches, and its [vars] resolve the MTP
             // and convolution shape facts.
-            0x92f9_7ff4_5a2c_d10b,
+            0xb805_2c12_749f_d1bf,
             0xe179_2f8b_9972_febb,
             0x6989_36fa_e0f3_fa07,
-            0x4810_320b_c6c3_a5a8,
+            0x2c46_752a_34ed_5194,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");
@@ -4816,7 +4840,10 @@ mod tests {
         assert_eq!(qwen.quantization.dense_format, WeightFormat::Bf16);
         assert!(matches!(
             qwen.quantization.expert_format,
-            WeightFormat::NvFp4 { group_size: 16 }
+            WeightFormat::NvFp4 {
+                group_size: 16,
+                wide: crate::format::NvFp4Wide::Qwen
+            }
         ));
         assert!(matches!(
             qwen.quantization.mtp_expert_format,
@@ -4836,7 +4863,10 @@ mod tests {
         ));
         assert!(matches!(
             WeightFormat::from_name(Some("fp4"), None, None),
-            WeightFormat::NvFp4 { group_size: 16 }
+            WeightFormat::NvFp4 {
+                group_size: 16,
+                wide: crate::format::NvFp4Wide::Qwen
+            }
         ));
         assert!(matches!(
             WeightFormat::from_name(Some("mxfp4"), Some(32), None),

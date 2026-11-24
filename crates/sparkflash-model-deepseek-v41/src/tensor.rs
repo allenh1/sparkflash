@@ -150,18 +150,35 @@ impl TensorPlan {
         };
         let scale = match format.scale_values() {
             ScaleValues::Ue8m0 => DType::F8E8M0,
-            ScaleValues::E4M3 => DType::U8,
+            ScaleValues::E4M3 => DType::F8E4M3,
             ScaleValues::Bf16 => DType::BF16,
             ScaleValues::F32 => DType::F32,
         };
         let block = format.block().max(1);
-        let shape = if format.has_scale(ScaleKind::Row) {
+        let shape = if format.has_scale(ScaleKind::Row) || format.has_scale(ScaleKind::Group) {
             vec![out, r#in.div_ceil(block)]
         } else {
             vec![out.div_ceil(block), r#in.div_ceil(block)]
         };
         self.insert(format!("{name}.weight"), values, vec![out, r#in]);
         self.insert(format!("{name}.scale"), scale, shape);
+        // A tensor-wide convention names its own companions. They are per tensor, not per
+        // block: one f32 each, read once beside the matrix they scale.
+        match format.tensor_wide() {
+            sparkflash_model::format::NvFp4Wide::None => {}
+            sparkflash_model::format::NvFp4Wide::Qwen => {
+                self.plain(&format!("{name}.weight_scale_2"), DType::F32, vec![1]);
+                self.plain(&format!("{name}.input_scale"), DType::F32, vec![1]);
+            }
+            sparkflash_model::format::NvFp4Wide::Inkling => {
+                self.plain(&format!("{name}.weight_amax"), DType::F32, vec![1]);
+                self.plain(
+                    &format!("{name}.weight_outer_scale_denominator"),
+                    DType::F32,
+                    vec![1],
+                );
+            }
+        }
     }
 
     fn plain(&mut self, name: &str, dtype: DType, shape: Vec<usize>) {

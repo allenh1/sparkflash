@@ -56,7 +56,7 @@ fn the_released_architecture_names_its_schedule() {
     assert!(
         config.quant.layer_expert_formats[..40]
             .iter()
-            .all(|format| matches!(format, WeightFormat::NvFp4 { group_size: 16 }))
+            .all(|format| matches!(format, WeightFormat::NvFp4 { group_size: 16, .. }))
     );
     assert!(
         config.quant.layer_expert_formats[40..]

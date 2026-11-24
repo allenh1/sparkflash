@@ -491,7 +491,10 @@ mod tests {
             .expect("the fixture round-trips through the shared parser");
         config.architecture.quantization.expert_format = match config.expert_quant {
             crate::config::ExpertQuant::Nvfp4 => {
-                sparkflash_model::architecture::WeightFormat::NvFp4 { group_size: 16 }
+                sparkflash_model::architecture::WeightFormat::NvFp4 {
+                    group_size: 16,
+                    wide: sparkflash_model::format::NvFp4Wide::Qwen,
+                }
             }
             crate::config::ExpertQuant::Fp8Block => {
                 sparkflash_model::architecture::WeightFormat::Fp8Tile {

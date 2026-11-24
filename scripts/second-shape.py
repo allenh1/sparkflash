@@ -65,6 +65,10 @@ STORED_FORMATS = {
     "released": None,
     "fp8-f32": {"quant_method": "fp8", "scale_fmt": "f32", "expert_dtype": "fp8"},
     "fp8-bf16": {"quant_method": "fp8", "scale_fmt": "bf16", "expert_dtype": "fp8"},
+    # The two NVFP4 expert conventions: the dense class stays the fixture's released 32 x 32
+    # power-of-two grid, and only the routed experts change format.
+    "nvfp4-qwen": {"expert_dtype": "nvfp4-qwen"},
+    "nvfp4-inkling": {"expert_dtype": "nvfp4-inkling"},
 }
 # The block an FP8 tile release stores: one inverse scale a 128 x 128 tile.
 TILE_BLOCK = 128
@@ -87,7 +91,8 @@ def variant_config(name: str, out: Path) -> Path:
     if declared is not None:
         quantization = document["quantization_config"]
         quantization.update(declared)
-        quantization["weight_block_size"] = [TILE_BLOCK, TILE_BLOCK]
+        if "quant_method" in declared:
+            quantization["weight_block_size"] = [TILE_BLOCK, TILE_BLOCK]
     path = out / f"config-{name}.json"
     path.write_text(json.dumps(document, indent=2))
     return path

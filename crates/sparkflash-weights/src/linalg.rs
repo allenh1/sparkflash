@@ -81,6 +81,9 @@ pub enum ScaleGrid {
     /// One scale per 32 elements along K, per output row: `scale[r][c / 32]`. This is the released
     /// FP4 expert grid (`[out, ceil(in/32)]`, kernel.py:582).
     PerRow32,
+    /// One E4M3 scale per 16 elements along K, per output row: `scale[r][c / 16]`. This is
+    /// NVFP4's group grid (`[out, ceil(in/16)]`).
+    PerRow16,
     /// One scale per `n x n` tile: `scale[r / n][c / n]`, `n` nonzero. This is the block-scaled
     /// FP8 layout (`quant_method: fp8`, `weight_block_size: [n, n]`) of the GLM-5.3-Flash release
     /// and the Qwen3.8 MTP experts, both at n = 128, whose grid is stored as `weight_scale_inv` in
@@ -95,6 +98,7 @@ impl ScaleGrid {
         match self {
             Self::Block32 => [rows.div_ceil(32), cols.div_ceil(32)],
             Self::PerRow32 => [rows, cols.div_ceil(32)],
+            Self::PerRow16 => [rows, cols.div_ceil(16)],
             Self::Tile(side) => [rows.div_ceil(side), cols.div_ceil(side)],
         }
     }
@@ -112,6 +116,7 @@ impl ScaleGrid {
         match self {
             Self::Block32 => (row / 32) * cols.div_ceil(32) + col / 32,
             Self::PerRow32 => row * cols.div_ceil(32) + col / 32,
+            Self::PerRow16 => row * cols.div_ceil(16) + col / 16,
             Self::Tile(side) => (row / side) * cols.div_ceil(side) + col / side,
         }
     }

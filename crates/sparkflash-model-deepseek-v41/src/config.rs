@@ -75,9 +75,16 @@ impl ModelConfig {
     }
 
     /// The routed experts' stored format, as the checkpoint declares it.
+    ///
+    /// A 4-bit release names its own convention: `nvfp4-qwen` is one E4M3 scale a 16-value
+    /// group with a weight global and an activation global, `nvfp4-inkling` is the same group
+    /// scale with a per-expert amax and outer denominator, and `fp4` is the released row-scaled
+    /// MXFP4.
     #[must_use]
     pub fn expert_format(&self) -> StoredFormat {
-        let block = if self.expert_dtype.contains("fp4") {
+        let block = if self.expert_dtype.contains("nvfp4") {
+            16
+        } else if self.expert_dtype.contains("fp4") {
             32
         } else {
             self.weight_block
@@ -126,6 +133,9 @@ pub fn grid_of(format: StoredFormat) -> Option<ScaleGrid> {
     use sparkflash_model::format::ScaleKind;
     if format.is_unscaled() {
         return None;
+    }
+    if format.has_scale(ScaleKind::Group) {
+        return Some(ScaleGrid::PerRow16);
     }
     if format.has_scale(ScaleKind::Row) {
         return Some(ScaleGrid::PerRow32);
@@ -997,7 +1007,9 @@ mod released {
                 ),
             });
         }
-        let expert_block = if quant.expert_dtype.contains("fp4") {
+        let expert_block = if quant.expert_dtype.contains("nvfp4") {
+            16
+        } else if quant.expert_dtype.contains("fp4") {
             32
         } else {
             block_n
@@ -1010,7 +1022,10 @@ mod released {
         .stored_format();
         let expert_ok = match expert.values() {
             sparkflash_model::format::FormatValues::Fp4E2M1 => {
-                expert.has_scale(sparkflash_model::format::ScaleKind::Row) && expert.block() == 32
+                (expert.has_scale(sparkflash_model::format::ScaleKind::Row) && expert.block() == 32)
+                    || (expert.has_scale(sparkflash_model::format::ScaleKind::Group)
+                        && expert.block() == 16
+                        && expert.has_scale(sparkflash_model::format::ScaleKind::TensorWide))
             }
             sparkflash_model::format::FormatValues::Fp8E4M3 => {
                 expert.has_scale(sparkflash_model::format::ScaleKind::Tile) && expert.block() == 128

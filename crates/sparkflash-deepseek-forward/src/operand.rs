@@ -34,7 +34,9 @@
 //! wrong decode.
 
 use sparkflash_model::Part;
-use sparkflash_model::format::{FormatLayout, FormatValues, ScaleKind, ScaleValues, StoredFormat};
+use sparkflash_model::format::{
+    FormatLayout, FormatValues, NvFp4Wide, ScaleKind, ScaleValues, StoredFormat,
+};
 
 /// The activation form a seam ends in, so the next body reads what the last one wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,7 +71,7 @@ impl ActivationForm {
         if format.has_scale(ScaleKind::PowerOfTwoGrid) && !format.has_scale(ScaleKind::Tile) {
             return Some(Self::Fp8Blocks);
         }
-        if format.has_scale(ScaleKind::Tile) {
+        if format.has_scale(ScaleKind::Tile) || format.has_scale(ScaleKind::Group) {
             return Some(Self::Bf16Rows);
         }
         if format.is_unscaled() {
@@ -91,12 +93,20 @@ impl ActivationForm {
 /// The scale planes a format's tensors carry, sized for one operand geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalePlanes {
-    /// The bytes of the block (grid or tile) scale plane, `0` when the format has none.
+    /// The bytes of the tile or power-of-two block grid, `0` when the format has none.
     pub grid_bytes: u64,
     /// The bytes of the row scale plane, `0` when the format has none.
     pub row_bytes: u64,
-    /// Whether the format multiplies by one tensor-wide factor beside its block scales.
-    pub tensor_wide: bool,
+    /// The bytes of the per-group plane (NVFP4's one E4M3 scale a 16-value group, per row),
+    /// `0` when the format has none.
+    pub group_bytes: u64,
+    /// The tensor-wide convention the bind carries, if any.
+    ///
+    /// Qwen's two factors are the weight global and the static activation global. Inkling's are
+    /// the per-expert amax and the outer denominator: the amax is per expert tensor, not per
+    /// block, so the routed-expert bind carries one f32 an expert and the body reads it by the
+    /// local expert index. [ScalePlanes::total_bytes] counts the two f32 a tensor.
+    pub tensor_wide: NvFp4Wide,
     /// The escape list a packed tensor carries, when its layout has one.
     pub escapes: Option<&'static [u32]>,
 }
@@ -111,7 +121,8 @@ impl ScalePlanes {
             format.block()
         };
         let bytes = format.scale_bytes() as u64;
-        let grid_entries = if format.has_scale(ScaleKind::Row) {
+        let grid_entries = if format.has_scale(ScaleKind::Row) || format.has_scale(ScaleKind::Group)
+        {
             0
         } else {
             rows.div_ceil(block) * cols.div_ceil(block)
@@ -121,10 +132,16 @@ impl ScalePlanes {
         } else {
             0
         };
+        let group_entries = if format.has_scale(ScaleKind::Group) {
+            rows * cols.div_ceil(block)
+        } else {
+            0
+        };
         Self {
             grid_bytes: grid_entries as u64 * bytes,
             row_bytes: row_entries as u64 * bytes,
-            tensor_wide: format.has_scale(ScaleKind::TensorWide),
+            group_bytes: group_entries as u64 * bytes,
+            tensor_wide: format.tensor_wide(),
             escapes: None,
         }
     }
@@ -134,7 +151,8 @@ impl ScalePlanes {
     pub const fn total_bytes(self) -> u64 {
         self.grid_bytes
             .saturating_add(self.row_bytes)
-            .saturating_add(if self.tensor_wide { 4 } else { 0 })
+            .saturating_add(self.group_bytes)
+            .saturating_add(self.tensor_wide.factors() as u64 * 4)
     }
 }
 
@@ -212,6 +230,10 @@ pub struct Operand {
     pub stored: StoredFormat,
     /// The form the seam before this part must leave its output in.
     pub activation: ActivationForm,
+    /// The tensor-wide convention the bind carries. For Inkling this includes the per-expert
+    /// amax, which is one f32 per expert tensor (not per block); the routed-expert body reads it
+    /// indexed by the local expert and applies `amax / outer_denominator` to the output.
+    pub tensor_wide: NvFp4Wide,
     /// The catalogue symbol of the body, when the plan claims one that decodes the format.
     pub body: Option<&'static str>,
 }
@@ -231,8 +253,7 @@ pub fn choose(
 ) -> Option<&'static str> {
     let wanted = ActivationForm::of(stored)?;
     claimed.iter().copied().find(|symbol| {
-        let decoded = formats(symbol);
-        let decodes = decoded.is_none_or(|declared| {
+        let decodes = formats(symbol).is_some_and(|declared| {
             declared.same_arithmetic(stored) || (declared.is_unscaled() && stored.is_unscaled())
         });
         decodes && body_serves(part, wanted)
@@ -293,7 +314,7 @@ mod tests {
         let released = ScalePlanes::of(StoredFormat::MXFP8_TILED_32, 1280, 5120);
         assert_eq!(released.grid_bytes, 40 * 160);
         assert_eq!(released.row_bytes, 0);
-        assert!(!released.tensor_wide);
+        assert_eq!(released.tensor_wide, NvFp4Wide::None);
         // A 128-tile f32 scale: sixteen bytes a tile.
         let f32_tile = ScalePlanes::of(StoredFormat::FP8_E4M3_TILE_128, 4096, 5120);
         assert_eq!(f32_tile.grid_bytes, 32 * 40 * 4);
@@ -304,6 +325,53 @@ mod tests {
         let expert = ScalePlanes::of(StoredFormat::MXFP4_ROW_32, 512, 5120);
         assert_eq!(expert.row_bytes, 512 * 160);
         assert_eq!(expert.grid_bytes, 0);
+        // NVFP4's per-16 E4M3 group plane is one row per output row, and two f32 factors ride
+        // beside it: Qwen's two globals, or Inkling's amax and outer denominator.
+        let qwen = ScalePlanes::of(StoredFormat::NVFP4_QWEN_16, 512, 5120);
+        assert_eq!(qwen.group_bytes, 512 * 320);
+        assert_eq!(qwen.grid_bytes, 0);
+        assert_eq!(qwen.tensor_wide, NvFp4Wide::Qwen);
+        assert_eq!(qwen.total_bytes(), 512 * 320 + 8);
+        let inkling = ScalePlanes::of(StoredFormat::NVFP4_INKLING_16, 512, 5120);
+        assert_eq!(inkling.group_bytes, qwen.group_bytes);
+        assert_eq!(inkling.tensor_wide, NvFp4Wide::Inkling);
+    }
+
+    #[test]
+    fn the_two_nvfp4_conventions_are_not_one_format() {
+        assert!(!StoredFormat::NVFP4_QWEN_16.same_arithmetic(StoredFormat::NVFP4_INKLING_16));
+        assert_eq!(
+            ActivationForm::of(StoredFormat::NVFP4_QWEN_16),
+            Some(ActivationForm::Bf16Rows)
+        );
+        let names = |symbol: &str| match symbol {
+            "qwen_nvfp4" => Some(StoredFormat::NVFP4_QWEN_16),
+            "inkling_nvfp4" => Some(StoredFormat::NVFP4_INKLING_16),
+            _ => None,
+        };
+        assert_eq!(
+            choose(
+                Part::Moe,
+                StoredFormat::NVFP4_INKLING_16,
+                &["qwen_nvfp4", "inkling_nvfp4"],
+                &names
+            ),
+            Some("inkling_nvfp4")
+        );
+        assert_eq!(
+            choose(Part::Moe, StoredFormat::NVFP4_16, &["qwen_nvfp4"], &names),
+            Some("qwen_nvfp4")
+        );
+        assert_eq!(
+            choose(
+                Part::Moe,
+                StoredFormat::NVFP4_16,
+                &["no_recorded_format"],
+                &|_| None
+            ),
+            None,
+            "a symbol with no recorded format is not a wildcard"
+        );
     }
 
     #[test]

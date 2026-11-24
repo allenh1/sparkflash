@@ -433,6 +433,7 @@ impl Description {
                         stored,
                         activation: crate::operand::ActivationForm::of(stored)
                             .unwrap_or(crate::operand::ActivationForm::Bf16Rows),
+                        tensor_wide: stored.tensor_wide(),
                         body: crate::operand::choose(
                             instance.part,
                             stored,

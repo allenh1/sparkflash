@@ -79,14 +79,33 @@ fn synthetic_bytes(spec: &TensorSpec, seed: u64) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(spec.dtype.storage_bytes(elements));
     match spec.dtype {
         DType::F8E4M3 => {
-            for _ in 0..elements {
-                out.push(quant::e4m3_encode(value_at(spec, &mut rng)));
+            for index in 0..elements {
+                // NVFP4's per-16 group scale is a positive E4M3 multiplier; an E4M3 weight code
+                // is the same encoder's signed value.
+                let value = if spec.name.ends_with(".scale") {
+                    scale_at(index, &spec.shape)
+                } else {
+                    value_at(spec, &mut rng)
+                };
+                out.push(quant::e4m3_encode(value));
             }
         }
         DType::F32 => {
             for index in 0..elements {
                 let value = if spec.name.ends_with("weight_scale_inv") {
                     matrix_width(spec.shape.last().copied().unwrap_or(1)) * (0.5 + rng.unit())
+                } else if spec.name.ends_with("weight_scale_2") {
+                    // Qwen's weight global: one positive f32 for the whole tensor.
+                    scale_at(index, &spec.shape)
+                } else if spec.name.ends_with("input_scale") {
+                    // Qwen's static activation global: a second f32 carried beside the weight's.
+                    0.75 + 0.5 * scale_at(index, &spec.shape)
+                } else if spec.name.ends_with("weight_amax") {
+                    // Inkling's per-expert amax: one f32 for this expert's tensor.
+                    1.0 + scale_at(index, &spec.shape)
+                } else if spec.name.ends_with("weight_outer_scale_denominator") {
+                    // Inkling's denominator already carries the 6 * 448 block rescale.
+                    2688.0
                 } else if spec.name.ends_with(".scale") {
                     // A tile or row inverse scale: one positive value a block, varying block to
                     // block so a body that indexes the grid wrongly reads a different number.
@@ -282,6 +301,52 @@ mod tests {
     use super::*;
     use sparkflash_weights::WeightSource;
     use sparkflash_weights::safetensors::SafeTensorsSource;
+
+    #[test]
+    fn a_nvfp4_configuration_writes_the_companions_its_convention_names() {
+        for (declared, weight_global, activation_global, amax, denominator) in [
+            ("nvfp4-qwen", true, true, false, false),
+            ("nvfp4-inkling", false, false, true, true),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "deepseek-nvfp4-{}-{}-{}",
+                declared,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("the clock")
+                    .as_nanos()
+            ));
+            let mut config = ModelConfig::tiny();
+            config.expert_dtype = declared.to_owned();
+            write_synthetic_checkpoint(&dir, &config, 7, 1).expect("the checkpoint writes");
+            let source = SafeTensorsSource::open(&dir, &dir.join("model.safetensors.index.json"))
+                .expect("the index opens");
+            let prefix = "layers.0.ffn.experts.0.w1";
+            assert!(source.contains(&format!("{prefix}.scale")), "{declared}");
+            assert_eq!(
+                source.contains(&format!("{prefix}.weight_scale_2")),
+                weight_global,
+                "{declared}"
+            );
+            assert_eq!(
+                source.contains(&format!("{prefix}.input_scale")),
+                activation_global,
+                "{declared}"
+            );
+            assert_eq!(
+                source.contains(&format!("{prefix}.weight_amax")),
+                amax,
+                "{declared}"
+            );
+            assert_eq!(
+                source.contains(&format!("{prefix}.weight_outer_scale_denominator")),
+                denominator,
+                "{declared}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     #[test]
     fn a_tiny_configuration_writes_a_checkpoint_its_plan_reads() {

@@ -344,7 +344,7 @@ pub fn write_experts(source: &mut TinySource, config: &Inkling2Config, layer: us
     let hidden = config.hidden_size;
     let intermediate = config.moe_intermediate_size;
     match config.layer_format(layer).unwrap_or(WeightFormat::Bf16) {
-        WeightFormat::NvFp4 { group_size } => {
+        WeightFormat::NvFp4 { group_size, .. } => {
             let w13_rows = 2 * intermediate;
             let w13_columns = hidden.div_ceil(2);
             let w2_columns = intermediate.div_ceil(2);

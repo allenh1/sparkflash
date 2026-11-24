@@ -255,7 +255,7 @@ impl MoeScratch {
         local_inter: Option<usize>,
     ) -> Result<ExpertWeights<'a>, EngineError> {
         let dim = cfg.dim;
-        let (inter, grid) = match body {
+        let (inter, grid, wide) = match body {
             ExpertBody::Routed(expert) => {
                 self.base.clear();
                 write!(self.base, "{prefix}.ffn.experts.{expert}")
@@ -267,6 +267,7 @@ impl MoeScratch {
                 (
                     local_inter.unwrap_or(cfg.moe_inter_dim),
                     cfg.expert_grid().unwrap_or(ScaleGrid::PerRow32),
+                    cfg.expert_format().tensor_wide(),
                 )
             }
             ExpertBody::Shared => {
@@ -276,6 +277,7 @@ impl MoeScratch {
                 (
                     cfg.moe_inter_dim * cfg.n_shared_experts.max(1),
                     cfg.dense_grid().unwrap_or(ScaleGrid::Block32),
+                    sparkflash_model::format::NvFp4Wide::None,
                 )
             }
         };
@@ -297,6 +299,7 @@ impl MoeScratch {
                 rows: inter,
                 cols: dim,
                 grid,
+                wide,
             },
             limit,
         )?;
@@ -309,6 +312,7 @@ impl MoeScratch {
                 rows: inter,
                 cols: dim,
                 grid,
+                wide,
             },
             limit,
         )?;
@@ -321,6 +325,7 @@ impl MoeScratch {
                 rows: dim,
                 cols: inter,
                 grid,
+                wide,
             },
             limit,
         )?;
@@ -421,12 +426,17 @@ fn compute_routed_batched(
     let dim = cfg.dim;
     let inter = local_inter.unwrap_or(cfg.moe_inter_dim);
     let count = choices.len();
+    // This batched body's kernel reads the released per-row 32-value grid; NVFP4's per-16 group
+    // and tensor-wide factor take the generic path, which materialises the weight exactly.
+    let grid = cfg.expert_grid().unwrap_or(ScaleGrid::PerRow32);
+    if grid != ScaleGrid::PerRow32 {
+        return Ok(false);
+    }
     let mut weights = Vec::with_capacity(count);
     for &(_, expert, _) in choices {
         let base = format!("{prefix}.ffn.experts.{expert}");
         // The batched body reads the packed F4 expert store on the checkpoint's own grid; any
         // other stored expert format takes the generic path, which materialises the weight.
-        let grid = cfg.expert_grid().unwrap_or(ScaleGrid::PerRow32);
         let w1 = WeightView::read_dense(src, &format!("{base}.w1"), inter, dim, grid, limit)?;
         let w3 = WeightView::read_dense(src, &format!("{base}.w3"), inter, dim, grid, limit)?;
         let w2 = WeightView::read_dense(src, &format!("{base}.w2"), dim, inter, grid, limit)?;
@@ -524,6 +534,8 @@ struct WeightGeometry {
     cols: usize,
     /// The grid of its `.scale` tensor.
     grid: ScaleGrid,
+    /// The tensor-wide convention its companions carry, if any.
+    wide: sparkflash_model::format::NvFp4Wide,
 }
 
 /// One token's routing work: the unbiased scores and the running selection.
@@ -1450,14 +1462,51 @@ fn read_weight<'a>(
     // source is coded, so a routed expert is never materialised as f32 on the release path.
     name.clear();
     write!(name, "{base}.{leaf}").expect("a String cannot fail to be written to");
-    WeightView::read_dense(
+    let mut view = WeightView::read_dense(
         src,
         name,
         geometry.rows,
         geometry.cols,
         geometry.grid,
         limit,
-    )
+    )?;
+    let factor = tensor_wide_factor(src, name, geometry.wide, limit)?;
+    view.scale_all(factor);
+    Ok(view)
+}
+
+/// The one f32 a tensor-wide convention multiplies a matrix by.
+///
+/// Qwen's weight global is `weight_scale_2`; its `input_scale` is the activation's static
+/// global and is carried beside it, not applied to the weight (the W4A16 reference multiplies an
+/// f32 activation). Inkling's is `amax / outer_scale_denominator`; the denominator already
+/// carries the 6 x 448 block rescale. A convention whose companions are absent is refused rather
+/// than decoded with one.
+fn tensor_wide_factor(
+    src: &dyn WeightSource,
+    name: &str,
+    wide: sparkflash_model::format::NvFp4Wide,
+    limit: usize,
+) -> Result<f32, EngineError> {
+    use sparkflash_model::format::NvFp4Wide;
+    match wide {
+        NvFp4Wide::None => Ok(1.0),
+        NvFp4Wide::Qwen => {
+            let weight = linalg::decode_by_name(src, &format!("{name}.weight_scale_2"), limit)?;
+            // The second factor travels; it is the activation's, so the weight does not see it.
+            let _activation = linalg::decode_by_name(src, &format!("{name}.input_scale"), limit)?;
+            Ok(weight.first().copied().unwrap_or(1.0))
+        }
+        NvFp4Wide::Inkling => {
+            let amax = linalg::decode_by_name(src, &format!("{name}.weight_amax"), limit)?;
+            let denominator = linalg::decode_by_name(
+                src,
+                &format!("{name}.weight_outer_scale_denominator"),
+                limit,
+            )?;
+            Ok(amax.first().copied().unwrap_or(0.0) / denominator.first().copied().unwrap_or(1.0))
+        }
+    }
 }
 
 /// A shape refusal naming the operation that could not be applied.

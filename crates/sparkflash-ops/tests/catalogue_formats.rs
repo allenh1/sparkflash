@@ -106,7 +106,10 @@ fn the_arithmetic_of_a_format_is_derived_not_folded() {
         Precision::MxFp4
     );
     assert_eq!(
-        precision_of(WeightFormat::NvFp4 { group_size: 16 }),
+        precision_of(WeightFormat::NvFp4 {
+            group_size: 16,
+            wide: sparkflash_model::format::NvFp4Wide::Qwen
+        }),
         Precision::NvFp4
     );
     assert_eq!(

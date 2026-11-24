@@ -249,7 +249,7 @@ impl Inkling2Weights {
             .layer_format(layer)
             .unwrap_or(WeightFormat::Bf16)
         {
-            WeightFormat::NvFp4 { group_size } => {
+            WeightFormat::NvFp4 { group_size, .. } => {
                 let amax = self.vector(&format!("{prefix}_weight_amax"))?;
                 let outer = self.vector(&format!("{prefix}_weight_outer_scale_denominator"))?;
                 let code_stride = rows * columns.div_ceil(2);

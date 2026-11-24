@@ -510,7 +510,7 @@ fn parse_quant(
     let nvfp4_group = layer_expert_formats
         .iter()
         .find_map(|format| match format {
-            WeightFormat::NvFp4 { group_size } => Some(*group_size),
+            WeightFormat::NvFp4 { group_size, .. } => Some(*group_size),
             _ => None,
         })
         .unwrap_or(16);
@@ -531,6 +531,7 @@ fn parse_quant(
                 match compute.as_str() {
                     "nvfp4" => Some(WeightFormat::NvFp4 {
                         group_size: nvfp4_group,
+                        wide: sparkflash_model::format::NvFp4Wide::Inkling,
                     }),
                     "mxfp8" => Some(WeightFormat::MxFp8 { block: mxfp8_block }),
                     _ => None,
