@@ -470,7 +470,10 @@ mod tests {
         let planes = ScalePlanes::of(StoredFormat::MXFP8_ROW_32, 512, 5120);
         assert_eq!(planes.row_bytes, 512 * 160);
         assert_eq!(planes.grid_bytes, 0);
-        assert!(!planes.tensor_wide);
+        assert_eq!(
+            planes.tensor_wide,
+            sparkflash_model::format::NvFp4Wide::None
+        );
         assert_eq!(planes.total_bytes(), 512 * 160);
         // The same tensor stored as a 32 x 32 grid is a different plane with a different size.
         let grid = ScalePlanes::of(StoredFormat::MXFP8_32, 512, 5120);
@@ -480,8 +483,8 @@ mod tests {
         let bytes: Vec<u8> = (0..(4 * 64) as u32)
             .map(|value| (value % 255) as u8 + 1)
             .collect();
-        let arranged =
-            arrange(StoredFormat::MXFP8_ROW_32, &bytes, 4, 64).expect("a row-major arrangement");
+        let arranged = arrange(StoredFormat::MXFP8_ROW_32, &bytes, 4, 64, &[])
+            .expect("a row-major arrangement");
         assert_eq!(arranged.bytes, bytes);
         assert_eq!(arranged.layout, FormatLayout::RowMajor);
     }
