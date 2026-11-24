@@ -680,8 +680,9 @@ layer's weights, scales and convention companions in it; the reference's `routed
 device's per-block `Operand` read the same statement, while an MTP stage keeps the plain class.
 The fixture is `expert_dtype: "nvfp4-qwen@0-3,mx-fp8-row@4-7"`: eight backbone layers, NVFP4's
 Qwen convention below and row-scaled MXFP8 above, so exactly one variant's expert format changes
-part-way up the stack. The host arm at world 1 agrees exactly (`second-shape: VERDICT PASS`,
-`external check PASS`) with the reference's greedy ids
+part-way up the stack. The host arm agrees at one, two and four ranks (`second-shape: VERDICT PASS`,
+`external check PASS` at every world), and each world's own split reproduces the global reference's
+greedy ids exactly
 
 ```
 [[6653, 28875, 12789, 22350, 23742, 29043, 20477, 3895],
@@ -689,10 +690,10 @@ part-way up the stack. The host arm at world 1 agrees exactly (`second-shape: VE
  [30169, 2663, 30363, 3368, 1942, 30952, 25487, 12199]]
 ```
 
-Worlds 2 and 4 are requested when the harness takes each world's reference at that world's own
-split; the device arm is the lead's window. The device launch already chooses per block: the plan's
-`Operand` carries the block's format and `moe_device` takes the NVFP4 or the row-scaled path from
-it. Open: the device verdict for this stack and the same-split host run at 2 and 4.
+so this stack's answer does not drift with the split. The device arm is the lead's window. The
+device launch already chooses per block: the plan's `Operand` carries the block's format and
+`moe_device` takes the NVFP4 or the row-scaled path from it. Open: the device verdict for this
+stack.
 
 ### S. The seam
 
