@@ -1498,8 +1498,7 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::Moe,
         Image::Deepseek,
         &[
-            deepseek_sym("b12x_mxfp4_moe_stored_sm121", &[Precision::MxFp4])
-                .decoding(StoredFormat::MXFP4_32),
+            deepseek_sym("b12x_mxfp4_moe_stored_sm121", &[Precision::MxFp4]),
             deepseek_sym("opt_moe_gate_up_sm121", &[Precision::MxFp4]),
             deepseek_sym("opt_moe_gate_up_k3_sm121", &[Precision::MxFp4]),
             deepseek_sym("opt_moe_down_combine_sm121", &[Precision::MxFp4]),
@@ -1513,8 +1512,7 @@ pub const CATALOGUE: &[PartKernel] = &[
             deepseek_sym("opt_moe_gate_up_dedup_k3_sm121", &[Precision::MxFp4]),
             // The pre-padded A8 routed combine the forward's single-node path launches: E2M1
             // codes over the 640-K row layout, one rank's selected slots.
-            deepseek_sym("b12x_mxfp4_moe_sm121", &[Precision::MxFp4])
-                .decoding(StoredFormat::MXFP4_32),
+            deepseek_sym("b12x_mxfp4_moe_sm121", &[Precision::MxFp4]),
             // Row-scaled MXFP8 routed experts: the same body the drafter head and the Engram
             // table already read (E4M3 codes, one ue8m0 scale a row every 32 columns, row-major),
             // launched over an expert's [rows, dim] slice. `opt_mma_sm121.cu` reads it at any
@@ -1717,8 +1715,7 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::GroupedMoeGemm,
         Image::Deepseek,
         &[
-            deepseek_sym("b12x_mxfp4_moe_stored_sm121", &[Precision::MxFp4])
-                .decoding(StoredFormat::MXFP4_32),
+            deepseek_sym("b12x_mxfp4_moe_stored_sm121", &[Precision::MxFp4]),
             deepseek_sym("opt_moe_gate_up_sm121", &[Precision::MxFp4]),
             deepseek_sym("opt_moe_down_combine_sm121", &[Precision::MxFp4]),
             deepseek_sym("opt_mma_moe_gate_up", &[Precision::MxFp4]),
