@@ -975,6 +975,23 @@ pub fn n_mtp_layers() -> usize {
     std::sync::atomic::AtomicUsize::load(&N_MTP_VALUE, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The DSpark draft block's depth: the profile's stated depth, or the plan's block.
+///
+/// The block is the plan's own fact (5 on the released model, 2 on the synthetic second shape).
+/// A default that fell back to a released literal would ask a second shape for a depth its plan
+/// never declared, which is the defect this is the one authority for.
+///
+/// # Errors
+/// The stated depth is zero or deeper than the plan's block.
+pub fn draft_depth(stated: Option<usize>) -> Result<usize, String> {
+    let block = dspark_block_size();
+    let depth = stated.unwrap_or(block);
+    if depth == 0 || depth > block {
+        return Err(format!("SPARKFLASH_DSPARK_K={depth}: needs 1..={block}"));
+    }
+    Ok(depth)
+}
+
 /// The DSpark drafter's routed expert count, read at open from the plan.
 #[must_use]
 pub fn dspark_n_routed_experts() -> usize {
@@ -1203,7 +1220,7 @@ pub fn named(name: &str) -> &'static str {
 /// The draft stack's blocks do not carry one stage each (the Markov head is claimed on the
 /// first draft block while its name says stage two), so the lookup is by name, not by block
 /// index. The name is the identifier the checkpoint and the plan share.
-fn mtp_name(stage: usize, tail: &str) -> &'static str {
+fn mtp_name(stage: usize, tail: &str) -> Result<&'static str, String> {
     let description = description();
     let prefix = format!("mtp.{stage}.");
     let suffix = format!(".{tail}");
@@ -1215,13 +1232,15 @@ fn mtp_name(stage: usize, tail: &str) -> &'static str {
             for part in &block.parts {
                 for claim in &part.claims {
                     if claim.name.starts_with(&prefix) && claim.name.ends_with(&suffix) {
-                        return claim.name.as_str();
+                        return Ok(claim.name.as_str());
                     }
                 }
             }
         }
     }
-    panic!("forward open: no MTP stage {stage} claims a tensor ending .{tail}");
+    Err(format!(
+        "forward open: no MTP stage {stage} claims a tensor ending .{tail}"
+    ))
 }
 
 /// The MTP stage prefix a claim under `segment` lives at, e.g. `mtp.1.attn`.
@@ -1254,10 +1273,40 @@ pub fn mtp_prefix(stage: usize, segment: &str) -> &'static str {
     panic!("forward open: MTP stage {stage} claims no tensor under .{segment}.");
 }
 
+/// One MTP stage's tensor, by the tail its checkpoint name carries, or the refusal.
+///
+/// This is the form a caller uses while it can still report: the refusal names the stage and the
+/// tail instead of panicking at open.
+///
+/// # Errors
+/// The stage claims no tensor whose name ends with `.{tail}`.
+pub fn mtp_claim_result(stage: usize, tail: &str) -> Result<&'static str, String> {
+    mtp_name(stage, tail)
+}
+
+/// The DSpark stage the draft block's last-stage tensors are claimed on.
+///
+/// The Markov head, the head norm and the Markov embedding belong to the last DSpark stage the
+/// plan states, exactly as the host reference derives them from `n_stages - 1`. The stage is a
+/// plan fact: the released model has three stages and the synthetic second shape has two, so a
+/// released literal would ask for a stage the checkpoint does not carry.
+///
+/// # Errors
+/// The plan states no DSpark stage.
+pub fn mtp_last_stage() -> Result<usize, String> {
+    n_mtp_layers()
+        .checked_sub(1)
+        .ok_or_else(|| "forward open: the plan states no DSpark stage".to_owned())
+}
+
 /// One MTP stage's tensor, by the tail its checkpoint name carries.
+///
+/// # Panics
+/// The stage claims no such tensor. The open path calls this only after it has validated the
+/// names it will ask for; a caller that can report uses [mtp_claim_result].
 #[must_use]
 pub fn mtp_claim(stage: usize, tail: &str) -> &'static str {
-    mtp_name(stage, tail)
+    mtp_name(stage, tail).unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// Install the released checkpoint's plan for `rank` of `world`.

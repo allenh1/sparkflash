@@ -17747,13 +17747,12 @@ fn run_forward_loop(
         // plan's own fact (5 on the released model, 2 on the synthetic second shape), and a
         // second shape that declares no depth used to inherit the released 5 and be refused by
         // its own plan.
-        let block = draft::draft_block();
-        let k: usize = sparkflash_model::active_profile()
-            .speculation
-            .dspark_k
-            .unwrap_or(block);
-        if k == 0 || k > block || k + 1 > rows::R_MAX {
-            return Err(format!("SPARKFLASH_DSPARK_K={k}: needs 1..={block}"));
+        let k = crate::plan::draft_depth(sparkflash_model::active_profile().speculation.dspark_k)?;
+        if k + 1 > rows::R_MAX {
+            return Err(format!(
+                "SPARKFLASH_DSPARK_K={k}: a pass holds {rows} rows",
+                rows = rows::R_MAX
+            ));
         }
         let staged: Vec<Option<SeamStagedWeights>> = (0..n_layers)
             .map(|layer| seam_wq_b.as_ref().and_then(|seam| seam.staged_for(layer)))
