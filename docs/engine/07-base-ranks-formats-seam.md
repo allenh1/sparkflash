@@ -462,11 +462,12 @@ fewer, for gate/up and then down. The SwiGLU and routing weight are the referenc
 between the two launches. A staged NVFP4 cubin is loaded by name; a missing one is refused at open
 rather than falling back to an MXFP4 body.
 
-`kernels/instances.toml` carries 32 NVFP4 rows: all eight entries at Qwen3.8's released expert
-geometry (hidden 2560, intermediate 640, 512 experts, top-10), and at the synthetic second shape
-(hidden 4096, 512 intermediate, 64 experts, top-4) at intermediate 512 and the per-world 256 (TP2)
-and 128 (TP4). `scripts/build-cubins.sh` takes them without a GPU edit; `scripts/second-shape.py`
-stages the `nvfp4_prefill_sm121_*.cubin` files under their own names for `--device`.
+`kernels/instances.toml` carries 40 NVFP4 rows: all eight entries at Qwen3.8's released expert
+geometry (hidden 2560, intermediate 640, 512 experts, top-10), at Inkling-2-Small's (hidden 4608,
+intermediate 2304, 384 experts, top-8), and at the synthetic second shape (hidden 4096, 512
+intermediate, 64 experts, top-4) at intermediate 512 and the per-world 256 (TP2) and 128 (TP4).
+`scripts/build-cubins.sh` takes them without a GPU edit; `scripts/second-shape.py` stages the
+`nvfp4_prefill_sm121_*.cubin` files under their own names for `--device`.
 
 The verdict is pending the lead's window: no device run, no tok/s and no accuracy gap against the
 arms that serve Qwen3.8 and Inkling today exist for this change, and the scan row for an NVFP4
@@ -482,6 +483,29 @@ python3 scripts/second-shape.py run --released <reference> --out /tmp/f4-nvfp4-d
 ```
 
 then the same with `--stored-format nvfp4-inkling` and `--world 4` if TP2 stops at R3.
+
+The single-operation check on real tensors is prepared as two examples, run after the same cubin
+build:
+
+```
+cargo run -p sparkflash-model-qwen4-exp --example nvfp4_expert_op --release -- \
+  --checkpoint <Qwen3.8-Flash-Next-NVFP4 snapshot> --cubin-dir target/cubins
+cargo run -p sparkflash-model-inkling2 --example nvfp4_expert_op --release -- \
+  --checkpoint <Inkling-2-Small snapshot> --cubin-dir target/cubins
+```
+
+The Qwen check reads one released expert's `gate_proj`/`up_proj`/`down_proj` codes, per-16
+E4M3 scales and `weight_scale_2`, and one real `embed_tokens` row. It compares the serving
+`q4e_expert_gate_up` (its activated rows) against the shared tile's two gate/up launches plus the
+same host `silu(gate) * up`, and the serving `q4e_expert_down` against the tile's down launch on
+the serving arm's activated rows. The Inkling check reads one released expert's `w13_weight` and
+`w2_weight`, their per-16 scales, the expert amax and the outer denominator, and one real
+`model.llm.embed` row; it compares `inkling_nvfp4_expert_matvec` against the tile's rows form on
+both projections, with `amax / denominator` applied at the output by both. Each prints max
+absolute/relative difference, max ULP distance, bit-equal count, and median launch milliseconds
+for the serving arm and the tile over `--repeat` runs. The commands run only in the lead's
+window; nothing in this repository changes the catalogue or the scan row until the device arm has
+run the synthetic variant.
 
 What a later F4 family must do differently: it inherits the two convention names, the `Group`
 plane and the `SPM_W_FP4` mode; it must not re-use one name for both, and it must not fold the
