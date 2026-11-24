@@ -24,6 +24,7 @@ Cargo build probes it with.
     scripts/instances.py --sources             the sources that have instances, one per line
     scripts/instances.py --defines-for-cubin N the defines for one cubin (empty when not listed)
     scripts/instances.py --check               validate; print a summary or fail
+    scripts/instances.py --world-builds W      released-stem<TAB>cubin a second shape loads at W
 
 A define is SPARK_INSTANCE_<ENTRY>_<ARG>=<value>u. Instances that share a cubin are compiled in
 one translation unit, which is what keeps the released multi-symbol cubins whole.
@@ -106,6 +107,20 @@ OPTIONAL = {
     "routed": ("plan_rows",),
     "select": ("score_blocks",),
 }
+# The fields whose per-rank value changes with the world: the routed and row bodies' expert
+# intermediate (and the routed padding) and the head's vocabulary shard and rank count. Every
+# other field is the whole model's - the attention, select, seam and drafter bodies take the
+# global head count and offset by rank at run time - so a cubin whose rows carry none of these
+# is the same build at every world.
+PER_RANK = {
+    "rows": ("intermediate",),
+    "routed": ("intermediate", "padded"),
+    "head": ("vocab_per_rank", "ranks"),
+}
+# A second shape's builds: `<stem>_s2` is the four-rank build, `<stem>_s2w2` and `<stem>_s2w1`
+# the two- and one-rank builds of a cubin whose rows carry a per-rank field.
+SHAPE_SUFFIX = "_s2"
+WORLDS = (1, 2, 4)
 # The catalogue generator understands these dimensions as shape claims. A key may name a subset
 # with catalogue_dims; a key without it keeps the router/routed convention.
 CATALOGUE_DIMS = {"hidden", "head_dim", "intermediate", "experts", "top_k", "ratio", "positions"}
@@ -274,12 +289,99 @@ def groups(rows: list[dict]) -> list[dict]:
     ]
 
 
+def world_suffix(world: int) -> str:
+    return SHAPE_SUFFIX if world == 4 else f"{SHAPE_SUFFIX}w{world}"
+
+
+def per_rank_fields(row: dict) -> list[str]:
+    return [key for key in PER_RANK.get(row["family"], ()) if key in row["shapes"]]
+
+
+def world_builds(rows: list[dict], world: int) -> dict[str, str]:
+    """What a second-shape run at `world` loads under each released cubin name.
+
+    Every cubin with a four-rank second-shape build maps to a build of that shape: its own
+    `<stem>_s2w<world>` when its rows carry a per-rank field, else the `<stem>_s2` build, which is
+    the same at every world. A world-dependent cubin with no build at this world is refused by
+    name, never left to the released cubin, which is compiled for another shape.
+    """
+
+    if world not in WORLDS:
+        raise SystemExit(f"world {world} is not one of {WORLDS}")
+    by_cubin: dict[str, list[dict]] = {}
+    for row in rows:
+        by_cubin.setdefault(row["cubin"], []).append(row)
+    plan: dict[str, str] = {}
+    missing: list[str] = []
+    for cubin, members in by_cubin.items():
+        if not cubin.endswith(SHAPE_SUFFIX):
+            continue
+        stem = cubin[: -len(SHAPE_SUFFIX)]
+        dependent = sorted({key for row in members for key in per_rank_fields(row)})
+        if world == 4 or not dependent:
+            if world != 4 and stem + world_suffix(world) in by_cubin:
+                missing.append(
+                    f"{stem + world_suffix(world)} repeats {cubin}, whose rows carry no per-rank "
+                    "field, so one build serves every world"
+                )
+            plan[stem] = cubin
+            continue
+        built = stem + world_suffix(world)
+        if built not in by_cubin:
+            missing.append(f"{cubin} (per-rank {', '.join(dependent)}) has no {built} rows")
+            continue
+        plan[stem] = built
+    if missing:
+        raise SystemExit(
+            f"{INSTANCES}: the second shape's builds at {world} ranks: " + "; ".join(missing)
+        )
+    return plan
+
+
+def check_world_builds(rows: list[dict]) -> None:
+    """Every world's builds exist, and a world build differs from its four-rank build only in
+    the per-rank fields: same entries, same family, every other value equal."""
+
+    by_cubin: dict[str, dict[str, dict]] = {}
+    for row in rows:
+        by_cubin.setdefault(row["cubin"], {})[row["entry"]] = row
+    for world in WORLDS:
+        for stem, cubin in world_builds(rows, world).items():
+            if cubin == stem + SHAPE_SUFFIX:
+                continue
+            base = by_cubin[stem + SHAPE_SUFFIX]
+            built = by_cubin[cubin]
+            if set(base) != set(built):
+                raise SystemExit(
+                    f"{INSTANCES}: {cubin} states entries {sorted(set(built) ^ set(base))} "
+                    f"that {stem + SHAPE_SUFFIX} does not, or the reverse"
+                )
+            for entry, row in built.items():
+                other = base[entry]
+                allowed = set(per_rank_fields(row))
+                for key in set(row["shapes"]) | set(other["shapes"]):
+                    if key in allowed:
+                        continue
+                    if row["shapes"].get(key) != other["shapes"].get(key):
+                        raise SystemExit(
+                            f"{INSTANCES}: {cubin} {entry}: {key} = {row['shapes'].get(key)} "
+                            f"but the four-rank build states {other['shapes'].get(key)}; only "
+                            f"{sorted(allowed) or 'no field'} may change with the world"
+                        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cubin-plan", action="store_true", help="print compile groups")
     parser.add_argument("--sources", action="store_true", help="print sources with instances")
     parser.add_argument("--defines-for-cubin", metavar="NAME", help="print one cubin's defines")
     parser.add_argument("--check", action="store_true", help="validate and summarise")
+    parser.add_argument(
+        "--world-builds",
+        metavar="WORLD",
+        type=int,
+        help="print released-stem<TAB>cubin for what a second-shape run at WORLD loads",
+    )
     args = parser.parse_args()
 
     rows = load()
@@ -296,12 +398,17 @@ def main() -> int:
             )
         print(" ".join(found[0]["defines"]) if found else "")
         return 0
+    if args.world_builds is not None:
+        for stem, cubin in sorted(world_builds(rows, args.world_builds).items()):
+            print(f"{stem}\t{cubin}")
+        return 0
     if args.cubin_plan:
         for group in groups(rows):
             print(f"{group['cubin']}\t{group['source']}\t{' '.join(group['defines'])}")
         return 0
     if args.check or not any(vars(args)[name] for name in vars(args)):
         compile_groups = groups(rows)
+        check_world_builds(rows)
         print(
             f"{len(rows)} instances in {len({row['source'] for row in rows})} sources, "
             f"{len(compile_groups)} compile groups"

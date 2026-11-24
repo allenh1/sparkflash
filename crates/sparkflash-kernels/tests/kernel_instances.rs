@@ -789,20 +789,45 @@ fn the_routed_device_pair_is_built_for_the_released_shape_and_every_second_shape
 }
 
 #[test]
-fn the_second_shape_worlds_have_their_router_and_mxfp4_bodies() {
-    let rows = instances();
-    for world in [1usize, 2] {
-        let suffix = format!("_s2w{world}");
-        for source in [
-            "moe_router_sm121.cu",
-            "opt_router_sm121.cu",
-            "b12x_mxfp4_moe_sm121.cu",
-            "b12x_mxfp4_moe_stored_sm121.cu",
+fn the_second_shape_loads_a_build_of_its_own_at_every_world() {
+    // scripts/instances.py states which fields change with the world and refuses a world whose
+    // per-rank cubin has no build there, so staging never keeps a released body under a second
+    // shape. The routers and the MXFP4 bodies are named because a world once ran without them.
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = crate_dir.join("../../scripts/instances.py");
+    for world in [1usize, 2, 4] {
+        let output = std::process::Command::new("python3")
+            .arg(&script)
+            .args(["--world-builds", &world.to_string()])
+            .output()
+            .expect("python3 runs scripts/instances.py");
+        assert!(
+            output.status.success(),
+            "scripts/instances.py --world-builds {world}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plan = String::from_utf8(output.stdout).expect("the plan is UTF-8");
+        let suffixes = if world == 4 {
+            vec!["_s2".to_owned()]
+        } else {
+            vec!["_s2".to_owned(), format!("_s2w{world}")]
+        };
+        for stem in [
+            "moe_router_sm121",
+            "opt_router_sm121",
+            "b12x_mxfp4_moe_sm121",
+            "b12x_mxfp4_moe_stored_sm121",
+            "opt_draft_sm121",
+            "layer_seams_sm121",
         ] {
+            let line = plan
+                .lines()
+                .find(|line| line.split('\t').next() == Some(stem))
+                .unwrap_or_else(|| panic!("world {world}: {stem} has no second-shape build"));
+            let cubin = line.split('\t').nth(1).expect("stem<TAB>cubin");
             assert!(
-                rows.iter()
-                    .any(|row| row.source.ends_with(source) && row.cubin.ends_with(&suffix)),
-                "{source} has no {world}-rank second-shape build, so staging would keep the released body"
+                suffixes.iter().any(|suffix| cubin == format!("{stem}{suffix}")),
+                "world {world}: {stem} loads {cubin}"
             );
         }
     }

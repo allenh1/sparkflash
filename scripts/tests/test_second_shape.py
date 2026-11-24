@@ -202,6 +202,49 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(line, "second-shape: world 2 FAIL: first part second part")
 
 
+class StageTest(unittest.TestCase):
+    """Every released name the second shape covers is replaced by a build of that shape."""
+
+    def plan(self, world):
+        import sys as _sys
+
+        _sys.path.insert(0, SCRIPTS)
+        import instances
+
+        return instances.world_builds(instances.load(), world)
+
+    def stage(self, world, built_names):
+        root = Path(tempfile.mkdtemp())
+        released, built, out = root / "released", root / "built", root / "out"
+        released.mkdir()
+        built.mkdir()
+        plan = self.plan(world)
+        for stem in plan:
+            (released / f"{stem}.cubin").write_bytes(b"released")
+        for name in built_names(plan):
+            (built / f"{name}.cubin").write_bytes(name.encode())
+        with contextlib.redirect_stdout(io.StringIO()):
+            second_shape.stage_cubins(released, built, out, world)
+        return plan, out
+
+    def test_every_covered_name_holds_a_shape_build_at_every_world(self):
+        for world in (1, 2, 4):
+            plan, out = self.stage(world, lambda plan: plan.values())
+            for stem, cubin in plan.items():
+                self.assertEqual((out / f"{stem}.cubin").read_bytes(), cubin.encode())
+
+    def test_a_one_rank_run_takes_the_drafter_and_seams_from_the_four_rank_build(self):
+        plan = self.plan(1)
+        self.assertEqual(plan["opt_draft_sm121"], "opt_draft_sm121_s2")
+        self.assertEqual(plan["layer_seams_sm121"], "layer_seams_sm121_s2")
+        self.assertEqual(plan["opt_moe_sm121"], "opt_moe_sm121_s2w1")
+
+    def test_a_listed_build_missing_from_disk_refuses_the_world(self):
+        with self.assertRaises(second_shape.WorldFailure) as caught:
+            self.stage(1, lambda plan: [name for name in plan.values() if "draft" not in name])
+        self.assertIn("opt_draft_sm121_s2", str(caught.exception))
+
+
 class DeviceEnvTest(unittest.TestCase):
     """The device group's environment carries the second shape's own declarations."""
 

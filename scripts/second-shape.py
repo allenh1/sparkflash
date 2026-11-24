@@ -242,33 +242,40 @@ def variant_config(name: str, out: Path) -> Path:
 
 
 def stage_cubins(released: Path, built: Path, out: Path, world: int) -> None:
-    """Every released cubin, then the world's second-shape cubins over their released names.
+    """Every released cubin, then a build of the second shape over each name it covers.
 
-    A shape that divides by the world has one cubin a world: the four-rank build is
-    `<stem>_s2`, the two- and one-rank builds are `<stem>_s2w2` and `<stem>_s2w1`, because
-    the compiled shape is not the same (the expert intermediate and the vocabulary shard scale
-    with the world). The loader keeps the released file names, so each world stages into its own
-    directory and the suffix never reaches it.
+    `scripts/instances.py --world-builds` states what the world loads under each released name:
+    the four-rank build `<stem>_s2`, or `<stem>_s2w<world>` for a cubin whose rows carry a field
+    that changes with the world (the expert intermediate, the vocabulary shard). Every name the
+    shape covers is replaced, and a build that is listed but not on disk refuses the world by
+    name: a released cubin left under a second shape is compiled for another width, and its first
+    launch reads past a row instead of refusing.
     """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import instances  # noqa: PLC0415 - the reader lives beside this script
+
+    try:
+        plan = instances.world_builds(instances.load(), world)
+    except SystemExit as error:
+        raise WorldFailure(str(error)) from None
     out.mkdir(parents=True, exist_ok=True)
     for cubin in released.glob("*.cubin"):
         shutil.copy2(cubin, out / cubin.name)
-    suffix = "_s2.cubin" if world == 4 else f"_s2w{world}.cubin"
-    staged = 0
-    for cubin in built.glob(f"*{suffix}"):
-        target = out / (cubin.name[: -len(suffix)] + ".cubin")
-        shutil.copy2(cubin, target)
-        staged += 1
+    missing = [cubin for cubin in plan.values() if not (built / f"{cubin}.cubin").is_file()]
+    if missing:
+        raise WorldFailure(
+            f"{len(missing)} second-shape builds for {world} ranks are not under {built} "
+            f"({', '.join(sorted(missing)[:6])}{', ...' if len(missing) > 6 else ''}); "
+            "run scripts/build-cubins.sh first"
+        )
+    for stem, cubin in plan.items():
+        shutil.copy2(built / f"{cubin}.cubin", out / f"{stem}.cubin")
+    staged = len(plan)
     # The NVFP4 wrappers are a new body, not a second shape of a released cubin: their instance
     # names are already the names the launch asks for, so they are staged as they are built.
     for cubin in built.glob("nvfp4_prefill_sm121_*.cubin"):
         shutil.copy2(cubin, out / cubin.name)
         staged += 1
-    if staged == 0:
-        raise WorldFailure(
-            f"no second-shape cubins for {world} ranks under {built}; "
-            "run scripts/build-cubins.sh first"
-        )
     print(f"second-shape: staged {staged} second-shape cubins for {world} ranks under {out}")
 
 

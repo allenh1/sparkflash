@@ -94,6 +94,7 @@ fn the_second_shape_opens_from_its_own_plan_at_one_two_and_four_ranks() {
         let mut gate = Refusals::default();
         check_head(&mut gate);
         check_streams(&mut gate, world);
+        check_shape_builds(&mut gate, world);
         check_parts(&mut gate, &plan, world);
         check_routed_dedup(&mut gate, &plan, world);
         check_drafter_block(&mut gate);
@@ -124,6 +125,38 @@ fn check_streams(gate: &mut Refusals, world: usize) {
                  built for {built}"
         )
     });
+}
+
+/// Every second-shape build states the plan's width and stream count. The stager loads one of
+/// these for every released cubin name it covers (`scripts/instances.py --world-builds`), so a row
+/// copied from another shape compiles a body whose strides are that shape's. The vision tower's
+/// `hidden` is its own width; its output width is the model's.
+fn check_shape_builds(gate: &mut Refusals, world: usize) {
+    let hidden = plan::hidden().to_string();
+    let streams = plan::hc_mult().to_string();
+    for row in instance_rows() {
+        let Some(cubin) = row.get("cubin") else {
+            continue;
+        };
+        if !cubin.contains("_s2") {
+            continue;
+        }
+        let width_key = if row.get("family").map(String::as_str) == Some("vision") {
+            "out_hidden"
+        } else {
+            "hidden"
+        };
+        for (key, want) in [(width_key, &hidden), ("hc", &streams)] {
+            if let Some(stated) = row.get(key) {
+                gate.require("shape build geometry", stated == want, || {
+                    format!(
+                        "world {world}: {cubin} {} states {key} = {stated}; the plan states {want}",
+                        row.get("entry").map_or("?", String::as_str)
+                    )
+                });
+            }
+        }
+    }
 }
 
 /// The certified head's buffer and the screen's block count, at the plan's width.
