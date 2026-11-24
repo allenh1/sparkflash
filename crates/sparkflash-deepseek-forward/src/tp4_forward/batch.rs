@@ -652,6 +652,17 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 self.room
             ));
         }
+        // The device embedding reads row `id` of the table unchecked: an id past the vocabulary
+        // would fault the context, so it is refused here by name.
+        if let Some(&id) = prompt
+            .iter()
+            .find(|&&id| id as usize >= crate::plan::vocab())
+        {
+            return Err(format!(
+                "token {id} is outside the {}-token vocabulary",
+                crate::plan::vocab()
+            ));
+        }
         let mut tokens = prompt.to_vec();
         if !images.is_empty() {
             if !self.device.has_vision() || self.exchange.is_none() {
@@ -945,8 +956,11 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let greedy = Sampler::GREEDY;
         for (index, len) in [bulk_min().max(1024), 40].into_iter().enumerate() {
             let len = len.min(self.room);
+            // Folded into the plan's vocabulary: a smaller one (the second shape's) would
+            // otherwise read past its embedding table; the released ids are unchanged.
+            let vocab = crate::plan::vocab() as u32;
             let ids: Vec<u32> = (0..len as u32)
-                .map(|i| 1000 + i.wrapping_mul(7919) % 90_000)
+                .map(|i| (1000 + i.wrapping_mul(7919) % 90_000) % vocab)
                 .collect();
             self.admit_seq(
                 u64::MAX - index as u64,
