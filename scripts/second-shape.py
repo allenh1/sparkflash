@@ -279,9 +279,28 @@ def stage_cubins(released: Path, built: Path, out: Path, world: int) -> None:
     print(f"second-shape: staged {staged} second-shape cubins for {world} ranks under {out}")
 
 
-def wait_ready(url: str, seconds: int = 600) -> None:
+def rank_failure(logs: Path | None) -> str | None:
+    """The first line of a rank log under `logs` that says the rank died, if any: a rank that
+    failed at load never becomes ready, and waiting out the timeout hides nothing."""
+    if logs is None:
+        return None
+    for log in sorted(logs.glob("**/rank*.log")):
+        try:
+            text = log.read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if "device_failure" in line or "panicked at" in line:
+                return f"{log.name}: {line.strip()}"
+    return None
+
+
+def wait_ready(url: str, seconds: int = 600, logs: Path | None = None) -> None:
     deadline = time.time() + seconds
     while time.time() < deadline:
+        failure = rank_failure(logs)
+        if failure is not None:
+            raise WorldFailure(f"a rank of the group at {url} failed: {failure}")
         try:
             with urllib.request.urlopen(url + "/readyz", timeout=3) as answer:
                 if answer.status == 200:
@@ -729,7 +748,7 @@ def run_world(
             started = True
             if result.returncode != 0:
                 raise WorldFailure(f"the {world}-rank device group did not start")
-            wait_ready(url)
+            wait_ready(url, logs=out / f"logs-serve-{world}")
             agreed = run(
                 [
                     sys.executable,

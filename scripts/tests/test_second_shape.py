@@ -202,6 +202,25 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(line, "second-shape: world 2 FAIL: first part second part")
 
 
+
+class ReadyTest(unittest.TestCase):
+    def test_a_failed_rank_ends_the_wait_with_its_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / "logs-serve-1" / "w1"
+            logs.mkdir(parents=True)
+            (logs / "rank0.log").write_text(
+                "lanes: 32 lanes\nsparkflash serve: device_failure the device loop failed\n"
+            )
+            with self.assertRaises(second_shape.WorldFailure) as caught:
+                second_shape.wait_ready("http://127.0.0.1:9", 30, logs=Path(tmp))
+            self.assertIn("rank0.log", str(caught.exception))
+            self.assertIn("device loop failed", str(caught.exception))
+
+    def test_healthy_logs_name_no_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "rank0.log").write_text("lanes: 32 lanes\n")
+            self.assertIsNone(second_shape.rank_failure(Path(tmp)))
+
 class StageTest(unittest.TestCase):
     """Every released name the second shape covers is replaced by a build of that shape."""
 
