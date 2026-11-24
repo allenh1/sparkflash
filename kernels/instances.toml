@@ -8788,3 +8788,92 @@ format = "bf16"
 hidden = 4096
 vocab_per_rank = 16384
 ranks = 2
+
+# Inkling-2-Small's released NVFP4 expert geometry (models/layouts/inkling2.toml).
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_inkling"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4608
+intermediate = 2304
+experts = 384
+top_k = 8
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_inkling"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4608
+intermediate = 2304
+experts = 384
+top_k = 8
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_inkling"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4608
+intermediate = 2304
+experts = 384
+top_k = 8
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_prefill_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_inkling"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4608
+intermediate = 2304
+experts = 384
+top_k = 8
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_inkling"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4608
+intermediate = 2304
+experts = 384
+top_k = 8
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_qwen_down_sm121"
+cubin = "nvfp4_prefill_sm121_inkling"
+family = "rows"
+format = "nvfp4-qwen"
+hidden = 4608
+intermediate = 2304
+experts = 384
+top_k = 8
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_gate_up_sm121"
+cubin = "nvfp4_prefill_sm121_inkling"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4608
+intermediate = 2304
+experts = 384
+top_k = 8
+
+[[instance]]
+source = "nvfp4_prefill_sm121.cu"
+entry = "nvfp4_rows_inkling_down_sm121"
+cubin = "nvfp4_prefill_sm121_inkling"
+family = "rows"
+format = "nvfp4-inkling"
+hidden = 4608
+intermediate = 2304
+experts = 384
+top_k = 8

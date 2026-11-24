@@ -35,7 +35,7 @@
 //!    * the kernel itself is compiled standalone, so it must be a self-contained translation
 //!      unit;
 //!    * every probed kernel is compiled on its own, so a failure names the file, and then
-//!      all forty-nine are compiled together with the trace macros enabled, which is the only
+//!      every probed source with a stem-cubin instance is compiled together with the trace macros enabled, while a stemless source is probed through its instance groups; together that is the only
 //!      check that can catch a collision BETWEEN kernel files.
 //!
 //!    None of that needs a GPU, only a CUDA frontend. When nvcc is absent but clang is present,
@@ -492,7 +492,7 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 }
 "#;
 
-/// The forty-nine device kernel sources the crate probes and pins, with the stem used for their PTX
+/// The fifty device kernel sources the crate probes and pins, with the stem used for their PTX
 /// output.
 ///
 /// Six of them are the Milestone 4 kernels of specification 6.2, the set m4_abi's frozen KERNELS
@@ -522,10 +522,10 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 /// M=1 and multi-row decode path, the bulk-prefill MMA and the D59 vision tower, loaded by name
 /// from their own cubins, one pin each). They are
 /// device sources this crate ships, the clang/nvcc probes compile them like the others, and
-/// baseline/kernel_baseline.txt records their cubins. Every one of the forty-nine is probed on every
+/// baseline/kernel_baseline.txt records their cubins. Every one of the fifty is probed on every
 /// build: a kernel that is only ever compiled by hand on a GPU host is a kernel nobody has
 /// type-checked, and the CI cuda-tests job runs exactly this probe.
-const PROBED_KERNELS: [(&str, &str); 49] = [
+const PROBED_KERNELS: [(&str, &str); 50] = [
     ("mega_mhc_sm121.cu", "mega_mhc_sm121"),
     ("b12x_mxfp8_dense_sm121.cu", "b12x_mxfp8_dense_sm121"),
     ("b12x_mxfp8_dense_m1_sm121.cu", "b12x_mxfp8_dense_m1_sm121"),
@@ -595,6 +595,12 @@ const PROBED_KERNELS: [(&str, &str); 49] = [
     ("inkling_moe_sm121.cu", "inkling_moe_sm121"),
     ("inkling_vision_sm121.cu", "inkling_vision_sm121"),
     ("inkling_draft_sm121.cu", "inkling_draft_sm121"),
+    // NVFP4 routed-expert wrappers over the shared prefill tile. The source has no stem-cubin
+    // instance: its cubins are the released expert geometries and the synthetic per-world
+    // shapes (`nvfp4_prefill_sm121_qwen`, `_inkling`, `_i512`, `_i256`, `_i128`), and the
+    // wrappers take their geometry as launch words. The combined translation unit therefore
+    // skips it; each of its instance groups is still probed on its own below.
+    ("nvfp4_prefill_sm121.cu", "nvfp4_prefill_sm121"),
 ];
 
 /// The shared header every one of those kernels includes for its model constants, the MX codecs
@@ -674,16 +680,30 @@ const MODEL_IMAGES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The combined probe: all forty-nine kernel sources in one translation unit with the trace macros
+/// The combined probe: every probed source with a stem-cubin instance in one translation unit with the trace macros
 /// ENABLED. This is the only check in the build that can catch a collision BETWEEN kernels (two
 /// files defining the same macro to different values, or two identical non-inline symbols), and it
 /// is also the only one that compiles the enabled branch of every trace scope.
-fn combined_probe_source() -> String {
+fn combined_probe_source(groups: &[(String, String, Vec<String>)]) -> String {
     let mut source = String::from("#define SPARKFLASH_ENABLE_GPU_TRACE 1\n");
     source.push_str("#include \"");
     source.push_str(M4_COMMON_HEADER);
     source.push_str("\"\n");
-    for (file, _) in PROBED_KERNELS {
+    for (file, stem) in PROBED_KERNELS {
+        // A source whose cubins are all shape variants has no stem-cubin instance, so
+        // released_defines has no shape macros for it and including it here would not compile.
+        // It is still probed on its own through each of its instance groups below.
+        let has_stem = groups
+            .iter()
+            .any(|(source, cubin, _)| source.ends_with(file) && cubin == stem);
+        if !has_stem {
+            source.push_str("/* skipped: ");
+            source.push_str(file);
+            source.push_str(
+                " has no stem-cubin instance; its instance groups are probed separately */\n",
+            );
+            continue;
+        }
         source.push_str("#include \"");
         source.push_str(file);
         source.push_str("\"\n");
@@ -811,7 +831,7 @@ fn main() {
     );
 
     // The probed kernel set. Every kernel is probed individually so that a failure names the file,
-    // and then all forty-nine are probed together with the trace macros enabled.
+    // and then every source with a stem-cubin instance is probed together with the trace macros enabled; a stemless source is probed through its instance groups.
     if !kernels.join(M4_COMMON_HEADER).is_file() {
         println!(
             "cargo:warning=sparkflash-kernels: {} is missing; skipping every probed-kernel probe",
@@ -864,8 +884,14 @@ fn main() {
     report(
         &nvcc,
         &arch,
-        "the combined probe (all forty-nine kernels, trace macros enabled)",
-        check_m4_probe(&nvcc, &arch, kernels, &released_defines(&instance_groups)),
+        "the combined probe (every stem-cubin source, trace macros enabled)",
+        check_m4_probe(
+            &nvcc,
+            &arch,
+            kernels,
+            &instance_groups,
+            &released_defines(&instance_groups),
+        ),
     );
 }
 
@@ -893,10 +919,11 @@ fn check_m4_probe(
     nvcc: &Path,
     arch: &str,
     kernels: &Path,
+    groups: &[(String, String, Vec<String>)],
     defines: &[String],
 ) -> Result<(), ProbeFailure> {
     let probe = out_dir()?.join("m4_kernels_probe.cu");
-    std::fs::write(&probe, combined_probe_source())
+    std::fs::write(&probe, combined_probe_source(groups))
         .map_err(|e| ProbeFailure::new(e.to_string()))?;
     compile_file(nvcc, arch, &probe, &[kernels], "m4_kernels_probe", defines)
 }
@@ -1104,7 +1131,7 @@ fn report_clang_probe(clang: &Path, arch: &str, groups: &[(String, String, Vec<S
                 println!(
                     "cargo:warning=sparkflash-kernels: nvcc not found; clang's CUDA frontend parsed \
                  kernels/rocenante_oneshot_sm121.cu, the RoCEnante ABI probe (trace macros \
-                 enabled, signature redeclared, slot static_asserts), {checked} of the forty-nine \
+                 enabled, signature redeclared, slot static_asserts), {checked} of the fifty \
                  probed kernels (the six Milestone 4 ABI kernels, the M7 SwiGLU quantiser \
                  epilogue and its weighted routed variant, the task-37 device router, the \
                  task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified head's \
@@ -1137,7 +1164,7 @@ fn report_clang_probe(clang: &Path, arch: &str, groups: &[(String, String, Vec<S
     }
 }
 
-/// Parses the forty-nine probed kernels and the combined probe with clang. Returns how many kernels were
+/// Parses the fifty probed kernels and the combined probe with clang. Returns how many kernels were
 /// found and how many were missing, so the warning can say which evidence was gathered.
 fn check_probed_kernels_syntax(
     clang: &Path,
@@ -1155,7 +1182,7 @@ fn check_probed_kernels_syntax(
         let path = kernels.join(file);
         if instanced.contains(file) {
             // Probe every group for this source, including a second-shape instance in its own
-            // cubin. The source is one of the forty-nine; the groups are its shapes.
+            // cubin. The source is one of the fifty; the groups are its shapes.
             let mut found = false;
             for (source, _, defines) in groups {
                 if source.strip_prefix("kernels/").unwrap_or(source) == file {
@@ -1179,7 +1206,7 @@ fn check_probed_kernels_syntax(
     }
     if checked > 0 {
         let probe = out_dir()?.join("m4_kernels_probe.cu");
-        std::fs::write(&probe, combined_probe_source())
+        std::fs::write(&probe, combined_probe_source(groups))
             .map_err(|e| ProbeFailure::new(e.to_string()))?;
         clang_syntax_check(clang, arch, &probe, &released_defines(groups))?;
     }
