@@ -735,3 +735,116 @@ fn the_woa_family_and_the_b12x_routed_sources_have_released_and_second_shapes() 
         );
     }
 }
+
+#[test]
+fn the_routed_device_pair_is_built_for_the_released_shape_and_every_second_shape_world() {
+    let rows = instances();
+    let pair: Vec<&Instance> = rows
+        .iter()
+        .filter(|row| row.source.ends_with("moe_routed_device_sm121.cu"))
+        .collect();
+    // One compile group holds the stage and the combine; every geometry must state both entries,
+    // because the forward resolves them from one cubin and the stage/combine kernels read the same
+    // hidden width and top-k.
+    for (cubin, world, hidden, intermediate, padded, experts, top_k) in [
+        (
+            "moe_routed_device_sm121",
+            4u64,
+            5120u64,
+            576u64,
+            640u64,
+            384u64,
+            6u64,
+        ),
+        ("moe_routed_device_sm121_s2", 4, 4096, 128, 128, 64, 4),
+        ("moe_routed_device_sm121_s2w1", 1, 4096, 512, 512, 64, 4),
+        ("moe_routed_device_sm121_s2w2", 2, 4096, 256, 256, 64, 4),
+    ] {
+        let entries: Vec<&&Instance> = pair.iter().filter(|row| row.cubin == cubin).collect();
+        assert_eq!(
+            entries.len(),
+            2,
+            "{cubin} holds the stage and combine entries"
+        );
+        for row in entries {
+            assert_eq!(row.family, "routed", "{cubin}");
+            assert_eq!(row.shapes["hidden"], hidden, "{cubin}");
+            assert_eq!(
+                row.shapes["intermediate"], intermediate,
+                "{cubin}: the row states the per-rank width, so a world is a build"
+            );
+            assert_eq!(row.shapes["padded"], padded, "{cubin}");
+            assert_eq!(row.shapes["experts"], experts, "{cubin}");
+            assert_eq!(row.shapes["top_k"], top_k, "{cubin}");
+            assert!(
+                row.catalogue.is_none(),
+                "{cubin} is loaded by symbol, not decoded by a catalogue rule"
+            );
+        }
+        // The global intermediate the geometry carries is the per-rank width times the rank count
+        // its cubin suffix states.
+        let global = if hidden == 5120 { 2304 } else { 512 };
+        assert_eq!(intermediate * world, global, "{cubin}");
+    }
+}
+
+#[test]
+fn the_second_shape_worlds_have_their_router_and_mxfp4_bodies() {
+    let rows = instances();
+    for world in [1usize, 2] {
+        let suffix = format!("_s2w{world}");
+        for source in [
+            "moe_router_sm121.cu",
+            "opt_router_sm121.cu",
+            "b12x_mxfp4_moe_sm121.cu",
+            "b12x_mxfp4_moe_stored_sm121.cu",
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|row| row.source.ends_with(source) && row.cubin.ends_with(&suffix)),
+                "{source} has no {world}-rank second-shape build, so staging would keep the released body"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_cubin_plan_resolves_the_routed_device_at_4096_and_512() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = crate_dir.join("../../scripts/instances.py");
+    for (cubin, intermediate) in [
+        ("moe_routed_device_sm121_s2", 128),
+        ("moe_routed_device_sm121_s2w1", 512),
+        ("moe_routed_device_sm121_s2w2", 256),
+    ] {
+        let output = std::process::Command::new("python3")
+            .arg(&script)
+            .args(["--defines-for-cubin", cubin])
+            .output()
+            .expect("python3 runs scripts/instances.py");
+        assert!(
+            output.status.success(),
+            "scripts/instances.py --defines-for-cubin {cubin}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let defines = String::from_utf8(output.stdout).expect("the plan is UTF-8");
+        for needle in [
+            "-DSPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_HIDDEN=4096u",
+            "-DSPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_EXPERTS=64u",
+            "-DSPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_TOP_K=4u",
+            "-DSPARK_INSTANCE_MOE_ROUTED_COMBINE_SM121_HIDDEN=4096u",
+            "-DSPARK_INSTANCE_MOE_ROUTED_COMBINE_SM121_TOP_K=4u",
+        ] {
+            assert!(
+                defines.contains(needle),
+                "{cubin} is missing {needle}: {defines}"
+            );
+        }
+        let per_rank =
+            format!("-DSPARK_INSTANCE_MOE_EXPERT_STAGE_SM121_INTERMEDIATE={intermediate}u");
+        assert!(
+            defines.contains(&per_rank),
+            "{cubin} is missing {per_rank}: {defines}"
+        );
+    }
+}

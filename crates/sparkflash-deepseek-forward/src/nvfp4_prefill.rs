@@ -174,6 +174,25 @@ const CANDIDATES: [&str; 4] = [
     "nvfp4_prefill_sm121_i128",
 ];
 
+fn staged(dir: &Path) -> Result<Option<(&'static str, Vec<u8>)>, String> {
+    for name in CANDIDATES {
+        let path = sparkflash_device::cubins::cubin_path(dir, name);
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        if let Some(pin) = sparkflash_kernels::baseline::pin(name)? {
+            sparkflash_device::cubins::verify_bytes(&bytes, &pin)?;
+        } else if std::env::var_os("SPARKFLASH_UNPINNED_SECOND_SHAPE").is_none() {
+            // An unpinned NVFP4 cubin is a second-shape or development build. A released run
+            // leaves it unloaded and the format branch refuses by name if the checkpoint needs it.
+            continue;
+        }
+        return Ok(Some((name, bytes)));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,23 +223,4 @@ mod tests {
             ]
         );
     }
-}
-
-fn staged(dir: &Path) -> Result<Option<(&'static str, Vec<u8>)>, String> {
-    for name in CANDIDATES {
-        let path = sparkflash_device::cubins::cubin_path(dir, name);
-        if !path.is_file() {
-            continue;
-        }
-        let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        if let Some(pin) = sparkflash_kernels::baseline::pin(name)? {
-            sparkflash_device::cubins::verify_bytes(&bytes, &pin)?;
-        } else if std::env::var_os("SPARKFLASH_UNPINNED_SECOND_SHAPE").is_none() {
-            // An unpinned NVFP4 cubin is a second-shape or development build. A released run
-            // leaves it unloaded and the format branch refuses by name if the checkpoint needs it.
-            continue;
-        }
-        return Ok(Some((name, bytes)));
-    }
-    Ok(None)
 }

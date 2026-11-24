@@ -430,7 +430,13 @@ impl MoeShare {
             ids: alloc(tokens * top_k * 4, true)?.0,
             weights: alloc(tokens * top_k * 4, true)?.0,
         };
-        let [sorted, items, items_count, codes, scales, slot] = MoeBulk::buffer_bytes(tokens);
+        let [sorted, items, items_count, codes, scales, slot] = MoeBulk::buffer_bytes(
+            device.routed_geometry.experts,
+            device.routed_geometry.top_k,
+            device.routed_geometry.local_inter,
+            device.routed_geometry.dim,
+            tokens,
+        );
         Ok(Self {
             stride,
             ways,
@@ -650,7 +656,13 @@ impl BulkState {
                 plan_threads: sparkflash_model::active_profile().plan.block_threads(),
             },
             None => {
-                let [sorted, items, items_count, codes, scales, slot] = MoeBulk::buffer_bytes(cap);
+                let [sorted, items, items_count, codes, scales, slot] = MoeBulk::buffer_bytes(
+                    device.routed_geometry.experts,
+                    device.routed_geometry.top_k,
+                    device.routed_geometry.local_inter,
+                    device.routed_geometry.dim,
+                    cap,
+                );
                 MoeBulk {
                     plan: moe_kernels[0],
                     gate_up: moe_kernels[1],

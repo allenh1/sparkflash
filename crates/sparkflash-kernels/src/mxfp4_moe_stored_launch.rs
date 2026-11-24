@@ -91,13 +91,26 @@ pub const TOKENS_INDEX: usize = 6;
 /// # Errors
 /// A zero token count is refused rather than launched as a zero-sized grid.
 pub fn grid(tokens: u32) -> Result<(u32, u32, u32), String> {
-    if tokens == 0 {
+    grid_at(tokens, mxfp4_moe_stored_abi::HIDDEN)
+}
+
+/// The grid for tokens routed rows at one instance's hidden width: `(tokens, ceil(dim / TILE_D), 1)`.
+///
+/// The released grid is [grid]; a second-shape build states a narrower hidden row, and its kernel
+/// guards the output column against its own compiled width, so a released grid would launch blocks
+/// that read past the weight rows before the guard discards them.
+///
+/// # Errors
+/// A zero token count or hidden width is refused rather than launched as a zero-sized grid.
+pub fn grid_at(tokens: u32, dim: u32) -> Result<(u32, u32, u32), String> {
+    if tokens == 0 || dim == 0 {
         return Err(
-            "the stored combine runs on at least one token, so the grid is not zero-sized"
+            "the stored combine runs on at least one token and one hidden column, so the grid is \
+             not zero-sized"
                 .to_owned(),
         );
     }
-    Ok((tokens, GRID_Y, 1))
+    Ok((tokens, dim.div_ceil(TILE_D), 1))
 }
 
 /// Loads the kernel from a cubin, resolving the pinned symbol.
@@ -114,6 +127,20 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
 /// Refuses a zero token count, and returns the driver's error otherwise.
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &Mxfp4MoeStoredParams) -> Result<(), String> {
     let grid = grid(params.tokens())?;
+    cuda.launch(kernel, grid, BLOCK, params.as_slice())
+}
+
+/// Launches the stored combine once at one instance's hidden width.
+///
+/// # Errors
+/// As [launch].
+pub fn launch_at(
+    cuda: &Cuda,
+    kernel: Kernel,
+    params: &Mxfp4MoeStoredParams,
+    dim: u32,
+) -> Result<(), String> {
+    let grid = grid_at(params.tokens(), dim)?;
     cuda.launch(kernel, grid, BLOCK, params.as_slice())
 }
 

@@ -55,13 +55,40 @@ pub fn routed_rows(tokens: u32) -> u32 {
 /// # Errors
 /// `tokens == 0` is refused rather than launched as a zero-sized grid.
 pub fn grid(tokens: u32) -> Result<(u32, u32, u32), String> {
-    if tokens == 0 {
+    grid_at(
+        tokens,
+        routed_gate_up_abi::TOP_K,
+        routed_gate_up_abi::WIDTH_PADDED,
+    )
+}
+
+/// The grid for `tokens` at one instance's top-k and padded width.
+///
+/// The released grid is [grid]; a second-shape build states different values, and its kernel
+/// guards the routed row and the column against its own compiled width, so a released grid would
+/// only add blocks that return. This computes the grid the instance was compiled for.
+///
+/// # Errors
+/// Zero tokens, top-k or padded width is refused rather than launched as a zero-sized grid.
+pub fn grid_at(tokens: u32, top_k: u32, padded: u32) -> Result<(u32, u32, u32), String> {
+    if tokens == 0 || top_k == 0 || padded == 0 {
         return Err(
-            "the gate/up projection runs at least one token, so the grid is not zero-sized"
+            "the gate/up projection runs at least one token and one column, so the grid is not \
+             zero-sized"
                 .to_owned(),
         );
     }
-    Ok((routed_rows(tokens), routed_gate_up_abi::TILES, 1))
+    Ok((
+        routed_rows_at(tokens, top_k),
+        padded.div_ceil(routed_gate_up_abi::TILE),
+        1,
+    ))
+}
+
+/// The routed rows `tokens` tokens produce at `top_k`.
+#[must_use]
+pub fn routed_rows_at(tokens: u32, top_k: u32) -> u32 {
+    tokens * top_k
 }
 
 /// One launch's arguments, in the kernel declaration's order.
@@ -125,6 +152,21 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
 /// Refuses `tokens == 0`, and returns the driver's error for everything else.
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &GateUpLaunchParams) -> Result<(), String> {
     let grid = grid(params.tokens)?;
+    cuda.launch(kernel, grid, BLOCK, &params.words())
+}
+
+/// Launches the projection once at one instance's top-k and padded width.
+///
+/// # Errors
+/// As [launch].
+pub fn launch_at(
+    cuda: &Cuda,
+    kernel: Kernel,
+    params: &GateUpLaunchParams,
+    top_k: u32,
+    padded: u32,
+) -> Result<(), String> {
+    let grid = grid_at(params.tokens, top_k, padded)?;
     cuda.launch(kernel, grid, BLOCK, &params.words())
 }
 
