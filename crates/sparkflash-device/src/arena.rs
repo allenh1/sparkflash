@@ -1558,6 +1558,18 @@ mod tests {
         );
     }
 
+    /// The format a test shard's dtype word stands for: the released tiled-MXFP8 for E4M3 codes,
+    /// bf16 and f32 for the unscaled words, and none for a scale plane (its weight sizes it).
+    fn format_of(dtype: &str) -> Option<sparkflash_model::format::StoredFormat> {
+        use sparkflash_model::format::StoredFormat;
+        match dtype {
+            "F8_E4M3" => Some(StoredFormat::MXFP8_TILED_32),
+            "BF16" => Some(StoredFormat::BF16),
+            "F32" => Some(StoredFormat::F32),
+            _ => None,
+        }
+    }
+
     #[test]
     fn the_b12x_layout_policy_tiles_only_dense_fp8_weights() {
         let planned =
@@ -1567,6 +1579,7 @@ mod tests {
                 placement: Placement::Resident,
                 rule: Some(crate::shard::ShardRule::Column),
                 dtype: dtype.to_string(),
+                format: format_of(dtype),
                 stored_shape: shape.to_vec(),
                 stored_bytes: 0,
                 shard_bytes: 0,
@@ -1580,7 +1593,7 @@ mod tests {
                 ResidentGroup::AttentionColumn,
                 &[64, 32]
             )),
-            Some((64, 32))
+            Some((64, 32, 32))
         );
         assert_eq!(
             b12x_layout(&planned(
@@ -1589,7 +1602,7 @@ mod tests {
                 ResidentGroup::SharedColumn,
                 &[32, 64]
             )),
-            Some((32, 64))
+            Some((32, 64, 32))
         );
         assert_eq!(
             b12x_layout(&planned(

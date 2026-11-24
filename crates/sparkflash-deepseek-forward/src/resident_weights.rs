@@ -38,9 +38,9 @@ use sparkflash_device::arena::{
 };
 use sparkflash_device::resident::{ResidentGroup, ResidentPlan};
 use sparkflash_engine::weights::WeightSource;
-use sparkflash_model::format::StoredFormat;
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
+use sparkflash_model::format::StoredFormat;
 /// Host seams are row-major BF16 weights with no scale grid and no device kernel; they are
 /// computed on the host (CompressorCache / IndexerWeights) and must never enter the device bind.
 fn is_host_seam_weight(name: &str) -> bool {
@@ -469,10 +469,7 @@ pub fn mhc_seam_layer_bytes(config: &ModelConfig) -> Result<u64, String> {
 fn mhc_seam_bound_shards<'a>(
     plan: &'a ResidentPlan,
     config: &ModelConfig,
-) -> Vec<(
-    &'a sparkflash_device::resident::ResidentShard,
-    StoredFormat,
-)> {
+) -> Vec<(&'a sparkflash_device::resident::ResidentShard, StoredFormat)> {
     let by_name: BTreeMap<&str, &sparkflash_device::resident::ResidentShard> = plan
         .shards()
         .iter()
@@ -527,8 +524,7 @@ pub fn bind_rank_mhc_seam(
                 shard.name,
                 shard
                     .format
-                    .map_or_else(|| "no stated format".to_owned(), |format| format
-                        .describe()),
+                    .map_or_else(|| "no stated format".to_owned(), |format| format.describe()),
                 format.describe()
             ));
         }
@@ -586,6 +582,19 @@ mod rank_plan_shape_tests {
     use sparkflash_device::resident::{HeaderEntry, Placement, ResidentPlan};
     use sparkflash_engine::tensor::TensorPlan;
 
+    /// The format a test fixture's dtype word stands for: the released tiled MXFP8 for E4M3
+    /// codes, the row-scaled MXFP4 for packed experts, bf16 and f32 for the unscaled words, and
+    /// none for a scale plane (its weight's format sizes it).
+    fn test_format(dtype: &str) -> Option<sparkflash_model::format::StoredFormat> {
+        use sparkflash_model::format::StoredFormat;
+        match dtype {
+            "F8_E4M3" => Some(StoredFormat::MXFP8_TILED_32),
+            "I8" => Some(StoredFormat::MXFP4_ROW_32),
+            "BF16" => Some(StoredFormat::BF16),
+            "F32" => Some(StoredFormat::F32),
+            _ => None,
+        }
+    }
     fn released_plan() -> ResidentPlan {
         let config = crate::plan::released_values().expect("config");
         let plan = TensorPlan::language_model(&config);
@@ -602,7 +611,8 @@ mod rank_plan_shape_tests {
                 } else {
                     (spec.dtype.name().to_string(), spec.shape.clone())
                 };
-                HeaderEntry::new(spec.name.clone(), dtype, shape)
+                HeaderEntry::new(spec.name.clone(), dtype.clone(), shape)
+                    .with_format(test_format(&dtype))
             })
             .collect();
         ResidentPlan::plan(0, 4, entries).expect("world=4 rank 0 plan")
@@ -705,7 +715,9 @@ mod rank_plan_shape_tests {
             "no MTP-lane tensor may enter the backbone bind"
         );
         assert!(
-            selected.iter().all(|(shard, format)| shard.format == Some(*format)),
+            selected
+                .iter()
+                .all(|(shard, format)| shard.format == Some(*format)),
             "every selected shard carries the class's planned format"
         );
     }
@@ -1609,6 +1621,21 @@ pub fn bind_rank_tail(
 mod bind_coverage_tests {
     use super::*;
     use sparkflash_device::resident::{HeaderEntry, Placement, ResidentPlan};
+
+    /// The format a test fixture's dtype word stands for: the released tiled MXFP8 for E4M3
+    /// codes, the row-scaled MXFP4 for packed experts, bf16 and f32 for the unscaled words, and
+    /// none for a scale plane (its weight's format sizes it).
+    fn test_format(dtype: &str) -> Option<sparkflash_model::format::StoredFormat> {
+        use sparkflash_model::format::StoredFormat;
+        match dtype {
+            "F8_E4M3" => Some(StoredFormat::MXFP8_TILED_32),
+            "I8" => Some(StoredFormat::MXFP4_ROW_32),
+            "BF16" => Some(StoredFormat::BF16),
+            "F32" => Some(StoredFormat::F32),
+            _ => None,
+        }
+    }
+
     use sparkflash_engine::tensor::TensorPlan;
 
     fn names(items: &[&str]) -> BTreeSet<String> {
@@ -1631,7 +1658,8 @@ mod bind_coverage_tests {
                 } else {
                     (spec.dtype.name().to_string(), spec.shape.clone())
                 };
-                HeaderEntry::new(spec.name.clone(), dtype, shape)
+                HeaderEntry::new(spec.name.clone(), dtype.clone(), shape)
+                    .with_format(test_format(&dtype))
             })
             .collect();
         ResidentPlan::plan(0, 4, entries).expect("world=4 rank 0 plan")
@@ -1829,7 +1857,7 @@ mod bind_coverage_tests {
             let shard = by_name.get(name).expect("plan shard");
             assert_eq!(
                 sparkflash_device::arena::b12x_layout(shard),
-                Some((cols, inner)),
+                Some((cols, inner, 32)),
                 "{name}: the bind byte rule must tile it"
             );
             assert_eq!(
@@ -1978,6 +2006,21 @@ mod bind_coverage_tests {
 mod mhc_seam_class_tests {
     use super::*;
     use sparkflash_device::resident::{HeaderEntry, Placement, ResidentPlan};
+
+    /// The format a test fixture's dtype word stands for: the released tiled MXFP8 for E4M3
+    /// codes, the row-scaled MXFP4 for packed experts, bf16 and f32 for the unscaled words, and
+    /// none for a scale plane (its weight's format sizes it).
+    fn test_format(dtype: &str) -> Option<sparkflash_model::format::StoredFormat> {
+        use sparkflash_model::format::StoredFormat;
+        match dtype {
+            "F8_E4M3" => Some(StoredFormat::MXFP8_TILED_32),
+            "I8" => Some(StoredFormat::MXFP4_ROW_32),
+            "BF16" => Some(StoredFormat::BF16),
+            "F32" => Some(StoredFormat::F32),
+            _ => None,
+        }
+    }
+
     use sparkflash_engine::tensor::TensorPlan;
 
     fn released_config() -> ModelConfig {
@@ -1999,7 +2042,8 @@ mod mhc_seam_class_tests {
                 } else {
                     (spec.dtype.name().to_string(), spec.shape.clone())
                 };
-                HeaderEntry::new(spec.name.clone(), dtype, shape)
+                HeaderEntry::new(spec.name.clone(), dtype.clone(), shape)
+                    .with_format(test_format(&dtype))
             })
             .collect();
         ResidentPlan::plan(0, 4, entries).expect("world=4 rank 0 plan")
@@ -2031,7 +2075,13 @@ mod mhc_seam_class_tests {
                 .find(|(suffix, _dtype)| name.ends_with(suffix))
                 .map(|(_suffix, dtype)| *dtype)
                 .expect("a known suffix");
-            assert_eq!(dtype, planned_dtype, "{name} dtype");
+            let word = match planned_dtype.values() {
+                sparkflash_model::format::FormatValues::Bf16 => "BF16",
+                sparkflash_model::format::FormatValues::F32 => "F32",
+                sparkflash_model::format::FormatValues::Fp8E4M3 => "F8_E4M3",
+                sparkflash_model::format::FormatValues::Fp4E2M1 => "F4_E2M1",
+            };
+            assert_eq!(dtype, word, "{name} dtype");
             total += bytes;
         }
         let per_layer = mhc_seam_layer_bytes(&config).expect("bytes");

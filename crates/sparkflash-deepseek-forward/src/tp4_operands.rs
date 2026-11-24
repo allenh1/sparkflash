@@ -301,12 +301,8 @@ fn load_entries(
             .map_err(|error| format!("{name}: {error}"))?;
         let format = tensor_format(name, tensor.dtype.as_str(), config);
         entries.push(
-            HeaderEntry::new(
-                name.to_string(),
-                tensor.dtype.clone(),
-                tensor.shape.clone(),
-            )
-            .with_format(format),
+            HeaderEntry::new(name.to_string(), tensor.dtype.clone(), tensor.shape.clone())
+                .with_format(format),
         );
     }
     let seen = entries.len();
@@ -326,9 +322,15 @@ fn tensor_format(
     dtype: &str,
     config: &crate::plan::ModelConfig,
 ) -> Option<sparkflash_model::format::StoredFormat> {
-    let projection = [".wq_a.weight", ".wkv.weight", ".wq_b.weight", ".wo_a.weight", ".wo_b.weight"]
-        .iter()
-        .any(|leaf| name.ends_with(leaf));
+    let projection = [
+        ".wq_a.weight",
+        ".wkv.weight",
+        ".wq_b.weight",
+        ".wo_a.weight",
+        ".wo_b.weight",
+    ]
+    .iter()
+    .any(|leaf| name.ends_with(leaf));
     if projection && dtype == "F8_E4M3" {
         Some(config.dense_format())
     } else {

@@ -86,9 +86,12 @@ impl ModelConfig {
     }
 
     fn declared_format(&self, method: &str, block: usize, scale: &str) -> StoredFormat {
-        let format =
-            sparkflash_model::architecture::WeightFormat::from_name(Some(method), Some(block), Some(scale))
-                .stored_format();
+        let format = sparkflash_model::architecture::WeightFormat::from_name(
+            Some(method),
+            Some(block),
+            Some(scale),
+        )
+        .stored_format();
         if format.values() == sparkflash_model::format::FormatValues::Fp8E4M3
             && format.has_scale(sparkflash_model::format::ScaleKind::PowerOfTwoGrid)
         {
@@ -132,7 +135,6 @@ pub fn grid_of(format: StoredFormat) -> Option<ScaleGrid> {
         side => Some(ScaleGrid::Tile(side)),
     }
 }
-
 
 /// The runtime configuration carried in this crate.
 pub const V41_FLASH_RUNTIME_CONFIG: &str =
@@ -987,7 +989,11 @@ mod released {
                 detail: format!(
                     "the dense format is E4M3 on a {} x {} block with {} scales, the document says \
                      quant_method {:?}, scale_fmt {:?}",
-                    block_n, block_m, dense.scale_values().name(), quant.quant_method, quant.scale_fmt
+                    block_n,
+                    block_m,
+                    dense.scale_values().name(),
+                    quant.quant_method,
+                    quant.scale_fmt
                 ),
             });
         }

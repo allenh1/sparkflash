@@ -165,8 +165,17 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
         engram_head_dim: opt_int(facts, "engram_head_dim").unwrap_or(0),
         dtype: text(facts, "dtype")?,
         expert_dtype: text(facts, "expert_dtype")?,
-        weight_block: opt_int(facts, "weight_block").unwrap_or(32),
-        weight_scale: text(facts, "weight_scale").unwrap_or_else(|_| "ue8m0".to_owned()),
+        // The block and the scale values are the plan's own statement of its linear format, not
+        // facts the released manifest records: read them from the resolved format.
+        weight_block: plan
+            .stored_format(sparkflash_model::Part::DenseMlp, None)
+            .map_or(32, |format| format.block()),
+        weight_scale: plan
+            .stored_format(sparkflash_model::Part::DenseMlp, None)
+            .map_or_else(
+                || "ue8m0".to_owned(),
+                |format| format.scale_values().name().to_owned(),
+            ),
         compress_rope_theta: float(facts, "compress_rope_theta")?,
         compress_ratios,
         image_token_id: u32::try_from(opt_int(facts, "image_token_id").unwrap_or(0))
@@ -1087,9 +1096,9 @@ pub fn description() -> &'static Description {
 /// No description is installed. The open path installs before any stage reads a part.
 #[must_use]
 pub fn operand(block: Option<usize>, part: Part) -> &'static crate::operand::Operand {
-    description()
-        .operand(block, part)
-        .unwrap_or_else(|| panic!("forward open: the plan states no format for {part:?} at {block:?}"))
+    description().operand(block, part).unwrap_or_else(|| {
+        panic!("forward open: the plan states no format for {part:?} at {block:?}")
+    })
 }
 
 /// The layer `block` claims a tensor whose name ends with `tail`.

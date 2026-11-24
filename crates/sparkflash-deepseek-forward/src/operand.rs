@@ -105,7 +105,11 @@ impl ScalePlanes {
     /// The planes one `rows` x `cols` tensor of `format` carries.
     #[must_use]
     pub const fn of(format: StoredFormat, rows: usize, cols: usize) -> Self {
-        let block = if format.block() == 0 { 1 } else { format.block() };
+        let block = if format.block() == 0 {
+            1
+        } else {
+            format.block()
+        };
         let bytes = format.scale_bytes() as u64;
         let grid_entries = if format.has_scale(ScaleKind::Row) {
             0
@@ -229,8 +233,7 @@ pub fn choose(
     claimed.iter().copied().find(|symbol| {
         let decoded = formats(symbol);
         let decodes = decoded.is_none_or(|declared| {
-            declared.same_arithmetic(stored)
-                || (declared.is_unscaled() && stored.is_unscaled())
+            declared.same_arithmetic(stored) || (declared.is_unscaled() && stored.is_unscaled())
         });
         decodes && body_serves(part, wanted)
     })
@@ -278,7 +281,10 @@ mod tests {
             ActivationForm::of(StoredFormat::FP8_E4M3_TILE_128_BF16),
             Some(ActivationForm::Bf16Rows)
         );
-        assert_eq!(ActivationForm::of(StoredFormat::BF16), Some(ActivationForm::Bf16Rows));
+        assert_eq!(
+            ActivationForm::of(StoredFormat::BF16),
+            Some(ActivationForm::Bf16Rows)
+        );
     }
 
     #[test]
@@ -311,12 +317,14 @@ mod tests {
     #[test]
     fn arranging_a_tiled_format_permutes_and_pads_but_loses_nothing() {
         // No zero in the store, so the padding the tiling adds is the only zero in the result.
-        let bytes: Vec<u8> = (0..(33 * 32) as u32)
-            .map(|v| (v % 255) as u8 + 1)
-            .collect();
+        let bytes: Vec<u8> = (0..(33 * 32) as u32).map(|v| (v % 255) as u8 + 1).collect();
         let arranged =
             arrange(StoredFormat::MXFP8_TILED_32, &bytes, 33, 32).expect("the tile arrangement");
-        assert_eq!(arranged.bytes.len(), 64 * 32, "rows pad to whole 32-row tiles");
+        assert_eq!(
+            arranged.bytes.len(),
+            64 * 32,
+            "rows pad to whole 32-row tiles"
+        );
         let mut sorted: Vec<u8> = arranged.bytes.iter().copied().filter(|b| *b != 0).collect();
         sorted.sort_unstable();
         let mut original = bytes.clone();
@@ -353,7 +361,10 @@ mod tests {
     #[test]
     fn only_the_tiled_32_block_format_is_a_b12x_operand() {
         assert!(is_b12x(Some(StoredFormat::MXFP8_TILED_32)));
-        assert!(!is_b12x(Some(StoredFormat::MXFP8_32)), "row-major is not tiled");
+        assert!(
+            !is_b12x(Some(StoredFormat::MXFP8_32)),
+            "row-major is not tiled"
+        );
         assert!(!is_b12x(Some(StoredFormat::FP8_E4M3_TILE_128)));
         assert!(!is_b12x(None));
     }

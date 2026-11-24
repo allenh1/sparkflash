@@ -7406,7 +7406,11 @@ fn gather_shared_expert_source(
     };
     let mut read_shard = |leaf: &str, suffix: &str, want: usize| -> Result<Vec<u8>, String> {
         let name = format!("{prefix}.{leaf}.{suffix}");
-        let want_dtype = if suffix == "scale" { want_scale } else { want_values };
+        let want_dtype = if suffix == "scale" {
+            want_scale
+        } else {
+            want_values
+        };
         match planned_dtype(request.resident_plan, &name) {
             Some(dtype) if dtype == want_dtype => {}
             Some(other) => {
@@ -7806,7 +7810,9 @@ fn build_shared_expert_device(
         let shared_format = crate::plan::description().values().dense_format();
         let (s1, s3, s2) =
             crate::moe_device::read_shared_scale_grids(source, base, inter, dim, shared_format)
-            .map_err(|error| format!("shared expert (device): layer {layer} scales: {error}"))?;
+                .map_err(|error| {
+                    format!("shared expert (device): layer {layer} scales: {error}")
+                })?;
         let mut stage = |leaf: &str,
                          cols: usize,
                          inner: usize|

@@ -241,13 +241,9 @@ impl StoredFormat {
     pub const FP8_E4M3_TILE_128: Self =
         Self::new(FormatValues::Fp8E4M3, 128, TILE, FormatLayout::RowMajor);
     /// The same arithmetic with the tile scale stored bf16 (GLM's and Qwen's releases).
-    pub const FP8_E4M3_TILE_128_BF16: Self = Self::new(
-        FormatValues::Fp8E4M3,
-        128,
-        TILE,
-        FormatLayout::RowMajor,
-    )
-    .with_scale_values(ScaleValues::Bf16);
+    pub const FP8_E4M3_TILE_128_BF16: Self =
+        Self::new(FormatValues::Fp8E4M3, 128, TILE, FormatLayout::RowMajor)
+            .with_scale_values(ScaleValues::Bf16);
     /// MXFP8: E4M3 codes with one power-of-two scale a 32-value block, row-major.
     pub const MXFP8_32: Self = Self::new(FormatValues::Fp8E4M3, 32, GRID, FormatLayout::RowMajor);
     /// MXFP8 in the 32 x 32 tiling DeepSeek's dense and attention bodies read.
@@ -573,8 +569,7 @@ mod tests {
             StoredFormat::FP8_E4M3_TILE_128_BF16
         );
         assert!(
-            !StoredFormat::FP8_E4M3_TILE_128
-                .same_arithmetic(StoredFormat::FP8_E4M3_TILE_128_BF16),
+            !StoredFormat::FP8_E4M3_TILE_128.same_arithmetic(StoredFormat::FP8_E4M3_TILE_128_BF16),
             "an f32 tile scale and a bf16 one are different bytes a body reads"
         );
         assert_eq!(

@@ -1224,6 +1224,7 @@ mod tests {
             OperandLayout::B12x {
                 cols: 1280,
                 inner: 5120,
+                block: 32,
                 weight_bytes: 1280 * 5120,
                 scale_bytes: 40 * 160,
             },
@@ -1237,6 +1238,7 @@ mod tests {
             OperandLayout::B12x {
                 cols: 512,
                 inner: 5120,
+                block: 32,
                 weight_bytes: 512 * 5120,
                 scale_bytes: 16 * 160,
             }
@@ -1249,6 +1251,7 @@ mod tests {
             OperandLayout::B12x {
                 cols: 5120,
                 inner: 2048,
+                block: 32,
                 weight_bytes: 5120 * 2048,
                 scale_bytes: 160 * 64,
             },

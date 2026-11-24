@@ -32,7 +32,6 @@ use sparkflash_engine::forward::moe::{
 use sparkflash_engine::linalg::EngineError;
 use sparkflash_engine::quant::quantize_activation_fp8;
 use sparkflash_engine::weights::WeightSource;
-use sparkflash_model::format::StoredFormat;
 use sparkflash_kernels::cert_lm_head_launch::{self, CertLmHeadParams};
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, KernelId, Module};
 use sparkflash_kernels::lm_head_reduce_launch::{
@@ -50,6 +49,7 @@ use sparkflash_kernels::routed_gate_up_launch::{self, GateUpLaunchParams};
 use sparkflash_kernels::routed_gate_up_ref as gate_up_ref;
 use sparkflash_kernels::router_launch::{self, RouterLaunchParams};
 use sparkflash_kernels::{router_ref, swiglu_ref};
+use sparkflash_model::format::StoredFormat;
 
 fn router_symbol() -> &'static str {
     crate::plan::handles().moe_router
@@ -101,10 +101,7 @@ const QUANT_BLOCK: usize = 32;
 /// The shared expert's two E8M0 scale grids, as (w1/w3, w2): one block scale per 32x32 tile.
 fn shared_scale_shapes(inter: usize, dim: usize, format: StoredFormat) -> ([usize; 2], [usize; 2]) {
     let block = format.block().max(1);
-    (
-        [inter / block, dim / block],
-        [dim / block, inter / block],
-    )
+    ([inter / block, dim / block], [dim / block, inter / block])
 }
 
 type SharedScaleGrids = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -123,7 +120,12 @@ pub fn read_shared_scale_grids(
     let (up_scale_shape, down_scale_shape) = shared_scale_shapes(inter, dim, format);
     let s1 = read_scale_spec(source, &format!("{base}.w1.scale"), format, &up_scale_shape)?;
     let s3 = read_scale_spec(source, &format!("{base}.w3.scale"), format, &up_scale_shape)?;
-    let s2 = read_scale_spec(source, &format!("{base}.w2.scale"), format, &down_scale_shape)?;
+    let s2 = read_scale_spec(
+        source,
+        &format!("{base}.w2.scale"),
+        format,
+        &down_scale_shape,
+    )?;
     Ok((s1, s3, s2))
 }
 
@@ -2364,7 +2366,11 @@ mod tests {
     #[test]
     fn the_shared_scale_reads_pin_the_32x32_grid_shapes() {
         let (inter, dim) = (2304usize, 5120usize);
-        assert_eq!(shared_scale_shapes(inter, dim), ([72, 160], [160, 72]));
+        let format = StoredFormat::MXFP8_32;
+        assert_eq!(
+            shared_scale_shapes(inter, dim, format),
+            ([72, 160], [160, 72])
+        );
         let mut source = GridSource::default();
         for (name, shape) in [
             ("layers.0.ffn.shared_experts.w1.scale", [72usize, 160]),
@@ -2384,7 +2390,7 @@ mod tests {
                 .insert(name.to_string(), vec![0u8; shape[0] * shape[1]]);
         }
         let (s1, s3, s2) =
-            read_shared_scale_grids(&source, "layers.0.ffn.shared_experts", inter, dim)
+            read_shared_scale_grids(&source, "layers.0.ffn.shared_experts", inter, dim, format)
                 .expect("literal grids");
         assert_eq!(
             (s1.len(), s3.len(), s2.len()),
@@ -2400,8 +2406,9 @@ mod tests {
                 shape: vec![160, 72],
             },
         );
-        let error = read_shared_scale_grids(&source, "layers.0.ffn.shared_experts", inter, dim)
-            .expect_err("a swapped w1/w2 grid must be refused");
+        let error =
+            read_shared_scale_grids(&source, "layers.0.ffn.shared_experts", inter, dim, format)
+                .expect_err("a swapped w1/w2 grid must be refused");
         assert!(error.to_string().contains("declared"), "{error}");
     }
 

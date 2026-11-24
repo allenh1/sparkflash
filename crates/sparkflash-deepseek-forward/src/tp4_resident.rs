@@ -1435,12 +1435,8 @@ fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize)
                 let format = crate::plan::installed()
                     .and_then(|description| tensor_format(description.plan(), &tensor.dtype));
                 entries.push(
-                    HeaderEntry::new(
-                        name.to_string(),
-                        tensor.dtype.clone(),
-                        tensor.shape.clone(),
-                    )
-                    .with_format(format),
+                    HeaderEntry::new(name.to_string(), tensor.dtype.clone(), tensor.shape.clone())
+                        .with_format(format),
                 );
             }
             let seen = entries.len();
