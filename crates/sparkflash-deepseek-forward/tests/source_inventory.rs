@@ -75,14 +75,17 @@ const BUDGET: &[(&str, Counts)] = &[
     (
         "src/moe_device.rs",
         Counts {
-            // The expert bind carries both NVFP4 factors and the packed escape plane, so the
-            // module names the conventions and reads the group geometry from the opened plan.
-            model_config: 7,
-            config_reads: 19,
+            // The expert bind carries both NVFP4 factors, the packed escape plane and the row
+            // scale plane, so the module names the conventions, reads the group geometry from the
+            // opened plan, and loads the row-scaled expert body by symbol.
+            model_config: 8,
+            config_reads: 20,
             model_constants: 0,
             shape_literals: 0,
             tensor_names: 3,
-            kernel_symbols: 0,
+            // opt_mma_fp8_rowscale_f32o for gate/up and for down, and the activation quantiser that
+            // feeds them: the row-scaled expert path's three launch symbols.
+            kernel_symbols: 3,
         },
     ),
     (
