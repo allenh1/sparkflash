@@ -1760,6 +1760,11 @@ extern "C" __global__ void opt_rows_inv_rope(
 #define OR_LM_THREADS 512u
 #define OR_LM_WARPS (OR_LM_THREADS / 32u)
 #define OR_LM_CHUNK 1024u
+// A warp reads a weight row 32 uint4 (256 bf16 values) a step, so the steps a row takes are its
+// width over 256 - 20 for the released 5,120 and 16 for the second shape's 4,096. A literal step
+// count reads past the row on any narrower shape, and past the tensor on its last row.
+#define OR_LM_STEPS (OR_LM_HIDDEN / 256u)
+static_assert(OR_LM_HIDDEN % 256u == 0u, "the head's row width is a whole number of warp steps");
 
 
 // The mixed-precision FMA takes the bf16 operands as they are: their product is exact in f32, so
@@ -1833,16 +1838,16 @@ extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_rows_lm_head(
         const uint32_t entry = base + r;
         if (entry >= vocab) break;
         const uint4 *row = reinterpret_cast<const uint4 *>(w + (uint64_t)entry * OR_LM_HIDDEN);
-        uint4 wv[20];
+        uint4 wv[OR_LM_STEPS];
 #pragma unroll
-        for (uint32_t i = 0; i < 20u; ++i) wv[i] = or_ldw(row + lane + 32u * i);
+        for (uint32_t i = 0; i < OR_LM_STEPS; ++i) wv[i] = or_ldw(row + lane + 32u * i);
 #pragma unroll
         for (uint32_t y = 0; y < OR_LM_ROWS; ++y) {
             if (y < live) {
                 const uint4 *h = s_h + y * per;
                 float acc = 0.0f;
 #pragma unroll
-                for (uint32_t i = 0; i < 20u; ++i) acc = or_dot8(wv[i], h[lane + 32u * i], acc);
+                for (uint32_t i = 0; i < OR_LM_STEPS; ++i) acc = or_dot8(wv[i], h[lane + 32u * i], acc);
 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
                 if (logits_out != nullptr && lane == 0u) logits_out[(uint64_t)(row0 + y) * vocab + entry] = acc;
@@ -2400,16 +2405,16 @@ extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_head_screen_exac
         if (mask == 0u) continue;
         scored += want ? 1u : 0u;
         const uint4 *row = reinterpret_cast<const uint4 *>(w + (uint64_t)entry * OR_LM_HIDDEN);
-        uint4 wv[20];
+        uint4 wv[OR_LM_STEPS];
 #pragma unroll
-        for (uint32_t i = 0; i < 20u; ++i) wv[i] = or_ldw(row + lane + 32u * i);
+        for (uint32_t i = 0; i < OR_LM_STEPS; ++i) wv[i] = or_ldw(row + lane + 32u * i);
 #pragma unroll
         for (uint32_t y = 0; y < OR_LM_ROWS; ++y) {
             if ((mask >> y) & 1u) {
                 const uint4 *h = s_h + y * per;
                 float acc = 0.0f;
 #pragma unroll
-                for (uint32_t i = 0; i < 20u; ++i) acc = or_dot8(wv[i], h[lane + 32u * i], acc);
+                for (uint32_t i = 0; i < OR_LM_STEPS; ++i) acc = or_dot8(wv[i], h[lane + 32u * i], acc);
 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
                 if (lane == y) {
