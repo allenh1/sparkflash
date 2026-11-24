@@ -709,8 +709,9 @@ pub struct ServeOptions {
     /// current directory (`reference/tokenizer.json` under either), so a binary copied to a node
     /// does not depend on the build host's checkout path. `--tokenizer` always overrides.
     pub tokenizer: Option<PathBuf>,
-    /// The ceiling on tokens generated for one request. A request asking for more is clamped to it.
-    pub max_tokens: usize,
+    /// The operator's ceiling on tokens generated for one request (`--max-tokens`). None leaves
+    /// the served model's own ceiling: another release's protocol bound is not this model's.
+    pub max_tokens: Option<usize>,
     /// The cap on requested logprobs, vLLM's `--max-logprobs`: 20 by default, `-1` for no cap.
     ///
     /// `usize::MAX` is how "no cap" is carried: the router compares each request against it.
@@ -804,6 +805,13 @@ pub struct ServeOptions {
 }
 
 impl ServeOptions {
+    /// The output ceiling for a model whose own ceiling is `model`: the operator's
+    /// `--max-tokens` when named, never above the model's.
+    #[must_use]
+    pub fn output_ceiling(&self, model: usize) -> usize {
+        self.max_tokens.map_or(model, |named| named.min(model))
+    }
+
     /// Parses the arguments that follow the `serve` subcommand.
     ///
     /// # Errors
@@ -1404,9 +1412,9 @@ struct ServeArgs {
     /// output.
     #[arg(long, value_name = "FILE")]
     tokenizer: Option<PathBuf>,
-    /// The ceiling on tokens generated for one request.
-    #[arg(long, value_name = "N", default_value_t = MODEL_MAX_OUTPUT_TOKENS)]
-    max_tokens: usize,
+    /// The ceiling on tokens generated for one request (default: the served model's own).
+    #[arg(long, value_name = "N")]
+    max_tokens: Option<usize>,
     /// The cap on requested logprobs, vLLM's `--max-logprobs`.
     ///
     /// A request asking for more, or for the whole vocabulary with `logprobs=-1`, is refused with
@@ -5453,7 +5461,11 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
         tokenizer: recipe.tokenizer.clone(),
         open: open_tp4_rank,
     };
-    let driver = match Tp4Driver::start(spec, rank_config, options.max_tokens) {
+    let driver = match Tp4Driver::start(
+        spec,
+        rank_config,
+        options.max_tokens.unwrap_or(MODEL_MAX_OUTPUT_TOKENS),
+    ) {
         Ok(driver) => driver,
         Err(message) => {
             eprintln!("sparkflash serve: {message}");
@@ -5744,7 +5756,11 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
     );
     crate::bootlog::info(role, "serve.rs:5033", "Loading model from scratch...");
     let load_started = std::time::Instant::now();
-    let driver = match ReferenceDriver::start(&recipe, options.element_limit, options.max_tokens) {
+    let driver = match ReferenceDriver::start(
+        &recipe,
+        options.element_limit,
+        options.max_tokens.unwrap_or(MODEL_MAX_OUTPUT_TOKENS),
+    ) {
         Ok(driver) => driver,
         Err(message) => {
             eprintln!("sparkflash serve: {message}");
@@ -5882,12 +5898,13 @@ fn serve_with_engine(
 
 /// The output ceiling a serving process actually enforces and advertises.
 ///
-/// Three caps meet: the checkpoint's compiled bound, the operator's `--max-tokens`, and the
-/// allocated context (a generated token must still fit beside the prompt). The card used to
-/// publish the checkpoint bound even when `--max-tokens` was lower, so a client could request
+/// Three caps meet: the checkpoint's compiled bound, the operator's `--max-tokens` when named,
+/// and the allocated context (a generated token must still fit beside the prompt). The card used
+/// to publish the checkpoint bound even when `--max-tokens` was lower, so a client could request
 /// a budget the driver then silently clamped.
-fn output_ceiling(descriptor: usize, cli: usize, context: usize) -> usize {
-    descriptor.min(cli).min(context)
+fn output_ceiling(descriptor: usize, cli: Option<usize>, context: usize) -> usize {
+    cli.map_or(descriptor, |named| descriptor.min(named))
+        .min(context)
 }
 
 /// Builds the app state from an already chosen prompt seam and serves the router.
@@ -9358,7 +9375,9 @@ mod tests {
     fn the_defaults_are_loopback_and_the_reference_caps() {
         let options = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
         assert_eq!(options.bind, SocketAddr::from(([127, 0, 0, 1], 8000)));
-        assert_eq!(options.max_tokens, MODEL_MAX_OUTPUT_TOKENS);
+        assert_eq!(options.max_tokens, None);
+        assert_eq!(options.output_ceiling(1_048_576), 1_048_576);
+        assert_eq!(options.output_ceiling(32_768), 32_768);
         assert_eq!(options.element_limit, REFERENCE_TENSOR_LIMIT);
         assert!(
             options.tokenizer.is_none(),
@@ -10831,10 +10850,14 @@ mod device_token_serve_tests {
     fn the_advertised_output_ceiling_is_the_one_enforced() {
         // The card must not publish the checkpoint's 32K bound when --max-tokens is 8K, and a
         // context smaller than either bound still wins.
-        assert_eq!(output_ceiling(32_768, 8_192, 32_768), 8_192);
-        assert_eq!(output_ceiling(32_768, 65_536, 32_768), 32_768);
-        assert_eq!(output_ceiling(131_072, 65_536, 32_768), 32_768);
-        assert_eq!(output_ceiling(131_072, 65_536, 131_072), 65_536);
+        assert_eq!(output_ceiling(32_768, Some(8_192), 32_768), 8_192);
+        assert_eq!(output_ceiling(32_768, Some(65_536), 32_768), 32_768);
+        assert_eq!(output_ceiling(131_072, Some(65_536), 32_768), 32_768);
+        assert_eq!(output_ceiling(131_072, Some(65_536), 131_072), 65_536);
+        // No --max-tokens leaves the model's own ceiling, bounded by its window: another
+        // release's protocol bound (V4.1's 393,216) is not this model's.
+        assert_eq!(output_ceiling(1_048_576, None, 1_048_576), 1_048_576);
+        assert_eq!(output_ceiling(1_048_576, None, 262_144), 262_144);
     }
 
     #[test]

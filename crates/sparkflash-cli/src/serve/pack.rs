@@ -1166,7 +1166,7 @@ fn serve_host<R: Release>(options: &ServeOptions) -> Result<ExitCode, String> {
         Box::new(backend),
         descriptor,
         seam,
-        options.max_tokens.min(R::max_output_tokens()),
+        options.output_ceiling(R::max_output_tokens()),
         1,
         dialect,
         &banner,
@@ -1294,7 +1294,7 @@ pub(super) fn serve_arm_identity<R: Release>(
         Box::new(backend),
         descriptor,
         seam,
-        options.max_tokens.min(R::max_output_tokens()),
+        options.output_ceiling(R::max_output_tokens()),
         1,
         Some(dialect::<R>()),
         &banner,
@@ -1401,7 +1401,7 @@ fn serve_group<R: Release>(
     let driver = Tp4Driver::start(
         spec,
         rank_config,
-        options.max_tokens.min(R::max_output_tokens()),
+        options.output_ceiling(R::max_output_tokens()),
     )?;
     println!(
         "sparkflash serve: {} TP={} rank 0 on {}; control {}; workers never detokenize",
@@ -1464,7 +1464,7 @@ fn serve_group_lanes<R: Release>(
         backend,
         descriptor,
         seam,
-        options.max_tokens.min(R::max_output_tokens()),
+        options.output_ceiling(R::max_output_tokens()),
         tp4.world_size,
         Some(dialect::<R>()),
         &banner,

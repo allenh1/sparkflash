@@ -1004,12 +1004,13 @@ pub(crate) fn serve_backend_world(
     banner: &str,
     world: usize,
 ) -> Result<ExitCode, String> {
+    let ceiling = options.output_ceiling(descriptor.max_output_tokens);
     pack::serve_backend(
         options,
         backend,
         descriptor,
         seam,
-        options.max_tokens,
+        ceiling,
         world,
         Some(dialect),
         &format!("sparkflash serve: {banner}"),

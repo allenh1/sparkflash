@@ -1478,7 +1478,9 @@ fn start_leader(
     cluster.transport.fabric_mode = DEVICE_FABRIC.to_owned();
     let driver = DeviceDriver {
         jobs,
-        max_tokens: options.max_tokens,
+        max_tokens: options
+            .max_tokens
+            .unwrap_or(sparkflash_api::engine::MODEL_MAX_OUTPUT_TOKENS),
         max_model_len: device.max_model_len,
         vocab_size: ModelConfig::v41_flash_cached().vocab_size,
         think_start,

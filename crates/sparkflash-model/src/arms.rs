@@ -687,12 +687,6 @@ impl Arm for Dory {
     }
 }
 
-/// The window Inkling's device group admits when the operator names none.
-///
-/// The release's window is 1M tokens; 256K is the arm's documented serving default, and the
-/// difference is 6 GiB of KV a rank.
-pub const INKLING2_GROUP_CONTEXT_TOKENS: usize = 262_144;
-
 /// The thinkingmachines Inkling-2-Small arm.
 pub struct Inkling;
 impl Arm for Inkling {
@@ -735,7 +729,9 @@ impl Arm for Inkling {
     }
     fn group(&self) -> GroupDefaults {
         GroupDefaults {
-            context: Some(INKLING2_GROUP_CONTEXT_TOKENS),
+            // The release's whole window (1M): the model card's, and the group's rank files plus
+            // its KV fit the four Sparks at it. --context narrows it.
+            context: None,
             lanes: 1,
         }
     }

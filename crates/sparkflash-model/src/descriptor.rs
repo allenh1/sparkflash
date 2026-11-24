@@ -110,8 +110,9 @@ pub const INKLING2_SMALL_WEIGHTS_ID: &str = "inkling2-small-nvfp4";
 /// The context window of the released Inkling-2-Small checkpoint.
 pub const INKLING2_CONTEXT_TOKENS: usize = 1_048_576;
 
-/// The output ceiling this build serves for Inkling-2-Small.
-pub const INKLING2_MAX_OUTPUT_TOKENS: usize = 32_768;
+/// The output ceiling this build serves for Inkling-2-Small: the release states none of its
+/// own, so a reply is bounded by the window (and, per request, by what the prompt leaves).
+pub const INKLING2_MAX_OUTPUT_TOKENS: usize = INKLING2_CONTEXT_TOKENS;
 
 /// The padded vocabulary of the released Inkling-2-Small checkpoint.
 pub const INKLING2_VOCAB_SIZE: usize = 201_024;
