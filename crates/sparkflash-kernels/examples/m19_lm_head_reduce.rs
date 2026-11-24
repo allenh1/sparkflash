@@ -412,7 +412,7 @@ fn run() -> Result<(), String> {
     let mut allocated = 0usize;
     let weight_d = cuda.alloc(head.len(), &mut allocated)?;
     cuda.copy_htod(&weight_d, &head)?;
-    let block_maxima = lm_head_ref::block_maxima_bf16(&head);
+    let block_maxima = lm_head_ref::block_maxima_bf16(&head, HIDDEN);
     let rank_max_bytes = VOCAB_PER_RANK * lm_head_ref::LM_BLOCKS * 2;
     let w_block_max_d: Vec<Deviceptr> = (0..RANKS)
         .map(|_| cuda.alloc(rank_max_bytes, &mut allocated))

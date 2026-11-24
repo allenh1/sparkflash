@@ -47,10 +47,10 @@ pub fn vocab() -> usize {
 }
 
 /// The certified head's screening blocks per output row, read at open from the plan's hidden
-/// width (one 128-value block each).
+/// width (one 128-value block each, the kernel's `CERT_BLOCKS`).
 #[must_use]
 pub fn blocks_per_entry() -> usize {
-    crate::plan::hidden().div_ceil(128)
+    sparkflash_kernels::lm_head_ref::blocks_per_row(crate::plan::hidden())
 }
 /// The certified head's chunk width (one block per chunk).
 pub const CHUNK: u32 = sparkflash_kernels::cert_lm_head_launch::CHUNK;
@@ -66,8 +66,8 @@ pub fn chunks_per_rank() -> usize {
 pub fn logits_bytes_per_rank() -> usize {
     crate::plan::vocab_per_rank() * 4
 }
-/// The BF16 bytes of one rank's derived head block-maxima side tensor.
-/// The BF16 bytes of one rank's derived head block-maxima side tensor.
+/// The BF16 bytes of one rank's derived head block-maxima side tensor: the plan's vocabulary
+/// shard times the plan's screen blocks per row.
 #[must_use]
 pub fn w_block_max_bytes() -> usize {
     crate::plan::vocab_per_rank() * blocks_per_entry() * 2
@@ -901,7 +901,7 @@ mod device {
             let mut shard = vec![0u8; shard_bytes];
             cuda.copy_dtoh(&mut shard, &bind.tail.head)
                 .map_err(|error| format!("head shard read for w_block_max: {error}"))?;
-            let maxima = lm_head_ref::block_maxima_bf16(&shard);
+            let maxima = lm_head_ref::block_maxima_bf16(&shard, crate::plan::hidden());
             debug_assert_eq!(maxima.len(), super::w_block_max_bytes());
             cuda.copy_htod(&w_block_max, &maxima)
                 .map_err(|error| format!("w_block_max upload: {error}"))?;

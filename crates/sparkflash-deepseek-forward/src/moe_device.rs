@@ -2096,12 +2096,13 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             ));
         }
         // The screen's per-block row maxima are a load-time precompute: one exact BF16 maximum per
-        // [entry][40] block, 2.58 MB per rank. They are cached with the head weight because they are
-        // a function of it, and the kernel's bound is then the same arithmetic the scan produced.
+        // [entry][blocks] block, 40 blocks and 2.58 MB per rank at the released width. They are
+        // cached with the head weight because they are a function of it, and the kernel's bound is
+        // then the same arithmetic the scan produced.
         let head_block_max = if let Some(maxima) = &self.head_block_max {
             Arc::clone(maxima)
         } else {
-            let maxima = Arc::new(lm_head_ref::block_maxima_bf16(&head));
+            let maxima = Arc::new(lm_head_ref::block_maxima_bf16(&head, dim));
             self.head_block_max = Some(Arc::clone(&maxima));
             maxima
         };
@@ -2183,7 +2184,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             reduce_count_d,
         ]);
         let rank_stride = per_rank * dim * 2;
-        let rank_max_stride = per_rank * lm_head_ref::LM_BLOCKS * 2;
+        let rank_max_stride = per_rank * lm_head_ref::blocks_per_row(dim) * 2;
         let mut best_value = f32::NEG_INFINITY;
         let mut best_index = 0u32;
         let mut certified_total = 0usize;

@@ -49,12 +49,35 @@
 
 use crate::m4_quant::bf16_bits_to_f32;
 
-/// The hidden width. Mirrors SPARK_M4_HIDDEN.
+/// The released model's hidden width. Mirrors SPARK_M4_HIDDEN.
+///
+/// The per-model geometry is the plan's, not this crate's: a caller that derives a head side
+/// tensor passes the plan's hidden width to [block_maxima_bf16], and this constant is only the
+/// released reference the certificate tests below are written at.
 pub const HIDDEN: usize = 5120;
 /// Entries of the hidden state per screen block. Mirrors SPARK_M4_LM_SCREEN_TILE.
 pub const SCREEN_TILE: usize = 128;
-/// The number of screen blocks. Mirrors SPARK_M4_LM_BLOCKS.
+/// The released model's number of screen blocks: its hidden width over [SCREEN_TILE]. Mirrors
+/// SPARK_M4_LM_BLOCKS.
 pub const LM_BLOCKS: usize = HIDDEN / SCREEN_TILE;
+
+/// The screen blocks in one output row of a head whose hidden width is `hidden`.
+///
+/// This is the certified kernel's `CERT_BLOCKS = CERT_HIDDEN / SPARK_M4_LM_SCREEN_TILE` for the
+/// width the plan states, and the same arithmetic [block_maxima_bf16] lays the maxima out by. The
+/// kernel's static assert requires the width to tile by [SCREEN_TILE], so a width that does not
+/// is refused here rather than being silently rounded down.
+///
+/// # Panics
+/// Panics unless `hidden` is a non-zero whole number of [SCREEN_TILE]-value blocks.
+#[must_use]
+pub fn blocks_per_row(hidden: usize) -> usize {
+    assert!(
+        hidden > 0 && hidden.is_multiple_of(SCREEN_TILE),
+        "the hidden width {hidden} is a whole number of {SCREEN_TILE}-value screen blocks"
+    );
+    hidden / SCREEN_TILE
+}
 
 /// How much of the vocabulary was computed exactly and how much was pruned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,7 +130,7 @@ pub fn entry_bound(hidden_block_sums: &[f32], weight_row: &[f32]) -> f32 {
     bound
 }
 
-/// The per-block absolute maxima of a BF16 weight matrix, in the kernel's [vocab][40] layout.
+/// The per-block absolute maxima of a BF16 weight matrix, in the kernel's [vocab][blocks] layout.
 ///
 /// This is the load-time precompute for the certified head: for each vocabulary entry and each
 /// 128-value screen block, the largest absolute weight in that block, stored as the BF16 bit pattern
@@ -115,26 +138,33 @@ pub fn entry_bound(hidden_block_sums: &[f32], weight_row: &[f32]) -> f32 {
 /// selection, not a rounding: replaying these values gives exactly the same row maxima as scanning
 /// the row, and therefore exactly the same bounds, certified flags and pruned logits.
 ///
-/// The input is the little-endian BF16 byte image (two bytes per weight, row-major [vocab][HIDDEN]);
-/// the output is vocab * LM_BLOCKS little-endian BF16 values. Working on bytes keeps a 1.32 GB head
-/// from needing a second 1.32 GB u16 staging copy.
+/// The row width is an argument, not the released model's [HIDDEN]: the certified head is built per
+/// plan, and the plan's hidden width is what states how many values a row holds. The released shape
+/// passes 5120 and gets the same bytes and the same [LM_BLOCKS] layout as before; a second shape
+/// passes its own width (the synthetic fixture's is 4096, which is 32 screen blocks a row).
+///
+/// The input is the little-endian BF16 byte image (two bytes per weight, row-major [vocab][hidden]);
+/// the output is vocab * [blocks_per_row] little-endian BF16 values. Working on bytes keeps a
+/// 1.32 GB head from needing a second 1.32 GB u16 staging copy.
 ///
 /// # Panics
-/// Panics if the image is not a whole number of BF16 rows.
+/// Panics if the image is not a whole number of BF16 rows, or if the width is not a whole number of
+/// [SCREEN_TILE]-value screen blocks (the certified kernel's own static assert).
 #[must_use]
-pub fn block_maxima_bf16(weights_le: &[u8]) -> Vec<u8> {
+pub fn block_maxima_bf16(weights_le: &[u8], hidden: usize) -> Vec<u8> {
     assert_eq!(weights_le.len() % 2, 0, "BF16 weights are whole bytes");
+    let blocks = blocks_per_row(hidden);
     let values = weights_le.len() / 2;
     assert_eq!(
-        values % HIDDEN,
+        values % hidden,
         0,
-        "the weight image is a whole number of HIDDEN-wide rows"
+        "the weight image is a whole number of {hidden}-wide rows"
     );
-    let vocab = values / HIDDEN;
-    let mut out = vec![0u8; vocab * LM_BLOCKS * 2];
+    let vocab = values / hidden;
+    let mut out = vec![0u8; vocab * blocks * 2];
     for entry in 0..vocab {
-        let row = &weights_le[entry * HIDDEN * 2..(entry + 1) * HIDDEN * 2];
-        for block in 0..LM_BLOCKS {
+        let row = &weights_le[entry * hidden * 2..(entry + 1) * hidden * 2];
+        for block in 0..blocks {
             let mut best_bits = 0u16;
             let mut best = 0.0f32;
             for i in 0..SCREEN_TILE {
@@ -148,7 +178,7 @@ pub fn block_maxima_bf16(weights_le: &[u8]) -> Vec<u8> {
                     best_bits = bits & 0x7fff;
                 }
             }
-            let at = (entry * LM_BLOCKS + block) * 2;
+            let at = (entry * blocks + block) * 2;
             out[at..at + 2].copy_from_slice(&best_bits.to_le_bytes());
         }
     }
@@ -312,7 +342,7 @@ mod tests {
             }
             *pair = bits.to_le_bytes();
         }
-        let maxima = block_maxima_bf16(&weights);
+        let maxima = block_maxima_bf16(&weights, HIDDEN);
         assert_eq!(maxima.len(), vocab * LM_BLOCKS * 2);
         for entry in 0..vocab {
             for block in 0..LM_BLOCKS {
