@@ -75,8 +75,10 @@ const BUDGET: &[(&str, Counts)] = &[
     (
         "src/moe_device.rs",
         Counts {
-            model_config: 6,
-            config_reads: 16,
+            // The expert bind carries both NVFP4 factors and the packed escape plane, so the
+            // module names the conventions and reads the group geometry from the opened plan.
+            model_config: 7,
+            config_reads: 19,
             model_constants: 0,
             shape_literals: 0,
             tensor_names: 3,
@@ -190,7 +192,9 @@ const BUDGET: &[(&str, Counts)] = &[
             model_constants: 0,
             shape_literals: 1,
             tensor_names: 2,
-            kernel_symbols: 6,
+            // opt_mma_hostw_bf16a_bf16w is the seventh symbol: a BF16-stored projection over
+            // BF16 activation rows, which the f32 row hostw kernels cannot take.
+            kernel_symbols: 7,
         },
     ),
     (
@@ -202,6 +206,19 @@ const BUDGET: &[(&str, Counts)] = &[
             shape_literals: 1,
             tensor_names: 2,
             kernel_symbols: 0,
+        },
+    ),
+    (
+        "src/nvfp4_prefill.rs",
+        Counts {
+            // The eight wrappers of the shared tile body's FP4 weight mode: two conventions and
+            // the prompt and rows forms, plus the release's own gate/up and down pair.
+            model_config: 0,
+            config_reads: 0,
+            model_constants: 0,
+            shape_literals: 0,
+            tensor_names: 0,
+            kernel_symbols: 12,
         },
     ),
     (
