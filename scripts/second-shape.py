@@ -64,8 +64,6 @@ PROMPTS = [[100, 101, 102, 103], [200, 201, 202], [300, 301, 302, 303, 304, 305]
 # declaration - the writer, the reference and the group all read this one file.
 STORED_FORMATS = {
     "released": None,
-    "fp8-f32": {"quant_method": "fp8", "scale_fmt": "f32", "expert_dtype": "fp8"},
-    "fp8-bf16": {"quant_method": "fp8", "scale_fmt": "bf16", "expert_dtype": "fp8"},
     # The two NVFP4 expert conventions: the dense class stays the fixture's released 32 x 32
     # power-of-two grid, and only the routed experts change format.
     "nvfp4-qwen": {"expert_dtype": "nvfp4-qwen"},
@@ -79,9 +77,12 @@ STORED_FORMATS = {
         "scale_fmt": "ue8m0",
         "expert_dtype": "fp4",
     },
+    "fp8-f32": {"quant_method": "fp8", "scale_fmt": "f32", "expert_dtype": "fp8", "block": 128},
+    "fp8-bf16": {"quant_method": "fp8", "scale_fmt": "bf16", "expert_dtype": "fp8", "block": 128},
+    # The routed experts one power-of-two scale a row, every 32 values along the contraction:
+    # Inkling's last eight layers, and the Engram table's and drafter head's own arithmetic.
+    "mx-fp8-row": {"quant_method": "fp8", "scale_fmt": "ue8m0", "expert_dtype": "mx-fp8-row", "block": 32},
 }
-# The block an FP8 tile release stores: one inverse scale a 128 x 128 tile.
-TILE_BLOCK = 128
 
 
 def fail(message: str) -> "NoReturn":
@@ -99,12 +100,16 @@ def variant_config(name: str, out: Path) -> Path:
     document = json.loads(FIXTURE.read_text())
     declared = STORED_FORMATS[name]
     if declared is not None:
+        declared = dict(declared)
+        block = declared.pop("block", None)
         quantization = document["quantization_config"]
         quantization.update(declared)
         if "quant_method" in declared:
-            # A tile release states its 128 x 128 block; an unquantized BF16 class has no
-            # scale plane at all, so it keeps the fixture's 32 x 32 declaration.
-            block = 32 if declared["quant_method"] in ("bf16", "packed-bf16") else TILE_BLOCK
+            # A tile release states its 128 x 128 block and the row-scaled variant its 32; an
+            # unquantized BF16 class has no scale plane at all, so it keeps the fixture's
+            # 32 x 32 declaration.
+            if block is None:
+                block = 32 if declared["quant_method"] in ("bf16", "packed-bf16") else TILE_BLOCK
             quantization["weight_block_size"] = [block, block]
     path = out / f"config-{name}.json"
     path.write_text(json.dumps(document, indent=2))

@@ -4090,6 +4090,80 @@ experts = 64
 top_k = 4
 intermediate = 128
 
+# The row-scaled MXFP8 routed experts at the second shape's other rank counts. The body takes
+# rows, columns and the scale block as launch words, so one compile serves every per-rank
+# intermediate; these rows are what makes the catalogue admit the shape each world plans.
+# `opt_mma_sm121.cu` asserts its router and gate/up instance macros at compile time, so each
+# group carries those two entries as compile companions. intermediate 256: TP2 (512 / 2);
+# intermediate 512: TP1.
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_rowscale_f32o"
+cubin = "opt_mma_sm121_s2_tp2"
+family = "rows"
+format = "mx-fp8-row"
+catalogue = "deepseek-moe"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_router_topk"
+cubin = "opt_mma_sm121_s2_tp2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_gate_up"
+cubin = "opt_mma_sm121_s2_tp2"
+family = "rows"
+format = "mx-fp4"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 256
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_fp8_rowscale_f32o"
+cubin = "opt_mma_sm121_s2_tp1"
+family = "rows"
+format = "mx-fp8-row"
+catalogue = "deepseek-moe"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_router_topk"
+cubin = "opt_mma_sm121_s2_tp1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
+[[instance]]
+source = "opt_mma_sm121.cu"
+entry = "opt_mma_moe_gate_up"
+cubin = "opt_mma_sm121_s2_tp1"
+family = "rows"
+format = "mx-fp4"
+hidden = 4096
+experts = 64
+top_k = 4
+intermediate = 512
+
 [[instance]]
 source = "opt_mma_sm121.cu"
 entry = "opt_mma_hostw_bf16w"

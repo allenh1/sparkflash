@@ -946,7 +946,25 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             return Ok(true);
         }
 
-        let experts = read_experts(source, layer, &table, dim, inter)?;
+        // The plan states the routed experts' format for this block; the bind reads the planes
+        // that format names. A plan that states none falls back to the configuration's class.
+        let routed_format = crate::plan::description()
+            .operand(Some(layer), sparkflash_model::Part::Moe)
+            .map_or(StoredFormat::MXFP4_ROW_32, |operand| operand.stored);
+        let experts = read_experts(source, layer, &table, dim, inter, routed_format)?;
+        // The staged operand is packed E2M1 below; a format with another arithmetic is refused
+        // by name here rather than sliced at an FP4 row width. The row-scaled MXFP8 body
+        // (`opt_mma_fp8_rowscale_f32o`) reads the arrangement the bind above produced, but this
+        // launch path still stages packed FP4, so it does not launch it yet.
+        if routed_format.values() != sparkflash_model::format::FormatValues::Fp4E2M1 {
+            return Err(err(
+                "device routed MoE launch",
+                format!(
+                    "{} is bound and arranged, but this routed launch stages packed E2M1 only; ",
+                    routed_format.describe()
+                ),
+            ));
+        }
         let expert_bytes: usize = experts.iter().map(Expert::bytes).sum();
         staged_bytes += expert_bytes as u64;
         host_bytes += expert_bytes as u64;
@@ -2200,28 +2218,47 @@ fn read_experts(
     table: &[(usize, usize)],
     dim: usize,
     inter: usize,
+    format: StoredFormat,
 ) -> Result<Vec<Expert>, EngineError> {
+    // The bind carries the planes the format names: a row plane, a block grid, or a tensor-wide
+    // factor. This reader carries the first two; a format that also needs a tensor-wide factor is
+    // refused by name rather than decoded without it.
+    let planes = |rows: usize, cols: usize| crate::operand::ScalePlanes::of(format, rows, cols);
+    if planes(inter, dim).tensor_wide {
+        return Err(err(
+            "device routed MoE bind",
+            format!(
+                "{} needs a tensor-wide scale the routed bind does not carry",
+                format.describe()
+            ),
+        ));
+    }
     let mut experts = Vec::with_capacity(table.len());
+    let mut read_pair = |base: &str, rows: usize, cols: usize| {
+        let plane = planes(rows, cols);
+        let values = read_len(
+            source,
+            &format!("{base}.weight"),
+            rows.saturating_mul(cols)
+                .div_ceil(format.values().values_per_byte()),
+        )?;
+        // The loader's one arrangement: as stored for a row-major format, the 32 x 32 B12x
+        // permutation for a tiled one. The body reads what this returns, never the file order.
+        let arranged = crate::operand::arrange(format, &values, rows, cols)
+            .map_err(|detail| err("device routed MoE bind", detail))?;
+        let scale_bytes = if plane.row_bytes > 0 {
+            plane.row_bytes
+        } else {
+            plane.grid_bytes
+        };
+        let scales = read_len(source, &format!("{base}.scale"), scale_bytes as usize)?;
+        Ok::<_, EngineError>((arranged.bytes, scales))
+    };
     for (_, expert) in table {
         let base = crate::plan::layer_prefix(layer, &format!("ffn.experts.{expert}"));
-        let w1 = read_len(source, &format!("{base}.w1.weight"), inter * (dim / 2))?;
-        let s1 = read_len(
-            source,
-            &format!("{base}.w1.scale"),
-            inter * (dim / QUANT_BLOCK),
-        )?;
-        let w3 = read_len(source, &format!("{base}.w3.weight"), inter * (dim / 2))?;
-        let s3 = read_len(
-            source,
-            &format!("{base}.w3.scale"),
-            inter * (dim / QUANT_BLOCK),
-        )?;
-        let w2 = read_len(source, &format!("{base}.w2.weight"), dim * (inter / 2))?;
-        let s2 = read_len(
-            source,
-            &format!("{base}.w2.scale"),
-            dim * (inter / QUANT_BLOCK),
-        )?;
+        let (w1, s1) = read_pair(&format!("{base}.w1"), inter, dim)?;
+        let (w3, s3) = read_pair(&format!("{base}.w3"), inter, dim)?;
+        let (w2, s2) = read_pair(&format!("{base}.w2"), dim, inter)?;
         experts.push(Expert {
             w1,
             s1,

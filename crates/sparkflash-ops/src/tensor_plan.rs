@@ -96,6 +96,11 @@ enum ExpertFormat {
         block: usize,
         scale: DType,
     },
+    /// Row-scaled MXFP8: one ue8m0 scale a row, every `block` columns.
+    Fp8Row {
+        /// The values one scale covers along the contraction.
+        block: usize,
+    },
     Bf16,
 }
 
@@ -120,6 +125,7 @@ impl ExpertFormat {
                 block: block_n.max(1),
                 scale: scale_dtype_of(scale_dtype),
             },
+            WeightFormat::MxFp8Row { block } => Self::Fp8Row { block },
             WeightFormat::MxFp8 { .. } | WeightFormat::Bf16 | WeightFormat::F32 => Self::Bf16,
         }
     }
@@ -788,7 +794,7 @@ impl Builder {
             format!("{prefix}.weight"),
             match format {
                 ExpertFormat::Fp4 { .. } => DType::F4E2M1,
-                ExpertFormat::Fp8 { .. } => DType::F8E4M3,
+                ExpertFormat::Fp8 { .. } | ExpertFormat::Fp8Row { .. } => DType::F8E4M3,
                 ExpertFormat::Bf16 => DType::BF16,
             },
             shape,
@@ -860,6 +866,31 @@ impl Builder {
                     role,
                 );
             }
+            ExpertFormat::Fp8Row { block } => {
+                let scale_shape = if rows {
+                    vec![width, hidden.div_ceil(block)]
+                } else {
+                    vec![hidden, width.div_ceil(block)]
+                };
+                let scale_rank = if rows {
+                    vec![local, hidden.div_ceil(block)]
+                } else {
+                    vec![hidden, local.div_ceil(block)]
+                };
+                let scale_run = run.map(|run| RankRun {
+                    offset: run.offset / block,
+                    count: run.count.div_ceil(block),
+                    total: run.total.div_ceil(block),
+                });
+                self.push(
+                    format!("{prefix}.weight_scale"),
+                    DType::F8E8M0,
+                    scale_shape,
+                    scale_rank,
+                    scale_run,
+                    role,
+                );
+            }
             ExpertFormat::Bf16 => {}
         }
         Ok(())
@@ -891,7 +922,7 @@ impl Builder {
                     ((total / self.tp.world()).next_multiple_of(64), None)
                 }
             }
-            ExpertFormat::Fp8 { block, .. } if block > 1 => {
+            ExpertFormat::Fp8 { block, .. } | ExpertFormat::Fp8Row { block } if block > 1 => {
                 let split = self.tp.split_tiles(total, block, TpAxis::Intermediate)?;
                 (split.padded, Some(RankRun::tiled(split)))
             }

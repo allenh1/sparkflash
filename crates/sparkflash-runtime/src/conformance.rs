@@ -182,6 +182,7 @@ impl FormatRule {
             WeightFormat::F32 => "F32",
             WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
             WeightFormat::MxFp8 { .. } => "MX FP8",
+            WeightFormat::MxFp8Row { .. } => "MX FP8, row-scaled",
             WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
         })
     }
