@@ -736,6 +736,62 @@ pub fn select_combine(geometry: CombineGeometry, kernels: &CombineKernelSet) -> 
     })
 }
 
+/// The routed down-projection geometry the bind actually built: the released plan stores one row per
+/// output row in `layers.0.ffn.experts.0.w2`, so the first expert's shard is the per-rank shape.
+///
+/// Returns `(rows, Some((weight_bytes, scale_bytes)))`, or `(rows, None)` when the plan does not
+/// carry that expert (which the preflight then reports as a missing bind, not as a stored layout).
+pub fn geometry_from_plan(
+    plan: &sparkflash_device::resident::ResidentPlan,
+) -> (usize, Option<(usize, usize)>) {
+    // The combine reads the released MXFP4 down rows; a block stored another way runs on the
+    // format route, so the geometry is the first block whose experts are the released format.
+    let by_name: std::collections::BTreeMap<&str, &sparkflash_device::resident::ResidentShard> =
+        plan.shards()
+            .iter()
+            .map(|shard| (shard.name.as_str(), shard))
+            .collect();
+    let released = |shard: &&sparkflash_device::resident::ResidentShard| {
+        shard.format.is_none_or(|format| {
+            format.same_arithmetic(sparkflash_model::format::StoredFormat::MXFP4_ROW_32)
+        })
+    };
+    let layer = (0..)
+        .map_while(|layer| {
+            by_name
+                .get(format!("layers.{layer}.ffn.experts.0.w2.weight").as_str())
+                .map(|shard| (layer, shard))
+        })
+        .find(|(_, shard)| released(shard))
+        .map(|(layer, _)| layer);
+    let find = |suffix: &str| {
+        layer.and_then(|layer| {
+            by_name
+                .get(format!("layers.{layer}.ffn.experts.0.{suffix}").as_str())
+                .copied()
+        })
+    };
+    let weight = find("w2.weight");
+    let scale = find("w2.scale");
+    let rows = weight
+        .and_then(|shard| shard.shard_shape.first().copied())
+        .filter(|rows| *rows > 0)
+        .unwrap_or(crate::tp4_forward::default_combine_rows());
+    let bytes = match (weight, scale) {
+        (Some(weight), Some(scale)) => {
+            match (
+                usize::try_from(weight.shard_bytes),
+                usize::try_from(scale.shard_bytes),
+            ) {
+                (Ok(weight_bytes), Ok(scale_bytes)) => Some((weight_bytes, scale_bytes)),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    (rows, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,5 +1088,55 @@ mod tests {
                     .contains("task-6")
             );
         }
+    }
+
+    #[test]
+    fn the_combine_geometry_comes_from_the_released_plan_row_geometry() {
+        // The released plan's routed down projection: stored [5120, 1152] I8 weight (2304 values
+        // packed two per byte) with a [5120, 72] E8M0 scale grid. Column rule shard = 288 packed
+        // bytes + 18 scale bytes per row, i.e. the stored 576-K layout the combine selector
+        // accepts - derived here from the plan API, not from a fixture file.
+        let plan = sparkflash_device::resident::ResidentPlan::plan(
+            0,
+            4,
+            vec![
+                sparkflash_device::resident::HeaderEntry::new(
+                    "layers.0.ffn.experts.0.w2.weight".to_string(),
+                    "I8".to_string(),
+                    vec![5120, 1152],
+                ),
+                sparkflash_device::resident::HeaderEntry::new(
+                    "layers.0.ffn.experts.0.w2.scale".to_string(),
+                    "F8_E8M0".to_string(),
+                    vec![5120, 72],
+                ),
+            ],
+        )
+        .expect("released w2 plan");
+        let (rows, bytes) = geometry_from_plan(&plan);
+        assert_eq!(rows, 5120);
+        let (weight_bytes, scale_bytes) = bytes.expect("w2 shard bytes");
+        assert_eq!(weight_bytes, 5120 * 288);
+        assert_eq!(scale_bytes, 5120 * 18);
+        let geometry = CombineGeometry::from_shard_bytes(rows, weight_bytes, scale_bytes)
+            .expect("stored geometry");
+        assert_eq!(geometry.layout(), CombineLayout::Stored576);
+    }
+
+    #[test]
+    fn a_plan_without_the_routed_down_projection_reports_no_bytes_instead_of_inventing_them() {
+        let plan = sparkflash_device::resident::ResidentPlan::plan(
+            0,
+            4,
+            vec![sparkflash_device::resident::HeaderEntry::new(
+                "norm.weight".to_string(),
+                "BF16".to_string(),
+                vec![5120],
+            )],
+        )
+        .expect("minimal plan");
+        let (rows, bytes) = geometry_from_plan(&plan);
+        assert_eq!(rows, crate::tp4_forward::default_combine_rows());
+        assert!(bytes.is_none(), "the preflight must refuse, not guess");
     }
 }

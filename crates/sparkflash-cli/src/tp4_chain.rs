@@ -427,40 +427,6 @@ fn check_token_ids(ids: &[u32], flag: &str, vocab: usize) -> Result<(), String> 
     Ok(())
 }
 
-/// The routed down-projection geometry the bind actually built: the released plan stores one row per
-/// output row in `layers.0.ffn.experts.0.w2`, so the first expert's shard is the per-rank shape.
-///
-/// Returns `(rows, Some((weight_bytes, scale_bytes)))`, or `(rows, None)` when the plan does not
-/// carry that expert (which the preflight then reports as a missing bind, not as a stored layout).
-fn combine_geometry_from_plan(
-    plan: &sparkflash_device::resident::ResidentPlan,
-) -> (usize, Option<(usize, usize)>) {
-    let find = |suffix: &str| {
-        plan.shards()
-            .iter()
-            .find(|shard| shard.name == format!("layers.0.ffn.experts.0.{suffix}"))
-    };
-    let weight = find("w2.weight");
-    let scale = find("w2.scale");
-    let rows = weight
-        .and_then(|shard| shard.shard_shape.first().copied())
-        .filter(|rows| *rows > 0)
-        .unwrap_or(crate::tp4_forward::default_combine_rows());
-    let bytes = match (weight, scale) {
-        (Some(weight), Some(scale)) => {
-            match (
-                usize::try_from(weight.shard_bytes),
-                usize::try_from(scale.shard_bytes),
-            ) {
-                (Ok(weight_bytes), Ok(scale_bytes)) => Some((weight_bytes, scale_bytes)),
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-    (rows, bytes)
-}
-
 /// Builds the C4-token request from the argv, the rank plan and the run header.
 fn build_token_request<'a>(
     args: &'a ChainArgs,
@@ -470,7 +436,7 @@ fn build_token_request<'a>(
     weights: Option<&'a sparkflash_engine::safetensors::SafeTensorsSource>,
     header: &crate::run_header::RunHeader,
 ) -> crate::tp4_forward::TokenStageRequest<'a> {
-    let (combine_rows, combine_bytes) = combine_geometry_from_plan(&setup.plan);
+    let (combine_rows, combine_bytes) = crate::tp4_combine::geometry_from_plan(&setup.plan);
     // The run's ONE arm decision was made by the header (crate::run_header::RunHeader::decide),
     // which read each switch exactly once at startup; the request carries it. Evidence recording
     // forces the host arm, so the chain's bootstrap must gate on this decision
@@ -1749,7 +1715,6 @@ mod reduce_arena_tests {
 #[cfg(test)]
 mod forward_args_tests {
     use super::*;
-    use sparkflash_device::resident::{HeaderEntry, ResidentPlan};
     use std::path::Path;
 
     fn base_argv() -> Vec<&'static str> {
@@ -1974,59 +1939,5 @@ mod forward_args_tests {
         );
         let error = parse_with(&["--loop", "--forward", "--token-ids", ","]).expect_err("empty");
         assert!(error.contains("at least one token id"), "{error}");
-    }
-
-    #[test]
-    fn the_combine_geometry_comes_from_the_released_plan_row_geometry() {
-        // The released plan's routed down projection: stored [5120, 1152] I8 weight (2304 values
-        // packed two per byte) with a [5120, 72] E8M0 scale grid. Column rule shard = 288 packed
-        // bytes + 18 scale bytes per row, i.e. the stored 576-K layout the combine selector
-        // accepts - derived here from the plan API, not from a fixture file.
-        let plan = ResidentPlan::plan(
-            0,
-            4,
-            vec![
-                HeaderEntry::new(
-                    "layers.0.ffn.experts.0.w2.weight".to_string(),
-                    "I8".to_string(),
-                    vec![5120, 1152],
-                ),
-                HeaderEntry::new(
-                    "layers.0.ffn.experts.0.w2.scale".to_string(),
-                    "F8_E8M0".to_string(),
-                    vec![5120, 72],
-                ),
-            ],
-        )
-        .expect("released w2 plan");
-        let (rows, bytes) = combine_geometry_from_plan(&plan);
-        assert_eq!(rows, 5120);
-        let (weight_bytes, scale_bytes) = bytes.expect("w2 shard bytes");
-        assert_eq!(weight_bytes, 5120 * 288);
-        assert_eq!(scale_bytes, 5120 * 18);
-        let geometry =
-            crate::tp4_combine::CombineGeometry::from_shard_bytes(rows, weight_bytes, scale_bytes)
-                .expect("stored geometry");
-        assert_eq!(
-            geometry.layout(),
-            crate::tp4_combine::CombineLayout::Stored576
-        );
-    }
-
-    #[test]
-    fn a_plan_without_the_routed_down_projection_reports_no_bytes_instead_of_inventing_them() {
-        let plan = ResidentPlan::plan(
-            0,
-            4,
-            vec![HeaderEntry::new(
-                "norm.weight".to_string(),
-                "BF16".to_string(),
-                vec![5120],
-            )],
-        )
-        .expect("minimal plan");
-        let (rows, bytes) = combine_geometry_from_plan(&plan);
-        assert_eq!(rows, crate::tp4_forward::default_combine_rows());
-        assert!(bytes.is_none(), "the preflight must refuse, not guess");
     }
 }
