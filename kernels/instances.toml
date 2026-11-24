@@ -9187,3 +9187,368 @@ intermediate = 256
 padded = 256
 experts = 64
 top_k = 4
+
+# --- DeepSeek routed experts in every non-released stored format -----------------------------
+# kernels/routed_format_sm121.cu: gate/up and down on the shared tile's routed mode, one pair a
+# format. The matrix shapes are runtime launch words; the rows pin the second shape's builds,
+# one a world (the rank's intermediate is the per-rank field).
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_fp8_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "fp8"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_fp8_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "fp8"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_fp8_bf16_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "fp8-bf16"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_fp8_bf16_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "fp8-bf16"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_nvfp4_qwen_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "nvfp4-qwen"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_nvfp4_qwen_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "nvfp4-qwen"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_nvfp4_inkling_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "nvfp4-inkling"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_nvfp4_inkling_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "nvfp4-inkling"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_mxfp8_row_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "mx-fp8-row"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_mxfp8_row_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "mx-fp8-row"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_fp8_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "fp8"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_fp8_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "fp8"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_fp8_bf16_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "fp8-bf16"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_fp8_bf16_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "fp8-bf16"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_nvfp4_qwen_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "nvfp4-qwen"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_nvfp4_qwen_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "nvfp4-qwen"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_nvfp4_inkling_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "nvfp4-inkling"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_nvfp4_inkling_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "nvfp4-inkling"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_mxfp8_row_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-row"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_mxfp8_row_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "mx-fp8-row"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_fp8_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "fp8"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_fp8_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "fp8"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_fp8_bf16_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "fp8-bf16"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_fp8_bf16_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "fp8-bf16"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_nvfp4_qwen_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "nvfp4-qwen"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_nvfp4_qwen_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "nvfp4-qwen"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_nvfp4_inkling_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "nvfp4-inkling"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_nvfp4_inkling_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "nvfp4-inkling"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_gate_up_mxfp8_row_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-row"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_down_mxfp8_row_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "mx-fp8-row"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4

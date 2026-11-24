@@ -1519,6 +1519,19 @@ pub const CATALOGUE: &[PartKernel] = &[
             // token count, so it serves the prompt rows and the token rows.
             deepseek_sym("opt_mma_fp8_rowscale_f32o", &[Precision::MxFp8])
                 .decoding(StoredFormat::MXFP8_ROW_32),
+            // Every non-released routed format on the shared tile's routed mode
+            // (kernels/routed_format_sm121.cu): gate/up and down a format, the entry's own
+            // format from the instance list.
+            deepseek_sym("routed_format_gate_up_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym("routed_format_down_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym("routed_format_gate_up_fp8_bf16_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym("routed_format_down_fp8_bf16_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym("routed_format_gate_up_nvfp4_qwen_sm121", &[Precision::NvFp4]),
+            deepseek_sym("routed_format_down_nvfp4_qwen_sm121", &[Precision::NvFp4]),
+            deepseek_sym("routed_format_gate_up_nvfp4_inkling_sm121", &[Precision::NvFp4]),
+            deepseek_sym("routed_format_down_nvfp4_inkling_sm121", &[Precision::NvFp4]),
+            deepseek_sym("routed_format_gate_up_mxfp8_row_sm121", &[Precision::MxFp8]),
+            deepseek_sym("routed_format_down_mxfp8_row_sm121", &[Precision::MxFp8]),
         ],
         true,
     ),
@@ -2147,6 +2160,18 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "opt_moe_combine_k3_sm121",
                 &[Precision::Bf16, Precision::F32],
             ),
+            // The stage's routed experts in a non-released format: the backbone's own route
+            // (kernels/routed_format_sm121.cu) at the stage's top-k.
+            deepseek_sym("routed_format_gate_up_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym("routed_format_down_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym("routed_format_gate_up_fp8_bf16_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym("routed_format_down_fp8_bf16_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym("routed_format_gate_up_nvfp4_qwen_sm121", &[Precision::NvFp4]),
+            deepseek_sym("routed_format_down_nvfp4_qwen_sm121", &[Precision::NvFp4]),
+            deepseek_sym("routed_format_gate_up_nvfp4_inkling_sm121", &[Precision::NvFp4]),
+            deepseek_sym("routed_format_down_nvfp4_inkling_sm121", &[Precision::NvFp4]),
+            deepseek_sym("routed_format_gate_up_mxfp8_row_sm121", &[Precision::MxFp8]),
+            deepseek_sym("routed_format_down_mxfp8_row_sm121", &[Precision::MxFp8]),
         ],
         true,
     ),

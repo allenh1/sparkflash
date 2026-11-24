@@ -87,6 +87,10 @@
 // words. kWide selects where the convention's tensor-wide factor is applied: 1 folds it into the
 // group scale at the load (Qwen), 2 applies it to the output (Inkling), 0 carries none.
 #define SPM_W_FP4 2
+// E4M3 codes with one ue8m0 scale a row every 32 values along the contraction, row-major
+// (StoredFormat::MXFP8_ROW_32). E4M3 times a power of two is exact in the tile's BF16 weight
+// words, so the stage folds the scale at the load, as SPM_W_FP4 folds its group scale.
+#define SPM_W_MX8R 3
 
 // A dense GEMM block's (column tile, row tile) for the grid's (x column tiles, y row tiles): the
 // linear block order walks GLM_RASTER row tiles down each column tile before moving on, so the
@@ -176,6 +180,7 @@ __device__ __forceinline__ void shared_prefill_mma_body(
     float wide = 1.0f) {
     constexpr bool kFp8 = kFormat == SPM_W_FP8;
     constexpr bool kFp4 = kFormat == SPM_W_FP4;
+    constexpr bool kMx8r = kFormat == SPM_W_MX8R;
     constexpr bool kFoldWide = kFp4 && kWide == 1;
     constexpr bool kOutWide = kFp4 && kWide == 2;
     __shared__ __align__(16) __nv_bfloat16 s_ah[GLM_BM * OB_LD];
@@ -205,9 +210,16 @@ __device__ __forceinline__ void shared_prefill_mma_body(
         tokens = min((uint32_t)item.z, GLM_MOE_ROWS);
         w_grp = reinterpret_cast<const uint8_t *>(table[(uint64_t)item.x * kTableStride +
                                                         kTableOffset]);
-        if constexpr (kFp8) {
+        // Every scaled format reads its expert's scale plane beside the weight. An NVFP4 expert
+        // with a tensor-wide convention carries its f32 factor's bits in the third word
+        // ([weight, scales, wide] a matrix), since the factor is the expert's, not the launch's.
+        if constexpr (kFp8 || kFp4 || kMx8r) {
             ws_grp = reinterpret_cast<const ScaleT *>(
                 table[(uint64_t)item.x * kTableStride + kTableOffset + 1]);
+        }
+        if constexpr (kFp4 && kWide != 0) {
+            wide = __uint_as_float(
+                (uint32_t)table[(uint64_t)item.x * kTableStride + kTableOffset + 2]);
         }
         item_slots = sorted + item.y;
     }
@@ -267,6 +279,14 @@ __device__ __forceinline__ void shared_prefill_mma_body(
                 rw[0] = __ldg(reinterpret_cast<const uint4 *>(src));
                 rs = spm_scale<ScaleT>(
                     __ldg(&ws_grp[(col >> 7) * (inner >> 7) + (kb >> 2)]));
+            } else if constexpr (kMx8r) {
+                // One 32-column stage of one output row: this half's 16 E4M3 codes and the row's
+                // power-of-two scale for the stage's 32 columns.
+                const uint8_t *src = w_grp + col * inner + kb * 32u + w_half * 16u;
+                rw[0] = __ldg(reinterpret_cast<const uint4 *>(src));
+                const uint8_t *scale_row =
+                    reinterpret_cast<const uint8_t *>(ws_grp) + col * (inner >> 5);
+                rs = opt_ue8m0_f32(__ldg(&scale_row[kb]));
             } else if constexpr (kFp4) {
                 // One 32-column stage of one output row: 16 packed E2M1 codes (8 bytes) for this
                 // half, and one E4M3 group scale for those 16 values.
@@ -311,7 +331,15 @@ __device__ __forceinline__ void shared_prefill_mma_body(
         }
         const uint32_t w_at = (w_tile * 32u + w_col) * OB_LD + w_half * 16u;
         __nv_bfloat16 *dst = &s_w[w_at];
-        if constexpr (kFp8) {
+        if constexpr (kMx8r) {
+            const uint4 r = rw[0];
+            *reinterpret_cast<uint4 *>(dst) =
+                make_uint4(ob_e4m3x2(r.x, rs), ob_e4m3x2(r.x >> 16, rs),
+                           ob_e4m3x2(r.y, rs), ob_e4m3x2(r.y >> 16, rs));
+            *reinterpret_cast<uint4 *>(dst + 8) =
+                make_uint4(ob_e4m3x2(r.z, rs), ob_e4m3x2(r.z >> 16, rs),
+                           ob_e4m3x2(r.w, rs), ob_e4m3x2(r.w >> 16, rs));
+        } else if constexpr (kFp8) {
             stage_scale = rs;
             const uint4 r = rw[0];
             *reinterpret_cast<uint4 *>(dst) =
