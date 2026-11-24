@@ -1556,9 +1556,17 @@ impl DeviceLayer<'_> {
         // The expert count and top-k are the open plan's routed geometry; the resolved router
         // entries enforce the compiled shape at open.
         let experts = self.routed_geometry.experts;
+        // The body's column tiles are 128 wide and it bounds a partial tile at 32 columns
+        // (opt_mma_bf16_body's col_tiles), so a count under 128 (the second shape's 64) is one
+        // tile, not none.
+        if experts % 32 != 0 {
+            return Err(format!(
+                "bulk router: {experts} experts are not whole 32-column tiles"
+            ));
+        }
         self.cuda.launch(
             bulk.k.router_dots,
-            ((experts / 128) as u32, (n as u32).div_ceil(128), 1),
+            ((experts as u32).div_ceil(128), (n as u32).div_ceil(128), 1),
             (256, 1, 1),
             &[
                 b.ffn_x,
