@@ -1589,6 +1589,8 @@ struct EngineOutput {
     token_logprobs: Vec<TokenLogprob>,
     /// Prompt logprobs, present when the engine was asked for them.
     prompt_logprobs: Option<PromptLogprobs>,
+    /// The generated ids, when the engine reported them ([`EngineEvent::TokenIds`]).
+    token_ids: Option<Vec<u32>>,
     finish_reason: FinishReason,
     usage: OpenAiUsageWithCache,
     stats: Box<DeepSeekSparkRequestStats>,
@@ -1604,6 +1606,7 @@ async fn drive_engine(
     let mut tool_calls: BTreeMap<usize, BufferedToolCall> = BTreeMap::new();
     let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
     let mut prompt_logprobs: Option<PromptLogprobs> = None;
+    let mut token_ids = None;
     let mut finished = None;
     while let Some(event) = stream.next().await {
         match event {
@@ -1612,6 +1615,7 @@ async fn drive_engine(
             EngineEvent::ContentDelta(text) => content.push_str(&text),
             EngineEvent::PromptLogprobs(payload) => prompt_logprobs = Some(*payload),
             EngineEvent::TokenLogprobs(logprob) => token_logprobs.push(*logprob),
+            EngineEvent::TokenIds(ids) => token_ids = Some(ids),
             EngineEvent::ToolCallDelta {
                 index,
                 id,
@@ -1650,6 +1654,7 @@ async fn drive_engine(
         tool_calls: tool_calls.into_values().collect(),
         token_logprobs,
         prompt_logprobs,
+        token_ids,
         finish_reason,
         usage,
         stats,
@@ -2872,8 +2877,9 @@ fn chat_stream_response(
             while let Some(event) = events.next().await {
                 match event {
                     EngineEvent::Started { .. } => {}
-                    // Explicit prompt_logprobs are refused for streams, so this cannot arrive here.
-                    EngineEvent::PromptLogprobs(_) => {}
+                    // Explicit prompt_logprobs are refused for streams, so this cannot arrive here;
+                    // nor can return_token_ids, which a stream refuses.
+                    EngineEvent::PromptLogprobs(_) | EngineEvent::TokenIds(_) => {}
                     EngineEvent::ReasoningDelta(text) => {
                         current_completion += 1;
                         reasoning_tokens += 1;
@@ -3506,6 +3512,14 @@ async fn completions(
             .map_err(ApiError::from)?;
     }
 
+    let token_ids = request.return_token_ids.unwrap_or(false);
+    if token_ids && request.stream {
+        return Err(ApiError::invalid_request(
+            "`return_token_ids` is served on buffered completions only, not with `stream=True`",
+            Some("return_token_ids".to_owned()),
+            Some("invalid_request".to_owned()),
+        ));
+    }
     if request.stream {
         let include_usage = request
             .stream_options
@@ -3538,6 +3552,11 @@ async fn completions(
         for engine_request in engine_requests {
             outputs.push(drive_engine(state.engine.as_ref(), engine_request).await?);
         }
+        if token_ids && outputs.iter().any(|output| output.token_ids.is_none()) {
+            return Err(ApiError::service_unavailable(
+                "`return_token_ids`: this engine does not report the generated token ids",
+            ));
+        }
         let usage = aggregate_completion_usage(&outputs, &request_plan);
         let stats = aggregate_stats(&outputs);
         state.metrics.record_request(&usage, &stats.kv_cache);
@@ -3552,6 +3571,7 @@ async fn completions(
             &model,
             logprob_info,
             echo,
+            token_ids,
         );
         Ok(json_response(body, trace))
     }
@@ -3582,6 +3602,7 @@ fn completion_body(
     model: &str,
     logprob_info: LogprobInfo,
     echo: bool,
+    token_ids: bool,
 ) -> Value {
     debug_assert_eq!(outputs.len(), request_plan.len());
     let choices: Vec<Value> = outputs
@@ -3611,7 +3632,7 @@ fn completion_body(
                 .prompt_logprobs
                 .as_ref()
                 .map_or(Value::Null, prompt_logprobs_value);
-            json!({
+            let mut choice = json!({
                 "index": index,
                 "text": text,
                 "logprobs": logprobs,
@@ -3621,7 +3642,11 @@ fn completion_body(
                 // choice until the device engine can report one.
                 "stop_reason": Value::Null,
                 "prompt_logprobs": prompt_logprobs,
-            })
+            });
+            if token_ids && let Some(ids) = output.token_ids.as_ref() {
+                choice["token_ids"] = json!(ids);
+            }
+            choice
         })
         .collect();
     let usage = aggregate_completion_usage(outputs, request_plan);
@@ -3958,7 +3983,8 @@ fn completions_stream_response(
             let (prompt_index, choice_index) = request_plan[request_index];
             let chunk_index = prompt_index * n + choice_index;
             match event {
-                EngineEvent::Started { .. } => {}
+                // A stream refuses return_token_ids, so the ids go nowhere here.
+                EngineEvent::Started { .. } | EngineEvent::TokenIds(_) => {}
                 EngineEvent::PromptLogprobs(payload) => {
                     prompt_logprobs[request_index] = Some(*payload)
                 }
@@ -5790,7 +5816,8 @@ fn responses_stream_response(
             match event {
                 EngineEvent::Started { .. }
                 | EngineEvent::PromptLogprobs(_)
-                | EngineEvent::TokenLogprobs(_) => {}
+                | EngineEvent::TokenLogprobs(_)
+                | EngineEvent::TokenIds(_) => {}
                 EngineEvent::ReasoningDelta(text) => {
                     for frame in responses_reasoning_frames(
                         &mut items,
@@ -6559,7 +6586,8 @@ fn messages_stream_response(
             match event {
                 EngineEvent::Started { .. }
                 | EngineEvent::PromptLogprobs(_)
-                | EngineEvent::TokenLogprobs(_) => {}
+                | EngineEvent::TokenLogprobs(_)
+                | EngineEvent::TokenIds(_) => {}
                 EngineEvent::ReasoningDelta(text) => {
                     for frame in anthropic_reasoning_frames(&mut items, &text) {
                         yield Ok(frame);

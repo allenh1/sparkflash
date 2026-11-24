@@ -384,6 +384,10 @@ pub enum EngineEvent {
     /// Prompt logprobs, emitted once after `Started` and before any delta or token logprob, only
     /// when the request asked for them. The payload's `positions[0]` is `None`.
     PromptLogprobs(Box<PromptLogprobs>),
+    /// Every generated token id, in order, emitted once before `Finished` by an engine that
+    /// reports them (vLLM's `return_token_ids`). An engine that does not emit it leaves a request
+    /// that asked for the ids refused, not answered without them.
+    TokenIds(Vec<u32>),
     /// Terminal event carrying usage and telemetry.
     Finished {
         /// Why generation stopped.

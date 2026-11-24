@@ -351,6 +351,10 @@ pub struct CompletionRequest {
     /// are the strings `token_id:{id}` instead of decoded text, so two ids that decode to the same
     /// text (byte-fallback pieces, for one) stay distinguishable.
     pub return_tokens_as_token_ids: Option<bool>,
+    /// vLLM's `return_token_ids`: each choice also carries `token_ids`, the generated ids, which
+    /// needs no logprobs (the device path serves none). An engine that does not report ids
+    /// refuses the request.
+    pub return_token_ids: Option<bool>,
     /// SparkFlash teacher forcing: generate exactly these token ids instead of the model's choice.
     ///
     /// Each position's logprobs are the model's distribution given the prompt and the forced

@@ -572,6 +572,8 @@ struct Live {
     reasoning_tail: Option<char>,
     reasoning_tokens: usize,
     completion_tokens: usize,
+    /// The ids streamed so far, for the terminal [EngineEvent::TokenIds].
+    ids: Vec<u32>,
     decode: DecodeState,
     stop: StopBuffer,
     /// The client stopped reading: the rest of the request is not sent.
@@ -592,6 +594,7 @@ impl Live {
             reasoning_tail: None,
             reasoning_tokens: 0,
             completion_tokens: 0,
+            ids: Vec::new(),
             decode: DecodeState::default(),
             stop,
             closed: false,
@@ -644,6 +647,7 @@ impl Live {
                 break;
             }
             self.completion_tokens += 1;
+            self.ids.push(token);
             metrics.record_generation_tokens(1);
             if self.ttft.is_none() {
                 metrics
@@ -762,6 +766,7 @@ impl Live {
                     },
                     DEVICE_FABRIC,
                 );
+                self.send(EngineEvent::TokenIds(std::mem::take(&mut self.ids)));
                 if let EngineEvent::Finished { usage, .. } = &mut event {
                     usage.completion_tokens_details.reasoning_tokens = self.reasoning_tokens;
                     usage.prompt_tokens_details.cached_tokens = outcome.cached_tokens;

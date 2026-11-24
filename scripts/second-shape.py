@@ -323,27 +323,42 @@ def parse_token_id(token: object) -> int:
 def request_completion(
     args: argparse.Namespace, prompt: list[int]
 ) -> tuple[list[int], list[list[list[float]]]]:
-    """One greedy completion, its ids, and the top-2 alternatives each generated position saw."""
-    body = json.dumps(
-        {
-            "model": args.model,
-            "prompt": prompt,
-            "max_tokens": args.max_tokens,
-            "temperature": 0.0,
-            # The engine's Top(n) selection includes the served token; asking for two
-            # alternatives leaves the served token plus its nearest rival, which is the gap.
-            "logprobs": 2,
-            "return_tokens_as_token_ids": True,
-        }
-    ).encode()
+    """One greedy completion, its ids, and the top-2 alternatives each generated position saw.
+
+    Under `--ids token-ids` (the device arm, which serves no logprobs) the ids are the choice's
+    `token_ids` and no alternatives are known."""
+    fields: dict[str, object] = {
+        "model": args.model,
+        "prompt": prompt,
+        "max_tokens": args.max_tokens,
+        "temperature": 0.0,
+    }
+    if args.ids == "token-ids":
+        fields["return_token_ids"] = True
+    else:
+        # The engine's Top(n) selection includes the served token; asking for two alternatives
+        # leaves the served token plus its nearest rival, which is the gap.
+        fields["logprobs"] = 2
+        fields["return_tokens_as_token_ids"] = True
+    body = json.dumps(fields).encode()
     request = urllib.request.Request(
         args.url + "/v1/completions",
         data=body,
         headers={"content-type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=600) as answer:
-        reply = json.loads(answer.read())
+    try:
+        with urllib.request.urlopen(request, timeout=600) as answer:
+            reply = json.loads(answer.read())
+    except urllib.error.HTTPError as error:
+        fail(f"the server refused the completion ({error.code}): {error.read().decode(errors='replace')}")
     choice = reply["choices"][0]
+    if args.ids == "token-ids":
+        ids = choice.get("token_ids")
+        if not isinstance(ids, list) or not all(isinstance(token, int) for token in ids):
+            fail(f"the server did not return token_ids (got {ids!r})")
+        if EOS in ids:
+            ids = ids[: ids.index(EOS) + 1]
+        return ids, []
     logprobs = choice.get("logprobs") or {}
     tokens = logprobs.get("tokens") or []
     positions = logprobs.get("top_logprobs") or []
@@ -764,6 +779,8 @@ def run_world(
                     str(args.max_tokens),
                     "--ready-timeout",
                     "60",
+                    "--ids",
+                    "token-ids",
                 ]
             ).returncode
         finally:
@@ -946,6 +963,13 @@ def main() -> int:
     compare_parser.add_argument("--model", default=MODEL)
     compare_parser.add_argument("--max-tokens", type=int, default=8)
     compare_parser.add_argument("--ready-timeout", type=int, default=600)
+    compare_parser.add_argument(
+        "--ids",
+        default="logprobs",
+        choices=("logprobs", "token-ids"),
+        help="where the ids come from: logprobs (with the top-2 gaps) or the choice's token_ids "
+        "(the device arm, which serves no logprobs)",
+    )
     compare_parser.set_defaults(func=compare)
 
     args = parser.parse_args()

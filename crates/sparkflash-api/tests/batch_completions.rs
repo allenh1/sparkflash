@@ -478,3 +478,84 @@ async fn streaming_batch_echoes_each_prompt_in_its_own_choice() {
         );
     }
 }
+
+/// [PromptAwareEngine] that also reports its one generated id, as the device engine does.
+struct IdsEngine(PromptAwareEngine);
+
+impl InferenceEngine for IdsEngine {
+    fn model_id(&self) -> &str {
+        self.0.model_id()
+    }
+
+    fn generate(&self, request: EngineRequest) -> futures::stream::BoxStream<'static, EngineEvent> {
+        use futures::StreamExt as _;
+        let prompt_tokens = request.prompt_tokens.len() as u32;
+        Box::pin(self.0.generate(request).flat_map(move |event| {
+            let events = if matches!(event, EngineEvent::Finished { .. }) {
+                vec![EngineEvent::TokenIds(vec![prompt_tokens + 100]), event]
+            } else {
+                vec![event]
+            };
+            futures::stream::iter(events)
+        }))
+    }
+
+    fn cluster_stats(&self) -> ClusterStatsSnapshot {
+        self.0.cluster_stats()
+    }
+}
+
+fn prompt_aware() -> PromptAwareEngine {
+    PromptAwareEngine {
+        model: MODEL_ID.to_owned(),
+        cluster: ClusterStatsSnapshot::default(),
+    }
+}
+
+#[tokio::test]
+async fn return_token_ids_puts_the_generated_ids_on_the_choice() {
+    let (status, body) = post(
+        app_with_engine(Arc::new(IdsEngine(prompt_aware()))),
+        "/v1/completions",
+        json!({"model": MODEL_ID, "prompt": [1, 2, 3], "max_tokens": 1, "return_token_ids": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["choices"][0]["token_ids"], json!([103]), "{body}");
+}
+
+#[tokio::test]
+async fn without_return_token_ids_a_choice_carries_no_ids() {
+    let (status, body) = post(
+        app_with_engine(Arc::new(IdsEngine(prompt_aware()))),
+        "/v1/completions",
+        json!({"model": MODEL_ID, "prompt": [1, 2], "max_tokens": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["choices"][0].get("token_ids").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn an_engine_that_reports_no_ids_refuses_return_token_ids() {
+    let (status, body) = post(
+        app_with_engine(Arc::new(prompt_aware())),
+        "/v1/completions",
+        json!({"model": MODEL_ID, "prompt": [1, 2], "max_tokens": 1, "return_token_ids": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.to_string().contains("return_token_ids"), "{body}");
+}
+
+#[tokio::test]
+async fn a_stream_refuses_return_token_ids() {
+    let (status, body) = post(
+        app_with_engine(Arc::new(IdsEngine(prompt_aware()))),
+        "/v1/completions",
+        json!({"model": MODEL_ID, "prompt": [1, 2], "max_tokens": 1, "stream": true, "return_token_ids": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("return_token_ids"), "{body}");
+}
