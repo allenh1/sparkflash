@@ -1515,25 +1515,15 @@ fn tensor_wide_factor(
     wide: sparkflash_model::format::NvFp4Wide,
     limit: usize,
 ) -> Result<f32, EngineError> {
-    use sparkflash_model::format::NvFp4Wide;
-    match wide {
-        NvFp4Wide::None => Ok(1.0),
-        NvFp4Wide::Qwen => {
-            let weight = linalg::decode_by_name(src, &format!("{name}.weight_scale_2"), limit)?;
-            // The second factor travels; it is the activation's, so the weight does not see it.
-            let _activation = linalg::decode_by_name(src, &format!("{name}.input_scale"), limit)?;
-            Ok(weight.first().copied().unwrap_or(1.0))
-        }
-        NvFp4Wide::Inkling => {
-            let amax = linalg::decode_by_name(src, &format!("{name}.weight_amax"), limit)?;
-            let denominator = linalg::decode_by_name(
-                src,
-                &format!("{name}.weight_outer_scale_denominator"),
-                limit,
-            )?;
-            Ok(amax.first().copied().unwrap_or(0.0) / denominator.first().copied().unwrap_or(1.0))
-        }
-    }
+    let Some([first, second]) = wide.leaves() else {
+        return Ok(1.0);
+    };
+    let first = linalg::decode_by_name(src, &format!("{name}.{first}"), limit)?;
+    let second = linalg::decode_by_name(src, &format!("{name}.{second}"), limit)?;
+    Ok(wide.factor(
+        first.first().copied().unwrap_or(0.0),
+        second.first().copied().unwrap_or(1.0),
+    ))
 }
 
 /// A shape refusal naming the operation that could not be applied.

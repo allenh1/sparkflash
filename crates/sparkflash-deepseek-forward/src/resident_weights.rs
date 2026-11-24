@@ -1036,6 +1036,11 @@ pub struct MatrixBind {
 pub struct MoeBind {
     /// (layer, expert, matrix) -> arena pointers.
     pub routed: BTreeMap<(usize, usize, Matrix), MatrixBind>,
+    /// (layer, expert, matrix) -> the two tensor-wide factor leaves of a layer whose expert
+    /// format carries an NVFP4 convention ([NvFp4Wide::leaves] order); absent elsewhere.
+    ///
+    /// [NvFp4Wide::leaves]: sparkflash_model::format::NvFp4Wide::leaves
+    pub routed_wide: BTreeMap<(usize, usize, Matrix), [Deviceptr; 2]>,
     /// (layer, matrix) -> arena pointers.
     pub shared: BTreeMap<(usize, Matrix), MatrixBind>,
     /// (layer, router part) -> arena pointer.
@@ -1355,6 +1360,13 @@ pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
     let mut shared: BTreeSet<String> = BTreeSet::new();
     let mut router: BTreeSet<String> = BTreeSet::new();
     for layer in 0..config.n_layers {
+        // A layer whose expert format carries an NVFP4 convention stores its two factors beside
+        // every matrix; the set names them so a plan that dropped one is refused here.
+        let wide = config
+            .expert_format_at(layer)
+            .map_or(sparkflash_model::format::NvFp4Wide::None, |format| {
+                format.tensor_wide()
+            });
         for expert in 0..config.n_routed_experts {
             for matrix in [Matrix::Gate, Matrix::Up] {
                 let base = crate::plan::layer_claim(
@@ -1364,11 +1376,13 @@ pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
                 .to_owned();
                 gate_up.insert(base.clone());
                 gate_up.insert(format!("{}.scale", base.trim_end_matches(".weight")));
+                gate_up.extend(wide_leaf_names(&base, wide));
             }
             let base = crate::plan::layer_claim(layer, &format!("ffn.experts.{expert}.w2.weight"))
                 .to_owned();
             down.insert(base.clone());
             down.insert(format!("{}.scale", base.trim_end_matches(".weight")));
+            down.extend(wide_leaf_names(&base, wide));
         }
         for matrix in [Matrix::Gate, Matrix::Up, Matrix::Down] {
             let base = crate::plan::layer_claim(
@@ -1393,6 +1407,28 @@ pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
     }
 }
 
+/// The factor leaves an NVFP4 convention stores beside the weight `base` (`<matrix>.weight`).
+fn wide_leaf_names(base: &str, wide: sparkflash_model::format::NvFp4Wide) -> Vec<String> {
+    let matrix = base.trim_end_matches(".weight");
+    wide.leaves()
+        .into_iter()
+        .flatten()
+        .map(|leaf| format!("{matrix}.{leaf}"))
+        .collect()
+}
+
+/// The (matrix, factor index) a routed expert's tensor-wide factor leaf names, for any NVFP4
+/// convention's spelling.
+fn wide_leaf(name: &str) -> Option<(Matrix, usize)> {
+    use sparkflash_model::format::NvFp4Wide;
+    let (matrix_name, leaf) = name.rsplit_once('.')?;
+    let index = [NvFp4Wide::Qwen, NvFp4Wide::Inkling]
+        .into_iter()
+        .find_map(|wide| wide.leaves()?.iter().position(|known| *known == leaf))?;
+    let (matrix, _) = matrix_and_scale(&format!("{matrix_name}.weight"))?;
+    Some((matrix, index))
+}
+
 /// Binds the routed experts, shared experts and routers of one rank to its arena, with one set
 /// check per device class and launch-compatibility rows for the current kernel ABIs.
 ///
@@ -1411,6 +1447,7 @@ pub fn bind_rank_moe(
         .collect();
     let empty_table: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let mut routed: BTreeMap<(usize, usize, Matrix), MatrixBind> = BTreeMap::new();
+    let mut routed_wide: BTreeMap<(usize, usize, Matrix), [Option<Deviceptr>; 2]> = BTreeMap::new();
     let mut shared: BTreeMap<(usize, Matrix), MatrixBind> = BTreeMap::new();
     let mut router: BTreeMap<(usize, RouterPart), Deviceptr> = BTreeMap::new();
     let mut routed_gate_up: BTreeSet<String> = BTreeSet::new();
@@ -1431,6 +1468,25 @@ pub fn bind_rank_moe(
                     .ok_or_else(|| format!("{}: no layer index", shard.name))?;
                 let expert = plan_expert(&shard.name)
                     .ok_or_else(|| format!("{}: no expert index", shard.name))?;
+                if let Some((matrix, index)) = wide_leaf(&shard.name) {
+                    let slice = arena.slice(&shard.name).ok_or_else(|| {
+                        format!("{}: no arena slice for the tensor-wide factor", shard.name)
+                    })?;
+                    if slice.bytes != 4 {
+                        return Err(format!(
+                            "{}: a tensor-wide factor is one f32, the arena slice is {} bytes",
+                            shard.name, slice.bytes
+                        ));
+                    }
+                    routed_wide.entry((layer, expert, matrix)).or_default()[index] =
+                        Some(slice.ptr);
+                    match matrix {
+                        Matrix::Down => &mut routed_down,
+                        Matrix::Gate | Matrix::Up => &mut routed_gate_up,
+                    }
+                    .insert(shard.name.clone());
+                    continue;
+                }
                 let Some((matrix, false)) = matrix_and_scale(&shard.name) else {
                     return Err(format!(
                         "{}: a routed expert leaf is not a w1/w3/w2 weight",
@@ -1582,7 +1638,14 @@ pub fn bind_rank_moe(
             ),
         }),
     ];
+    // A factor pair the plan carried only half of is refused by the coverage sets above; the
+    // pairs left are whole.
+    let routed_wide = routed_wide
+        .into_iter()
+        .filter_map(|(key, [first, second])| Some((key, [first?, second?])))
+        .collect();
     Ok(MoeBind {
+        routed_wide,
         routed,
         shared,
         router,

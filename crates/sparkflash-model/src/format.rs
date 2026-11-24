@@ -198,6 +198,31 @@ impl NvFp4Wide {
             Self::Inkling => "inkling",
         }
     }
+
+    /// The two leaves beside a weight (`<matrix>.<leaf>`) its factors are stored under, in the
+    /// order [NvFp4Wide::factor] takes them; `None` for no convention. Every reader (the host
+    /// reference and the device binds) names them here, so the spelling is stated once.
+    #[must_use]
+    pub const fn leaves(self) -> Option<[&'static str; 2]> {
+        match self {
+            Self::None => None,
+            Self::Qwen => Some(["weight_scale_2", "input_scale"]),
+            Self::Inkling => Some(["weight_amax", "weight_outer_scale_denominator"]),
+        }
+    }
+
+    /// The factor a weight's decoded products are multiplied by, from its two stored values.
+    ///
+    /// Qwen's weight global is the factor (the second value is the activation's static global,
+    /// which the weight does not see); Inkling's is the amax over the outer denominator.
+    #[must_use]
+    pub fn factor(self, first: f32, second: f32) -> f32 {
+        match self {
+            Self::None => 1.0,
+            Self::Qwen => first,
+            Self::Inkling => first / second,
+        }
+    }
 }
 
 /// How a body reads a tensor's values in memory.

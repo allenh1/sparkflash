@@ -5148,8 +5148,27 @@ impl Layer0MoeRouted {
     }
 }
 
+/// The tokens one format-route piece holds; a longer step runs in pieces of this many.
+#[cfg(feature = "cuda")]
+const ROUTED_FORMAT_TOKENS: usize = 256;
+
+/// The stored format the plan states for one decoder block's routed experts.
+#[cfg(feature = "cuda")]
+fn routed_expert_format(layer: usize) -> Result<sparkflash_model::format::StoredFormat, String> {
+    crate::plan::description()
+        .operand(Some(layer), sparkflash_model::Part::Moe)
+        .map(|operand| operand.stored)
+        .ok_or_else(|| {
+            format!("layer device routed MoE: the plan states no expert format for layer {layer}")
+        })
+}
+
 /// The per-rank slice base pointers of one routed-expert matrix, accepting either the plan's sharded
 /// slice shape or the released full shape (in which case the rank's slice offset is added).
+///
+/// `values` is the slice's logical `[rows, cols]`; the stored shape and the scale plane's length
+/// follow from `format` (two E2M1 codes a byte, one E4M3 code a byte, the format's own scale
+/// arrangement), so one rule serves every expert format.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn routed_slice_base(
@@ -5160,8 +5179,10 @@ fn routed_slice_base(
     matrix: crate::resident_weights::Matrix,
     leaf: &str,
     rank: usize,
-    slice_shape: [usize; 2],
+    format: sparkflash_model::format::StoredFormat,
+    values: [usize; 2],
 ) -> Result<(Deviceptr, Deviceptr), String> {
+    let slice_shape = [values[0], values[1] / format.values().values_per_byte()];
     let pair = bind.routed.get(&(layer, expert, matrix)).ok_or_else(|| {
         format!("MoE: the bind has no routed expert {expert} {leaf} (layer {layer})")
     })?;
@@ -5169,7 +5190,7 @@ fn routed_slice_base(
         crate::plan::layer_claim(layer, &format!("ffn.experts.{expert}.{leaf}.weight"));
     let scale_name = crate::plan::layer_claim(layer, &format!("ffn.experts.{expert}.{leaf}.scale"));
     let slice_values = slice_shape[0] * slice_shape[1];
-    let scale_slice = slice_shape[0] * (slice_shape[1] / 16);
+    let scale_slice = format.scale_count(values[0], values[1]);
     let weight_shape = plan_index
         .shard_shape(weight_name)
         .ok_or_else(|| format!("MoE: the rank plan does not carry {weight_name}"))?;
@@ -5383,7 +5404,8 @@ fn run_layer_moe_routed(
                 crate::resident_weights::Matrix::Gate,
                 "w1",
                 rank,
-                [local_inter, dim / 2],
+                sparkflash_model::format::StoredFormat::MXFP4_ROW_32,
+                [local_inter, dim],
             )?;
             let (w3, s3) = routed_slice_base(
                 &bind.moe,
@@ -5393,7 +5415,8 @@ fn run_layer_moe_routed(
                 crate::resident_weights::Matrix::Up,
                 "w3",
                 rank,
-                [local_inter, dim / 2],
+                sparkflash_model::format::StoredFormat::MXFP4_ROW_32,
+                [local_inter, dim],
             )?;
             let (w2, s2) = routed_slice_base(
                 &bind.moe,
@@ -5403,7 +5426,8 @@ fn run_layer_moe_routed(
                 crate::resident_weights::Matrix::Down,
                 "w2",
                 rank,
-                [dim, inter / 2 / world],
+                sparkflash_model::format::StoredFormat::MXFP4_ROW_32,
+                [dim, inter / world],
             )?;
             cuda.copy_dtod(&gate_stage.offset(slot * w_slice), &w1, w_slice)
                 .map_err(|error| format!("MoE: w1 stage copy: {error}"))?;
@@ -11421,6 +11445,10 @@ struct DeviceLayer<'a> {
     /// The routed stage's run-scope state: the expert pointer table and the staging buffers.
     /// `attach_moe_routed` builds it once, after `attach_routed` has resolved the arena pointers.
     moe_routed_device: Option<sparkflash_kernels::moe_routed_device::MoeRoutedDevice>,
+    /// The routed experts of the blocks whose stored format the released MXFP4 bodies do not
+    /// read, on the format route ([Self::attach_routed_format]); `None` when every block is the
+    /// released format.
+    routed_format: Option<sparkflash_kernels::routed_format::RoutedFormatDevice>,
     /// The `moe_router` probe count the last `moe_routed` call consumed, so a stale id row is
     /// refused instead of combined.
     moe_router_seen: u64,
@@ -12665,6 +12693,7 @@ impl<'a> DeviceLayer<'a> {
             cubin_dir: kernel_cubin_dir.map(std::path::Path::to_path_buf),
             opt_select,
             moe_routed_device: None,
+            routed_format: None,
             moe_router_seen: 0,
             engram: None,
             seam_staged: None,
@@ -13857,6 +13886,179 @@ impl<'a> DeviceLayer<'a> {
         Ok(())
     }
 
+    /// Opens the format route for the blocks whose expert format the released MXFP4 bodies do not
+    /// read: the catalogue entries that decode each such block's format, its expert table (with
+    /// each matrix's NVFP4 factor, read once from the arena) and the route's planes.
+    ///
+    /// Called once, after `attach_moe_routed`. A run whose every block is the released format
+    /// opens nothing and needs no new cubin; one that has such a block refuses by name if the
+    /// staged directory lacks `routed_format_sm121.cubin` or the plan claims no entry decoding
+    /// the block's format.
+    fn attach_routed_format(
+        &mut self,
+        bind: &crate::tp4_resident::DeviceBind,
+        kernel_dir: &std::path::Path,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::routed_format::{
+            FormatEntries, RoutedFormatDevice, RoutedFormatGeometry, SharedKernels, TABLE_STRIDE,
+            matrix_words,
+        };
+        use sparkflash_model::format::StoredFormat;
+        if self.routed_format.is_some() {
+            return Err("layer device routed format: attached twice".to_owned());
+        }
+        let Some(routed) = self.routed.as_ref() else {
+            return Err("layer device routed format: no routed shard was attached".to_owned());
+        };
+        let formats = (0..routed.len())
+            .map(routed_expert_format)
+            .collect::<Result<Vec<_>, _>>()?;
+        let released = |format: &StoredFormat| format.same_arithmetic(StoredFormat::MXFP4_ROW_32);
+        if formats.iter().all(released) {
+            return Ok(());
+        }
+        let what = |layer: usize| {
+            format!(
+                "layer device routed format: layer {layer} stores its experts as {}",
+                formats[layer].describe()
+            )
+        };
+        let first = formats
+            .iter()
+            .position(|format| !released(format))
+            .unwrap_or(0);
+        let (cubin, _sha) =
+            cached_cubin(&kernel_dir.join("routed_format_sm121.cubin")).map_err(|error| {
+                format!(
+                    "{}, which only the format route reads: {error}",
+                    what(first)
+                )
+            })?;
+        let load = |name: &'static str| -> Result<sparkflash_kernels::cuda_driver::Kernel, String> {
+            // The modules stay loaded for the process, as every by-name load here does.
+            self.cuda
+                .load_named(&cubin, name)
+                .map(|(_module, kernel)| kernel)
+                .map_err(|error| format!("layer device routed format: load {name}: {error}"))
+        };
+        let description = crate::plan::description();
+        let mut layers = Vec::with_capacity(formats.len());
+        for (layer, format) in formats.iter().enumerate() {
+            if released(format) {
+                layers.push(None);
+                continue;
+            }
+            let entry = |prefix: &str| {
+                description
+                    .symbol_decoding(Some(layer), sparkflash_model::Part::Moe, prefix, *format)
+                    .map_err(|error| format!("{}: {error}", what(layer)))
+            };
+            layers.push(Some(FormatEntries {
+                gate_up: load(entry("routed_format_gate_up_")?)?,
+                down: load(entry("routed_format_down_")?)?,
+            }));
+        }
+        let opt = self.moe_opt_kernels.as_ref().ok_or_else(|| {
+            format!(
+                "{}: the format route sums its slots with the opt MoE combine, and the run loaded                  no opt_moe_sm121 (diagnostics.opt_moe is off)",
+                what(first)
+            )
+        })?;
+        let plan_image = sparkflash_kernels::images::moe_plan_cubin();
+        if plan_image.is_empty() {
+            return Err(format!(
+                "{}: this build embeds no routed-expert plan cubin",
+                what(first)
+            ));
+        }
+        let (_plan_module, plan) = self
+            .cuda
+            .load_named(plan_image, "moe_plan")
+            .map_err(|error| format!("layer device routed format: load moe_plan: {error}"))?;
+        let (rows_cubin, _sha) = cached_cubin(&kernel_dir.join("opt_rows_sm121.cubin"))
+            .map_err(|error| format!("layer device routed format: {error}"))?;
+        let (_swiglu_module, swiglu) = self
+            .cuda
+            .load_named(&rows_cubin, "opt_rows_shared_swiglu")
+            .map_err(|error| format!("layer device routed format: load SwiGLU: {error}"))?;
+        let shared = SharedKernels {
+            plan,
+            plan_threads: sparkflash_model::active_profile().plan.block_threads(),
+            swiglu,
+            combine: opt.dedup[2].1,
+            widen: load("routed_format_widen_sm121")?,
+        };
+        // The table: every layer's rows, the released layers' too (the route never reads them),
+        // so a layer's base is its index times the layer stride.
+        let geometry = self.routed_geometry;
+        let mut table = Vec::with_capacity(routed.len() * geometry.experts * TABLE_STRIDE);
+        let factor = |layer: usize, expert: usize, matrix| -> Result<f32, String> {
+            let wide = formats[layer].tensor_wide();
+            if wide.leaves().is_none() {
+                return Ok(0.0);
+            }
+            let pair = bind
+                .moe
+                .routed_wide
+                .get(&(layer, expert, matrix))
+                .ok_or_else(|| {
+                    format!(
+                        "{}: expert {expert} {matrix:?} has no bound {} factor pair",
+                        what(layer),
+                        wide.name()
+                    )
+                })?;
+            let mut values = [0f32; 2];
+            for (value, ptr) in values.iter_mut().zip(pair) {
+                let mut word = [0u8; 4];
+                self.cuda
+                    .copy_dtoh(&mut word, ptr)
+                    .map_err(|error| format!("layer device routed format: factor read: {error}"))?;
+                *value = f32::from_le_bytes(word);
+            }
+            Ok(wide.factor(values[0], values[1]))
+        };
+        for (layer, experts) in routed.iter().enumerate() {
+            for (expert, matrices) in experts.iter().enumerate() {
+                for (bound, matrix) in matrices.iter().zip([
+                    crate::resident_weights::Matrix::Gate,
+                    crate::resident_weights::Matrix::Up,
+                    crate::resident_weights::Matrix::Down,
+                ]) {
+                    let wide = if released(&formats[layer]) {
+                        0.0
+                    } else {
+                        factor(layer, expert, matrix)?
+                    };
+                    table.extend(matrix_words(bound.weight, bound.scales, wide));
+                }
+            }
+        }
+        let device = RoutedFormatDevice::open(
+            self.cuda,
+            RoutedFormatGeometry {
+                dim: geometry.dim,
+                local_inter: geometry.local_inter,
+                experts: geometry.experts,
+                top_k: geometry.top_k,
+            },
+            shared,
+            layers,
+            &table,
+            ROUTED_FORMAT_TOKENS,
+            self.swiglu_limit,
+        )?;
+        self.routed_format = Some(device);
+        Ok(())
+    }
+
+    /// Whether the format route serves `layer`'s routed experts.
+    pub(crate) fn routed_format_serves(&self, layer: usize) -> bool {
+        self.routed_format
+            .as_ref()
+            .is_some_and(|route| route.serves(layer))
+    }
+
     /// The routed data path's device bytes, as `attach_moe_routed` allocated them.
     fn moe_routed_device_bytes(&self) -> usize {
         self.moe_routed_device.as_ref().map_or(
@@ -14508,6 +14710,7 @@ impl<'a> DeviceLayer<'a> {
         let n_layers = self.compress_ratio.len();
         let mut layers = Vec::with_capacity(n_layers);
         for layer in 0..n_layers {
+            let format = routed_expert_format(layer)?;
             let mut experts = Vec::with_capacity(geometry.experts);
             for expert in 0..geometry.experts {
                 let mut pair = [crate::resident_weights::MatrixBind {
@@ -14518,17 +14721,17 @@ impl<'a> DeviceLayer<'a> {
                     (
                         crate::resident_weights::Matrix::Gate,
                         "w1",
-                        [geometry.local_inter, geometry.dim / 2],
+                        [geometry.local_inter, geometry.dim],
                     ),
                     (
                         crate::resident_weights::Matrix::Up,
                         "w3",
-                        [geometry.local_inter, geometry.dim / 2],
+                        [geometry.local_inter, geometry.dim],
                     ),
                     (
                         crate::resident_weights::Matrix::Down,
                         "w2",
-                        [geometry.dim, geometry.inter / 2 / geometry.world],
+                        [geometry.dim, geometry.inter / geometry.world],
                     ),
                 ];
                 for (index, (matrix, leaf, shape)) in wanted.into_iter().enumerate() {
@@ -14540,6 +14743,7 @@ impl<'a> DeviceLayer<'a> {
                         matrix,
                         leaf,
                         rank,
+                        format,
                         shape,
                     )
                     .map_err(|error| format!("layer device routed MoE: {error}"))?;
@@ -14778,6 +14982,9 @@ impl Drop for DeviceLayer<'_> {
         // and its five module handles (a cached module's free is a documented no-op).
         if let Some(routed) = self.moe_routed_device.take() {
             routed.release(self.cuda);
+        }
+        if let Some(route) = self.routed_format.take() {
+            route.release(self.cuda);
         }
         // The Engram stage's arena, constant matrices, scratch and six module handles.
         if let Some(engram) = self.engram.take() {
@@ -16597,6 +16804,28 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         } else {
             0
         };
+        if let Some(route) = self
+            .routed_format
+            .as_ref()
+            .filter(|route| route.serves(layer))
+        {
+            // The format route reads the f32 normed row `ffn_seams` wrote at seam_row's base.
+            route.run(
+                self.cuda,
+                layer,
+                1,
+                &sparkflash_kernels::routed_format::RoutedFormatRows {
+                    x: workspace.seam_row.device,
+                    ids: workspace.moe_ids.device,
+                    weights: workspace.moe_weights.device,
+                    delta_f32: workspace.moe_delta.device,
+                    delta_bf16: workspace.moe_delta_bf16.device,
+                    addend,
+                },
+            )?;
+            probe::count("moe_routed");
+            return Ok(());
+        }
         device.set_addend(addend);
         device.run(self.cuda, layer, position, 1, &operands)?;
         probe::count("moe_routed");
@@ -17611,6 +17840,10 @@ fn run_forward_loop(
             // kernels for the launches. It allocates its 9.8 MiB staging state once, here, before
             // the first clock.
             device.attach_moe_routed()?;
+            let format_dir = request.kernel_cubin_dir.ok_or_else(|| {
+                "layer device: the routed format route needs the staged cubin directory".to_owned()
+            })?;
+            device.attach_routed_format(bind, format_dir)?;
             device.attach_seam_ring()?;
             if let Some(seam) = seam_wq_b.as_ref() {
                 device.set_seam_kernels(seam.hostw_symbols());

@@ -3815,6 +3815,30 @@ impl DeviceLayer<'_> {
             .as_ref()
             .ok_or("rows: no routed device")?;
         let top_k = self.routed_geometry.top_k;
+        if let Some(route) = self
+            .routed_format
+            .as_ref()
+            .filter(|route| route.serves(layer))
+        {
+            // The route reads f32 FFN rows: the seam's own, or a split chunk's gathered BF16 rows
+            // widened into the seam rows (free under a split, whose seam writes none).
+            if self.sp_rows(rows, n).is_some() {
+                route.widen(self.cuda, b.ffn_x, b.seam_row, n * dim)?;
+            }
+            return route.run(
+                self.cuda,
+                layer,
+                n,
+                &sparkflash_kernels::routed_format::RoutedFormatRows {
+                    x: b.seam_row,
+                    ids: b.moe_ids,
+                    weights: b.moe_weights,
+                    delta_f32: b.delta_f32,
+                    delta_bf16: b.delta_bf16,
+                    addend: b.shared_out,
+                },
+            );
+        }
         let operand = |device: u64, len: usize| MoeSpan::new(Deviceptr(device), len);
         let operands = MoeRoutedOperands {
             act_codes: operand(b.ffn_codes, n * dim),

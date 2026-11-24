@@ -1378,29 +1378,48 @@ impl ResidentArgs {
 /// The stored format a checkpoint header states, as the plan resolved it for that tensor's class.
 ///
 /// The file's dtype word selects which class format to ask the plan for, and the plan answers it:
-/// an E4M3 tensor is read in the dense class's arrangement ([EnginePlan::dense_stored_format]),
-/// an E2M1 tensor in the experts' class format, and a bf16 or f32 tensor in the one unscaled
-/// format its word names. A scale plane's dtype carries no arithmetic of its own (its weight's
-/// format sizes it), so it states none.
+/// a routed expert's weight is read in its own block's expert format (two blocks of one stack
+/// may store different ones, and an E4M3 expert is not the dense class), any other E4M3 tensor
+/// in the dense class's arrangement ([EnginePlan::dense_stored_format]), an E2M1 tensor in its
+/// block's expert format, and a bf16 or f32 tensor in the one unscaled format its word names. A
+/// scale plane's dtype carries no arithmetic of its own (its weight's format sizes it), so it
+/// states none.
 ///
 /// Nothing here compares a dtype word against an expected one: the bind's authority is the format
 /// the plan resolved, and a release stored another way changes that format, not this match.
 #[must_use]
 pub fn tensor_format(
     plan: &sparkflash_ops::engine_plan::EnginePlan,
+    name: &str,
     dtype: &str,
 ) -> Option<sparkflash_model::format::StoredFormat> {
-    use sparkflash_model::Part;
     use sparkflash_model::format::StoredFormat;
+    let routed = routed_expert_format(plan, name);
     match dtype {
-        "F8_E4M3" => Some(plan.dense_stored_format()),
-        "F4_E2M1" | "I8" => plan
-            .stored_format(Part::Moe, None)
-            .or(Some(StoredFormat::MXFP4_ROW_32)),
+        "F8_E4M3" => Some(routed.unwrap_or_else(|| plan.dense_stored_format())),
+        "F4_E2M1" | "I8" => routed.or(Some(StoredFormat::MXFP4_ROW_32)),
         "BF16" => Some(StoredFormat::BF16),
         "F32" => Some(StoredFormat::F32),
         _ => None,
     }
+}
+
+/// The expert format of the block that claims a routed expert's weight, or `None` for a tensor
+/// that is not one (a scale plane, the shared expert, a dense projection).
+fn routed_expert_format(
+    plan: &sparkflash_ops::engine_plan::EnginePlan,
+    name: &str,
+) -> Option<sparkflash_model::format::StoredFormat> {
+    if !name.contains(".ffn.experts.") || !name.ends_with(".weight") {
+        return None;
+    }
+    // A decoder block's experts take that block's format (a joint declaration states it per
+    // range); a draft stage's are no decoder block and take the part's own aggregate.
+    let block = name
+        .strip_prefix("layers.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|block| block.parse::<usize>().ok());
+    plan.stored_format(sparkflash_model::Part::Moe, block)
 }
 /// Reads the headers the plan needs, from whichever source was given.
 fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize), String> {
@@ -1446,7 +1465,7 @@ fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize)
                 let tensor = header
                     .tensor(name)
                     .map_err(|error| format!("{name}: {error}"))?;
-                let format = tensor_format(&plan, &tensor.dtype);
+                let format = tensor_format(&plan, name, &tensor.dtype);
                 entries.push(
                     HeaderEntry::new(name.to_string(), tensor.dtype.clone(), tensor.shape.clone())
                         .with_format(format),
@@ -1491,7 +1510,7 @@ pub fn entries_from_tensor_index(path: &Path) -> Result<Vec<HeaderEntry>, String
         .into_iter()
         .map(|(name, tensor)| {
             let format = crate::plan::installed()
-                .and_then(|description| tensor_format(description.plan(), &tensor.dtype));
+                .and_then(|description| tensor_format(description.plan(), &name, &tensor.dtype));
             HeaderEntry::new(name, tensor.dtype, tensor.shape).with_format(format)
         })
         .collect())

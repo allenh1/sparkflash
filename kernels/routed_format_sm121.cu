@@ -174,3 +174,16 @@ extern "C" __global__ __launch_bounds__(OM_THREADS) void routed_format_down_mxfp
     OPT_PDL_ENTRY();
     rf_down<SPM_W_MX8R, uint8_t, 0>(table, items, a, route, out, cols, inner, sorted, topk);
 }
+
+// A split chunk's FFN rows reach the routed experts as the gathered BF16 rows (the f32 seam rows
+// are each rank's own); widening them is exact (the low 16 mantissa bits are zeros), so the
+// experts read the same values the BF16 rows hold. Grid-stride over `count` values.
+extern "C" __global__ void routed_format_widen_sm121(const __nv_bfloat16 *__restrict__ src,
+                                                     float *__restrict__ dst, uint32_t count) {
+    OPT_PDL_ENTRY();
+    const uint32_t stride = blockDim.x * gridDim.x;
+    for (uint32_t index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
+         index += stride) {
+        dst[index] = __bfloat162float(src[index]);
+    }
+}

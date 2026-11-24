@@ -2625,14 +2625,13 @@ fn shared_format() -> Result<StoredFormat, EngineError> {
 
 /// The one f32 an NVFP4 convention multiplies a matrix by.
 ///
-/// Qwen's weight global is `weight_scale_2`; `input_scale` is the activation's static global
-/// and is read but not applied to the weight. Inkling's is `amax / outer_scale_denominator`.
+/// Both leaves the convention names are read (a missing one is refused); which of them reach the
+/// weight is [sparkflash_model::format::NvFp4Wide::factor]'s rule.
 fn nvfp4_wide(
     source: &dyn WeightSource,
     name: &str,
     format: StoredFormat,
 ) -> Result<f32, EngineError> {
-    use sparkflash_model::format::NvFp4Wide;
     let scalar = |suffix: &str| -> Result<f32, EngineError> {
         let tensor = format!("{name}.{suffix}");
         let bytes = source
@@ -2646,19 +2645,11 @@ fn nvfp4_wide(
         })?;
         Ok(f32::from_le_bytes(word))
     };
-    match format.tensor_wide() {
-        NvFp4Wide::None => Ok(1.0),
-        NvFp4Wide::Qwen => {
-            let weight = scalar("weight_scale_2")?;
-            let _activation = scalar("input_scale")?;
-            Ok(weight)
-        }
-        NvFp4Wide::Inkling => {
-            let amax = scalar("weight_amax")?;
-            let denominator = scalar("weight_outer_scale_denominator")?;
-            Ok(amax / denominator)
-        }
-    }
+    let wide = format.tensor_wide();
+    let Some([first, second]) = wide.leaves() else {
+        return Ok(1.0);
+    };
+    Ok(wide.factor(scalar(first)?, scalar(second)?))
 }
 
 /// The storage dtype a format's block scale plane needs in the file.

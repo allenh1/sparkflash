@@ -100,6 +100,7 @@ pub mod rmsnorm_ref;
 pub mod roce_abi;
 pub mod roce_reduce;
 pub mod roofline;
+pub mod routed_format;
 pub mod routed_gate_up_abi;
 pub mod routed_gate_up_launch;
 pub mod routed_gate_up_ref;

@@ -588,6 +588,39 @@ impl Description {
         ))
     }
 
+    /// A part instance's symbol in the role `prefix` names whose build decodes `format`.
+    ///
+    /// The format key is the one the build recorded for the symbol
+    /// ([sparkflash_ops::parts::built_format]), so two entries of one role that read different
+    /// arithmetic (NVFP4's two conventions, FP8's two scale dtypes) are told apart by it, never
+    /// by their names.
+    ///
+    /// # Errors
+    /// The part instance claims no symbol of that role decoding the format.
+    pub fn symbol_decoding(
+        &self,
+        block: Option<usize>,
+        part: Part,
+        prefix: &str,
+        format: sparkflash_model::format::StoredFormat,
+    ) -> Result<&'static str, ConfigError> {
+        self.symbols(block, part)
+            .iter()
+            .copied()
+            .find(|symbol| {
+                symbol.starts_with(prefix)
+                    && sparkflash_ops::parts::built_format(symbol)
+                        .is_some_and(|built| built.same_arithmetic(format))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "the plan's {part:?} part instance at {block:?} claims no `{prefix}*` symbol \
+                     decoding {}",
+                    format.describe()
+                )
+            })
+    }
+
     /// A part's symbol that starts with `prefix`.
     ///
     /// # Errors

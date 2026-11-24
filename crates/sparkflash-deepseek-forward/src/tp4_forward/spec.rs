@@ -1597,7 +1597,8 @@ impl DeviceLayer<'_> {
                     break;
                 }
                 let merged = &merged[merged.len() - chunks.len()..];
-                let merge = merge && chunks.len() > 1;
+                // A format block's experts run on the format route, a pass a chunk.
+                let merge = merge && chunks.len() > 1 && !self.routed_format_serves(layer);
                 self.set_seam_weights(*weights);
                 let slot = engram_layers.iter().position(|&target| target == layer);
                 for &(rows, lane, p0, n, task) in chunks {

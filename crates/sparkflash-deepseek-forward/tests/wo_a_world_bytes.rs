@@ -59,7 +59,7 @@ fn resident(path: &Path, world: usize, written: &TensorPlan, names: &[&str]) -> 
         .filter(|spec| names.contains(&spec.name.as_str()))
         .map(|spec| {
             let dtype = spec.dtype.name();
-            let format = sparkflash_deepseek_forward::tp4_resident::tensor_format(&plan, dtype);
+            let format = sparkflash_deepseek_forward::tp4_resident::tensor_format(&plan, &spec.name, dtype);
             HeaderEntry::new(spec.name.clone(), dtype, spec.shape.clone()).with_format(format)
         });
     ResidentPlan::plan(0, world, entries)

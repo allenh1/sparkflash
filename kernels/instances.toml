@@ -9315,6 +9315,17 @@ top_k = 4
 
 [[instance]]
 source = "routed_format_sm121.cu"
+entry = "routed_format_widen_sm121"
+cubin = "routed_format_sm121_s2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
 entry = "routed_format_gate_up_fp8_sm121"
 cubin = "routed_format_sm121_s2w1"
 family = "rows"
@@ -9435,6 +9446,17 @@ top_k = 4
 
 [[instance]]
 source = "routed_format_sm121.cu"
+entry = "routed_format_widen_sm121"
+cubin = "routed_format_sm121_s2w1"
+family = "rows"
+format = "bf16"
+hidden = 4096
+intermediate = 512
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
 entry = "routed_format_gate_up_fp8_sm121"
 cubin = "routed_format_sm121_s2w2"
 family = "rows"
@@ -9548,6 +9570,17 @@ cubin = "routed_format_sm121_s2w2"
 family = "rows"
 format = "mx-fp8-row"
 catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 256
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "routed_format_sm121.cu"
+entry = "routed_format_widen_sm121"
+cubin = "routed_format_sm121_s2w2"
+family = "rows"
+format = "bf16"
 hidden = 4096
 intermediate = 256
 experts = 64
