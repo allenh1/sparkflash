@@ -547,6 +547,41 @@ def host_group_env(logs: Path, binary: str) -> dict[str, str]:
     }
 
 
+def env_for_world(
+    args: argparse.Namespace,
+    out: Path,
+    checkpoint: Path,
+    tokenizer: str,
+    staged: Path,
+    world: int,
+    node_list: list[str],
+    peer_list: list[str],
+) -> dict[str, str]:
+    """The environment for one world's device group, declared the same way at every world."""
+    return {
+        **os.environ,
+        "SPARKFLASH_BIN": args.binary,
+        "SPARKFLASH_CHECKPOINT": str(checkpoint),
+        "SPARKFLASH_TOKENIZER": tokenizer,
+        "SPARKFLASH_CUBINS": str(staged),
+        "SPARKFLASH_LOG_ROOT": str(out / f"logs-serve-{world}"),
+        # Collect needs the launch's run directory; a generated stamp would differ.
+        "SPARKFLASH_RUN_ID": f"w{world}",
+        "ONE_HOST_LOGS": str(out / f"logs-{world}"),
+        "SPARK_NODES": " ".join(node_list),
+        "SPARK_PEERS": " ".join(peer_list),
+        "SPARK_WORLD": str(world),
+        "SPARK_LOCAL_RANKS": "0",
+        "SPARKFLASH_HTTP_BIND": f"0.0.0.0:{args.port}",
+        # The certified head screen is built for the released 5,120-value rows (160 blocks of
+        # 32); this shape serves its full 4,096-value rows (128 blocks) through that head.
+        "SPARKFLASH_HEAD_SCREEN": "0",
+        # The second shape's cubins are built from the instance list, not pinned in the
+        # released baseline; the open manifest records their hashes.
+        "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
+    }
+
+
 def run_world(
     args: argparse.Namespace,
     out: Path,
@@ -654,25 +689,9 @@ def run_world(
             sync_to_nodes(node_list, sync_paths)
         else:
             print("second-shape: node sync skipped (set SPARK_SYNC=1 to distribute the run)")
-        group_env = {
-            **os.environ,
-            "SPARKFLASH_BIN": args.binary,
-            "SPARKFLASH_CHECKPOINT": str(checkpoint),
-            "SPARKFLASH_TOKENIZER": tokenizer,
-            "SPARKFLASH_CUBINS": str(staged),
-            "SPARKFLASH_LOG_ROOT": str(out / f"logs-serve-{world}"),
-            # Collect needs the launch's run directory; a generated stamp would differ.
-            "SPARKFLASH_RUN_ID": f"w{world}",
-            "ONE_HOST_LOGS": str(out / f"logs-{world}"),
-            "SPARK_NODES": " ".join(node_list),
-            "SPARK_PEERS": " ".join(peer_list),
-            "SPARK_WORLD": str(world),
-            "SPARK_LOCAL_RANKS": "0",
-            "SPARKFLASH_HTTP_BIND": f"0.0.0.0:{args.port}",
-            # The second shape's cubins are built from the instance list, not pinned in the
-            # released baseline; the open manifest records their hashes.
-            "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
-        }
+        group_env = env_for_world(
+            args, out, checkpoint, tokenizer, staged, world, node_list, peer_list
+        )
         launcher = str(ROOT / "scripts/serve-four-node.sh")
         started = False
         agreed = 1

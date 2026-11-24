@@ -26,6 +26,7 @@ import importlib.util
 import io
 import os
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -198,6 +199,29 @@ class SummaryTest(unittest.TestCase):
     def test_a_wrapped_reason_stays_on_one_line(self):
         line = second_shape.world_summary([(2, False, "first part\nsecond part")])[0]
         self.assertEqual(line, "second-shape: world 2 FAIL: first part second part")
+
+
+class DeviceEnvTest(unittest.TestCase):
+    """The device group's environment carries the second shape's own declarations."""
+
+    def test_a_device_world_declares_the_head_screen_and_unpinned_cubins(self):
+        args = types.SimpleNamespace(binary="sparkflash", port=8126)
+        env = second_shape.env_for_world(
+            args,
+            Path("/out"),
+            Path("/out/checkpoint"),
+            "/out/tokenizer.json",
+            Path("/out/cubins-w2"),
+            2,
+            ["worker-0", "worker-1"],
+            ["peer-0", "peer-1"],
+        )
+        # The certified screen covers the released width, not this shape's.
+        self.assertEqual(env["SPARKFLASH_HEAD_SCREEN"], "0")
+        self.assertEqual(env["SPARKFLASH_UNPINNED_SECOND_SHAPE"], "1")
+        self.assertEqual(env["SPARKFLASH_CUBINS"], "/out/cubins-w2")
+        self.assertEqual(env["SPARK_NODES"], "worker-0 worker-1")
+        self.assertEqual(env["SPARK_WORLD"], "2")
 
 
 if __name__ == "__main__":
