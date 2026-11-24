@@ -333,6 +333,16 @@ checkpoint agrees with the host reference at one, two and four ranks (`scripts/s
 run --world 1,2,4`). The device arm at one and two ranks still needs R3's rank-count instances;
 its scan shows those rows.
 
+**Result (2026-11-24, R3, no device).** The instance list is the one statement of what a kernel is
+built for: 730 instances over 32 sources in 111 compile groups, and `scripts/instances.py --check`
+holds it together. The head and its reduction take the rank count as an instance argument, the
+routed expert's padding is an instance, and every family carries the world-suffixed copies the
+launcher stages: for the second shape 39 `_s2`, 14 `_s2w1` and 14 `_s2w2` cubins, built from the
+same plan the run reads. The check that the relaxation moved nothing released is the one this
+section's ladder already asks for: the world-four lanes reproduce production's cubins byte for
+byte, 31 of 31. What R3 still owes is the device run at one rank; the window above could not
+give it, because `wo_a`'s stored bytes and world rows are open.
+
 ### F. Formats
 
 * **F1. The format arrives intact (`sparkflash-model`, `sparkflash-ops`, the instance list).**
