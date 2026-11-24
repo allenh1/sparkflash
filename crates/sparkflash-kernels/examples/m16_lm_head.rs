@@ -1214,7 +1214,7 @@ fn run() -> Result<(), String> {
     println!("device buffers: {allocated} B on device 0");
     check_floor(args.floor_gib, "m16_lm_head pre-upload")?;
     cuda.copy_htod(&buffers.weight, &head)?;
-    let block_maxima = lm_head_ref::block_maxima_bf16(&head);
+    let block_maxima = lm_head_ref::block_maxima_bf16(&head, HIDDEN);
     cuda.copy_htod(&buffers.block_maxima, &block_maxima)?;
     check_floor(args.floor_gib, "m16_lm_head post head upload")?;
 

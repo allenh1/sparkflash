@@ -1192,7 +1192,7 @@ fn run() -> Result<(), String> {
     );
 
     let maxima_start = Instant::now();
-    let block_maxima = lm_head_ref::block_maxima_bf16(&head_bytes);
+    let block_maxima = lm_head_ref::block_maxima_bf16(&head_bytes, HIDDEN);
     let maxima_ms = maxima_start.elapsed().as_secs_f64() * 1.0e3;
     cuda.copy_htod(&buffers.weight, &head_bytes)?;
     cuda.copy_htod(&buffers.block_maxima, &block_maxima)?;

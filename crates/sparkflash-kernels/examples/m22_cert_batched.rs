@@ -147,7 +147,7 @@ fn run() -> Result<(), String> {
     if head.len() != VOCAB * HIDDEN * 2 {
         return Err("head.weight size mismatch".to_owned());
     }
-    let block_maxima = lm_head_ref::block_maxima_bf16(&head);
+    let block_maxima = lm_head_ref::block_maxima_bf16(&head, HIDDEN);
     let rank_head = RANK * VOCAB_PER_RANK * HIDDEN * 2;
     // The head's bound geometry: BLOCKS hidden screen blocks per entry. GRID is the number of
     // 1,024-entry vocabulary chunks the kernel launches; the two must not be conflated.
