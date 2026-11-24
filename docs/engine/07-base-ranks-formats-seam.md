@@ -244,6 +244,67 @@ confirms them. A worker's own log is written on the worker's node, so a group-le
 head node sees only rank 0 and hides the cause; the harness now collects every node's log, and a
 window that reads only `rank0.log` is not a window.
 
+**Result (2026-11-24, the device arm at one, two and four ranks, two windows).** Both windows
+ran the synthetic second-shape checkpoint (2.8 GB; the released `mx-fp4` row-scaled expert
+format; hidden 4096; 64 experts, top-4; intermediate 512; vocabulary 32,768) through
+`scripts/second-shape.py run --device`, which drives `scripts/serve-four-node.sh`, on the
+four-node group: worlds 1, 2 and 4, one at a time. Each world's reference is the host arm's own
+output at that world. The host reference was identical to the global file at all three worlds
+and gave
+
+```
+[[6653, 20427, 12813, 422, 9389, 6388, 16395, 6405],
+ [25425, 11040, 11559, 23442, 29453, 17940, 5192, 25888],
+ [30169, 105, 2323, 11724, 1353, 885, 3013, 30683]]
+```
+
+The first window did not reach a rank. The harness's copy step counted the command list instead
+of the hosts it had collected, so the four-node run reported every rank local and skipped the
+copy; it then handed `sync-nodes.py` no `--host` and died at world 1. With the distribution in
+place, the workers had no work tree to `cd` into - the launcher makes every rank run from the
+checkout - so no rank started. Both defects were in the harness and the operator's path, not in
+the arm, and both are fixed (`b9583ff`, `335fd7c`); the operator brief now stages the binary to
+each worker and checks its sha256 before a rank starts.
+
+The second window built `97544a5c` (binary `7245ee9c`) and staged 72 second-shape cubins (39
+`_s2`, 14 `_s2w2`, 14 `_s2w1`, 5 `nvfp4_prefill_sm121_*`), the same binary at the same absolute
+path on every node. No rank reached a launch:
+
+* **World 1: no verdict.** Rank 0 printed `TP=4 device rank 0/1: waiting for the workers` and
+  then spun at full CPU for over two minutes without binding its port; the thread dumps are in
+  `run-r3/w1-hang/`. The harness was in its ready wait, so the window killed it rather than
+  wait out the timeout.
+* **Worlds 2 and 4: refused at the loader's byte check.** Two ranks at each of those worlds
+  printed `tp4-chain: layers.0.attn.wo_a.weight: arena slice is 2097152 bytes but the stored
+  F8_E4M3 layout expects 4194304 bytes (no B12x, no scale)` (2 MiB at two ranks, 1 MiB at four)
+  and the chain exited.
+
+**Cause (2026-11-24, on the source and in the plan, no window).** The shared-expert refusal the
+first window would have hit is one defect and the `wo_a` byte check is another.
+
+* **The shared expert borrowed a format no layer carries.** The gather read
+  `plan::operand(Some(block), Part::DenseMlp)` for `ffn.shared_experts.*`, but every layer of
+  both the released model and the second shape is MoE: the layout claims those tensors under
+  `Part::Moe`, so the description holds no dense-MLP operand at any block and the plan panicked
+  `the plan states no format for DenseMlp at Some(0)`. The released four-rank record predates the
+  plan-format lookup, which is why the group serves while the tip would not. The plan now states
+  the shared expert's format from the tensors whose layout role is `shared_expert`, per block,
+  and answers only when the block's MoE geometry splits a shared width; a layer with no shared
+  expert refuses by name (`bd23e64`, with a regression test over the released plan and the
+  second shape at every rank).
+* **`wo_a`'s stored bytes are stated without the world.** At the second shape one layer's `wo_a`
+  is (o_groups x o_lora_rank) x dim = 1024 x 4096 E4M3 values, 4 MiB, and the arena holds 2 MiB
+  at two ranks and 1 MiB at four: the rows split over the world exactly as the arena does. The
+  expectation compared against is the unsharded 4 MiB, so the check is world-blind on one side.
+  The instance list has a released row and a `_s2` row for `b12x_mxfp8_wo_a_sm121` and no
+  `_s2w1` or `_s2w2` row, so worlds 1 and 2 stage the released cubin, compiled for a geometry
+  this shape does not have; world 1 passes the byte check (its arena is the whole tensor) and
+  then hangs, which is consistent with that body running against the wrong geometry but is not
+  yet proven from the staged cubin's compiled shape. Both halves are open.
+
+So the bar this section sets is still unmet for the second shape at any world: what has run on a
+device is the plan builder at four ranks and nothing beyond it. The next window is gated on the
+`wo_a` fix.
 ## 4. The work
 
 ### R. Ranks
