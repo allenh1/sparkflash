@@ -2311,7 +2311,8 @@ impl WeightSource for RankWeights {
         {
             self.read_calls.fetch_add(1, Ordering::Relaxed);
             let bytes = self.read_packed(name, &escape, rule)?;
-            self.read_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            self.read_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             return Ok(bytes);
         }
         if let Some(cache) = &self.cache
