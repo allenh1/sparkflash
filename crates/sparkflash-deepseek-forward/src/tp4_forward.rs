@@ -62,6 +62,17 @@ mod draft;
 mod lanes;
 #[cfg(feature = "cuda")]
 pub(crate) mod rows;
+
+/// The number of hidden streams the row kernels are built for (kernels/opt_rows_sm121.cu's
+/// `OR_S_HC`). A plan that states another count is refused before a row is written: the gather
+/// writes this many streams per row, and the checkpoint's own stream count has to be the same one.
+pub const ROWS_STREAMS: usize = 4;
+
+/// The streams per row the device path is built for.
+#[must_use]
+pub fn rows_streams() -> usize {
+    ROWS_STREAMS
+}
 // Pure host code, built (and tested) without the device too; only the device path uses it.
 #[cfg(test)]
 mod live_trace;

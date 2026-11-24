@@ -436,15 +436,49 @@ world issued a `VERDICT`; nvcc ran beside the cargo build. The cluster was down 
 the restore, production came back on the same release binary (`5a299b15`) through the control
 plane, and `/readyz` answered 200 25 s after the launch.
 
+**Result (2026-11-24, the ninth window, world 1, the embedding gather's streams).** Tip `4caf7b4`
+(binary `880c8e1`), world 1 only. The checkpoint and the world-1 reference were reused from the
+seventh window, so the run went straight to the group; 85 cubins, `SPARKFLASH_NCCL_LIB` exported,
+trace on. Setup completed for the first time: `setup done` 4,488 ms after the run header (layer
+seams 214 ms, tail 3,322 ms, layer device open 4,103 ms, attachments 4,121 ms), and the first
+prefill then refused:
+
+```
+sparkflash serve: device_failure epoch_ms=... the device loop failed, exiting: rows: the device
+embedding gather takes 1..=64 rows of 4096 x 4, not 40 of 40 rows of 4096 x 2
+```
+
+The checkpoint states `hc_mult: 2` (the fixture took the model config's default), the row kernels
+`OR_S_HC 4u`, and the guard at `rows.rs` compared the two only when the first gather ran. The
+stream count is a model fact, not a format: the second shape had taken a count no rows build
+states. The shape now states 4, the released model's count and the only one the row kernels are
+built for; the guard compares against one named constant (`ROWS_STREAMS`), and the device-open
+gate asks the plan for its stream count at every world (`embedding gather streams`, sensitivity
+above). The shape's host reference was regenerated on the dev box and now reads
+
+```
+[[24319, 14482, 27568, 20871, 10699, 19197, 5245, 24450],
+ [2230, 19981, 7902, 23487, 13332, 10093, 23350, 20839],
+ [18661, 1217, 25908, 3469, 27591, 27897, 27916, 23008]]
+```
+
+The ids in the sixth and seventh window records belong to the two-stream shape and stay as
+history. Restore: `readyz` 200 at 14:21:29Z, 4/4 ranks, the production binary unchanged, one
+4-token completion; downtime 6m34s (stop 14:14:55Z, launch 14:20:21Z). Deviations: the NCCL
+directory holds `libnccl.so.2`, not `libnccl.so` (the loader's first name, present on all four
+nodes), so step 0's literal check was satisfied by the `.so.2`; the harness was SIGTERMed at the
+refusal, so no world issued a `VERDICT`; no worker ran.
+
 **The device-open gate (2026-11-24).** `crates/sparkflash-deepseek-forward/tests/device_open_gate.rs`
 builds the second shape's plan at worlds 1, 2 and 4 and walks every part the device opens: the
 stored format each part states and the kernel symbols the plan names for it, the shared expert's
 own format, one rank's `wo_a` rows in the B12x operand the body reads, the routed geometry an
 instance was built for, the head's block-maxima buffer at the plan's width, the screen's certified
-width and the setting that turns it off, every DSpark stage's tensors including the last stage's
-Markov head, the depth authority, and the NVFP4 prefill candidate and its pin. It collects every
+width and the setting that turns it off, the hidden-stream count the rows kernels are built for,
+every DSpark stage's tensors including the last stage's Markov head, the depth authority, and the
+NVFP4 prefill candidate and its pin. It collects every
 refusal and reports them in one run, naming the part. The gate is plan-driven: it does not list
-the six defects, it asks each part the question they answered wrongly. Sensitivity was checked by
+the recorded defects, it asks each part the question they answered wrongly. Sensitivity was checked by
 reverting each fix's behaviour in turn on the gate's tip; each revert produced exactly its own
 named case at all three worlds, and the passing tree produces none:
 
@@ -456,6 +490,7 @@ named case at all three worlds, and the passing tree produces none:
 | the geometry accepts only the released shape | `routed device geometry` |
 | an unstated depth falls back to 5 | `DSpark depth` |
 | the Markov head reads the released stage two | `drafter stage claims` |
+| the plan states 2 hidden streams, the rows kernels are built for 4 | `embedding gather streams` |
 
 The gate cannot be compiled on the pre-fix tree `1ef7a6ca` verbatim: the plan answers it asks for
 (`shared_expert_format`, `dense_stored_format`, `blocks_per_row`, `mtp_last_stage`, `draft_depth`)

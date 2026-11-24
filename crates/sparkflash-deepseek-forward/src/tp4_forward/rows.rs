@@ -971,13 +971,13 @@ impl DeviceLayer<'_> {
         spans: bool,
     ) -> Result<(), String> {
         if self.dim != crate::plan::hidden()
-            || self.hc_mult != 4
+            || self.hc_mult != ROWS_STREAMS
             || n == 0
             || n > total
             || total > rows.cap
         {
             return Err(format!(
-                "rows: the device embedding gather takes 1..={} rows of {} x 4, not {n} of {total} rows of {} x {}",
+                "rows: the device embedding gather takes 1..={} rows of {} x {ROWS_STREAMS}, not {n} of {total} rows of {} x {}",
                 rows.cap,
                 crate::plan::hidden(),
                 self.dim,
