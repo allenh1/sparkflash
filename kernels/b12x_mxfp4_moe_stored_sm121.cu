@@ -88,12 +88,25 @@
 
 #include "m4_common_sm121.cuh"
 
+// The model geometry is an argument from kernels/instances.toml, with no default: a build that
+// names no instance does not compile. The real per-rank width and the padded activation row are
+// the shapes this body walks; the tile width, K groups, thread count and the FP4 byte ratio stay
+// the body's own constants.
+#if !defined(SPARK_INSTANCE_B12X_MXFP4_MOE_STORED_SM121_HIDDEN)
+#error "b12x_mxfp4_moe_stored_sm121.cu: no instance macros; the model geometry is an argument from kernels/instances.toml"
+#endif
+
+#define SPARK_STORED_HIDDEN SPARK_INSTANCE_B12X_MXFP4_MOE_STORED_SM121_HIDDEN
+#define SPARK_STORED_TOP_K SPARK_INSTANCE_B12X_MXFP4_MOE_STORED_SM121_TOP_K
+#define SPARK_STORED_K_VALUES SPARK_INSTANCE_B12X_MXFP4_MOE_STORED_SM121_INTERMEDIATE
+#define SPARK_STORED_ACT_ROW SPARK_INSTANCE_B12X_MXFP4_MOE_STORED_SM121_PADDED
+
 // ---------------------------------------------------------------------------------------
 // Stored 576-K row layout contract
 // ---------------------------------------------------------------------------------------
-// The per-rank real width and its two row strides. Every number is derived from the shared header's
-// model geometry, so a geometry change fails the build instead of silently changing the layout.
-#define SPARK_M4_STORED_K_VALUES SPARK_M4_MOE_WIDTH
+// The per-rank real width and its two row strides. Every number is derived from the instance's
+// geometry, so a geometry change fails the build instead of silently changing the layout.
+#define SPARK_M4_STORED_K_VALUES SPARK_STORED_K_VALUES
 #define SPARK_M4_STORED_FP4_PER_BYTE 2u
 #define SPARK_M4_STORED_CODE_ROW (SPARK_M4_STORED_K_VALUES / SPARK_M4_STORED_FP4_PER_BYTE)
 #define SPARK_M4_STORED_SCALE_ROW (SPARK_M4_STORED_K_VALUES / SPARK_M4_QUANT_BLOCK)
@@ -101,43 +114,36 @@
 #define SPARK_M4_STORED_ROW_TOTAL (SPARK_M4_STORED_CODE_ROW + SPARK_M4_STORED_SCALE_ROW)
 #define SPARK_M4_STORED_K_BLOCKS SPARK_M4_STORED_SCALE_ROW
 
-// The A operand is the A8 chain layout, unchanged: 640 E4M3 bytes (one per padded width value) and a
-// 20-byte ue8m0 scale grid per routed row. Only blocks 0..17 are read.
-#define SPARK_M4_STORED_ACT_ROW SPARK_M4_MOE_WIDTH_PADDED
-#define SPARK_M4_STORED_ACT_SCALE_ROW (SPARK_M4_MOE_WIDTH_PADDED / SPARK_M4_QUANT_BLOCK)
+// The A operand is the A8 chain layout, unchanged: one E4M3 byte per padded width value and a
+// ue8m0 scale per 32-value block. Only the real blocks of that padded grid are read.
+#define SPARK_M4_STORED_ACT_ROW SPARK_STORED_ACT_ROW
+#define SPARK_M4_STORED_ACT_SCALE_ROW (SPARK_M4_STORED_ACT_ROW / SPARK_M4_QUANT_BLOCK)
 
 // One block per (token, 32-value hidden tile): 32 output columns x 8 parallel K groups.
 #define SPARK_M4_STORED_TILE_D 32u
 #define SPARK_M4_STORED_K_GROUPS 8u
 #define SPARK_M4_STORED_THREADS (SPARK_M4_STORED_TILE_D * SPARK_M4_STORED_K_GROUPS)
 // Hidden tiles: 5120 / 32 = 160 blocks along grid.y.
-#define SPARK_M4_STORED_GRID_Y (SPARK_M4_HIDDEN / SPARK_M4_STORED_TILE_D)
+#define SPARK_M4_STORED_GRID_Y (SPARK_STORED_HIDDEN / SPARK_M4_STORED_TILE_D)
 
 static_assert(SPARK_M4_STORED_K_VALUES % SPARK_M4_QUANT_BLOCK == 0u,
               "the stored rank width tiles by 32-value MX blocks");
-static_assert(SPARK_M4_STORED_K_BLOCKS == 18u, "576 real values are 18 MX blocks");
-static_assert(SPARK_M4_STORED_CODE_ROW == 288u, "576 FP4 values pack to 288 code bytes");
 static_assert(SPARK_M4_STORED_CODE_ROW * SPARK_M4_STORED_FP4_PER_BYTE == SPARK_M4_STORED_K_VALUES,
               "the code row is exactly one byte per two K values");
-static_assert(SPARK_M4_STORED_SCALE_ROW == 18u, "the stored scale row is 18 ue8m0 bytes");
-static_assert(SPARK_M4_STORED_ROW_TOTAL == 306u,
-              "one stored output row costs 288 code + 18 scale bytes across the two tensors");
-static_assert(SPARK_M4_STORED_ACT_ROW == 640u,
-              "the A operand is the A8 chain layout: 640 E4M3 bytes per routed row");
-static_assert(SPARK_M4_STORED_ACT_SCALE_ROW == 20u,
-              "the A scale grid is 20 ue8m0 bytes per routed row");
+static_assert(SPARK_M4_STORED_ACT_ROW % SPARK_M4_QUANT_BLOCK == 0u,
+              "the padded activation row is whole MX blocks");
+static_assert(SPARK_M4_STORED_K_VALUES <= SPARK_M4_STORED_ACT_ROW,
+              "the stored row cannot be wider than the padded activation row it is read with");
 static_assert(SPARK_M4_STORED_K_BLOCKS <= SPARK_M4_STORED_ACT_SCALE_ROW,
               "the kernel reads only the real blocks of the padded A scale grid");
-static_assert(SPARK_M4_HIDDEN % SPARK_M4_STORED_TILE_D == 0u,
+static_assert(SPARK_STORED_HIDDEN % SPARK_M4_STORED_TILE_D == 0u,
               "the hidden dimension tiles evenly by 32 output columns");
-static_assert(SPARK_M4_STORED_GRID_Y == 160u, "5120 hidden values are 160 tiles of 32 columns");
 static_assert(SPARK_M4_STORED_THREADS == 256u,
               "the block is 32 columns x 8 parallel K groups");
 static_assert(SPARK_M4_STORED_TILE_D * SPARK_M4_STORED_K_GROUPS == SPARK_M4_STORED_THREADS,
               "one thread per (column, K group)");
-static_assert(SPARK_M4_MOE_TOP_K * SPARK_M4_STORED_TILE_D <= SPARK_M4_STORED_THREADS,
+static_assert(SPARK_STORED_TOP_K * SPARK_M4_STORED_TILE_D <= SPARK_M4_STORED_THREADS,
               "one reducer thread per (slot, column)");
-static_assert(SPARK_M4_MOE_TOP_K * SPARK_M4_QUANT_BLOCK == 192u, "six slots of 32 values");
 static_assert(SPARK_B12X_KTILE == SPARK_M4_QUANT_BLOCK, "an MX scale covers one 32-value block");
 
 // The E2M1 value stored in the low nibble of byte (index / 2) at even indices, high nibble at odd.
@@ -179,11 +185,11 @@ extern "C" __global__ void b12x_mxfp4_moe_stored_sm121(
     // eight groups removes the per-thread serial chain without moving a rounding: the reducer below
     // still folds the 18 scaled partials in strictly ascending block order, with the same two exact
     // power-of-two multiplies and one rounded add per block.
-    __shared__ float terms[SPARK_M4_MOE_TOP_K][SPARK_M4_STORED_K_BLOCKS][SPARK_M4_STORED_TILE_D];
+    __shared__ float terms[SPARK_STORED_TOP_K][SPARK_M4_STORED_K_BLOCKS][SPARK_M4_STORED_TILE_D];
 
     if (live) {
-        const uint64_t routed_row = (uint64_t)token * SPARK_M4_MOE_TOP_K;
-        for (uint32_t slot = 0; slot < (uint32_t)SPARK_M4_MOE_TOP_K; ++slot) {
+        const uint64_t routed_row = (uint64_t)token * SPARK_STORED_TOP_K;
+        for (uint32_t slot = 0; slot < (uint32_t)SPARK_STORED_TOP_K; ++slot) {
             const uint32_t expert = expert_ids[routed_row + slot];
             // The slot's own activation row, A8 chain layout: the routing weight was multiplied into
             // the activation before quantisation (model.py:849-851).
@@ -193,7 +199,7 @@ extern "C" __global__ void b12x_mxfp4_moe_stored_sm121(
             // The stored weight row: one output element of one expert. The code row and the scale row
             // start at the same (expert, column) index but live in two different tensors with their
             // own strides - this is the whole layout difference and it stays on these two lines.
-            const uint64_t weight_row = (uint64_t)expert * SPARK_M4_HIDDEN + column;
+            const uint64_t weight_row = (uint64_t)expert * SPARK_STORED_HIDDEN + column;
             const uint8_t *w_row = w_fp4 + weight_row * SPARK_M4_STORED_CODE_ROW;
             const uint8_t *w_scale_row = w_scales + weight_row * SPARK_M4_STORED_SCALE_ROW;
             for (uint32_t block = group; block < (uint32_t)SPARK_M4_STORED_K_BLOCKS;
@@ -229,24 +235,24 @@ extern "C" __global__ void b12x_mxfp4_moe_stored_sm121(
     // strictly ascending block order - the reference's only ordered arithmetic - and adds the rank
     // partial into the f32 slot accumulator, unrounded. One reducer owns each (slot, column), so the
     // accumulator is still written by exactly one thread.
-    const uint32_t reducers = (uint32_t)SPARK_M4_MOE_TOP_K * SPARK_M4_STORED_TILE_D;
+    const uint32_t reducers = (uint32_t)SPARK_STORED_TOP_K * SPARK_M4_STORED_TILE_D;
     if (tid < reducers) {
         const uint32_t slot = tid / SPARK_M4_STORED_TILE_D;
         const uint32_t col = tid % SPARK_M4_STORED_TILE_D;
         const uint32_t out_column = blockIdx.y * SPARK_M4_STORED_TILE_D + col;
-        if (live && out_column < (uint32_t)SPARK_M4_HIDDEN) {
+        if (live && out_column < (uint32_t)SPARK_STORED_HIDDEN) {
             float acc = 0.0f;
             for (uint32_t block = 0; block < (uint32_t)SPARK_M4_STORED_K_BLOCKS; ++block) {
                 acc = __fadd_rn(acc, terms[slot][block][col]);
             }
-            slot_acc[((uint64_t)token * SPARK_M4_MOE_TOP_K + slot) * SPARK_M4_HIDDEN + out_column] += acc;
+            slot_acc[((uint64_t)token * SPARK_STORED_TOP_K + slot) * SPARK_STORED_HIDDEN + out_column] += acc;
         }
     }
     __syncthreads();
 
     if (tid == 0u) {
         // payload_meta: one f32 per (slot, output element) of this block's tile.
-        const uint32_t meta = SPARK_M4_STORED_TILE_D * SPARK_M4_MOE_TOP_K * 4u;
+        const uint32_t meta = SPARK_M4_STORED_TILE_D * SPARK_STORED_TOP_K * 4u;
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_MOE_MXFP4, layer_id, meta, t_enter);
         (void)step_seq;
     }

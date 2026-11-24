@@ -28,3 +28,22 @@ include!(concat!(env!("OUT_DIR"), "/kernel_instance_defines.rs"));
 pub mod capacities {
     include!(concat!(env!("OUT_DIR"), "/kernel_instance_capacities.rs"));
 }
+
+/// Parses a source and adds the generated defines of the released compile group that builds it.
+///
+/// A converted source takes its model geometry from `kernels/instances.toml`, so its static
+/// asserts name entry-prefixed instance macros. The ABI tests resolve those through this table,
+/// which is the same define table the compiler received for the released cubin.
+#[must_use]
+pub fn consts_for_source(source: &str, name: &str) -> crate::c_decl::Consts {
+    let mut table = crate::c_decl::Consts::parse(source);
+    match name {
+        "b12x_mxfp4_moe_sm121.cu" => table.extend(B12X_MXFP4_MOE_SM121_DEFINES),
+        "b12x_mxfp4_moe_stored_sm121.cu" => {
+            table.extend(B12X_MXFP4_MOE_STORED_SM121_DEFINES);
+        }
+        "b12x_mxfp8_wo_a_sm121.cu" => table.extend(B12X_MXFP8_WO_A_SM121_DEFINES),
+        _ => {}
+    }
+    table
+}

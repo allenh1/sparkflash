@@ -46,6 +46,82 @@
 #include "b12x_common_sm121.cuh"
 #include "b12x_dense_sm121.cuh"
 
+// The model geometry is an argument from kernels/instances.toml, with no default: a build that
+// names no instance does not compile. The query heads, their width, the output-group count and one
+// group's output rank are the shapes this body derives its reduction from; the tile sizes, thread
+// counts and vector widths stay the body's own constants. All five entries of the released cubin
+// carry the same geometry, and the selection below keeps that one copy.
+#if !defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_HEADS) && \
+    !defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_HEADS) && \
+    !defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_HEADS) && \
+    !defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_HEADS) && \
+    !defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_HEADS)
+#error "b12x_mxfp8_wo_a_sm121.cu: no instance macros; the model geometry is an argument from kernels/instances.toml"
+#endif
+
+#if defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_HEADS)
+#define SPARK_WOA_HEADS SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_HEADS
+#define SPARK_WOA_HEAD_DIM SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_HEAD_DIM
+#define SPARK_WOA_O_GROUPS SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_O_GROUPS
+#define SPARK_WOA_O_LORA_RANK SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_O_LORA_RANK
+#elif defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_HEADS)
+#define SPARK_WOA_HEADS SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_HEADS
+#define SPARK_WOA_HEAD_DIM SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_HEAD_DIM
+#define SPARK_WOA_O_GROUPS SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_O_GROUPS
+#define SPARK_WOA_O_LORA_RANK SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_O_LORA_RANK
+#elif defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_HEADS)
+#define SPARK_WOA_HEADS SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_HEADS
+#define SPARK_WOA_HEAD_DIM SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_HEAD_DIM
+#define SPARK_WOA_O_GROUPS SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_O_GROUPS
+#define SPARK_WOA_O_LORA_RANK SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_O_LORA_RANK
+#elif defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_HEADS)
+#define SPARK_WOA_HEADS SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_HEADS
+#define SPARK_WOA_HEAD_DIM SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_HEAD_DIM
+#define SPARK_WOA_O_GROUPS SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_O_GROUPS
+#define SPARK_WOA_O_LORA_RANK SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_O_LORA_RANK
+#else
+#define SPARK_WOA_HEADS SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_HEADS
+#define SPARK_WOA_HEAD_DIM SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_HEAD_DIM
+#define SPARK_WOA_O_GROUPS SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_O_GROUPS
+#define SPARK_WOA_O_LORA_RANK SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_O_LORA_RANK
+#endif
+
+#if defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_HEADS)
+static_assert(SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_HEADS == SPARK_WOA_HEADS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_HEAD_DIM == SPARK_WOA_HEAD_DIM &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_O_GROUPS == SPARK_WOA_O_GROUPS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_SM121_O_LORA_RANK == SPARK_WOA_O_LORA_RANK,
+              "one cubin carries one wo_a geometry");
+#endif
+#if defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_HEADS)
+static_assert(SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_HEADS == SPARK_WOA_HEADS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_HEAD_DIM == SPARK_WOA_HEAD_DIM &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_O_GROUPS == SPARK_WOA_O_GROUPS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_WARP_SM121_O_LORA_RANK == SPARK_WOA_O_LORA_RANK,
+              "one cubin carries one wo_a geometry");
+#endif
+#if defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_HEADS)
+static_assert(SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_HEADS == SPARK_WOA_HEADS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_HEAD_DIM == SPARK_WOA_HEAD_DIM &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_O_GROUPS == SPARK_WOA_O_GROUPS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_TILE_SM121_O_LORA_RANK == SPARK_WOA_O_LORA_RANK,
+              "one cubin carries one wo_a geometry");
+#endif
+#if defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_HEADS)
+static_assert(SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_HEADS == SPARK_WOA_HEADS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_HEAD_DIM == SPARK_WOA_HEAD_DIM &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_O_GROUPS == SPARK_WOA_O_GROUPS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_PERROW_SM121_O_LORA_RANK == SPARK_WOA_O_LORA_RANK,
+              "one cubin carries one wo_a geometry");
+#endif
+#if defined(SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_HEADS)
+static_assert(SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_HEADS == SPARK_WOA_HEADS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_HEAD_DIM == SPARK_WOA_HEAD_DIM &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_O_GROUPS == SPARK_WOA_O_GROUPS &&
+                  SPARK_INSTANCE_B12X_MXFP8_WO_A_BATCHED_SM121_O_LORA_RANK == SPARK_WOA_O_LORA_RANK,
+              "one cubin carries one wo_a geometry");
+#endif
+
 // The shared header's helpers, under the names this image used.
 #define spark_woa_load128 spark_b12x_load128
 #define spark_woa_byte spark_b12x_byte
@@ -56,27 +132,29 @@
 #define SPARK_M4_WOA_THREADS 256u
 #define SPARK_M4_WOA_TILE 256u
 // Heads per group: 64 heads over 8 groups.
-#define SPARK_M4_WOA_HEADS_PER_GROUP (SPARK_M4_HEADS / SPARK_M4_O_GROUPS)
+#define SPARK_M4_WOA_HEADS_PER_GROUP (SPARK_WOA_HEADS / SPARK_WOA_O_GROUPS)
 // The reduction width of one group: its heads' 512-dim outputs concatenated.
-#define SPARK_M4_WOA_GROUP_INNER (SPARK_M4_WOA_HEADS_PER_GROUP * SPARK_M4_HEAD_DIM)
+#define SPARK_M4_WOA_GROUP_INNER (SPARK_M4_WOA_HEADS_PER_GROUP * SPARK_WOA_HEAD_DIM)
 
-static_assert(SPARK_M4_WOA_HEADS_PER_GROUP == 8u, "64 heads over 8 groups is 8 heads per group");
-static_assert(SPARK_M4_WOA_GROUP_INNER == 4096u, "the group reduction width is 4096");
+static_assert(SPARK_WOA_HEADS % SPARK_WOA_O_GROUPS == 0u,
+              "the query heads split evenly over the output groups");
+static_assert(SPARK_WOA_HEADS >= SPARK_WOA_O_GROUPS, "every output group owns at least one head");
 static_assert(SPARK_M4_WOA_GROUP_INNER % SPARK_M4_QUANT_BLOCK == 0u, "the width tiles by 32");
-static_assert(SPARK_M4_O_LORA_RANK % SPARK_M4_WOA_TILE == 0u, "1024 output channels tile by 256");
+static_assert(SPARK_WOA_O_LORA_RANK % SPARK_M4_WOA_TILE == 0u,
+              "the output channels tile by the output tile width");
 static_assert(SPARK_M4_WOA_THREADS == SPARK_M4_WOA_TILE, "one output element per thread");
-static_assert(SPARK_M4_O_GROUPS == 8u && SPARK_M4_O_GROUPS_PER_RANK == 2u, "8 groups, 2 per rank");
-static_assert(SPARK_M4_O_LORA_RANK % SPARK_B12X_NTILE == 0u,
+static_assert(SPARK_WOA_O_GROUPS >= 2u, "the output projection has more than one group");
+static_assert(SPARK_WOA_O_LORA_RANK % SPARK_B12X_NTILE == 0u,
               "the output rank is whole B12x micro-tile rows, so nothing is padded away");
 static_assert(SPARK_M4_WOA_GROUP_INNER % SPARK_B12X_KTILE == 0u,
               "the group reduction width is whole B12x micro-tiles");
 // The scale grid of one group is ceil(o_lora_rank / 32) * (group_inner / 32) bytes, which is 32
 // times smaller than the weight block: a group stride shared between the two would overrun the
 // scale buffer by 31 group strides, which is the defect this pin exists to prevent returning.
-static_assert(SPARK_M4_O_LORA_RANK / SPARK_B12X_NTILE == 32u,
-              "1024 output channels are 32 micro-tile rows of scales");
-static_assert(SPARK_M4_WOA_GROUP_INNER / SPARK_B12X_KTILE == 128u,
-              "4096 reduction values are 128 scale blocks along K");
+static_assert(SPARK_WOA_O_LORA_RANK >= SPARK_M4_WOA_TILE,
+              "the output rank is at least one output tile");
+static_assert(SPARK_M4_WOA_GROUP_INNER >= SPARK_B12X_KTILE,
+              "the group reduction width is at least one B12x micro-tile");
 static_assert(SPARK_B12X_TILE_BYTES == 1024u, "a 32x32 block is 1024 weight bytes, one scale");
 
 extern "C" __global__ void b12x_mxfp8_wo_a_sm121(
@@ -90,7 +168,7 @@ extern "C" __global__ void b12x_mxfp8_wo_a_sm121(
     const uint32_t layer_id,
     const uint64_t step_seq) {
     b12x_woa_scalar_body<false, SPARK_M4_WOA_TILE, SPARK_M4_WOA_THREADS,
-                          SPARK_M4_WOA_GROUP_INNER, SPARK_M4_O_LORA_RANK>(
+                          SPARK_M4_WOA_GROUP_INNER, SPARK_WOA_O_LORA_RANK>(
         attn_fp8, attn_scales, nullptr, w_fp8, w_scales, lo_out, groups, trace_ring, layer_id,
         step_seq);
 }
@@ -136,13 +214,13 @@ extern "C" __global__ void b12x_mxfp8_wo_a_warp_sm121(
 
     uint64_t t_enter = 0u;
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
-    if (group < groups && col < (uint32_t)SPARK_M4_O_LORA_RANK) {
+    if (group < groups && col < (uint32_t)SPARK_WOA_O_LORA_RANK) {
         const uint8_t *a_row = attn_fp8 + (uint64_t)group * SPARK_M4_WOA_GROUP_INNER;
         const uint8_t *a_scale_row = attn_scales + (uint64_t)group * k_blocks;
         const uint64_t group_weight_base =
-            (uint64_t)group * spark_b12x_buffer_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
+            (uint64_t)group * spark_b12x_buffer_bytes(SPARK_WOA_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
         const uint64_t group_scale_base =
-            (uint64_t)group * spark_b12x_scale_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
+            (uint64_t)group * spark_b12x_scale_bytes(SPARK_WOA_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
         float acc = 0.0f;
         for (uint32_t base = lane * SPARK_M4_WOA_WARP_BYTES;
              base < (uint32_t)SPARK_M4_WOA_GROUP_INNER;
@@ -170,7 +248,7 @@ extern "C" __global__ void b12x_mxfp8_wo_a_warp_sm121(
             }
         }
         if (lane == 0u) {
-            lo_out[(uint64_t)group * SPARK_M4_O_LORA_RANK + col] = __float2bfloat16_rn(acc);
+            lo_out[(uint64_t)group * SPARK_WOA_O_LORA_RANK + col] = __float2bfloat16_rn(acc);
         }
     }
     if (threadIdx.x == 0u) {
@@ -187,7 +265,7 @@ extern "C" __global__ void b12x_mxfp8_wo_a_warp_sm121(
 // cvt.rn.f16x2.e4m3x2, which is exact for every E4M3 value.
 #define SPARK_M4_WOA_TILE_THREADS 128u
 #define SPARK_M4_WOA_TILE_COLUMNS 128u
-#define SPARK_M4_WOA_TILE_STAGE 4096u
+#define SPARK_M4_WOA_TILE_STAGE SPARK_M4_WOA_GROUP_INNER
 
 static_assert(SPARK_M4_WOA_TILE_COLUMNS == SPARK_M4_WOA_TILE_THREADS,
               "one thread per output channel of the tile");
@@ -232,11 +310,11 @@ extern "C" __global__ void b12x_mxfp8_wo_a_tile_sm121(
     __syncthreads();
 
     float acc = 0.0f;
-    if (group < groups && col < (uint32_t)SPARK_M4_O_LORA_RANK) {
+    if (group < groups && col < (uint32_t)SPARK_WOA_O_LORA_RANK) {
         const uint64_t group_weight_base =
-            (uint64_t)group * spark_b12x_buffer_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
+            (uint64_t)group * spark_b12x_buffer_bytes(SPARK_WOA_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
         const uint64_t group_scale_base =
-            (uint64_t)group * spark_b12x_scale_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
+            (uint64_t)group * spark_b12x_scale_bytes(SPARK_WOA_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
         for (uint32_t b = 0u; b < k_blocks; ++b) {
             const uint32_t base = b * SPARK_M4_QUANT_BLOCK;
             const float a_scale = spark_ue8m0_decode(a_scales_row[b]);
@@ -262,7 +340,7 @@ extern "C" __global__ void b12x_mxfp8_wo_a_tile_sm121(
                 acc = __fadd_rn(acc, __fmul_rn(a_hi * a_scale, w_hi * w_scale));
             }
         }
-        lo_out[(uint64_t)group * SPARK_M4_O_LORA_RANK + col] = __float2bfloat16_rn(acc);
+        lo_out[(uint64_t)group * SPARK_WOA_O_LORA_RANK + col] = __float2bfloat16_rn(acc);
     }
     if (threadIdx.x == 0u) {
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, 0u, t_enter);
@@ -302,7 +380,7 @@ extern "C" __global__ void b12x_mxfp8_wo_a_batched_perrow_sm121(
     const uint32_t col = blockIdx.x * SPARK_M4_WOA_TILE_COLUMNS + lane;
     const uint32_t k_blocks = SPARK_M4_WOA_GROUP_INNER / SPARK_M4_QUANT_BLOCK;
     const uint64_t attn_row_stride =
-        (uint64_t)SPARK_M4_O_GROUPS * SPARK_M4_WOA_GROUP_INNER;
+        (uint64_t)SPARK_WOA_O_GROUPS * SPARK_M4_WOA_GROUP_INNER;
 
     uint64_t t_enter = 0u;
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
@@ -332,12 +410,12 @@ extern "C" __global__ void b12x_mxfp8_wo_a_batched_perrow_sm121(
     }
     __syncthreads();
 
-    if (lane_row < rows && group < groups && col < (uint32_t)SPARK_M4_O_LORA_RANK) {
+    if (lane_row < rows && group < groups && col < (uint32_t)SPARK_WOA_O_LORA_RANK) {
         const uint32_t row_index = lane_row;
         const uint64_t group_weight_base =
-            (uint64_t)group * spark_b12x_buffer_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
+            (uint64_t)group * spark_b12x_buffer_bytes(SPARK_WOA_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
         const uint64_t group_scale_base =
-            (uint64_t)group * spark_b12x_scale_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
+            (uint64_t)group * spark_b12x_scale_bytes(SPARK_WOA_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
         float acc = 0.0f;
         for (uint32_t b = 0u; b < k_blocks; ++b) {
             const uint32_t base = b * SPARK_M4_QUANT_BLOCK;
@@ -364,8 +442,8 @@ extern "C" __global__ void b12x_mxfp8_wo_a_batched_perrow_sm121(
                 acc = __fadd_rn(acc, __fmul_rn(a_hi * a_scale, w_hi * w_scale));
             }
         }
-        lo_out[(uint64_t)row_index * SPARK_M4_O_GROUPS * SPARK_M4_O_LORA_RANK +
-               (uint64_t)group * SPARK_M4_O_LORA_RANK + col] = __float2bfloat16_rn(acc);
+        lo_out[(uint64_t)row_index * SPARK_WOA_O_GROUPS * SPARK_WOA_O_LORA_RANK +
+               (uint64_t)group * SPARK_WOA_O_LORA_RANK + col] = __float2bfloat16_rn(acc);
     }
     if (threadIdx.x == 0u) {
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, 0u, t_enter);
@@ -400,7 +478,7 @@ extern "C" __global__ void b12x_mxfp8_wo_a_batched_sm121(
     const uint32_t col = blockIdx.x * SPARK_M4_WOA_TILE_COLUMNS + lane;
     const uint32_t k_blocks = SPARK_M4_WOA_GROUP_INNER / SPARK_M4_QUANT_BLOCK;
     const uint64_t attn_row_stride =
-        (uint64_t)SPARK_M4_O_GROUPS * SPARK_M4_WOA_GROUP_INNER;
+        (uint64_t)SPARK_WOA_O_GROUPS * SPARK_M4_WOA_GROUP_INNER;
 
     uint64_t t_enter = 0u;
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
@@ -426,11 +504,11 @@ extern "C" __global__ void b12x_mxfp8_wo_a_batched_sm121(
     }
     __syncthreads();
 
-    if (group < groups && col < (uint32_t)SPARK_M4_O_LORA_RANK) {
+    if (group < groups && col < (uint32_t)SPARK_WOA_O_LORA_RANK) {
         const uint64_t group_weight_base =
-            (uint64_t)group * spark_b12x_buffer_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
+            (uint64_t)group * spark_b12x_buffer_bytes(SPARK_WOA_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
         const uint64_t group_scale_base =
-            (uint64_t)group * spark_b12x_scale_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
+            (uint64_t)group * spark_b12x_scale_bytes(SPARK_WOA_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
         float acc[SPARK_M4_WOA_BATCH6_ROWS];
 #pragma unroll
         for (uint32_t r = 0u; r < SPARK_M4_WOA_BATCH6_ROWS; ++r) {
@@ -472,8 +550,8 @@ extern "C" __global__ void b12x_mxfp8_wo_a_batched_sm121(
         }
 #pragma unroll
         for (uint32_t r = 0u; r < SPARK_M4_WOA_BATCH6_ROWS; ++r) {
-            lo_out[(uint64_t)r * SPARK_M4_O_GROUPS * SPARK_M4_O_LORA_RANK +
-                   (uint64_t)group * SPARK_M4_O_LORA_RANK + col] = __float2bfloat16_rn(acc[r]);
+            lo_out[(uint64_t)r * SPARK_WOA_O_GROUPS * SPARK_WOA_O_LORA_RANK +
+                   (uint64_t)group * SPARK_WOA_O_LORA_RANK + col] = __float2bfloat16_rn(acc[r]);
         }
     }
     if (threadIdx.x == 0u) {
