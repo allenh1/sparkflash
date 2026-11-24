@@ -240,7 +240,13 @@ fn run_lines(args: &[&str]) -> Result<(GateOutcome, PathBuf), String> {
         crate::plan::install(plan)
             .map_err(|error| format!("install the checkpoint description: {error}"))?;
     }
-    let (entries, source) = load_entries(&args)?;
+    // The format the configuration declares is the one this gate judges headers against: a
+    // 128-tile release is refused here rather than bound as a B12x operand.
+    let config = match crate::plan::installed() {
+        Some(description) => description.values().clone(),
+        None => crate::plan::cached_values().clone(),
+    };
+    let (entries, source) = load_entries(&args, &config)?;
     let plan = ResidentPlan::plan(args.rank, args.world, entries)
         .map_err(|error| format!("plan rank {}: {error}", args.rank))?;
     let outcome = evaluate(&plan, args.rank, args.world, &source, args.expect_plan_hash)?;
@@ -258,9 +264,18 @@ fn run_lines(args: &[&str]) -> Result<(GateOutcome, PathBuf), String> {
 }
 
 /// Loads the header entries from a checkpoint directory or a header dump.
-fn load_entries(args: &GateArgs) -> Result<(Vec<HeaderEntry>, String), String> {
+fn load_entries(
+    args: &GateArgs,
+    config: &crate::plan::ModelConfig,
+) -> Result<(Vec<HeaderEntry>, String), String> {
     if let Some(path) = &args.tensor_index {
-        let entries = crate::tp4_resident::entries_from_tensor_index(path)?;
+        let entries = crate::tp4_resident::entries_from_tensor_index(path)?
+            .into_iter()
+            .map(|entry| {
+                let format = tensor_format(&entry.name, &entry.dtype, config);
+                entry.with_format(format)
+            })
+            .collect::<Vec<_>>();
         let seen = entries.len();
         return Ok((
             entries,
@@ -284,17 +299,41 @@ fn load_entries(args: &GateArgs) -> Result<(Vec<HeaderEntry>, String), String> {
         let tensor = header
             .tensor(name)
             .map_err(|error| format!("{name}: {error}"))?;
-        entries.push(HeaderEntry::new(
-            name.to_string(),
-            tensor.dtype.clone(),
-            tensor.shape.clone(),
-        ));
+        let format = tensor_format(name, tensor.dtype.as_str(), config);
+        entries.push(
+            HeaderEntry::new(
+                name.to_string(),
+                tensor.dtype.clone(),
+                tensor.shape.clone(),
+            )
+            .with_format(format),
+        );
     }
     let seen = entries.len();
     Ok((
         entries,
         format!("checkpoint {} ({seen} tensors)", dir.display()),
     ))
+}
+
+/// The stored format a header states, for the tensors this gate judges.
+///
+/// The gate is the attention operand path: a projection weight is read in the dense class's
+/// format, which the configuration declares, and a scale tensor carries no arithmetic of its own
+/// (the weight's format sizes it). Every other tensor is bound as stored.
+fn tensor_format(
+    name: &str,
+    dtype: &str,
+    config: &crate::plan::ModelConfig,
+) -> Option<sparkflash_model::format::StoredFormat> {
+    let projection = [".wq_a.weight", ".wkv.weight", ".wq_b.weight", ".wo_a.weight", ".wo_b.weight"]
+        .iter()
+        .any(|leaf| name.ends_with(leaf));
+    if projection && dtype == "F8_E4M3" {
+        Some(config.dense_format())
+    } else {
+        None
+    }
 }
 
 /// The projection leaf of a planned attention weight name.
@@ -421,6 +460,7 @@ fn evaluate(
             OperandLayout::B12x {
                 cols,
                 inner,
+                block,
                 weight_bytes,
                 scale_bytes,
             } => {
@@ -431,15 +471,19 @@ fn evaluate(
                     ));
                 }
                 let scale_name = format!("{}.scale", shard.name.trim_end_matches(".weight"));
+                // The plane's size is the format's: one scale a block, block from the format the
+                // plan resolved for the weight. No dtype word is consulted.
                 match planned
                     .get(scale_name.as_str())
                     .map(|scale| scale.operand_layout())
                 {
-                    Some(OperandLayout::Stored { dtype, bytes })
-                        if dtype == "F8_E8M0" && bytes == scale_bytes => {}
+                    Some(OperandLayout::Stored { bytes, .. }) if bytes == scale_bytes => {}
                     Some(OperandLayout::Stored { dtype, bytes }) => {
                         return Err(format!(
-                            "{scale_name}: stored {dtype} {bytes} B but the B12x scale grid is F8_E8M0 {scale_bytes} B"
+                            "{scale_name}: stored {bytes} B ({dtype} in the file) but the {block}-value {} grid is {scale_bytes} B",
+                            shard
+                                .format
+                                .map_or("stored", |format| format.scale_values().name())
                         ));
                     }
                     Some(OperandLayout::B12x { .. }) => {

@@ -821,7 +821,7 @@ fn plan_only_evidence(plan: &ResidentPlan) -> (Value, Vec<String>) {
             continue;
         }
         let payload = match b12x_layout(planned) {
-            Some((cols, inner)) => {
+            Some((cols, inner, _block)) => {
                 sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes(cols, inner) as u64
             }
             None => planned.shard_bytes,
@@ -1165,7 +1165,7 @@ fn upload_arena(
             )
         })?;
         let payload = match b12x_layout(planned) {
-            Some((cols, inner)) => tile_b12x(&slice.bytes, cols, inner)?,
+            Some((cols, inner, _block)) => tile_b12x(&slice.bytes, cols, inner)?,
             None => slice.bytes.clone(),
         };
         arena.verify_slice(&planned.name, &payload)?;
@@ -1375,6 +1375,34 @@ impl ResidentArgs {
     }
 }
 
+/// The stored format a checkpoint header states, as the plan resolved it for that tensor's class.
+///
+/// The file's dtype word selects which class format to ask the plan for, and the plan answers it:
+/// an E4M3 tensor is read in the dense class's format, an E2M1 tensor in the experts' class
+/// format, and a bf16 or f32 tensor in the one unscaled format its word names. A scale plane's
+/// dtype carries no arithmetic of its own (its weight's format sizes it), so it states none.
+///
+/// Nothing here compares a dtype word against an expected one: the bind's authority is the format
+/// the plan resolved, and a release stored another way changes that format, not this match.
+#[must_use]
+pub fn tensor_format(
+    plan: &sparkflash_ops::engine_plan::EnginePlan,
+    dtype: &str,
+) -> Option<sparkflash_model::format::StoredFormat> {
+    use sparkflash_model::Part;
+    use sparkflash_model::format::StoredFormat;
+    match dtype {
+        "F8_E4M3" => plan
+            .stored_format(Part::DenseMlp, None)
+            .or(Some(StoredFormat::MXFP8_32)),
+        "F4_E2M1" | "I8" => plan
+            .stored_format(Part::Moe, None)
+            .or(Some(StoredFormat::MXFP4_ROW_32)),
+        "BF16" => Some(StoredFormat::BF16),
+        "F32" => Some(StoredFormat::F32),
+        _ => None,
+    }
+}
 /// Reads the headers the plan needs, from whichever source was given.
 fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize), String> {
     let path = args
@@ -1404,11 +1432,16 @@ fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize)
                 let tensor = header
                     .tensor(name)
                     .map_err(|error| format!("{name}: {error}"))?;
-                entries.push(HeaderEntry::new(
-                    name.to_string(),
-                    tensor.dtype.clone(),
-                    tensor.shape.clone(),
-                ));
+                let format = crate::plan::installed()
+                    .and_then(|description| tensor_format(description.plan(), &tensor.dtype));
+                entries.push(
+                    HeaderEntry::new(
+                        name.to_string(),
+                        tensor.dtype.clone(),
+                        tensor.shape.clone(),
+                    )
+                    .with_format(format),
+                );
             }
             let seen = entries.len();
             Ok((entries, format!("checkpoint {}", path.display()), seen))
@@ -1447,7 +1480,11 @@ pub fn entries_from_tensor_index(path: &Path) -> Result<Vec<HeaderEntry>, String
     })?;
     Ok(map
         .into_iter()
-        .map(|(name, tensor)| HeaderEntry::new(name, tensor.dtype, tensor.shape))
+        .map(|(name, tensor)| {
+            let format = crate::plan::installed()
+                .and_then(|description| tensor_format(description.plan(), &tensor.dtype));
+            HeaderEntry::new(name, tensor.dtype, tensor.shape).with_format(format)
+        })
         .collect())
 }
 

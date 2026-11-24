@@ -764,6 +764,7 @@ pub fn attention_plan_from_plan(
                 Some(OperandLayout::B12x {
                     cols,
                     inner,
+                    block: _,
                     weight_bytes,
                     scale_bytes,
                 }) => AttentionOperandPlan {
@@ -7388,18 +7389,30 @@ fn gather_shared_expert_source(
     let mut gather_calls = 0usize;
     let mut tensors = std::collections::BTreeMap::new();
 
+    // The shared expert is a dense-class tensor, so its format is the block's dense operand:
+    // the gather checks the plan's format, not the checkpoint's dtype word.
+    let shared_format = crate::plan::operand(Some(layer), sparkflash_model::Part::DenseMlp).stored;
+    let want_values = match shared_format.values() {
+        sparkflash_model::format::FormatValues::Fp8E4M3 => "F8_E4M3",
+        sparkflash_model::format::FormatValues::Bf16 => "BF16",
+        sparkflash_model::format::FormatValues::F32 => "F32",
+        sparkflash_model::format::FormatValues::Fp4E2M1 => "F4_E2M1",
+    };
+    let want_scale = match shared_format.scale_values() {
+        sparkflash_model::format::ScaleValues::Ue8m0 => "F8_E8M0",
+        sparkflash_model::format::ScaleValues::E4M3 => "U8",
+        sparkflash_model::format::ScaleValues::Bf16 => "BF16",
+        sparkflash_model::format::ScaleValues::F32 => "F32",
+    };
     let mut read_shard = |leaf: &str, suffix: &str, want: usize| -> Result<Vec<u8>, String> {
         let name = format!("{prefix}.{leaf}.{suffix}");
-        let want_dtype = if suffix == "scale" {
-            "F8_E8M0"
-        } else {
-            "F8_E4M3"
-        };
+        let want_dtype = if suffix == "scale" { want_scale } else { want_values };
         match planned_dtype(request.resident_plan, &name) {
             Some(dtype) if dtype == want_dtype => {}
             Some(other) => {
                 return Err(format!(
-                    "shared expert gather: {name} is planned as {other}; the released shared expert is {want_dtype}"
+                    "shared expert gather: {name} is planned as {other}; the plan's {} shared expert is {want_dtype}",
+                    shared_format.describe()
                 ));
             }
             None => {
@@ -7790,7 +7803,9 @@ fn build_shared_expert_device(
     for (layer, gather) in shared.iter().enumerate() {
         let source: &dyn WeightSource = &gather.source;
         let base = crate::plan::layer_prefix(layer, "ffn.shared_experts");
-        let (s1, s3, s2) = crate::moe_device::read_shared_scale_grids(source, base, inter, dim)
+        let shared_format = crate::plan::description().values().dense_format();
+        let (s1, s3, s2) =
+            crate::moe_device::read_shared_scale_grids(source, base, inter, dim, shared_format)
             .map_err(|error| format!("shared expert (device): layer {layer} scales: {error}"))?;
         let mut stage = |leaf: &str,
                          cols: usize,
