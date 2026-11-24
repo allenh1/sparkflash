@@ -327,6 +327,31 @@ second shape cannot reach a launch until the head's block maxima take their widt
 and that is a defect of the same kind as the last two: a released constant standing where the
 plan's answer belongs. World 1 did not hang this time, which is evidence - not proof - that the
 hang was the released `wo_a` body running against a geometry this shape does not have.
+
+**Result (2026-11-24, the fourth window, the head width from the plan).** Tip `c4fd7d4d` (binary
+`3a6fdf66`), the same checkpoint and group, 74 cubins, down 28m53s. The head assertion is gone and
+the host arm passed at all three worlds with the same ids. The device arm then showed what the
+previous three failures had hidden:
+
+* **World 1 refused at open, deterministically.** `moe_routed device: the pinned routed launches
+  run the released four-rank shape (dim 5120, inter 2304, world 4, 384 experts, top-6); got dim
+  4096, inter 512, world 1, 64 experts, top-4`. The routed device path is released-only by
+  construction: `MoeRoutedGeometry::new` compares against `released()` and nothing else, and the
+  instance plan has no `moe_routed_device` row at any world, so there is no second-shape build to
+  resolve.
+* **Worlds 2 and 4 did not refuse and did not bind.** They ran at roughly 2.5 to 3 minutes a layer
+  (world 2 reached layer 6 of 8 in about 3 minutes, world 4 reached layer 2 in about 6), with
+  three workers waiting in an all-reduce. That is consistent with the released routed body running
+  against a 64-expert, 512-intermediate shape, which is a hypothesis the next window tests, not a
+  measurement this one made.
+
+Two things the window used that are not the shape's: `SPARKFLASH_HEAD_SCREEN=0`, because the rows
+head's screen is compiled for the released 5,120-wide row (160 code blocks) and has no 4,096 build,
+so running it on this shape would read past its own table rather than fail; and, for the first
+time, per-world invocations, because the harness stops a run at its first failing world and waits
+600 s per world. The screen is a diagnostic over the head, not the head: what this run measures,
+the certified head and its reduction, is unchanged. Giving the screen a 4,096 build, and letting
+the harness carry on to the next world after a refusal, are separate items.
 ## 4. The work
 
 ### R. Ranks
