@@ -833,6 +833,14 @@ const SELECT_SCORE_TILE: usize = 16;
 /// wider grid has the blocks past the hidden size write their partials into the next row's.
 const SEAM_COLS: usize = 64;
 
+/// The heads a rank the split attention (opt_rows_attn_scores, _softmax and _values, whose
+/// OR_A3_HEADS it is) and the bulk tensor-core attention (opt_bulk_attn's OBA_HEADS) are compiled
+/// for: the released 64 heads over four ranks. At any other width (the second shape's 32 at one
+/// rank, 8 at four) the rows take opt_rows_attn, whose head count is its grid and whose bits the
+/// split kernels reproduce; a 16-head kernel there would read and write every row at the wrong
+/// stride.
+const FIXED_ATTN_HEADS: usize = 16;
+
 /// The batched score launch's block cap, read from the select instance entry that built the body.
 fn select_score_blocks() -> usize {
     sparkflash_kernels::instances::capacities::OPT_SELECT_SM121_SCORE_BLOCKS
@@ -3425,11 +3433,13 @@ impl DeviceLayer<'_> {
             ));
         }
         let sink = self.sink_pool.0 + (layer * sink_stride) as u64;
+        let fixed_heads = usize::try_from(self.heads_per_rank).ok() == Some(FIXED_ATTN_HEADS)
+            && attn_heads == FIXED_ATTN_HEADS;
         // A bulk chunk runs the tensor-core attention (16 heads as the MMA's M), one block a row.
         let bulk_attn = rows
             .bulk
             .as_ref()
-            .filter(|_| n > R_MAX && usize::try_from(self.heads_per_rank).ok() == Some(attn_heads))
+            .filter(|_| n > R_MAX && fixed_heads)
             .map(|bulk| bulk.k.attn);
         let (cos, sin) = self.rows_rope_tables(layer)?;
         let q_row = (rows.q_cols * 2) as u64;
@@ -3439,7 +3449,7 @@ impl DeviceLayer<'_> {
         let table = self.row_table(rows, &segs).filter(|_| {
             bulk_attn.is_none()
                 && rows.kernels.attn_split.is_some()
-                && usize::try_from(self.heads_per_rank).ok() == Some(attn_heads)
+                && fixed_heads
         });
         let last = segs.last().copied();
         for seg in Self::row_units(&segs, table) {
@@ -3469,8 +3479,7 @@ impl DeviceLayer<'_> {
             let geometry = [seg.p0 as u64, ratio as u64, self.index_topk as u64];
             let ring = [selected_stride as u64, self.kv_ring.rows() as u64];
             match (bulk_attn, rows.kernels.attn_split) {
-                (None, Some([scores, softmax, values]))
-                    if usize::try_from(self.heads_per_rank).ok() == Some(attn_heads) =>
+                (None, Some([scores, softmax, values])) if fixed_heads =>
                 {
                     let attn_scores =
                         b.attn_scores + row0 * (attn_heads * attn_max_attended * 4) as u64;
