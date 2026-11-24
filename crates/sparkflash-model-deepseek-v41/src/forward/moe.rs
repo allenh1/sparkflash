@@ -2908,7 +2908,7 @@ mod tests {
             let mut hand = Hand::default().gate(prefix, EXPERTS, DIM, &gate).bias(
                 prefix,
                 EXPERTS,
-                &vec![0.0; EXPERTS],
+                &[0.0; EXPERTS],
             );
             for expert in 0..EXPERTS {
                 let base = format!("{prefix}.ffn.experts.{expert}");
