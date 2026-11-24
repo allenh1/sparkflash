@@ -45,6 +45,12 @@ world's file, exactly. Each world's file is also reported against the global one
 prompts that differ and the top-2 logprob gap at the first divergence, but that drift never
 fails the run. Token ids are never compared with a tolerance.
 
+Every requested world runs in one invocation. A world that fails is recorded and the run goes on
+to the next one; the closing summary gives each world's verdict, and the exit code is 1 when any
+world failed. The checkpoint and each world's reference carry a `.plan` sidecar holding a hash of
+the inputs that produced them, so an unchanged variant, world, prompt list and token budget reuse
+the file instead of rewriting it.
+
 The host arm runs on a CPU host; `--device` needs a GPU host. `compare` is what `--check`
 calls while the group is up; it is also usable alone against a group someone else started. With
 `--dump` it writes the served ids as the same JSON list of lists the host reference writes and
@@ -61,6 +67,7 @@ rank logs under `<out>/logs-{world}/` before the ranks stop.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -79,6 +86,9 @@ MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 # The end-of-sequence id the configuration names; the host reference stops after writing it.
 EOS = 1
 PROMPTS = [[100, 101, 102, 103], [200, 201, 202], [300, 301, 302, 303, 304, 305]]
+# A sidecar beside a reference or the checkpoint records the hash of every input that produced the
+# file. A matching hash lets the next invocation reuse the file instead of rebuilding it.
+PLAN_SCHEMA = "second-shape-plan/1"
 # The stored formats the checkpoint can be written in: the fixture's released 32 x 32 power-of-two
 # grid, FP8 on 128 x 128 tiles with the inverse scale stored f32 or bf16, or an unquantized
 # BF16 dense class in its row-major or packed arrangement. The variant is the checkpoint's own
@@ -120,6 +130,94 @@ def fail(message: str) -> "NoReturn":
 def run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
     print("second-shape:", " ".join(command), flush=True)
     return subprocess.run(command, check=False, **kwargs)
+
+
+class WorldFailure(Exception):
+    """A failure confined to one world; the run records it and continues to the next world."""
+
+
+def config_digest(config: bytes) -> str:
+    """The hash of one variant configuration as it is written to disk."""
+    return hashlib.sha256(config).hexdigest()
+
+
+def checkpoint_plan(config: bytes) -> str:
+    """The hash of everything that determines the checkpoint: the variant config bytes."""
+    return hashlib.sha256(
+        json.dumps(
+            {"schema": PLAN_SCHEMA, "kind": "checkpoint", "config": config_digest(config)},
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+
+
+def reference_plan(
+    config: bytes, world: int, prompts: list[list[int]], max_tokens: int
+) -> str:
+    """The hash of everything that determines one world's host reference file."""
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "schema": PLAN_SCHEMA,
+                "kind": "reference",
+                "config": config_digest(config),
+                "world": world,
+                "prompts": prompts,
+                "max_tokens": max_tokens,
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+
+
+def write_plan(path: Path, plan: str) -> None:
+    """Write the sidecar that records one plan hash beside the file it describes."""
+    path.write_text(json.dumps({"schema": PLAN_SCHEMA, "plan": plan}) + "\n")
+
+
+def read_plan(path: Path) -> str | None:
+    """The plan hash a sidecar records, or None when it is missing or unreadable."""
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict) or document.get("schema") != PLAN_SCHEMA:
+        return None
+    plan = document.get("plan")
+    return plan if isinstance(plan, str) else None
+
+
+def checkpoint_reusable(checkpoint: Path, sidecar: Path, config: bytes) -> bool:
+    """True when the stamp matches and the kept checkpoint carries the config bytes it covers."""
+    if not checkpoint.is_dir() or read_plan(sidecar) != checkpoint_plan(config):
+        return False
+    try:
+        return (checkpoint / "config.json").read_bytes() == config
+    except OSError:
+        return False
+
+
+def reference_reusable(reference: Path, sidecar: Path, plan: str) -> bool:
+    """True only when the reference and its sidecar exist and the sidecar records this plan."""
+    return reference.is_file() and read_plan(sidecar) == plan
+
+
+def world_summary(outcomes: list[tuple[int, bool, str]]) -> list[str]:
+    """One line per requested world, in order, with PASS or FAIL and the one-line reason."""
+    lines = []
+    for world, passed, reason in outcomes:
+        verdict = "PASS" if passed else "FAIL"
+        # A failure reason may wrap over several lines; the summary keeps it on one.
+        lines.append(f"second-shape: world {world} {verdict}: {' '.join(reason.split())}")
+    return lines
+
+
+def summarise(outcomes: list[tuple[int, bool, str]]) -> int:
+    """Print the summary block and return 1 when any world failed, 0 when all passed."""
+    print("second-shape: summary")
+    for line in world_summary(outcomes):
+        print(line)
+    return 0 if all(passed for _world, passed, _reason in outcomes) else 1
 
 
 def variant_config(name: str, out: Path) -> Path:
@@ -167,7 +265,7 @@ def stage_cubins(released: Path, built: Path, out: Path, world: int) -> None:
         shutil.copy2(cubin, out / cubin.name)
         staged += 1
     if staged == 0:
-        fail(
+        raise WorldFailure(
             f"no second-shape cubins for {world} ranks under {built}; "
             "run scripts/build-cubins.sh first"
         )
@@ -184,7 +282,7 @@ def wait_ready(url: str, seconds: int = 600) -> None:
         except (urllib.error.URLError, OSError):
             pass
         time.sleep(2)
-    fail(f"the group at {url} never became ready")
+    raise WorldFailure(f"the group at {url} never became ready")
 
 
 def parse_token_id(token: object) -> int:
@@ -277,7 +375,10 @@ def report_divergence(
 
 def compare(args: argparse.Namespace) -> int:
     prompts = json.loads(Path(args.prompts).read_text())
-    wait_ready(args.url, args.ready_timeout)
+    try:
+        wait_ready(args.url, args.ready_timeout)
+    except WorldFailure as error:
+        fail(str(error))
     if args.dump:
         captured: list[list[int]] = []
         gaps: list[list[list[list[float]]]] = []
@@ -375,7 +476,9 @@ def sync_to_nodes(nodes: list[str], paths: list[str]) -> None:
     """Copy the paths to every node at the same absolute path, then print each node and size."""
     names = os.environ.get("SPARK_SSH_NAMES", "").split()
     if names and len(names) < len(nodes):
-        fail(f"SPARK_SSH_NAMES names {len(names)} node(s); the group needs {len(nodes)}")
+        raise WorldFailure(
+            f"SPARK_SSH_NAMES names {len(names)} node(s); the group needs {len(nodes)}"
+        )
     # A rank that runs on this host already has the paths: the copy would go over ssh to itself,
     # which the lead Spark does not trust, and it would be the same bytes the harness just wrote.
     local = {int(rank) for rank in os.environ.get("SPARK_LOCAL_RANKS", "").split() if rank}
@@ -396,7 +499,7 @@ def sync_to_nodes(nodes: list[str], paths: list[str]) -> None:
         command += ["--path", path]
     command += ["--ssh-arg=-o", "--ssh-arg=BatchMode=yes"]
     if run(command).returncode != 0:
-        fail("the checkpoint, cubins or tokenizer did not reach every node")
+        raise WorldFailure("the checkpoint, cubins or tokenizer did not reach every node")
     size = tree_bytes(paths)
     for node in nodes:
         print(f"second-shape: synced {node}: {size} bytes ({human_bytes(size)})")
@@ -444,6 +547,225 @@ def host_group_env(logs: Path, binary: str) -> dict[str, str]:
     }
 
 
+def env_for_world(
+    args: argparse.Namespace,
+    out: Path,
+    checkpoint: Path,
+    tokenizer: str,
+    staged: Path,
+    world: int,
+    node_list: list[str],
+    peer_list: list[str],
+) -> dict[str, str]:
+    """The environment for one world's device group, declared the same way at every world."""
+    return {
+        **os.environ,
+        "SPARKFLASH_BIN": args.binary,
+        "SPARKFLASH_CHECKPOINT": str(checkpoint),
+        "SPARKFLASH_TOKENIZER": tokenizer,
+        "SPARKFLASH_CUBINS": str(staged),
+        "SPARKFLASH_LOG_ROOT": str(out / f"logs-serve-{world}"),
+        # Collect needs the launch's run directory; a generated stamp would differ.
+        "SPARKFLASH_RUN_ID": f"w{world}",
+        "ONE_HOST_LOGS": str(out / f"logs-{world}"),
+        "SPARK_NODES": " ".join(node_list),
+        "SPARK_PEERS": " ".join(peer_list),
+        "SPARK_WORLD": str(world),
+        "SPARK_LOCAL_RANKS": "0",
+        "SPARKFLASH_HTTP_BIND": f"0.0.0.0:{args.port}",
+        # The certified head screen is built for the released 5,120-value rows (160 blocks of
+        # 32); this shape serves its full 4,096-value rows (128 blocks) through that head.
+        "SPARKFLASH_HEAD_SCREEN": "0",
+        # The second shape's cubins are built from the instance list, not pinned in the
+        # released baseline; the open manifest records their hashes.
+        "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
+    }
+
+
+def run_world(
+    args: argparse.Namespace,
+    out: Path,
+    checkpoint: Path,
+    config: bytes,
+    built: Path,
+    prompts_file: Path,
+    global_file: Path,
+    global_ids: list[list[int]],
+    tokenizer: str,
+    world: int,
+) -> str:
+    """Run one world's reference, arm and comparison, and return the reason it passed.
+
+    A failure that belongs to this world raises WorldFailure so the caller can record it and go
+    on to the next requested world.
+    """
+    url = f"http://127.0.0.1:{args.port}"
+    # The expected file for this world is the host arm's own output at this split. It is captured
+    # from a live group before any device arm is launched. The sidecar records the inputs that
+    # produced it, so an unchanged checkpoint, world, prompt list and token budget reuse it.
+    expected_file = out / f"host-reference-w{world}.json"
+    tops_file = Path(str(expected_file) + ".top2.json")
+    plan_file = Path(str(expected_file) + ".plan")
+    plan = reference_plan(config, world, PROMPTS, args.max_tokens)
+    if reference_reusable(expected_file, plan_file, plan) and tops_file.is_file():
+        print(
+            f"second-shape: reusing {expected_file.name}; "
+            "the plan covers the same checkpoint, world, prompts and max-tokens"
+        )
+    else:
+        capture = compare_command(
+            url, prompts_file, dump=expected_file, max_tokens=args.max_tokens
+        )
+        result = run(
+            [
+                str(ROOT / "scripts/one-host-group.sh"),
+                "deepseek",
+                str(world),
+                "--model",
+                MODEL,
+                "--checkpoint",
+                str(checkpoint),
+                "--tokenizer",
+                tokenizer,
+                "--port",
+                str(args.port),
+                "--check",
+                capture,
+                "--apply",
+            ],
+            env=host_group_env(out / f"logs-host-ref-{world}", args.binary),
+        )
+        if result.returncode != 0:
+            raise WorldFailure(f"the {world}-rank host arm could not write its reference")
+        write_plan(plan_file, plan)
+    expected = json.loads(expected_file.read_text())
+    tops = json.loads(tops_file.read_text())
+    differing = report_world(world, expected_file, expected, global_ids, tops)
+    if world == 1 and differing:
+        prompts = ", ".join(str(index) for index in differing)
+        raise WorldFailure(
+            "the one-rank host arm does not equal the global reference at prompt(s) "
+            f"{prompts}"
+        )
+
+    # A shape that divides by the world has a cubin a world; stage this world's own directory
+    # so the loader's released file names resolve to the build for this rank count.
+    staged = out / "cubins"
+    if args.device:
+        staged = out / f"cubins-w{world}"
+        stage_cubins(Path(args.released_cubins), built, staged, world)
+
+    # The device arm is held to the split's own file at every world; world 1's file is
+    # checked against the global reference above, so the anchor is not lost.
+    if args.device:
+        expected_for_check = expected_file
+    else:
+        expected_for_check = global_file if world == 1 else expected_file
+    # The device arm takes NCCL collectives, so its group is the one the deployed launcher
+    # starts: one process a node over ssh. SPARK_NODES names the nodes in rank order; the first
+    # world of them are the group. Without it the device group runs on one host, which is the
+    # host arm's exchange and is refused by the device run header.
+    all_nodes = os.environ.get("SPARK_NODES", "").split()
+    if args.device and all_nodes:
+        node_list = all_nodes[:world]
+        peers = os.environ.get("SPARK_PEERS") or " ".join(all_nodes)
+        peer_list = peers.replace(",", " ").split()[:world]
+        if len(node_list) != world or len(peer_list) != world:
+            raise WorldFailure(
+                f"a {world}-rank device group needs {world} SPARK_NODES and SPARK_PEERS "
+                "addresses"
+            )
+        if os.environ.get("SPARK_SYNC") == "1":
+            tokenizer_file = str(Path(tokenizer).resolve())
+            sync_paths = [str(checkpoint), str(staged)]
+            checkpoint_prefix = str(checkpoint) + os.sep
+            if tokenizer_file != str(checkpoint) and not tokenizer_file.startswith(
+                checkpoint_prefix
+            ):
+                sync_paths.append(tokenizer_file)
+            print(
+                f"second-shape: syncing {len(sync_paths)} path(s) to the first {world} node(s)"
+            )
+            sync_to_nodes(node_list, sync_paths)
+        else:
+            print("second-shape: node sync skipped (set SPARK_SYNC=1 to distribute the run)")
+        group_env = env_for_world(
+            args, out, checkpoint, tokenizer, staged, world, node_list, peer_list
+        )
+        launcher = str(ROOT / "scripts/serve-four-node.sh")
+        started = False
+        agreed = 1
+        try:
+            result = run([launcher, "launch"], env=group_env)
+            started = True
+            if result.returncode != 0:
+                raise WorldFailure(f"the {world}-rank device group did not start")
+            wait_ready(url)
+            agreed = run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "compare",
+                    "--url",
+                    url,
+                    "--prompts",
+                    str(prompts_file),
+                    "--expected",
+                    str(expected_for_check),
+                    "--max-tokens",
+                    str(args.max_tokens),
+                    "--ready-timeout",
+                    "60",
+                ]
+            ).returncode
+        finally:
+            if started:
+                # Pull every worker's own log before the ranks stop; a head-only read keeps
+                # rank 0's file and has already hidden a worker failure.
+                run([launcher, "collect"], env=group_env)
+                run([launcher, "stop"], env=group_env)
+        if agreed != 0:
+            raise WorldFailure(
+                f"the {world}-rank device group did not agree with "
+                f"{expected_for_check.name}"
+            )
+        return f"the device group agreed with {expected_for_check.name}"
+
+    # One host: the host arm itself is the check when no device arm is asked for. World 1 is
+    # held to the global reference; every other world to its own split's file.
+    check = compare_command(
+        url,
+        prompts_file,
+        expected=expected_for_check,
+        max_tokens=args.max_tokens,
+    )
+    result = run(
+        [
+            str(ROOT / "scripts/one-host-group.sh"),
+            "deepseek",
+            str(world),
+            "--model",
+            MODEL,
+            "--checkpoint",
+            str(checkpoint),
+            "--tokenizer",
+            tokenizer,
+            *(("--cubins", str(staged)) if args.device else ()),
+            "--port",
+            str(args.port),
+            "--check",
+            check,
+            "--apply",
+        ],
+        env=host_group_env(out / f"logs-{world}", args.binary),
+    )
+    if result.returncode != 0:
+        raise WorldFailure(
+            f"the {world}-rank group did not agree with {expected_for_check.name}"
+        )
+    return f"the host group agreed with {expected_for_check.name}"
+
+
 def run_test(args: argparse.Namespace) -> int:
     all_nodes = os.environ.get("SPARK_NODES", "").split()
     four_node = args.device and bool(all_nodes)
@@ -455,15 +777,28 @@ def run_test(args: argparse.Namespace) -> int:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     checkpoint = out / "checkpoint"
-    cubins = out / "cubins"
-    if checkpoint.exists():
-        shutil.rmtree(checkpoint)
+    # The stamp covers the variant config bytes the writer is given. A matching stamp and a
+    # checkpoint whose own config.json is those bytes keep it; anything else rewrites it.
     config = variant_config(args.stored_format, out)
-    result = run(
-        [args.writer, str(config), str(checkpoint), "7", "4"],
-    )
-    if result.returncode != 0:
-        fail("the synthetic checkpoint did not write")
+    config_bytes = config.read_bytes()
+    checkpoint_stamp = out / "checkpoint.plan"
+    if checkpoint_reusable(checkpoint, checkpoint_stamp, config_bytes):
+        print(
+            f"second-shape: reusing {checkpoint.name}; "
+            "the plan covers the same variant config"
+        )
+    else:
+        if checkpoint.exists():
+            shutil.rmtree(checkpoint)
+        result = run(
+            [args.writer, str(config), str(checkpoint), "7", "4"],
+        )
+        if result.returncode != 0:
+            fail("the synthetic checkpoint did not write")
+        written = checkpoint / "config.json"
+        if not written.is_file() or written.read_bytes() != config_bytes:
+            fail(f"{written} is not the variant config the plan covers")
+        write_plan(checkpoint_stamp, checkpoint_plan(config_bytes))
     if args.build_cubins:
         result = run(
             [str(ROOT / "scripts/build-cubins.sh")],
@@ -493,175 +828,27 @@ def run_test(args: argparse.Namespace) -> int:
     worlds = [int(world) for world in args.world.split(",") if world.strip()]
     if not worlds:
         fail("--world names no rank count")
+    outcomes: list[tuple[int, bool, str]] = []
     for world in worlds:
-        url = f"http://127.0.0.1:{args.port}"
-        # The expected file for this world is the host arm's own output at this split. It is
-        # captured from a live group before any device arm is launched.
-        expected_file = out / f"host-reference-w{world}.json"
-        tops_file = Path(str(expected_file) + ".top2.json")
-        capture = compare_command(
-            url, prompts_file, dump=expected_file, max_tokens=args.max_tokens
-        )
-        result = run(
-            [
-                str(ROOT / "scripts/one-host-group.sh"),
-                "deepseek",
-                str(world),
-                "--model",
-                MODEL,
-                "--checkpoint",
-                str(checkpoint),
-                "--tokenizer",
+        try:
+            reason = run_world(
+                args,
+                out,
+                checkpoint,
+                config_bytes,
+                built,
+                prompts_file,
+                global_file,
+                global_ids,
                 tokenizer,
-                "--port",
-                str(args.port),
-                "--check",
-                capture,
-                "--apply",
-            ],
-            env=host_group_env(out / f"logs-host-ref-{world}", args.binary),
-        )
-        if result.returncode != 0:
-            fail(f"the {world}-rank host arm could not write its reference")
-        expected = json.loads(expected_file.read_text())
-        tops = json.loads(tops_file.read_text())
-        differing = report_world(world, expected_file, expected, global_ids, tops)
-        if world == 1 and differing:
-            prompts = ", ".join(str(index) for index in differing)
-            fail(
-                "the one-rank host arm does not equal the global reference at prompt(s) "
-                f"{prompts}"
+                world,
             )
-
-        # A shape that divides by the world has a cubin a world; stage this world's own directory
-        # so the loader's released file names resolve to the build for this rank count.
-        staged = cubins
-        if args.device:
-            staged = out / f"cubins-w{world}"
-            stage_cubins(Path(args.released_cubins), built, staged, world)
-
-        # The device arm is held to the split's own file at every world; world 1's file is
-        # checked against the global reference above, so the anchor is not lost.
-        if args.device:
-            expected_for_check = expected_file
+        except WorldFailure as error:
+            outcomes.append((world, False, str(error)))
         else:
-            expected_for_check = global_file if world == 1 else expected_file
-        # The device arm takes NCCL collectives, so its group is the one the deployed launcher
-        # starts: one process a node over ssh. SPARK_NODES names the nodes in rank order; the first
-        # `world` of them are the group. Without it the device group runs on one host, which is the
-        # host arm's exchange and is refused by the device run header.
-        if args.device and all_nodes:
-            node_list = all_nodes[:world]
-            peers = os.environ.get("SPARK_PEERS") or " ".join(all_nodes)
-            peer_list = peers.replace(",", " ").split()[:world]
-            if len(node_list) != world or len(peer_list) != world:
-                fail(
-                    f"a {world}-rank device group needs {world} SPARK_NODES and SPARK_PEERS "
-                    "addresses"
-                )
-            if os.environ.get("SPARK_SYNC") == "1":
-                tokenizer_file = str(Path(tokenizer).resolve())
-                sync_paths = [str(checkpoint), str(staged)]
-                checkpoint_prefix = str(checkpoint) + os.sep
-                if tokenizer_file != str(checkpoint) and not tokenizer_file.startswith(
-                    checkpoint_prefix
-                ):
-                    sync_paths.append(tokenizer_file)
-                print(
-                    f"second-shape: syncing {len(sync_paths)} path(s) to the first {world} node(s)"
-                )
-                sync_to_nodes(node_list, sync_paths)
-            else:
-                print("second-shape: node sync skipped (set SPARK_SYNC=1 to distribute the run)")
-            group_env = {
-                **os.environ,
-                "SPARKFLASH_BIN": args.binary,
-                "SPARKFLASH_CHECKPOINT": str(checkpoint),
-                "SPARKFLASH_TOKENIZER": tokenizer,
-                "SPARKFLASH_CUBINS": str(staged),
-                "SPARKFLASH_LOG_ROOT": str(out / f"logs-serve-{world}"),
-                # Collect needs the launch's run directory; a generated stamp would differ.
-                "SPARKFLASH_RUN_ID": f"w{world}",
-                "ONE_HOST_LOGS": str(out / f"logs-{world}"),
-                "SPARK_NODES": " ".join(node_list),
-                "SPARK_PEERS": " ".join(peer_list),
-                "SPARK_WORLD": str(world),
-                "SPARK_LOCAL_RANKS": "0",
-                "SPARKFLASH_HTTP_BIND": f"0.0.0.0:{args.port}",
-                # The second shape's cubins are built from the instance list, not pinned in the
-                # released baseline; the open manifest records their hashes.
-                "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",
-            }
-            launcher = str(ROOT / "scripts/serve-four-node.sh")
-            started = False
-            agreed = 1
-            try:
-                result = run([launcher, "launch"], env=group_env)
-                started = True
-                if result.returncode != 0:
-                    fail(f"the {world}-rank device group did not start")
-                wait_ready(url)
-                agreed = run(
-                    [
-                        sys.executable,
-                        str(Path(__file__).resolve()),
-                        "compare",
-                        "--url",
-                        url,
-                        "--prompts",
-                        str(prompts_file),
-                        "--expected",
-                        str(expected_for_check),
-                        "--max-tokens",
-                        str(args.max_tokens),
-                        "--ready-timeout",
-                        "60",
-                    ]
-                ).returncode
-            finally:
-                if started:
-                    # Pull every worker's own log before the ranks stop; a head-only read keeps
-                    # rank 0's file and has already hidden a worker failure.
-                    run([launcher, "collect"], env=group_env)
-                    run([launcher, "stop"], env=group_env)
-            if agreed != 0:
-                fail(
-                    f"the {world}-rank device group did not agree with "
-                    f"{expected_for_check.name}"
-                )
-            continue
+            outcomes.append((world, True, reason))
+    return summarise(outcomes)
 
-        # One host: the host arm itself is the check when no device arm is asked for. World 1 is
-        # held to the global reference; every other world to its own split's file.
-        check = compare_command(
-            url,
-            prompts_file,
-            expected=expected_for_check,
-            max_tokens=args.max_tokens,
-        )
-        result = run(
-            [
-                str(ROOT / "scripts/one-host-group.sh"),
-                "deepseek",
-                str(world),
-                "--model",
-                MODEL,
-                "--checkpoint",
-                str(checkpoint),
-                "--tokenizer",
-                tokenizer,
-                *(("--cubins", str(staged)) if args.device else ()),
-                "--port",
-                str(args.port),
-                "--check",
-                check,
-                "--apply",
-            ],
-            env=host_group_env(out / f"logs-{world}", args.binary),
-        )
-        if result.returncode != 0:
-            fail(f"the {world}-rank group did not agree with {expected_for_check.name}")
-    return 0
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
