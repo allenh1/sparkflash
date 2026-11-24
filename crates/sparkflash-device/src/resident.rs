@@ -240,6 +240,19 @@ impl HeaderEntry {
     }
 }
 
+/// Whether an expert leaf (`w1.<leaf>`) is one of an NVFP4 convention's tensor-wide factors.
+fn is_wide_leaf(leaf: &str) -> bool {
+    use sparkflash_model::format::NvFp4Wide;
+    let Some((matrix, factor)) = leaf.split_once('.') else {
+        return false;
+    };
+    matches!(matrix, "w1" | "w2" | "w3")
+        && [NvFp4Wide::Qwen, NvFp4Wide::Inkling]
+            .into_iter()
+            .filter_map(NvFp4Wide::leaves)
+            .any(|leaves| leaves.contains(&factor))
+}
+
 /// Classifies one checkpoint tensor name.
 ///
 /// # Errors
@@ -322,6 +335,16 @@ pub fn classify(name: &str) -> Result<Option<Classification>, ShardError> {
                 classified(Group::ExpertsColumn, ShardRule::Column)
             }
             "w2.weight" | "w2.scale" => classified(Group::ExpertsRow, ShardRule::Row),
+            // An NVFP4 convention's two tensor-wide factors beside a matrix: one f32 each, the
+            // whole matrix's, so every rank holds them whole.
+            other if is_wide_leaf(other) => classified(
+                if other.starts_with("w2.") {
+                    Group::ExpertsRow
+                } else {
+                    Group::ExpertsColumn
+                },
+                ShardRule::Replicated,
+            ),
             _ => Err(unknown()),
         };
     }
