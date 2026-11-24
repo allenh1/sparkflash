@@ -350,8 +350,10 @@ head's screen is compiled for the released 5,120-wide row (160 code blocks) and 
 so running it on this shape would read past its own table rather than fail; and, for the first
 time, per-world invocations, because the harness stops a run at its first failing world and waits
 600 s per world. The screen is a diagnostic over the head, not the head: what this run measures,
-the certified head and its reduction, is unchanged. Giving the screen a 4,096 build, and letting
-the harness carry on to the next world after a refusal, are separate items.
+the certified head and its reduction, is unchanged. Giving the screen a 4,096 build remains a
+separate item; the harness now declares the screen off and carries on to the next world after a
+refusal (#70).
+
 **Result (2026-11-24, the fifth window, the routed builds and the DSpark depth).** Tip
 `1646b7c4` (binary `9b7a060b`), the same checkpoint and group, 85 second-shape cubins (40
 `_s2`, 20 `_s2w1`, 20 `_s2w2`, 5 `nvfp4_prefill_sm121_*`), the cluster down 35m24s and
@@ -393,6 +395,85 @@ and the control plane's drain was the path. The driver reports 0% GPU utilisatio
 process including the production server, so the window claims no GPU number. What the next
 window owes: world 1 with the DSpark depth from the plan, then worlds 4 and 2 with the trace on,
 and the device ids against each world's own reference.
+
+**Result (2026-11-24, the sixth window, the draft stage).** Tip `359233a3` (binary `92485301`), the
+same checkpoint and group, the same 85 second-shape cubins, `SPARKFLASH_SETUP_TRACE=1` and
+`SPARKFLASH_HEAD_SCREEN=0`, worlds 1, 4 and 2 in that order, each its own invocation. The arm line
+is `arm=device reduce=nccl evidence=false`; the host arm passed at every world and the three
+per-world references are identical and equal the global reference
+
+```
+[[6653, 20427, 12813, 422, 9389, 6388, 16395, 6405],
+ [25425, 11040, 11559, 23442, 29453, 17940, 5192, 25888],
+ [30169, 105, 2323, 11724, 1353, 885, 3013, 30683]]
+```
+
+* **Every world opened and every world died at the same plan check.** Setup is healthy and fast:
+  every rank reached `setup done` in 2.0 to 4.3 s (world 1 rank 0: layer seams 203 ms, tail
+  3104 ms, layer device open 3890 ms, attachments 3908 ms), the shared-expert gathers are 0 ms
+  each, and then rank 0 and every worker panicked at `plan.rs:1224`
+
+      forward open: no MTP stage 2 claims a tensor ending .markov_head.head.weight
+
+  The depth fix moved the failure one layer later: the draft block then opened, and asked the
+  plan for the released model's stage two. The synthetic second shape states two DSpark stages
+  (`num_nextn_predict_layers: 2`), and the checkpoint writes the Markov head, the head norm and
+  the Markov embedding only on the last stage (`tensor.rs`, `stage + 1 == n_mtp_layers`), exactly
+  as the host reference derives them from `n_stages - 1` (`forward/mtp.rs`). The device path
+  spelled `2` in four places. `draft.rs` now takes the stage from `plan::mtp_last_stage()`;
+  `mtp_claim_result` is the reportable form of the name lookup. The released three-stage plan
+  still reads stage two. Regressions: `tests/second_shape.rs`
+  (`the_draft_blocks_last_stage_is_the_plans`) and the device-open gate below.
+* **The silence in window 5 was this panic.** Worlds 2 and 4 printed nothing that window because
+  their ranks died at the same check after the last trace line; with the trace on, all three
+  worlds print it. No world produced a device id, a first token or a `VERDICT` line.
+* **The window is recorded, not repeated.** Per the lead's freeze, no cluster window is dispatched
+  until the host gate and the harness change below are merged; the next window is world 1 only,
+  and worlds 4 and 2 run only after world 1 produces its ids.
+
+Deviations: the grace period was 31 s, not 120; the harnesses were stopped at the panic, so no
+world issued a `VERDICT`; nvcc ran beside the cargo build. The cluster was down 9m14s including
+the restore, production came back on the same release binary (`5a299b15`) through the control
+plane, and `/readyz` answered 200 25 s after the launch.
+
+**The device-open gate (2026-11-24).** `crates/sparkflash-deepseek-forward/tests/device_open_gate.rs`
+builds the second shape's plan at worlds 1, 2 and 4 and walks every part the device opens: the
+stored format each part states and the kernel symbols the plan names for it, the shared expert's
+own format, one rank's `wo_a` rows in the B12x operand the body reads, the routed geometry an
+instance was built for, the head's block-maxima buffer at the plan's width, the screen's certified
+width and the setting that turns it off, every DSpark stage's tensors including the last stage's
+Markov head, the depth authority, and the NVFP4 prefill candidate and its pin. It collects every
+refusal and reports them in one run, naming the part. The gate is plan-driven: it does not list
+the six defects, it asks each part the question they answered wrongly. Sensitivity was checked by
+reverting each fix's behaviour in turn on the gate's tip; each revert produced exactly its own
+named case at all three worlds, and the passing tree produces none:
+
+| reverted behaviour | gate case |
+|---|---|
+| head buffer at the released 5,120 width | `head block maxima` |
+| E4M3 dense class read from the empty `DenseMlp` aggregate | `wo_a per-rank stored bytes` |
+| the plan states no shared-expert format | `shared expert format` |
+| the geometry accepts only the released shape | `routed device geometry` |
+| an unstated depth falls back to 5 | `DSpark depth` |
+| the Markov head reads the released stage two | `drafter stage claims` |
+
+The gate cannot be compiled on the pre-fix tree `1ef7a6ca` verbatim: the plan answers it asks for
+(`shared_expert_format`, `dense_stored_format`, `blocks_per_row`, `mtp_last_stage`, `draft_depth`)
+did not exist there, and a version of the gate that compiled on both trees could only compare
+constants, not plan answers. The six reverts are the pre-fix evidence: each is the defect as it
+stood, restored in the one place the fix moved, and each is caught by name.
+
+**The harness runs every world in one invocation (2026-11-24).** `scripts/second-shape.py` no
+longer stops at the first failing world: it records the world's refusal, tears the group down and
+goes on, then prints one PASS or FAIL line per requested world and returns 1 if any failed. Each
+world keeps its own `host-reference-w{W}.json` and `.top2.json`, and the comparison is still the
+exact id list against that world's own file, with world 1 checked against the global reference
+including on a reused file. `host-reference-w{W}.json.plan` hashes the variant config, the world,
+the prompt list and the token budget; the host arm is skipped when the reference, its sidecar and
+its top-2 file exist and the hash matches. `checkpoint.plan` does the same for the checkpoint.
+`SPARKFLASH_HEAD_SCREEN=0` is now part of the device environment, beside
+`SPARKFLASH_UNPINNED_SECOND_SHAPE=1`, so the 4,096-wide shape does not run a screen built for
+5,120. Unit tests are in `scripts/tests/test_second_shape.py`.
 
 ## 4. The work
 
