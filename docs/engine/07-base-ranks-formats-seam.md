@@ -535,6 +535,45 @@ one-address stop form the brief suggested is refused by the launcher (it wants f
 rank order), so the stop was the harness's own; `/v1/cluster/stats` again reported an empty node
 list beside a serving group.
 
+**Diagnosis on a one-GPU workstation (2026-11-24, not a cluster window).** Windows 7 to 11 each
+spent cluster time to find one released literal, so the next round moved off the cluster to a
+workstation whose GPU is the same compute capability (12.1) as the Spark's: the same tip, the
+same cubins (rebuilt locally with its nvcc), world 1, `SPARK_LOCAL_RANKS=0` so rank 0 runs
+without ssh, and `CUDA_LAUNCH_BLOCKING=1` so a fault is attributed to the launch that caused it
+instead of surfacing at a later one. The cluster stayed up throughout; production was never
+stopped.
+
+* **The launch error now names its kernel.** `cuda_driver`'s `launch_async` reported the driver
+  code alone, which is why windows 10 and 11 blamed the launch after the fault. It now names the
+  kernel, its grid and its block, so `cuLaunchKernel failed: 700` became
+  `... on opt_rows_lm_head (grid 10x32x1, block 512x1x1, 0 B shared)`.
+* **The rows LM head read past every row.** `opt_rows_lm_head`'s weight loop was unrolled for the
+  released width (a warp takes a row 32 uint4 - 256 bf16 values - a step, so 20 steps for 5,120)
+  regardless of the width it was compiled for. On a 4,096-wide shape it read 128 uint4 past each
+  row and past the tensor on the last one, which is the illegal address both windows 10 and 11
+  reported one launch late. Both copies of the loop (the whole head and the screen's exact arm)
+  now state `OR_LM_STEPS = OR_LM_HIDDEN / 256`, with a `static_assert` that the width is whole.
+* **The drafter's routed down block was the released 288.** `draft.rs` launched
+  `opt_moe_down_dedup_sm121` with a literal 288 while the backbone's launch had already been
+  fixed to half the plan's per-rank intermediate; the drafter's is the same instance bound, so it
+  takes the same function (`dedup_down_threads_for`). The gate's `drafter routed block` reads the
+  drafter's source and refuses a literal there.
+* **The rows head refuses a step wider than its state.** The buffers hold `cap` rows while the
+  head's only guard was the global `R_MAX`; a step between the two is now a named refusal.
+* **What is still open, by name: the second shape has no one-rank drafter build.**
+  `kernels/instances.toml` states `opt_draft_sm121_s2` and `_s2w2` rows and none with `_s2w1`, so
+  world 1 stages the released drafter cubin (compiled for a 5,120-value row) and its head
+  quantiser reads a 4,096-wide weight with a 5,120 stride:
+
+```
+the device loop failed, exiting: cuLaunchKernel failed: 700 on opt_draft_head_fp8t
+(grid 32768x1x1, block 256x1x1, 0 B shared)
+```
+
+  Those rows also state `hc = 2` while the shape now states 4, so they need regenerating, not just
+  copying to a world-1 name. Until they exist, world 1 of this shape cannot open the drafter, and
+  the plan gate has no table of drafter geometries to refuse it by name.
+
 **The device-open gate (2026-11-24).** `crates/sparkflash-deepseek-forward/tests/device_open_gate.rs`
 builds the second shape's plan at worlds 1, 2 and 4 and walks every part the device opens: the
 stored format each part states and the kernel symbols the plan names for it, the shared expert's
@@ -559,6 +598,7 @@ named case at all three worlds, and the passing tree produces none:
 | the Markov head reads the released stage two | `drafter stage claims` |
 | the plan states 2 hidden streams, the rows kernels are built for 4 | `embedding gather streams` |
 | the dedup down block is the released 288 | `routed dedup block` |
+| the drafter's dedup down block is the released 288 | `drafter routed block` |
 
 The gate cannot be compiled on the pre-fix tree `1ef7a6ca` verbatim: the plan answers it asks for
 (`shared_expert_format`, `dense_stored_format`, `blocks_per_row`, `mtp_last_stage`, `draft_depth`)

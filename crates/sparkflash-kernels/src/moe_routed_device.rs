@@ -284,6 +284,16 @@ pub struct MoeRoutedGeometry {
     pub padded: usize,
 }
 
+/// The routed dedup down body's block for a rank that holds `local_inter` intermediate columns.
+///
+/// The instance compiles its launch bounds from the same number (`OPT_MOE_DD_THREADS =
+/// OPT_MOE_INTER / 2`), so every caller - the backbone's routed FFN and the drafter's - states the
+/// plan's number through this one function rather than a literal that only fits the released 576.
+#[must_use]
+pub fn dedup_down_threads_for(local_inter: usize) -> usize {
+    local_inter / 2
+}
+
 impl MoeRoutedGeometry {
     /// The released four-rank geometry.
     #[must_use]
@@ -379,7 +389,7 @@ impl MoeRoutedGeometry {
     /// driver before a thread runs.
     #[must_use]
     pub fn dedup_down_threads(&self) -> usize {
-        self.local_inter() / 2
+        dedup_down_threads_for(self.local_inter())
     }
 
     /// The gate/up/SwiGLU operand's columns: [`Self::local_inter`] plus the build's padding.

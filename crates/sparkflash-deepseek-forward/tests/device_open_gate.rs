@@ -96,6 +96,7 @@ fn the_second_shape_opens_from_its_own_plan_at_one_two_and_four_ranks() {
         check_streams(&mut gate, world);
         check_parts(&mut gate, &plan, world);
         check_routed_dedup(&mut gate, &plan, world);
+        check_drafter_block(&mut gate);
         check_wo_a(&mut gate, &dir, world, &written, &plan);
         check_draft(&mut gate, world);
         check_prefill(&mut gate, world);
@@ -123,6 +124,20 @@ fn check_streams(gate: &mut Refusals, world: usize) {
                  built for {built}"
         )
     });
+}
+
+/// The certified head's buffer and the screen's block count, at the plan's width.
+/// The drafter's dedup down launch states half its rank's intermediate, never a literal.
+fn check_drafter_block(gate: &mut Refusals) {
+    gate.require(
+        "drafter routed block",
+        DRAFT.contains("local_inter() / 2") && DRAFT.contains("(down_threads, 1, 1)"),
+        || {
+            "the drafter's dedup down launch does not derive its block from the plan's per-rank \
+             intermediate"
+                .to_owned()
+        },
+    );
 }
 
 /// The certified head's buffer and the screen's block count, at the plan's width.
@@ -187,6 +202,10 @@ fn check_head(gate: &mut Refusals) {
         },
     );
 }
+
+/// The drafter's own routed FFN launches one of the same instances, so its block is the plan's
+/// too: the source is read here because the drafter is behind the cuda feature and the gate is not.
+const DRAFT: &str = include_str!("../src/tp4_forward/draft.rs");
 
 /// The instance catalogue the build compiles from, read so the gate can compare what one cubin was
 /// compiled for with what the plan states. A body's launch bounds and its operand strides come

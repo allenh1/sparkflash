@@ -1585,12 +1585,16 @@ impl DeviceLayer<'_> {
                 (128, 1, 1),
                 &args,
             )?;
-            // Two 32-column tiles a block (OPT_MOE_DD_TILES), two of a tile's 576 chunks a thread;
-            // blocks past the distinct count exit.
+            // Two 32-column tiles a block (OPT_MOE_DD_TILES), two of a tile's chunks a thread, so
+            // the block is half this rank's intermediate - the number the instance compiles its
+            // launch bounds from. Blocks past the distinct count exit.
+            let down_threads = u32::try_from(local_inter() / 2).map_err(|_| {
+                "draft routed: the dedup down block does not fit a launch word".to_owned()
+            })?;
             self.cuda.launch(
                 down,
                 ((dim / 64) as u32, routed, 1),
-                (288, 1, 1),
+                (down_threads, 1, 1),
                 &[
                     stage.table + 2 * matrix,
                     draft.moe_plan,

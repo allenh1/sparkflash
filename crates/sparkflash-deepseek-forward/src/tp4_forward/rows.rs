@@ -4133,6 +4133,16 @@ impl DeviceLayer<'_> {
         if n > R_MAX {
             return Err(format!("rows head: {n} rows are more than {R_MAX}"));
         }
+        // The state's buffers hold `cap` rows, which the draft's own row budget can raise above the
+        // serve's. A step wider than that writes past every buffer the head reads and writes, so it
+        // is refused here rather than left to fault on the device.
+        if n > rows.cap {
+            return Err(format!(
+                "rows head: a step of {n} rows exceeds this state's {} rows; the batch must split \
+                 the step",
+                rows.cap
+            ));
+        }
         // Greedy rows draw no noise, so an all-greedy step is one sampler's too.
         let uniform = samplers
             .iter()

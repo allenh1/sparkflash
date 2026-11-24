@@ -4209,7 +4209,23 @@ impl Cuda {
             return self.graph_segment_launch(mode, kernel, grid, block, args);
         }
         self.launch_kernel(std::ptr::null_mut(), kernel, grid, block, args)
-            .map_err(|r| format!("cuLaunchKernel failed: {r}"))
+            .map_err(|r| {
+                // A refused launch names the kernel and the geometry it was given: the driver's
+                // code alone cannot say which of a stage's launches failed, and a run that reports
+                // only the code sends its reader to the caller's neighbour.
+                format!(
+                    "cuLaunchKernel failed: {r} on {} (grid {}x{}x{}, block {}x{}x{}, {} B \
+                     shared)",
+                    kernel.name,
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block.0,
+                    block.1,
+                    block.2,
+                    kernel.shared_bytes
+                )
+            })
     }
 
     /// Queues one launch on `stream`, with programmatic stream serialization when the kernel
