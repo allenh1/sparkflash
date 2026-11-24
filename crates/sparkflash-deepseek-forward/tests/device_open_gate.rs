@@ -93,6 +93,7 @@ fn the_second_shape_opens_from_its_own_plan_at_one_two_and_four_ranks() {
         plan::install(plan.clone()).unwrap_or_else(|error| panic!("world {world}: {error}"));
         let mut gate = Refusals::default();
         check_head(&mut gate);
+        check_streams(&mut gate, world);
         check_parts(&mut gate, &plan, world);
         check_wo_a(&mut gate, &dir, world, &written, &plan);
         check_draft(&mut gate, world);
@@ -111,6 +112,19 @@ fn the_second_shape_opens_from_its_own_plan_at_one_two_and_four_ranks() {
 }
 
 /// The certified head's buffer and the screen's block count, at the plan's width.
+/// The row kernels are built for one stream count; the plan must state it, or the embedding
+/// gather writes rows of a width no kernel reads.
+fn check_streams(gate: &mut Refusals, world: usize) {
+    let stated = plan::hc_mult();
+    let built = sparkflash_deepseek_forward::tp4_forward::rows_streams();
+    gate.require("embedding gather streams", stated == built, || {
+        format!(
+            "world {world}: the plan states {stated} hidden streams; the rows kernels are \
+                 built for {built}"
+        )
+    });
+}
+
 fn check_head(gate: &mut Refusals) {
     let hidden = plan::hidden();
     let blocks = hidden / lm_head_ref::SCREEN_TILE;
