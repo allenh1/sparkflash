@@ -36,7 +36,7 @@ use crate::plan::ModelConfig;
 use sparkflash_device::arena::{
     ArenaAllocator, ArenaTensor, ResidentArena, TensorLayout, tile_b12x,
 };
-use sparkflash_device::resident::{ResidentGroup, ResidentPlan};
+use sparkflash_device::resident::{OperandLayout, ResidentGroup, ResidentPlan};
 use sparkflash_engine::weights::WeightSource;
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
@@ -382,7 +382,8 @@ pub fn rank_attention_plan_shapes(
 /// The ten stored per-layer tensors the whole-layer device seam bodies read and the attention
 /// projection bind cannot carry: the six mHC tensors, the two block norms and the q/kv norms. Every
 /// one is planned as a stored operand (no B12x payload, no scale grid), which is why it is not in
-/// the attention projection table and why this class binds it by stored_bytes instead of a geometry.
+/// the attention projection table and why this class binds it by this rank's stored slice instead
+/// of a B12x geometry.
 ///
 /// The list is (plan-name suffix, planned format), in the order a reader meets them: the two block
 /// norms the seam bodies take as norm_w, then the q/kv norms the attention body reads, then the mHC
@@ -540,7 +541,9 @@ pub fn bind_rank_mhc_seam(
                 shard.name
             )
         })?;
-        let expected_bytes = shard.stored_bytes as usize;
+        // This rank's slice, not the whole tensor: the seam class is replicated today, so the two
+        // agree, and a future split seam cannot pass a world-blind comparison here.
+        let expected_bytes = usize::try_from(shard.shard_bytes).unwrap_or(usize::MAX);
         if slice.bytes != expected_bytes {
             return Err(format!(
                 "{}: arena slice is {} bytes but the stored {} layout expects {expected_bytes} bytes (no B12x, no scale)",
@@ -864,11 +867,14 @@ pub struct RankBind {
 /// `RankBind`: the (weight, scales) pointers the kernels must be launched with plus the named
 /// coverage report of this pass.
 ///
-/// This is the bind-time byte check the seam relies on: the weight slice must be exactly the B12x
-/// payload for the (cols, inner) the kernel will read, and the scale slice exactly the 32x32 grid,
-/// or the bind fails naming the tensor rather than launching on the wrong bytes. Every table key
-/// that is resident in this rank's plan must be bound: a missing entry means the arena and the
-/// expected-shape table disagree, which is a bug, not a fallback.
+/// This is the bind-time byte check the seam relies on: the weight slice must be exactly the
+/// operand the plan records for this rank - the B12x payload for the (cols, inner) the kernel will
+/// read, or the stored slice's own bytes - and a B12x scale slice exactly the 32x32 grid, or the
+/// bind fails naming the tensor rather than launching on the wrong bytes. Both sides are the
+/// per-rank plan: the expectation is `shard.operand_layout()`, never the whole tensor's stored
+/// length, so a row-split tensor is checked against the slice the arena actually holds. Every
+/// table key that is resident in this rank's plan must be bound: a missing entry means the arena
+/// and the expected-shape table disagree, which is a bug, not a fallback.
 ///
 /// # Errors
 /// A missing arena slice, a payload whose bytes do not match the geometry, or a table key the plan
@@ -900,9 +906,18 @@ pub fn bind_rank_attention(
                 shard.name
             )
         })?;
-        match sparkflash_device::arena::b12x_layout(shard) {
-            Some((cols, inner, _block)) => {
-                let expected_weight = b12x_buffer_bytes(cols, inner);
+        // The expected bytes are this rank's planned operand, never the whole tensor: a row-split
+        // tensor's arena slice is `shard_bytes`, so an expectation read from `stored_bytes` would
+        // hold at world 1 and refuse every wider world by a factor of the world.
+        match shard.operand_layout() {
+            OperandLayout::B12x {
+                cols,
+                inner,
+                weight_bytes,
+                scale_bytes,
+                ..
+            } => {
+                let expected_weight = usize::try_from(weight_bytes).unwrap_or(usize::MAX);
                 if weight.bytes != expected_weight {
                     return Err(format!(
                         "{}: arena slice is {} bytes but the {cols}x{inner} B12x payload is {expected_weight}",
@@ -910,7 +925,7 @@ pub fn bind_rank_attention(
                     ));
                 }
                 let scale_name = format!("{}.scale", shard.name.trim_end_matches(".weight"));
-                let expected_scale = cols.div_ceil(32) * inner.div_ceil(32);
+                let expected_scale = usize::try_from(scale_bytes).unwrap_or(usize::MAX);
                 let scales = arena.slice(&scale_name).ok_or_else(|| {
                     format!("{scale_name}: no arena slice for the weight's scale grid")
                 })?;
@@ -922,11 +937,11 @@ pub fn bind_rank_attention(
                 }
                 bound.insert(shard.name.clone(), (weight.ptr, scales.ptr));
             }
-            None => {
-                let expected = shard.stored_bytes as usize;
+            OperandLayout::Stored { bytes, .. } => {
+                let expected = usize::try_from(bytes).unwrap_or(usize::MAX);
                 if weight.bytes != expected {
                     return Err(format!(
-                        "{}: arena slice is {} bytes but the stored {} layout expects {expected} bytes (no B12x, no scale)",
+                        "{}: arena slice is {} bytes but this rank's stored {} slice is {expected} bytes (no B12x, no scale)",
                         shard.name, weight.bytes, shard.dtype
                     ));
                 }

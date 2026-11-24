@@ -1378,9 +1378,10 @@ impl ResidentArgs {
 /// The stored format a checkpoint header states, as the plan resolved it for that tensor's class.
 ///
 /// The file's dtype word selects which class format to ask the plan for, and the plan answers it:
-/// an E4M3 tensor is read in the dense class's format, an E2M1 tensor in the experts' class
-/// format, and a bf16 or f32 tensor in the one unscaled format its word names. A scale plane's
-/// dtype carries no arithmetic of its own (its weight's format sizes it), so it states none.
+/// an E4M3 tensor is read in the dense class's arrangement ([EnginePlan::dense_stored_format]),
+/// an E2M1 tensor in the experts' class format, and a bf16 or f32 tensor in the one unscaled
+/// format its word names. A scale plane's dtype carries no arithmetic of its own (its weight's
+/// format sizes it), so it states none.
 ///
 /// Nothing here compares a dtype word against an expected one: the bind's authority is the format
 /// the plan resolved, and a release stored another way changes that format, not this match.
@@ -1392,9 +1393,7 @@ pub fn tensor_format(
     use sparkflash_model::Part;
     use sparkflash_model::format::StoredFormat;
     match dtype {
-        "F8_E4M3" => plan
-            .stored_format(Part::DenseMlp, None)
-            .or(Some(StoredFormat::MXFP8_32)),
+        "F8_E4M3" => Some(plan.dense_stored_format()),
         "F4_E2M1" | "I8" => plan
             .stored_format(Part::Moe, None)
             .or(Some(StoredFormat::MXFP4_ROW_32)),
