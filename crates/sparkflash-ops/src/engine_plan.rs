@@ -150,7 +150,7 @@ pub const fn format_of_precision(precision: Precision) -> StoredFormat {
         Precision::Fp8E4M3 => StoredFormat::FP8_E4M3_TILE_128,
         Precision::MxFp8 => StoredFormat::MXFP8_32,
         Precision::NvFp4 => StoredFormat::NVFP4_16,
-        Precision::MxFp4 => StoredFormat::MXFP4_32,
+        Precision::MxFp4 => StoredFormat::MXFP4_ROW_32,
     }
 }
 
@@ -802,6 +802,27 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
                 .unwrap_or_else(|| "bf16".to_owned()),
         ),
     );
+    put(
+        "weight_block",
+        FactValue::Integer(
+            architecture
+                .quantization
+                .block
+                .unwrap_or(32)
+                .try_into()
+                .unwrap_or(32),
+        ),
+    );
+    put(
+        "weight_scale",
+        FactValue::Text(
+            architecture
+                .quantization
+                .scale
+                .clone()
+                .unwrap_or_else(|| "ue8m0".to_owned()),
+        ),
+    );
     if let Some(attention) = first.map(|layer| &layer.attention) {
         put("n_heads", FactValue::Integer(attention.heads as i64));
         put("head_dim", FactValue::Integer(attention.head_dim as i64));
@@ -1250,26 +1271,20 @@ fn layout_format(dtype: LayoutDtype, architecture: &Architecture) -> Option<Weig
         LayoutDtype::Dense => Some(quantization.dense_format),
         LayoutDtype::Expert => Some(quantization.expert_format),
         LayoutDtype::F8E4M3 => {
-            // An explicit E4M3 tensor keeps the tile or MX block the checkpoint's own formats
-            // name. A release that states no FP8 class still stores 128x128 bf16 scales here.
+            // A tensor the layout stores as E4M3 explicitly (the Engram table) is not one of the
+            // linear classes: its scale companion is a ue8m0 grid, so its format is the MX block
+            // even when the release's linears are 128-tile FP8. Only a release whose classes are
+            // MX names a tile here, and then that class's block travels.
             for format in [
                 quantization.dense_format,
                 quantization.expert_format,
                 quantization.mtp_expert_format.unwrap_or(WeightFormat::Bf16),
             ] {
-                if matches!(
-                    format,
-                    WeightFormat::Fp8Tile { .. } | WeightFormat::MxFp8 { .. }
-                ) {
+                if let WeightFormat::MxFp8 { .. } = format {
                     return Some(format);
                 }
             }
-            Some(WeightFormat::Fp8Tile {
-                block_m: 128,
-                block_n: 128,
-                scale_dtype: ScaleDType::Bf16,
-                dynamic_activations: false,
-            })
+            Some(WeightFormat::MxFp8 { block: 32 })
         }
         LayoutDtype::F4E2M1
             if matches!(
