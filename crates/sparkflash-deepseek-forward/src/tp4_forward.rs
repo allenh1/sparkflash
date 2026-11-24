@@ -2878,6 +2878,16 @@ pub fn token_stage(request: &TokenStageRequest<'_>) -> TokenStageOutcome {
     }
 }
 
+/// Whether the run was asked for its setup milestone lines (SPARKFLASH_SETUP_TRACE=1).
+///
+/// A second shape spends its first minutes in setup phases a released run never shows at this
+/// width, and a stuck run prints nothing after the run header. The lines are opt-in, go to stderr,
+/// and change no arithmetic, launch, allocation or ordering.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn setup_trace_on() -> bool {
+    std::env::var_os("SPARKFLASH_SETUP_TRACE").is_some()
+}
+
 /// Runs the forward loop with the live arena and bind: the only place the arena pointers are used.
 ///
 /// The caller must hold the arena epoch open; [crate::tp4_resident::bind_device_sets_in_arena_with]
@@ -7451,6 +7461,14 @@ fn gather_shared_expert_source(
                 .saturating_mul(8)
                 .saturating_add(index as u64),
         );
+        if setup_trace_on() {
+            eprintln!(
+                "setup trace r{} shared layer {layer} {what}: gather start, {} words",
+                request.rank,
+                words.len()
+            );
+        }
+        let started = std::time::Instant::now();
         transport
             .all_gather_bf16(&words, &mut gathered, sequence)
             .map_err(|error| {
@@ -7459,6 +7477,13 @@ fn gather_shared_expert_source(
                 )
             })?;
         gather_calls += 1;
+        if setup_trace_on() {
+            eprintln!(
+                "setup trace r{} shared layer {layer} {what}: done in {} ms",
+                request.rank,
+                started.elapsed().as_millis()
+            );
+        }
         let mut shards = Vec::with_capacity(world);
         for rank in 0..world {
             let start = rank * words.len();
@@ -16990,6 +17015,19 @@ fn run_forward_loop(
         },
         if evidence { "recording" } else { "off" }
     );
+    // Cumulative setup milestones, default off: the next line names the phase the run is in, so a
+    // window that never reaches the serving loop still says where its minutes went.
+    let setup_started = std::time::Instant::now();
+    let setup_trace = |stage: &str| {
+        if setup_trace_on() {
+            eprintln!(
+                "setup trace r{} {stage}: {} ms",
+                request.rank,
+                setup_started.elapsed().as_millis()
+            );
+        }
+    };
+    setup_trace("begin");
     if request.forward_perf.probe_nosync && !async_launches {
         // The no-sync meter queues its launches to keep the device wait off the host wall, so a row
         // that opted back into the pre-M2 drain would still measure a host-only wall for launches
@@ -17081,6 +17119,13 @@ fn run_forward_loop(
             .map_err(|error| {
                 format!("embedding all-gather (position {position}, token {prompt_token}): {error}")
             })?;
+        if setup_trace_on() {
+            eprintln!(
+                "setup trace r{} embedding position {position}/{gathered_positions}: {} ms",
+                request.rank,
+                setup_started.elapsed().as_millis()
+            );
+        }
         let hidden_row: Vec<u8> = gathered
             [owner * crate::plan::hidden()..(owner + 1) * crate::plan::hidden()]
             .iter()
@@ -17100,6 +17145,7 @@ fn run_forward_loop(
         }
     }
     probe::run(&cuda, "embedding_gathers", timer);
+    setup_trace("embeddings");
     let prompt_hidden_sha256 = sha256_hex(&prefill_hidden[..prompt_len * row_bytes]);
     let forward_hidden_sha256 = sha256_hex(&prefill_hidden);
     let hidden_sha256 = prompt_hidden_sha256.clone();
@@ -17280,6 +17326,7 @@ fn run_forward_loop(
     // replicated. A prefill reads the same replicated views for every position, so the six
     // all-gathers are paid once per layer here and every position of the layer borrows them: the
     // bytes are identical to the per-position gathers the earlier single-position loop issued.
+    setup_trace("attention body and kv");
     let shared_started = std::time::Instant::now();
     // Same rule as head_total: the counters must be read before the prewarm moves them.
     let shared_prewarm_timer = BlockTimer::start(probe_on);
@@ -17312,6 +17359,7 @@ fn run_forward_loop(
         .iter()
         .map(|gather| gather.gather_calls)
         .sum();
+    setup_trace("shared expert");
 
     // M3/C1: the boundary projection pair re-reads and re-loads the same two cubins on every layer.
     // One cache, warmed here before the step timer and freed after the loop, keeps those modules
@@ -17335,6 +17383,7 @@ fn run_forward_loop(
     // and the recorded predictor/base/norm digests are the same bytes the per-call read path
     // produced; only the per-layer mhc_entry.arena_reads drops from 4 to 0.
     let layer_seams = build_layer_seam_cache(&cuda, arena, request, n_layers)?;
+    setup_trace("layer seams");
     // M2 Phase 2A: the tail stage and the final-norm weight are position-independent, so they are
     // opened/read ONCE at run scope and borrowed by every head position. Bytes are identical (same
     // cubins; w_block_max and head_shard_sha256 derived once from the same arena head shard; same
@@ -17381,6 +17430,7 @@ fn run_forward_loop(
     // The run-scope tail open: the final-norm weight DTOH is inside this block (the arena_reads
     // counter carries its bytes/time); the head path no longer repeats it.
     probe::run(&cuda, "tail_open", timer);
+    setup_trace("tail");
     // Debug hook for the phase1-boundary v1 cross-check: when SPARKFLASH_BOUNDARY_TRACE names a
     // directory (relative names live under the evidence dir), rank 0 writes the same per-layer
     // tensor set the engine capture holds for every position listed in SPARKFLASH_TRACE_POSITIONS
@@ -17521,6 +17571,7 @@ fn run_forward_loop(
     } else {
         None
     };
+    setup_trace("layer device open");
     // The run's single shared-expert gather is attached here, before the first position: prewarm
     // work, one per run, and `moe_shared` refuses by name if it is missing.
     if let Some(device) = layer_device.as_mut() {
@@ -17564,6 +17615,7 @@ fn run_forward_loop(
             device.attach_engram(kernel_dir, host)?;
         }
     }
+    setup_trace("attachments");
     // The multi-row verify step, teacher-forced (SPARKFLASH_ROWS=n): from SPARKFLASH_ROWS_FROM
     // (default the prompt length) every n positions run as one rows step, rank 0 prints each
     // row's argmax and the step's wall, and the run ends after the last row.
@@ -17682,6 +17734,7 @@ fn run_forward_loop(
                 .collect(),
         )
     };
+    setup_trace("setup done");
     if dspark {
         let (Some(device), Some(rows), Some(dir)) = (
             layer_device.as_mut(),
@@ -17690,15 +17743,17 @@ fn run_forward_loop(
         ) else {
             return Err("SPARKFLASH_DSPARK: needs the device arm and the cubins".to_owned());
         };
+        // An unset depth is the plan's draft block, never a released literal: the block is the
+        // plan's own fact (5 on the released model, 2 on the synthetic second shape), and a
+        // second shape that declares no depth used to inherit the released 5 and be refused by
+        // its own plan.
+        let block = draft::draft_block();
         let k: usize = sparkflash_model::active_profile()
             .speculation
             .dspark_k
-            .unwrap_or(5);
-        if k == 0 || k > draft::draft_block() || k + 1 > rows::R_MAX {
-            return Err(format!(
-                "SPARKFLASH_DSPARK_K={k}: needs 1..={}",
-                draft::draft_block()
-            ));
+            .unwrap_or(block);
+        if k == 0 || k > block || k + 1 > rows::R_MAX {
+            return Err(format!("SPARKFLASH_DSPARK_K={k}: needs 1..={block}"));
         }
         let staged: Vec<Option<SeamStagedWeights>> = (0..n_layers)
             .map(|layer| seam_wq_b.as_ref().and_then(|seam| seam.staged_for(layer)))
