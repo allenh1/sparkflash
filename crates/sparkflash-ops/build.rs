@@ -174,6 +174,21 @@ fn generate() -> String {
                 "sparkflash-ops: {entry} is listed twice with different formats"
             );
         }
+        let family = table
+            .get("family")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
+        // The grouped attention output projection compiles its heads, head width, output-group
+        // count and one group's output rank from the instance, but no catalogue part names that
+        // geometry: the released forward loads these symbols by KernelId. Refuse a claim rather
+        // than generate a rule that cannot constrain the output rank.
+        if family == "woa" {
+            assert!(
+                table.get("catalogue").is_none(),
+                "sparkflash-ops: {entry} is a woa instance and cannot claim a catalogue key"
+            );
+            continue;
+        }
         let Some(key) = table.get("catalogue").and_then(toml::Value::as_str) else {
             continue;
         };
@@ -183,11 +198,6 @@ fn generate() -> String {
         let width = positive("hidden")
             .unwrap_or_else(|| panic!("sparkflash-ops: {key} has no positive integer hidden"));
         hidden.entry(key.clone()).or_default().insert(width);
-
-        let family = table
-            .get("family")
-            .and_then(toml::Value::as_str)
-            .unwrap_or_default();
         if family == "vision" {
             let row = vision.entry(key.clone()).or_default();
             row.hidden.insert(width);

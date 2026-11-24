@@ -86,6 +86,9 @@ fn instances() -> Vec<Instance> {
                 "ring_capacity",
                 "positions",
                 "ratio",
+                "heads",
+                "o_groups",
+                "o_lora_rank",
             ] {
                 if let Some(value) = table.get(key).and_then(toml::Value::as_integer) {
                     assert!(value > 0, "{key} is positive");
@@ -142,7 +145,7 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
         assert!(
             [
                 "router", "routed", "seams", "drafter", "rows", "head", "vision", "mla", "select",
-                "csa2",
+                "csa2", "woa",
             ]
             .contains(&instance.family.as_str()),
             "{} names family {:?}",
@@ -187,6 +190,7 @@ fn every_instance_names_a_source_and_an_entry_the_source_carries() {
                 "positions",
             ],
             "csa2" => &["hidden", "head_dim", "ratio", "positions"],
+            "woa" => &["heads", "head_dim", "o_groups", "o_lora_rank"],
             other => panic!("{} names family {other}", instance.entry),
         };
         for key in keys {
@@ -651,6 +655,83 @@ fn the_attention_and_selection_families_have_their_released_shapes_and_a_second_
         assert!(
             keys.contains(key),
             "the catalogue key {key} has no instance"
+        );
+    }
+}
+
+#[test]
+fn the_woa_family_and_the_b12x_routed_sources_have_released_and_second_shapes() {
+    let rows = instances();
+    let baseline = pins().expect("the baseline parses");
+
+    // The grouped attention output projection is the new family: five entries share one released
+    // cubin and one geometry, and a second shape compiles the same five entries from its own
+    // cubin. The reduction width is heads / o_groups * head_dim in both.
+    let woa: Vec<&Instance> = rows.iter().filter(|row| row.family == "woa").collect();
+    let released: Vec<&&Instance> = woa
+        .iter()
+        .filter(|row| row.cubin == "b12x_mxfp8_wo_a_sm121")
+        .collect();
+    assert_eq!(released.len(), 5, "the released wo_a cubin's five entries");
+    for row in &released {
+        assert_eq!(row.shapes["heads"], 64, "{}", row.entry);
+        assert_eq!(row.shapes["head_dim"], 512, "{}", row.entry);
+        assert_eq!(row.shapes["o_groups"], 8, "{}", row.entry);
+        assert_eq!(row.shapes["o_lora_rank"], 1024, "{}", row.entry);
+        assert!(row.catalogue.is_none(), "{} is loaded by symbol", row.entry);
+    }
+    let second: Vec<&&Instance> = woa
+        .iter()
+        .filter(|row| row.cubin == "b12x_mxfp8_wo_a_sm121_s2")
+        .collect();
+    assert_eq!(
+        second.len(),
+        5,
+        "the second-shape wo_a cubin's five entries"
+    );
+    for row in &second {
+        assert_eq!(row.shapes["heads"], 32, "{}", row.entry);
+        assert_eq!(row.shapes["head_dim"], 512, "{}", row.entry);
+        assert_eq!(row.shapes["o_groups"], 4, "{}", row.entry);
+        assert_eq!(row.shapes["o_lora_rank"], 256, "{}", row.entry);
+        assert!(
+            !baseline.iter().any(|pin| pin.name == row.cubin),
+            "{} is a proof cubin",
+            row.cubin
+        );
+    }
+
+    // The two MXFP4 routed-expert sources take the rank's real width, the padded activation row,
+    // the expert count and the selected slots from the instance.
+    for source in ["b12x_mxfp4_moe_sm121.cu", "b12x_mxfp4_moe_stored_sm121.cu"] {
+        let row = rows
+            .iter()
+            .find(|row| row.source.ends_with(source) && !row.cubin.ends_with("_s2"))
+            .unwrap_or_else(|| panic!("{source} has no released instance"));
+        assert_eq!(row.family, "routed", "{source}");
+        assert_eq!(row.shapes["hidden"], 5120, "{source}");
+        assert_eq!(row.shapes["intermediate"], 576, "{source}");
+        assert_eq!(row.shapes["padded"], 640, "{source}");
+        assert_eq!(row.shapes["experts"], 384, "{source}");
+        assert_eq!(row.shapes["top_k"], 6, "{source}");
+        assert_eq!(row.catalogue.as_deref(), Some("deepseek-moe"), "{source}");
+        assert!(
+            baseline.iter().any(|pin| pin.name == row.cubin),
+            "{source} keeps its released pin"
+        );
+
+        let proof = rows
+            .iter()
+            .find(|row| row.source.ends_with(source) && row.cubin.ends_with("_s2"))
+            .unwrap_or_else(|| panic!("{source} has no second-shape instance"));
+        assert_eq!(proof.shapes["hidden"], 4096, "{source}");
+        assert_eq!(proof.shapes["intermediate"], 128, "{source}");
+        assert_eq!(proof.shapes["padded"], 128, "{source}");
+        assert_eq!(proof.shapes["experts"], 64, "{source}");
+        assert_eq!(proof.shapes["top_k"], 4, "{source}");
+        assert!(
+            !baseline.iter().any(|pin| pin.name == proof.cubin),
+            "{source}'s proof cubin is not in the baseline"
         );
     }
 }

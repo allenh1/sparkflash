@@ -111,7 +111,7 @@ pub fn declaration() -> KernelDecl {
 /// The kernel's constants with the shared M4 header's names resolvable.
 #[must_use]
 pub fn constants() -> Consts {
-    let mut table = Consts::parse(SOURCE);
+    let mut table = crate::instances::consts_for_source(SOURCE, "b12x_mxfp4_moe_stored_sm121.cu");
     table.extend(COMMON_HEADER);
     table
 }

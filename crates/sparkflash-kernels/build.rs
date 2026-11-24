@@ -204,6 +204,10 @@ fn read_instances() -> Vec<Instance> {
             // CSA2 compression: the released hidden width, the latent width the append packs,
             // the compression ratio and the position bound the claim states.
             "csa2" => &["hidden", "head_dim", "ratio", "positions"],
+            // The grouped attention output projection: the query heads, their width, the
+            // output-group count and one group's output rank. The reduction width is
+            // heads / o_groups * head_dim.
+            "woa" => &["heads", "head_dim", "o_groups", "o_lora_rank"],
             other => panic!(
                 "sparkflash-kernels: instance {}: family {other:?} is not a known family",
                 number + 1
