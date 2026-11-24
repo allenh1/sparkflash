@@ -305,6 +305,28 @@ first window would have hit is one defect and the `wo_a` byte check is another.
 So the bar this section sets is still unmet for the second shape at any world: what has run on a
 device is the plan builder at four ranks and nothing beyond it. The next window is gated on the
 `wo_a` fix.
+
+**Result (2026-11-24, the third window, `wo_a` fixed).** The same checkpoint, arm, worlds and host,
+tip `2d4d45de` (binary `cb316937`), 74 cubins staged in 17 s (39 `_s2`, 15 `_s2w1`, 15 `_s2w2`,
+5 `nvfp4_prefill_sm121_*`), the same binary at the same path on every node, down 14m33s. The
+`wo_a` refusal is gone: no world printed the byte check. Every world then failed at open on one
+assertion, before any port bound:
+
+```
+thread 'main' panicked at crates/sparkflash-kernels/src/lm_head_ref.rs:128:5:
+assertion `left == right` failed: the weight image is a whole number of HIDDEN-wide rows
+  left: 2048 (world 1) / 1024 (world 2) / 3072 (world 4), right: 0
+```
+
+The host reference was again identical to the global file at all three worlds, and no device id
+was produced, so no world reached the compare. The head shard the tail reads is exactly
+`vocab_per_rank * hidden * 2` bytes - 32,768 x 4096 x 2 at one rank, halved at two, quartered at
+four - and those lengths are the remainders above modulo 5,120. The row width divided by is the
+`lm_head_ref::HIDDEN` constant, a released-model fact, while the shard is the plan's. So the
+second shape cannot reach a launch until the head's block maxima take their width from the plan,
+and that is a defect of the same kind as the last two: a released constant standing where the
+plan's answer belongs. World 1 did not hang this time, which is evidence - not proof - that the
+hang was the released `wo_a` body running against a geometry this shape does not have.
 ## 4. The work
 
 ### R. Ranks
