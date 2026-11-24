@@ -16,7 +16,8 @@
 #   family       the shape vocabulary: "router" needs hidden/experts/top_k, "routed" needs those
 #                plus intermediate/padded, "seams" needs hidden and optionally hc (the residual
 #                stream count; the runtime-width seam entries omit it), "drafter" needs
-#                hidden/hc/taps/latent/window/markov_rank, "rows" needs
+#                hidden/hc/taps/latent/window/markov_rank, "woa" needs
+#                heads/head_dim/o_groups/o_lora_rank, "rows" needs
 #                hidden/intermediate/experts/top_k, "head" needs hidden/vocab_per_rank/ranks,
 #                "vision" needs hidden/heads/patch/intermediate/out_hidden/experts/top_k,
 #                "mla" needs the CSA2 latent/index/window geometry, and "select" the indexer's
@@ -2451,6 +2452,93 @@ head_dim = 256
 ratio = 2
 positions = 1048576
 
+# The routed-expert MXFP4 bodies and the grouped output projection. The two MoE sources fix the
+# rank's real 576-wide expert slice (padded to 640 in the incumbent's activation operand), 384
+# experts and top-6. The stored source reads the plan's real 576-wide rows with the same padded
+# activation operand, so it carries the same shapes. b12x_mxfp8_wo_a is the attention output
+# projection A: 64 heads of 512 over 8 output groups with a 1024-wide output rank. Its five entries
+# share the released cubin, so every row names the same geometry.
+[[instance]]
+source = "b12x_mxfp4_moe_sm121.cu"
+entry = "b12x_mxfp4_moe_sm121"
+cubin = "b12x_mxfp4_moe_sm121"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "b12x_mxfp4_moe_stored_sm121.cu"
+entry = "b12x_mxfp4_moe_stored_sm121"
+cubin = "b12x_mxfp4_moe_stored_sm121"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 5120
+intermediate = 576
+padded = 640
+experts = 384
+top_k = 6
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 64
+head_dim = 512
+o_groups = 8
+o_lora_rank = 1024
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_warp_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 64
+head_dim = 512
+o_groups = 8
+o_lora_rank = 1024
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_tile_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 64
+head_dim = 512
+o_groups = 8
+o_lora_rank = 1024
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_batched_perrow_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 64
+head_dim = 512
+o_groups = 8
+o_lora_rank = 1024
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_batched_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 64
+head_dim = 512
+o_groups = 8
+o_lora_rank = 1024
+
 # b12x_mxfp8_dense_sm121.cu
 [[instance]]
 source = "b12x_mxfp8_dense_sm121.cu"
@@ -4827,6 +4915,90 @@ hidden = 4096
 head_dim = 512
 ratio = 2
 positions = 1048576
+
+# The routed-expert and output-projection second shape: the synthetic checkpoint's 4096-wide
+# stage, 64 experts top-4, a 128-wide per-rank expert slice, 32 heads of 512 over 4 output groups
+# and a 256-wide output rank. Each source builds into its own cubin and never into the baseline.
+[[instance]]
+source = "b12x_mxfp4_moe_sm121.cu"
+entry = "b12x_mxfp4_moe_sm121"
+cubin = "b12x_mxfp4_moe_sm121_s2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+padded = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "b12x_mxfp4_moe_stored_sm121.cu"
+entry = "b12x_mxfp4_moe_stored_sm121"
+cubin = "b12x_mxfp4_moe_stored_sm121_s2"
+family = "routed"
+format = "mx-fp4"
+catalogue = "deepseek-moe"
+hidden = 4096
+intermediate = 128
+padded = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_warp_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_tile_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_batched_perrow_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
+
+[[instance]]
+source = "b12x_mxfp8_wo_a_sm121.cu"
+entry = "b12x_mxfp8_wo_a_batched_sm121"
+cubin = "b12x_mxfp8_wo_a_sm121_s2"
+family = "woa"
+format = "mx-fp8-tiled"
+heads = 32
+head_dim = 512
+o_groups = 4
+o_lora_rank = 256
 
 [[instance]]
 source = "b12x_mxfp8_dense_sm121.cu"

@@ -1257,9 +1257,9 @@ const ASSERT_COUNTS: [(&str, usize); 7] = [
     ("m4_common_sm121.cuh", 20),
     ("mega_mhc_sm121.cu", 7),
     ("b12x_mxfp8_dense_sm121.cu", 15),
-    ("b12x_mxfp4_moe_sm121.cu", 12),
+    ("b12x_mxfp4_moe_sm121.cu", 13),
     ("flash_mla_csa2_sm121.cu", 17),
-    ("b12x_mxfp8_wo_a_sm121.cu", 20),
+    ("b12x_mxfp8_wo_a_sm121.cu", 25),
     ("cert_lm_head_sm121.cu", 18),
 ];
 
@@ -1583,7 +1583,7 @@ fn every_static_assert_in_the_milestone_holds_under_rust_too() {
     let mut checked = 0usize;
     for (name, source) in std::iter::once(("m4_common_sm121.cuh", COMMON_HEADER)).chain(KERNELS) {
         let stripped = crate::c_decl::strip_comments(source);
-        let mut table = Consts::parse(&stripped);
+        let mut table = crate::instances::consts_for_source(&stripped, name);
         table.extend(COMMON_HEADER);
         // The certified head's shapes are instance arguments now: resolve its bounds through
         // the defines kernels/instances.toml gave the released compile group.
@@ -1626,11 +1626,12 @@ fn every_static_assert_in_the_milestone_holds_under_rust_too() {
         }
     }
     assert_eq!(
-        checked, 109,
+        checked, 115,
         "the milestone's static asserts must all be evaluated: 20 in the shared header plus 7, 15, \
-         12, 17, 20 and 18 in the six kernels (mega_mhc, dense, MoE, flash_mla, wo_a, cert). The MoE \
+         13, 17, 25 and 18 in the six kernels (mega_mhc, dense, MoE, flash_mla, wo_a, cert). The MoE \
          count rose from 10 to 12 with the split-K tiling: the 256-thread block identity and the \
-         one-reducer-per-(slot, column) bound. D14 had raised it from 7 to 10 for the FP8 E4M3 \
+         one-reducer-per-(slot, column) bound, and to 13 when the instance conversion added the \
+         real-width tile assert. D14 had raised it from 7 to 10 for the FP8 E4M3 \
          activation operand's byte width; flash_mla's rose from 13 to 15 with the engine window \
          format's two layout asserts, then to 17 with the union capacity's two. The format VALUE is \
          not among them: it is a runtime launch parameter and is guarded at kernel entry instead"
@@ -2610,15 +2611,15 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
         let code = crate::c_decl::strip_comments(source);
         code.contains("const uint64_t group_weight_base =")
             && code.contains("const uint64_t group_scale_base =")
-            && code.contains("(uint64_t)group * spark_b12x_scale_bytes(SPARK_M4_O_LORA_RANK")
+            && code.contains("(uint64_t)group * spark_b12x_scale_bytes(SPARK_WOA_O_LORA_RANK")
             && code.contains("w_fp8[group_weight_base +")
             && code.contains("w_scales[group_scale_base +")
     };
     let wo_a = format!("{MXFP8_WO_A}\n{B12X_DENSE_HEADER}");
     assert!(wo_a_has_two_strides(&wo_a));
     let shared_stride = wo_a.replace(
-        "(uint64_t)group * spark_b12x_scale_bytes(SPARK_M4_O_LORA_RANK",
-        "(uint64_t)group * spark_b12x_buffer_bytes(SPARK_M4_O_LORA_RANK",
+        "(uint64_t)group * spark_b12x_scale_bytes(SPARK_WOA_O_LORA_RANK",
+        "(uint64_t)group * spark_b12x_buffer_bytes(SPARK_WOA_O_LORA_RANK",
     );
     assert_ne!(shared_stride, wo_a, "the mutation must apply");
     assert!(
@@ -2701,13 +2702,13 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
         let code = crate::c_decl::strip_comments(source);
         // The trailing newline matters: the padded constant starts with the real one, so a bare
         // prefix check would accept the unmasked mutant.
-        code.contains("const float act_value = index < (uint32_t)SPARK_M4_MOE_WIDTH\n")
+        code.contains("const float act_value = index < (uint32_t)SPARK_MOE_WIDTH\n")
             && code.contains("? spark_fp8_e4m3_decode(act_row[index])")
     };
     assert!(moe_masks_the_padding(MXFP4_MOE));
     let unmasked = MXFP4_MOE.replace(
-        "index < (uint32_t)SPARK_M4_MOE_WIDTH",
-        "index < (uint32_t)SPARK_M4_MOE_WIDTH_PADDED",
+        "index < (uint32_t)SPARK_MOE_WIDTH",
+        "index < (uint32_t)SPARK_MOE_WIDTH_PADDED",
     );
     assert_ne!(unmasked, MXFP4_MOE, "the mutation must apply");
     assert!(
@@ -2723,9 +2724,8 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
         let code = crate::c_decl::strip_comments(source);
         code.contains("#define SPARK_M4_MOE_ACT_BYTES_PER_VALUE 1u")
             && code.contains("static_assert(SPARK_M4_MOE_ACT_BYTES_PER_VALUE == 1u,")
-            && code.contains(
-                "static_assert(SPARK_M4_MOE_ACT_BYTES_PER_ROW == SPARK_M4_MOE_WIDTH_PADDED,",
-            )
+            && code
+                .contains("static_assert(SPARK_M4_MOE_ACT_BYTES_PER_ROW == SPARK_MOE_WIDTH_PADDED,")
             && code.contains("const uint8_t *__restrict__ act_fp8")
             && code.contains("? spark_fp8_e4m3_decode(act_row[index])")
             && code.contains("terms[slot][block][col_local] =")

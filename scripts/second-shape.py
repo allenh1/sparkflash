@@ -103,6 +103,12 @@ STORED_FORMATS = {
     # The routed experts one power-of-two scale a row, every 32 values along the contraction:
     # Inkling's last eight layers, and the Engram table's and drafter head's own arithmetic.
     "mx-fp8-row": {"quant_method": "fp8", "scale_fmt": "ue8m0", "expert_dtype": "mx-fp8-row", "block": 32},
+    # One stack whose expert format changes part-way up: NVFP4's Qwen convention on the first
+    # four backbone layers and row-scaled MXFP8 on the last four. The dense class stays the
+    # fixture's released grid; only the routed experts move.
+    "joint-nvfp4-mxfp8-row": {
+        "expert_dtype": "nvfp4-qwen@0-3,mx-fp8-row@4-7",
+    },
 }
 
 
@@ -370,12 +376,20 @@ def sync_to_nodes(nodes: list[str], paths: list[str]) -> None:
     names = os.environ.get("SPARK_SSH_NAMES", "").split()
     if names and len(names) < len(nodes):
         fail(f"SPARK_SSH_NAMES names {len(names)} node(s); the group needs {len(nodes)}")
+    # A rank that runs on this host already has the paths: the copy would go over ssh to itself,
+    # which the lead Spark does not trust, and it would be the same bytes the harness just wrote.
+    local = {int(rank) for rank in os.environ.get("SPARK_LOCAL_RANKS", "").split() if rank}
     command = [sys.executable, "-I", str(ROOT / "scripts/sync-nodes.py")]
     for index, node in enumerate(nodes):
+        if index in local:
+            continue
         # The destination may be a fast-network address; HostKeyAlias checks the key already
         # trusted for the node's SSH name, so no new host key is written.
         alias = names[index] if names else node.rpartition("@")[2]
         command += ["--host", f"{node},{alias}"]
+    if len(command) == 2:
+        print("second-shape: every rank runs on this host; nothing to copy")
+        return
     for path in paths:
         command += ["--path", path]
     command += ["--ssh-arg=-o", "--ssh-arg=BatchMode=yes"]

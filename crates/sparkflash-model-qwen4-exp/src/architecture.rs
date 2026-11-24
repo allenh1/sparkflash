@@ -212,6 +212,7 @@ pub(crate) fn tiny_architecture() -> Architecture {
         quantization: Quantization {
             method: Some("MIXED_PRECISION".to_owned()),
             expert: Some("NVFP4".to_owned()),
+            expert_formats: Vec::new(),
             expert_format: WeightFormat::NvFp4 {
                 group_size: 16,
                 wide: sparkflash_model::format::NvFp4Wide::Qwen,

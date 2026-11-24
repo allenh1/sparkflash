@@ -160,6 +160,7 @@ fn hybrid() -> Architecture {
                 scale_dtype: ScaleDType::F32,
                 dynamic_activations: true,
             },
+            expert_formats: Vec::new(),
             expert_format: WeightFormat::Fp8Tile {
                 block_m: 128,
                 block_n: 128,

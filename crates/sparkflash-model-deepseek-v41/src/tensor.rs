@@ -79,6 +79,8 @@ pub struct TensorPlan {
     dense_format: Option<StoredFormat>,
     /// The routed experts' stored format; the released row-scaled MXFP4 when unset.
     expert_format: Option<StoredFormat>,
+    /// One expert format per backbone layer, when the declaration states block-part ranges.
+    expert_formats: Vec<Option<StoredFormat>>,
     /// The dense and expert weights this plan stores in a format, by tensor name. The writer
     /// packs exactly these where the format's layout is the packed word form; a plain BF16 tensor
     /// (an embedding, a norm, a router) is not one of them, and the Engram table keeps its own
@@ -96,6 +98,9 @@ impl TensorPlan {
         let mut plan = TensorPlan {
             dense_format: Some(config.dense_format()),
             expert_format: Some(config.expert_format()),
+            expert_formats: (0..config.n_layers)
+                .map(|layer| config.expert_format_at(layer))
+                .collect(),
             ..TensorPlan::default()
         };
         plan.push_globals(config);
@@ -126,9 +131,20 @@ impl TensorPlan {
         self.dense_format.unwrap_or(StoredFormat::MXFP8_TILED_32)
     }
 
-    /// The routed experts' format, or the released one when the plan states none.
-    fn expert_stored(&self) -> StoredFormat {
-        self.expert_format.unwrap_or(StoredFormat::MXFP4_ROW_32)
+    /// The routed experts' format for one layer, or the class's when the plan states no list.
+    ///
+    /// An MTP stage takes the class's format: the ranges a checkpoint declares are its backbone
+    /// layers' expert formats.
+    fn expert_stored(&self, mtp: bool, layer: usize) -> StoredFormat {
+        if mtp {
+            return self.expert_format.unwrap_or(StoredFormat::MXFP4_ROW_32);
+        }
+        self.expert_formats
+            .get(layer)
+            .copied()
+            .flatten()
+            .or(self.expert_format)
+            .unwrap_or(StoredFormat::MXFP4_ROW_32)
     }
 
     fn dense(&mut self, name: &str, out: usize, r#in: usize) {
@@ -136,8 +152,8 @@ impl TensorPlan {
         self.scaled(name, format, out, r#in);
     }
 
-    fn expert(&mut self, name: &str, out: usize, r#in: usize) {
-        let format = self.expert_stored();
+    fn expert(&mut self, name: &str, out: usize, r#in: usize, mtp: bool, layer: usize) {
+        let format = self.expert_stored(mtp, layer);
         self.scaled(name, format, out, r#in);
     }
 
@@ -316,9 +332,27 @@ impl TensorPlan {
 
         for expert in 0..n_routed {
             let base = format!("{prefix}.ffn.experts.{expert}");
-            self.expert(&format!("{base}.w1"), inter_for_expert(config), dim);
-            self.expert(&format!("{base}.w2"), dim, inter_for_expert(config));
-            self.expert(&format!("{base}.w3"), inter_for_expert(config), dim);
+            self.expert(
+                &format!("{base}.w1"),
+                inter_for_expert(config),
+                dim,
+                mtp,
+                layer,
+            );
+            self.expert(
+                &format!("{base}.w2"),
+                dim,
+                inter_for_expert(config),
+                mtp,
+                layer,
+            );
+            self.expert(
+                &format!("{base}.w3"),
+                inter_for_expert(config),
+                dim,
+                mtp,
+                layer,
+            );
         }
         let _ = layer;
     }
@@ -517,4 +551,48 @@ impl TensorPlan {
 /// The intermediate width of one routed expert: `moe_inter_dim`, independent of the shared expert.
 fn inter_for_expert(config: &ModelConfig) -> usize {
     config.moe_inter_dim
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModelConfig;
+    use crate::dtype::DType;
+
+    #[test]
+    fn a_joint_declaration_states_one_expert_format_a_block_range() {
+        let mut config = ModelConfig::tiny();
+        config.n_layers = 8;
+        config.n_mtp_layers = 0;
+        config.dspark_target_layer_ids.clear();
+        config.compress_ratios = vec![0; 8];
+        config.expert_dtype = "nvfp4-qwen@0-3,mx-fp8-row@4-7".to_owned();
+        config.validate().expect("the joint declaration validates");
+        assert_eq!(
+            config.expert_format_at(0),
+            Some(sparkflash_model::format::StoredFormat::NVFP4_QWEN_16)
+        );
+        assert_eq!(
+            config.expert_format_at(4),
+            Some(sparkflash_model::format::StoredFormat::MXFP8_ROW_32)
+        );
+        let plan = TensorPlan::language_model(&config);
+        let dtype = |layer: usize| {
+            plan.get(&format!("layers.{layer}.ffn.experts.0.w1.weight"))
+                .expect("the layer's expert is planned")
+                .dtype
+        };
+        assert_eq!(dtype(0), DType::F4E2M1);
+        assert_eq!(dtype(3), DType::F4E2M1);
+        assert_eq!(dtype(4), DType::F8E4M3);
+        assert_eq!(dtype(7), DType::F8E4M3);
+        assert!(
+            plan.contains("layers.0.ffn.experts.0.w1.input_scale"),
+            "the NVFP4 layers carry their convention companions"
+        );
+        assert!(
+            !plan.contains("layers.4.ffn.experts.0.w1.input_scale"),
+            "the row-scaled layers do not"
+        );
+    }
 }

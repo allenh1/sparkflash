@@ -732,6 +732,42 @@ cubin and from `baseline/kernel_baseline.txt`. The full
 one of the recorded kernels `ok`.
 
 
+#### D.9 The MXFP4 routed-expert remainder and the wo_a output projection
+
+**Sources and shapes.** `b12x_mxfp4_moe_sm121.cu` and its stored-row variant
+`b12x_mxfp4_moe_stored_sm121.cu` now carry a `family = "routed"` instance at the released
+shape: hidden 5,120, the rank's real 576-wide expert slice padded to 640, 384 experts and top-6.
+The padded source reads the padded activation row; the stored source reads the plan's real
+576-wide weight rows and the same padded activation operand. Both compile their hidden width,
+real width, padded width, expert count and selected slots from
+`SPARK_INSTANCE_<ENTRY>_<ARG>`; only the 32-column tile, the eight K groups, the 256-thread
+block and the FP4 byte ratio remain source constants.
+
+`b12x_mxfp8_wo_a_sm121.cu` is `family = "woa"`, a new family. Its keys are `heads`,
+`head_dim`, `o_groups` and `o_lora_rank`; the released values are 64, 512, 8 and 1,024,
+and the reduction width is derived as heads / o_groups * head_dim. The family is new because the
+existing ones name other geometry: `mla` is the attention body's latent/window shape, `rows`
+requires routed-expert widths, and `head` is the vocabulary shard. The source's five entries
+share the released cubin and one geometry, so every row names the same four values.
+
+**The catalogue.** The two MoE rows claim `deepseek-moe`. Their released and second-shape
+values are already in that key's generated set, so the rule does not move. `woa` carries no
+catalogue key: the forward loads those symbols by KernelId, no catalogue part exposes a grouped
+output rank, and `crates/sparkflash-ops/build.rs` therefore refuses a `woa` claim instead of
+generating a shape rule it cannot enforce.
+
+**The second shape.** The MoE sources are built at hidden 4,096, intermediate 128, padded 128,
+64 experts and top-4; the wo_a entries at 32 heads of 512 over four output groups with a
+256-wide output rank. Each source builds into its own `_s2` cubin, and none of those cubins is
+in the baseline or loaded by an arm.
+
+**Verification.** This host has no nvcc and no GPU, so the cubins were not regenerated and no
+byte, PTX or launch claim is made here. The clang CUDA frontend parsed every instance compile
+group, released and second shape, against the stub headers; the released defines reproduce the
+numbers the sources stated before the conversion, so the pinned cubin bytes are unchanged.
+`scripts/instances.py --check`, the kernel and ops test suites, and the instance test that
+pins these rows are the gates run for this change.
+
 ## 5. Order
 
 1. A, alone.
