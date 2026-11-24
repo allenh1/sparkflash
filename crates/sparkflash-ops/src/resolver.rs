@@ -884,7 +884,7 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "moe on sm121 at NVFP4 (tile scale + tensor-wide scale, one scale per 16 values, \
+            "moe on sm121 at NVFP4 (per-group scale + tensor-wide scale, one scale per 16 values, \
              row-major) in the decode pass: first; second"
         );
         let empty = ResolveError {
@@ -893,7 +893,7 @@ mod tests {
         };
         assert_eq!(
             empty.to_string(),
-            "moe on sm121 at NVFP4 (tile scale + tensor-wide scale, one scale per 16 values, \
+            "moe on sm121 at NVFP4 (per-group scale + tensor-wide scale, one scale per 16 values, \
              row-major) in the decode pass: no catalogue entry"
         );
     }

@@ -128,6 +128,8 @@ pub enum ScaleKind {
     PowerOfTwoGrid,
     /// One inverse scale a tile of the matrix.
     Tile,
+    /// One E4M3 group scale a row, every [StoredFormat::block] columns (NVFP4's per-16 plane).
+    Group,
     /// One power-of-two scale a row, every [StoredFormat::block] columns.
     Row,
     /// One factor for the whole tensor, beside any block scale.
@@ -141,8 +143,49 @@ impl ScaleKind {
         match self {
             Self::PowerOfTwoGrid => "power-of-two grid",
             Self::Tile => "tile scale",
+            Self::Group => "per-group scale",
             Self::Row => "row scale",
             Self::TensorWide => "tensor-wide scale",
+        }
+    }
+}
+
+/// How a 4-bit format carries its tensor-wide factors.
+///
+/// The two releases that store NVFP4 multiply the same group dequantisation by a different
+/// factor in a different place. Qwen stores a weight global (`weight_scale_2`) beside a static
+/// activation global (`input_scale`); its body folds the weight global into the group scale
+/// before accumulation. Inkling stores a per-expert `amax` and one outer denominator per expert
+/// tensor; its body applies `amax / denominator` to the expert's output after accumulation.
+/// The products are mathematically equal but round at different points, so the two are formats a
+/// body cannot be handed for one another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NvFp4Wide {
+    /// No tensor-wide factor.
+    None,
+    /// Qwen's weight global and static activation global: two f32 factors.
+    Qwen,
+    /// Inkling's per-expert amax and outer denominator: two f32 factors.
+    Inkling,
+}
+
+impl NvFp4Wide {
+    /// The number of f32 factors the convention stores.
+    #[must_use]
+    pub const fn factors(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Qwen | Self::Inkling => 2,
+        }
+    }
+
+    /// The name a scan row prints.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Qwen => "qwen",
+            Self::Inkling => "inkling",
         }
     }
 }
@@ -175,7 +218,7 @@ const NONE: &[ScaleKind] = &[];
 const GRID: &[ScaleKind] = &[ScaleKind::PowerOfTwoGrid];
 const TILE: &[ScaleKind] = &[ScaleKind::Tile];
 const ROW_AND_GRID: &[ScaleKind] = &[ScaleKind::Row, ScaleKind::PowerOfTwoGrid];
-const GROUP_AND_TENSOR: &[ScaleKind] = &[ScaleKind::Tile, ScaleKind::TensorWide];
+const GROUP_AND_TENSOR: &[ScaleKind] = &[ScaleKind::Group, ScaleKind::TensorWide];
 
 /// One stored tensor format: the values, the block one scale covers, the scales the body applies
 /// and the layout it reads.
@@ -189,14 +232,30 @@ pub struct StoredFormat {
     scales: &'static [ScaleKind],
     scale_values: ScaleValues,
     layout: FormatLayout,
+    wide: NvFp4Wide,
 }
 
 /// Whether a scale list carries a tile scale. A const predicate, because the format's implied
 /// scale values are computed in a const constructor.
 const fn has_tile(scales: &[ScaleKind]) -> bool {
+    has_kind(scales, ScaleKind::Tile)
+}
+
+/// Whether a scale list carries a per-group (NVFP4 per-16) scale.
+const fn has_group(scales: &[ScaleKind]) -> bool {
+    has_kind(scales, ScaleKind::Group)
+}
+
+/// Whether a scale list carries a tensor-wide factor.
+const fn has_tensor(scales: &[ScaleKind]) -> bool {
+    has_kind(scales, ScaleKind::TensorWide)
+}
+
+/// Whether a scale list carries one kind.
+const fn has_kind(scales: &[ScaleKind], kind: ScaleKind) -> bool {
     let mut index = 0;
     while index < scales.len() {
-        if scales[index] as u8 == ScaleKind::Tile as u8 {
+        if scales[index] as u8 == kind as u8 {
             return true;
         }
         index += 1;
@@ -220,9 +279,13 @@ impl StoredFormat {
     ) -> Self {
         let scale_values = match values {
             // A 4-bit group scale is E4M3 (NVFP4); a 4-bit block or row scale is a power of two.
-            FormatValues::Fp4E2M1 if has_tile(scales) => ScaleValues::E4M3,
+            FormatValues::Fp4E2M1 if has_group(scales) || has_tile(scales) => ScaleValues::E4M3,
             FormatValues::Fp8E4M3 if has_tile(scales) => ScaleValues::F32,
             _ => ScaleValues::Ue8m0,
+        };
+        let wide = match values {
+            FormatValues::Fp4E2M1 if has_tensor(scales) => NvFp4Wide::Qwen,
+            _ => NvFp4Wide::None,
         };
         Self {
             values,
@@ -230,6 +293,7 @@ impl StoredFormat {
             scales,
             scale_values,
             layout,
+            wide,
         }
     }
 
@@ -256,13 +320,19 @@ impl StoredFormat {
         ROW_AND_GRID,
         FormatLayout::RowMajor,
     );
-    /// NVFP4: E2M1 codes with one E4M3 scale a 16-value group and a tensor-wide factor.
-    pub const NVFP4_16: Self = Self::new(
+    /// NVFP4 with Qwen's two tensor-wide factors: E2M1 codes, one E4M3 scale a 16-value group,
+    /// a weight global folded into the group scale and a static activation global.
+    pub const NVFP4_QWEN_16: Self = Self::new(
         FormatValues::Fp4E2M1,
         16,
         GROUP_AND_TENSOR,
         FormatLayout::RowMajor,
     );
+    /// NVFP4 with Inkling's two tensor-wide factors: E2M1 codes, one E4M3 scale a 16-value
+    /// group, a per-expert amax and an outer denominator applied to the expert's output.
+    pub const NVFP4_INKLING_16: Self = Self::NVFP4_QWEN_16.with_tensor_wide(NvFp4Wide::Inkling);
+    /// The name the older code uses for Qwen's NVFP4 convention.
+    pub const NVFP4_16: Self = Self::NVFP4_QWEN_16;
     /// MXFP4 in the expert arrangement: E2M1 codes with one power-of-two scale a row, every 32
     /// values along the contraction. This is the form every fp4 expert body in the tree reads, so
     /// it is the one a declaration's `mx-fp4` means.
@@ -302,6 +372,21 @@ impl StoredFormat {
         self.scale_values
     }
 
+    /// The tensor-wide convention this format applies.
+    #[must_use]
+    pub const fn tensor_wide(self) -> NvFp4Wide {
+        self.wide
+    }
+
+    /// This format with a tensor-wide convention.
+    ///
+    /// The factors a format stores are part of its arithmetic: Qwen's weight global is folded
+    /// into the group scale, Inkling's per-expert factor is applied to the output.
+    #[must_use]
+    pub const fn with_tensor_wide(self, wide: NvFp4Wide) -> Self {
+        Self { wide, ..self }
+    }
+
     /// This format's scale plane in other values: the same arithmetic, stored another way.
     ///
     /// It is not the same arithmetic: a body that decodes f32 scales cannot read bf16 ones, so
@@ -330,7 +415,7 @@ impl StoredFormat {
             return 0;
         }
         let block = if self.block == 0 { 1 } else { self.block };
-        if self.has_row() {
+        if self.has_row() || self.has_group() {
             return rows * cols.div_ceil(block);
         }
         rows.div_ceil(block) * cols.div_ceil(block)
@@ -380,6 +465,7 @@ impl StoredFormat {
         self.values as u8 == other.values as u8
             && self.block == other.block
             && self.scale_values as u8 == other.scale_values as u8
+            && self.wide as u8 == other.wide as u8
             && self.scales.len() == other.scales.len()
             && {
                 let mut index = 0;
@@ -411,10 +497,22 @@ impl StoredFormat {
             }
             (FormatValues::Fp8E4M3, _) if self.has_scale(ScaleKind::Tile) => "FP8",
             (FormatValues::Fp8E4M3, _) => "MXFP8",
+            (FormatValues::Fp4E2M1, _)
+                if self.has_scale(ScaleKind::TensorWide)
+                    && self.wide as u8 == NvFp4Wide::Inkling as u8 =>
+            {
+                "NVFP4-INKLING"
+            }
             (FormatValues::Fp4E2M1, _) if self.has_scale(ScaleKind::TensorWide) => "NVFP4",
             (FormatValues::Fp4E2M1, _) if self.has_row() => "MXFP4",
             (FormatValues::Fp4E2M1, _) => "MXFP4-GRID",
         }
+    }
+
+    /// Whether the format carries one E4M3 scale a row, every 16 values.
+    #[must_use]
+    pub const fn has_group(self) -> bool {
+        has_group(self.scales)
     }
 
     /// Whether the format carries one scale a row.
@@ -474,12 +572,13 @@ impl StoredFormat {
                 Self::new(FormatValues::Fp8E4M3, block, TILE, FormatLayout::RowMajor)
                     .with_scale_values(ScaleValues::of(scale_dtype))
             }
-            WeightFormat::NvFp4 { group_size } => Self::new(
+            WeightFormat::NvFp4 { group_size, wide } => Self::new(
                 FormatValues::Fp4E2M1,
                 group_size,
                 GROUP_AND_TENSOR,
                 FormatLayout::RowMajor,
-            ),
+            )
+            .with_tensor_wide(wide),
             WeightFormat::MxFp8 { block } => {
                 Self::new(FormatValues::Fp8E4M3, block, GRID, FormatLayout::RowMajor)
             }
@@ -511,12 +610,70 @@ impl StoredFormat {
             "mxfp8-row" | "mx-fp8-row" | "mxfp8-rowscale" | "mx-fp8-rowscale" => {
                 Some(Self::MXFP8_ROW_32)
             }
-            "nvfp4" => Some(Self::NVFP4_16),
+            "nvfp4" | "nvfp4-qwen" | "nvfp4-qwen-16" => Some(Self::NVFP4_QWEN_16),
+            "nvfp4-inkling" | "nvfp4-inkling-16" => Some(Self::NVFP4_INKLING_16),
             "mxfp4" | "mx-fp4" | "mxfp4-row" | "mx-fp4-row" => Some(Self::MXFP4_ROW_32),
             "mx-fp4-grid" | "mxfp4-grid" => Some(Self::MXFP4_32),
             "packed" | "packed-bf16" => Some(Self::PACKED_BF16),
             _ => None,
         }
+    }
+}
+
+/// A stored format stated for a range of blocks.
+///
+/// A checkpoint whose expert format changes part-way up the stack (Inkling stores NVFP4 in
+/// blocks 0-39 and row-scaled MXFP8 above) states one entry a range. The name is the format's
+/// own spelling, `@`, and the inclusive block range: `nvfp4-qwen@0-39`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockPartFormat {
+    /// The format the range stores.
+    pub format: StoredFormat,
+    /// The first block the range covers.
+    pub first: usize,
+    /// The last block the range covers, inclusive.
+    pub last: usize,
+}
+
+impl BlockPartFormat {
+    /// A format and the inclusive block range it covers.
+    #[must_use]
+    pub const fn new(format: StoredFormat, first: usize, last: usize) -> Self {
+        Self {
+            format,
+            first,
+            last,
+        }
+    }
+
+    /// Whether a block belongs to the range.
+    #[must_use]
+    pub const fn covers(&self, block: usize) -> bool {
+        block >= self.first && block <= self.last
+    }
+
+    /// The name a build list or a ledger prints: `format@first-last`.
+    #[must_use]
+    pub fn name(&self) -> String {
+        format!("{}@{}..={}", self.format.name(), self.first, self.last)
+    }
+
+    /// The format and range a name describes, or `None` for an unknown spelling.
+    ///
+    /// The accepted names are [StoredFormat::from_name]'s, followed by `@first-last` or
+    /// `@first..=last`.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        let (format, blocks) = name.rsplit_once('@')?;
+        let blocks = blocks.trim();
+        let (first, last) = blocks
+            .split_once("..=")
+            .or_else(|| blocks.split_once('-'))?;
+        Some(Self::new(
+            StoredFormat::from_name(format)?,
+            first.parse().ok()?,
+            last.parse().ok()?,
+        ))
     }
 }
 
@@ -573,7 +730,10 @@ mod tests {
             "an f32 tile scale and a bf16 one are different bytes a body reads"
         );
         assert_eq!(
-            StoredFormat::of(WeightFormat::NvFp4 { group_size: 16 }),
+            StoredFormat::of(WeightFormat::NvFp4 {
+                group_size: 16,
+                wide: NvFp4Wide::Qwen
+            }),
             StoredFormat::NVFP4_16
         );
     }
@@ -583,7 +743,10 @@ mod tests {
         let wide = StoredFormat::of(WeightFormat::MxFp4 { block: 64 });
         assert_eq!(wide.block(), 64);
         assert!(!wide.same_arithmetic(StoredFormat::MXFP4_ROW_32));
-        let group = StoredFormat::of(WeightFormat::NvFp4 { group_size: 32 });
+        let group = StoredFormat::of(WeightFormat::NvFp4 {
+            group_size: 32,
+            wide: NvFp4Wide::Qwen,
+        });
         assert_eq!(group.block(), 32);
         assert!(group.has_scale(ScaleKind::TensorWide));
     }
@@ -593,8 +756,9 @@ mod tests {
         assert!(!StoredFormat::MXFP4_32.same_arithmetic(StoredFormat::NVFP4_16));
         assert!(StoredFormat::MXFP4_32.has_scale(ScaleKind::PowerOfTwoGrid));
         assert!(!StoredFormat::MXFP4_32.has_scale(ScaleKind::TensorWide));
-        assert!(StoredFormat::NVFP4_16.has_scale(ScaleKind::Tile));
+        assert!(StoredFormat::NVFP4_16.has_scale(ScaleKind::Group));
         assert!(StoredFormat::NVFP4_16.has_scale(ScaleKind::TensorWide));
+        assert!(!StoredFormat::NVFP4_16.has_scale(ScaleKind::Tile));
     }
 
     #[test]
@@ -655,6 +819,39 @@ mod tests {
             Some(StoredFormat::FP8_E4M3_TILE_128_BF16)
         );
         assert_eq!(StoredFormat::from_name("nope"), None);
+    }
+
+    #[test]
+    fn a_format_name_can_state_a_block_part_range() {
+        let range = BlockPartFormat::from_name("nvfp4-qwen@0-39").expect("the range spelling");
+        assert!(range.format.same_arithmetic(StoredFormat::NVFP4_QWEN_16));
+        assert_eq!((range.first, range.last), (0, 39));
+        assert!(range.covers(0) && range.covers(39) && !range.covers(40));
+        assert_eq!(
+            BlockPartFormat::from_name("nvfp4-inkling@0..=39")
+                .expect("the long range spelling")
+                .format,
+            StoredFormat::NVFP4_INKLING_16
+        );
+        assert!(BlockPartFormat::from_name("nvfp4-qwen").is_none());
+        assert!(BlockPartFormat::from_name("nope@0-1").is_none());
+    }
+
+    #[test]
+    fn the_two_nvfp4_conventions_round_trip_their_names() {
+        for format in [StoredFormat::NVFP4_QWEN_16, StoredFormat::NVFP4_INKLING_16] {
+            let named = StoredFormat::from_name(&format.name().to_ascii_lowercase())
+                .unwrap_or_else(|| panic!("{}", format.name()));
+            assert!(named.same_arithmetic(format), "{}", format.name());
+        }
+        assert_eq!(
+            StoredFormat::from_name("nvfp4-qwen"),
+            Some(StoredFormat::NVFP4_QWEN_16)
+        );
+        assert_eq!(
+            StoredFormat::from_name("nvfp4-inkling"),
+            Some(StoredFormat::NVFP4_INKLING_16)
+        );
     }
 
     #[test]

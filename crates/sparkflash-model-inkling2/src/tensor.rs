@@ -176,7 +176,7 @@ impl InklingTensorPlan {
                 // columns on two ranks.
                 let block = (0..config.num_hidden_layers)
                     .map(|layer| match config.layer_format(layer) {
-                        Some(WeightFormat::NvFp4 { group_size }) => group_size,
+                        Some(WeightFormat::NvFp4 { group_size, .. }) => group_size,
                         Some(WeightFormat::MxFp8 { block }) => block,
                         _ => 1,
                     })
@@ -405,7 +405,7 @@ impl InklingTensorPlan {
                 Role::Router,
             );
             match config.layer_format(layer).unwrap_or(WeightFormat::Bf16) {
-                WeightFormat::NvFp4 { group_size } => {
+                WeightFormat::NvFp4 { group_size, .. } => {
                     let w13_out = 2 * config.moe_intermediate_size;
                     let w13_cols = hidden.div_ceil(group_size);
                     let w2_cols = config.moe_intermediate_size.div_ceil(group_size);

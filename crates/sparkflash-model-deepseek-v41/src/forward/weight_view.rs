@@ -232,6 +232,20 @@ impl<'a> WeightView<'a> {
         }
     }
 
+    /// Multiplies a materialised weight by a tensor-wide factor.
+    ///
+    /// Only [WeightView::F32] carries values this can touch; a coded view is left alone because
+    /// its fused body applies the factor itself. A factor of one is a no-op.
+    pub(crate) fn scale_all(&mut self, factor: f32) {
+        if factor != 1.0
+            && let WeightView::F32(values) = self
+        {
+            for value in values {
+                *value *= factor;
+            }
+        }
+    }
+
     /// The scale grid this view decodes with, when it has one.
     pub(crate) fn grid(&self) -> Option<ScaleGrid> {
         match self {

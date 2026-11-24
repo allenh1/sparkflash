@@ -68,7 +68,10 @@ fn the_released_document_parses_its_hybrid_schedule_and_geometry() {
     assert_eq!(inkling.softcaps.up, 25.0);
     assert_eq!(
         inkling.layer_expert_formats[0],
-        WeightFormat::NvFp4 { group_size: 16 }
+        WeightFormat::NvFp4 {
+            group_size: 16,
+            wide: sparkflash_model::format::NvFp4Wide::Inkling
+        }
     );
     assert_eq!(
         inkling.layer_expert_formats[40],

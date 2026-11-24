@@ -212,7 +212,10 @@ pub(crate) fn tiny_architecture() -> Architecture {
         quantization: Quantization {
             method: Some("MIXED_PRECISION".to_owned()),
             expert: Some("NVFP4".to_owned()),
-            expert_format: WeightFormat::NvFp4 { group_size: 16 },
+            expert_format: WeightFormat::NvFp4 {
+                group_size: 16,
+                wide: sparkflash_model::format::NvFp4Wide::Qwen,
+            },
             // The release's MTP experts are FP8 on 128x128 tiles, declared FP8_PB_WO; the parser
             // reads that name's scale as F32, and the Qwen plan stores the BF16 the release does.
             mtp_expert_format: Some(WeightFormat::Fp8Tile {

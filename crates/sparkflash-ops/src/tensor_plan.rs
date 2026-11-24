@@ -102,7 +102,7 @@ enum ExpertFormat {
 impl ExpertFormat {
     fn of(format: WeightFormat) -> Self {
         match format {
-            WeightFormat::NvFp4 { group_size } => Self::Fp4 {
+            WeightFormat::NvFp4 { group_size, .. } => Self::Fp4 {
                 block: group_size.max(1),
                 tensor_wide: true,
             },

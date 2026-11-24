@@ -327,6 +327,69 @@ The released path is unchanged: the same code reads the released 32-block MXFP8 
 `Block32`/`PerRow32` exactly as before, and the released proof (`scripts/second-shape.py` with no
 `--stored-format`) still passes at one, two and four ranks.
 
+**Result (2026-11-24, F4 NVFP4).** NVFP4 is declared as two formats, because the two releases
+multiply the same group dequantisation by a tensor-wide factor in different places. Both are E2M1
+values with one E4M3 scale a 16-value group (`ScaleKind::Group`) and two f32 tensor-wide factors
+(`NvFp4Wide`). `NVFP4-QWEN` is `weight_scale_2` folded into the group scale plus the static
+`input_scale` carried beside it; `NVFP4-INKLING` is the per-expert `weight_amax` over
+`weight_outer_scale_denominator`, applied to the expert's output after accumulation.
+`same_arithmetic` tells them apart, and `from_name` round-trips `nvfp4`, `nvfp4-qwen` and
+`nvfp4-inkling`. A block-part range is a format name with the range attached
+(`BlockPartFormat::from_name("nvfp4-qwen@0-39")`); a sibling that changes the expert format
+part-way up the stack states the same format with that helper.
+
+The bind carries the group plane and both factors. `ScalePlanes::of` sizes the per-row group plane
+(`rows x ceil(cols / 16)` E4M3 bytes) in `group_bytes`, and `tensor_wide` is the convention, not a
+bare flag; `total_bytes` adds its two f32. `Operand::tensor_wide` states the Inkling per-expert
+amax: it is one f32 per expert tensor, not a block scale, so the routed-expert bind carries one an
+expert and the body reads it by the local expert index. `arrange` is the row-major identity for
+both conventions and refuses a store that is not the format's byte length; `choose` resolves a
+body only from a claimed symbol whose recorded format has the same arithmetic (a symbol with no
+recorded format is now refused rather than treated as a wildcard).
+
+The host reference reads the checkpoint's own declaration: `ModelConfig::expert_format` takes the
+16-value group from `expert_dtype`, the tensor plan writes the E4M3 group plane and the companions
+the convention names, the writer encodes them, and every routed-expert read applies
+`PerRow16` and then the convention's factor. `scripts/second-shape.py` gained
+`--stored-format nvfp4-qwen` and `nvfp4-inkling`; the dense class stays the fixture's released
+32 x 32 power-of-two grid. Both variants pass at one, two and four ranks on the host arm:
+`second-shape: VERDICT PASS` and `external check PASS` at every world, with the reference's greedy
+ids
+
+```
+[[6653, 20427, 12813, 422, 9389, 6388, 16395, 6405],
+ [25425, 11040, 11559, 23442, 29453, 17940, 5192, 25888],
+ [30169, 105, 2323, 11724, 1353, 885, 3013, 30683]]
+```
+
+for Qwen's convention (the same ids the lead's pre-change reference recorded) and the same ids for
+Inkling's. The released proof still passes at one, two and four ranks.
+
+**The device arm has not run NVFP4.** No body in the base's cubin set decodes this format yet:
+today's NVFP4 arithmetic lives in Qwen's `q4e_expert_gate_up`/`q4e_expert_down` and
+`q4p_moe_*` bodies and in Inkling's `inkling_nvfp4_expert_*` bodies, each a separate copy because
+the tensor-wide factor is applied in a different place. The one copy this family chooses is
+`kernels/shared_prefill_mma_sm121.cuh`: an `SPM_W_FP4` weight mode that dequantises each E2M1
+code by its 16-value E4M3 group scale into the BF16 weight tile, folds Qwen's weight global into the
+group scale at the load (where the separate body applies it) and applies Inkling's
+`amax / denominator` to the output after accumulation. That mode, its prompt and token wrappers,
+and the rows on `kernels/instances.toml` at hidden 4096, intermediate 256 (TP2) and 128 (TP4) are
+not built, so no NVFP4 instance row exists and the scan row for an NVFP4 expert part still says
+`not built`. The base's device routed-expert seam still launches the released MXFP4 bodies;
+R3's rank-count instances have not merged either, and the TP2 device arm already refuses the
+released format at intermediate 256 before an NVFP4 launch could be reached. The device verdict is
+therefore pending the lead's window, with the cubin build (`scripts/build-cubins.sh`) part of that
+window. The command to run after a build, once the rows and the mode land, is the same one this
+family used for the host arm with `--device --released-cubins <dir>` at worlds 2 and 4, once for
+`--stored-format nvfp4-qwen` and once for `nvfp4-inkling`.
+
+What a later F4 family must do differently: it inherits the two convention names and the
+`Group` plane; it must not re-use one name for both, and it must not fold the tensor-wide factor
+into the group scale for Inkling (or apply it to the output for Qwen) merely because the products
+are equal. The bit check on real Qwen and Inkling expert tensors is still open: no device launch,
+no tok/s and no accuracy gap against the arms that serve those two models today exist for this
+change.
+
 ### S. The seam
 
 * **S1. Blocks become steps, decided at open (rows path).** For each block the engine builds a

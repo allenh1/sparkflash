@@ -769,7 +769,10 @@ fn stored_format(dtype: &str, architecture: &Architecture) -> Option<StoredForma
         },
         "F4_E2M1" | "F4E2M1" | "I8" => match architecture.quantization.expert_format {
             format @ (WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. }) => Some(format),
-            _ => Some(WeightFormat::NvFp4 { group_size: 16 }),
+            _ => Some(WeightFormat::NvFp4 {
+                group_size: 16,
+                wide: sparkflash_model::format::NvFp4Wide::Qwen,
+            }),
         },
         _ => None,
     };
