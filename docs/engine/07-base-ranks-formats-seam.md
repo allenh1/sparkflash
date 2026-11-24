@@ -505,6 +505,36 @@ restore is proven by the process list and the launcher's own status. Downtime 7m
 14:59:59Z, launch 15:06:44Z, `readyz` 200 at 15:07:15Z), production back on the same release
 binary (`5a299b15`) and serving.
 
+**Result (2026-11-24, the eleventh window, world 1, the prefill fault).** Tip `e201479` (binary
+`1ff96cea`), world 1 only, the checkpoint and the world-1 reference reused from the tenth window
+(the global reference was rewritten and matched), the same 85 cubins. The routed dedup down launch
+that refused the tenth window with `cuLaunchKernel failed: 1` now runs: the gate/up and down
+dedup launches pass and setup completes at 4,177 ms (layer seams 254, tail 3,019, layer device
+open 3,805, attachments 3,825). The first prefill then reports
+
+```
+sparkflash serve: device_failure epoch_ms=... the device loop failed, exiting: compressor latent:
+the forward rope launch: cuLaunchKernel failed: 700
+```
+
+700 is `CUDA_ERROR_ILLEGAL_ADDRESS`, not a launch-configuration refusal: it is raised by this
+launch whether the fault is its own or an earlier asynchronous kernel's, so the window cannot say
+which launch touched the bad address. What the host can already say: the rope's row span, its
+norm weight and its two tables are checked before the launch and the checks are satisfied at this
+shape (the pair holds two `mla_latent`-wide bf16 rows, the weight is its width, and
+`rope_table_span_bytes` is `2 x max_positions x pairs x 4`), and the layer's own refusal for a
+position past the tables did not fire. The class is therefore "an asynchronous fault whose first
+launch is not named", which no host check of the plan can see; naming it needs the run to make
+every launch synchronous. No token was generated and no device id exists; the arm line is the same
+`arm=device reduce=nccl evidence=false`.
+
+Restore: stop 15:17:52Z, launch 15:22:54Z, `readyz` 200 at 15:23:24Z, downtime 5m32s (the cap
+held), production back on `5a299b15` with four serve processes and `/v1/models` serving. The
+harness was stopped 150 s after the rank died, so no `VERDICT` was issued. Deviations: the
+one-address stop form the brief suggested is refused by the launcher (it wants four addresses in
+rank order), so the stop was the harness's own; `/v1/cluster/stats` again reported an empty node
+list beside a serving group.
+
 **The device-open gate (2026-11-24).** `crates/sparkflash-deepseek-forward/tests/device_open_gate.rs`
 builds the second shape's plan at worlds 1, 2 and 4 and walks every part the device opens: the
 stored format each part states and the kernel symbols the plan names for it, the shared expert's
