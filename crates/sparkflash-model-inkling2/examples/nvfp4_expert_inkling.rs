@@ -30,7 +30,7 @@
 //!
 //! Usage, after `scripts/build-cubins.sh`:
 //! ```
-//! cargo run -p sparkflash-model-inkling2 --example nvfp4_expert_op --release -- \
+//! cargo run -p sparkflash-model-inkling2 --example nvfp4_expert_inkling --release -- \
 //!   --checkpoint <Inkling-2-Small snapshot> --cubin-dir target/cubins \
 //!   [--layer 0] [--expert 0] [--repeat 50]
 //! ```
@@ -49,7 +49,7 @@ const EXPERTS: usize = 384;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("nvfp4_expert_op: {error}");
+        eprintln!("nvfp4_expert_inkling: {error}");
         std::process::exit(1);
     }
 }

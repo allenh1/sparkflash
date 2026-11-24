@@ -31,7 +31,7 @@
 //!
 //! Usage, after `scripts/build-cubins.sh`:
 //! ```
-//! cargo run -p sparkflash-model-qwen4-exp --example nvfp4_expert_op --release -- \
+//! cargo run -p sparkflash-model-qwen4-exp --example nvfp4_expert_qwen --release -- \
 //!   --checkpoint <Qwen3.8-Flash-Next-NVFP4 snapshot> --cubin-dir target/cubins \
 //!   [--layer 0] [--expert 0] [--repeat 50]
 //! ```
@@ -51,7 +51,7 @@ const SLOTS: usize = 10;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("nvfp4_expert_op: {error}");
+        eprintln!("nvfp4_expert_qwen: {error}");
         std::process::exit(1);
     }
 }

@@ -488,9 +488,11 @@ The single-operation check on real tensors is prepared as two examples, run afte
 build:
 
 ```
-cargo run -p sparkflash-model-qwen4-exp --example nvfp4_expert_op --release -- \
+cargo build --release -p sparkflash-model-qwen4-exp --example nvfp4_expert_qwen
+cargo build --release -p sparkflash-model-inkling2 --example nvfp4_expert_inkling
+target/release/examples/nvfp4_expert_qwen \
   --checkpoint <Qwen3.8-Flash-Next-NVFP4 snapshot> --cubin-dir target/cubins
-cargo run -p sparkflash-model-inkling2 --example nvfp4_expert_op --release -- \
+target/release/examples/nvfp4_expert_inkling \
   --checkpoint <Inkling-2-Small snapshot> --cubin-dir target/cubins
 ```
 
