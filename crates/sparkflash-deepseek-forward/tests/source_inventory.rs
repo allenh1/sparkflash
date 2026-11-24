@@ -207,11 +207,14 @@ const BUDGET: &[(&str, Counts)] = &[
     (
         "src/tp4_operands.rs",
         Counts {
-            model_config: 0,
-            config_reads: 0,
+            // The operands module names the seven projection leaves a shard can be and reads
+            // the format the opened plan states, so the header gate judges a checkpoint by the
+            // description it was opened with rather than by a second copy of the model's facts.
+            model_config: 2,
+            config_reads: 1,
             model_constants: 0,
             shape_literals: 0,
-            tensor_names: 2,
+            tensor_names: 7,
             kernel_symbols: 1,
         },
     ),
