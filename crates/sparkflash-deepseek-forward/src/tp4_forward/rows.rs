@@ -175,6 +175,10 @@ pub(super) struct RowsKernels {
     /// opt_rows_hostw_{bf16w, f32w}_f32o_ring: the compressor's projections of every lane's rows
     /// into their rings in one launch each (none in an older cubin, or SPARKFLASH_ROWS_RING=0).
     hostw_ring: Option<[Kernel; 2]>,
+    /// opt_mma_hostw_bf16a_bf16w: a BF16-stored projection over BF16 activation rows. The row
+    /// hostw kernels take f32 rows, so a seam that has BF16 rows (q_normed, the attention body,
+    /// the o latent) uses this one instead.
+    hostw_bf16a: Kernel,
     /// A step's completed compressor groups, every lane's at once (none in an older cubin, or
     /// SPARKFLASH_ROWS_GROUPS=0).
     groups: Option<GroupKernels>,
@@ -519,6 +523,10 @@ impl RowsState {
         } else {
             None
         };
+        let (mma, _sha) = cached_cubin(&kernel_dir.join("opt_mma_sm121.cubin"))
+            .map_err(|error| format!("rows: {error}"))?;
+        let (mma_module, hostw_bf16a) = cuda.load_named(&mma, "opt_mma_hostw_bf16a_bf16w")?;
+        modules.push(mma_module);
         let kernels = RowsKernels {
             _modules: modules,
             seam,
@@ -543,6 +551,7 @@ impl RowsState {
             rank_permute,
             hostw,
             hostw_ring,
+            hostw_bf16a,
             groups,
             prefetch_l2,
             prologue,
@@ -2396,6 +2405,17 @@ impl DeviceLayer<'_> {
         let b = rows.b;
         let dim = self.dim;
         let tokens = n as u32;
+        // A BF16-stored attention projection is read by the host-weight bodies from the arena's
+        // row-major bytes. The packed arrangement has no device loader yet, so it is refused by
+        // name rather than read as row-major BF16 words.
+        let stored = crate::plan::operand(Some(layer), sparkflash_model::Part::MlaAttention).stored;
+        let bf16_weight =
+            stored.values() == sparkflash_model::format::FormatValues::Bf16 && stored.is_unscaled();
+        if stored.layout() == sparkflash_model::format::FormatLayout::Packed {
+            return Err(format!(
+                "rows: layer {layer}'s attention weights are stored in the packed BF16 form, which the device loader does not arrange yet"
+            ));
+        }
         let gemv = |name: &str,
                     a: u64,
                     a_scales: u64,
@@ -2407,6 +2427,23 @@ impl DeviceLayer<'_> {
                 .weights
                 .pair(layer, name)
                 .map_err(|error| format!("rows {name}: {error}"))?;
+            if bf16_weight {
+                // opt_rows_hostw_bf16w: f32 activation rows against row-major BF16 weights.
+                return self.cuda.launch(
+                    rows.kernels.hostw[0],
+                    ((cols / 32) as u32, tokens, 1),
+                    (32, 1, 1),
+                    &[
+                        a,
+                        w.0,
+                        out,
+                        cols as u64,
+                        inner as u64,
+                        inner as u64,
+                        cols as u64,
+                    ],
+                );
+            }
             launch_opt_rows(
                 self.cuda,
                 OptKind::Fp8aBf16o,
@@ -2433,15 +2470,13 @@ impl DeviceLayer<'_> {
             .map_err(|error| format!("rows {name}: {error}"))
         };
         let lora = rows.lora_cols;
-        gemv("wq_a", b.act_codes, b.act_scales, b.q_lora, lora, dim)?;
-        gemv(
-            "wkv",
-            b.act_codes,
-            b.act_scales,
-            b.kv_latent,
-            rows.kv_cols,
-            dim,
-        )?;
+        let (act, act_scales) = if bf16_weight {
+            (b.normed, 0)
+        } else {
+            (b.act_codes, b.act_scales)
+        };
+        gemv("wq_a", act, act_scales, b.q_lora, lora, dim)?;
+        gemv("wkv", act, act_scales, b.kv_latent, rows.kv_cols, dim)?;
         let q_norm = self
             .weights
             .get(layer, "q_norm")
@@ -2455,8 +2490,35 @@ impl DeviceLayer<'_> {
             layer as u32,
             p0 as u64,
         )?;
-        rows.quantise_bf16(self.cuda, b.q_normed, b.q_codes, b.q_scales, lora, n)?;
-        gemv("wq_b", b.q_codes, b.q_scales, b.q, rows.q_cols, lora)?;
+        if bf16_weight {
+            let (w, _) = self
+                .weights
+                .pair(layer, "wq_b")
+                .map_err(|error| format!("rows wq_b: {error}"))?;
+            // opt_mma_hostw_bf16a_bf16w: BF16 activation rows (q_normed) against row-major BF16.
+            self.cuda.launch(
+                rows.kernels.hostw_bf16a,
+                (
+                    (rows.q_cols as u32).div_ceil(128),
+                    (tokens).div_ceil(128),
+                    1,
+                ),
+                (256, 1, 1),
+                &[
+                    b.q_normed,
+                    w.0,
+                    b.q,
+                    rows.q_cols as u64,
+                    lora as u64,
+                    tokens as u64,
+                    lora as u64,
+                    rows.q_cols as u64,
+                ],
+            )?;
+        } else {
+            rows.quantise_bf16(self.cuda, b.q_normed, b.q_codes, b.q_scales, lora, n)?;
+            gemv("wq_b", b.q_codes, b.q_scales, b.q, rows.q_cols, lora)?;
+        }
         let (cos, sin) = self.rows_rope_tables(layer)?;
         let (_, rope) = self.opt_rope.ok_or("rows: the opt rope is not loaded")?;
         let kv_norm = self
@@ -3493,6 +3555,61 @@ impl DeviceLayer<'_> {
         let groups = geometry.groups as u64;
         let (cols, inner) = (geometry.o_lora_rank as u64, geometry.group_inner as u64);
         let tokens = n as u32;
+        let stored = crate::plan::operand(Some(layer), sparkflash_model::Part::MlaAttention).stored;
+        let bf16_weight =
+            stored.values() == sparkflash_model::format::FormatValues::Bf16 && stored.is_unscaled();
+        if stored.layout() == sparkflash_model::format::FormatLayout::Packed {
+            return Err(format!(
+                "rows output: layer {layer}'s attention weights are stored in the packed BF16 form, which the device loader does not arrange yet"
+            ));
+        }
+        if bf16_weight {
+            // wo_a groups its reduction; the host-weight body has no group stride, so one launch
+            // a group over the same BF16 rows. wo_b then reads the BF16 latent the body wrote.
+            let hostw = |a: u64,
+                         w: u64,
+                         out: u64,
+                         cols: u64,
+                         inner: u64,
+                         a_stride: u64,
+                         out_stride: u64| {
+                self.cuda.launch(
+                    rows.kernels.hostw_bf16a,
+                    ((cols as u32).div_ceil(128), tokens.div_ceil(128), 1),
+                    (256, 1, 1),
+                    &[
+                        a,
+                        w,
+                        out,
+                        cols,
+                        inner,
+                        u64::from(tokens),
+                        a_stride,
+                        out_stride,
+                    ],
+                )
+            };
+            for group in 0..groups {
+                hostw(
+                    b.attn_body + group * inner * 2,
+                    wo_a.0.0 + group * cols * inner * 2,
+                    b.attn_lo + group * cols * 2,
+                    cols,
+                    inner,
+                    inner * groups,
+                    cols * groups,
+                )?;
+            }
+            return hostw(
+                b.attn_lo,
+                wo_b.0.0,
+                b.attn_out,
+                geometry.hidden as u64,
+                rows.lo_cols as u64,
+                rows.lo_cols as u64,
+                geometry.hidden as u64,
+            );
+        }
         launch_opt_rows(
             self.cuda,
             OptKind::Bf16aBf16o,

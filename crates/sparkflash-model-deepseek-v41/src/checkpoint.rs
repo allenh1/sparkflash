@@ -170,11 +170,46 @@ pub fn write_synthetic_checkpoint(
     shards: usize,
 ) -> Result<(), String> {
     let plan = TensorPlan::language_model(config);
-    let tensors = plan
-        .specs()
-        .iter()
-        .map(|spec| Ok((spec.clone(), synthetic_bytes(spec, seed)?)))
-        .collect::<Result<Vec<_>, String>>()?;
+    let mut tensors: Vec<(TensorSpec, Vec<u8>)> = Vec::with_capacity(plan.specs().len());
+    for spec in plan.specs() {
+        let bytes = synthetic_bytes(spec, seed)?;
+        // The packed word form is an arrangement of the BF16 rows, not another arithmetic: the
+        // writer packs the bytes it just made, and writes the escape list the loader needs beside
+        // the packed rows. A row-major BF16 tensor is written as it is.
+        if plan
+            .weight_format(&spec.name)
+            .is_some_and(|format| format.layout() == sparkflash_model::format::FormatLayout::Packed)
+        {
+            let rows = spec.shape.first().copied().unwrap_or(0);
+            let columns = spec.shape.get(1).copied().unwrap_or(0);
+            let (packed, escapes) = sparkflash_model::packed_bf16::pack(rows, columns, &bytes)
+                .map_err(|error| format!("{}: {error}", spec.name))?;
+            let stride = sparkflash_model::packed_bf16::row_bytes(columns);
+            let escape_name = spec.name.trim_end_matches(".weight").to_owned() + ".escape";
+            let mut escape_bytes = Vec::with_capacity(escapes.len() * 4);
+            for entry in &escapes {
+                escape_bytes.extend_from_slice(&entry.to_le_bytes());
+            }
+            tensors.push((
+                TensorSpec {
+                    name: spec.name.clone(),
+                    dtype: DType::U8,
+                    shape: vec![rows, stride],
+                },
+                packed,
+            ));
+            tensors.push((
+                TensorSpec {
+                    name: escape_name,
+                    dtype: DType::U8,
+                    shape: vec![escape_bytes.len()],
+                },
+                escape_bytes,
+            ));
+        } else {
+            tensors.push((spec.clone(), bytes));
+        }
+    }
     write_checkpoint(directory, &tensors, shards).map_err(|error| error.to_string())
 }
 
@@ -368,6 +403,96 @@ mod tests {
                 .expect("every planned tensor is stored");
             assert_eq!(bytes.len() as u128, spec.storage_bytes(), "{}", spec.name);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn bf16_tiny(dense: &str) -> ModelConfig {
+        let mut config = ModelConfig::tiny();
+        // The packed row walk takes whole 256-column rounds, so the test's geometry has one.
+        config.dim = 256;
+        config.q_lora_rank = 256;
+        config.n_heads = 16;
+        config.head_dim = 16;
+        config.o_groups = 1;
+        config.o_lora_rank = 256;
+        config.moe_inter_dim = 256;
+        config.dtype = dense.to_owned();
+        config.expert_dtype = "fp4".to_owned();
+        config.weight_block = 32;
+        config.weight_scale = "ue8m0".to_owned();
+        config
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "deepseek-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn a_bf16_dense_class_writes_no_scale_plane() {
+        let dir = temp_dir("bf16");
+        let config = bf16_tiny("bf16");
+        write_synthetic_checkpoint(&dir, &config, 7, 2).expect("the checkpoint writes");
+        let source = SafeTensorsSource::open(&dir, &dir.join("model.safetensors.index.json"))
+            .expect("the index opens");
+        let spec = source
+            .spec("layers.0.attn.wq_a.weight")
+            .expect("the dense projection is planned");
+        assert_eq!(spec.dtype, DType::BF16, "the dense class is unquantized");
+        assert!(
+            !source.contains("layers.0.attn.wq_a.scale"),
+            "an unscaled weight has no scale tensor"
+        );
+        assert_eq!(
+            source
+                .read("layers.0.attn.wq_a.weight")
+                .expect("read")
+                .len(),
+            spec.shape[0] * spec.shape[1] * 2
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_packed_dense_class_writes_the_rows_and_the_escape_list_it_stands_for() {
+        let dir = temp_dir("packed");
+        let config = bf16_tiny("packed-bf16");
+        let plan = TensorPlan::language_model(&config);
+        let weight = plan
+            .specs()
+            .iter()
+            .find(|spec| spec.name == "layers.0.attn.wq_a.weight")
+            .expect("the dense projection is planned");
+        let original = synthetic_bytes(weight, 7).expect("the fixture's bf16 rows");
+        write_synthetic_checkpoint(&dir, &config, 7, 2).expect("the checkpoint writes");
+        let source = SafeTensorsSource::open(&dir, &dir.join("model.safetensors.index.json"))
+            .expect("the index opens");
+        let stored = source
+            .spec("layers.0.attn.wq_a.weight")
+            .expect("the packed weight is stored");
+        assert_eq!(stored.dtype, DType::U8, "the packed rows are bytes");
+        let escape = source
+            .read("layers.0.attn.wq_a.escape")
+            .expect("the escape list travels beside the rows");
+        let escapes: Vec<u32> = escape
+            .chunks(4)
+            .map(|entry| u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]))
+            .collect();
+        let packed = source.read("layers.0.attn.wq_a.weight").expect("read");
+        let rows = weight.shape[0];
+        let columns = weight.shape[1];
+        let unpacked = sparkflash_model::packed_bf16::unpack(rows, columns, &packed, &escapes)
+            .expect("the packed rows and their escape list are one matrix");
+        assert_eq!(
+            unpacked, original,
+            "the body reads the rows the writer held"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

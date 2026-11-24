@@ -411,6 +411,67 @@ tensor-wide factor into the group scale for Inkling (or apply it to the output f
 because the products are equal. The catalogue claim for the new symbols, the scan row that still
 says `not built`, and the real-tensor bit check against the Qwen and Inkling arms are open.
 
+**Result (2026-11-24, F4 BF16 row-major and packed BF16).** BF16 row-major is unscaled:
+`StoredFormat::BF16` has no scale plane, so `ScalePlanes::of` sizes nothing and carries no escape
+list. The packed word form is that same BF16 arithmetic in the arrangement
+`kernels/bf16_packed_sm121.cuh` reads; its one plane is the escape list,
+`[offsets: rows + 1][entries: column << 16 | word]`, which the bind states and `arrange` reads.
+A checkpoint declares the two by `quantization_config.quant_method`: `bf16` or `packed-bf16`.
+**No released layout declares packed BF16** - the layout dtype vocabulary has no spelling for it -
+so the packed declaration is exercised only by the synthetic second shape. The writer packs the
+BF16 rows it generated and writes `{name}.escape` beside `{name}.weight`; the reference reader
+(`forward/weight_view.rs`) and the seam's `arrange` unpack them back to the row-major BF16 the body
+already reads, so no kernel is added and the packed form's host ids must equal the row-major
+form's. The host-TP path unpacks a packed weight before it shards it (`tp4_host.rs`), because
+a packed row cannot be sliced by byte range.
+
+By the recipe: (1) the formats are `StoredFormat::BF16` and `StoredFormat::PACKED_BF16`, already
+stated by F1/F2; `from_name("packed-bf16")` round-trips. (2) `TensorPlan::scaled` writes no
+`{name}.scale` for an unscaled format and keeps the format per weight, so the writer packs exactly
+the dense class (the Engram table keeps its own grid). (3) The reference reads a BF16 weight
+through `read_optional_scale` (attention, shared and routed expert, MTP) and a packed one by its
+escape list; `dense_grid()` is `None` for BF16. (4) `arrange` unpacks the packed form into
+row-major BF16 and refuses a store that is not the escape list's length; `choose` resolves the same
+BF16 body for both names. (5) `ScalePlanes` carries the escape plane for a packed tensor and no
+plane for a BF16 one. (6) No new body: `opt_mma_hostw_bf16a_bf16w` and `opt_rows_hostw_bf16w`
+are the tree's row-major BF16 modes, and their synthetic-shape instances were already on
+`kernels/instances.toml` from F1 (`opt_mma_sm121_s2` and `opt_rows_sm121_s2`, hidden 4096; no new
+row or cubin edit is needed). The device rows seam now reads a BF16-stored attention part from the
+plan's format: wq_a/wkv over the f32 normed rows through `opt_rows_hostw_bf16w`, and
+wq_b/wo_a/wo_b over BF16 rows through `opt_mma_hostw_bf16a_bf16w` (wo_a once a group, which has no
+group stride). A packed part is refused by name at that seam until the loader arranges it. (7)
+Proved on the host arm at worlds 1, 2 and 4 for both declarations: `second-shape: VERDICT PASS`
+and `external check PASS` at every world, with the same host-reference ids for `bf16` and
+`packed-bf16` (the packed form is lossless):
+
+```
+[[6653, 20427, 7012, 12813, 1671, 30705, 17404, 5096],
+ [25425, 11040, 2024, 16309, 32049, 1442, 21654, 2395],
+ [30169, 2663, 30363, 3368, 22356, 24675, 32436, 8472]]
+```
+
+**The device arm is not proved and this family is not done.** What is open, by name: the arena's
+upload does not call `arrange`, so a packed weight would bind packed bytes and is refused at the
+seam instead; the shared expert, the MTP `main_proj` and any BF16 expert/router projection still
+take their coded paths (the synthesised checkpoint's local expert intermediate 256 at two ranks is
+the lead's released-format expert row); and no device launch of these bodies has run. The window
+commands, to be run by the lead with the cubin build (`scripts/build-cubins.sh` rebuilds
+`opt_mma_sm121_s2`/`opt_rows_sm121_s2` from the existing rows):
+
+```
+python3 scripts/second-shape.py run --released <released> --out /tmp/f4-bf16-device \
+  --binary target/release/sparkflash \
+  --writer target/release/examples/write-synthetic-checkpoint \
+  --reference target/release/examples/host-reference \
+  --stored-format bf16 --world 2,4 --device --released-cubins <released cubins> --port 8131
+```
+
+then the same with `--stored-format packed-bf16` (currently expected to refuse by name at the
+packed seam), and the one-operation check: the real BF16 dense projections of the model that
+stores them (Dory or Inkling), bits first and then tokens/s against the arm that serves that model
+today. The released path is unchanged and still passes; the device arm at world 4 was never
+attempted by the earlier window.
+
 ### S. The seam
 
 * **S1. Blocks become steps, decided at open (rows path).** For each block the engine builds a

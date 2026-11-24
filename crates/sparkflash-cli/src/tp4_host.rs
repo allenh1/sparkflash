@@ -2174,6 +2174,92 @@ impl RankWeights {
     fn shard_read_bytes(&self) -> u64 {
         self.read_bytes.load(Ordering::Relaxed)
     }
+
+    /// The escape tensor beside a packed BF16 weight, when the checkpoint stores it that way.
+    fn packed_escape(&self, name: &str) -> Option<String> {
+        let base = name.strip_suffix(".weight")?;
+        let escape = format!("{base}.escape");
+        self.source.contains(&escape).then_some(escape)
+    }
+
+    /// A packed weight's logical (rows, columns), from the packed row header.
+    fn packed_shape(&self, name: &str) -> Result<Option<(usize, usize)>, WeightError> {
+        if self.packed_escape(name).is_none() {
+            return Ok(None);
+        }
+        let header = self.source.header(name)?;
+        let descriptor = header.tensor(name).map_err(|error| WeightError::Missing {
+            name: format!("{name} ({error})"),
+        })?;
+        let [rows, stride] = descriptor.shape.as_slice() else {
+            return Err(WeightError::Malformed {
+                name: name.to_owned(),
+                detail: "a packed BF16 weight is two-dimensional".to_owned(),
+            });
+        };
+        let columns =
+            sparkflash_model::packed_bf16::columns_of_row_bytes(*stride).ok_or_else(|| {
+                WeightError::Malformed {
+                    name: name.to_owned(),
+                    detail: format!(
+                        "a packed row of {stride} bytes is not one of the form's strides"
+                    ),
+                }
+            })?;
+        Ok(Some((*rows, columns)))
+    }
+
+    /// The logical rows and columns this rank reads of a packed matrix.
+    fn local_packed(&self, rule: ShardRule, (rows, columns): (usize, usize)) -> (usize, usize) {
+        match rule {
+            ShardRule::Replicated => (rows, columns),
+            ShardRule::Column => (rows / self.world, columns),
+            ShardRule::Row => (rows, columns / self.world),
+        }
+    }
+
+    /// Reads a packed BF16 matrix, unpacks it and returns this rank's logical slice.
+    fn read_packed(
+        &self,
+        name: &str,
+        escape: &str,
+        rule: ShardRule,
+    ) -> Result<Vec<u8>, WeightError> {
+        let packed = self.source.read(name)?;
+        let escapes = self.source.read(escape)?;
+        let (rows, columns) = self
+            .packed_shape(name)?
+            .expect("the escape names a packed weight");
+        let entries: Vec<u32> = escapes
+            .chunks(4)
+            .map(|entry| u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]))
+            .collect();
+        let logical = sparkflash_model::packed_bf16::unpack(rows, columns, &packed, &entries)
+            .map_err(|detail| WeightError::Malformed {
+                name: name.to_owned(),
+                detail,
+            })?;
+        let (local_rows, local_columns) = self.local_packed(rule, (rows, columns));
+        let rank = self.plan.tp_rank();
+        let mut out = Vec::with_capacity(local_rows * local_columns * 2);
+        match rule {
+            ShardRule::Replicated => out = logical,
+            ShardRule::Column => {
+                let first = rank * local_rows;
+                out.extend_from_slice(
+                    &logical[first * columns * 2..(first + local_rows) * columns * 2],
+                );
+            }
+            ShardRule::Row => {
+                let first = rank * local_columns;
+                for row in 0..rows {
+                    let start = (row * columns + first) * 2;
+                    out.extend_from_slice(&logical[start..start + local_columns * 2]);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn shard_error_to_weight(name: &str, error: ShardError) -> WeightError {
@@ -2195,6 +2281,14 @@ impl WeightSource for RankWeights {
         match self.plan.rule(name) {
             None => self.source.spec(name),
             Some(rule) => {
+                if let Some((rows, columns)) = self.packed_shape(name)? {
+                    let (rows, columns) = self.local_packed(rule, (rows, columns));
+                    return Ok(TensorSpec {
+                        name: name.to_owned(),
+                        dtype: DType::BF16,
+                        shape: vec![rows, columns],
+                    });
+                }
                 let header = self.source.header(name)?;
                 let descriptor = header.tensor(name).map_err(|error| WeightError::Missing {
                     name: format!("{name} ({error})"),
@@ -2210,6 +2304,17 @@ impl WeightSource for RankWeights {
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        // A packed weight is not a byte range of its stored tensor: it is unpacked and sliced by
+        // rows and columns, so it bypasses the resident cache (which holds stored slices).
+        if let Some(escape) = self.packed_escape(name)
+            && let Some(rule) = self.plan.rule(name)
+        {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            let bytes = self.read_packed(name, &escape, rule)?;
+            self.read_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            return Ok(bytes);
+        }
         if let Some(cache) = &self.cache
             && let Some(bytes) = cache.get(name)
         {
@@ -2232,6 +2337,10 @@ impl WeightSource for RankWeights {
     }
 
     fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+        // A packed weight's stored bytes are not its logical rows; the reader unpacks them.
+        if self.packed_escape(name).is_some() {
+            return Ok(None);
+        }
         Ok(self
             .cache
             .as_ref()
@@ -3254,6 +3363,21 @@ fn resident_estimate(source: &SafeTensorsSource, plan: &ShardPlan) -> Result<u64
     for (name, rule) in plan.rules() {
         let header = source.header(name).map_err(|error| error.to_string())?;
         let descriptor = header.tensor(name).map_err(|error| error.to_string())?;
+        // A packed BF16 weight's stored bytes are not its logical rows; the estimate counts the
+        // BF16 values the unfold produces, not the packed bytes.
+        if source.contains(&format!("{}.escape", name.trim_end_matches(".weight"))) {
+            let columns = sparkflash_model::packed_bf16::columns_of_row_bytes(
+                descriptor.shape.get(1).copied().unwrap_or(0),
+            )
+            .ok_or_else(|| format!("{name}: a packed row is not one of the form's strides"))?;
+            let (rows, columns) = match rule {
+                ShardRule::Replicated => (descriptor.shape[0], columns),
+                ShardRule::Column => (descriptor.shape[0] / plan.tp_world(), columns),
+                ShardRule::Row => (descriptor.shape[0], columns / plan.tp_world()),
+            };
+            bytes = bytes.saturating_add((rows * columns * 2) as u64);
+            continue;
+        }
         let mut stored = descriptor.shape.clone();
         match rule {
             ShardRule::Replicated => {}

@@ -93,12 +93,19 @@ impl ModelConfig {
     }
 
     fn declared_format(&self, method: &str, block: usize, scale: &str) -> StoredFormat {
-        let format = sparkflash_model::architecture::WeightFormat::from_name(
-            Some(method),
-            Some(block),
-            Some(scale),
-        )
-        .stored_format();
+        // The packed form is the same arithmetic as BF16 in the one arrangement F2 made: the
+        // checkpoint states it by name because no dtype word can say which layout the bytes are
+        // in. Every other method parses through the release's vocabulary.
+        let format = if method.eq_ignore_ascii_case("packed-bf16") {
+            StoredFormat::PACKED_BF16
+        } else {
+            sparkflash_model::architecture::WeightFormat::from_name(
+                Some(method),
+                Some(block),
+                Some(scale),
+            )
+            .stored_format()
+        };
         if format.values() == sparkflash_model::format::FormatValues::Fp8E4M3
             && format.has_scale(sparkflash_model::format::ScaleKind::PowerOfTwoGrid)
         {
@@ -955,11 +962,20 @@ mod released {
             &text.rope_scaling.rope_type,
             "yarn",
         )?;
-        require(
-            "quantization_config.quant_method",
-            &quant.quant_method,
-            "fp8",
-        )?;
+        // The dense class is the released MXFP8/FP8 tile arithmetic or an unquantized BF16 row
+        // (the packed word form is that same BF16 arithmetic in its packed arrangement).
+        if !matches!(
+            quant.quant_method.to_ascii_lowercase().as_str(),
+            "fp8" | "bf16" | "packed-bf16"
+        ) {
+            return Err(ConfigError::Invalid {
+                field: "quantization_config.quant_method",
+                detail: format!(
+                    "the dense class is fp8, bf16 or packed-bf16, the document says {:?}",
+                    quant.quant_method
+                ),
+            });
+        }
         require_flag("text_config.attention_bias", text.attention_bias, false)?;
         require_flag(
             "text_config.tie_word_embeddings",
@@ -991,9 +1007,13 @@ mod released {
                 dense.has_scale(sparkflash_model::format::ScaleKind::Tile)
                     || dense.has_scale(sparkflash_model::format::ScaleKind::PowerOfTwoGrid)
             }
+            sparkflash_model::format::FormatValues::Bf16 => dense.is_unscaled(),
             _ => false,
         };
-        if !dense_ok || (tile && dense.block() != 128) || (!tile && dense.block() != 32) {
+        if !dense_ok
+            || (tile && dense.block() != 128)
+            || (!tile && !dense.is_unscaled() && dense.block() != 32)
+        {
             return Err(ConfigError::Invalid {
                 field: "quantization_config.quant_method",
                 detail: format!(
@@ -1030,6 +1050,7 @@ mod released {
             sparkflash_model::format::FormatValues::Fp8E4M3 => {
                 expert.has_scale(sparkflash_model::format::ScaleKind::Tile) && expert.block() == 128
             }
+            sparkflash_model::format::FormatValues::Bf16 => expert.is_unscaled(),
             _ => false,
         };
         if !expert_ok {

@@ -815,7 +815,9 @@ fn dense_view<'a>(
     rows: usize,
     cols: usize,
 ) -> Result<WeightView<'a>, EngineError> {
-    WeightView::read_dense(src.source, name, rows, cols, grid, src.limit)
+    // A BF16 row has no scale plane; the released coded weight has one. The reader applies
+    // `{name}.scale` only when the source carries it.
+    WeightView::read_optional_scale(src.source, name, rows, cols, grid, src.limit)
 }
 
 /// Reads a weight whose scale grid may be absent: `wo_a` is fp8 in the file and bf16 after
