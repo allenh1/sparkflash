@@ -5578,8 +5578,10 @@ top_k = 10
 # --- The second shape at one and two ranks ------------------------------------------------
 # A per-rank width divides by the world, so the same fixture at one and two ranks is a
 # different instance: every per-rank expert intermediate and vocabulary shard widens, and the
-# head and its reduction are built for that rank count. These copies leave every released
-# cubin's bytes alone; the _s2w<ranks> suffix is a separate cubin a rank count stages.
+# head and its reduction are built for that rank count. A whole cubin group moves together,
+# because the entries in one cubin share its compiled shape. These copies leave every
+# released cubin's bytes alone; the _s2w<ranks> suffix is a separate cubin a rank count
+# stages.
 
 [[instance]]
 source = "routed_gate_up_sm121.cu"
@@ -6968,6 +6970,18 @@ hidden = 4096
 experts = 64
 top_k = 4
 intermediate = 512
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_group_append"
+cubin = "opt_misc_sm121_s2w1"
+family = "csa2"
+format = "f32"
+catalogue = "deepseek-csa2"
+hidden = 4096
+head_dim = 512
+ratio = 2
+positions = 1048576
 
 [[instance]]
 source = "b12x_mxfp8_dense_sm121.cu"
@@ -8559,6 +8573,18 @@ hidden = 4096
 experts = 64
 top_k = 4
 intermediate = 256
+
+[[instance]]
+source = "opt_misc_sm121.cu"
+entry = "opt_rows_group_append"
+cubin = "opt_misc_sm121_s2w2"
+family = "csa2"
+format = "f32"
+catalogue = "deepseek-csa2"
+hidden = 4096
+head_dim = 512
+ratio = 2
+positions = 1048576
 
 [[instance]]
 source = "b12x_mxfp8_dense_sm121.cu"
