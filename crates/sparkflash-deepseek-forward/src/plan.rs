@@ -1102,6 +1102,27 @@ pub fn operand(block: Option<usize>, part: Part) -> &'static crate::operand::Ope
     })
 }
 
+/// The stored format the plan states for one layer's shared expert.
+///
+/// The shared expert's tensors are claimed by the MoE part (`ffn.shared_experts.w1/w3/w2`), but
+/// they are a dense-class MLP, so neither the routed-experts aggregate nor a dense-MLP part the
+/// layer does not carry speaks for them. The plan collects the format from the layout's own
+/// `shared_expert` role.
+///
+/// # Errors
+/// The layer has no shared expert, or the plan's layout states no format for its tensors. The
+/// refusal names the layer; it never falls back to a neighbouring class.
+pub fn shared_expert_format(
+    block: usize,
+) -> Result<sparkflash_model::format::StoredFormat, ConfigError> {
+    description()
+        .plan()
+        .shared_expert_format(block)
+        .ok_or_else(|| {
+            format!("the plan states no stored format for layer {block}'s shared expert")
+        })
+}
+
 /// The layer `block` claims a tensor whose name ends with `tail`.
 ///
 /// The name is the claim's own string; a plan that does not claim it is a refusal, never a

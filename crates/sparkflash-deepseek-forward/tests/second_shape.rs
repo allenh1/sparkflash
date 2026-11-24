@@ -58,6 +58,15 @@ fn one_ranks_shapes_come_from_the_plans_world() {
         let plan = sparkflash_deepseek_forward::plan::plan_from_path(&dir, world, 0)
             .unwrap_or_else(|error| panic!("world {world}: {error}"));
         sparkflash_deepseek_forward::plan::install(plan).expect("the plan installs");
+        // The forward's shared-expert gather asks the installed plan for this format; every MoE
+        // layer carries one shared expert, and the plan states the format of its own tensors.
+        let shared = sparkflash_deepseek_forward::plan::shared_expert_format(0)
+            .unwrap_or_else(|error| panic!("world {world}: {error}"));
+        assert_eq!(
+            shared.block(),
+            32,
+            "world {world}: shared-expert scale block"
+        );
         assert_eq!(sparkflash_deepseek_forward::plan::world(), world);
         assert_eq!(
             sparkflash_deepseek_forward::plan::vocab_per_rank(),

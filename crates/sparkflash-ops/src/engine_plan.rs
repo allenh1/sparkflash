@@ -64,6 +64,13 @@ type PartFormats = BTreeMap<PartKey, StoredFormat>;
 /// tensor of their own. The format there is still the compressor's, stated by the layout at the
 /// owning block; it is not the dense class and must not be invented as one.
 type SharedFormats = BTreeMap<Part, StoredFormat>;
+/// The stored format of one block's shared expert, as the layout declares its own tensors.
+///
+/// A shared expert is claimed by [Part::Moe] (it is `ffn.shared_experts.w1/w3/w2` on the MoE
+/// layer), but its arithmetic is the dense class, not the routed experts' class. The routed
+/// aggregate would let the experts' format speak for it, so the tensors whose layout role is
+/// `shared_expert` are tallied on their own, per block.
+type SharedExpertFormats = BTreeMap<usize, StoredFormat>;
 
 /// The operand precision this run uses for each class of weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +257,7 @@ pub struct EnginePlan {
     precision: PrecisionPolicy,
     formats: PartFormats,
     shared_formats: SharedFormats,
+    shared_expert_formats: SharedExpertFormats,
     globals: Vec<PartRequirement>,
     layers: Vec<LayerExecution>,
     model_facts: BTreeMap<String, FactValue>,
@@ -328,7 +336,7 @@ impl EnginePlan {
         // The layout states each part's stored dtype. That dtype, not the part's kind, decides
         // the operand precision: a block mixer stored in f32 and an attention stored in bf16 are
         // both exact even beside NVFP4 experts.
-        let (formats, shared_formats) = stored_formats(&architecture);
+        let (formats, shared_formats, shared_expert_formats) = stored_formats(&architecture);
         let model = ModelFamily::of(&architecture.family, &architecture.architectures);
         let mut globals =
             global_requirements(&architecture, &tp, precision, &formats, &shared_formats)?;
@@ -412,6 +420,7 @@ impl EnginePlan {
             precision,
             formats,
             shared_formats,
+            shared_expert_formats,
             globals,
             layers,
             model_facts,
@@ -529,6 +538,28 @@ impl EnginePlan {
             })
     }
 
+    /// The stored format of one layer's shared expert, when the plan has one and states it.
+    ///
+    /// A shared expert is stored on the MoE part's `ffn.shared_experts.*` tensors, but it is a
+    /// dense-class MLP: the routed experts' format beside it says nothing about it, and a layer
+    /// with no dense body has no [Part::DenseMlp] instance to borrow one from. The value here is
+    /// the format the layout declares for the tensors whose role is `shared_expert`, and only
+    /// when the block's MoE geometry actually splits a shared width. A dense FFN, a MoE layer
+    /// with no shared expert, or a layout that states no format for the shared-expert tensors is
+    /// `None`; the caller refuses rather than assuming either class.
+    #[must_use]
+    pub fn shared_expert_format(&self, block: usize) -> Option<StoredFormat> {
+        let layer = self.layers.iter().find(|layer| layer.index == block)?;
+        let moe = layer
+            .requirements
+            .iter()
+            .find(|requirement| requirement.part == Part::Moe)?;
+        if moe.geometry.shared_experts == 0 || moe.geometry.shared == 0 {
+            return None;
+        }
+        self.shared_expert_formats.get(&block).copied()
+    }
+
     /// The model-wide facts the plan carries, named as the open manifest names them.
     #[must_use]
     pub fn model_facts(&self) -> &BTreeMap<String, FactValue> {
@@ -642,14 +673,20 @@ pub trait EngineBuilder {
 /// so a router's bf16 row does not describe the experts beside it. A scale or index tensor that
 /// names no arithmetic is skipped; an f32 part keeps f32 only when no sibling tensor states a
 /// narrower format.
-fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
+///
+/// The third map is the shared expert's format by block. The shared expert is claimed by
+/// [Part::Moe], so the part aggregate answers for the routed experts, never for it.
+fn stored_formats(
+    architecture: &Architecture,
+) -> (PartFormats, SharedFormats, SharedExpertFormats) {
     let mut totals = FormatTotals::new();
     let mut shared_totals: BTreeMap<Part, Vec<(StoredFormat, usize)>> = BTreeMap::new();
+    let mut shared_expert_totals: BTreeMap<usize, Vec<(StoredFormat, usize)>> = BTreeMap::new();
     let Ok(Some(layout)) = sparkflash_model::layout::matching(architecture) else {
-        return (BTreeMap::new(), BTreeMap::new());
+        return (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
     };
     let Ok(tensors) = layout.tensors(architecture) else {
-        return (BTreeMap::new(), BTreeMap::new());
+        return (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
     };
     // A row-scaled weight's sibling scale is one entry a row, every 32 columns; a block grid's
     // is one a 32 x 32 block. The layout's own shape is the evidence for which arrangement the
@@ -706,13 +743,29 @@ fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
         } else {
             layout_format(tensor.dtype, architecture).map(WeightFormat::stored_format)
         };
-        let Some(format) = format else {
-            continue;
-        };
         let elements = tensor
             .shape
             .iter()
             .fold(1usize, |product, dim| product.saturating_mul(*dim));
+        // The shared expert is a dense-class MLP stored on the MoE part: its tensors are
+        // `ffn.shared_experts.*` and the layout claims them under [Part::Moe], but their
+        // arithmetic is the class their own dtype declares, not the routed experts' packed class
+        // beside them. Tally those tensors by block so the forward can state the shared expert's
+        // format without borrowing a dense-MLP part the layer does not carry.
+        if tensor.role == "shared_expert"
+            && let Some(block) = tensor.block
+            && let Some(format) =
+                layout_format(tensor.dtype, architecture).map(WeightFormat::stored_format)
+        {
+            add_format(
+                shared_expert_totals.entry(block).or_default(),
+                format,
+                elements,
+            );
+        }
+        let Some(format) = format else {
+            continue;
+        };
         add_format(
             totals.entry((tensor.part, block)).or_default(),
             format,
@@ -755,7 +808,13 @@ fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
             winning_format(entries).map(|format| (part, arranged(format)))
         })
         .collect();
-    (formats, shared)
+    let shared_expert = shared_expert_totals
+        .into_iter()
+        .filter_map(|(block, entries)| {
+            winning_format(entries).map(|format| (block, arranged(format)))
+        })
+        .collect();
+    (formats, shared, shared_expert)
 }
 
 /// Add one tensor's format to a (format, claimed elements) tally.

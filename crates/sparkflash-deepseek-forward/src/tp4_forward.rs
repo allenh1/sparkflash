@@ -7389,9 +7389,12 @@ fn gather_shared_expert_source(
     let mut gather_calls = 0usize;
     let mut tensors = std::collections::BTreeMap::new();
 
-    // The shared expert is a dense-class tensor, so its format is the block's dense operand:
-    // the gather checks the plan's format, not the checkpoint's dtype word.
-    let shared_format = crate::plan::operand(Some(layer), sparkflash_model::Part::DenseMlp).stored;
+    // The shared expert's tensors are claimed by the MoE part, but they are a dense-class MLP:
+    // the plan states their format from the layout's own `shared_expert` role, not from a dense-MLP
+    // operand the layer does not carry and not from the routed experts' class beside them. The
+    // gather checks the plan's format, not the checkpoint's dtype word; a plan that states none
+    // refuses here by name.
+    let shared_format = crate::plan::shared_expert_format(layer)?;
     let want_values = match shared_format.values() {
         sparkflash_model::format::FormatValues::Fp8E4M3 => "F8_E4M3",
         sparkflash_model::format::FormatValues::Bf16 => "BF16",
