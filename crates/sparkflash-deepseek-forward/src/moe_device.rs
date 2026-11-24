@@ -2486,7 +2486,7 @@ fn read_experts(
     // factor. This reader carries the first two; a format that also needs a tensor-wide factor is
     // refused by name rather than decoded without it.
     let planes = |rows: usize, cols: usize| crate::operand::ScalePlanes::of(format, rows, cols);
-    if planes(inter, dim).tensor_wide {
+    if planes(inter, dim).tensor_wide != sparkflash_model::format::NvFp4Wide::None {
         return Err(err(
             "device routed MoE bind",
             format!(
@@ -2496,7 +2496,7 @@ fn read_experts(
         ));
     }
     let mut experts = Vec::with_capacity(table.len());
-    let mut read_pair = |base: &str, rows: usize, cols: usize| {
+    let read_pair = |base: &str, rows: usize, cols: usize| {
         let plane = planes(rows, cols);
         let values = read_len(
             source,
@@ -2506,13 +2506,10 @@ fn read_experts(
         )?;
         // The loader's one arrangement: as stored for a row-major format, the 32 x 32 B12x
         // permutation for a tiled one. The body reads what this returns, never the file order.
-        let arranged = crate::operand::arrange(format, &values, rows, cols)
-            .map_err(|detail| err("device routed MoE bind", detail))?;
-        let scale_bytes = if plane.row_bytes > 0 {
-            plane.row_bytes
-        } else {
-            plane.grid_bytes
-        };
+        let arranged =
+            crate::operand::arrange(format, &values, rows, cols, plane.escapes.unwrap_or(&[]))
+                .map_err(|detail| err("device routed MoE bind", detail))?;
+        let scale_bytes = plane.row_bytes + plane.grid_bytes + plane.group_bytes;
         let scales = read_len(source, &format!("{base}.scale"), scale_bytes as usize)?;
         Ok::<_, EngineError>((arranged.bytes, scales))
     };

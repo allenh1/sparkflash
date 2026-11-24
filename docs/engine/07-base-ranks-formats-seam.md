@@ -570,11 +570,10 @@ The plan states the format per block: the DeepSeek writer's `TensorPlan::scaled`
 store through, and `moe_device::read_experts` now takes the block's format, sizes both planes from
 it, arranges the stored bytes and refuses a tensor-wide factor the routed bind does not carry. A
 unit test pins that the instance list builds `opt_mma_fp8_rowscale_f32o` for this format and that
-`choose` resolves it for a routed-expert block. `kernels/instances.toml` gains the shape rows the
-synthetic checkpoint needs at one, two and four ranks: `opt_mma_fp8_rowscale_f32o` at per-rank
-intermediate 512 (TP1), 256 (TP2) and the existing 128 (TP4), each new compile group carrying the
-router and gate/up rows `opt_mma_sm121.cu` asserts at compile time. The catalogue admits the shape
-as `deepseek-moe`.
+`choose` resolves it for a routed-expert block. `kernels/instances.toml` already carries
+`opt_mma_fp8_rowscale_f32o` at the synthetic shape's per-world intermediate 512, 256 and 128
+(R3's `_s2w1`, `_s2w2` and `_s2` rows, with the router and gate/up rows the source asserts beside
+them); this step adds the `deepseek-moe` catalogue symbol that claims the body for `Part::Moe`.
 
 Proof on the host arm, `/tmp/f4-mxfp8`, this tip: the fixture written with `expert_dtype:
 "mx-fp8-row"`, `weight_block_size: [32, 32]`, `scale_fmt: ue8m0` and compared with the host
@@ -621,8 +620,8 @@ python3 scripts/second-shape.py run \
   --stored-format mx-fp8-row --world 2,4 --port 8133
 ```
 
-with the cubin build in the window (the new instance groups compile `opt_mma_sm121.cu` once per
-rank width). Open items: the device verdict; the device body's tensor-core accumulation against
+with the cubin build in the window (the per-world `opt_mma_sm121` cubins are part of it). Open
+items: the device verdict; the device body's tensor-core accumulation against
 the host's per-element sum at the same split (the exact-id bar above); and the joint mid-stack
 variant (NVFP4 below a layer boundary, this format above), which is not started and needs this
 launch proved first.
