@@ -1515,6 +1515,12 @@ pub const CATALOGUE: &[PartKernel] = &[
             // codes over the 640-K row layout, one rank's selected slots.
             deepseek_sym("b12x_mxfp4_moe_sm121", &[Precision::MxFp4])
                 .decoding(StoredFormat::MXFP4_32),
+            // Row-scaled MXFP8 routed experts: the same body the drafter head and the Engram
+            // table already read (E4M3 codes, one ue8m0 scale a row every 32 columns, row-major),
+            // launched over an expert's [rows, dim] slice. `opt_mma_sm121.cu` reads it at any
+            // token count, so it serves the prompt rows and the token rows.
+            deepseek_sym("opt_mma_fp8_rowscale_f32o", &[Precision::MxFp8])
+                .decoding(StoredFormat::MXFP8_ROW_32),
         ],
         true,
     ),

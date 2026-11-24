@@ -752,6 +752,13 @@ pub enum WeightFormat {
         /// Elements a scale covers.
         block: usize,
     },
+    /// E4M3 codes with one power-of-two `ue8m0` scale a row, every `block` columns: the
+    /// row-scaled MXFP8 arrangement Inkling's last layers and the DeepSeek Engram table and
+    /// drafter head use.
+    MxFp8Row {
+        /// Elements a scale covers along the contraction.
+        block: usize,
+    },
     /// E2M1 codes with one power-of-two `ue8m0` scale a block.
     MxFp4 {
         /// Elements a scale covers.
@@ -769,6 +776,7 @@ impl WeightFormat {
             Self::Fp8Tile { .. } => "FP8",
             Self::NvFp4 { .. } => "NVFP4",
             Self::MxFp8 { .. } => "MXFP8",
+            Self::MxFp8Row { .. } => "MXFP8-ROW",
             Self::MxFp4 { .. } => "MXFP4",
         }
     }
@@ -797,12 +805,26 @@ impl WeightFormat {
                 },
             };
         }
+        // The row-scaled arrangement is a distinct stored format whether the producer spells it
+        // `mxfp8-row`, `mx-fp8-row` or `fp8` with a row scale.
+        if name.contains("row") && (name.contains("fp8") || name.contains("e4m3")) {
+            return Self::MxFp8Row {
+                block: block.unwrap_or(32),
+            };
+        }
         if name.contains("mxfp4") {
             return Self::MxFp4 {
                 block: block.unwrap_or(32),
             };
         }
         if name.contains("mxfp8") {
+            // The row-scaled arrangement is a distinct stored format: one power-of-two scale a
+            // row, every block columns, is not the 2-D block grid.
+            if name.contains("row") {
+                return Self::MxFp8Row {
+                    block: block.unwrap_or(32),
+                };
+            }
             return Self::MxFp8 {
                 block: block.unwrap_or(32),
             };
@@ -1521,7 +1543,7 @@ impl Architecture {
                         crate::format::NvFp4Wide::Qwen
                     },
                 },
-                ("mxfp8", _) => WeightFormat::MxFp8 {
+                ("mxfp8", _) => WeightFormat::MxFp8Row {
                     block: block.unwrap_or(32),
                 },
                 (_, "uint8") if read_key(group, "weight_scale_format").is_some() => {
@@ -1539,7 +1561,7 @@ impl Architecture {
                         value.as_str().is_some_and(|name| name.contains("mxfp8"))
                     }) =>
                 {
-                    WeightFormat::MxFp8 {
+                    WeightFormat::MxFp8Row {
                         block: block.unwrap_or(32),
                     }
                 }

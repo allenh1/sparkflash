@@ -75,7 +75,7 @@ fn the_released_document_parses_its_hybrid_schedule_and_geometry() {
     );
     assert_eq!(
         inkling.layer_expert_formats[40],
-        WeightFormat::MxFp8 { block: 32 }
+        WeightFormat::MxFp8Row { block: 32 }
     );
 }
 

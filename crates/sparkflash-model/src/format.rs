@@ -592,6 +592,12 @@ impl StoredFormat {
             WeightFormat::MxFp8 { block } => {
                 Self::new(FormatValues::Fp8E4M3, block, GRID, FormatLayout::RowMajor)
             }
+            WeightFormat::MxFp8Row { block } => Self::new(
+                FormatValues::Fp8E4M3,
+                block,
+                ROW_AND_GRID,
+                FormatLayout::RowMajor,
+            ),
             WeightFormat::MxFp4 { block } => Self::new(
                 FormatValues::Fp4E2M1,
                 block,
@@ -721,6 +727,14 @@ mod tests {
         assert_eq!(
             StoredFormat::of(WeightFormat::MxFp8 { block: 32 }),
             StoredFormat::MXFP8_32
+        );
+        assert_eq!(
+            StoredFormat::of(WeightFormat::MxFp8Row { block: 32 }),
+            StoredFormat::MXFP8_ROW_32
+        );
+        assert!(
+            !StoredFormat::MXFP8_32.same_arithmetic(StoredFormat::MXFP8_ROW_32),
+            "a 2-D block grid and one scale a row are different arithmetic"
         );
         assert_eq!(
             StoredFormat::of(WeightFormat::MxFp4 { block: 32 }),

@@ -108,6 +108,7 @@ impl ModelConfig {
         };
         if format.values() == sparkflash_model::format::FormatValues::Fp8E4M3
             && format.has_scale(sparkflash_model::format::ScaleKind::PowerOfTwoGrid)
+            && !format.has_scale(sparkflash_model::format::ScaleKind::Row)
         {
             format.with_layout(FormatLayout::Tile32)
         } else {
@@ -1048,7 +1049,11 @@ mod released {
                         && expert.has_scale(sparkflash_model::format::ScaleKind::TensorWide))
             }
             sparkflash_model::format::FormatValues::Fp8E4M3 => {
-                expert.has_scale(sparkflash_model::format::ScaleKind::Tile) && expert.block() == 128
+                (expert.has_scale(sparkflash_model::format::ScaleKind::Tile)
+                    && expert.block() == 128)
+                    || (expert.has_scale(sparkflash_model::format::ScaleKind::Row)
+                        && expert.block() == 32
+                        && !expert.has_scale(sparkflash_model::format::ScaleKind::Tile))
             }
             sparkflash_model::format::FormatValues::Bf16 => expert.is_unscaled(),
             _ => false,
@@ -1057,9 +1062,9 @@ mod released {
             return Err(ConfigError::Invalid {
                 field: "quantization_config.expert_dtype",
                 detail: format!(
-                    "the expert format is E2M1 with a power-of-two scale a 32-value block or E4M3 \
-                     with a 128 x 128 tile scale, the document says expert_dtype {:?} with {:?} \
-                     scales",
+                    "the expert format is E2M1 with a power-of-two scale a 32-value block, E4M3 \
+                     with a 128 x 128 tile scale, or E4M3 with one power-of-two scale a row, every \
+                     32 columns; the document says expert_dtype {:?} with {:?} scales",
                     quant.expert_dtype, quant.scale_fmt
                 ),
             });

@@ -580,6 +580,82 @@ stores them (Dory or Inkling), bits first and then tokens/s against the arm that
 today. The released path is unchanged and still passes; the device arm at world 4 was never
 attempted by the earlier window.
 
+**Result (2026-11-23, F4 row-scaled MXFP8).** The format is E4M3 codes with one `ue8m0` scale a
+row, every 32 columns along the contraction, row-major: `StoredFormat::MXFP8_ROW_32`, carried by
+the new `WeightFormat::MxFp8Row` and declared by a checkpoint as `expert_dtype: "mx-fp8-row"`.
+The layout reader states it from the layout's own evidence, the sibling scale tensor's shape: one
+entry a row rather than a 32 x 32 grid (`sparkflash-ops/src/engine_plan.rs`, `is_row_scale`), so
+Inkling's layers 40-47 now report this format instead of a grid. The one copy body is
+`opt_mma_fp8_rowscale_f32o` (`kernels/opt_mma_sm121.cu:279`): row-major E4M3 weights, the per-row
+`ue8m0` plane and the block-quantised activation seam, at any token count, so it serves prompt rows
+and token rows. The base already launches it for the drafter head
+(`tp4_forward/draft.rs:290`). The Engram table's embed lookup reads the same row arrangement in
+`kernels/engram_embed_sm121.cu:75`; the `engram.wkv` projection beside it is the 32 x 32 grid
+(`sparkflash-model-deepseek-v41/src/tensor.rs`, `push_engram`), not this format. No new kernel is
+added, so there is no new measurement: the body's cost is the one the drafter head already pays.
+
+The plan states the format per block: the DeepSeek writer's `TensorPlan::scaled` writes the
+[out, in/32] scale plane for the routed experts, the MTP experts and every other expert tensor;
+`ScalePlanes::of` sizes the bind's row plane (rows x cols/32 bytes), `arrange` passes a row-major
+store through, and `moe_device::read_experts` now takes the block's format, sizes both planes from
+it, arranges the stored bytes and refuses a tensor-wide factor the routed bind does not carry. A
+unit test pins that the instance list builds `opt_mma_fp8_rowscale_f32o` for this format and that
+`choose` resolves it for a routed-expert block. `kernels/instances.toml` already carries
+`opt_mma_fp8_rowscale_f32o` at the synthetic shape's per-world intermediate 512, 256 and 128
+(R3's `_s2w1`, `_s2w2` and `_s2` rows, with the router and gate/up rows the source asserts beside
+them); this step adds the `deepseek-moe` catalogue symbol that claims the body for `Part::Moe`.
+
+Proof on the host arm, `/tmp/f4-mxfp8`, this tip: the fixture written with `expert_dtype:
+"mx-fp8-row"`, `weight_block_size: [32, 32]`, `scale_fmt: ue8m0` and compared with the host
+reference. The reference's greedy ids are
+
+```
+[[14394, 19734, 21122, 7155, 13460, 11376, 10110, 6859],
+ [23919, 23153, 804, 31899, 25048, 27934, 8126, 23473],
+ [25626, 8511, 2658, 12093, 30760, 21890, 17708, 12438]]
+```
+
+World 1 is the anchor and agrees exactly (`second-shape: VERDICT PASS`, `external check PASS`).
+At two ranks all three prompts part from the third generated token on; at four ranks prompt 1
+parts from its third token while prompts 0 and 2 agree. The released path at the same tip passes
+at one, two and four ranks with the ids recorded for the device window, so the harness and the
+split are sound. The difference is the row-scaled E4M3 expert sum: measured on layer 0 of this
+checkpoint, the four rank partials of `routed_forward` differ from the reference's single global
+sum by at most 1.75e-10 absolute (4.7e-7 relative; 3,803 of 4,096 f32 values differ in bits). The
+released E2M1 arm regroups without changing its bits; E4M3 codes do not, and this fixture's logits
+are close enough that the rounding flips a greedy token. The worlds 2 and 4 runs are therefore
+**blocked on the reference policy**, not claimed as passes: device(W) must equal host(W) exactly,
+and host(W) against host(1) may differ only at a greedy tie inside the measured band. The
+property is committed as a test beside the routed forward
+(`the_row_scaled_expert_split_rounds_where_the_released_arm_regroups_exactly`): the released
+format regroups with zero differing bits at two and four ranks, the row format does not, and the
+relative band is bounded. **The family is not done.**
+
+The device launch is wired: when the block's stored format is `MXFP8_ROW_32`, `moe_device::ffn`
+takes the plan's arranged expert tensors and calls `ffn_mxfp8_row`, which gathers each expert's
+routed slots, launches `opt_mma_fp8_rowscale_f32o` for gate and up over each rank's intermediate
+slice, applies the reference's SwiGLU and routing weight on the host, quantises those rows, and
+launches the down projection over a gathered `[dim, width]` slice, adding the rank partials in
+rank order. The cubin rows use the harness's per-world names (`opt_mma_sm121_s2`, `_s2w2`,
+`_s2w1`) so `stage_cubins` picks them up. **No device kernel has read this format**: the verdict
+is pending the lead's window with:
+
+```
+python3 scripts/second-shape.py run \
+  --released /home/allenh1/sparkflash/.agents/worktrees/f4-mxfp8/reference \
+  --out /tmp/f4-mxfp8 --device --released-cubins <cubins> \
+  --binary target/release/sparkflash \
+  --writer target/release/examples/write-synthetic-checkpoint \
+  --reference target/release/examples/host-reference \
+  --stored-format mx-fp8-row --world 2,4 --port 8133
+```
+
+with the cubin build in the window (the per-world `opt_mma_sm121` cubins are part of it). Open
+items: the device verdict; the device body's tensor-core accumulation against
+the host's per-element sum at the same split (the exact-id bar above); and the joint mid-stack
+variant (NVFP4 below a layer boundary, this format above), which is not started and needs this
+launch proved first.
+
 ### S. The seam
 
 * **S1. Blocks become steps, decided at open (rows path).** For each block the engine builds a

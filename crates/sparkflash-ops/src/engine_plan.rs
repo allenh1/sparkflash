@@ -651,6 +651,15 @@ fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
     let Ok(tensors) = layout.tensors(architecture) else {
         return (BTreeMap::new(), BTreeMap::new());
     };
+    // A row-scaled weight's sibling scale is one entry a row, every 32 columns; a block grid's
+    // is one a 32 x 32 block. The layout's own shape is the evidence for which arrangement the
+    // release stores, since both are E4M3 bytes with a u8 scale stream.
+    let mut scale_shapes: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for tensor in &tensors {
+        if let Some(scale_name) = layout_scale_name(&tensor.name) {
+            scale_shapes.insert(scale_name, tensor.shape.clone());
+        }
+    }
     for tensor in tensors {
         let block = match tensor.stack {
             StackKind::Draft | StackKind::Vision | StackKind::Audio => None,
@@ -665,10 +674,19 @@ fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
                 LayoutDtype::Expert | LayoutDtype::U8 | LayoutDtype::F4E2M1 => {
                     Some(architecture.quantization.expert_format)
                 }
-                LayoutDtype::F8E4M3 => Some(match architecture.quantization.expert_format {
-                    format @ WeightFormat::Fp8Tile { .. } => format,
-                    _ => WeightFormat::MxFp8 { block: 32 },
-                }),
+                LayoutDtype::F8E4M3 => {
+                    let row_scaled = layout_scale_name(&tensor.name)
+                        .and_then(|scale| scale_shapes.get(&scale))
+                        .is_some_and(|scale| is_row_scale(&tensor.shape, scale));
+                    Some(if row_scaled {
+                        WeightFormat::MxFp8Row { block: 32 }
+                    } else {
+                        match architecture.quantization.expert_format {
+                            format @ WeightFormat::Fp8Tile { .. } => format,
+                            _ => WeightFormat::MxFp8 { block: 32 },
+                        }
+                    })
+                }
                 _ => layout_format(tensor.dtype, architecture),
             }
         } else {
@@ -1257,6 +1275,29 @@ fn part_symbols(architecture: &Architecture) -> Vec<PartSymbols> {
         })
         .collect()
 }
+/// The scale tensor a weight tensor's name implies, for the two layout spellings.
+fn layout_scale_name(name: &str) -> Option<String> {
+    if let Some(stem) = name.strip_suffix(".weight") {
+        Some(format!("{stem}.scale"))
+    } else {
+        name.strip_suffix("_weight")
+            .map(|stem| format!("{stem}_weight_scale"))
+    }
+}
+
+/// Whether `scale` is one entry a row of `weight`, every 32 columns, rather than a square grid.
+fn is_row_scale(weight: &[usize], scale: &[usize]) -> bool {
+    let (Some(&rows), Some(&cols), Some(&scale_rows), Some(&scale_cols)) = (
+        weight.get(weight.len().saturating_sub(2)),
+        weight.last(),
+        scale.get(scale.len().saturating_sub(2)),
+        scale.last(),
+    ) else {
+        return false;
+    };
+    rows == scale_rows && cols == scale_cols.saturating_mul(32)
+}
+
 fn layout_format(dtype: LayoutDtype, architecture: &Architecture) -> Option<WeightFormat> {
     let quantization = &architecture.quantization;
     match dtype {
@@ -1274,7 +1315,9 @@ fn layout_format(dtype: LayoutDtype, architecture: &Architecture) -> Option<Weig
             ] {
                 if matches!(
                     format,
-                    WeightFormat::Fp8Tile { .. } | WeightFormat::MxFp8 { .. }
+                    WeightFormat::Fp8Tile { .. }
+                        | WeightFormat::MxFp8 { .. }
+                        | WeightFormat::MxFp8Row { .. }
                 ) {
                     return Some(format);
                 }

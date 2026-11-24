@@ -268,6 +268,8 @@ struct Kernels {
     head: Kernel,
     head_reduce: Kernel,
     rmsnorm: Kernel,
+    /// The row-scaled MXFP8 expert body, when `opt_mma_sm121.cubin` is staged.
+    mxfp8_row: Option<Kernel>,
     _router_module: Module,
     _router_topk_module: Module,
     _gate_up_module: Module,
@@ -278,6 +280,7 @@ struct Kernels {
     _head_module: Module,
     _head_reduce_module: Module,
     _rmsnorm_module: Module,
+    _mxfp8_row_module: Option<Module>,
 }
 
 /// The c4b routed-MoE device backend.
@@ -327,6 +330,25 @@ impl MoeDeviceBackendImpl {
         let (head_reduce_module, head_reduce) = head_reduce::load(&cuda, &head_reduce_bytes)?;
         let (rmsnorm_module, rmsnorm) = rmsnorm_launch::load(&cuda, &rmsnorm_bytes)?;
         let nvfp4 = crate::nvfp4_prefill::Nvfp4Kernels::load(dir, &cuda)?;
+        // The row-scaled MXFP8 body is the drafter head's own tensor-core GEMM, staged in the
+        // shared opt_mma cubin. It is loaded only when that cubin is present; a checkpoint that
+        // stores this format and a window without the cubin meets the refusal in `ffn`.
+        let (mxfp8_row_module, mxfp8_row) = {
+            let path = sparkflash_device::cubins::cubin_path(dir, "opt_mma_sm121");
+            if path.is_file() {
+                let bytes =
+                    std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                if std::env::var_os("SPARKFLASH_UNPINNED_SECOND_SHAPE").is_none()
+                    && let Some(pin) = sparkflash_kernels::baseline::pin("opt_mma_sm121")?
+                {
+                    sparkflash_device::cubins::verify_bytes(&bytes, &pin)?;
+                }
+                let (module, kernel) = cuda.load_named(&bytes, "opt_mma_fp8_rowscale_f32o")?;
+                (Some(module), Some(kernel))
+            } else {
+                (None, None)
+            }
+        };
         Ok(Self {
             cuda,
             nvfp4,
@@ -341,6 +363,7 @@ impl MoeDeviceBackendImpl {
                 head,
                 head_reduce,
                 rmsnorm,
+                mxfp8_row,
                 _router_module: router_module,
                 _router_topk_module: router_topk_module,
                 _gate_up_module: gate_up_module,
@@ -351,6 +374,7 @@ impl MoeDeviceBackendImpl {
                 _head_module: head_module,
                 _head_reduce_module: head_reduce_module,
                 _rmsnorm_module: rmsnorm_module,
+                _mxfp8_row_module: mxfp8_row_module,
             },
             stats: MoeDeviceStats {
                 layer0_host_max_abs: f32::NAN,
@@ -609,6 +633,217 @@ impl MoeDeviceBackendImpl {
         self.cuda.free_buffers(&ptrs.iter().collect::<Vec<_>>());
         self.stats.device_us += started.elapsed().as_micros() as u64;
         let _ = tokens;
+        Ok(())
+    }
+
+    /// One layer's routed experts stored row-scaled MXFP8, on the tensor-core GEMM the drafter
+    /// head already launches.
+    ///
+    /// The body reads E4M3 codes with one `ue8m0` scale a row every 32 columns and the seam's
+    /// block-quantised activation rows. Each rank's intermediate slice is one launch for gate and
+    /// one for up; the SwiGLU, routing weight and the down projection's activation quantisation
+    /// are the reference's f32/host arithmetic; the down projection is one launch a rank over a
+    /// gathered `[dim, width]` slice because the stored `w2` is row-major with the full
+    /// intermediate width. The rank partials are added into `out` in rank order.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_mxfp8_row(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        act_codes: &[u8],
+        act_scales: &[u8],
+        experts: &[Expert],
+        weights: &[f32],
+        local_ids: &[u32],
+        tokens: usize,
+        topk: usize,
+        dim: usize,
+        inter: usize,
+        out: &mut [f32],
+    ) -> Result<(), EngineError> {
+        let Some(kernel) = self.kernels.mxfp8_row else {
+            return Err(err(
+                "device routed MoE",
+                "the checkpoint stores row-scaled MXFP8 experts, but opt_mma_sm121.cubin with opt_mma_fp8_rowscale_f32o is not staged".to_owned(),
+            ));
+        };
+        let ranks = crate::plan::world().max(1);
+        if inter == 0 || !inter.is_multiple_of(ranks) || dim == 0 {
+            return Err(err(
+                "device routed MXFP8 experts",
+                format!("intermediate {inter} does not divide into {ranks} ranks"),
+            ));
+        }
+        let width = inter / ranks;
+        let scale_block = 32usize;
+        let limit = config.swiglu_limit as f32;
+        let started = std::time::Instant::now();
+        let mut allocated = 0usize;
+        let mut ptrs = Vec::new();
+        for (local, expert) in experts.iter().enumerate() {
+            let slots: Vec<usize> = local_ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| **id as usize == local)
+                .map(|(slot, _)| slot)
+                .collect();
+            if slots.is_empty() {
+                continue;
+            }
+            let count = slots.len();
+            let mut a_codes = Vec::with_capacity(count * dim);
+            let mut a_scales = Vec::with_capacity(count * (dim / scale_block));
+            for &slot in &slots {
+                let token = slot / topk;
+                a_codes.extend_from_slice(&act_codes[token * dim..(token + 1) * dim]);
+                a_scales.extend_from_slice(
+                    &act_scales[token * (dim / scale_block)..(token + 1) * (dim / scale_block)],
+                );
+            }
+            let a_codes_d = self
+                .cuda
+                .alloc(a_codes.len(), &mut allocated)
+                .map_err(drv)?;
+            let a_scales_d = self
+                .cuda
+                .alloc(a_scales.len(), &mut allocated)
+                .map_err(drv)?;
+            ptrs.push(a_codes_d);
+            ptrs.push(a_scales_d);
+            self.cuda.copy_htod(&a_codes_d, &a_codes).map_err(drv)?;
+            self.cuda.copy_htod(&a_scales_d, &a_scales).map_err(drv)?;
+            for rank in 0..ranks {
+                let row_start = rank * width;
+                let scale_start = rank * (width / scale_block);
+                let mut branches: Vec<Vec<f32>> = Vec::with_capacity(2);
+                for (values, scales) in [(&expert.w1, &expert.s1), (&expert.w3, &expert.s3)] {
+                    let w_start = row_start * dim;
+                    let w_end = w_start + width * dim;
+                    let s_start = scale_start * (dim / scale_block);
+                    let s_end = s_start + width * (dim / scale_block);
+                    let w_slice = &values[w_start..w_end];
+                    let s_slice = &scales[s_start..s_end];
+                    let w_d = self
+                        .cuda
+                        .alloc(w_slice.len(), &mut allocated)
+                        .map_err(drv)?;
+                    let s_d = self
+                        .cuda
+                        .alloc(s_slice.len(), &mut allocated)
+                        .map_err(drv)?;
+                    let out_d = self
+                        .cuda
+                        .alloc(count * width * 4, &mut allocated)
+                        .map_err(drv)?;
+                    ptrs.extend([w_d, s_d, out_d]);
+                    self.cuda.copy_htod(&w_d, w_slice).map_err(drv)?;
+                    self.cuda.copy_htod(&s_d, s_slice).map_err(drv)?;
+                    self.cuda
+                        .launch(
+                            kernel,
+                            (
+                                (count as u32).div_ceil(128),
+                                (width as u32).div_ceil(128),
+                                1,
+                            ),
+                            (256, 1, 1),
+                            &[
+                                a_codes_d.0,
+                                a_scales_d.0,
+                                w_d.0,
+                                s_d.0,
+                                out_d.0,
+                                width as u64,
+                                dim as u64,
+                                count as u64,
+                                dim as u64,
+                                width as u64,
+                            ],
+                        )
+                        .map_err(drv)?;
+                    let mut bytes = vec![0u8; count * width * 4];
+                    self.cuda.copy_dtoh(&mut bytes, &out_d).map_err(drv)?;
+                    branches.push(
+                        bytes
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|chunk| f32::from_le_bytes(*chunk))
+                            .collect(),
+                    );
+                }
+                let (gate, up) = branches.split_at(1);
+                let gate = &gate[0];
+                let up = &up[0];
+                let mut codes = Vec::with_capacity(count * width);
+                let mut scales = Vec::with_capacity(count * (width / scale_block));
+                for row in 0..count {
+                    let (row_codes, row_scales) = swiglu_ref::quantise_row_weighted(
+                        &gate[row * width..(row + 1) * width],
+                        &up[row * width..(row + 1) * width],
+                        limit,
+                        weights[slots[row]],
+                    );
+                    codes.extend(row_codes);
+                    scales.extend(row_scales);
+                }
+                // The stored down projection is [dim, inter]; this rank owns the contiguous
+                // column block [rank * width, (rank + 1) * width), gathered row by row.
+                let mut w2 = Vec::with_capacity(dim * width);
+                let mut s2 = Vec::with_capacity(dim * (width / scale_block));
+                for row in 0..dim {
+                    let at = row * inter + rank * width;
+                    w2.extend_from_slice(&expert.w2[at..at + width]);
+                    let sat = row * (inter / scale_block) + rank * (width / scale_block);
+                    s2.extend_from_slice(&expert.s2[sat..sat + width / scale_block]);
+                }
+                let c_d = self.cuda.alloc(codes.len(), &mut allocated).map_err(drv)?;
+                let cs_d = self.cuda.alloc(scales.len(), &mut allocated).map_err(drv)?;
+                let w_d = self.cuda.alloc(w2.len(), &mut allocated).map_err(drv)?;
+                let s_d = self.cuda.alloc(s2.len(), &mut allocated).map_err(drv)?;
+                let out_d = self
+                    .cuda
+                    .alloc(count * dim * 4, &mut allocated)
+                    .map_err(drv)?;
+                ptrs.extend([c_d, cs_d, w_d, s_d, out_d]);
+                self.cuda.copy_htod(&c_d, &codes).map_err(drv)?;
+                self.cuda.copy_htod(&cs_d, &scales).map_err(drv)?;
+                self.cuda.copy_htod(&w_d, &w2).map_err(drv)?;
+                self.cuda.copy_htod(&s_d, &s2).map_err(drv)?;
+                self.cuda
+                    .launch(
+                        kernel,
+                        ((count as u32).div_ceil(128), (dim as u32).div_ceil(128), 1),
+                        (256, 1, 1),
+                        &[
+                            c_d.0,
+                            cs_d.0,
+                            w_d.0,
+                            s_d.0,
+                            out_d.0,
+                            dim as u64,
+                            width as u64,
+                            count as u64,
+                            width as u64,
+                            dim as u64,
+                        ],
+                    )
+                    .map_err(drv)?;
+                let mut bytes = vec![0u8; count * dim * 4];
+                self.cuda.copy_dtoh(&mut bytes, &out_d).map_err(drv)?;
+                for (row, &slot) in slots.iter().enumerate() {
+                    let token = slot / topk;
+                    for column in 0..dim {
+                        let at = (row * dim + column) * 4;
+                        out[token * dim + column] +=
+                            f32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
+                    }
+                }
+            }
+        }
+        self.cuda.free_buffers(&ptrs.iter().collect::<Vec<_>>());
+        self.stats.device_us += started.elapsed().as_micros() as u64;
+        let _ = (layer, tokens);
         Ok(())
     }
 
@@ -946,7 +1181,52 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             return Ok(true);
         }
 
-        let experts = read_experts(source, layer, &table, dim, inter)?;
+        // The plan states the routed experts' format for this block; the bind reads the planes
+        // that format names. A plan that states none falls back to the configuration's class.
+        let routed_format = crate::plan::description()
+            .operand(Some(layer), sparkflash_model::Part::Moe)
+            .map_or(StoredFormat::MXFP4_ROW_32, |operand| operand.stored);
+        let experts = read_experts(source, layer, &table, dim, inter, routed_format)?;
+        if routed_format.same_arithmetic(StoredFormat::MXFP8_ROW_32) {
+            let mut weight_bytes = vec![0u8; rows * 4];
+            self.cuda
+                .copy_dtoh(&mut weight_bytes, &weights_d)
+                .map_err(drv)?;
+            let routing: Vec<f32> = weight_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
+                .collect();
+            self.ffn_mxfp8_row(
+                config,
+                layer,
+                &act_codes,
+                &act_scales,
+                &experts,
+                &routing,
+                &local_ids,
+                tokens,
+                top_k,
+                dim,
+                inter,
+                out,
+            )?;
+            self.stats.routed_launches += 0;
+            self.stats.launches += 0;
+            return Ok(true);
+        }
+        // The staged operand below is packed E2M1; another arithmetic is refused by name rather
+        // than sliced at an FP4 row width.
+        if routed_format.values() != sparkflash_model::format::FormatValues::Fp4E2M1 {
+            return Err(err(
+                "device routed MoE launch",
+                format!(
+                    "{} is bound and arranged, but this routed launch has no body for it",
+                    routed_format.describe()
+                ),
+            ));
+        }
         let expert_bytes: usize = experts.iter().map(Expert::bytes).sum();
         staged_bytes += expert_bytes as u64;
         host_bytes += expert_bytes as u64;
@@ -2200,28 +2480,44 @@ fn read_experts(
     table: &[(usize, usize)],
     dim: usize,
     inter: usize,
+    format: StoredFormat,
 ) -> Result<Vec<Expert>, EngineError> {
+    // The bind carries the planes the format names: a row plane, a block grid, or a tensor-wide
+    // factor. This reader carries the first two; a format that also needs a tensor-wide factor is
+    // refused by name rather than decoded without it.
+    let planes = |rows: usize, cols: usize| crate::operand::ScalePlanes::of(format, rows, cols);
+    if planes(inter, dim).tensor_wide != sparkflash_model::format::NvFp4Wide::None {
+        return Err(err(
+            "device routed MoE bind",
+            format!(
+                "{} needs a tensor-wide scale the routed bind does not carry",
+                format.describe()
+            ),
+        ));
+    }
     let mut experts = Vec::with_capacity(table.len());
+    let read_pair = |base: &str, rows: usize, cols: usize| {
+        let plane = planes(rows, cols);
+        let values = read_len(
+            source,
+            &format!("{base}.weight"),
+            rows.saturating_mul(cols)
+                .div_ceil(format.values().values_per_byte()),
+        )?;
+        // The loader's one arrangement: as stored for a row-major format, the 32 x 32 B12x
+        // permutation for a tiled one. The body reads what this returns, never the file order.
+        let arranged =
+            crate::operand::arrange(format, &values, rows, cols, plane.escapes.unwrap_or(&[]))
+                .map_err(|detail| err("device routed MoE bind", detail))?;
+        let scale_bytes = plane.row_bytes + plane.grid_bytes + plane.group_bytes;
+        let scales = read_len(source, &format!("{base}.scale"), scale_bytes as usize)?;
+        Ok::<_, EngineError>((arranged.bytes, scales))
+    };
     for (_, expert) in table {
         let base = crate::plan::layer_prefix(layer, &format!("ffn.experts.{expert}"));
-        let w1 = read_len(source, &format!("{base}.w1.weight"), inter * (dim / 2))?;
-        let s1 = read_len(
-            source,
-            &format!("{base}.w1.scale"),
-            inter * (dim / QUANT_BLOCK),
-        )?;
-        let w3 = read_len(source, &format!("{base}.w3.weight"), inter * (dim / 2))?;
-        let s3 = read_len(
-            source,
-            &format!("{base}.w3.scale"),
-            inter * (dim / QUANT_BLOCK),
-        )?;
-        let w2 = read_len(source, &format!("{base}.w2.weight"), dim * (inter / 2))?;
-        let s2 = read_len(
-            source,
-            &format!("{base}.w2.scale"),
-            dim * (inter / QUANT_BLOCK),
-        )?;
+        let (w1, s1) = read_pair(&format!("{base}.w1"), inter, dim)?;
+        let (w3, s3) = read_pair(&format!("{base}.w3"), inter, dim)?;
+        let (w2, s2) = read_pair(&format!("{base}.w2"), dim, inter)?;
         experts.push(Expert {
             w1,
             s1,

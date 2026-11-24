@@ -465,6 +465,85 @@ mod tests {
     }
 
     #[test]
+    fn a_row_scaled_store_keeps_one_scale_a_row_and_arranges_as_stored() {
+        // One ue8m0 code a row, every 32 columns: rows x (cols / 32) row bytes, no grid.
+        let planes = ScalePlanes::of(StoredFormat::MXFP8_ROW_32, 512, 5120);
+        assert_eq!(planes.row_bytes, 512 * 160);
+        assert_eq!(planes.grid_bytes, 0);
+        assert_eq!(
+            planes.tensor_wide,
+            sparkflash_model::format::NvFp4Wide::None
+        );
+        assert_eq!(planes.total_bytes(), 512 * 160);
+        // The same tensor stored as a 32 x 32 grid is a different plane with a different size.
+        let grid = ScalePlanes::of(StoredFormat::MXFP8_32, 512, 5120);
+        assert_eq!(grid.grid_bytes, 16 * 160);
+        assert_eq!(grid.row_bytes, 0);
+        // E4M3 codes are a byte a value, so the arrangement is the stored bytes.
+        let bytes: Vec<u8> = (0..(4 * 64) as u32)
+            .map(|value| (value % 255) as u8 + 1)
+            .collect();
+        let arranged = arrange(StoredFormat::MXFP8_ROW_32, &bytes, 4, 64, &[])
+            .expect("a row-major arrangement");
+        assert_eq!(arranged.bytes, bytes);
+        assert_eq!(arranged.layout, FormatLayout::RowMajor);
+    }
+
+    #[test]
+    fn one_body_is_chosen_for_the_engram_table_and_an_expert_block() {
+        // The Engram table and a routed expert both store E4M3 codes with one scale a row every
+        // 32 columns, so the same claimed body decodes both; the part does not pick the decode.
+        let claimed = ["other_body", "row_scaled_body"];
+        let formats = |symbol: &str| match symbol {
+            "other_body" => Some(StoredFormat::MXFP8_32),
+            "row_scaled_body" => Some(StoredFormat::MXFP8_ROW_32),
+            _ => None,
+        };
+        for part in [Part::Engram, Part::Moe, Part::LmHead] {
+            assert_eq!(
+                choose(part, StoredFormat::MXFP8_ROW_32, &claimed, &formats),
+                Some("row_scaled_body"),
+                "{part:?} reads the same row-scaled arrangement"
+            );
+        }
+        assert_eq!(
+            ActivationForm::of(StoredFormat::MXFP8_ROW_32),
+            Some(ActivationForm::Fp8Blocks),
+            "the row-scaled body reads the block-quantised activation seam"
+        );
+        assert_eq!(
+            StoredFormat::from_name("mx-fp8-row"),
+            Some(StoredFormat::MXFP8_ROW_32)
+        );
+        assert_eq!(
+            StoredFormat::from_name("MX-FP8-ROW"),
+            Some(StoredFormat::MXFP8_ROW_32),
+            "a build file's spelling is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn the_instance_list_builds_the_row_scaled_expert_body_the_plan_chooses() {
+        // The build's own record, not a literal: the entry's format comes from kernels/instances.toml.
+        let symbol = "opt_mma_fp8_rowscale_f32o";
+        assert_eq!(
+            sparkflash_ops::parts::built_format(symbol),
+            Some(StoredFormat::MXFP8_ROW_32),
+            "{symbol} is built for the row-scaled arrangement"
+        );
+        assert_eq!(
+            choose(
+                Part::Moe,
+                StoredFormat::MXFP8_ROW_32,
+                &[symbol],
+                &sparkflash_ops::parts::built_format,
+            ),
+            Some(symbol),
+            "a routed expert block of this format resolves to the body that reads it"
+        );
+    }
+
+    #[test]
     fn a_short_store_is_refused_by_the_format() {
         assert!(arrange(StoredFormat::BF16, &[0u8; 4], 4, 4, &[]).is_err());
         assert!(arrange(StoredFormat::MXFP8_TILED_32, &[0u8; 4], 4, 4, &[]).is_err());
