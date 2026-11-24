@@ -123,7 +123,7 @@ fn download_f32(cuda: &Cuda, ptr: Deviceptr, count: usize) -> Result<Vec<f32>, S
         .collect())
 }
 
-fn compare(name: &str, serving: &[f32], candidate: &[f32]) {
+fn compare(name: &str, serving: &[f32], candidate: &[f32]) -> Result<(), String> {
     assert_eq!(serving.len(), candidate.len(), "{name}: lengths");
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
@@ -132,7 +132,7 @@ fn compare(name: &str, serving: &[f32], candidate: &[f32]) {
     for (&a, &b) in serving.iter().zip(candidate) {
         if !a.is_finite() || !b.is_finite() {
             if a.to_bits() != b.to_bits() {
-                println!("{name}: NON-FINITE MISMATCH {a} vs {b}");
+                return Err(format!("{name}: non-finite mismatch {a} vs {b}"));
             }
             continue;
         }
@@ -153,6 +153,10 @@ fn compare(name: &str, serving: &[f32], candidate: &[f32]) {
         "{name}: values={} bit_equal={equal} max_abs={max_abs:.6e} max_rel={max_rel:.6e} max_ulp={max_ulp}",
         serving.len()
     );
+    if max_rel > 0.02 {
+        return Err(format!("{name}: max_rel {max_rel:.6e} exceeds 2%"));
+    }
+    Ok(())
 }
 
 fn median_ms(mut samples: Vec<f64>) -> f64 {
@@ -362,7 +366,7 @@ fn run() -> Result<(), String> {
         "gate_up(activated)",
         &serving_activated,
         &candidate_activated,
-    );
+    )?;
 
     let act_d = upload_f32(&cuda, &serving_activated, &mut total)?;
     let down_out = cuda.alloc(SLOTS * HIDDEN * 4, &mut total)?;
@@ -378,7 +382,7 @@ fn run() -> Result<(), String> {
     )?;
     cuda.synchronize()?;
     let candidate_down = download_f32(&cuda, down_out, SLOTS * HIDDEN)?;
-    compare("down", &serving_down, &candidate_down);
+    compare("down", &serving_down, &candidate_down)?;
 
     let mut serving_samples = Vec::new();
     let mut tile_samples = Vec::new();

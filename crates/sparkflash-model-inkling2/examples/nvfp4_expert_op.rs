@@ -112,7 +112,7 @@ fn download_f32(cuda: &Cuda, ptr: Deviceptr, count: usize) -> Result<Vec<f32>, S
         .collect())
 }
 
-fn compare(name: &str, serving: &[f32], candidate: &[f32]) {
+fn compare(name: &str, serving: &[f32], candidate: &[f32]) -> Result<(), String> {
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
     let mut max_ulp = 0u32;
@@ -123,7 +123,7 @@ fn compare(name: &str, serving: &[f32], candidate: &[f32]) {
         }
         if !a.is_finite() || !b.is_finite() {
             if a.to_bits() != b.to_bits() {
-                println!("{name}: NON-FINITE MISMATCH {a} vs {b}");
+                return Err(format!("{name}: non-finite mismatch {a} vs {b}"));
             }
             continue;
         }
@@ -141,6 +141,10 @@ fn compare(name: &str, serving: &[f32], candidate: &[f32]) {
         "{name}: values={} bit_equal={equal} max_abs={max_abs:.6e} max_rel={max_rel:.6e} max_ulp={max_ulp}",
         serving.len()
     );
+    if max_rel > 0.02 {
+        return Err(format!("{name}: max_rel {max_rel:.6e} exceeds 2%"));
+    }
+    Ok(())
 }
 
 fn median_ms(mut samples: Vec<f64>) -> f64 {
@@ -201,7 +205,7 @@ fn run_projection(
     cuda.synchronize()?;
     let serving_values = download_f32(cuda, serving_out, rows)?;
     let candidate_values = download_f32(cuda, tile_out, rows)?;
-    compare(name, &serving_values, &candidate_values);
+    compare(name, &serving_values, &candidate_values)?;
 
     let mut serving_samples = Vec::new();
     let mut tile_samples = Vec::new();
