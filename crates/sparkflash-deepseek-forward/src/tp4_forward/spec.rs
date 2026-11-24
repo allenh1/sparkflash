@@ -1657,13 +1657,69 @@ impl DeviceLayer<'_> {
         n: usize,
     ) -> Result<(), String> {
         sparkflash_kernels::cuda_driver::stage_timing_forward("prefill", n);
+        let dump = rows_dump_dir()?;
+        if let Some(dir) = dump.as_deref() {
+            self.rows_dump_stream(rows, dir, "embed", p0, n)?;
+        }
         for (layer, weights) in staged.iter().enumerate() {
             self.set_seam_weights(*weights);
             self.run_layer_rows(rows, layer, p0, n)?;
+            if let Some(dir) = dump.as_deref() {
+                self.rows_dump_stream(rows, dir, &format!("L{layer:02}"), p0, n)?;
+            }
         }
         self.wait_collectives()?;
         Ok(())
     }
+
+    /// The rows' stream (`[n][hc][dim]` f32) as `<dir>/<name>-stream.f32`, after the device has
+    /// finished every launch queued so far. A diagnostic: it stalls the step at each call.
+    fn rows_dump_stream(
+        &self,
+        rows: &RowsState,
+        dir: &std::path::Path,
+        name: &str,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        self.wait_collectives()?;
+        self.cuda.synchronize()?;
+        let mut bytes = vec![0u8; n * self.hc_mult * self.dim * 4];
+        self.cuda
+            .copy_dtoh(&mut bytes, &Deviceptr(rows.b.stream))
+            .map_err(|error| format!("rows dump {name}: {error}"))?;
+        let path = dir.join(format!("{name}-stream.f32"));
+        std::fs::write(&path, &bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+        println!(
+            "sparkflash serve: rows dump {} rows={n} p0={p0} hc={} dim={}",
+            path.display(),
+            self.hc_mult,
+            self.dim
+        );
+        Ok(())
+    }
+}
+
+/// Counts the prefill passes [rows_dump_dir] has handed out: only the first is dumped.
+static ROWS_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `SPARKFLASH_ROWS_DUMP=<dir>`: the directory for the first prefill pass's per-layer stream
+/// (run with `SPARKFLASH_WARMUP=0` so it is a client prompt's, not the warm-up's), created here.
+/// None once that pass has been dumped, or when unset.
+fn rows_dump_dir() -> Result<Option<std::path::PathBuf>, String> {
+    let Some(dir) = sparkflash_model::active_profile()
+        .diagnostics
+        .rows_dump
+        .clone()
+    else {
+        return Ok(None);
+    };
+    if ROWS_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).map_err(|error| format!("rows dump {}: {error}", dir.display()))?;
+    Ok(Some(dir))
 }
 
 /// The modelled wall of a c=1 step on GB10 that verifies `depth` drafts (ms): the draft, the

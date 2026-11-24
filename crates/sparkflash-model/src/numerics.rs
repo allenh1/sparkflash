@@ -96,6 +96,7 @@ pub const ARITHMETIC_FIELDS: &[&str] = &[
     "diagnostics.route_dump",
     "diagnostics.reduce_dump",
     "diagnostics.device_diff_dump",
+    "diagnostics.rows_dump",
     "diagnostics.generate",
     "diagnostics.print_argmax",
     "diagnostics.l2_prefetch",

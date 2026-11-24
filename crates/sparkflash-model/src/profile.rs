@@ -510,6 +510,8 @@ pub struct DiagnosticsProfile {
     pub reduce_dump: Option<String>,
     /// File for the device-diff dump.
     pub device_diff_dump: Option<String>,
+    /// Directory for the rows path's per-layer stream dump of the first prefill.
+    pub rows_dump: Option<String>,
     /// Generate measurement-only tokens.
     pub generate: Option<bool>,
     /// Print the per-position argmax.
@@ -751,6 +753,7 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
         "SPARKFLASH_DEVICE_DIFF_DUMP",
         "diagnostics.device_diff_dump",
     ),
+    ("SPARKFLASH_ROWS_DUMP", "diagnostics.rows_dump"),
     ("SPARKFLASH_GENERATE", "diagnostics.generate"),
     ("SPARKFLASH_PRINT_ARGMAX", "diagnostics.print_argmax"),
     ("SPARKFLASH_L2_PREFETCH", "diagnostics.l2_prefetch"),
@@ -1081,6 +1084,7 @@ const TEXT_FIELDS: &[(&str, TextField)] = &[
     ("diagnostics.device_diff_dump", |p| {
         &mut p.diagnostics.device_diff_dump
     }),
+    ("diagnostics.rows_dump", |p| &mut p.diagnostics.rows_dump),
     ("diagnostics.tolerance_arm", |p| {
         &mut p.diagnostics.tolerance_arm
     }),
