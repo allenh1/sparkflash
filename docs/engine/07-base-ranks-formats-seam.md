@@ -605,8 +605,10 @@ grouping or by a body whose per-rank partial is exact. (3) The device proof is t
 lead's window:
 
 ```
-python3 scripts/second-shape.py run --released <released> --out /tmp/f4-mxfp8 --device \
-  --released-cubins <cubins> --binary target/release/sparkflash \
+python3 scripts/second-shape.py run \
+  --released /home/allenh1/sparkflash/.agents/worktrees/f4-mxfp8/reference \
+  --out /tmp/f4-mxfp8 --device --released-cubins <cubins> \
+  --binary target/release/sparkflash \
   --writer target/release/examples/write-synthetic-checkpoint \
   --reference target/release/examples/host-reference \
   --stored-format mx-fp8-row --world 2,4 --port 8133
