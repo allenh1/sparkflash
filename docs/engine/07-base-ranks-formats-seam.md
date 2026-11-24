@@ -125,6 +125,32 @@ Line numbers are the tree's at the start of this milestone.
   checkpoint; the milestone closes when every check passes.
 * **The released shape**: one comparison window on the four-node group for each of the three
   lines of work, batched at its end.
+* **The arm that proves a variant is the device arm.** It is the served path: the bind, the
+  loader's arrangement, the instance list and the launches. The engine's host arm
+  (`SPARKFLASH_LAYER_DEVICE=0`) launches no kernel; a variant that agrees there shows the plan,
+  the names and the split are right, and is half the proof. A step is done when the device arm
+  agrees with the host reference. On one GPU that is the device arm at one rank, which needs
+  R3; two and four ranks run on the four-node group with `scripts/second-shape.py run --device`.
+
+### 3.1 Where the proof stands (review of `1ef7a6ca`, 2026-11-23)
+
+Every result recorded below under R1, R2, F1, F2 and F3, and the second shape of milestone 2,
+was measured on the host arm. No device kernel has run a second shape, a world other than
+four, or a format other than the released ones. What that leaves open:
+
+* **R3 is not started** (`cert_lm_head` and `lm_head_reduce` still assert four ranks; the
+  instance list has no other rank count). It is the gate for every device proof on one GPU, so
+  it goes first.
+* **The second shape on the device arm.** Its cubins build; nothing has launched them.
+* **F2's seam has no reader.** `operand::arrange` and `ScalePlanes::of` are called only by
+  their own tests, and nothing reads an operand's `body` or `activation`. The loader, the bind
+  and the launch must take them, or they are a second description of what the old code still
+  decides.
+* **F3 chose the body and did not launch it.** A tile-format part still resolves to no symbol
+  of the base's image. The shared tile header needs rows on the instance list at the
+  synthetic shape and a launch from the base's seam, prompt rows and token rows.
+* **F4** follows the same bar: a family is done when the device arm reads the synthetic
+  checkpoint stored its way, not when the host arm does.
 
 ## 4. The work
 
