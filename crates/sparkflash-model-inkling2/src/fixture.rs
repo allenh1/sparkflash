@@ -397,7 +397,7 @@ pub fn write_experts(source: &mut TinySource, config: &Inkling2Config, layer: us
                 &[6.0],
             );
         }
-        WeightFormat::MxFp8 { block } => {
+        WeightFormat::MxFp8Row { block } => {
             let w13_rows = 2 * intermediate;
             let w13_columns = hidden;
             let w2_columns = intermediate;

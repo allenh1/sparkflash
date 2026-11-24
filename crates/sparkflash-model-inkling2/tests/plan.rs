@@ -61,7 +61,7 @@ fn the_released_architecture_names_its_schedule() {
     assert!(
         config.quant.layer_expert_formats[40..]
             .iter()
-            .all(|format| matches!(format, WeightFormat::MxFp8 { block: 32 }))
+            .all(|format| matches!(format, WeightFormat::MxFp8Row { block: 32 }))
     );
     assert_eq!(config.vision.as_ref().map(|vision| vision.depth), Some(23));
     assert_eq!(

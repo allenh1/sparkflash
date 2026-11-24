@@ -269,7 +269,7 @@ impl Inkling2Weights {
                 crate::reference::nvfp4_matvec(&codes, &scales, scale_2, input, rows, columns)
                     .map_err(|error| format!("{prefix}: {error}"))
             }
-            WeightFormat::MxFp8 { block } => {
+            WeightFormat::MxFp8Row { block } => {
                 let code_stride = rows * columns;
                 let scale_stride = rows * columns.div_ceil(block);
                 let codes = self.range(

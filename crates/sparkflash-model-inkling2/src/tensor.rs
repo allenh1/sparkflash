@@ -177,7 +177,7 @@ impl InklingTensorPlan {
                 let block = (0..config.num_hidden_layers)
                     .map(|layer| match config.layer_format(layer) {
                         Some(WeightFormat::NvFp4 { group_size, .. }) => group_size,
-                        Some(WeightFormat::MxFp8 { block }) => block,
+                        Some(WeightFormat::MxFp8Row { block }) => block,
                         _ => 1,
                     })
                     .max()
@@ -462,7 +462,7 @@ impl InklingTensorPlan {
                         Role::Experts,
                     );
                 }
-                WeightFormat::MxFp8 { block } => {
+                WeightFormat::MxFp8Row { block } => {
                     let w13_out = 2 * config.moe_intermediate_size;
                     let w13_cols = hidden.div_ceil(block);
                     let w2_cols = config.moe_intermediate_size.div_ceil(block);
@@ -520,7 +520,12 @@ impl InklingTensorPlan {
                         Role::Experts,
                     );
                 }
-                _ => return Err(format!("layer {layer} has no expert format")),
+                other => {
+                    return Err(format!(
+                        "layer {layer}: the Inkling arm reads BF16, NVFP4 and row-scaled MXFP8 experts, and this layer states {}",
+                        other.name()
+                    ));
+                }
             }
         }
 

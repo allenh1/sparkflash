@@ -113,7 +113,7 @@ fn a_sliding_layer_keeps_only_its_window_and_a_full_layer_keeps_all() {
 #[test]
 fn an_mxfp8_layer_uses_the_power_of_two_scale() {
     let mut config = Inkling2Config::tiny();
-    config.quant.layer_expert_formats[0] = WeightFormat::MxFp8 { block: 32 };
+    config.quant.layer_expert_formats[0] = WeightFormat::MxFp8Row { block: 32 };
     let source = Arc::new(tiny_source(&config));
     let weights = Inkling2Weights::load(config.clone(), source).expect("the weights load");
     let mut state = Inkling2State::new(&config);

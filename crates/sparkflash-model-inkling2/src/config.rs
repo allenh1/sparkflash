@@ -503,7 +503,7 @@ fn parse_quant(
     for (layer, format) in layer_expert_formats.iter().enumerate() {
         match format {
             WeightFormat::NvFp4 { .. } => nvfp4_layers.push(layer),
-            WeightFormat::MxFp8 { .. } => mxfp8_layers.push(layer),
+            WeightFormat::MxFp8Row { .. } => mxfp8_layers.push(layer),
             _ => {}
         }
     }
@@ -517,7 +517,7 @@ fn parse_quant(
     let mxfp8_block = layer_expert_formats
         .iter()
         .find_map(|format| match format {
-            WeightFormat::MxFp8 { block } => Some(*block),
+            WeightFormat::MxFp8Row { block } => Some(*block),
             _ => None,
         })
         .unwrap_or(32);
@@ -533,7 +533,7 @@ fn parse_quant(
                         group_size: nvfp4_group,
                         wide: sparkflash_model::format::NvFp4Wide::Inkling,
                     }),
-                    "mxfp8" => Some(WeightFormat::MxFp8 { block: mxfp8_block }),
+                    "mxfp8" => Some(WeightFormat::MxFp8Row { block: mxfp8_block }),
                     _ => None,
                 }
             })

@@ -1375,7 +1375,7 @@ impl InklingDevicePlan {
         // each, and a BF16 band is a slice of one dense `[experts][rows][columns]` matrix.
         let body = match config.layer_format(layer) {
             Some(WeightFormat::NvFp4 { .. }) => ExpertBody::NvFp4,
-            Some(WeightFormat::MxFp8 { .. }) => ExpertBody::MxFp8,
+            Some(WeightFormat::MxFp8Row { .. }) => ExpertBody::MxFp8,
             Some(WeightFormat::Bf16) | None => ExpertBody::Bf16,
             Some(other) => {
                 return Err(format!(
