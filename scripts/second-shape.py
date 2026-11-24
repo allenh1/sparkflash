@@ -380,6 +380,7 @@ def sync_to_nodes(nodes: list[str], paths: list[str]) -> None:
     # which the lead Spark does not trust, and it would be the same bytes the harness just wrote.
     local = {int(rank) for rank in os.environ.get("SPARK_LOCAL_RANKS", "").split() if rank}
     command = [sys.executable, "-I", str(ROOT / "scripts/sync-nodes.py")]
+    remote = 0
     for index, node in enumerate(nodes):
         if index in local:
             continue
@@ -387,7 +388,8 @@ def sync_to_nodes(nodes: list[str], paths: list[str]) -> None:
         # trusted for the node's SSH name, so no new host key is written.
         alias = names[index] if names else node.rpartition("@")[2]
         command += ["--host", f"{node},{alias}"]
-    if len(command) == 2:
+        remote += 1
+    if remote == 0:
         print("second-shape: every rank runs on this host; nothing to copy")
         return
     for path in paths:
