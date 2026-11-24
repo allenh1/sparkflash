@@ -701,6 +701,8 @@ pub struct Quantization {
     pub dense_format: WeightFormat,
     /// The backbone decoder experts' stored format.
     pub expert_format: WeightFormat,
+    /// One expert format per block range, when the declaration states a joint list.
+    pub expert_formats: Vec<crate::format::BlockPartFormat>,
     /// The MTP stage's expert format, which a release may store differently from the backbone's.
     pub mtp_expert_format: Option<WeightFormat>,
 }
@@ -3114,13 +3116,19 @@ fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
     // under expert_weight.quant_algo with a top-level quant_algo of MIXED_PRECISION. A ModelOpt
     // release writes neither the expert format nor a format in quant_method at all: the producer
     // goes in quant_method and the arithmetic in quant_algo / quantized_layers.
-    let expert = optional_string(config, "expert_dtype")
+    let expert_text = optional_string(config, "expert_dtype");
+    let expert = expert_text
+        .clone()
         .or_else(|| object(config, "expert_weight").and_then(|value| string(value, "quant_algo")))
         .or_else(|| {
             object(config, "mtp_expert_weight").and_then(|value| string(value, "quant_algo"))
         })
         .map(DeclaredFormat::named)
         .or_else(|| modelopt_expert(config));
+    let expert_formats = expert_text
+        .as_deref()
+        .and_then(crate::format::block_part_formats)
+        .unwrap_or_default();
     // A producer name is not the arithmetic; ModelOpt records that in quant_algo.
     let method = match optional_string(config, "quant_method") {
         Some(name) if !names_the_producer(&name) => Some(name),
@@ -3148,7 +3156,8 @@ fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
         block,
         scale,
         activation: optional_string(config, "activation_scheme"),
-        expert: expert.map(|declared| declared.name),
+        expert: expert_text.or_else(|| expert.map(|declared| declared.name)),
+        expert_formats,
         dense_format,
         expert_format,
         mtp_expert_format,

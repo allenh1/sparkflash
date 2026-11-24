@@ -51,6 +51,8 @@ use std::fmt::Write as _;
 
 use sparkflash_weights::topk::noaux_top_k;
 
+use sparkflash_model::format::StoredFormat;
+
 use crate::config::{ConfigError, ModelConfig};
 use crate::dtype::DType;
 use crate::forward::weight_view::WeightView;
@@ -220,6 +222,26 @@ pub struct MoeScratch {
     name: String,
 }
 
+/// The routed experts' format for the block a checkpoint prefix names.
+///
+/// A joint declaration states one format a block range; a layer the ranges do not cover is a
+/// refusal, never the class's format. An MTP stage (`mtp.N`) takes the class's format.
+fn routed_format(cfg: &ModelConfig, prefix: &str) -> Result<StoredFormat, EngineError> {
+    let layer = prefix
+        .strip_prefix("layers.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|index| index.parse::<usize>().ok());
+    match layer {
+        Some(layer) => cfg.expert_format_at(layer).ok_or_else(|| {
+            shape_error(
+                "routed expert format",
+                format!("the declaration names no expert format for layer {layer}"),
+            )
+        }),
+        None => Ok(cfg.expert_format()),
+    }
+}
+
 impl MoeScratch {
     /// Zeroed scratch sized from the configuration.
     ///
@@ -264,10 +286,11 @@ impl MoeScratch {
                 // geometry check below then compares the local bytes against the local shape,
                 // so a source that serves the global tensor is refused here rather than
                 // producing a wrong partial sum.
+                let format = routed_format(cfg, prefix)?;
                 (
                     local_inter.unwrap_or(cfg.moe_inter_dim),
-                    cfg.expert_grid().unwrap_or(ScaleGrid::PerRow32),
-                    cfg.expert_format().tensor_wide(),
+                    crate::config::grid_of(format).unwrap_or(ScaleGrid::PerRow32),
+                    format.tensor_wide(),
                 )
             }
             ExpertBody::Shared => {
@@ -428,7 +451,8 @@ fn compute_routed_batched(
     let count = choices.len();
     // This batched body's kernel reads the released per-row 32-value grid; NVFP4's per-16 group
     // and tensor-wide factor take the generic path, which materialises the weight exactly.
-    let grid = cfg.expert_grid().unwrap_or(ScaleGrid::PerRow32);
+    let format = routed_format(cfg, prefix)?;
+    let grid = crate::config::grid_of(format).unwrap_or(ScaleGrid::PerRow32);
     if grid != ScaleGrid::PerRow32 {
         return Ok(false);
     }

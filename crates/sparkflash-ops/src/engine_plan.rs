@@ -54,7 +54,7 @@ use crate::resolver::PlanContext;
 /// One part instance's position: the part kind and its layout block, or `None` for a global.
 type PartKey = (Part, Option<usize>);
 /// The formats and claimed element counts of one part's layout tensors.
-type FormatTotals = BTreeMap<PartKey, Vec<(WeightFormat, usize)>>;
+type FormatTotals = BTreeMap<PartKey, Vec<(StoredFormat, usize)>>;
 /// The stored format of each part instance.
 type PartFormats = BTreeMap<PartKey, StoredFormat>;
 /// The format a part reads where a block claims no tensor of its own.
@@ -644,7 +644,7 @@ pub trait EngineBuilder {
 /// narrower format.
 fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
     let mut totals = FormatTotals::new();
-    let mut shared_totals: BTreeMap<Part, Vec<(WeightFormat, usize)>> = BTreeMap::new();
+    let mut shared_totals: BTreeMap<Part, Vec<(StoredFormat, usize)>> = BTreeMap::new();
     let Ok(Some(layout)) = sparkflash_model::layout::matching(architecture) else {
         return (BTreeMap::new(), BTreeMap::new());
     };
@@ -669,28 +669,42 @@ fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
         // stores NVFP4 as U8 bytes with E4M3 block scales, and MXFP8 as E4M3 bytes with U8
         // `ue8m0` scales; the wider weight tensor names which one the layer uses, while the
         // smaller scale stream is the other dtype and loses the aggregate below.
+        // A joint declaration states the expert format per block range; that statement is the
+        // plan's authority for a routed expert, above the layout's dtype container.
+        let declared = block.and_then(|block| {
+            architecture
+                .quantization
+                .expert_formats
+                .iter()
+                .find(|range| range.covers(block))
+                .copied()
+        });
         let format = if tensor.part == Part::Moe {
-            match tensor.dtype {
-                LayoutDtype::Expert | LayoutDtype::U8 | LayoutDtype::F4E2M1 => {
-                    Some(architecture.quantization.expert_format)
+            if let Some(range) = declared {
+                Some(range.format)
+            } else {
+                match tensor.dtype {
+                    LayoutDtype::Expert | LayoutDtype::U8 | LayoutDtype::F4E2M1 => {
+                        Some(architecture.quantization.expert_format.stored_format())
+                    }
+                    LayoutDtype::F8E4M3 => {
+                        let row_scaled = layout_scale_name(&tensor.name)
+                            .and_then(|scale| scale_shapes.get(&scale))
+                            .is_some_and(|scale| is_row_scale(&tensor.shape, scale));
+                        Some(if row_scaled {
+                            StoredFormat::MXFP8_ROW_32
+                        } else {
+                            match architecture.quantization.expert_format {
+                                format @ WeightFormat::Fp8Tile { .. } => format.stored_format(),
+                                _ => StoredFormat::MXFP8_32,
+                            }
+                        })
+                    }
+                    _ => layout_format(tensor.dtype, architecture).map(WeightFormat::stored_format),
                 }
-                LayoutDtype::F8E4M3 => {
-                    let row_scaled = layout_scale_name(&tensor.name)
-                        .and_then(|scale| scale_shapes.get(&scale))
-                        .is_some_and(|scale| is_row_scale(&tensor.shape, scale));
-                    Some(if row_scaled {
-                        WeightFormat::MxFp8Row { block: 32 }
-                    } else {
-                        match architecture.quantization.expert_format {
-                            format @ WeightFormat::Fp8Tile { .. } => format,
-                            _ => WeightFormat::MxFp8 { block: 32 },
-                        }
-                    })
-                }
-                _ => layout_format(tensor.dtype, architecture),
             }
         } else {
-            layout_format(tensor.dtype, architecture)
+            layout_format(tensor.dtype, architecture).map(WeightFormat::stored_format)
         };
         let Some(format) = format else {
             continue;
@@ -724,8 +738,7 @@ fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
         .method
         .as_deref()
         .is_some_and(|method| method.eq_ignore_ascii_case("packed-bf16"));
-    let arranged = |format: WeightFormat| {
-        let stored = format.stored_format();
+    let arranged = |stored: StoredFormat| {
         if packed && stored.values() == sparkflash_model::format::FormatValues::Bf16 {
             stored.with_layout(sparkflash_model::format::FormatLayout::Packed)
         } else {
@@ -746,7 +759,7 @@ fn stored_formats(architecture: &Architecture) -> (PartFormats, SharedFormats) {
 }
 
 /// Add one tensor's format to a (format, claimed elements) tally.
-fn add_format(entries: &mut Vec<(WeightFormat, usize)>, format: WeightFormat, elements: usize) {
+fn add_format(entries: &mut Vec<(StoredFormat, usize)>, format: StoredFormat, elements: usize) {
     if let Some((_, weight)) = entries.iter_mut().find(|(held, _)| *held == format) {
         *weight = weight.saturating_add(elements);
     } else {
@@ -755,7 +768,7 @@ fn add_format(entries: &mut Vec<(WeightFormat, usize)>, format: WeightFormat, el
 }
 
 /// The format the most claimed bytes use.
-fn winning_format(entries: Vec<(WeightFormat, usize)>) -> Option<WeightFormat> {
+fn winning_format(entries: Vec<(StoredFormat, usize)>) -> Option<StoredFormat> {
     entries
         .into_iter()
         .max_by_key(|(_, weight)| *weight)

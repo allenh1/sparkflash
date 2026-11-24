@@ -693,6 +693,24 @@ impl BlockPartFormat {
     }
 }
 
+/// The block-part formats a checkpoint's declaration lists, in the order given.
+///
+/// The spelling is one or more [BlockPartFormat] names separated by commas:
+/// `nvfp4-qwen@0-3,mx-fp8-row@4-7`. A name without `@` is refused here, because a plain
+/// declaration is the caller's single format, not a range.
+#[must_use]
+pub fn block_part_formats(name: &str) -> Option<Vec<BlockPartFormat>> {
+    let mut formats = Vec::new();
+    for part in name.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        formats.push(BlockPartFormat::from_name(part)?);
+    }
+    (!formats.is_empty()).then_some(formats)
+}
+
 impl From<WeightFormat> for StoredFormat {
     fn from(format: WeightFormat) -> Self {
         Self::of(format)
@@ -876,6 +894,18 @@ mod tests {
             StoredFormat::from_name("nvfp4-inkling"),
             Some(StoredFormat::NVFP4_INKLING_16)
         );
+    }
+
+    #[test]
+    fn a_declaration_lists_the_block_part_ranges_it_states() {
+        let formats = block_part_formats("nvfp4-qwen@0-3, mx-fp8-row@4-7").expect("a list");
+        assert_eq!(formats.len(), 2);
+        assert_eq!(formats[0].format, StoredFormat::NVFP4_QWEN_16);
+        assert!(formats[0].covers(0) && formats[0].covers(3) && !formats[0].covers(4));
+        assert_eq!(formats[1].format, StoredFormat::MXFP8_ROW_32);
+        assert!(formats[1].covers(4) && formats[1].covers(7));
+        assert!(block_part_formats("mx-fp8-row").is_none());
+        assert!(block_part_formats("mx-fp8-row@4-7,").is_none());
     }
 
     #[test]

@@ -670,6 +670,31 @@ the host's per-element sum at the same split (the exact-id bar above); and the j
 variant (NVFP4 below a layer boundary, this format above), which is not started and needs this
 launch proved first.
 
+**Result (2026-11-24, F4 joint expert format).** A checkpoint states its routed experts one format
+a block range: `quantization_config.expert_dtype` is a comma-separated list of
+`format@first-last` (also `@first..=last`), parsed by
+`sparkflash_model::format::block_part_formats` beside `BlockPartFormat::from_name`. A layer no
+range covers is refused by name, never read as the class's format. `ModelConfig::expert_format_at`
+is the one per-layer answer; `TensorPlan` states each backbone layer's format and writes that
+layer's weights, scales and convention companions in it; the reference's `routed_format` and the
+device's per-block `Operand` read the same statement, while an MTP stage keeps the plain class.
+The fixture is `expert_dtype: "nvfp4-qwen@0-3,mx-fp8-row@4-7"`: eight backbone layers, NVFP4's
+Qwen convention below and row-scaled MXFP8 above, so exactly one variant's expert format changes
+part-way up the stack. The host arm agrees at one, two and four ranks (`second-shape: VERDICT PASS`,
+`external check PASS` at every world), and each world's own split reproduces the global reference's
+greedy ids exactly
+
+```
+[[6653, 28875, 12789, 22350, 23742, 29043, 20477, 3895],
+ [338, 9686, 24519, 14376, 7470, 29768, 25769, 9869],
+ [30169, 2663, 30363, 3368, 1942, 30952, 25487, 12199]]
+```
+
+so this stack's answer does not drift with the split. The device arm is the lead's window. The
+device launch already chooses per block: the plan's `Operand` carries the block's format and
+`moe_device` takes the NVFP4 or the row-scaled path from it. Open: the device verdict for this
+stack.
+
 ### S. The seam
 
 * **S1. Blocks become steps, decided at open (rows path).** For each block the engine builds a

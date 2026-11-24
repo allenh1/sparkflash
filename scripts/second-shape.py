@@ -103,6 +103,12 @@ STORED_FORMATS = {
     # The routed experts one power-of-two scale a row, every 32 values along the contraction:
     # Inkling's last eight layers, and the Engram table's and drafter head's own arithmetic.
     "mx-fp8-row": {"quant_method": "fp8", "scale_fmt": "ue8m0", "expert_dtype": "mx-fp8-row", "block": 32},
+    # One stack whose expert format changes part-way up: NVFP4's Qwen convention on the first
+    # four backbone layers and row-scaled MXFP8 on the last four. The dense class stays the
+    # fixture's released grid; only the routed experts move.
+    "joint-nvfp4-mxfp8-row": {
+        "expert_dtype": "nvfp4-qwen@0-3,mx-fp8-row@4-7",
+    },
 }
 
 
