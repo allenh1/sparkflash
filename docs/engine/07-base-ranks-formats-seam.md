@@ -352,6 +352,48 @@ time, per-world invocations, because the harness stops a run at its first failin
 600 s per world. The screen is a diagnostic over the head, not the head: what this run measures,
 the certified head and its reduction, is unchanged. Giving the screen a 4,096 build, and letting
 the harness carry on to the next world after a refusal, are separate items.
+**Result (2026-11-24, the fifth window, the routed builds and the DSpark depth).** Tip
+`1646b7c4` (binary `9b7a060b`), the same checkpoint and group, 85 second-shape cubins (40
+`_s2`, 20 `_s2w1`, 20 `_s2w2`, 5 `nvfp4_prefill_sm121_*`), the cluster down 35m24s and
+production restored to the same sha256 and serving.
+
+* **World 1 opens the routed device path.** Window 4's `moe_routed device` refusal is gone: the
+  plan names `moe_routed_device_sm121_s2`, `_s2w1` and `_s2w2`, the 11 new cubin rows are
+  exactly the routed set, and the run proceeds. It then refuses 165 s after the device-rank line
+  at the DSpark draft depth
+
+      tp4-chain: forward refused on rank 0: SPARKFLASH_DSPARK_K=5: needs 1..=2
+
+  The fixture declares no `speculation.dspark_k`, so the loop fell back to the literal 5 that
+  the released plan states, while `draft::draft_block()` reads this plan's `dspark_block_size`
+  of 2. Fixed at `ef8643b`: an unset depth is the plan's block, not a released literal. The
+  released plan states 5, so the released arm reads the same depth as before.
+* **Worlds 2 and 4 did not refuse, did not bind and did not token.** `:8131` never answered
+  `/readyz`, no rank wrote an error, and the host was active on one thread; the workers were
+  still in the device loop when the window stopped them. The rank log has no line between the
+  run header and the serving loop, so this window cannot say which setup phase held them. It
+  does retire window 4's hypothesis: the routed body is no longer the suspect, because the
+  second-shape routed builds exist and are selected at every world. Window 4's reading of
+  "2.5 to 3 minutes a layer" was the host reference arm's collective walk, not the device path,
+  and is corrected here.
+* **The trace that will answer it** (`ef8643b`, default off): `SPARKFLASH_SETUP_TRACE=1` writes
+  cumulative milliseconds for each setup phase (begin, embeddings, attention body, shared
+  expert, layer seams, tail, layer device, attachments, setup done) and one start/done pair per
+  shared-expert all-gather and per embedding gather, naming the layer and tensor. Stderr only,
+  no arithmetic and no launch change, forwarded to every rank by `serve-four-node.sh`.
+
+The arm line is the same text on every rank that reached it,
+`arm=device reduce=nccl evidence=false`; the host arm passed at all three worlds and the three
+per-world references are identical and equal the global one. Deviations, recorded: the head
+screen ran off (`SPARKFLASH_HEAD_SCREEN=0`; the screen's 160-block table has no 4,096 build),
+each world ran as its own invocation with caps of 900/780/660 s rather than 15 minutes because
+the restore deadline cannot absorb three 15-minute windows and the harness's own 600 s ready
+wait ended world 2 first, and the 120 s grace was 107 s because the step-1 recording took 35 s
+and the control plane's drain was the path. The driver reports 0% GPU utilisation for every
+process including the production server, so the window claims no GPU number. What the next
+window owes: world 1 with the DSpark depth from the plan, then worlds 4 and 2 with the trace on,
+and the device ids against each world's own reference.
+
 ## 4. The work
 
 ### R. Ranks
@@ -387,8 +429,11 @@ routed expert's padding is an instance, and every family carries the world-suffi
 launcher stages: for the second shape 39 `_s2`, 14 `_s2w1` and 14 `_s2w2` cubins, built from the
 same plan the run reads. The check that the relaxation moved nothing released is the one this
 section's ladder already asks for: the world-four lanes reproduce production's cubins byte for
-byte, 31 of 31. What R3 still owes is the device run at one rank; the window above could not
-give it, because `wo_a`'s stored bytes and world rows are open.
+byte, 31 of 31. The routed device path then needed its own second-shape builds (`3db0ce5`):
+18 rows in 12 compile groups for the routed expert stage, the combine, the router, the opt
+router and both MXFP4 expert bodies, taking the list to 758 instances in 125 groups, of which
+the harness selects 85 for the second shape. What R3 still owes is the device run at one rank;
+the window above could not give it, because `wo_a`'s stored bytes and world rows are open.
 
 ### F. Formats
 
