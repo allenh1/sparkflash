@@ -46,7 +46,8 @@
 use std::collections::BTreeMap;
 
 use crate::config::ModelConfig;
-use crate::dtype::{DType, dense_scale_shape, expert_scale_shape};
+use crate::dtype::DType;
+use sparkflash_model::format::{FormatValues, ScaleKind, ScaleValues, StoredFormat};
 
 pub use sparkflash_weights::TensorSpec;
 
@@ -74,12 +75,24 @@ pub fn checkpoint_storage_dtype(name: &str) -> Option<DType> {
 pub struct TensorPlan {
     specs: Vec<TensorSpec>,
     by_name: BTreeMap<String, usize>,
+    /// The dense projections' stored format; the released 32 x 32 tiled MXFP8 when unset.
+    dense_format: Option<StoredFormat>,
+    /// The routed experts' stored format; the released row-scaled MXFP4 when unset.
+    expert_format: Option<StoredFormat>,
 }
 
 impl TensorPlan {
     /// Plan every tensor the language-model forward reads, in a stable order.
+    ///
+    /// The two quantised classes take the formats the configuration declares: a release stored as
+    /// 128 x 128 FP8 tiles writes f32 or bf16 inverse scales on that grid, and one stored the
+    /// released way writes a power-of-two grid a 32-value block.
     pub fn language_model(config: &ModelConfig) -> Self {
-        let mut plan = TensorPlan::default();
+        let mut plan = TensorPlan {
+            dense_format: Some(config.dense_format()),
+            expert_format: Some(config.expert_format()),
+            ..TensorPlan::default()
+        };
         plan.push_globals(config);
         for layer in 0..config.n_layers {
             plan.push_block(&format!("layers.{layer}"), config, false, layer);
@@ -103,22 +116,52 @@ impl TensorPlan {
         self.specs.push(TensorSpec { name, dtype, shape });
     }
 
+    /// The dense projections' format, or the released one when the plan states none.
+    fn dense_stored(&self) -> StoredFormat {
+        self.dense_format.unwrap_or(StoredFormat::MXFP8_TILED_32)
+    }
+
+    /// The routed experts' format, or the released one when the plan states none.
+    fn expert_stored(&self) -> StoredFormat {
+        self.expert_format.unwrap_or(StoredFormat::MXFP4_ROW_32)
+    }
+
     fn dense(&mut self, name: &str, out: usize, r#in: usize) {
-        self.insert(format!("{name}.weight"), DType::F8E4M3, vec![out, r#in]);
-        self.insert(
-            format!("{name}.scale"),
-            DType::F8E8M0,
-            dense_scale_shape(out, r#in).to_vec(),
-        );
+        let format = self.dense_stored();
+        self.scaled(name, format, out, r#in);
     }
 
     fn expert(&mut self, name: &str, out: usize, r#in: usize) {
-        self.insert(format!("{name}.weight"), DType::F4E2M1, vec![out, r#in]);
-        self.insert(
-            format!("{name}.scale"),
-            DType::F8E8M0,
-            expert_scale_shape(out, r#in).to_vec(),
-        );
+        let format = self.expert_stored();
+        self.scaled(name, format, out, r#in);
+    }
+
+    /// One quantised weight and its scale grid, in the format the plan resolved for its class.
+    ///
+    /// The values dtype, the scale dtype and the grid's shape all come from the format: a 128-tile
+    /// release's scale is one f32 or bf16 a tile, and the released expert's is one byte a row per
+    /// 32 values along the contraction.
+    fn scaled(&mut self, name: &str, format: StoredFormat, out: usize, r#in: usize) {
+        let values = match format.values() {
+            FormatValues::Fp8E4M3 => DType::F8E4M3,
+            FormatValues::Fp4E2M1 => DType::F4E2M1,
+            FormatValues::Bf16 => DType::BF16,
+            FormatValues::F32 => DType::F32,
+        };
+        let scale = match format.scale_values() {
+            ScaleValues::Ue8m0 => DType::F8E8M0,
+            ScaleValues::E4M3 => DType::U8,
+            ScaleValues::Bf16 => DType::BF16,
+            ScaleValues::F32 => DType::F32,
+        };
+        let block = format.block().max(1);
+        let shape = if format.has_scale(ScaleKind::Row) {
+            vec![out, r#in.div_ceil(block)]
+        } else {
+            vec![out.div_ceil(block), r#in.div_ceil(block)]
+        };
+        self.insert(format!("{name}.weight"), values, vec![out, r#in]);
+        self.insert(format!("{name}.scale"), scale, shape);
     }
 
     fn plain(&mut self, name: &str, dtype: DType, shape: Vec<usize>) {
@@ -324,8 +367,12 @@ impl TensorPlan {
         // 3, while the test configuration in this crate has 2 and gives 1, so a hardcoded 3 would be
         // wrong for it.
         let fetched = (config.engram_max_ngram_size - 1) * config.engram_n_heads * width;
-        self.dense(
+        // The Engram table's own format is a model fact, not the dense class's: E4M3 codes with
+        // one ue8m0 scale a 32-value block (model.py:345). A release that stores its linears as
+        // FP8 tiles still stores this table the released way.
+        self.scaled(
             &format!("{prefix}.engram.wkv"),
+            StoredFormat::MXFP8_32,
             config.dim * (config.hc_mult + 1),
             fetched,
         );

@@ -99,12 +99,13 @@ fn read_dense(
     src: &dyn WeightSource,
     rows: usize,
     cols: usize,
+    grid: ScaleGrid,
     limit: usize,
 ) -> Result<Vec<f32>, EngineError> {
     let scale_name = name.replace("weight", "scale");
     let mut weight = linalg::decode_by_name(src, name, limit)?;
     let scales = linalg::decode_by_name(src, &scale_name, limit)?;
-    linalg::apply_scales(&mut weight, rows, cols, &scales, ScaleGrid::Block32)?;
+    linalg::apply_scales(&mut weight, rows, cols, &scales, grid)?;
     Ok(weight)
 }
 
@@ -450,7 +451,14 @@ pub fn dspark_seed(
         ));
     }
     let rows = main_hidden.len() / width;
-    let proj = read_dense("mtp.0.main_proj.weight", src, dim, width, limit)?;
+    let proj = read_dense(
+        "mtp.0.main_proj.weight",
+        src,
+        dim,
+        width,
+        config.dense_grid().unwrap_or(ScaleGrid::Block32),
+        limit,
+    )?;
     let main_norm = linalg::decode_by_name(src, "mtp.0.main_norm.weight", limit)?;
     let mut main_x = vec![0.0f32; rows * dim];
     linalg::matmul(&mut main_x, main_hidden, &proj, dim, width, rows)?;
@@ -541,6 +549,7 @@ pub(crate) fn dspark_forward_observed(
         src,
         dim,
         targets * dim,
+        config.dense_grid().unwrap_or(ScaleGrid::Block32),
         limit,
     )?;
     let main_norm = linalg::decode_by_name(src, &format!("{first}.main_norm.weight"), limit)?;

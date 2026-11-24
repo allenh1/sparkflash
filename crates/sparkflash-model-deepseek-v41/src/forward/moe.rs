@@ -266,7 +266,7 @@ impl MoeScratch {
                 // producing a wrong partial sum.
                 (
                     local_inter.unwrap_or(cfg.moe_inter_dim),
-                    ScaleGrid::PerRow32,
+                    cfg.expert_grid().unwrap_or(ScaleGrid::PerRow32),
                 )
             }
             ExpertBody::Shared => {
@@ -275,7 +275,7 @@ impl MoeScratch {
                     .expect("a String cannot fail to be written to");
                 (
                     cfg.moe_inter_dim * cfg.n_shared_experts.max(1),
-                    ScaleGrid::Block32,
+                    cfg.dense_grid().unwrap_or(ScaleGrid::Block32),
                 )
             }
         };
@@ -424,37 +424,16 @@ fn compute_routed_batched(
     let mut weights = Vec::with_capacity(count);
     for &(_, expert, _) in choices {
         let base = format!("{prefix}.ffn.experts.{expert}");
-        let w1 = WeightView::read_dense(
-            src,
-            &format!("{base}.w1"),
-            inter,
-            dim,
-            ScaleGrid::PerRow32,
-            limit,
-        )?;
-        let w3 = WeightView::read_dense(
-            src,
-            &format!("{base}.w3"),
-            inter,
-            dim,
-            ScaleGrid::PerRow32,
-            limit,
-        )?;
-        let w2 = WeightView::read_dense(
-            src,
-            &format!("{base}.w2"),
-            dim,
-            inter,
-            ScaleGrid::PerRow32,
-            limit,
-        )?;
+        // The batched body reads the packed F4 expert store on the checkpoint's own grid; any
+        // other stored expert format takes the generic path, which materialises the weight.
+        let grid = cfg.expert_grid().unwrap_or(ScaleGrid::PerRow32);
+        let w1 = WeightView::read_dense(src, &format!("{base}.w1"), inter, dim, grid, limit)?;
+        let w3 = WeightView::read_dense(src, &format!("{base}.w3"), inter, dim, grid, limit)?;
+        let w2 = WeightView::read_dense(src, &format!("{base}.w2"), dim, inter, grid, limit)?;
         if w1.f4_parts().is_none() || w3.f4_parts().is_none() || w2.f4_parts().is_none() {
             return Ok(false);
         }
-        if w1.grid() != Some(ScaleGrid::PerRow32)
-            || w3.grid() != Some(ScaleGrid::PerRow32)
-            || w2.grid() != Some(ScaleGrid::PerRow32)
-        {
+        if w1.grid() != Some(grid) || w3.grid() != Some(grid) || w2.grid() != Some(grid) {
             return Ok(false);
         }
         weights.push(ExpertWeights { w1, w3, w2, inter });
@@ -1173,6 +1152,7 @@ pub fn shared_expert_rows(
 /// BF16 values; only the released F8-E4M3 32x32 store is accepted.
 fn native_linear(
     weight: &WeightView<'_>,
+    grid: ScaleGrid,
     x: &[f32],
     out: &mut [f32],
     rows: usize,
@@ -1180,13 +1160,13 @@ fn native_linear(
 ) -> Result<(), EngineError> {
     let released_store = matches!(
         weight,
-        WeightView::Coded { dtype, grid, .. }
-            if *dtype == DType::F8E4M3 && *grid == ScaleGrid::Block32
+        WeightView::Coded { dtype, grid: weight_grid, .. }
+            if *dtype == DType::F8E4M3 && *weight_grid == grid
     );
     if !released_store {
         return Err(shape_error(
             "the native shared expert",
-            "the released shared Expert stores F8-E4M3 weights with 32x32 E8M0 block scales (model.py:26-32, 210-236); this source does not".to_owned(),
+            "the shared Expert's body reads F8-E4M3 weights on the checkpoint's own scale grid; this source does not store them that way".to_owned(),
         ));
     }
     let quantised = crate::quant::quantize_activation_fp8(x)?;
@@ -1244,6 +1224,7 @@ pub fn add_shared_expert_native(
         }
         native_linear(
             &shared.w1,
+            cfg.dense_grid().unwrap_or(ScaleGrid::Block32),
             &stream,
             &mut scratch.gate_branch[..inter],
             inter,
@@ -1251,6 +1232,7 @@ pub fn add_shared_expert_native(
         )?;
         native_linear(
             &shared.w3,
+            cfg.dense_grid().unwrap_or(ScaleGrid::Block32),
             &stream,
             &mut scratch.up_branch[..inter],
             inter,
@@ -1266,6 +1248,7 @@ pub fn add_shared_expert_native(
         }
         native_linear(
             &shared.w2,
+            cfg.dense_grid().unwrap_or(ScaleGrid::Block32),
             &activation,
             &mut scratch.expert_out[..dim],
             dim,

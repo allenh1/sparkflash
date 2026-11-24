@@ -810,11 +810,12 @@ fn narrow_and_round_trip(
 /// As [weight], plus [EngineError::Shape] when the weight or grid does not match `rows` by `cols`.
 fn dense_view<'a>(
     src: Reads<'a>,
+    grid: ScaleGrid,
     name: &str,
     rows: usize,
     cols: usize,
 ) -> Result<WeightView<'a>, EngineError> {
-    WeightView::read_dense(src.source, name, rows, cols, ScaleGrid::Block32, src.limit)
+    WeightView::read_dense(src.source, name, rows, cols, grid, src.limit)
 }
 
 /// Reads a weight whose scale grid may be absent: `wo_a` is fp8 in the file and bf16 after
@@ -825,11 +826,12 @@ fn dense_view<'a>(
 /// As [weight], plus [EngineError::Shape] when a grid that is present does not match.
 fn scaled_or_plain_view<'a>(
     src: Reads<'a>,
+    grid: ScaleGrid,
     name: &str,
     rows: usize,
     cols: usize,
 ) -> Result<WeightView<'a>, EngineError> {
-    WeightView::read_optional_scale(src.source, name, rows, cols, ScaleGrid::Block32, src.limit)
+    WeightView::read_optional_scale(src.source, name, rows, cols, grid, src.limit)
 }
 
 /// Reads a plain BF16 (or f32) Linear weight, e.g. the compressor, indexer or head projections.
@@ -1470,6 +1472,7 @@ fn index_source_wq_b(request: &IndexRequest<'_>) -> Result<Vec<f32>, EngineError
     }
     let wq_b = dense_view(
         request.src,
+        request.config.dense_grid().unwrap_or(ScaleGrid::Block32),
         &format!("{}.attn.indexer.wq_b", request.prefix),
         cols,
         inner,
@@ -2386,7 +2389,13 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let dim = config.dim;
         let rank = config.q_lora_rank;
         let seqlen = rows_of(x, dim, "attention input")?;
-        let wq_a = dense_view(src, &format!("{prefix}.attn.wq_a"), rank, dim)?;
+        let wq_a = dense_view(
+            src,
+            config.dense_grid().unwrap_or(ScaleGrid::Block32),
+            &format!("{prefix}.attn.wq_a"),
+            rank,
+            dim,
+        )?;
         let mut latent = vec![0.0; seqlen * rank];
         wq_a.matmul(&mut latent, x, rank, dim, seqlen)?;
         Ok(latent)
@@ -2405,7 +2414,13 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let rank = config.q_lora_rank;
         let cols = config.n_heads * config.head_dim;
         let seqlen = rows_of(latent, rank, "q latent")?;
-        let wq_b = dense_view(src, &format!("{prefix}.attn.wq_b"), cols, rank)?;
+        let wq_b = dense_view(
+            src,
+            config.dense_grid().unwrap_or(ScaleGrid::Block32),
+            &format!("{prefix}.attn.wq_b"),
+            cols,
+            rank,
+        )?;
         let mut q = vec![0.0; seqlen * cols];
         wq_b.matmul(&mut q, latent, cols, rank, seqlen)?;
         Ok(q)
@@ -2424,7 +2439,13 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let dim = config.dim;
         let head_dim = config.head_dim;
         let seqlen = rows_of(x, dim, "attention input")?;
-        let wkv = dense_view(src, &format!("{prefix}.attn.wkv"), head_dim, dim)?;
+        let wkv = dense_view(
+            src,
+            config.dense_grid().unwrap_or(ScaleGrid::Block32),
+            &format!("{prefix}.attn.wkv"),
+            head_dim,
+            dim,
+        )?;
         let mut kv = vec![0.0; seqlen * head_dim];
         wkv.matmul(&mut kv, x, head_dim, dim, seqlen)?;
         Ok(kv)
@@ -2448,7 +2469,13 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let seqlen = rows_of(wide, wide_row, "attention wide")?;
         let grouped_width = groups * config.o_lora_rank;
         let wo_a_name = format!("{prefix}.attn.wo_a");
-        let wo_a = scaled_or_plain_view(src, &wo_a_name, grouped_width, group_in)?;
+        let wo_a = scaled_or_plain_view(
+            src,
+            config.dense_grid().unwrap_or(ScaleGrid::Block32),
+            &wo_a_name,
+            grouped_width,
+            group_in,
+        )?;
         // A grid whose row blocks do not start on a 32-row boundary (the tiny configuration's
         // o_lora_rank 8), or a packed grid whose block starts mid-byte, cannot slice its stored
         // representation by row block. Those geometries keep the old materialised path, which is
@@ -2465,7 +2492,7 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
                     grouped_width,
                     group_in,
                     &scales,
-                    ScaleGrid::Block32,
+                    config.dense_grid().unwrap_or(ScaleGrid::Block32),
                 )?;
             }
             Some(values)
@@ -2516,6 +2543,7 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let seqlen = rows_of(grouped, grouped_width, "grouped lo")?;
         let wo_b = dense_view(
             src,
+            config.dense_grid().unwrap_or(ScaleGrid::Block32),
             &format!("{prefix}.attn.wo_b"),
             config.dim,
             grouped_width,
@@ -2682,6 +2710,7 @@ fn query_path_with(
             let seqlen = rows_of(&latent, rank, "q latent")?;
             let wq_b = dense_view(
                 Reads { source, limit },
+                config.dense_grid().unwrap_or(ScaleGrid::Block32),
                 &format!("{prefix}.attn.wq_b"),
                 cols,
                 rank,
@@ -3223,7 +3252,13 @@ fn wo_a_local(
         ));
     }
     let wo_a_name = format!("{prefix}.attn.wo_a");
-    let wo_a = scaled_or_plain_view(src, &wo_a_name, grouped_width, group_in)?;
+    let wo_a = scaled_or_plain_view(
+        src,
+        config.dense_grid().unwrap_or(ScaleGrid::Block32),
+        &wo_a_name,
+        grouped_width,
+        group_in,
+    )?;
     // The same geometry exception as the replicated path: a grid whose row blocks are not whole
     // 32-row blocks must be materialised first. The released o_lora_rank 1024 is fine either way.
     let materialised = if wo_a.row_blocks_supported(config.o_lora_rank, group_in) {
@@ -3238,7 +3273,7 @@ fn wo_a_local(
                 grouped_width,
                 group_in,
                 &scales,
-                ScaleGrid::Block32,
+                config.dense_grid().unwrap_or(ScaleGrid::Block32),
             )?;
         }
         Some(values)
