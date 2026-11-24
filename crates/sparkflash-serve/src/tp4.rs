@@ -28,10 +28,11 @@ use std::time::Duration;
 
 use sparkflash_model::{MergedPosition, Sampling, Speculation};
 
-/// What rank 0 passes to the rank factory: the checkpoint and the group geometry, not a tokenizer.
+/// What rank 0 passes to the rank factory: the checkpoint and the group geometry.
 ///
-/// Token ids are the contract between serve and the rank; the tokenizer stays on rank 0 and never
-/// reaches a worker.
+/// Token ids are the contract between serve and the rank; text is tokenised on rank 0 only. Each
+/// rank reads its own process's tokenizer file for one thing: the Engram compressed token map the
+/// n-gram hash runs over.
 #[derive(Debug, Clone)]
 pub struct Tp4RankConfig {
     /// This process's rank.
@@ -53,6 +54,9 @@ pub struct Tp4RankConfig {
     pub context: usize,
     /// The startup and control deadline.
     pub timeout: Duration,
+    /// This process's `tokenizer.json`, for the Engram compressed token map (`None` when none was
+    /// passed or found; a checkpoint with Engram layers is then refused at open).
+    pub tokenizer: Option<PathBuf>,
 }
 
 impl Tp4RankConfig {

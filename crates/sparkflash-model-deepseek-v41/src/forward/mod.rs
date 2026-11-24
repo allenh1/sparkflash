@@ -431,6 +431,13 @@ impl InferenceEngine {
         Ok(())
     }
 
+    /// The Engram compressed token map [Self::set_engram_token_map] installed, for a driver that
+    /// hashes outside the engine ([engram::ngram_hashes_mapped]).
+    #[must_use]
+    pub fn engram_token_map(&self) -> Option<&[u32]> {
+        self.engram_token_map.as_deref()
+    }
+
     #[must_use]
     pub fn with_bit_gather(mut self, gather: Box<dyn crate::parallel_tp::BitGather>) -> Self {
         self.gather = Some(crate::parallel_tp::BitGatherHandle::new(gather));

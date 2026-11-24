@@ -566,6 +566,9 @@ pub struct Tp4RankConfig {
     pub resident_cache: bool,
     /// Per-collective read timeout.
     pub timeout: Duration,
+    /// The `tokenizer.json` whose compressed map the Engram n-grams hash over; a checkpoint with
+    /// Engram layers is refused without one.
+    pub tokenizer: Option<PathBuf>,
 }
 
 impl Default for Tp4RankConfig {
@@ -579,6 +582,7 @@ impl Default for Tp4RankConfig {
             element_limit: ELEMENT_LIMIT,
             resident_cache: true,
             timeout: Duration::from_secs(180),
+            tokenizer: None,
         }
     }
 }
@@ -937,7 +941,7 @@ impl Tp4Rank {
             resident_cache: config.resident_cache,
             profile: false,
             bench_steps: 0,
-            tokenizer: None,
+            tokenizer: config.tokenizer.clone(),
         };
         Self::open_input_with_transport(
             &input,
@@ -1054,6 +1058,22 @@ impl Tp4Rank {
         };
         let mut engine = InferenceEngine::new(config.clone(), engine_source, element_limit)
             .map_err(|error| Tp4Error::new(format!("engine: {error}")))?;
+        // The Engram n-grams hash over the tokenizer's compressed map, as the reference does. The
+        // fixture's ids are synthetic and already compressed, so only it hashes them as given.
+        if !config.engram_layer_ids.is_empty() && input.source_mode != "fixture" {
+            let path = input.tokenizer.as_ref().ok_or_else(|| {
+                Tp4Error::new(format!(
+                    "the checkpoint has Engram layers {:?}: pass --tokenizer FILE, whose \
+                     compressed map the n-grams hash over",
+                    config.engram_layer_ids
+                ))
+            })?;
+            let map = sparkflash_engram::compress::compressed_token_map_json(path)
+                .map_err(|error| Tp4Error::new(format!("{}: {error}", path.display())))?;
+            engine
+                .set_engram_token_map(map)
+                .map_err(|error| Tp4Error::new(format!("{}: {error}", path.display())))?;
+        }
         if attention_shard {
             engine = engine.with_bit_gather(Box::new(Tp4Seam {
                 rank: input.rank,
@@ -1504,8 +1524,14 @@ impl Tp4Rank {
         let mut history = state.tokens().to_vec();
         history.extend_from_slice(tokens);
         let mut hashes = Vec::new();
-        engram::ngram_hashes(config, &history, start_pos, &mut hashes)
-            .map_err(|error| Tp4Error::new(format!("engram hashes: {error}")))?;
+        engram::ngram_hashes_mapped(
+            config,
+            engine.engram_token_map(),
+            &history,
+            start_pos,
+            &mut hashes,
+        )
+        .map_err(|error| Tp4Error::new(format!("engram hashes: {error}")))?;
         let per_token = hashes.len() / seqlen.max(1);
         backend.position = start_pos;
         let providers = HostProviders::for_rank(config, shared);
@@ -1669,8 +1695,14 @@ impl Tp4Rank {
         let mut history = state.tokens().to_vec();
         history.push(token);
         let mut hashes = Vec::new();
-        engram::ngram_hashes(config, &history, position, &mut hashes)
-            .map_err(|error| Tp4Error::new(format!("engram hashes: {error}")))?;
+        engram::ngram_hashes_mapped(
+            config,
+            engine.engram_token_map(),
+            &history,
+            position,
+            &mut hashes,
+        )
+        .map_err(|error| Tp4Error::new(format!("engram hashes: {error}")))?;
         let embedding = read_embedding_row(source, config, token).map_err(Tp4Error::new)?;
         backend.position = position;
         let providers = HostProviders::for_rank(config, shared);

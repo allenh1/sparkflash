@@ -4030,6 +4030,11 @@ fn tp4_rank_config(
         element_limit: options.element_limit,
         context: options.context.unwrap_or(default_context),
         timeout,
+        // The Engram n-grams hash over the tokenizer's compressed map on every rank.
+        tokenizer: options
+            .tokenizer
+            .clone()
+            .or_else(|| default_tokenizer().ok()),
     })
 }
 
@@ -4148,6 +4153,7 @@ fn open_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> 
         element_limit: config.element_limit,
         resident_cache: true,
         timeout: config.timeout,
+        tokenizer: config.tokenizer.clone(),
     })
     .map_err(|error| format!("TP=4 rank {} open failed: {error}", config.rank))?;
     Ok(Box::new(HostTp4Rank { rank }))
