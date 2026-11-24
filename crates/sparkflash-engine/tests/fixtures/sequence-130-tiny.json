@@ -69,6 +69,8 @@
     "engram_head_dim": 8,
     "dtype": "fp8",
     "expert_dtype": "fp4",
+    "weight_block": 32,
+    "weight_scale": "ue8m0",
     "compress_rope_theta": 160000.0,
     "compress_ratios": [
       2,
