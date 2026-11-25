@@ -1697,6 +1697,11 @@ impl DeviceLayer<'_> {
             self.set_seam_weights(*weights);
             let Some(dir) = dump.as_deref().filter(|_| Self::block_fused(layer)) else {
                 self.run_layer_rows(rows, layer, p0, n)?;
+                // A block that runs its parts one at a time: its stream out.
+                if let Some(dir) = dump.as_deref() {
+                    let name = format!("L{layer:02}");
+                    self.rows_dump(dir, &name, &[("stream", b.stream, n * hc * dim * 4)], p0, n)?;
+                }
                 continue;
             };
             let name = format!("L{layer:02}");
