@@ -903,28 +903,37 @@ fn no_unrecorded_widening<A: ArmFixture>() -> Result<CheckOutcome, BackendError>
 /// a second fixture driven a row at a time through [`Walk::walk`] and [`Walk::head`]. The two
 /// token runs must be equal, which is the property a rejected draft can break.
 fn drafted_equals_plain<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
-    let drafted = A::fixture(1)?;
-    let plain = A::fixture(1)?;
-    let expected = plain_run(&plain.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
-    let actual = if A::tick_engine() {
-        engine_run(drafted.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
-    } else {
-        let runtime = Runtime::new(drafted.walk, 0)?;
-        runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
-    };
-    if actual != expected {
-        return Err(disagreement(
-            "drafted = plain",
-            &expected,
-            &actual,
-            &drafted.source,
-        ));
+    let prompts = [
+        CONFORMANCE_PROMPT,
+        CONFORMANCE_OTHER,
+        CONFORMANCE_THIRD,
+        CONFORMANCE_FOURTH,
+    ];
+    let mut source = String::new();
+    let mut tokens = 0;
+    // Every conformance prompt, so a drafted member of the four-at-once check is checked alone.
+    for (index, prompt) in prompts.iter().enumerate() {
+        let drafted = A::fixture(1)?;
+        let plain = A::fixture(1)?;
+        let expected = plain_run(&plain.walk, prompt, CONFORMANCE_TOKENS)?;
+        let actual = if A::tick_engine() {
+            engine_run(drafted.walk, prompt, CONFORMANCE_TOKENS)?
+        } else {
+            let runtime = Runtime::new(drafted.walk, 0)?;
+            runtime_run(&runtime, prompt, CONFORMANCE_TOKENS)?
+        };
+        if actual != expected {
+            return Err(disagreement(
+                &format!("drafted = plain (prompt {index})"),
+                &expected,
+                &actual,
+                &drafted.source,
+            ));
+        }
+        tokens = actual.len();
+        source = drafted.source;
     }
-    println!(
-        "conformance: drafted = plain: {} tokens over {}",
-        actual.len(),
-        drafted.source
-    );
+    println!("conformance: drafted = plain: {tokens} tokens on each of 4 prompts over {source}");
     Ok(CheckOutcome::Passed)
 }
 
