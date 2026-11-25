@@ -40,8 +40,8 @@ use sparkflash_runtime::tick::replay::{Config, Replay};
 use sparkflash_runtime::tick::{
     Clock, Decision, DecodePlan, InjectedClock, LaneCandidate, ShareClock, TickHost, TickRows,
     TickTrace, TogetherHost, band, bulk_budget, bulk_from, common_prefix, decode_plan,
-    decoder_resume, pick_lane, prefill_order, reusable_shared, runs_decoder, skip_end_after,
-    tick_chunks, tick_prefill, tick_rows, whole_chunk_fits,
+    decoder_resume, pick_lane, prefill_order, recurrent_start, reusable_shared, runs_decoder,
+    save_cut, save_point, skip_end_after, tick_chunks, tick_prefill, tick_rows, whole_chunk_fits,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +83,9 @@ struct Lane {
     seq: Option<u64>,
     used: u64,
     skip_end: usize,
+    /// The position the lane's recurrent state was saved at (`Batch` asks the device's
+    /// checkpoint).
+    point: Option<usize>,
 }
 
 /// The CPU mirror of `Batch::tick`: token and lane state, the shared decision functions and an
@@ -295,6 +298,12 @@ impl LiveBatch {
                     self.cfg.decoder_warm,
                 );
             }
+            if self.cfg.save_step.is_some() {
+                start = recurrent_start(start, self.lanes[lane].point);
+                if start == 0 {
+                    self.lanes[lane].point = None;
+                }
+            }
             let bulk = bulk_from(
                 target,
                 start,
@@ -335,6 +344,7 @@ impl LiveBatch {
         let from = self.seqs[index].pos;
         let lane = self.seqs[index].lane?;
         let id = self.seqs[index].id;
+        let save = self.cfg.save_step.and_then(|step| save_point(target, step));
         let mut ran = 0;
         if bulk {
             let cap = self.cfg.bulk_cap;
@@ -354,6 +364,8 @@ impl LiveBatch {
                 |_, _| None,
             );
             for (p, rows) in chunks {
+                // A recurrent stack's chunk ends at its save point (one way: no chunk follows).
+                let rows = rows.min(save_cut(p, target, save) - p);
                 self.record(Decision::Prefill {
                     seq: id,
                     from: p,
@@ -368,6 +380,9 @@ impl LiveBatch {
                     !self.cfg.decoder_skip || runs_decoder(p, rows, target, self.cfg.decoder_warm),
                 );
                 ran += rows;
+                if Some(p + rows) == save {
+                    self.lanes[lane].point = save;
+                }
             }
         } else {
             let steps = tick_rows(
@@ -382,7 +397,7 @@ impl LiveBatch {
                 if p == target {
                     break;
                 }
-                let n = self.cfg.rows_max.min(target - p);
+                let n = self.cfg.rows_max.min(save_cut(p, target, save) - p);
                 self.record(Decision::Prefill {
                     seq: id,
                     from: p,
@@ -398,6 +413,9 @@ impl LiveBatch {
                 );
                 p += n;
                 ran += n;
+                if Some(p) == save {
+                    self.lanes[lane].point = save;
+                }
             }
             self.seqs[index].pos = p;
         }
@@ -633,5 +651,68 @@ fn the_live_tick_makes_the_replay_s_decisions() {
     assert_eq!(
         live_trace, replay_trace,
         "the CPU mirror of Batch::tick and tick::replay disagree; the live path's decisions drifted"
+    );
+}
+
+/// A recurrent stack's decisions: every prefill is cut at its save point, and a turn that
+/// continues an ended prompt resumes at that point, not at the shared prefix's end; the mirror and
+/// the replay agree on both.
+#[test]
+fn the_live_tick_makes_the_replay_s_decisions_over_a_recurrent_stack() {
+    let config = Config {
+        save_step: Some(2),
+        decoder_skip: false,
+        ways: 1,
+        ..Config::deepseek(2)
+    };
+    let mut live = LiveBatch::new(config);
+    let mut replay = Replay::new(config);
+    let first = tokens(1, 5_000);
+    let mut second = first.clone();
+    second.extend(tokens(9, 300));
+    live.admit(1, first.clone(), 5_000);
+    replay.admit(1, first, 5_000);
+    for tick in 0..12 {
+        let hold = live.hold_prefill();
+        live.tick(hold, 40);
+        replay.tick(40);
+        if tick == 5 {
+            live.finish(1);
+            replay.finish(1);
+            live.admit(2, second.clone(), 5_300);
+            replay.admit(2, second.clone(), 5_300);
+        }
+    }
+    assert_eq!(live.trace().render(), replay.trace().render());
+    let decisions: Vec<&Decision> = live
+        .trace()
+        .entries()
+        .iter()
+        .map(|entry| &entry.decision)
+        .collect();
+    let cut = |seq: u64, at: usize| {
+        decisions.iter().any(|decision| {
+            matches!(**decision, Decision::Prefill { seq: s, from, rows, .. } if s == seq && from + rows == at)
+        })
+    };
+    assert!(
+        cut(1, 4_998),
+        "the first prompt's prefill stops at its save point"
+    );
+    assert!(
+        cut(2, 5_298),
+        "the second prompt's prefill stops at its own save point"
+    );
+    assert!(
+        decisions.iter().any(|decision| matches!(
+            **decision,
+            Decision::Place {
+                seq: 2,
+                start: 4_998,
+                ..
+            }
+        )),
+        "the continued turn resumes at the saved point: {}",
+        live.trace().render()
     );
 }
