@@ -158,14 +158,24 @@ impl DenseGroups {
 pub struct DenseFormat {
     /// `dense_format_<io>_<class>_sm121`, in [DenseIo::ALL] order.
     pub entries: [Kernel; 4],
+    /// The square scale grid a scaled class's entries index, values a side (`None` for an
+    /// unscaled class). A scale row holds `inner / block` scales, so an inner it does not divide
+    /// is refused rather than read off the wrong row.
+    pub scale_block: Option<usize>,
+}
+
+impl DenseFormat {
+    /// The side of the scale grid every scaled entry indexes (`col >> 7`, `k >> 7`).
+    pub const SCALE_BLOCK: usize = 128;
 }
 
 impl DenseFormat {
     /// `out[t][c] = sum_k a[t][k] * W[c][k]` for every row, through the class's `io` entry.
     ///
     /// # Errors
-    /// A geometry the tile cannot cut (columns or inner not a multiple of 32, a stride shorter
-    /// than its row or not a whole 16-byte load), or the launch fails.
+    /// A geometry the tile cannot cut (columns or inner not a multiple of 32, a scaled class's
+    /// inner not a whole number of scale blocks, a stride shorter than its row or not a whole
+    /// 16-byte load), or the launch fails.
     pub fn project(
         &self,
         cuda: &Cuda,
@@ -184,6 +194,14 @@ impl DenseFormat {
         {
             return Err(format!(
                 "dense format: a {}x{} matrix is not cut by the tile's 32-wide steps",
+                matrix.cols, matrix.inner
+            ));
+        }
+        if let Some(block) = self.scale_block
+            && !matrix.inner.is_multiple_of(block)
+        {
+            return Err(format!(
+                "dense format: a {}x{} matrix's inner is not a whole number of its {block}-wide scale blocks",
                 matrix.cols, matrix.inner
             ));
         }

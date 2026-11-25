@@ -175,7 +175,10 @@ fn the_dense_format_entries_are_the_host_sum_within_the_split() {
             modules.push(module);
             kernel
         });
-        let format = DenseFormat { entries };
+        let format = DenseFormat {
+            entries,
+            scale_block: (class != Class::Bf16).then_some(DenseFormat::SCALE_BLOCK),
+        };
         let weights = stored(class, groups, cols, inner, 0xd3a5 + class as u64);
         let w = upload(&cuda, &weights.bytes);
         let ws = if weights.scales.is_empty() {

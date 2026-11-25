@@ -8030,7 +8030,21 @@ pub(crate) fn open_dense_format(
     let entries = entries
         .try_into()
         .map_err(|_| format!("{what}: the route has four row forms"))?;
-    Ok(DenseFormat { entries })
+    // The entries index one fixed square scale grid; a scaled class stored on another is
+    // refused here, not read off the wrong scales.
+    let scale_block = (!format.is_unscaled()).then(|| format.block());
+    if let Some(block) = scale_block
+        && block != DenseFormat::SCALE_BLOCK
+    {
+        return Err(format!(
+            "{what}: its scales cover {block}-wide blocks and the route's entries read {}-wide ones",
+            DenseFormat::SCALE_BLOCK
+        ));
+    }
+    Ok(DenseFormat {
+        entries,
+        scale_block,
+    })
 }
 
 /// Stages the shared expert on the device for every layer: B12x repack, upload, budget admission.
