@@ -71,8 +71,8 @@ use sparkflash_model::vision::ImageSpan;
 use sparkflash_runtime::tick::{
     ADOPT_MIN, Decision, DecodePlan, DecodeShare, LaneCandidate, QUEUE, ShareClock, TickHost,
     TickRows, TogetherHost, TraceSink, WallClock, bulk_budget, bulk_from, bulk_rows, common_prefix,
-    decode_plan, decoder_resume, pick_lane, prefill_order, reusable_shared, runs_decoder,
-    skip_end_after, tick_prefill, tick_rows, whole_chunk_fits,
+    decode_plan, decoder_resume, pick_lane, prefill_order, recurrent_start, reusable_shared,
+    runs_decoder, save_cut, save_point, skip_end_after, tick_prefill, tick_rows, whole_chunk_fits,
 };
 use sparkflash_vision::IMAGE_TOKEN_ID;
 use std::sync::Arc;
@@ -119,6 +119,40 @@ pub(super) fn decoder_warm() -> usize {
     let window = sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW;
     let decoder_layers = crate::plan::n_layers().saturating_sub(encoder_layers());
     (window - 1) * decoder_layers + window
+}
+
+/// The stack's first recurrent block among the decoder layers ([encoder_layers] on), if any: its
+/// state is the fold of every row before it, so a prompt row that stopped after the encoder would
+/// leave it wrong.
+pub(super) fn recurrent_decoder_block() -> Option<usize> {
+    let encoder = encoder_layers();
+    crate::plan::description()
+        .values()
+        .gdn_layers
+        .iter()
+        .copied()
+        .find(|&layer| layer >= encoder)
+}
+
+/// Whether prompt rows before the last [decoder_warm] stop after the encoder layers: the
+/// profile's `prefill_decoder_skip` (on by default), off when a recurrent block sits among the
+/// decoder layers ([recurrent_decoder_block]; the ledger says so).
+///
+/// # Errors
+/// A profile that asks for the skip over such a stack: refused by name, not ignored.
+fn prefill_decoder_skip() -> Result<bool, String> {
+    let asked = sparkflash_model::active_profile()
+        .diagnostics
+        .prefill_decoder_skip;
+    match recurrent_decoder_block() {
+        None => Ok(asked.unwrap_or(true)),
+        Some(layer) if asked == Some(true) => Err(format!(
+            "prefill_decoder_skip: block {layer} is a Gated DeltaNet among the decoder layers, \
+             whose state folds every prompt row, so prompt rows cannot stop after the encoder \
+             (leave prefill_decoder_skip unset or false)"
+        )),
+        Some(_) => Ok(false),
+    }
 }
 
 /// The least calibrated chain probability a draft needs for a verify row of a shared speculative
@@ -431,6 +465,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let room = device
             .max_positions
             .saturating_sub(k + draft::draft_block() + 2);
+        let decoder_skip = prefill_decoder_skip()?;
         Ok(Self {
             device,
             rows,
@@ -459,10 +494,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 .prefill
                 .exact
                 .unwrap_or(false),
-            decoder_skip: sparkflash_model::active_profile()
-                .diagnostics
-                .prefill_decoder_skip
-                .unwrap_or(true),
+            decoder_skip,
             busy_chunk: busy_chunk(),
             busy_exact_steps: busy_exact_steps(),
             spec_floor: batch_spec_floor(),
@@ -543,21 +575,30 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 )
             },
         );
-        ledger.set(
-            Strategy::PromptParts,
-            Mode::native(if self.exact_prefill {
-                format!(
-                    "exact steps, {} of {R_MAX} rows a tick while other lanes decode",
-                    self.busy_exact_steps
-                )
-            } else {
-                format!(
-                    "bulk chunks, {} rows a tick while other lanes decode, the decoders' share up \
-                     to {:.2}",
-                    self.busy_chunk, self.share.most
-                )
-            }),
-        );
+        let mut parts = if self.exact_prefill {
+            format!(
+                "exact steps, {} of {R_MAX} rows a tick while other lanes decode",
+                self.busy_exact_steps
+            )
+        } else {
+            format!(
+                "bulk chunks, {} rows a tick while other lanes decode, the decoders' share up \
+                 to {:.2}",
+                self.busy_chunk, self.share.most
+            )
+        };
+        if let Some(layer) = recurrent_decoder_block() {
+            parts.push_str(&format!(
+                "; every prompt row runs the decoder layers (Gated DeltaNet block {layer} sits \
+                 among them, so the decoder skip is off)"
+            ));
+        }
+        if self.device.has_recurrent() {
+            parts.push_str(
+                "; a prompt's recurrent state is saved at the last resume boundary before its end",
+            );
+        }
+        ledger.set(Strategy::PromptParts, Mode::native(parts));
         let depth = super::spec::depth_policy(self.k);
         ledger.drafting(
             Some(format!(
@@ -590,8 +631,13 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             if self.reuse {
                 Mode::native(format!(
                     "a lane keeps its sequence and a prompt resumes from the longest shared prefix \
-                     (cut to the compress ratios); lanes holding more than {} rows keep them from \
+                     (cut to the compress ratios{}); lanes holding more than {} rows keep them from \
                      shorter matches",
+                    if self.device.has_recurrent() {
+                        ", then to the lane's saved recurrent point"
+                    } else {
+                        ""
+                    },
                     self.prefix_reuse_min_rows
                 ))
             } else {
@@ -1204,6 +1250,11 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                     decoder_warm(),
                 ));
             }
+            // A recurrent state holds only the lane's last position and its saved point: the
+            // prompt resumes there or from the start.
+            if self.device.has_recurrent() {
+                start = recurrent_start(start, self.device.recurrent_point(lane));
+            }
             // A lane whose window rings slid past the resume point cannot resume there (the rows
             // start reads need both windows, the layers' and the drafter's, behind it).
             let floor = self.device.lane_floor(lane);
@@ -1243,6 +1294,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             }
             self.enter(lane)?;
             self.device.rewind_rows(start);
+            self.device.recurrent_resume(lane, start)?;
             let id = self.seqs[index].id;
             let lane_state = &mut self.lanes[lane];
             lane_state.seq = Some(id);
@@ -1267,6 +1319,19 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 bulk,
             });
         }
+    }
+
+    /// Where a prefill to `target` saves a recurrent stack's state: the last resume boundary
+    /// ([DeviceLayer::resume_step]) before the prompt's end, the latest point a later prompt can
+    /// resume from (`None` for a stack with no recurrent block, or a prompt too short to hold
+    /// one). This is the base's "save at the prompt's end" at its resume granularity: the rows
+    /// resume only on a boundary, so a save past the last one could never be resumed from, and
+    /// the prompt's last row always runs for its first token's logits.
+    fn save_point(&self, target: usize) -> Option<usize> {
+        if !self.device.has_recurrent() {
+            return None;
+        }
+        save_point(target, self.device.resume_step())
     }
 
     /// Whether a prefill from `start` to `target` takes the bulk chunks.
@@ -1354,6 +1419,11 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 decoder_warm(),
             ));
         }
+        // A recurrent state is adopted only at the point `src` saved.
+        let recurrent = self.device.has_recurrent();
+        if recurrent {
+            start = recurrent_start(start, self.device.recurrent_point(src));
+        }
         if start < seq.pos + ADOPT_MIN {
             return Ok(());
         }
@@ -1365,6 +1435,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         }
         if !self.device.copy_lane_prefix(own, src, start)? {
             return Ok(());
+        }
+        if recurrent {
+            self.device.recurrent_adopt(own, src, start)?;
         }
         self.lanes[own].skip_end = skip_end;
         let bulk = self.bulk_from(target, start);
@@ -1579,13 +1652,14 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let (rows, inputs, draft) = (self.rows, self.inputs, self.draft);
         let lane = self.seqs[index].lane.ok_or("prefill: no lane")?;
         let steps = self.tick_rows(false, decoding).div_ceil(R_MAX);
+        let save = self.save_point(target);
         let mut first = None;
         for _ in 0..steps {
             let p = self.seqs[index].pos;
             if p == target {
                 break;
             }
-            let n = R_MAX.min(target - p);
+            let n = R_MAX.min(save_cut(p, target, save) - p);
             self.traced(Decision::Prefill {
                 seq: self.seqs[index].id,
                 from: p,
@@ -1658,6 +1732,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 first = Some(picks[last].0);
             }
             self.seqs[index].pos = p + n;
+            if save == Some(p + n) {
+                self.device.recurrent_save(lane, p + n)?;
+            }
         }
         Ok(first)
     }
@@ -1710,6 +1787,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             1
         };
         let split = self.decoder_skip.then_some(decoder_warm());
+        let save = self.save_point(target);
         let chunk = move |p: usize, slot: usize| {
             bulk_rows(
                 target - p,
@@ -1718,6 +1796,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 split.filter(|_| slot + 1 < ways),
                 R_MAX,
             )
+            .min(save_cut(p, target, save) - p)
         };
         let pending = match self.prefill_next.take() {
             Some(next) if next.seq == id && next.p == p => Some(next),
@@ -1818,13 +1897,23 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 self.device.draft_seed(state, draft, p, n)?;
             }
             self.seqs[index].pos = after;
+            if save == Some(after) {
+                self.device.recurrent_save(lane, after)?;
+            }
             if after < target || self.seqs[index].emitted() > 0 {
                 return Ok(None);
             }
             return self.bulk_first(index, state, n, target).map(Some);
         }
         // The chunks this tick runs together: the first, then one on each further rows state while
-        // another chunk of more than R_MAX rows follows.
+        // another chunk of more than R_MAX rows follows. A recurrent block runs alone (the plan
+        // gives it one prefill way), so it never comes here.
+        if self.device.has_recurrent() {
+            return Err(
+                "prefill: a recurrent stack's prompt reached the interleaved bulk chunks"
+                    .to_owned(),
+            );
+        }
         let more = inputs.bulk_more;
         if self.prefill_more.len() < more.len() {
             self.prefill_more.resize_with(more.len(), || None);
@@ -2362,6 +2451,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             }
         }
         let tl = Instant::now();
+        self.device.keep_recurrent = true;
         let waited = self.device.spec_layers_gathered(
             rows,
             inputs.staged,
@@ -2372,7 +2462,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             reads,
             pos,
             n,
-        )?;
+        );
+        self.device.keep_recurrent = false;
+        let waited = waited?;
         self.send_ahead(ahead)?;
         let constraint_refs: Vec<Option<&sparkflash_api::constrained::TokenConstraint>> =
             if row_constraints.is_empty() {
@@ -2436,6 +2528,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             seq.verify_ms += t1.elapsed().as_secs_f64() * 1e3;
             self.finish(index, finish, pos, step, out)?;
             return Ok(n);
+        }
+        // The recurrent state ran every verify row; it keeps the last accepted row's.
+        if m + 1 < n {
+            self.device.commit_recurrent(rows, lane, m)?;
         }
         self.device.rewind_rows(pos + m + 1);
         self.device.draft_seed(rows, draft, pos, m + 1)?;
@@ -2685,7 +2781,8 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         )?;
         let (room, hold) = (self.room(), self.hold_after());
         let result = (|| {
-            self.device.spec_layers_gathered(
+            self.device.keep_recurrent = true;
+            let layers = self.device.spec_layers_gathered(
                 rows,
                 inputs.staged,
                 &inputs.config.engram_layer_ids,
@@ -2695,7 +2792,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 None,
                 0,
                 n,
-            )?;
+            );
+            self.device.keep_recurrent = false;
+            layers?;
             ahead(room, hold)?;
             let samplers: Vec<(Sampler, usize)> = group
                 .iter()
@@ -2750,6 +2849,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             }
             seq.pos = pos + m + 1;
             let id = seq.id;
+            // The recurrent state ran every verify row; it keeps the last accepted row's.
+            if m + 1 < seg.n {
+                self.device.commit_recurrent(rows, seg.lane, seg.row0 + m)?;
+            }
             self.enter(seg.lane)?;
             self.device.rewind_rows(pos + m + 1);
             out.push(Emission {
