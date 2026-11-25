@@ -18059,10 +18059,13 @@ fn run_forward_loop(
     // on the host (the A/B arm). A decline at call time - a layer whose source does not serve the
     // released F8-E4M3 + E8-E8M0 pair - falls back to the engine's host native rule for that layer,
     // never to a third arithmetic.
-    let mut seam_wq_b: Option<SeamDevice<'_>> = if sparkflash_model::active_profile()
-        .diagnostics
-        .seam_ref_host
-        .unwrap_or(false)
+    // A stated stack runs no release seam: its absorbed MLA and pooled indexer are the stated
+    // walk's device operands.
+    let mut seam_wq_b: Option<SeamDevice<'_>> = if crate::plan::stated_stack()
+        || sparkflash_model::active_profile()
+            .diagnostics
+            .seam_ref_host
+            .unwrap_or(false)
     {
         None
     } else {
