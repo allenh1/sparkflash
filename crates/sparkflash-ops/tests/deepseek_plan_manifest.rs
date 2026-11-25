@@ -194,14 +194,25 @@ fn the_plan_reproduces_the_deepseek_baseline_manifest() {
         // The row-scaled MXFP8 expert body the plan chooses for a checkpoint that stores its
         // routed experts one ue8m0 scale a row every 32 columns (F4).
         ("opt_mma_fp8_rowscale_f32o", Part::Moe),
+        // The drafter's norm entry that also writes the unquantised rows, for a dense class the
+        // released bodies do not read (its own cubin, so the released one keeps its bytes).
+        ("opt_draft_norm_quant_normed", Part::Mtp),
     ]
     .into_iter()
     .map(|(symbol, _part)| symbol)
     .collect();
     let missing: Vec<&String> = baseline_symbols.difference(&plan_symbols).collect();
+    // The format routes (kernels/dense_format_sm121.cu, kernels/routed_format_sm121.cu) serve a
+    // stored class the released bodies do not read, so the released run never loads them; the
+    // catalogue carries every entry so a variant checkpoint finds its own.
+    let format_route = |symbol: &str| {
+        ["dense_format_", "routed_format_"]
+            .iter()
+            .any(|prefix| symbol.starts_with(prefix))
+    };
     let extra: Vec<&String> = plan_symbols
         .difference(&baseline_symbols)
-        .filter(|symbol| !additions.contains(symbol.as_str()))
+        .filter(|symbol| !additions.contains(symbol.as_str()) && !format_route(symbol))
         .collect();
     assert!(
         missing.is_empty() && extra.is_empty(),
@@ -214,6 +225,7 @@ fn the_plan_reproduces_the_deepseek_baseline_manifest() {
         ("flash_mla_csa2_sm121", Part::MlaAttention),
         ("lm_head_reduce_sm121", Part::LmHead),
         ("opt_mma_fp8_rowscale_f32o", Part::Moe),
+        ("opt_draft_norm_quant_normed", Part::Mtp),
     ] {
         assert!(
             baseline_symbols.contains(symbol) || plan_symbols.contains(symbol),

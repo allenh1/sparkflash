@@ -469,6 +469,19 @@ impl Builder {
             ))
         })?;
         match tensor.dtype {
+            LayoutDtype::Dense if matches!(self.dense_format, WeightFormat::MxFp8 { .. }) => {
+                // An MXFP8 dense class is E4M3 codes beside an E8M0 block scale the layout
+                // names as a tensor of its own (DeepSeek's `.scale`), so the weight is the codes
+                // alone, split as the layout states.
+                self.layout_split(
+                    &tensor.name,
+                    DType::F8E4M3,
+                    &tensor.shape,
+                    tensor.split,
+                    tensor.tile,
+                    role,
+                )?;
+            }
             LayoutDtype::Dense => {
                 let [rows, columns] = two(&tensor.name, &tensor.shape)?;
                 let split = match tensor.split {
