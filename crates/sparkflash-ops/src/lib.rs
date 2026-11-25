@@ -115,6 +115,7 @@ pub mod scan;
 pub mod scan_report;
 pub mod slot_pack;
 pub mod tensor_plan;
+pub mod tiled;
 
 pub mod gdn;
 pub mod gemv;

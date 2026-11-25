@@ -2095,8 +2095,9 @@ impl ManifoldMixer {
         )
     }
 
-    /// After a branch: each row's `branch` rows (whole, summed over the group) mixed into its
-    /// `streams` in place by the coefficients [Self::enter] left at `coeffs`.
+    /// After a branch: each row's `branch` rows (whole, summed over the group; f32, or BF16
+    /// words when `wire_bf16`) mixed into its `streams` in place by the coefficients
+    /// [Self::enter] left at `coeffs`.
     ///
     /// # Errors
     /// The driver's refusal.
@@ -2104,7 +2105,7 @@ impl ManifoldMixer {
         &self,
         cx: &C,
         (streams, branch, coeffs): (Deviceptr, Deviceptr, Deviceptr),
-        stated: bool,
+        (stated, wire_bf16): (bool, bool),
     ) -> Result<(), BackendError> {
         let geometry = self.geometry;
         cx.launch(
@@ -2129,7 +2130,7 @@ impl ManifoldMixer {
                 0,
                 0,
                 0,
-                u64::from(stated),
+                u64::from(stated) | (u64::from(wire_bf16) << 1),
             ],
         )
     }

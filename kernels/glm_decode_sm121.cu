@@ -1102,7 +1102,8 @@ extern "C" __global__ void q4e_mhc_in(const float* __restrict__ raw,
 // With `stated` the update is the producer's BF16 expression (modeling_glm5_next.py 1317-1328):
 // the branch's sum narrowed to BF16 as its module returns it, post and comb cast to BF16, the post
 // term one BF16 product, the comb term summed in f32 over the source copies and rounded once, and
-// their sum rounded (stated::hc_post).
+// their sum rounded (stated::hc_post). `stated` is a set of flags: bit 0 the producer's types, bit
+// 1 a branch of BF16 words (the base's sum on its BF16 wire), widened exactly as it is read.
 #define Q4E_MHC_PAIRS 12
 static_assert(Q4E_BLOCK == Q4E_TG_THREADS && Q4E_BLOCK == 32 * 8,
               "a mixer block's columns of a copy are one round of the tiled BF16 GEMV");
@@ -1147,7 +1148,8 @@ extern "C" __global__ void q4e_mhc_post(float* __restrict__ streams,
     const float* post = coeffs + (unsigned long long)t * (2 + hc) * hc + hc;
     const float* comb = post + hc;
     const unsigned long long at = (unsigned long long)t * hidden + j;
-    float y = branch[at];
+    float y = (stated & 2) ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(branch)[at])
+                           : branch[at];
     if (world > 1) {
         const unsigned long long slot = (unsigned long long)gridDim.y * hidden;
         float sum = 0.0f;
@@ -1156,7 +1158,7 @@ extern "C" __global__ void q4e_mhc_post(float* __restrict__ streams,
         }
         y = sum;
     }
-    if (stated) {
+    if (stated & 1) {
         y = q4e_bf16r(y);
     }
     float residual[Q4E_MHC_MAX_HC];
@@ -1168,7 +1170,7 @@ extern "C" __global__ void q4e_mhc_post(float* __restrict__ streams,
     for (int copy = 0; copy < Q4E_MHC_MAX_HC; ++copy) {
         if (copy < hc) {
             float accumulated;
-            if (stated) {
+            if (stated & 1) {
                 float mixed = 0.0f;
 #pragma unroll
                 for (int source = 0; source < Q4E_MHC_MAX_HC; ++source) {
