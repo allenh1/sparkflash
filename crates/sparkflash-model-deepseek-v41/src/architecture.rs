@@ -126,6 +126,18 @@ impl ModelConfig {
                 check("grouped-query heads", geometry.heads, layer.attention.heads)?;
                 check("grouped-query key/value heads", geometry.kv_heads, *kv_heads)?;
                 check("grouped-query head width", geometry.head_dim, layer.attention.head_dim)?;
+                check("grouped-query rotary floats", geometry.rotary, layer.attention.rope.rotated_dims)?;
+                if layer.attention.rope.scaling.is_some()
+                    || (geometry.theta - layer.attention.rope.theta).abs() > f64::EPSILON * geometry.theta.abs()
+                {
+                    return Err(ConfigError::Invalid {
+                        field: "text_config.gqa_attn_config",
+                        detail: format!(
+                            "block {index}'s rotary is {:?} and the typed geometry's an unscaled base {}",
+                            layer.attention.rope, geometry.theta
+                        ),
+                    });
+                }
             }
         }
         // A block is a dense gated MLP where the typed configuration names it one

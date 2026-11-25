@@ -45,6 +45,7 @@ pub mod attention_case;
 pub mod batch;
 pub mod boundary;
 pub mod engram;
+pub mod grouped;
 pub mod layer_zero;
 pub mod mhc;
 pub mod moe;
@@ -69,6 +70,8 @@ use crate::weights::WeightSource;
 pub struct SequenceState {
     tokens: Vec<u32>,
     attention: Vec<attention::AttnState>,
+    /// Every backbone block's grouped-query cache; empty at an MLA block.
+    grouped: Vec<grouped::GroupedCache>,
 }
 
 impl SequenceState {
@@ -80,6 +83,7 @@ impl SequenceState {
             attention: (0..config.n_layers + config.n_mtp_layers)
                 .map(|_| attention::AttnState::for_config(config))
                 .collect(),
+            grouped: vec![grouped::GroupedCache::default(); config.n_layers],
         }
     }
 
@@ -1670,48 +1674,55 @@ impl InferenceEngine {
             u64_bytes(wide),
             "reference attention arithmetic over the window KV",
         );
-        // Batch-18: an engine that has the exact gather seam and a rank-local attention source
-        // runs the Option-A body (one rank's head block, wo_a rows and o_lora slice). A
-        // whole-tensor source answers None and keeps the replicated path, which is also the
-        // default whenever no gather is installed.
-        let shard_geometry = match self.gather.as_ref() {
-            Some(gather) => {
-                attention::attention_shard_geometry(config, &prefix, source, gather.world())?
-            }
-            None => None,
-        };
-        if let Some((heads, groups)) = shard_geometry {
+        if config.gqa_layers.contains(&layer) {
+            // A grouped-query block computes its attention whole on every rank: the host path
+            // has no grouped-query shard, and a device projection backend is MLA's.
             if attention.is_some() {
                 return Err(EngineError::Shape {
                     what: format!("layer {layer} attention"),
-                    detail: "the batch-18 attention shard is host-only; a device projection backend cannot run it".to_owned(),
+                    detail: "a grouped-query block runs on the host; a device projection backend is MLA's and cannot run it".to_owned(),
                 });
             }
-            let gather = self
-                .gather
-                .as_ref()
-                .expect("a shard geometry implies the gather");
-            let shard = attention::AttentionShard {
-                gather,
-                rank: gather.rank(),
-                heads,
-                groups,
-            };
-            attention::attention_forward_sharded(
+            grouped::grouped_attention_forward(
                 config,
                 layer,
                 &prefix,
                 &scratch.attn_in,
                 start_pos,
-                &mut state.attention[layer],
+                &mut state.grouped[layer],
                 source,
                 &mut scratch.attn_out,
                 self.limit,
-                &shard,
             )?;
         } else {
-            match attention {
-                Some(backend) => attention::attention_forward_with_backend(
+            // Batch-18: an engine that has the exact gather seam and a rank-local attention source
+            // runs the Option-A body (one rank's head block, wo_a rows and o_lora slice). A
+            // whole-tensor source answers None and keeps the replicated path, which is also the
+            // default whenever no gather is installed.
+            let shard_geometry = match self.gather.as_ref() {
+                Some(gather) => {
+                    attention::attention_shard_geometry(config, &prefix, source, gather.world())?
+                }
+                None => None,
+            };
+            if let Some((heads, groups)) = shard_geometry {
+                if attention.is_some() {
+                    return Err(EngineError::Shape {
+                        what: format!("layer {layer} attention"),
+                        detail: "the batch-18 attention shard is host-only; a device projection backend cannot run it".to_owned(),
+                    });
+                }
+                let gather = self
+                    .gather
+                    .as_ref()
+                    .expect("a shard geometry implies the gather");
+                let shard = attention::AttentionShard {
+                    gather,
+                    rank: gather.rank(),
+                    heads,
+                    groups,
+                };
+                attention::attention_forward_sharded(
                     config,
                     layer,
                     &prefix,
@@ -1721,19 +1732,34 @@ impl InferenceEngine {
                     source,
                     &mut scratch.attn_out,
                     self.limit,
-                    backend,
-                )?,
-                None => attention::attention_forward(
-                    config,
-                    layer,
-                    &prefix,
-                    &scratch.attn_in,
-                    start_pos,
-                    &mut state.attention[layer],
-                    source,
-                    &mut scratch.attn_out,
-                    self.limit,
-                )?,
+                    &shard,
+                )?;
+            } else {
+                match attention {
+                    Some(backend) => attention::attention_forward_with_backend(
+                        config,
+                        layer,
+                        &prefix,
+                        &scratch.attn_in,
+                        start_pos,
+                        &mut state.attention[layer],
+                        source,
+                        &mut scratch.attn_out,
+                        self.limit,
+                        backend,
+                    )?,
+                    None => attention::attention_forward(
+                        config,
+                        layer,
+                        &prefix,
+                        &scratch.attn_in,
+                        start_pos,
+                        &mut state.attention[layer],
+                        source,
+                        &mut scratch.attn_out,
+                        self.limit,
+                    )?,
+                }
             }
         }
         // The projection left exactly one residual row per position; the head buffer beyond that is

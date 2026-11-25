@@ -186,7 +186,7 @@ pub const V41_FLASH_RUNTIME_CONFIG: &str =
 pub use sparkflash_weights::ConfigError;
 
 /// A grouped-query layer's geometry in a DeepSeek-shaped stack (`gqa_attn_config`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GqaGeometry {
     /// Query heads.
     pub heads: usize,
@@ -194,6 +194,10 @@ pub struct GqaGeometry {
     pub kv_heads: usize,
     /// One head's width.
     pub head_dim: usize,
+    /// The floats of a head that rotate: every one (the stack's `partial_rotary_factor` is MLA's).
+    pub rotary: usize,
+    /// The rotary base: the stack's `rope_theta`, unscaled (the stack's YaRN is MLA's).
+    pub theta: f64,
 }
 
 /// The hyperparameters of one DeepSeek-V4.1-Flash-shaped model.
@@ -1215,6 +1219,8 @@ mod released {
                 heads: nested.num_attention_heads,
                 kv_heads: nested.num_key_value_heads,
                 head_dim: nested.head_dim,
+                rotary: nested.head_dim,
+                theta: text.rope_theta,
             }),
             (None, false) => {
                 return Err(ConfigError::Invalid {

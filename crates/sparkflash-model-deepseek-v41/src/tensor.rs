@@ -245,34 +245,49 @@ impl TensorPlan {
         };
         let _ = n_activated;
 
-        self.dense(&format!("{prefix}.attn.wq_a"), config.q_lora_rank, dim);
-        self.dense(&format!("{prefix}.attn.wq_b"), heads, config.q_lora_rank);
-        self.dense(&format!("{prefix}.attn.wkv"), config.head_dim, dim);
-        // wo_a is per group: each group projects its own slice of the head dimension, so the input
-        // width is heads / o_groups (model.py:785-787). The scale grid is the 32x32 one;
-        // convert.py:164 also accepts a 128x128 grid for this tensor, and only a real header says
-        // which the release uses.
-        self.dense(
-            &format!("{prefix}.attn.wo_a"),
-            o_wide,
-            heads / config.o_groups,
-        );
-        self.dense(&format!("{prefix}.attn.wo_b"), dim, o_wide);
-        self.plain(
-            &format!("{prefix}.attn.attn_sink"),
-            DType::F32,
-            vec![config.n_heads],
-        );
-        self.plain(
-            &format!("{prefix}.attn.q_norm.weight"),
-            DType::BF16,
-            vec![config.q_lora_rank],
-        );
-        self.plain(
-            &format!("{prefix}.attn.kv_norm.weight"),
-            DType::BF16,
-            vec![config.head_dim],
-        );
+        if let (false, true, Some(gqa)) = (
+            mtp,
+            config.gqa_layers.contains(&layer),
+            config.gqa.as_ref(),
+        ) {
+            // A grouped-query block: its four projections in the dense class, and none of MLA's
+            // low-rank query, latent, grouped output, sink or norms.
+            let query = gqa.heads * gqa.head_dim;
+            let kv = gqa.kv_heads * gqa.head_dim;
+            self.dense(&format!("{prefix}.attn.wq"), query, dim);
+            self.dense(&format!("{prefix}.attn.wk"), kv, dim);
+            self.dense(&format!("{prefix}.attn.wv"), kv, dim);
+            self.dense(&format!("{prefix}.attn.wo"), dim, query);
+        } else {
+            self.dense(&format!("{prefix}.attn.wq_a"), config.q_lora_rank, dim);
+            self.dense(&format!("{prefix}.attn.wq_b"), heads, config.q_lora_rank);
+            self.dense(&format!("{prefix}.attn.wkv"), config.head_dim, dim);
+            // wo_a is per group: each group projects its own slice of the head dimension, so the input
+            // width is heads / o_groups (model.py:785-787). The scale grid is the 32x32 one;
+            // convert.py:164 also accepts a 128x128 grid for this tensor, and only a real header says
+            // which the release uses.
+            self.dense(
+                &format!("{prefix}.attn.wo_a"),
+                o_wide,
+                heads / config.o_groups,
+            );
+            self.dense(&format!("{prefix}.attn.wo_b"), dim, o_wide);
+            self.plain(
+                &format!("{prefix}.attn.attn_sink"),
+                DType::F32,
+                vec![config.n_heads],
+            );
+            self.plain(
+                &format!("{prefix}.attn.q_norm.weight"),
+                DType::BF16,
+                vec![config.q_lora_rank],
+            );
+            self.plain(
+                &format!("{prefix}.attn.kv_norm.weight"),
+                DType::BF16,
+                vec![config.head_dim],
+            );
+        }
         self.plain(
             &format!("{prefix}.attn_norm.weight"),
             DType::BF16,

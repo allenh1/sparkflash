@@ -138,6 +138,7 @@ order = [
   "hyper_connection",
   "engram",
   "mla_attention",
+  "gqa_attention",
   "csa2_compression",
   "sparse_indexer",
   "moe",
@@ -231,7 +232,6 @@ dtype = "bf16"
 shape = ["hidden"]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla" }
 
 [[tensor]]
 name = "layers.{layer}.ffn_norm.weight"
@@ -241,7 +241,6 @@ dtype = "bf16"
 shape = ["hidden"]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla" }
 
 # model.py:939-945: mHC coefficients. mix_hc = (2 + hc_mult) * hc_mult and hc_dim =
 # hc_mult * dim; all six tensors are created inside set_dtype(torch.float32).
@@ -253,7 +252,6 @@ dtype = "f32"
 shape = ["hyper_rows", "hyper_width"]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla" }
 
 [[tensor]]
 name = "layers.{layer}.hc_attn_base"
@@ -263,7 +261,6 @@ dtype = "f32"
 shape = ["hyper_rows"]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla" }
 
 [[tensor]]
 name = "layers.{layer}.hc_attn_scale"
@@ -273,7 +270,6 @@ dtype = "f32"
 shape = [3]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla" }
 
 [[tensor]]
 name = "layers.{layer}.hc_ffn_fn"
@@ -283,7 +279,6 @@ dtype = "f32"
 shape = ["hyper_rows", "hyper_width"]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla" }
 
 [[tensor]]
 name = "layers.{layer}.hc_ffn_base"
@@ -293,7 +288,6 @@ dtype = "f32"
 shape = ["hyper_rows"]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla" }
 
 [[tensor]]
 name = "layers.{layer}.hc_ffn_scale"
@@ -303,7 +297,6 @@ dtype = "f32"
 shape = [3]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla" }
 
 # model.py:639-644: q/k RMSNorms and the per-head learned attention sink.
 [[tensor]]
@@ -438,6 +431,91 @@ split = "whole"
 repeat = "layers"
 when = { attention = "mla" }
 
+# A grouped-query layer inside the MLA stack (text_config.layer_types names it gqa_attention, and
+# text_config.gqa_attn_config holds its heads, key/value heads and head width): four projections
+# in the dense class, no low-rank query, no latent and no sink. The query and key/value
+# projections split by heads (the key/value rows by key/value heads, which a wider world shares)
+# and the output projection by columns, the dense arm's grouped-query split.
+[[tensor]]
+name = "layers.{layer}.attn.wq.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "dense"
+shape = ["heads * head_dim", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wq.scale"
+part = "gqa_attention"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(heads * head_dim) / quant_block[0]", "(hidden) / quant_block[0]"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wk.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "dense"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wk.scale"
+part = "gqa_attention"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(kv_heads * head_dim) / quant_block[0]", "(hidden) / quant_block[0]"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wv.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "dense"
+shape = ["kv_heads * head_dim", "hidden"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wv.scale"
+part = "gqa_attention"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(kv_heads * head_dim) / quant_block[0]", "(hidden) / quant_block[0]"]
+split = "kv_rows"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wo.weight"
+part = "gqa_attention"
+role = "attention"
+dtype = "dense"
+shape = ["hidden", "heads * head_dim"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gqa" }
+
+[[tensor]]
+name = "layers.{layer}.attn.wo.scale"
+part = "gqa_attention"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(hidden) / quant_block[0]", "(heads * head_dim) / quant_block[0]"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gqa" }
+
 # model.py:798-809: the router matrix is BF16 (the index has no ffn.gate.scale) and its two
 # f32 biases are [routed]; bias_vl exists because the checkpoint has a vision tower.
 [[tensor]]
@@ -448,7 +526,7 @@ dtype = "bf16"
 shape = ["routed", "hidden"]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.gate.bias"
@@ -458,7 +536,7 @@ dtype = "f32"
 shape = ["routed"]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.gate.bias_vl"
@@ -468,7 +546,7 @@ dtype = "f32"
 shape = ["routed"]
 split = "whole"
 repeat = "layers"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 # model.py:886-903: the one shared expert is a dense FP8 set (w1/w3 [shared_width, hidden],
 # w2 [hidden, shared_width]), not a routed expert.
@@ -480,7 +558,7 @@ dtype = "dense"
 shape = ["shared_width", "hidden"]
 split = "rows"
 repeat = "layers"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.shared_experts.w1.scale"
@@ -490,7 +568,7 @@ dtype = "f8e8m0"
 shape = ["(shared_width) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "rows"
 repeat = "layers"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.shared_experts.w2.weight"
@@ -500,7 +578,7 @@ dtype = "dense"
 shape = ["hidden", "shared_width"]
 split = "columns"
 repeat = "layers"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.shared_experts.w2.scale"
@@ -510,7 +588,7 @@ dtype = "f8e8m0"
 shape = ["(hidden) / quant_block[0]", "(shared_width) / quant_block[0]"]
 split = "columns"
 repeat = "layers"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.shared_experts.w3.weight"
@@ -520,7 +598,7 @@ dtype = "dense"
 shape = ["shared_width", "hidden"]
 split = "rows"
 repeat = "layers"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.shared_experts.w3.scale"
@@ -530,7 +608,7 @@ dtype = "f8e8m0"
 shape = ["(shared_width) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "rows"
 repeat = "layers"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 # A dense-FFN layer (first_k_dense_replace): one gated MLP in the dense class, named like the
 # shared expert one level up (w1/w3 [intermediate, hidden], w2 [hidden, intermediate]). The
@@ -543,7 +621,7 @@ dtype = "dense"
 shape = ["intermediate", "hidden"]
 split = "rows"
 repeat = "layers"
-when = { attention = "mla", ffn = "dense" }
+when = { ffn = "dense" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.w1.scale"
@@ -553,7 +631,7 @@ dtype = "f8e8m0"
 shape = ["(intermediate) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "rows"
 repeat = "layers"
-when = { attention = "mla", ffn = "dense" }
+when = { ffn = "dense" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.w2.weight"
@@ -563,7 +641,7 @@ dtype = "dense"
 shape = ["hidden", "intermediate"]
 split = "columns"
 repeat = "layers"
-when = { attention = "mla", ffn = "dense" }
+when = { ffn = "dense" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.w2.scale"
@@ -573,7 +651,7 @@ dtype = "f8e8m0"
 shape = ["(hidden) / quant_block[0]", "(intermediate) / quant_block[0]"]
 split = "columns"
 repeat = "layers"
-when = { attention = "mla", ffn = "dense" }
+when = { ffn = "dense" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.w3.weight"
@@ -583,7 +661,7 @@ dtype = "dense"
 shape = ["intermediate", "hidden"]
 split = "rows"
 repeat = "layers"
-when = { attention = "mla", ffn = "dense" }
+when = { ffn = "dense" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.w3.scale"
@@ -593,7 +671,7 @@ dtype = "f8e8m0"
 shape = ["(intermediate) / quant_block[0]", "(hidden) / quant_block[0]"]
 split = "rows"
 repeat = "layers"
-when = { attention = "mla", ffn = "dense" }
+when = { ffn = "dense" }
 
 # model.py:860-903: routed experts. The index stores w1/w3 as [inter, hidden/2] int8 FP4
 # and w2 as [hidden, inter/2]; the arithmetic shapes are [inter, hidden] and [hidden, inter].
@@ -607,7 +685,7 @@ dtype = "f4e2m1"
 shape = ["moe_intermediate", "hidden"]
 split = "rows"
 repeat = "experts"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.experts.{expert}.w1.scale"
@@ -617,7 +695,7 @@ dtype = "f8e8m0"
 shape = ["moe_intermediate", "hidden / quant_block[0]"]
 split = "rows"
 repeat = "experts"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.experts.{expert}.w2.weight"
@@ -627,7 +705,7 @@ dtype = "f4e2m1"
 shape = ["hidden", "moe_intermediate"]
 split = "columns"
 repeat = "experts"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.experts.{expert}.w2.scale"
@@ -637,7 +715,7 @@ dtype = "f8e8m0"
 shape = ["hidden", "moe_intermediate / quant_block[0]"]
 split = "columns"
 repeat = "experts"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.experts.{expert}.w3.weight"
@@ -647,7 +725,7 @@ dtype = "f4e2m1"
 shape = ["moe_intermediate", "hidden"]
 split = "rows"
 repeat = "experts"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 [[tensor]]
 name = "layers.{layer}.ffn.experts.{expert}.w3.scale"
@@ -657,7 +735,7 @@ dtype = "f8e8m0"
 shape = ["moe_intermediate", "hidden / quant_block[0]"]
 split = "rows"
 repeat = "experts"
-when = { attention = "mla", ffn = "moe" }
+when = { ffn = "moe" }
 
 # model.py:429-470 and config kv_source_layer_ids: the layers that own a compressed KV. The
 # listed repeat walks the config array, so no name carries a literal layer number.

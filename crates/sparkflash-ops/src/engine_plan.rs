@@ -1013,6 +1013,8 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
             put("gqa_kv_heads", FactValue::Integer(kv_heads as i64));
         }
         put("gqa_head_dim", FactValue::Integer(gqa.attention.head_dim as i64));
+        put("gqa_rotary", FactValue::Integer(gqa.attention.rope.rotated_dims as i64));
+        put("gqa_rope_theta", FactValue::Float(gqa.attention.rope.theta));
     }
     if let Some(moe) = first_moe {
         put("moe_inter_dim", FactValue::Integer(moe.intermediate as i64));

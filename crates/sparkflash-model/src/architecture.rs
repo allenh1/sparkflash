@@ -2265,9 +2265,10 @@ struct Schedule<'a> {
 /// another attention (a DeepSeek-shaped MLA stack): its geometry is `gqa_attn_config`'s.
 pub const GQA_LAYER_TYPE: &str = "gqa_attention";
 
-/// The keys a stack spells for its own attention (MLA, its compressor and its indexer) that a
-/// `gqa_attention` layer does not inherit: its geometry is the nested object's alone.
-const STACK_ATTENTION_KEYS: [&str; 26] = [
+/// The keys a stack spells for its own attention (MLA, its compressor and its indexer, and the
+/// rotary scaling its long context is trained under) that a `gqa_attention` layer does not
+/// inherit: its geometry, and any rotary scaling, is the nested object's alone.
+const STACK_ATTENTION_KEYS: [&str; 27] = [
     "num_attention_heads",
     "num_key_value_heads",
     "head_dim",
@@ -2294,6 +2295,7 @@ const STACK_ATTENTION_KEYS: [&str; 26] = [
     "index_source_layer_ids",
     "sliding_window",
     "partial_rotary_factor",
+    "rope_scaling",
 ];
 
 /// The text config a `gqa_attention` layer reads: the stack's keys without its own attention's
@@ -4383,6 +4385,10 @@ mod tests {
         assert!(matches!(first.kind, AttentionKind::Gqa { kv_heads: 8, .. }), "{:?}", first.kind);
         assert_eq!((first.heads, first.head_dim), (32, 128));
         assert!(first.compression.is_none() && first.indexer.is_none());
+        // The stack's YaRN scaling is MLA's; the grouped-query layer rotates every float of a
+        // head at the stack's base, unscaled.
+        assert!(first.rope.scaling.is_none(), "{:?}", first.rope);
+        assert_eq!(first.rope.rotated_dims, 128);
         assert!(matches!(architecture.layers[1].attention.kind, AttentionKind::Mla { .. }));
         assert_eq!(architecture.layers[1].attention.head_dim, 512);
         // A compressing grouped-query layer and a nested object that leaves a width out are

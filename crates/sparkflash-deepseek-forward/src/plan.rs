@@ -128,6 +128,8 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
                 heads: int(facts, "gqa_heads")?,
                 kv_heads: int(facts, "gqa_kv_heads")?,
                 head_dim: int(facts, "gqa_head_dim")?,
+                rotary: int(facts, "gqa_rotary")?,
+                theta: float(facts, "gqa_rope_theta")?,
             }),
             None => None,
         },
