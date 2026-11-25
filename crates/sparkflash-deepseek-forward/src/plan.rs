@@ -1281,9 +1281,17 @@ pub fn widest_mlp() -> usize {
 #[must_use]
 pub fn layer_claim(block: usize, tail: &str) -> &'static str {
     layer_claim_any(block, tail)
+        .unwrap_or_else(|| panic!("forward open: block {block} claims no tensor ending .{tail}"))
 }
 
-fn layer_claim_any(block: usize, tail: &str) -> &'static str {
+/// The tensor the layer `block` claims whose name ends with `tail`, or `None` where its parts
+/// claim none (a grouped-query block claims no MLA norm).
+#[must_use]
+pub fn layer_claim_if(block: usize, tail: &str) -> Option<&'static str> {
+    layer_claim_any(block, tail)
+}
+
+fn layer_claim_any(block: usize, tail: &str) -> Option<&'static str> {
     let description = description();
     let suffix = format!(".{tail}");
     for ((candidate, _), names) in &description.claims {
@@ -1291,10 +1299,10 @@ fn layer_claim_any(block: usize, tail: &str) -> &'static str {
             continue;
         }
         if let Some(name) = names.iter().find(|name| name.ends_with(&suffix)) {
-            return name.as_str();
+            return Some(name.as_str());
         }
     }
-    panic!("forward open: block {block} claims no tensor ending .{tail}");
+    None
 }
 
 /// The layer prefix a claim under `segment` lives at, e.g. `layers.7.attn`.

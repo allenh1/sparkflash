@@ -245,6 +245,24 @@ pub fn rank_attention_geometry(
     };
     let mut map = BTreeMap::new();
     for layer in 0..config.n_layers {
+        // A grouped-query block: wq/wk/wv split their output rows (the rank's heads), wo its
+        // inner axis, as the resident plan shards them.
+        if config.gqa_layers.contains(&layer) {
+            let gqa = config.gqa.ok_or_else(|| {
+                format!("rank_attention_geometry: block {layer} is grouped-query and the stack has no geometry")
+            })?;
+            let query = split(gqa.heads * gqa.head_dim, "cols", "wq")?;
+            let kv = split(gqa.kv_heads * gqa.head_dim, "cols", "wk/wv")?;
+            for (tail, shape) in [
+                ("attn.wq.weight", (query, config.dim)),
+                ("attn.wk.weight", (kv, config.dim)),
+                ("attn.wv.weight", (kv, config.dim)),
+                ("attn.wo.weight", (config.dim, query)),
+            ] {
+                map.insert(crate::plan::layer_claim(layer, tail).to_owned(), shape);
+            }
+            continue;
+        }
         // Replicated: the whole projection on every rank.
         map.insert(
             crate::plan::layer_claim(layer, "attn.wq_a.weight").to_owned(),
@@ -409,8 +427,11 @@ pub const MHC_SEAM_PARTS: [(&str, StoredFormat); 10] = [
 pub fn mhc_seam_plan_names(config: &ModelConfig) -> Vec<String> {
     let mut names = Vec::with_capacity(config.n_layers * MHC_SEAM_PARTS.len());
     for layer in 0..config.n_layers {
+        // A block claims the ones its parts hold: a grouped-query block has no q/kv norm.
         for (suffix, _dtype) in MHC_SEAM_PARTS {
-            names.push(crate::plan::layer_claim(layer, suffix).to_owned());
+            if let Some(name) = crate::plan::layer_claim_if(layer, suffix) {
+                names.push(name.to_owned());
+            }
         }
     }
     names
@@ -479,7 +500,9 @@ fn mhc_seam_bound_shards<'a>(
     let mut selected = Vec::with_capacity(config.n_layers * MHC_SEAM_PARTS.len());
     for layer in 0..config.n_layers {
         for (suffix, format) in MHC_SEAM_PARTS {
-            let name = crate::plan::layer_claim(layer, suffix);
+            let Some(name) = crate::plan::layer_claim_if(layer, suffix) else {
+                continue;
+            };
             if let Some(shard) = by_name.get(name) {
                 selected.push((*shard, format));
             }
