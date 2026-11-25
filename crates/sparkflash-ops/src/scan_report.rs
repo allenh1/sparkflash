@@ -575,6 +575,15 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
                 .to_owned(),
         );
     }
+    // A grouped-query block inside an MLA stack runs on the MLA stack's base, whose grouped-query
+    // part has no body for interleaved prompt chunks yet: the base takes the chunks one at a time.
+    if parts.contains(Part::GqaAttention) && parts.contains(Part::MlaAttention) {
+        report.coverage_notes.push(
+            "gqa_attention inside an MLA stack has no body for interleaved prompt chunks: the \
+             base runs this stack's prompt chunks one at a time (one prefill way)"
+                .to_owned(),
+        );
+    }
     // The layout's claimed tensors are the row's evidence: their stored dtypes decide the
     // format and precision, their shapes decide the shape. The plan already resolved the
     // format per part; the stored shape comes from the shared tensor plan's claim for the first

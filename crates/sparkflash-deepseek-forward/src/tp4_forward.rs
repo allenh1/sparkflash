@@ -18538,9 +18538,20 @@ fn run_forward_loop(
         // WAYS=1: one chunk at a time). Their seams split over the ranks by rows unless
         // SPARKFLASH_PREFILL_SP=0, and they share the routed experts' rows, so the chunks' routed
         // experts read each expert's weights once (DeviceLayer::rows_moe_merged).
-        let ways: usize = match sparkflash_model::active_profile().prefill.pair {
-            Some(0) => 1,
-            _ => sparkflash_model::active_profile().prefill.ways.unwrap_or(3),
+        // A part with no body for interleaved chunks (a grouped-query block) takes them one at a
+        // time; a profile that asks for more ways is refused rather than quietly narrowed.
+        let prefill = &sparkflash_model::active_profile().prefill;
+        let ways: usize = match (crate::plan::first_non_interleaving(), prefill.pair) {
+            (Some((block, part)), _) => match prefill.ways {
+                Some(asked) if asked > 1 && prefill.pair != Some(0) => {
+                    return Err(format!(
+                        "prefill: the profile asks for {asked} interleaved prompt chunks and block {block}'s {part:?} part has no body for them; set prefill ways to 1"
+                    ));
+                }
+                _ => 1,
+            },
+            (None, Some(0)) => 1,
+            (None, _) => prefill.ways.unwrap_or(3),
         };
         let moe_share = if chunk > rows::R_MAX
             && ways > 1

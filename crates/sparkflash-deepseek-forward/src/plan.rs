@@ -1564,6 +1564,7 @@ pub const fn forward_has_body(part: Part) -> bool {
             | Part::HyperConnection
             | Part::ManifoldHyperConnection
             | Part::MlaAttention
+            | Part::GqaAttention
             | Part::Csa2Compression
             | Part::SparseIndexer
             | Part::Moe
@@ -1607,11 +1608,42 @@ const FUSED_PARTS: [Part; 8] = [
 ];
 
 /// Whether the base runs `part` on its own, outside the fused halves: the MLA attention (its
-/// entry seam, its sublayers and its post) and the dense gated MLP (its seam, the shared
-/// [sparkflash_ops::roles::GatedMlp] body and its post).
+/// entry seam, its sublayers and its post), the grouped-query attention (the same entry seam, the
+/// shared [sparkflash_ops::roles::GqaLayer] body and the base's reduce) and the dense gated MLP
+/// (its seam, the shared [sparkflash_ops::roles::GatedMlp] body and its post).
 #[must_use]
 pub const fn runs_alone(part: Part) -> bool {
-    matches!(part, Part::MlaAttention | Part::DenseMlp)
+    matches!(
+        part,
+        Part::MlaAttention | Part::GqaAttention | Part::DenseMlp
+    )
+}
+
+/// Whether `part` has a body for a pass that interleaves several prompt chunks
+/// ([crate::tp4_forward] `ways`): the base's own parts do; a foreign part runs one chunk at a time
+/// until its body takes interleaved chunks, and the scan says so.
+#[must_use]
+pub const fn interleaves(part: Part) -> bool {
+    !matches!(part, Part::GqaAttention)
+}
+
+/// The first language block part with no body for interleaved prompt chunks ([interleaves]), and
+/// its block: the base then runs prompt chunks one at a time.
+#[must_use]
+pub fn first_non_interleaving() -> Option<(usize, Part)> {
+    description()
+        .plan
+        .stacks()
+        .iter()
+        .filter(|stack| stack.kind == sparkflash_model::StackKind::Language)
+        .flat_map(|stack| &stack.blocks)
+        .find_map(|block| {
+            block
+                .parts
+                .iter()
+                .find(|instance| !interleaves(instance.part))
+                .map(|instance| (block.index, instance.part))
+        })
 }
 
 /// The sublayers a part that runs alone carries inside its own body: the norms and the stream
