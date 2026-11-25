@@ -2393,6 +2393,75 @@ extern "C" __global__ void q4e_narrow_bf16(__nv_bfloat16* __restrict__ dst,
     }
 }
 
+// One f32 value rounded to BF16 and widened back, round to nearest even: a module output in the
+// producer's BF16 type, held in an f32 row.
+__device__ __forceinline__ float q4e_held(float value) {
+    return __bfloat162float(__float2bfloat16_rn(value));
+}
+
+// rows x width floats from src (rows src_stride apart) into dst (rows dst_stride apart): a
+// projection written packed, placed into a wider row it shares with others. grid (ceil(width /
+// 256), rows), 256 threads.
+extern "C" __global__ void q4e_copy_rows(float* __restrict__ dst, const float* __restrict__ src,
+                                         int rows, int width, int dst_stride, int src_stride) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.y;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || column >= width) {
+        return;
+    }
+    dst[(unsigned long long)row * dst_stride + column] =
+        src[(unsigned long long)row * src_stride + column];
+}
+
+// The gated activation in the producer's BF16 types (`modeling_glm5_next.py`'s MLP and the
+// release's FP8 experts): out = bf16(bf16(silu(min(gate, limit))) * clamp(up, -limit, limit)),
+// the clamps only when limit > 0, gate and up the BF16 module outputs held in f32. The host twin
+// is sparkflash-model-deepseek-v41 forward/moe.rs stated_expert_body. count values, a thread
+// each.
+extern "C" __global__ void q4e_swiglu_held(const float* __restrict__ gate,
+                                           const float* __restrict__ up, float* __restrict__ out,
+                                           int count, float limit) {
+    OPT_PDL_ENTRY();
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
+         index += blockDim.x * gridDim.x) {
+        float g = gate[index];
+        float u = up[index];
+        if (limit > 0.0f) {
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+        }
+        const float activated = q4e_held(__fmul_rn(g, q4e_sigmoid_ref(g)));
+        out[index] = q4e_held(__fmul_rn(activated, u));
+    }
+}
+
+// A token's routed choices and its shared expert in the producer's BF16 types: each choice's
+// held output times its BF16 weight, rounded (bf16(y bf16(w))), summed in f32 in slot order (the
+// router writes a token's slots in ascending expert order, the host's order), the sum rounded
+// once and the shared expert's held output added in BF16. y is [rows][topk][dim], weights
+// [rows][topk], shared [rows][dim]; out [rows][dim] BF16 words. The host twin is forward/moe.rs
+// stated_ffn_forward. grid (ceil(dim / 256), rows), 256 threads.
+extern "C" __global__ void q4e_combine_held(const float* __restrict__ y,
+                                            const float* __restrict__ weights,
+                                            const float* __restrict__ shared,
+                                            __nv_bfloat16* __restrict__ out, int dim, int topk) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.y;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= dim) {
+        return;
+    }
+    float sum = 0.0f;
+    for (int slot = 0; slot < topk; ++slot) {
+        const unsigned long long pair = (unsigned long long)row * topk + slot;
+        const float weight = q4e_held(weights[pair]);
+        sum = __fadd_rn(sum, q4e_held(__fmul_rn(y[pair * dim + column], weight)));
+    }
+    const unsigned long long at = (unsigned long long)row * dim + column;
+    out[at] = __float2bfloat16_rn(__fadd_rn(q4e_held(sum), shared[at]));
+}
+
 // ---------------------------------------------------------------------------------------------
 // GLM-5.3-Flash: the kernels its device arm (sparkflash-model-glm5-next) adds to the ones above.
 //

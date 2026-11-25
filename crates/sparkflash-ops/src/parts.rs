@@ -1353,6 +1353,11 @@ pub const CATALOGUE: &[PartKernel] = &[
             // A flat copy of an f32 state or widened-stream region.
             sym("q4e_copy_flat", &[Precision::F32]),
             sym("q4e_narrow_bf16", &[Precision::Bf16]),
+            // A stated block's row placement, and its gated activation and expert combine in
+            // the producer's BF16 types.
+            sym("q4e_copy_rows", &[Precision::F32]),
+            sym("q4e_swiglu_held", &[Precision::Bf16]),
+            sym("q4e_combine_held", &[Precision::Bf16]),
         ],
         false,
     ),

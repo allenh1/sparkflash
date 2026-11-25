@@ -346,6 +346,8 @@ pub(super) struct RowsState {
     pub(super) grouped: Option<GroupedRows>,
     /// A stack with a Gated DeltaNet block: the shared body's kernels and rows (None without one).
     pub(super) recurrent: Option<RecurrentRows>,
+    /// A stack whose layout states its wiring: the stated walk's rows (None for the release).
+    pub(super) stated: Option<super::stated::StatedRows>,
 }
 
 /// A grouped-query block's body on the rows path ([sparkflash_ops::roles::GqaLayer]): the shared
@@ -720,11 +722,14 @@ impl RowsState {
         if device.dim != crate::plan::hidden() || device.hc_mult != crate::plan::hc_mult() {
             return refuse("the row kernels hold the plan dim and hc only");
         }
+        // A stated stack walks its own bodies (super::stated): the release's routed router, opt
+        // seams and rank-split shared expert are never opened for it.
+        let stated = crate::plan::stated_stack();
         if !device.dim.is_multiple_of(128)
-            || !device
-                .routed_geometry
-                .experts
-                .is_multiple_of(sparkflash_kernels::moe_routed_device::OPT_ROUTER_EXPERTS_PER_BLOCK)
+            || (!stated
+                && !device.routed_geometry.experts.is_multiple_of(
+                    sparkflash_kernels::moe_routed_device::OPT_ROUTER_EXPERTS_PER_BLOCK,
+                ))
         {
             return Err(format!(
                 "rows: hidden {} is not whole 128-column blocks or {} experts are not whole \
@@ -732,12 +737,12 @@ impl RowsState {
                 device.dim, device.routed_geometry.experts
             ));
         }
-        if !device.opt_seams_active()
-            || device.opt_rope.is_none()
-            || device.opt_router.is_none()
-            || device.opt_attn.is_none()
-            || !device.shared_tp_active()
-            || !sparkflash_kernels::mxfp8_gemv_launch::opt_installed()
+        if !stated && !device.opt_seams_active()
+            || !stated && device.opt_rope.is_none()
+            || !stated && device.opt_router.is_none()
+            || !stated && device.opt_attn.is_none()
+            || !stated && !device.shared_tp_active()
+            || !stated && !sparkflash_kernels::mxfp8_gemv_launch::opt_installed()
         {
             return refuse(
                 "the multi-row step needs the opt seams, rope, router, attention, GEMV and the \
@@ -889,11 +894,11 @@ impl RowsState {
         let kv_cols = device.projections[1].cols as usize;
         let q_cols = device.projections[2].cols as usize;
         let lo_cols = device.out_geometry.groups * device.out_geometry.o_lora_rank;
-        let shared = device
-            .shared
-            .as_ref()
-            .ok_or("rows: no shared expert operands")?;
-        let shared_local = shared.inter / device.routed_geometry.world;
+        let shared_local = match device.shared.as_ref() {
+            Some(shared) => shared.inter / device.routed_geometry.world,
+            None if stated => 0,
+            None => return refuse("no shared expert operands"),
+        };
         // The MLP scratch holds the widest gated MLP's slice: the shared experts', or a dense-FFN
         // block's when it is wider.
         let mlp_local =
@@ -1029,6 +1034,11 @@ impl RowsState {
             )?),
             None => None,
         };
+        let stated = if stated {
+            Some(super::stated::StatedRows::open(device, d, &mut alloc)?)
+        } else {
+            None
+        };
         let head_params = cuda.alloc_host_mapped(R_MAX * 8 * 4, &mut 0)?;
         Ok(Self {
             kernels,
@@ -1037,6 +1047,7 @@ impl RowsState {
             head_params,
             grouped,
             recurrent,
+            stated,
             q_cols,
             lora_cols,
             kv_cols,
@@ -1243,7 +1254,8 @@ impl RowsLinear for RouteLinear {
 /// One of this rank's projections on the tiled projection ([sparkflash_ops::tiled]): the body
 /// a release with dynamic FP8 activations runs, the rank's matrix, and whether the outputs are
 /// rounded to BF16 (`held`) and keep the row GEMV's bits past its batch (`exact`). f32 rows in
-/// and out, packed.
+/// and out, packed; a body that lays it beside others in a wider row (KDA's q, k and v) has it
+/// written packed into `stage` and placed by its row copy (`q4e_copy_rows`).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TiledLinear<'a> {
     pub(super) body: &'a sparkflash_ops::tiled::TiledProjection,
@@ -1251,6 +1263,7 @@ pub(super) struct TiledLinear<'a> {
     pub(super) matrix: sparkflash_ops::tiled::TiledMatrix,
     pub(super) exact: bool,
     pub(super) held: bool,
+    pub(super) stage: Option<(sparkflash_ops::roles::Bound, Deviceptr)>,
 }
 
 impl RowsLinear for TiledLinear<'_> {
@@ -1261,23 +1274,39 @@ impl RowsLinear for TiledLinear<'_> {
         (output, stride): (Deviceptr, usize),
         rows: usize,
     ) -> Result<(), sparkflash_model::backend::BackendError> {
-        if stride != self.matrix.rows {
-            return Err(sparkflash_model::backend::BackendError::new(
-                ROWS_CX,
-                format!(
-                    "a body asked for {} tiled outputs {stride} floats apart; the tiled projection writes packed rows",
-                    self.matrix.rows
-                ),
-            ));
-        }
+        let width = self.matrix.rows;
+        let packed = match (stride == width, self.stage) {
+            (true, _) => output,
+            (false, Some((_, stage))) => stage,
+            (false, None) => {
+                return Err(sparkflash_model::backend::BackendError::new(
+                    ROWS_CX,
+                    format!(
+                        "a body asked for {width} tiled outputs {stride} floats apart and the projection has no stage to place them from"
+                    ),
+                ));
+            }
+        };
         self.body.project(
             cx,
             self.scratch,
             &self.matrix,
-            (input, output),
+            (input, packed),
             rows,
             (self.exact, self.held),
-        )
+        )?;
+        match self.stage {
+            Some((copy, stage)) if stride != width => {
+                let call = sparkflash_ops::calls::copy_rows(
+                    (output.0, stride),
+                    (stage.0, width),
+                    width,
+                    rows,
+                );
+                sparkflash_ops::roles::Launcher::launch(cx, copy, (call.grid, call.block), &call.args)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn outputs(&self) -> usize {
@@ -1469,7 +1498,7 @@ fn seg_blocks() -> usize {
         .max(1)
 }
 
-fn span(device: u64, len: usize) -> DeviceSpan {
+pub(super) fn span(device: u64, len: usize) -> DeviceSpan {
     DeviceSpan::new(device, len)
 }
 
@@ -2038,15 +2067,29 @@ impl DeviceLayer<'_> {
                 "rows layer {layer}: a split chunk reached a {name} block; the body projects whole rows (enable_prefill_sp)"
             ));
         }
-        let recurrent = rows
-            .recurrent
-            .as_ref()
-            .ok_or_else(|| format!("rows layer {layer}: the rows state carved no {name} rows"))?;
         let route = self.layer_dense(layer).recurrent.ok_or_else(|| {
             format!(
                 "rows layer {layer}: the {name} block has no dense format route (attach_dense_format)"
             )
         })?;
+        let (recurrent, segments) = self.recurrent_segments(rows, layer, (p0, n), name)?;
+        Ok((recurrent, route, segments))
+    }
+
+    /// The recurrent rows of `rows` and the pass's segments for layer `layer`'s recurrent block
+    /// over rows p0..p0+n: each sequence's conv history and state in its lane, and its snapshot
+    /// slots on a verify pass.
+    pub(super) fn recurrent_segments<'r>(
+        &self,
+        rows: &'r RowsState,
+        layer: usize,
+        (p0, n): (usize, usize),
+        name: &str,
+    ) -> Result<(&'r RecurrentRows, Vec<LaneSegment>), String> {
+        let recurrent = rows
+            .recurrent
+            .as_ref()
+            .ok_or_else(|| format!("rows layer {layer}: the rows state carved no {name} rows"))?;
         let block = recurrent_block(layer)?;
         let snapshots = match (self.keep_recurrent, recurrent.snapshots.as_ref()) {
             (false, _) => None,
@@ -2098,7 +2141,7 @@ impl DeviceLayer<'_> {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok((recurrent, route, segments))
+        Ok((recurrent, segments))
     }
 
     /// A Gated DeltaNet block: the previous layer's post and the entry seam
@@ -2282,6 +2325,7 @@ impl DeviceLayer<'_> {
             conv: *joined,
             decay: (vector(names.a_log)?, vector(names.dt_bias)?),
             norm: vector(names.norm)?,
+            hold: None,
         };
         self.run_layer_attn_seam(rows, layer, p0, n)?;
         let b = rows.b;
@@ -2927,7 +2971,7 @@ impl DeviceLayer<'_> {
 
     /// A layer's all-reduce of `n` rows: on the collective stream when `rows` is a paired bulk
     /// chunk ([RowsState::overlap]), else on the run's stream.
-    fn reduce_layer_rows(
+    pub(super) fn reduce_layer_rows(
         &self,
         rows: &RowsState,
         stage: &'static str,
@@ -5629,26 +5673,31 @@ impl DeviceLayer<'_> {
             || samplers.iter().all(|(other, _)| other.is_greedy());
         let b = rows.b;
         let dim = self.dim;
-        rows.hc_collapse(
-            self.cuda,
-            b.pre_mix,
-            b.stream,
-            b.lm_hidden,
-            tail.buffers.certified_count.0,
-            (1, n, 0),
-        )?;
-        let norm = sparkflash_kernels::rmsnorm_launch::RmsNormLaunchParams {
-            x: Deviceptr(b.lm_hidden),
-            weight: tail.norm_weight,
-            out: Deviceptr(b.lm_normed),
-            rows: n as u32,
-            cols: dim as u32,
-            eps: tail.eps,
-            trace_ring: 0,
-            layer_id: 0,
-            step_seq: 0,
-        };
-        sparkflash_kernels::rmsnorm_launch::launch(self.cuda, self.row_norm.1, &norm)?;
+        if rows.stated.is_some() {
+            // A stated stack folds its streams and norms them in its producer's types.
+            self.stated_head(rows, tail.norm_weight, tail.eps, n)?;
+        } else {
+            rows.hc_collapse(
+                self.cuda,
+                b.pre_mix,
+                b.stream,
+                b.lm_hidden,
+                tail.buffers.certified_count.0,
+                (1, n, 0),
+            )?;
+            let norm = sparkflash_kernels::rmsnorm_launch::RmsNormLaunchParams {
+                x: Deviceptr(b.lm_hidden),
+                weight: tail.norm_weight,
+                out: Deviceptr(b.lm_normed),
+                rows: n as u32,
+                cols: dim as u32,
+                eps: tail.eps,
+                trace_ring: 0,
+                layer_id: 0,
+                step_seq: 0,
+            };
+            sparkflash_kernels::rmsnorm_launch::launch(self.cuda, self.row_norm.1, &norm)?;
+        }
         let chunks = crate::tp4_tail::chunks_per_rank();
         let vocab = crate::plan::vocab_per_rank();
         let truncated: Vec<bool> = samplers.iter().map(|(s, _)| s.truncated()).collect();

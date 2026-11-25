@@ -1820,6 +1820,30 @@ pub struct KdaLayer<'a, L: ?Sized> {
     pub decay: (Deviceptr, Deviceptr),
     /// The gated norm's gains, BF16 a head's width.
     pub norm: Deviceptr,
+    /// The rounding a producer's BF16 types take ([round_bf16]'s kernel), or none for f32
+    /// values: with it the conv's SiLU, beta, the delta rule's output and the gated norm's
+    /// output are each rounded to BF16 where the producer returns them in that type
+    /// (`modeling_glm5_next.py` 357-391); the decay and the state stay f32.
+    pub hold: Option<Bound>,
+}
+
+/// Rounds `count` f32 values at `values` to BF16 in place on `kernel`
+/// ([crate::tiled::TiledProjection::rounding]), round to nearest even.
+///
+/// # Errors
+/// The driver's refusal.
+pub fn round_bf16<C: Launcher + ?Sized>(
+    cx: &C,
+    kernel: Bound,
+    values: Deviceptr,
+    count: usize,
+) -> Result<(), BackendError> {
+    let blocks = count.div_ceil(BLOCK as usize).clamp(1, 65_535) as u32;
+    cx.launch(
+        kernel,
+        ((blocks, 1, 1), (BLOCK, 1, 1)),
+        &[values.0, count as u64],
+    )
 }
 
 impl<L: ?Sized> KdaLayer<'_, L> {
@@ -1868,6 +1892,11 @@ impl<L: ?Sized> KdaLayer<'_, L> {
             };
             chunk.conv.run(cx, &rows_in, conv, segment.rows, windows)?;
         }
+        let hold = |values: Deviceptr, floats: usize| match self.hold {
+            Some(kernel) => round_bf16(cx, kernel, values, floats),
+            None => Ok(()),
+        };
+        hold(rows.mixed, count * width)?;
         cx.project(self.forget.1, rows.f_a, rows.forget, count)?;
         cx.project(self.gate.1, rows.g_a, rows.gate, count)?;
         chunk.decay(
@@ -1885,6 +1914,8 @@ impl<L: ?Sized> KdaLayer<'_, L> {
             (rows.qk, rows.decay_beta),
             count,
         )?;
+        // Each head's (1, beta): the 1 is exact in BF16.
+        hold(rows.decay_beta, count * 2 * geometry.heads)?;
         let qk_row = geometry.key_heads * crate::gdn::gdn_qk_row(geometry.key_dim) * 4;
         for segment in cx.segments() {
             let (_, state, (_, states)) = state(&segment)?;
@@ -1905,6 +1936,7 @@ impl<L: ?Sized> KdaLayer<'_, L> {
                 states,
             )?;
         }
+        hold(rows.attended, count * geometry.value_width())?;
         chunk.gate.run(
             cx,
             (rows.attended, rows.gate, self.norm, rows.attended),
@@ -1912,6 +1944,7 @@ impl<L: ?Sized> KdaLayer<'_, L> {
             (eps, true),
             count,
         )?;
+        hold(rows.attended, count * geometry.value_width())?;
         cx.project(self.out, rows.attended, output, count)
     }
 }

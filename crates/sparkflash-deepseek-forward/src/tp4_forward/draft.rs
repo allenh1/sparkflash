@@ -850,10 +850,14 @@ impl DeviceLayer<'_> {
     pub(super) fn draft_seed(
         &self,
         rows: &RowsState,
-        draft: &DraftState,
+        draft: Option<&DraftState>,
         p0: usize,
         n: usize,
     ) -> Result<(), String> {
+        // A release without a drafter seeds nothing.
+        let Some(draft) = draft else {
+            return Ok(());
+        };
         let b = rows.b;
         let dim = self.dim;
         if n == 0 || n > rows.cap || p0 + n > self.max_positions {

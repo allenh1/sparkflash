@@ -11841,6 +11841,9 @@ struct DeviceLayer<'a> {
     /// uploaded once at open by `attach_engram`. `None` on a run with no Engram layer, and
     /// `engram_write` then no-ops for every layer (there is no row to write).
     engram: Option<EngramDevice>,
+    /// A stated stack's device state (shared bodies and block tensors), set by `attach_stated`;
+    /// `None` for the release.
+    stated: Option<stated::StatedDevice>,
     /// This layer's staged ratio>0 seam weights, set by the loop before `run_layer` (the run scope's
     /// `SeamDevice` owns them; the device arm only borrows the pointers). `None` on ratio-0 layers and
     /// on layers the source did not serve. Distinct from `seam_weights` above, which is the host
@@ -13116,6 +13119,7 @@ impl<'a> DeviceLayer<'a> {
             dense_format: Vec::new(),
             moe_router_seen: 0,
             engram: None,
+            stated: None,
             seam_staged: None,
             seam_ring: None,
             index_verify_last: std::cell::Cell::new(None),
@@ -15534,6 +15538,9 @@ impl Drop for DeviceLayer<'_> {
         // The Engram stage's arena, constant matrices, scratch and six module handles.
         if let Some(engram) = self.engram.take() {
             engram.release(self.cuda);
+        }
+        if let Some(stated) = self.stated.take() {
+            stated.release(self.cuda);
         }
         if let Some(mut ring) = self.seam_ring.take() {
             // With lanes the rings, stores and keys are the selected lane's, inside the lanes'
@@ -18471,6 +18478,14 @@ fn run_forward_loop(
             })?;
             device.attach_seam_pool(pool_dir)?;
         }
+        // A stated stack's walk reads its tensors from the arena and the routed slices just
+        // attached.
+        if crate::plan::stated_stack() {
+            let (arena, _) = bound
+                .as_ref()
+                .ok_or("layer device: a stated stack's walk needs the bound arena")?;
+            device.attach_stated(arena)?;
+        }
         // The Engram write stage's run-scope state: the arena, the constant matrices and the six
         // symbols, all uploaded/loaded here so the first position's clock sees no setup work.
         if let Some(host) = engram_host.as_ref() {
@@ -18612,7 +18627,19 @@ fn run_forward_loop(
         // plan's own fact (5 on the released model, 2 on the synthetic second shape), and a
         // second shape that declares no depth used to inherit the released 5 and be refused by
         // its own plan.
-        let k = crate::plan::draft_depth(sparkflash_model::active_profile().speculation.dspark_k)?;
+        // A release whose plan declares no draft block (GLM-5.3-Flash) serves with no drafter:
+        // every decode step is plain, and a profile that asks for a draft depth is refused.
+        let drafting = crate::plan::dspark_block_size() > 0;
+        let stated_k = sparkflash_model::active_profile().speculation.dspark_k;
+        let k = match (drafting, stated_k) {
+            (true, _) => crate::plan::draft_depth(stated_k)?,
+            (false, None) => 0,
+            (false, Some(asked)) => {
+                return Err(format!(
+                    "SPARKFLASH_DSPARK_K={asked}: this release declares no DSpark drafter"
+                ));
+            }
+        };
         if k + 1 > rows::R_MAX {
             return Err(format!(
                 "SPARKFLASH_DSPARK_K={k}: a pass holds {rows} rows",
@@ -18638,10 +18665,18 @@ fn run_forward_loop(
             bulk_more: &[],
         };
         let counter = Cell::new(0u64);
-        let noise = spec::gather_rows(&cuda, &inputs, &counter, &[config.dspark_noise_token_id])?;
-        let drafter = draft::DraftState::open(device, arena, dir, noise)?;
-        let (tap_kernel, sink) = drafter.tap_sink();
-        rows.taps = Some((tap_kernel, sink, config.dspark_target_layer_ids.clone()));
+        let drafter = if drafting {
+            let noise =
+                spec::gather_rows(&cuda, &inputs, &counter, &[config.dspark_noise_token_id])?;
+            Some(draft::DraftState::open(device, arena, dir, noise)?)
+        } else {
+            None
+        };
+        let tap_kernel = drafter.as_ref().map(|drafter| {
+            let (tap_kernel, sink) = drafter.tap_sink();
+            rows.taps = Some((tap_kernel, sink, config.dspark_target_layer_ids.clone()));
+            tap_kernel
+        });
         // The bulk prefill's rows state, [prefill_chunk] rows per chunk.
         let chunk = prefill_chunk();
         // `sparkflash serve --tp4-device` installs a link before the epoch: serve its requests
@@ -18668,7 +18703,7 @@ fn run_forward_loop(
         if lane_count > 0 {
             device.attach_lanes(&lanes::LaneGeometry {
                 count: lane_count,
-                draft_ring_rows: drafter.ring_rows(),
+                draft_ring_rows: drafter.as_ref().map_or(0, draft::DraftState::ring_rows),
                 engram_rows: chunk.max(rows::R_MAX),
             })?;
         }
@@ -18733,6 +18768,9 @@ fn run_forward_loop(
             })?;
         }
         for state in bulk_rows.iter_mut().chain(more_rows.iter_mut()) {
+            let Some(tap_kernel) = tap_kernel else {
+                break;
+            };
             let taps = state.bulk.as_ref().map_or(0, |bulk| bulk.taps);
             state.taps = Some((tap_kernel, taps, config.dspark_target_layer_ids.clone()));
         }
@@ -18747,16 +18785,20 @@ fn run_forward_loop(
             .unwrap_or(usize::MAX);
         match (link, walk) {
             (Some(mut link), _) => {
-                spec::serve(device, rows, &drafter, &inputs, k, link.as_mut())?;
+                spec::serve(device, rows, drafter.as_ref(), &inputs, k, link.as_mut())?;
             }
-            (None, Some(walk)) => spec::serve_walk(device, rows, &drafter, &inputs, k, &walk)?,
-            (None, None) => spec::run_spec(device, rows, &drafter, &inputs, k, max_new)?,
+            (None, Some(walk)) => {
+                spec::serve_walk(device, rows, drafter.as_ref(), &inputs, k, &walk)?;
+            }
+            (None, None) => spec::run_spec(device, rows, drafter.as_ref(), &inputs, k, max_new)?,
         }
         device.release_vision();
         if let Some(table) = device.embed_table.take() {
             cuda.free_buffers(&[&Deviceptr(table)]);
         }
-        drafter.release(&cuda);
+        if let Some(drafter) = drafter {
+            drafter.release(&cuda);
+        }
         if let Some(state) = bulk_rows.take() {
             state.release(&cuda);
         }

@@ -72,7 +72,15 @@ struct Offsets {
     /// Per layer, a Gated DeltaNet block's (conv history, state), each touched whole; `None` at
     /// every other block.
     recurrent: Vec<Option<(usize, usize)>>,
+    /// Per layer, a stated absorbed MLA block's regions ([ABSORBED_REGIONS]), position-addressed;
+    /// `None` at every other block.
+    absorbed: Vec<Option<[usize; ABSORBED_REGIONS]>>,
 }
+
+/// A stated absorbed MLA block's lane regions, in the bodies' order: the latent cache and its
+/// block scales ([sparkflash_ops::roles::AbsorbedMla]), then the pooled indexer's keys, gates and
+/// pooled keys ([sparkflash_ops::roles::PooledIndexer]).
+pub(super) const ABSORBED_REGIONS: usize = 5;
 
 /// One lane's device pointers, as the DeviceLayer fields hold them.
 #[derive(Clone, Debug)]
@@ -86,6 +94,7 @@ pub(super) struct LanePointers {
     pub(super) draft: Vec<(u64, u64)>,
     pub(super) grouped: Vec<Option<(u64, u64)>>,
     pub(super) recurrent: Vec<Option<(u64, u64)>>,
+    pub(super) absorbed: Vec<Option<[u64; ABSORBED_REGIONS]>>,
 }
 
 /// The host counters of a lane's device state, swapped in and out with its pointers.
@@ -169,6 +178,11 @@ impl Lanes<'_> {
                 .recurrent
                 .iter()
                 .map(|part| part.map(|(history, state)| (at(history), at(state))))
+                .collect(),
+            absorbed: o
+                .absorbed
+                .iter()
+                .map(|part| part.map(|regions| regions.map(at)))
                 .collect(),
         }
     }
@@ -386,6 +400,19 @@ impl<'a> DeviceLayer<'a> {
                 ));
             }
         }
+        // A stated absorbed MLA block's latent cache (f32 a latent column) and its E4M3 block
+        // scales, then its pooled indexer's keys, gates and pooled keys (f32 a key column), each
+        // a row a position and backed as far as the lane's positions reach.
+        let mut absorbed = vec![None; layers];
+        for (layer, widths) in super::stated::absorbed_regions()? {
+            let slot = absorbed
+                .get_mut(layer)
+                .ok_or_else(|| format!("lanes: absorbed block {layer} of {layers} layers"))?;
+            *slot = Some(widths.map(|width| {
+                let row_bytes = (width * 4).max(4);
+                layout.part(self.max_positions * row_bytes, row_bytes, 0)
+            }));
+        }
         // A Gated DeltaNet block's conv history and state, each a sequence's whole, then one
         // checkpoint arena for them all: nothing at all for a stack with no recurrent block.
         let mut recurrent = vec![None; layers];
@@ -416,6 +443,7 @@ impl<'a> DeviceLayer<'a> {
             draft,
             grouped,
             recurrent,
+            absorbed,
         };
 
         // The single sequence's state goes before the lanes take memory.

@@ -330,12 +330,13 @@ impl TiledProjection {
         values: Deviceptr,
         count: usize,
     ) -> Result<(), BackendError> {
-        let blocks = count.div_ceil(BLOCK as usize).clamp(1, 65_535) as u32;
-        cx.launch(
-            self.hold,
-            ((blocks, 1, 1), (BLOCK, 1, 1)),
-            &[values.0, count as u64],
-        )
+        crate::roles::round_bf16(cx, self.hold, values, count)
+    }
+
+    /// The loaded rounding kernel [Self::hold] launches, for a body that rounds its own values.
+    #[must_use]
+    pub const fn rounding(&self) -> Bound {
+        self.hold
     }
 
     /// The tiled GEMV over up to [GEMV_GROUP_ROWS] rows a launch, a group of [GEMV_MAX_BATCH]

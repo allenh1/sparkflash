@@ -2047,7 +2047,7 @@ pub(super) fn cut_step(
 pub(super) fn generate(
     device: &mut DeviceLayer<'_>,
     rows: &RowsState,
-    draft: &DraftState,
+    draft: Option<&DraftState>,
     inputs: &SpecInputs<'_>,
     k: usize,
     request: &SpecRequest<'_>,
@@ -2065,7 +2065,7 @@ pub(super) fn generate(
 pub(super) fn run_spec(
     device: &mut DeviceLayer<'_>,
     rows: &RowsState,
-    draft: &DraftState,
+    draft: Option<&DraftState>,
     inputs: &SpecInputs<'_>,
     k: usize,
     max_new: usize,
@@ -2156,7 +2156,7 @@ fn sampler_from_env() -> Result<Sampler, String> {
 pub(super) fn serve(
     device: &mut DeviceLayer<'_>,
     rows: &RowsState,
-    draft: &DraftState,
+    draft: Option<&DraftState>,
     inputs: &SpecInputs<'_>,
     k: usize,
     link: &mut dyn DeviceLink,
@@ -2181,7 +2181,7 @@ pub(super) fn serve(
 pub(super) fn serve_walk(
     device: &mut DeviceLayer<'_>,
     rows: &RowsState,
-    draft: &DraftState,
+    draft: Option<&DraftState>,
     inputs: &SpecInputs<'_>,
     k: usize,
     walk: &std::sync::mpsc::Receiver<crate::device_link::WalkRequest>,

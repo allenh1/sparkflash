@@ -89,6 +89,52 @@ pub const fn narrow(dst: u64, src: u64, count: usize) -> Call<3> {
     flat(count, [dst, src, count as u64])
 }
 
+/// `q4e_copy_rows`: `rows` rows of `width` floats, `src_stride` floats apart in `src`, into
+/// rows `dst_stride` apart in `dst`.
+#[must_use]
+pub const fn copy_rows(
+    (dst, dst_stride): (u64, usize),
+    (src, src_stride): (u64, usize),
+    width: usize,
+    rows: usize,
+) -> Call<6> {
+    Call {
+        grid: (flat_blocks(width), rows as u32, 1),
+        block: (BLOCK, 1, 1),
+        args: [
+            dst,
+            src,
+            rows as u64,
+            width as u64,
+            dst_stride as u64,
+            src_stride as u64,
+        ],
+    }
+}
+
+/// `q4e_swiglu_held`: [swiglu_clamped] in the producer's BF16 types, the activation and the
+/// product each rounded to BF16 (`limit` 0 clamps nothing).
+#[must_use]
+pub const fn swiglu_held(gate: u64, up: u64, out: u64, count: usize, limit: f32) -> Call<5> {
+    flat(count, [gate, up, out, count as u64, limit.to_bits() as u64])
+}
+
+/// `q4e_combine_held`: `rows` tokens' `topk` held expert outputs `y` ([rows][topk][dim]) times
+/// their BF16 weights, summed in slot order, rounded and added to the held `shared` output, as
+/// BF16 words at `out`.
+#[must_use]
+pub const fn combine_held(
+    (y, weights, shared): (u64, u64, u64),
+    out: u64,
+    (rows, topk, dim): (usize, usize, usize),
+) -> Call<6> {
+    Call {
+        grid: (flat_blocks(dim), rows as u32, 1),
+        block: (BLOCK, 1, 1),
+        args: [y, weights, shared, out, dim as u64, topk as u64],
+    }
+}
+
 /// `q4e_zero`: `count` floats of `dst` set to zero.
 #[must_use]
 pub const fn zero(dst: u64, count: usize) -> Call<2> {

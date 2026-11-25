@@ -456,7 +456,8 @@ struct PrefillReads<'r> {
 pub(super) struct Batch<'b, 'a, 'r> {
     device: &'b mut DeviceLayer<'a>,
     rows: &'b RowsState,
-    draft: &'b DraftState,
+    /// The drafter, or none for a release without one: every decode step is then plain.
+    draft: Option<&'b DraftState>,
     inputs: &'b SpecInputs<'r>,
     pools: &'b Pools<'r>,
     k: usize,
@@ -516,7 +517,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     pub(super) fn new(
         device: &'b mut DeviceLayer<'a>,
         rows: &'b RowsState,
-        draft: &'b DraftState,
+        draft: Option<&'b DraftState>,
         inputs: &'b SpecInputs<'r>,
         pools: &'b Pools<'r>,
         k: usize,
@@ -671,6 +672,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         }
         ledger.set(Strategy::PromptParts, Mode::native(parts));
         let depth = super::spec::depth_policy(self.k);
+        if self.draft.is_none() {
+            ledger.drafting(None, false, false);
+            return self.ledger_rest(ledger);
+        }
         ledger.drafting(
             Some(format!(
                 "DSpark, up to {} drafts, {} depth",
@@ -697,6 +702,12 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 ),
             },
         );
+        self.ledger_rest(ledger)
+    }
+
+    /// The ledger's entries past the drafting ones: prefix reuse and the group.
+    fn ledger_rest(&self, mut ledger: sparkflash_runtime::Ledger) -> sparkflash_runtime::Ledger {
+        use sparkflash_runtime::{Mode, Strategy};
         ledger.set(
             Strategy::PrefixReuse,
             if self.reuse {
@@ -2314,6 +2325,14 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             R_MAX,
         ) {
             DecodePlan::None => return Ok(0),
+            // A release without a drafter decodes every sequence on the plain step.
+            DecodePlan::Spec | DecodePlan::Shared if self.draft.is_none() => {
+                let mut rows = 0;
+                for group in decoding.chunks(R_MAX) {
+                    rows += self.plain_step(group, out, &mut *ahead)?;
+                }
+                (rows, "plain")
+            }
             DecodePlan::Spec => (self.spec_step(decoding[0], out, ahead)?, "spec"),
             DecodePlan::Plain { .. } => {
                 let mut rows = 0;
@@ -2366,7 +2385,8 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         out: &mut Vec<Emission>,
         ahead: Ahead<'_>,
     ) -> Result<usize, String> {
-        let (rows, inputs, draft, k) = (self.rows, self.inputs, self.draft, self.k);
+        let (rows, inputs, k) = (self.rows, self.inputs, self.k);
+        let draft = self.draft.ok_or("decode: a speculative step needs the drafter")?;
         let lane = self.seqs[index].lane.ok_or("decode: no lane")?;
         self.enter(lane)?;
         let (id, pos) = (self.seqs[index].id, self.seqs[index].pos);
@@ -2581,7 +2601,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             self.device.commit_recurrent(rows, lane, m)?;
         }
         self.device.rewind_rows(pos + m + 1);
-        self.device.draft_seed(rows, draft, pos, m + 1)?;
+        self.device.draft_seed(rows, Some(draft), pos, m + 1)?;
         self.seqs[index].pos = pos + m + 1;
         self.read_ahead(index)?;
         let seq = &mut self.seqs[index];
@@ -2823,7 +2843,8 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     /// passes of up to [DraftState::pass_seqs] blocks ([DeviceLayer::draft_blocks]): the drafts
     /// and the drafter's probability of each.
     fn draft_group(&mut self, group: &[usize], depth: usize) -> Result<Vec<Drafted>, String> {
-        let (rows, inputs, draft) = (self.rows, self.inputs, self.draft);
+        let (rows, inputs) = (self.rows, self.inputs);
+        let draft = self.draft.ok_or("decode: a shared step needs the drafter")?;
         let blocks = group
             .iter()
             .map(|&index| {
