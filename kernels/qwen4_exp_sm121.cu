@@ -2382,6 +2382,17 @@ extern "C" __global__ void q4e_copy_flat(float* __restrict__ dst, const float* _
     }
 }
 
+// dst[i] = bf16(src[i]) for count floats, round to nearest even: a module's f32 output narrowed
+// to the BF16 words a reader of the producer's BF16 output takes (the base's reduce wire).
+extern "C" __global__ void q4e_narrow_bf16(__nv_bfloat16* __restrict__ dst,
+                                            const float* __restrict__ src, int count) {
+    OPT_PDL_ENTRY();
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
+         index += blockDim.x * gridDim.x) {
+        dst[index] = __float2bfloat16_rn(src[index]);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // GLM-5.3-Flash: the kernels its device arm (sparkflash-model-glm5-next) adds to the ones above.
 //

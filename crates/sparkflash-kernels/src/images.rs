@@ -219,6 +219,7 @@ impl Image {
                 "q4e_argmax_prob_slices",
                 "q4e_argmax_slices",
                 "q4e_copy_flat",
+                "q4e_narrow_bf16",
                 "q4e_decode_f8e4m3",
                 "q4e_deinterleave",
                 "q4e_embed",

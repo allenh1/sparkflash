@@ -1128,7 +1128,7 @@ impl RowsState {
         use sparkflash_ops::roles::SwiGluBody;
         RowsSwiGlu(self.kernels.swiglu)
             .swiglu(
-                &RowsCx::new(cuda, inter, None),
+                &RowsCx::<RouteLinear>::new(cuda, inter, None),
                 (Deviceptr(gate), Deviceptr(up), Deviceptr(out)),
                 inter,
                 (limit > 0.0).then_some(limit),
@@ -1186,22 +1186,122 @@ pub(super) struct RouteLinear {
     pub(super) io: sparkflash_kernels::dense_format::DenseIo,
 }
 
+/// A projection the rows path runs ([sparkflash_ops::roles::DeviceCx::Linear]): the dense
+/// format route ([RouteLinear]) or the tiled projection ([TiledLinear]).
+pub(super) trait RowsLinear {
+    /// `output` rows `stride` floats apart from `rows` input rows, on `cx`'s stream.
+    ///
+    /// # Errors
+    /// A stride the projection does not write, or the driver's refusal.
+    fn project_rows(
+        &self,
+        cx: &RowsCx<'_, Self>,
+        input: Deviceptr,
+        output: (Deviceptr, usize),
+        rows: usize,
+    ) -> Result<(), sparkflash_model::backend::BackendError>
+    where
+        Self: Sized;
+
+    /// The output row's floats, the stride [sparkflash_ops::roles::DeviceCx::project] writes.
+    fn outputs(&self) -> usize;
+}
+
+impl RowsLinear for RouteLinear {
+    fn project_rows(
+        &self,
+        cx: &RowsCx<'_, Self>,
+        input: Deviceptr,
+        (output, stride): (Deviceptr, usize),
+        rows: usize,
+    ) -> Result<(), sparkflash_model::backend::BackendError> {
+        use sparkflash_kernels::dense_format::{DenseGroups, DenseRows};
+        self.route
+            .project(
+                cx.cuda,
+                self.io,
+                &self.matrix,
+                &DenseRows {
+                    a: input.0,
+                    a_stride: self.matrix.inner,
+                    out: output.0,
+                    out_stride: stride,
+                    tokens: rows,
+                },
+                DenseGroups::ONE,
+            )
+            .map_err(|error| {
+                sparkflash_model::backend::BackendError::new(ROWS_CX, error.to_string())
+            })
+    }
+
+    fn outputs(&self) -> usize {
+        self.matrix.cols
+    }
+}
+
+/// One of this rank's projections on the tiled projection ([sparkflash_ops::tiled]): the body
+/// a release with dynamic FP8 activations runs, the rank's matrix, and whether the outputs are
+/// rounded to BF16 (`held`) and keep the row GEMV's bits past its batch (`exact`). f32 rows in
+/// and out, packed.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TiledLinear<'a> {
+    pub(super) body: &'a sparkflash_ops::tiled::TiledProjection,
+    pub(super) scratch: &'a sparkflash_ops::tiled::TiledScratch,
+    pub(super) matrix: sparkflash_ops::tiled::TiledMatrix,
+    pub(super) exact: bool,
+    pub(super) held: bool,
+}
+
+impl RowsLinear for TiledLinear<'_> {
+    fn project_rows(
+        &self,
+        cx: &RowsCx<'_, Self>,
+        input: Deviceptr,
+        (output, stride): (Deviceptr, usize),
+        rows: usize,
+    ) -> Result<(), sparkflash_model::backend::BackendError> {
+        if stride != self.matrix.rows {
+            return Err(sparkflash_model::backend::BackendError::new(
+                ROWS_CX,
+                format!(
+                    "a body asked for {} tiled outputs {stride} floats apart; the tiled projection writes packed rows",
+                    self.matrix.rows
+                ),
+            ));
+        }
+        self.body.project(
+            cx,
+            self.scratch,
+            &self.matrix,
+            (input, output),
+            rows,
+            (self.exact, self.held),
+        )
+    }
+
+    fn outputs(&self) -> usize {
+        self.matrix.rows
+    }
+}
+
 /// The rows path as a role body's device ([sparkflash_ops::roles::DeviceCx]): the run's stream,
-/// the pass's rows, this rank's share, and the dense format route as its projection
-/// ([RouteLinear]).
+/// the pass's rows, this rank's share, and its projection (`L`, a [RowsLinear]: the dense
+/// format route for the release).
 ///
 /// The base sums a part's partials itself, through its own reduce on the BF16 wire, so
 /// [sparkflash_ops::roles::DeviceCx::sum] refuses by name. A pass's segments are the step's
 /// sequences with the part's regions in each one's lane ([LaneSegment]); a stateless body's pass
 /// has none.
-pub(super) struct RowsCx<'c> {
+pub(super) struct RowsCx<'c, L = RouteLinear> {
     cuda: &'c Cuda,
     rows: usize,
     share: Option<sparkflash_model::TpPlan>,
     segments: &'c [LaneSegment],
+    linear: std::marker::PhantomData<fn(&L)>,
 }
 
-impl<'c> RowsCx<'c> {
+impl<'c, L> RowsCx<'c, L> {
     pub(super) fn new(
         cuda: &'c Cuda,
         rows: usize,
@@ -1212,6 +1312,7 @@ impl<'c> RowsCx<'c> {
             rows,
             share,
             segments: &[],
+            linear: std::marker::PhantomData,
         }
     }
 
@@ -1233,7 +1334,7 @@ pub(super) struct LaneSegment {
     pub(super) snapshots: Vec<Deviceptr>,
 }
 
-impl sparkflash_ops::roles::Launcher for RowsCx<'_> {
+impl<L> sparkflash_ops::roles::Launcher for RowsCx<'_, L> {
     fn launch(
         &self,
         kernel: impl Into<Kernel>,
@@ -1247,8 +1348,8 @@ impl sparkflash_ops::roles::Launcher for RowsCx<'_> {
     }
 }
 
-impl sparkflash_ops::roles::DeviceCx for RowsCx<'_> {
-    type Linear = RouteLinear;
+impl<L: RowsLinear> sparkflash_ops::roles::DeviceCx for RowsCx<'_, L> {
+    type Linear = L;
 
     fn rows(&self) -> usize {
         self.rows
@@ -1272,58 +1373,22 @@ impl sparkflash_ops::roles::DeviceCx for RowsCx<'_> {
 
     fn project(
         &self,
-        linear: &RouteLinear,
+        linear: &L,
         input: Deviceptr,
         output: Deviceptr,
         rows: usize,
     ) -> Result<(), sparkflash_model::backend::BackendError> {
-        use sparkflash_kernels::dense_format::{DenseGroups, DenseRows};
-        linear
-            .route
-            .project(
-                self.cuda,
-                linear.io,
-                &linear.matrix,
-                &DenseRows {
-                    a: input.0,
-                    a_stride: linear.matrix.inner,
-                    out: output.0,
-                    out_stride: linear.matrix.cols,
-                    tokens: rows,
-                },
-                DenseGroups::ONE,
-            )
-            .map_err(|error| {
-                sparkflash_model::backend::BackendError::new(ROWS_CX, error.to_string())
-            })
+        linear.project_rows(self, input, (output, linear.outputs()), rows)
     }
 
     fn project_strided(
         &self,
-        linear: &RouteLinear,
+        linear: &L,
         input: Deviceptr,
         (output, stride): (Deviceptr, usize),
         rows: usize,
     ) -> Result<(), sparkflash_model::backend::BackendError> {
-        use sparkflash_kernels::dense_format::{DenseGroups, DenseRows};
-        linear
-            .route
-            .project(
-                self.cuda,
-                linear.io,
-                &linear.matrix,
-                &DenseRows {
-                    a: input.0,
-                    a_stride: linear.matrix.inner,
-                    out: output.0,
-                    out_stride: stride,
-                    tokens: rows,
-                },
-                DenseGroups::ONE,
-            )
-            .map_err(|error| {
-                sparkflash_model::backend::BackendError::new(ROWS_CX, error.to_string())
-            })
+        linear.project_rows(self, input, (output, stride), rows)
     }
 
     fn sum(

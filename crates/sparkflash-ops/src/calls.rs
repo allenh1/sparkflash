@@ -83,6 +83,12 @@ pub const fn copy(dst: u64, src: u64, count: usize) -> Call<3> {
     flat(count, [dst, src, count as u64])
 }
 
+/// `q4e_narrow_bf16`: `count` floats from `src` narrowed to BF16 words at `dst`.
+#[must_use]
+pub const fn narrow(dst: u64, src: u64, count: usize) -> Call<3> {
+    flat(count, [dst, src, count as u64])
+}
+
 /// `q4e_zero`: `count` floats of `dst` set to zero.
 #[must_use]
 pub const fn zero(dst: u64, count: usize) -> Call<2> {

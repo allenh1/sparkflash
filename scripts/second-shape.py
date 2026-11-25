@@ -85,6 +85,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = ROOT / "crates/sparkflash-deepseek-forward/tests/fixtures/second-shape/config.json"
+# GLM-5.3-Flash's architecture at small widths (the base host's described-GLM fixture): KDA
+# blocks split by heads, absorbed NoPE MLA with the pooled indexer, a dense prefix, the
+# noaux_tc router, FP8 128 x 128 tiles with f32 scales on dynamic activations, and the MTP layer.
+GLM_FIXTURE = ROOT / "crates/sparkflash-model-deepseek-v41/tests/fixtures/glm-tiny/config.json"
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 # The end-of-sequence id the configuration names; the host reference stops after writing it.
 # The alternatives a reference capture records at each position (the served token included).
@@ -101,6 +105,11 @@ VARIANT_PROMPTS = {
     "gdn-dense": PROMPTS + [PROMPTS[2] + [306, 307, 308]],
     "gdn-decoder": [_LONG_A, _LONG_B, _LONG_A + [6000 + index for index in range(20)]],
     "kda-dense": PROMPTS + [PROMPTS[2] + [306, 307, 308]],
+    # Past the indexer's budget (top 8 of pools of 4) so the selection drops pools, and one that
+    # extends the last so the group serves it from the kept KDA state.
+    "glm": PROMPTS
+    + [[400 + (index * 5) % 100 for index in range(40)]]
+    + [[400 + (index * 5) % 100 for index in range(40)] + [306, 307, 308]],
 }
 
 
@@ -215,6 +224,8 @@ STORED_FORMATS = {
     # The same Gated DeltaNet as the last block, above the encoder layers, with its compress
     # ratio 0 (a recurrent block compresses nothing) and the fixture's MoE; the stack below it is
     # the fixture's.
+    # GLM-5.3-Flash's own fixture, as its release stores it (GLM_FIXTURE).
+    "glm": {"fixture": "glm"},
     "gdn-decoder": {
         "quant_method": "bf16",
         "scale_fmt": "ue8m0",
@@ -342,8 +353,12 @@ def summarise(outcomes: list[tuple[int, bool, str]]) -> int:
 
 def variant_config(name: str, out: Path) -> Path:
     """Write the fixture's configuration with the variant's stored format, and return its path."""
-    document = json.loads(FIXTURE.read_text())
     declared = STORED_FORMATS[name]
+    if declared is not None and declared.get("fixture") == "glm":
+        path = out / f"config-{name}.json"
+        path.write_text(GLM_FIXTURE.read_text())
+        return path
+    document = json.loads(FIXTURE.read_text())
     if declared is not None:
         declared = dict(declared)
         block = declared.pop("block", None)

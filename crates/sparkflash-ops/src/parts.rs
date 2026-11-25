@@ -1332,6 +1332,7 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("q4e_zero", &[Precision::Bf16, Precision::F32]),
             // A flat copy of an f32 state or widened-stream region.
             sym("q4e_copy_flat", &[Precision::F32]),
+            sym("q4e_narrow_bf16", &[Precision::Bf16]),
         ],
         false,
     ),
