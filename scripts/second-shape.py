@@ -131,6 +131,25 @@ STORED_FORMATS = {
         "expert_dtype": "fp4",
         "text_config": {"first_k_dense_replace": 1, "intermediate_size": 1024},
     },
+    # A foreign token mixer: the first block's attention grouped-query (32 query heads over 8
+    # key/value heads, 128 wide, the stack's unscaled rope_theta over every float) and its FFN
+    # the dense-mlp variant's gated MLP, on the BF16 dense route. The stack after it is the
+    # fixture's MLA.
+    "gqa-dense": {
+        "quant_method": "bf16",
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+        "text_config": {
+            "first_k_dense_replace": 1,
+            "intermediate_size": 1024,
+            "layer_types": ["gqa_attention"] + ["compressed_attention"] * 7,
+            "gqa_attn_config": {
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+            },
+        },
+    },
 }
 
 
