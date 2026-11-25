@@ -316,7 +316,15 @@ def rank_failure(logs: Path | None) -> str | None:
         except OSError:
             continue
         for line in text.splitlines():
-            if "device_failure" in line or "panicked at" in line:
+            if any(
+                mark in line
+                for mark in (
+                    "device_failure",
+                    "panicked at",
+                    "forward refused on rank",
+                    "the server cannot answer",
+                )
+            ):
                 return f"{log.name}: {line.strip()}"
     return None
 
