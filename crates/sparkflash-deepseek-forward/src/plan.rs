@@ -1635,13 +1635,24 @@ const FUSED_PARTS: [Part; 8] = [
 /// Whether the base runs `part` on its own, outside the fused halves: the MLA attention (its
 /// entry seam, its sublayers and its post), the grouped-query attention (the same entry seam, the
 /// shared [sparkflash_ops::roles::GqaLayer] body and the base's reduce), the Gated DeltaNet scan
-/// (the same seam, the shared [sparkflash_ops::roles::GdnLayer] body and the reduce) and the dense
-/// gated MLP (its seam, the shared [sparkflash_ops::roles::GatedMlp] body and its post).
+/// (the same seam, the shared [sparkflash_ops::roles::GdnLayer] body and the reduce), the dense
+/// gated MLP (its seam, the shared [sparkflash_ops::roles::GatedMlp] body and its post) and the
+/// MoE (the fused block's FFN half: its seam folds the attention part's post, so an attention
+/// part runs before it).
 #[must_use]
 pub const fn runs_alone(part: Part) -> bool {
     matches!(
         part,
-        Part::MlaAttention | Part::GqaAttention | Part::GdnScan | Part::DenseMlp
+        Part::MlaAttention | Part::GqaAttention | Part::GdnScan | Part::DenseMlp | Part::Moe
+    )
+}
+
+/// Whether `part` is an attention part: the mixer an FFN part's seam folds the post of.
+#[must_use]
+pub const fn is_attention(part: Part) -> bool {
+    matches!(
+        part,
+        Part::MlaAttention | Part::GqaAttention | Part::GdnScan
     )
 }
 
@@ -1722,6 +1733,17 @@ pub fn language_steps(plan: &EnginePlan) -> Result<Vec<BlockSteps>, ConfigError>
             // compression or indexer sublayer belongs to the attention part; outside the halves
             // each part must run alone, and the first one that cannot names the refusal.
             let mut parts = Vec::new();
+            if has(Part::Moe)
+                && !block
+                    .parts
+                    .iter()
+                    .any(|instance| is_attention(instance.part))
+            {
+                return Err(format!(
+                    "forward open: block {} carries the Moe part: its FFN half folds an attention part's post, and the block carries no attention part",
+                    block.index
+                ));
+            }
             for instance in &block.parts {
                 let sublayer = matches!(instance.part, Part::Csa2Compression | Part::SparseIndexer);
                 if absorbed(instance.part) && (!sublayer || has(Part::MlaAttention)) {
@@ -1729,9 +1751,6 @@ pub fn language_steps(plan: &EnginePlan) -> Result<Vec<BlockSteps>, ConfigError>
                 }
                 if !runs_alone(instance.part) {
                     let why = match instance.part {
-                        Part::Moe if !has(Part::MlaAttention) => {
-                            "the MoE part runs only inside the fused attention/FFN seam, which needs the MlaAttention part beside it"
-                        }
                         Part::Csa2Compression | Part::SparseIndexer if !has(Part::MlaAttention) => {
                             "the sublayer belongs to an MlaAttention part the block does not carry"
                         }

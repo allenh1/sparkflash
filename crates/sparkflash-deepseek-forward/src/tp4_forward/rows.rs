@@ -1629,6 +1629,17 @@ impl DeviceLayer<'_> {
                         "rows layer {layer}: the dense MLP's seam folds the attention's delta, and no attention part runs before it"
                     ));
                 }
+                // The fused block's FFN half: its seam folds the attention's post, and its own
+                // post is deferred into the next block's seam when that block is fused.
+                Part::Moe if attention_pending => {
+                    self.run_layer_ffn(rows, layer, p0, n)?;
+                    attention_pending = false;
+                }
+                Part::Moe => {
+                    return Err(format!(
+                        "rows layer {layer}: the MoE half's seam folds the attention's delta, and no attention part runs before it"
+                    ));
+                }
                 _ => {
                     return Err(format!(
                         "rows layer {layer}: the {part:?} part runs alone, and the rows path has no body for it in this order"
