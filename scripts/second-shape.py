@@ -367,6 +367,14 @@ def variant_config(name: str, out: Path) -> Path:
         shape = json.loads(FIXTURE.read_text())["text_config"]
         for key in ("hidden_size", "vocab_size"):
             document["text_config"][key] = shape[key]
+        # Four ranks split each attention's output projection and each FFN's intermediate on
+        # 128-wide FP8 scale tiles, so every split width must hold four tiles: eight heads of
+        # 64 on both attentions, and the second shape's expert intermediate. The fixture's
+        # narrower widths stay its own world-1 tests'.
+        document["text_config"]["num_attention_heads"] = 8
+        document["text_config"]["num_key_value_heads"] = 8
+        document["text_config"]["linear_attn_config"]["num_heads"] = 8
+        document["text_config"]["moe_intermediate_size"] = shape["moe_intermediate_size"]
         if "activation_scheme" in declared:
             document["quantization_config"]["activation_scheme"] = declared["activation_scheme"]
         path = out / f"config-{name}.json"
