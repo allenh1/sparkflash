@@ -246,6 +246,56 @@ impl PackedWeight {
         sparkflash_model::packed_bf16::unpack(self.rows, self.columns, &packed, &entries)
             .map_err(|error| ShardError::Plan(format!("{name}: {error}")))
     }
+
+    /// The values of `name` as the plan reads them: a packed BF16 weight unpacked with its escape
+    /// list into the BF16 rows it stands for, any other weight as stored. `stated_packed` is
+    /// whether the plan reads the weight in the packed layout.
+    ///
+    /// # Errors
+    /// [ShardError::Plan] when the checkpoint and the plan disagree on the packed form (an escape
+    /// list the plan does not state, or none where it states one), plus [Self::in_source]'s and
+    /// [Self::unpack]'s failures.
+    pub fn read_stated<S: WeightSource + ?Sized>(
+        source: &S,
+        name: &str,
+        stated_packed: bool,
+    ) -> Result<StatedWeight, ShardError> {
+        let packed = Self::in_source(source, name)?;
+        if packed.is_some() != stated_packed {
+            return Err(ShardError::Plan(format!(
+                "{name}: the plan reads it {} but the checkpoint {} beside it",
+                if stated_packed { "packed" } else { "as stored" },
+                if packed.is_some() { "stores an escape list" } else { "has no escape list" }
+            )));
+        }
+        match packed {
+            Some(packed) => Ok(StatedWeight {
+                dtype: sparkflash_engine::dtype::DType::BF16,
+                shape: packed.shape(),
+                bytes: packed.unpack(source, name)?,
+            }),
+            None => {
+                let spec = source.spec(name)?;
+                Ok(StatedWeight {
+                    dtype: spec.dtype,
+                    shape: spec.shape.clone(),
+                    bytes: source.read(name)?,
+                })
+            }
+        }
+    }
+}
+
+/// A weight's values as the plan reads them, with the dtype and shape those values have
+/// ([PackedWeight::read_stated]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatedWeight {
+    /// The values' dtype: BF16 for a packed weight's rows, the header's otherwise.
+    pub dtype: sparkflash_engine::dtype::DType,
+    /// The values' shape: a packed weight's logical rows, the header's otherwise.
+    pub shape: Vec<usize>,
+    /// The values.
+    pub bytes: Vec<u8>,
 }
 
 /// The dtype, shape and byte length a planned tensor is sliced by: a packed weight's logical BF16
@@ -729,6 +779,24 @@ mod tests {
                 assert_eq!(verified[0].shard_bytes, expected.len() as u64);
             }
         }
+    }
+
+    #[test]
+    fn a_stated_read_unpacks_a_packed_weight_and_refuses_a_plan_that_disagrees() {
+        let (_dir, source, logical) = packed_fixture();
+        let stated =
+            PackedWeight::read_stated(&source, "m.weight", true).expect("the packed rows read");
+        assert_eq!(stated.dtype, sparkflash_engine::dtype::DType::BF16);
+        assert_eq!(stated.shape, vec![4, 512]);
+        assert_eq!(stated.bytes, logical);
+        let unstated = PackedWeight::read_stated(&source, "m.weight", false)
+            .expect_err("an escape list the plan does not state is refused")
+            .to_string();
+        assert!(unstated.contains("m.weight") && unstated.contains("stores an escape list"));
+        let missing = PackedWeight::read_stated(&source, "m.escape", true)
+            .expect_err("a packed plan over a tensor with no escape list is refused")
+            .to_string();
+        assert!(missing.contains("m.escape") && missing.contains("has no escape list"));
     }
 
     #[test]

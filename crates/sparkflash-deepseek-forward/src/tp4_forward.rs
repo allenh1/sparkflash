@@ -6893,20 +6893,23 @@ impl<'a> SeamDevice<'a> {
                 )));
             }
         };
-        let spec = src
-            .spec(name)
-            .map_err(|error| shape(format!("{name}: {error}")))?;
-        if spec.dtype != want || spec.shape.as_slice() != [cols, inner] {
+        // A packed weight is read as the BF16 rows it stands for, so the check below is on the
+        // values the route reads.
+        let stated = sparkflash_device::shard::PackedWeight::read_stated(
+            src,
+            name,
+            format.layout() == sparkflash_model::format::FormatLayout::Packed,
+        )
+        .map_err(|error| shape(error.to_string()))?;
+        if stated.dtype != want || stated.shape.as_slice() != [cols, inner] {
             return Err(shape(format!(
                 "{name}: declared {:?} {:?}, the plan's {} indexer wq_b is {want:?} [{cols}, {inner}]",
-                spec.dtype,
-                spec.shape,
+                stated.dtype,
+                stated.shape,
                 format.describe()
             )));
         }
-        let raw = src
-            .read(name)
-            .map_err(|error| shape(format!("{name}: {error}")))?;
+        let raw = stated.bytes;
         let scales = if format.is_unscaled() {
             Vec::new()
         } else {
@@ -8149,24 +8152,13 @@ fn build_shared_expert_device(
                 |error: String| format!("shared expert (device): layer {layer} {name}: {error}");
             // A packed weight is the BF16 rows it stands for, unpacked once here with its escape
             // list; the route reads those rows. The checkpoint and the plan must agree on it.
-            let packed = sparkflash_device::shard::PackedWeight::in_source(source, &name)
-                .map_err(|error| what(error.to_string()))?;
-            let stated = shared_format.layout() == sparkflash_model::format::FormatLayout::Packed;
-            if packed.is_some() != stated {
-                return Err(what(format!(
-                    "the plan reads it as {} but the checkpoint {} an escape list beside it",
-                    shared_format.describe(),
-                    if packed.is_some() { "stores" } else { "has no" }
-                )));
-            }
-            let codes = match packed {
-                Some(packed) => packed
-                    .unpack(source, &name)
-                    .map_err(|error| what(error.to_string()))?,
-                None => source
-                    .read(&name)
-                    .map_err(|error| what(error.to_string()))?,
-            };
+            let codes = sparkflash_device::shard::PackedWeight::read_stated(
+                source,
+                &name,
+                shared_format.layout() == sparkflash_model::format::FormatLayout::Packed,
+            )
+            .map_err(|error| what(error.to_string()))?
+            .bytes;
             let tiled = if released {
                 sparkflash_device::arena::tile_b12x(&codes, cols, inner).map_err(|error| {
                     format!("shared expert (device): layer {layer} {name}: {error}")
