@@ -1124,16 +1124,17 @@ def run_test(args: argparse.Namespace) -> int:
     prompts_file = out / "prompts.json"
     global_file = out / "host-reference.json"
     prompts_file.write_text(json.dumps(variant_prompts(args.stored_format)))
-    # The reference hashes Engram n-grams over the tokenizer's compressed map, as the device does.
+    # The reference hashes Engram n-grams over the tokenizer's compressed map, as the device does;
+    # a stack with no Engram layer reads no map, so the reference is given none.
     tokenizer = args.tokenizer or str(Path(args.released) / "tokenizer.json")
+    engram = bool(json.loads(config_bytes).get("engram_layer_ids"))
     result = run(
         [
             args.reference,
             str(checkpoint),
             str(prompts_file),
             str(args.max_tokens),
-            "--tokenizer",
-            tokenizer,
+            *(("--tokenizer", tokenizer) if engram else ()),
         ],
         stdout=subprocess.PIPE,
         text=True,
