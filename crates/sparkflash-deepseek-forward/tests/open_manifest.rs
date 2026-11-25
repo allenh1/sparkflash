@@ -29,8 +29,14 @@ fn every_configuration_field_is_one_ranked_record() {
     record_model_config(&tiny_values(), 3, 4);
     let text = std::fs::read_to_string(&path).expect("the manifest file");
     let lines: Vec<&str> = text.lines().collect();
-    // One line per ModelConfig field; the stored format's block and scale values are two of them.
-    assert_eq!(lines.len(), 68, "one line per ModelConfig field");
+    // One line per ModelConfig field the configuration sets: a stacked block's fields when the
+    // stack has none, and the released grid's weight block and scale, are left out, so the
+    // released DeepSeek records the fields it always did.
+    assert_eq!(
+        lines.len(),
+        66,
+        "one line per ModelConfig field the configuration sets"
+    );
     assert!(lines.iter().all(|line| line.contains("\"kind\":\"model\"")));
     assert!(lines.iter().all(|line| line.contains("\"rank\":3")));
     assert!(text.contains("\"name\":\"dim\",\"value\":64"));

@@ -62,6 +62,16 @@ fn default_weight_scale() -> String {
     "ue8m0".to_owned()
 }
 
+/// Whether `block` is the released grid's, which the open manifest leaves out as it always did.
+fn is_default_weight_block(block: &usize) -> bool {
+    *block == default_weight_block()
+}
+
+/// Whether `scale` is the released grid's, which the open manifest leaves out as it always did.
+fn is_default_weight_scale(scale: &str) -> bool {
+    scale == default_weight_scale()
+}
+
 use sparkflash_model::format::{FormatLayout, StoredFormat};
 use sparkflash_weights::linalg::ScaleGrid;
 
@@ -218,8 +228,7 @@ pub struct GdnGeometry {
 
 /// Whether a width is zero: a stack without the block it sizes, whose field the open manifest
 /// leaves out so the released configuration records the fields it always has.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_zero(value: &usize) -> bool {
+fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
@@ -350,10 +359,16 @@ pub struct ModelConfig {
     /// The expert weight format (`fp4`, or `fp8` for a release that stores the experts as tiles).
     pub expert_dtype: String,
     /// The block one weight scale covers: 32 for a power-of-two grid, 128 for a tile.
-    #[serde(default = "default_weight_block")]
+    #[serde(
+        default = "default_weight_block",
+        skip_serializing_if = "is_default_weight_block"
+    )]
     pub weight_block: usize,
     /// The scale plane's values, as the config spells them (`ue8m0`, `f32` or `bf16`).
-    #[serde(default = "default_weight_scale")]
+    #[serde(
+        default = "default_weight_scale",
+        skip_serializing_if = "is_default_weight_scale"
+    )]
     pub weight_scale: String,
     /// RoPE base for the compressor.
     pub compress_rope_theta: f64,
