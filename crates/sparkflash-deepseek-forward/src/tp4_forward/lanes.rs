@@ -336,9 +336,10 @@ impl<'a> DeviceLayer<'a> {
         if count == 0 {
             return Err("lanes: zero lanes".to_owned());
         }
-        let Some(ring) = self.seam_ring else {
-            return Err("lanes: the run has no compressor ring".to_owned());
-        };
+        // A stack with no compressed layer has no compressor ring (attach_seam_ring), and its
+        // lanes carry no ring, store or index keys.
+        let ring = self.seam_ring;
+        let compressed = ring.is_some();
         let cuda = self.cuda;
         let granularity = cuda
             .vmm_granularity()
@@ -358,10 +359,14 @@ impl<'a> DeviceLayer<'a> {
             );
         }
         let owners = self.kv_source_layers.len().max(1);
-        let ring_span = owners * ring.rows * ring.head_dim * 4;
+        let ring_span = ring.map_or(0, |ring| owners * ring.rows * ring.head_dim * 4);
         let wkv = layout.part(ring_span, 0, 0);
         let wgate = layout.part(ring_span, 0, 0);
-        let (code_bytes, scale_bytes) = seam_store_owner_bytes(self.max_positions)?;
+        let (code_bytes, scale_bytes) = if compressed {
+            seam_store_owner_bytes(self.max_positions)?
+        } else {
+            (0, 0)
+        };
         let min_rows = sparkflash_kernels::attention_operands::EXPANDED_ROWS;
         // The owners of a store are contiguous (owner o at o * the owner's bytes).
         let mut owner_parts = |bytes: usize, row_bytes: usize, min_rows: usize| {
@@ -373,8 +378,12 @@ impl<'a> DeviceLayer<'a> {
         };
         let store_codes = owner_parts(code_bytes, CODE_BYTES, min_rows);
         let store_scales = owner_parts(scale_bytes, SCALE_BYTES, min_rows);
-        let key_bytes = self.max_positions * self.index_head_dim * 4;
-        let index_keys = owner_parts(key_bytes.max(4), self.index_head_dim * 4, 0);
+        let key_bytes = if compressed {
+            (self.max_positions * self.index_head_dim * 4).max(4)
+        } else {
+            0
+        };
+        let index_keys = owner_parts(key_bytes, self.index_head_dim * 4, 0);
         let mut draft = vec![(0usize, 0usize); crate::plan::n_mtp_layers()];
         let draft_rows = geometry.draft_ring_rows.max(1);
         let latent = self.head_width as usize;
@@ -451,12 +460,16 @@ impl<'a> DeviceLayer<'a> {
         let mut freed = vec![
             Deviceptr(self.kv_cache.device),
             Deviceptr(self.kv_ring_base),
-            ring.wkv,
-            ring.wgate,
-            ring.store_codes,
-            ring.store_scales,
-            ring.index_keys,
         ];
+        if let Some(ring) = ring {
+            freed.extend([
+                ring.wkv,
+                ring.wgate,
+                ring.store_codes,
+                ring.store_scales,
+                ring.index_keys,
+            ]);
+        }
         freed.retain(|ptr| ptr.0 != 0);
         cuda.free_buffers(&freed.iter().collect::<Vec<_>>());
         self.kv_cache_off = true;
