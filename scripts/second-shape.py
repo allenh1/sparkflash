@@ -91,6 +91,22 @@ MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 TOPS = 8
 EOS = 1
 PROMPTS = [[100, 101, 102, 103], [200, 201, 202], [300, 301, 302, 303, 304, 305]]
+# A recurrent variant's prompts: the ones above, then one that extends the last of them, so the
+# group serves it from the kept state of the request before (prefix reuse) and the reference runs
+# it fresh. The decoder variant's prompts are longer than the decoder's warm-up rows (255), so
+# the recurrent block above the encoder layers sees rows the skip would have dropped.
+_LONG_A = [1000 + (index * 7) % 5000 for index in range(300)]
+_LONG_B = [2000 + index for index in range(270)]
+VARIANT_PROMPTS = {
+    "gdn-dense": PROMPTS + [PROMPTS[2] + [306, 307, 308]],
+    "gdn-decoder": [_LONG_A, _LONG_B, _LONG_A + [6000 + index for index in range(20)]],
+}
+
+
+def variant_prompts(name: str) -> list[list[int]]:
+    """The prompts a variant runs: its own where it names some, PROMPTS otherwise."""
+    return VARIANT_PROMPTS.get(name, PROMPTS)
+
 # A sidecar beside a reference or the checkpoint records the hash of every input that produced the
 # file. A matching hash lets the next invocation reuse the file instead of rebuilding it.
 PLAN_SCHEMA = "second-shape-plan/1"
@@ -98,6 +114,13 @@ PLAN_SCHEMA = "second-shape-plan/1"
 # grid, FP8 on 128 x 128 tiles with the inverse scale stored f32 or bf16, or an unquantized
 # BF16 dense class in its row-major or packed arrangement. The variant is the checkpoint's own
 # declaration - the writer, the reference and the group all read this one file.
+GDN_GEOMETRY = {
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+    }
 STORED_FORMATS = {
     "released": None,
     # The two NVFP4 expert conventions: the dense class stays the fixture's released 32 x 32
@@ -150,6 +173,33 @@ STORED_FORMATS = {
                 "num_key_value_heads": 8,
                 "head_dim": 128,
             },
+        },
+    },
+    # A recurrent token mixer: the first block a Gated DeltaNet (16 key heads, 32 value heads,
+    # 128 wide each, a 4-tap conv; the Qwen3-Next spelling) with the dense-mlp variant's gated MLP
+    # on the BF16 dense route. The stack after it is the fixture's MLA.
+    "gdn-dense": {
+        "quant_method": "bf16",
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+        "text_config": {
+            "first_k_dense_replace": 1,
+            "intermediate_size": 1024,
+            "layer_types": ["linear_attention"] + ["compressed_attention"] * 7,
+            **GDN_GEOMETRY,
+        },
+    },
+    # The same Gated DeltaNet as the last block, above the encoder layers, with its compress
+    # ratio 0 (a recurrent block compresses nothing) and the fixture's MoE; the stack below it is
+    # the fixture's.
+    "gdn-decoder": {
+        "quant_method": "bf16",
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+        "text_config": {
+            "layer_types": ["compressed_attention"] * 7 + ["linear_attention"],
+            "compress_ratios": [0, 0, 2, 2, 2, 2, 1, 0, 1, 1],
+            **GDN_GEOMETRY,
         },
     },
 }
@@ -789,7 +839,7 @@ def run_world(
     expected_file = out / f"host-reference-w{world}.json"
     tops_file = Path(str(expected_file) + ".tops.json")
     plan_file = Path(str(expected_file) + ".plan")
-    plan = reference_plan(config, world, PROMPTS, args.max_tokens)
+    plan = reference_plan(config, world, variant_prompts(args.stored_format), args.max_tokens)
     if reference_reusable(expected_file, plan_file, plan) and tops_file.is_file():
         print(
             f"second-shape: reusing {expected_file.name}; "
@@ -1032,7 +1082,7 @@ def run_test(args: argparse.Namespace) -> int:
 
     prompts_file = out / "prompts.json"
     global_file = out / "host-reference.json"
-    prompts_file.write_text(json.dumps(PROMPTS))
+    prompts_file.write_text(json.dumps(variant_prompts(args.stored_format)))
     # The reference hashes Engram n-grams over the tokenizer's compressed map, as the device does.
     tokenizer = args.tokenizer or str(Path(args.released) / "tokenizer.json")
     result = run(
