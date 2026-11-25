@@ -73,6 +73,36 @@ impl Region {
     }
 }
 
+/// Lays one part's regions out in a lane of `capacity` positions, in the part's order:
+/// `place(bytes, bytes_per_row)` reserves a region and returns where it starts. A positional
+/// region is `capacity` rows of `bytes_per_row`; a recurrent one its whole state, with
+/// `bytes_per_row` 0, which the arm lays out as a state no prefix copy reads (sparkflash-kernels'
+/// `Layout::state`).
+pub fn carve(
+    regions: &[Region],
+    capacity: usize,
+    mut place: impl FnMut(usize, usize) -> usize,
+) -> Vec<usize> {
+    regions
+        .iter()
+        .map(|region| match *region {
+            Region::Positional { bytes_per_row, .. } => {
+                place(capacity.saturating_mul(bytes_per_row), bytes_per_row)
+            }
+            Region::Recurrent { bytes, .. } => place(bytes, 0),
+        })
+        .collect()
+}
+
+/// The recurrent regions' bytes of `regions`, in order: the sizes a checkpoint arena of them
+/// takes (sparkflash-kernels' `Checkpoint`).
+pub fn recurrent_sizes(regions: &[Region]) -> impl Iterator<Item = usize> + '_ {
+    regions.iter().filter_map(|region| match *region {
+        Region::Recurrent { bytes, .. } => Some(bytes),
+        Region::Positional { .. } => None,
+    })
+}
+
 /// What a sequence's state looks like, in the order its arm declares it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateLayout {
@@ -302,6 +332,28 @@ pub fn check_rewind(code: &'static str, to: usize, position: usize) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_carve_places_each_region_in_order() {
+        let regions = [
+            Region::Positional {
+                name: "kv",
+                bytes_per_row: 8,
+            },
+            Region::Recurrent {
+                name: "gated-deltanet",
+                bytes: 96,
+            },
+        ];
+        let mut placed = Vec::new();
+        let offsets = carve(&regions, 10, |bytes, row| {
+            placed.push((bytes, row));
+            placed.len() * 1000
+        });
+        assert_eq!(offsets, vec![1000, 2000]);
+        assert_eq!(placed, vec![(80, 8), (96, 0)]);
+        assert_eq!(recurrent_sizes(&regions).collect::<Vec<_>>(), vec![96]);
+    }
 
     #[test]
     fn the_kind_follows_the_regions() {

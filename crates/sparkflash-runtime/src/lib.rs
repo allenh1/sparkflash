@@ -67,7 +67,8 @@ pub use group::{
     mirror_ticks_until_the_group_ends, watched_hub,
 };
 pub use layout::{
-    LaneState, Limits, Region, StateKind, StateLayout, check_checkpoint, check_rewind,
+    LaneState, Limits, Region, StateKind, StateLayout, carve, check_checkpoint, check_rewind,
+    recurrent_sizes,
 };
 pub use ledger::{Ledger, Mode, Strategy};
 pub use part::{PartBody, PartExec, PartHost, PartMaker, PartRegistry, RankSplit};

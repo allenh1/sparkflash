@@ -2894,22 +2894,18 @@ impl LaneParts {
     fn plan(layout: &mut Layout, layers: &[Layer], capacity: usize, rewind: bool) -> Self {
         let regions = branches(layers)
             .map(|branch| {
-                branch
-                    .part
-                    .state()
-                    .iter()
-                    .map(|region| match *region {
-                        Region::Positional { bytes_per_row, .. } => {
-                            layout.part(capacity * bytes_per_row, bytes_per_row, 0)
-                        }
-                        Region::Recurrent { bytes, .. } => layout.part(bytes, 0, 0),
-                    })
-                    .collect()
+                sparkflash_runtime::carve(branch.part.state(), capacity, |bytes, row| {
+                    if row == 0 {
+                        layout.state(bytes)
+                    } else {
+                        layout.part(bytes, row, 0)
+                    }
+                })
             })
             .collect();
         let sizes = linear_sizes(layers);
-        let arena = (rewind && !sizes.is_empty())
-            .then(|| layout.part(Checkpoint::arena_bytes(&sizes), 0, 0));
+        let arena =
+            (rewind && !sizes.is_empty()).then(|| layout.state(Checkpoint::arena_bytes(&sizes)));
         Self { regions, arena }
     }
 }
