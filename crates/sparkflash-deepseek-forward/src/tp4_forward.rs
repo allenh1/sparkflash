@@ -18097,13 +18097,19 @@ fn run_forward_loop(
             warm_engram_rows(config, request.prompt_tokens, engram_positions, source)?;
         }
     }
-    let body = AttentionBody::open(
-        &cuda,
-        request,
-        arena,
-        config.n_heads / request.world.max(1),
-        config.head_dim,
-    )?;
+    // The release's attention body (the V4 latent with its window and sink); a stated stack's
+    // absorbed MLA runs on the stated walk and opens none.
+    let body = (!crate::plan::stated_stack())
+        .then(|| {
+            AttentionBody::open(
+                &cuda,
+                request,
+                arena,
+                config.n_heads / request.world.max(1),
+                config.head_dim,
+            )
+        })
+        .transpose()?;
     let mut kv_cache: Vec<Vec<(Vec<u8>, Vec<u8>)>> = (0..n_layers)
         .map(|_| Vec::with_capacity(total_positions))
         .collect();
@@ -19166,7 +19172,14 @@ fn run_forward_loop(
                 let staged = attention_staging.stage(layer, &window_rows, &seam)?;
                 probe::count("stage_attention");
                 let twin_requested = request.forward_perf.twin_requested(is_head, position);
-                let attention_step = body.run(
+                let attention_step = body
+                    .as_ref()
+                    .ok_or_else(|| {
+                        format!(
+                            "forward loop: layer {layer}: a stated stack has no release attention body; its blocks run on the rows path"
+                        )
+                    })?
+                    .run(
                     &cuda,
                     request,
                     layer,
