@@ -369,6 +369,8 @@ pub struct Description {
     operands: BTreeMap<(Option<usize>, Part), crate::operand::Operand>,
     /// The draft block's tap layers, read from its part facts once at open.
     tap_layers: Box<[usize]>,
+    /// Each language block's steps, decided once at open from its parts ([language_steps]).
+    steps: Vec<BlockSteps>,
 }
 
 impl std::fmt::Debug for Description {
@@ -467,6 +469,7 @@ impl Description {
                 })
             })
             .unwrap_or_default();
+        let steps = language_steps(&plan)?;
         Ok(Self {
             plan,
             values,
@@ -475,6 +478,21 @@ impl Description {
             symbols,
             operands,
             tap_layers,
+            steps,
+        })
+    }
+
+    /// How the rows path runs language block `block`: the fused halves, or its parts one at a
+    /// time. A block the plan does not have is the fused one's refusal, not a default.
+    ///
+    /// # Errors
+    /// The plan has no language block `block`.
+    pub fn block_steps(&self, block: usize) -> Result<&BlockSteps, ConfigError> {
+        self.steps.get(block).ok_or_else(|| {
+            format!(
+                "forward: block {block} is past the plan's {} language blocks",
+                self.steps.len()
+            )
         })
     }
 
@@ -1490,12 +1508,48 @@ pub const fn forward_has_body(part: Part) -> bool {
     )
 }
 
-/// Refuse, at open, a language block part the forward has no body for.
+/// How the rows path runs one language block, decided at open from the block's parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockSteps {
+    /// The block's parts are the ones the base's four fused halves cover (the attention seam and
+    /// rest, the FFN seam and rest): the same launches and the same trace as a released block.
+    Fused,
+    /// Any other block: the pending residual lands, then each part runs on its own, in plan
+    /// order, its delta folded back before the next one reads the rows.
+    Parts(Vec<Part>),
+}
+
+/// The parts the fused halves cover. A block of only these, carrying both the attention and the
+/// MoE part, runs [BlockSteps::Fused].
+const FUSED_PARTS: [Part; 8] = [
+    Part::RmsNorm,
+    Part::HyperConnection,
+    Part::ManifoldHyperConnection,
+    Part::MlaAttention,
+    Part::Csa2Compression,
+    Part::SparseIndexer,
+    Part::Moe,
+    Part::Engram,
+];
+
+/// Whether the base runs `part` on its own, outside the fused halves.
+///
+/// None does yet: the base's own parts run only inside the halves, so a block that is not fused
+/// is refused by the part that has no body of its own.
+#[must_use]
+pub const fn runs_alone(part: Part) -> bool {
+    let _ = part;
+    false
+}
+
+/// Each language block's steps, in block order.
 ///
 /// # Errors
-/// The part is not in [forward_has_body]; the message names it and its block.
-pub fn check_language_parts(description: &Description) -> Result<(), ConfigError> {
-    for stack in description.plan().stacks() {
+/// A block carries a part the forward has no body for, or a block that is not fused carries a
+/// part that does not run on its own; the message names the block and the part.
+pub fn language_steps(plan: &EnginePlan) -> Result<Vec<BlockSteps>, ConfigError> {
+    let mut steps = Vec::new();
+    for stack in plan.stacks() {
         if stack.kind != sparkflash_model::StackKind::Language {
             continue;
         }
@@ -1509,29 +1563,52 @@ pub fn check_language_parts(description: &Description) -> Result<(), ConfigError
                 }
             }
             let has = |part| block.parts.iter().any(|instance| instance.part == part);
-            // The fused attention-post/FFN seam is one body that spans the attention part and
-            // the MoE part. It is chosen only when the block carries both; a block that carries
-            // the MoE part without the attention part is refused by name because the fused body
-            // would read an attention post that does not exist.
-            if has(Part::Moe) && !has(Part::MlaAttention) {
-                return Err(format!(
-                    "forward open: block {} carries the MoE part but no MlaAttention part; the fused attention/FFN seam covers both, so the block is refused by name",
-                    block.index
-                ));
+            let fused = has(Part::MlaAttention)
+                && has(Part::Moe)
+                && block
+                    .parts
+                    .iter()
+                    .all(|instance| FUSED_PARTS.contains(&instance.part));
+            if fused {
+                steps.push(BlockSteps::Fused);
+                continue;
             }
-            // A compression or indexer sublayer without the attention part it belongs to is
-            // refused for the same reason.
-            for sublayer in [Part::Csa2Compression, Part::SparseIndexer] {
-                if has(sublayer) && !has(Part::MlaAttention) {
+            // The fused attention-post/FFN seam spans the attention part and the MoE part, and a
+            // compression or indexer sublayer belongs to the attention part; outside the halves
+            // each part must run alone, and the first one that cannot names the refusal.
+            let mut parts = Vec::new();
+            for instance in &block.parts {
+                if !runs_alone(instance.part) {
+                    let why = match instance.part {
+                        Part::Moe if !has(Part::MlaAttention) => {
+                            "the MoE part runs only inside the fused attention/FFN seam, which needs the MlaAttention part beside it"
+                        }
+                        Part::Csa2Compression | Part::SparseIndexer if !has(Part::MlaAttention) => {
+                            "the sublayer belongs to an MlaAttention part the block does not carry"
+                        }
+                        _ => {
+                            "the base runs it only inside the fused halves, and this block is not one they cover"
+                        }
+                    };
                     return Err(format!(
-                        "forward open: block {} carries the {sublayer:?} part but no MlaAttention part",
-                        block.index
+                        "forward open: block {} carries the {:?} part: {why}",
+                        block.index, instance.part
                     ));
                 }
+                parts.push(instance.part);
             }
+            steps.push(BlockSteps::Parts(parts));
         }
     }
-    Ok(())
+    Ok(steps)
+}
+
+/// Refuse, at open, a language block part the forward has no body for.
+///
+/// # Errors
+/// As [language_steps].
+pub fn check_language_parts(description: &Description) -> Result<(), ConfigError> {
+    language_steps(description.plan()).map(|_| ())
 }
 
 #[cfg(test)]

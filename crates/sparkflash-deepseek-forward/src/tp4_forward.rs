@@ -6777,6 +6777,17 @@ impl<'a> SeamDevice<'a> {
         };
         let name = crate::plan::layer_claim(layer, "attn.indexer.wq_b.weight");
         let scale_name = crate::plan::layer_claim(layer, "attn.indexer.wq_b.scale");
+        // A class the released bodies do not read is staged as stored for the dense format route:
+        // its row-major values and, when it has one, its scale plane, checked against the plan's
+        // format rather than declined into the host rule.
+        let format = crate::plan::description()
+            .operand(Some(layer), sparkflash_model::Part::SparseIndexer)
+            .map(|operand| operand.stored);
+        if let Some(format) = format.filter(|format| !released_dense(*format)) {
+            return self
+                .stage_as_stored(layer, src, name, scale_name, format)
+                .map(Some);
+        }
         let spec = src
             .spec(name)
             .map_err(|error| shape(format!("{name}: {error}")))?;
@@ -6849,6 +6860,97 @@ impl<'a> SeamDevice<'a> {
             .map_err(failure("scale upload"))?;
         self.weights.insert(layer, (weight, grid));
         Ok(Some((weight, grid)))
+    }
+
+    /// Stages layer `layer`'s indexer wq_b in a class the dense format route reads: the stored
+    /// row-major values and, for a scaled class, its plane of one scale a `block x block` tile.
+    ///
+    /// # Errors
+    /// The source serves the weight or its plane in a dtype or shape that is not the plan's
+    /// format, plus any allocation or upload failure.
+    fn stage_as_stored(
+        &mut self,
+        layer: usize,
+        src: &dyn sparkflash_engine::weights::WeightSource,
+        name: &str,
+        scale_name: &str,
+        format: sparkflash_model::format::StoredFormat,
+    ) -> Result<(Deviceptr, Deviceptr), sparkflash_engine::linalg::EngineError> {
+        use sparkflash_engine::dtype::DType;
+        use sparkflash_model::format::{FormatValues, ScaleValues};
+        let shape = |detail: String| sparkflash_engine::linalg::EngineError::Shape {
+            what: "ref seam indexer wq_b".to_owned(),
+            detail,
+        };
+        let (cols, inner) = (self.cols, self.inner);
+        let want = match format.values() {
+            FormatValues::Fp8E4M3 => DType::F8E4M3,
+            FormatValues::Bf16 => DType::BF16,
+            other => {
+                return Err(shape(format!(
+                    "{name}: the dense format route reads no {} weight",
+                    other.name()
+                )));
+            }
+        };
+        let spec = src
+            .spec(name)
+            .map_err(|error| shape(format!("{name}: {error}")))?;
+        if spec.dtype != want || spec.shape.as_slice() != [cols, inner] {
+            return Err(shape(format!(
+                "{name}: declared {:?} {:?}, the plan's {} indexer wq_b is {want:?} [{cols}, {inner}]",
+                spec.dtype,
+                spec.shape,
+                format.describe()
+            )));
+        }
+        let raw = src
+            .read(name)
+            .map_err(|error| shape(format!("{name}: {error}")))?;
+        let scales = if format.is_unscaled() {
+            Vec::new()
+        } else {
+            let block = format.block().max(1);
+            let want_scale = match format.scale_values() {
+                ScaleValues::F32 => DType::F32,
+                ScaleValues::Bf16 => DType::BF16,
+                ScaleValues::Ue8m0 => DType::F8E8M0,
+                ScaleValues::E4M3 => DType::U8,
+            };
+            let grid = [cols.div_ceil(block), inner.div_ceil(block)];
+            let scale_spec = src
+                .spec(scale_name)
+                .map_err(|error| shape(format!("{scale_name}: {error}")))?;
+            if scale_spec.dtype != want_scale || scale_spec.shape.as_slice() != grid {
+                return Err(shape(format!(
+                    "{scale_name}: declared {:?} {:?}, the plan's {} plane is {want_scale:?} {grid:?}",
+                    scale_spec.dtype,
+                    scale_spec.shape,
+                    format.describe()
+                )));
+            }
+            src.read(scale_name)
+                .map_err(|error| shape(format!("{scale_name}: {error}")))?
+        };
+        let mut allocated = 0usize;
+        let mut upload = |bytes: &[u8], what: &str| -> Result<Deviceptr, _> {
+            if bytes.is_empty() {
+                return Ok(Deviceptr(0));
+            }
+            let pointer = self
+                .cuda
+                .alloc(bytes.len(), &mut allocated)
+                .map_err(|error| shape(format!("{what} buffer: {error}")))?;
+            self.allocations.push(pointer);
+            self.cuda
+                .copy_htod(&pointer, bytes)
+                .map_err(|error| shape(format!("{what} upload: {error}")))?;
+            Ok(pointer)
+        };
+        let weight = upload(&raw, name)?;
+        let grid = upload(&scales, scale_name)?;
+        self.weights.insert(layer, (weight, grid));
+        Ok((weight, grid))
     }
 
     /// Stages one host-weight projection: the checkpoint's own values in the kernel's B12x order.
@@ -7544,29 +7646,51 @@ fn gather_shared_expert_source(
                 format!("shared expert gather: {what} is not B12x-untileable: {error}")
             })
         };
-    let w1_weight = read_shard("w1", "weight", local_inter * dim)?;
-    let w1_scale = read_shard("w1", "scale", shard_blocks * dim_blocks)?;
-    let w3_weight = read_shard("w3", "weight", local_inter * dim)?;
-    let w3_scale = read_shard("w3", "scale", shard_blocks * dim_blocks)?;
-    let w2_weight = read_shard("w2", "weight", dim * local_inter)?;
-    let w2_scale = read_shard("w2", "scale", dim_blocks * shard_blocks)?;
+    // The released class is B12x-tiled in the arena on the 32 x 32 grid; any other class the plan
+    // states keeps its stored bytes, row-major, with its own value width and scale plane (none for
+    // BF16, one f32 or BF16 inverse scale a 128 x 128 tile for the FP8 tile class). The shard
+    // split must stay on whole scale blocks so each rank's plane is its rows' own.
+    let released = released_dense(shared_format);
+    let value_bytes = shared_format.values().bytes_per_value();
+    let scaled = !shared_format.is_unscaled();
+    let block = if scaled { shared_format.block() } else { 1 };
+    let scale_bytes = shared_format.scale_values().bytes();
+    if scaled && (!dim.is_multiple_of(block) || !local_inter.is_multiple_of(block)) {
+        return Err(format!(
+            "shared expert gather: dim {dim} and shard {local_inter} must be whole {block}-value scale blocks of the plan's {} shared expert",
+            shared_format.describe()
+        ));
+    }
+    let (dim_scales, inter_scales, shard_scales) =
+        (dim / block, inter / block, local_inter / block);
+    let w1_weight = read_shard("w1", "weight", local_inter * dim * value_bytes)?;
+    let w3_weight = read_shard("w3", "weight", local_inter * dim * value_bytes)?;
+    let w2_weight = read_shard("w2", "weight", dim * local_inter * value_bytes)?;
+    let mut scale_shard = |leaf: &str, elements: usize| -> Result<Vec<u8>, String> {
+        if scaled {
+            read_shard(leaf, "scale", elements * scale_bytes)
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let w1_scale = scale_shard("w1", shard_scales * dim_scales)?;
+    let w3_scale = scale_shard("w3", shard_scales * dim_scales)?;
+    let w2_scale = scale_shard("w2", dim_scales * shard_scales)?;
+    let _ = (dim_blocks, inter_blocks, shard_blocks);
 
-    // The plan itself is the proof the shards are B12x and of the geometry to untile them with:
-    // b12x_layout is what the arena upload used, so a plan that reports B12x here is the same
-    // predicate that tiled the bytes. Refuse a plan whose geometry is not the released shard's.
-    let b12x_geometry = |leaf: &str| -> Result<(usize, usize), String> {
+    // The plan itself is the proof of the arena's arrangement: b12x_layout is what the arena upload
+    // used, so a plan that reports B12x here is the same predicate that tiled the bytes, and a
+    // released shard planned any other way (or another class planned B12x) is refused by name.
+    let planned_layout = |leaf: &str| -> Result<Option<(usize, usize)>, String> {
         let name = format!("{prefix}.{leaf}");
         let plan = request.resident_plan.ok_or_else(|| {
             "shared expert gather: the loop was built without the rank plan".to_string()
         })?;
         match plan.operand_layout(&name) {
             Some(sparkflash_device::resident::OperandLayout::B12x { cols, inner, .. }) => {
-                Ok((cols, inner))
+                Ok(Some((cols, inner)))
             }
-            Some(other) => Err(format!(
-                "shared expert gather: {name} is planned as {}; the shared-expert weight shards are B12x",
-                other.as_str()
-            )),
+            Some(_) => Ok(None),
             None => Err(format!(
                 "shared expert gather: the rank plan does not carry {name}"
             )),
@@ -7577,58 +7701,94 @@ fn gather_shared_expert_source(
         ("w3.weight", (local_inter, dim)),
         ("w2.weight", (dim, local_inter)),
     ] {
-        let got = b12x_geometry(leaf)?;
-        if got != want {
-            return Err(format!(
-                "shared expert gather: {leaf} is planned B12x {got:?}, the released shard is {want:?}"
-            ));
+        match (planned_layout(leaf)?, released) {
+            (Some(got), true) if got == want => {}
+            (None, false) => {}
+            (Some(got), true) => {
+                return Err(format!(
+                    "shared expert gather: {leaf} is planned B12x {got:?}, the released shard is {want:?}"
+                ));
+            }
+            (None, true) => {
+                return Err(format!(
+                    "shared expert gather: {leaf} is not planned B12x; the released shared-expert weight shards are"
+                ));
+            }
+            (Some(_), false) => {
+                return Err(format!(
+                    "shared expert gather: {leaf} is planned B12x, but the plan's {} shared expert is read as stored",
+                    shared_format.describe()
+                ));
+            }
         }
     }
-    let w1_weight = untile_shard(&w1_weight, local_inter, dim, "w1.weight")?;
-    let w3_weight = untile_shard(&w3_weight, local_inter, dim, "w3.weight")?;
-    let w2_weight = untile_shard(&w2_weight, dim, local_inter, "w2.weight")?;
+    let (w1_weight, w3_weight, w2_weight) = if released {
+        (
+            untile_shard(&w1_weight, local_inter, dim, "w1.weight")?,
+            untile_shard(&w3_weight, local_inter, dim, "w3.weight")?,
+            untile_shard(&w2_weight, dim, local_inter, "w2.weight")?,
+        )
+    } else {
+        (w1_weight, w3_weight, w2_weight)
+    };
 
     let full_w1 = join_column_shards(&gather_one(&w1_weight, 0, "w1.weight")?);
-    let full_w1_scale = join_column_shards(&gather_one(&w1_scale, 1, "w1.scale")?);
     let full_w3 = join_column_shards(&gather_one(&w3_weight, 2, "w3.weight")?);
-    let full_w3_scale = join_column_shards(&gather_one(&w3_scale, 3, "w3.scale")?);
-    let full_w2 = join_row_shards(&gather_one(&w2_weight, 4, "w2.weight")?, dim, local_inter)?;
-    let full_w2_scale = join_row_shards(
-        &gather_one(&w2_scale, 5, "w2.scale")?,
-        dim_blocks,
-        shard_blocks,
+    let full_w2 = join_row_shards(
+        &gather_one(&w2_weight, 4, "w2.weight")?,
+        dim,
+        local_inter * value_bytes,
     )?;
 
+    let value_dtype = match shared_format.values() {
+        sparkflash_model::format::FormatValues::Bf16 => DType::BF16,
+        sparkflash_model::format::FormatValues::F32 => DType::F32,
+        _ => DType::F8E4M3,
+    };
+    let scale_dtype = match shared_format.scale_values() {
+        sparkflash_model::format::ScaleValues::Bf16 => DType::BF16,
+        sparkflash_model::format::ScaleValues::F32 => DType::F32,
+        _ => DType::F8E8M0,
+    };
     let mut full_bytes = 0usize;
     let mut insert = |leaf: &str, suffix: &str, dtype: DType, shape: Vec<usize>, bytes: Vec<u8>| {
         let name = format!("{prefix}.{leaf}.{suffix}");
         full_bytes += bytes.len();
         tensors.insert(name.clone(), (TensorSpec { name, dtype, shape }, bytes));
     };
-    insert("w1", "weight", DType::F8E4M3, vec![inter, dim], full_w1);
-    insert(
-        "w1",
-        "scale",
-        DType::F8E8M0,
-        vec![inter_blocks, dim_blocks],
-        full_w1_scale,
-    );
-    insert("w3", "weight", DType::F8E4M3, vec![inter, dim], full_w3);
-    insert(
-        "w3",
-        "scale",
-        DType::F8E8M0,
-        vec![inter_blocks, dim_blocks],
-        full_w3_scale,
-    );
-    insert("w2", "weight", DType::F8E4M3, vec![dim, inter], full_w2);
-    insert(
-        "w2",
-        "scale",
-        DType::F8E8M0,
-        vec![dim_blocks, inter_blocks],
-        full_w2_scale,
-    );
+    insert("w1", "weight", value_dtype, vec![inter, dim], full_w1);
+    insert("w3", "weight", value_dtype, vec![inter, dim], full_w3);
+    insert("w2", "weight", value_dtype, vec![dim, inter], full_w2);
+    if scaled {
+        let full_w1_scale = join_column_shards(&gather_one(&w1_scale, 1, "w1.scale")?);
+        let full_w3_scale = join_column_shards(&gather_one(&w3_scale, 3, "w3.scale")?);
+        let full_w2_scale = join_row_shards(
+            &gather_one(&w2_scale, 5, "w2.scale")?,
+            dim_scales,
+            shard_scales * scale_bytes,
+        )?;
+        insert(
+            "w1",
+            "scale",
+            scale_dtype,
+            vec![inter_scales, dim_scales],
+            full_w1_scale,
+        );
+        insert(
+            "w3",
+            "scale",
+            scale_dtype,
+            vec![inter_scales, dim_scales],
+            full_w3_scale,
+        );
+        insert(
+            "w2",
+            "scale",
+            scale_dtype,
+            vec![dim_scales, inter_scales],
+            full_w2_scale,
+        );
+    }
 
     Ok(SharedExpertGather {
         source: ArenaHostSource { tensors },
@@ -7799,6 +7959,73 @@ struct SharedExpertWorkspace {
     out_f32: sparkflash_kernels::cuda_driver::Deviceptr,
 }
 
+/// Whether the base's released dense bodies read `format`: E4M3 on the 32 x 32 power-of-two
+/// grid, whichever arrangement it is stored in (the arena tiles it for them).
+#[must_use]
+pub(crate) fn released_dense(format: sparkflash_model::format::StoredFormat) -> bool {
+    format.same_arithmetic(sparkflash_model::format::StoredFormat::MXFP8_32)
+}
+
+/// One layer's dense format routes: the attention projections (wq_a, wkv, wq_b, wo_a, wo_b), the
+/// indexer's wq_b and the shared expert, each `None` where the released bodies read it.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LayerDense {
+    pub(crate) attention: Option<sparkflash_kernels::dense_format::DenseFormat>,
+    pub(crate) indexer: Option<sparkflash_kernels::dense_format::DenseFormat>,
+    pub(crate) shared: Option<sparkflash_kernels::dense_format::DenseFormat>,
+}
+
+#[cfg(feature = "cuda")]
+impl LayerDense {
+    fn any(&self) -> bool {
+        self.attention.is_some() || self.indexer.is_some() || self.shared.is_some()
+    }
+}
+
+/// The dense format route's four row-form entries for one stored class, by the catalogue symbols
+/// the plan's `part` instance at `block` claims for it.
+///
+/// The packed word form is the BF16 arithmetic in another arrangement; the arena unpacks it to
+/// the row-major rows these entries read, so it opens the BF16 entries.
+///
+/// # Errors
+/// The staged directory lacks `dense_format_sm121.cubin`, or the plan claims no entry decoding
+/// the class.
+#[cfg(feature = "cuda")]
+pub(crate) fn open_dense_format(
+    cuda: &sparkflash_kernels::cuda_driver::Cuda,
+    kernel_dir: &std::path::Path,
+    block: Option<usize>,
+    part: sparkflash_model::Part,
+    format: sparkflash_model::format::StoredFormat,
+    what: &str,
+) -> Result<sparkflash_kernels::dense_format::DenseFormat, String> {
+    use sparkflash_kernels::dense_format::{DenseFormat, DenseIo};
+    let what = format!(
+        "dense format: {what} stores its projections as {}",
+        format.describe()
+    );
+    let (cubin, _sha) = cached_cubin(&kernel_dir.join("dense_format_sm121.cubin"))
+        .map_err(|error| format!("{what}, which only the dense format route reads: {error}"))?;
+    let description = crate::plan::description();
+    let mut entries = Vec::with_capacity(DenseIo::ALL.len());
+    for io in DenseIo::ALL {
+        let symbol = description
+            .symbol_decoding(block, part, io.prefix(), format)
+            .map_err(|error| format!("{what}: {error}"))?;
+        // The modules stay loaded for the process, as every by-name load here does.
+        let (_module, kernel) = cuda
+            .load_named(&cubin, symbol)
+            .map_err(|error| format!("{what}: load {symbol}: {error}"))?;
+        entries.push(kernel);
+    }
+    let entries = entries
+        .try_into()
+        .map_err(|_| format!("{what}: the route has four row forms"))?;
+    Ok(DenseFormat { entries })
+}
+
 /// Stages the shared expert on the device for every layer: B12x repack, upload, budget admission.
 ///
 /// Warmup only. The repack is permutation-only ([sparkflash_device::arena::tile_b12x]) and the
@@ -7810,6 +8037,20 @@ struct SharedExpertWorkspace {
 /// A missing plan tensor or dtype, a repack geometry mismatch, a budget refusal, or a driver
 /// allocation/copy failure.
 #[cfg(feature = "cuda")]
+/// A row-major `[rows][cols]` grid of `unit`-byte values laid out rank-major: rank r's
+/// `[rows][cols / world]` column slice, then rank r + 1's.
+fn rank_major(bytes: &[u8], rows: usize, cols: usize, world: usize, unit: usize) -> Vec<u8> {
+    let slice = cols / world * unit;
+    let mut out = Vec::with_capacity(bytes.len());
+    for rank in 0..world {
+        for row in 0..rows {
+            let at = row * cols * unit + rank * slice;
+            out.extend_from_slice(&bytes[at..at + slice]);
+        }
+    }
+    out
+}
+
 fn build_shared_expert_device(
     cuda: &sparkflash_kernels::cuda_driver::Cuda,
     request: &TokenStageRequest<'_>,
@@ -7873,12 +8114,16 @@ fn build_shared_expert_device(
     for (layer, gather) in shared.iter().enumerate() {
         let source: &dyn WeightSource = &gather.source;
         let base = crate::plan::layer_prefix(layer, "ffn.shared_experts");
-        let shared_format = crate::plan::description().values().dense_format();
-        let (s1, s3, s2) =
+        let shared_format = crate::plan::shared_expert_format(layer)?;
+        let released = released_dense(shared_format);
+        // The released class is tiled for the B12x bodies; any other is uploaded as stored for
+        // the dense format route, its scale plane (if it has one) beside it.
+        let (s1, s3, s2) = if shared_format.is_unscaled() {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
             crate::moe_device::read_shared_scale_grids(source, base, inter, dim, shared_format)
-                .map_err(|error| {
-                    format!("shared expert (device): layer {layer} scales: {error}")
-                })?;
+                .map_err(|error| format!("shared expert (device): layer {layer} scales: {error}"))?
+        };
         let mut stage = |leaf: &str,
                          cols: usize,
                          inner: usize|
@@ -7887,10 +8132,21 @@ fn build_shared_expert_device(
             let codes = source.read(&name).map_err(|error| {
                 format!("shared expert (device): layer {layer} {name}: {error}")
             })?;
-            let tiled =
+            let tiled = if released {
                 sparkflash_device::arena::tile_b12x(&codes, cols, inner).map_err(|error| {
                     format!("shared expert (device): layer {layer} {name}: {error}")
-                })?;
+                })?
+            } else if leaf == "w2" && request.world > 1 {
+                rank_major(
+                    &codes,
+                    cols,
+                    inner,
+                    request.world,
+                    shared_format.values().bytes_per_value(),
+                )
+            } else {
+                codes.to_vec()
+            };
             let pointer = cuda.alloc(tiled.len(), &mut allocated).map_err(|error| {
                 format!("shared expert (device): layer {layer} {name} allocation: {error}")
             })?;
@@ -7902,9 +8158,27 @@ fn build_shared_expert_device(
         let w1 = stage("w1", inter, dim)?;
         let w3 = stage("w3", inter, dim)?;
         let w2 = stage("w2", dim, inter)?;
+        // The dense format route reads whole weight rows: the down's reduction is split over
+        // the ranks, so its stored [dim][inter] goes up rank-major ([world][dim][inter/world],
+        // its scale grid alike), each rank's slice one contiguous matrix.
+        let s2 = if s2.is_empty() || released || request.world == 1 {
+            s2
+        } else {
+            let block = shared_format.block().max(1);
+            rank_major(
+                &s2,
+                dim.div_ceil(block),
+                inter.div_ceil(block),
+                request.world,
+                shared_format.scale_bytes(),
+            )
+        };
         let mut upload = |bytes: &[u8],
                           what: &str|
          -> Result<sparkflash_kernels::cuda_driver::Deviceptr, String> {
+            if bytes.is_empty() {
+                return Ok(sparkflash_kernels::cuda_driver::Deviceptr(0));
+            }
             let pointer = cuda.alloc(bytes.len(), &mut allocated).map_err(|error| {
                 format!("shared expert (device): layer {layer} {what} allocation: {error}")
             })?;
@@ -11449,6 +11723,10 @@ struct DeviceLayer<'a> {
     /// read, on the format route ([Self::attach_routed_format]); `None` when every block is the
     /// released format.
     routed_format: Option<sparkflash_kernels::routed_format::RoutedFormatDevice>,
+    /// Each layer's dense projections whose stored class the released MXFP8 bodies do not read,
+    /// on the dense format route ([Self::attach_dense_format]); empty when every layer's dense
+    /// class is the released one.
+    dense_format: Vec<LayerDense>,
     /// The `moe_router` probe count the last `moe_routed` call consumed, so a stale id row is
     /// refused instead of combined.
     moe_router_seen: u64,
@@ -12694,6 +12972,7 @@ impl<'a> DeviceLayer<'a> {
             opt_select,
             moe_routed_device: None,
             routed_format: None,
+            dense_format: Vec::new(),
             moe_router_seen: 0,
             engram: None,
             seam_staged: None,
@@ -13884,6 +14163,60 @@ impl<'a> DeviceLayer<'a> {
         device.set_opt(self.moe_opt_kernels);
         self.moe_routed_device = Some(device);
         Ok(())
+    }
+
+    /// Opens the dense format route for every layer whose attention, indexer or shared-expert
+    /// projections are stored in a class the released MXFP8 bodies do not read: the four row-form
+    /// entries the plan's catalogue claims for the class, loaded once here.
+    ///
+    /// # Errors
+    /// The staged directory lacks `dense_format_sm121.cubin`, or the plan claims no entry decoding
+    /// a layer's class.
+    fn attach_dense_format(&mut self, kernel_dir: &std::path::Path) -> Result<(), String> {
+        use sparkflash_model::Part;
+        if !self.dense_format.is_empty() {
+            return Err("layer device dense format: attached twice".to_owned());
+        }
+        let description = crate::plan::description();
+        let layers = description.values().n_layers;
+        let mut routes = Vec::with_capacity(layers);
+        for layer in 0..layers {
+            let attention = description
+                .operand(Some(layer), Part::MlaAttention)
+                .map(|operand| operand.stored);
+            let indexer = description
+                .operand(Some(layer), Part::SparseIndexer)
+                .map(|operand| operand.stored);
+            let shared = description.plan().shared_expert_format(layer);
+            let open =
+                |part: Part, format: Option<sparkflash_model::format::StoredFormat>| match format {
+                    Some(format) if !released_dense(format) => open_dense_format(
+                        self.cuda,
+                        kernel_dir,
+                        Some(layer),
+                        part,
+                        format,
+                        &format!("layer {layer} {part:?}"),
+                    )
+                    .map(Some),
+                    _ => Ok(None),
+                };
+            routes.push(LayerDense {
+                attention: open(Part::MlaAttention, attention)?,
+                indexer: open(Part::SparseIndexer, indexer)?,
+                // The shared expert's tensors are claimed by the MoE part.
+                shared: open(Part::Moe, shared)?,
+            });
+        }
+        if routes.iter().any(LayerDense::any) {
+            self.dense_format = routes;
+        }
+        Ok(())
+    }
+
+    /// Layer `layer`'s dense format route, or `None` where the released bodies read it.
+    pub(super) fn layer_dense(&self, layer: usize) -> LayerDense {
+        self.dense_format.get(layer).copied().unwrap_or_default()
     }
 
     /// Opens the format route for the blocks whose expert format the released MXFP4 bodies do not
@@ -17844,6 +18177,7 @@ fn run_forward_loop(
                 "layer device: the routed format route needs the staged cubin directory".to_owned()
             })?;
             device.attach_routed_format(bind, format_dir)?;
+            device.attach_dense_format(format_dir)?;
             device.attach_seam_ring()?;
             if let Some(seam) = seam_wq_b.as_ref() {
                 device.set_seam_kernels(seam.hostw_symbols());

@@ -9585,3 +9585,139 @@ hidden = 4096
 intermediate = 256
 experts = 64
 top_k = 4
+
+# --- DeepSeek dense projections in every non-released dense class ----------------------------
+# kernels/dense_format_sm121.cu: the shared tile's dense mode, one entry a class. The matrix
+# shapes are runtime launch words, so one build serves every world.
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_f32a_f32o_fp8_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "fp8"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_f32a_f32o_fp8_bf16_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "fp8-bf16"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_f32a_f32o_bf16_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_f32a_bf16o_fp8_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "fp8"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_f32a_bf16o_fp8_bf16_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "fp8-bf16"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_f32a_bf16o_bf16_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_bf16a_f32o_fp8_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "fp8"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_bf16a_f32o_fp8_bf16_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "fp8-bf16"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_bf16a_f32o_bf16_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_bf16a_bf16o_fp8_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "fp8"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_bf16a_bf16o_fp8_bf16_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "fp8-bf16"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4
+
+[[instance]]
+source = "dense_format_sm121.cu"
+entry = "dense_format_bf16a_bf16o_bf16_sm121"
+cubin = "dense_format_sm121_s2"
+family = "rows"
+format = "bf16"
+hidden = 4096
+intermediate = 128
+experts = 64
+top_k = 4

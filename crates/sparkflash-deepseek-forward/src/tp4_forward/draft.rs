@@ -36,6 +36,9 @@ use super::rows::{R_MAX, RowsState};
 use super::*;
 use crate::layer_device::DeviceSpan;
 use sparkflash_kernels::cuda_driver::{HostMapped, Kernel, Module};
+use sparkflash_kernels::dense_format::{
+    DenseFormat, DenseGroups, DenseIo, DenseMatrix, DenseRows, RowForm,
+};
 use sparkflash_kernels::moe_routed_device::{
     OPT_MOE_GATE_UP_DEDUP_ARGS, OPT_MOE_PLAN_ARGS, plan_in_cta_from,
 };
@@ -241,6 +244,10 @@ pub(super) struct DraftState {
     /// The stages' routed experts on the format route, when the release stores them in a format
     /// the released MXFP4 bodies do not read (one route layer a stage).
     routed_format: Option<sparkflash_kernels::routed_format::RoutedFormatDevice>,
+    /// The stages' dense projections (attention, shared expert, main_proj) on the dense format
+    /// route, when the release stores the dense class in a format the released MXFP8 bodies do
+    /// not read.
+    dense: Option<sparkflash_kernels::dense_format::DenseFormat>,
 }
 
 impl DraftState {
@@ -390,11 +397,19 @@ impl DraftState {
                 .map(|pointer| pointer.0)
                 .ok_or_else(|| format!("draft: the arena holds no {name}"))
         };
+        // An unscaled dense class (BF16) stores no scale plane beside its weights.
+        let unscaled = crate::plan::description()
+            .plan()
+            .dense_stored_format()
+            .is_unscaled();
         let pair = |base: String| -> Result<(u64, u64), String> {
-            Ok((
-                ptr(format!("{base}.weight"))?,
-                ptr(format!("{base}.scale"))?,
-            ))
+            let weight = ptr(format!("{base}.weight"))?;
+            let scales = if unscaled {
+                0
+            } else {
+                ptr(format!("{base}.scale"))?
+            };
+            Ok((weight, scales))
         };
         let mut allocations = Vec::new();
         let mut total = 0usize;
@@ -414,10 +429,14 @@ impl DraftState {
             let mut words = Vec::with_capacity(3 * draft_experts() * 2);
             for leaf in ["w1", "w3", "w2"] {
                 for expert in 0..draft_experts() {
-                    let (weight, scales) = pair(
+                    // A routed expert keeps its own plane whatever the dense class is.
+                    let base =
                         crate::plan::mtp_prefix(stage, &format!("ffn.experts.{expert}.{leaf}"))
-                            .to_owned(),
-                    )?;
+                            .to_owned();
+                    let (weight, scales) = (
+                        ptr(format!("{base}.weight"))?,
+                        ptr(format!("{base}.scale"))?,
+                    );
                     words.push(weight);
                     words.push(scales);
                 }
@@ -460,16 +479,37 @@ impl DraftState {
             });
         }
 
-        // main_proj is stored row-major (it is replicated, not a B12x shard): tile it once here.
+        // The stages' dense class: the released MXFP8 grid runs the B12x bodies, any other class
+        // the dense format route the plan's Mtp instance claims entries for.
+        let dense_class = crate::plan::description().plan().dense_stored_format();
+        let dense = if super::released_dense(dense_class) {
+            None
+        } else {
+            Some(super::open_dense_format(
+                cuda,
+                kernel_dir,
+                None,
+                sparkflash_model::Part::Mtp,
+                dense_class,
+                "the drafter's stages",
+            )?)
+        };
+        // main_proj is stored row-major (it is replicated, not a B12x shard): tile it once here
+        // for the B12x bodies; the dense format route reads it as stored.
         let (proj_codes, proj_scales) = pair("mtp.0.main_proj".to_owned())?;
         let inner = draft_taps() * dim;
-        let mut row_major = vec![0u8; dim * inner];
-        cuda.copy_dtoh(&mut row_major, &Deviceptr(proj_codes))?;
-        let tiled = sparkflash_device::arena::tile_b12x(&row_major, dim, inner)
-            .map_err(|error| format!("draft: main_proj tiling: {error}"))?;
-        drop(row_major);
-        let main_proj_tiled = alloc(tiled.len())?;
-        cuda.copy_htod(&Deviceptr(main_proj_tiled), &tiled)?;
+        let main_proj_tiled = if dense.is_some() {
+            proj_codes
+        } else {
+            let mut row_major = vec![0u8; dim * inner];
+            cuda.copy_dtoh(&mut row_major, &Deviceptr(proj_codes))?;
+            let tiled = sparkflash_device::arena::tile_b12x(&row_major, dim, inner)
+                .map_err(|error| format!("draft: main_proj tiling: {error}"))?;
+            drop(row_major);
+            let main_proj_tiled = alloc(tiled.len())?;
+            cuda.copy_htod(&Deviceptr(main_proj_tiled), &tiled)?;
+            main_proj_tiled
+        };
 
         let vocab = crate::plan::vocab_per_rank();
         let chunks = crate::tp4_tail::chunks_per_rank();
@@ -490,6 +530,7 @@ impl DraftState {
         let r = R_MAX;
         Ok(Self {
             routed_format,
+            dense,
             kernels,
             stages,
             main_proj: (main_proj_tiled, proj_scales),
@@ -734,6 +775,40 @@ impl DeviceLayer<'_> {
         )
     }
 
+    /// One drafter projection on the dense format route: `out = a @ W^T` over `n` rows of the
+    /// stored (row-major) weight, in the reference's unquantised arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    fn draft_dense(
+        &self,
+        route: &DenseFormat,
+        io: DenseIo,
+        w: (u64, u64),
+        (a, a_stride): (u64, usize),
+        (out, out_stride): (u64, usize),
+        (cols, inner): (usize, usize),
+        n: usize,
+        groups: DenseGroups,
+    ) -> Result<(), String> {
+        route.project(
+            self.cuda,
+            io,
+            &DenseMatrix {
+                weight: w.0,
+                scales: w.1,
+                cols,
+                inner,
+            },
+            &DenseRows {
+                a,
+                a_stride,
+                out,
+                out_stride,
+                tokens: n,
+            },
+            groups,
+        )
+    }
+
     /// The plain rope table pair (the MTP stages are window-only, compress ratio 0).
     fn draft_rope(&self) -> (u64, u64) {
         let span = self.buffers.workspace.rope_tables_plain;
@@ -797,32 +872,66 @@ impl DeviceLayer<'_> {
             }
             None => (dim, 0, main_x, dim),
         };
-        // The tiled weight: tile t's K-blocks at t * k_blocks * 1024 bytes, its scales at
-        // t * k_blocks.
-        let k_blocks = draft_taps() * dim / 32;
-        launch_opt(
-            self.cuda,
-            OptKind::F32aF32o,
-            &OptArgs {
-                a: taps,
-                a_scales: 0,
-                w: draft.main_proj.0 + (first_tile * k_blocks * 1024) as u64,
-                ws: draft.main_proj.1 + (first_tile * k_blocks) as u64,
-                out,
-                cols: cols as u32,
-                inner: (draft_taps() * dim) as u32,
-                tokens: n as u32,
-                a_tok_stride: (draft_taps() * dim) as u64,
-                out_tok_stride: out_stride as u64,
-                groups: 1,
-                a_grp_stride: 0,
-                w_grp_stride: 0,
-                s_grp_stride: 0,
-                out_grp_stride: 0,
-                k_stride_blocks: 0,
-            },
-        )
-        .map_err(|error| format!("draft main_proj: {error}"))?;
+        let inner = draft_taps() * dim;
+        if let Some(route) = draft.dense.as_ref() {
+            // The stored weight is row-major: a rank's columns start `first column` rows in, and
+            // its scale rows `first column / block` grid rows in.
+            let format = crate::plan::description().plan().dense_stored_format();
+            let first_col = first_tile * 32;
+            let block = format.block().max(1);
+            if split.is_some() && !first_col.is_multiple_of(block) {
+                return Err(format!(
+                    "draft main_proj: a rank's first column {first_col} is not on the {block}-wide \
+                     scale grid of the dense class {format}"
+                ));
+            }
+            let weight =
+                draft.main_proj.0 + (first_col * inner * format.values().bytes_per_value()) as u64;
+            let scales = if format.is_unscaled() {
+                0
+            } else {
+                draft.main_proj.1
+                    + ((first_col / block) * inner.div_ceil(block) * format.scale_bytes()) as u64
+            };
+            self.draft_dense(
+                route,
+                DenseIo::new(RowForm::F32, RowForm::F32),
+                (weight, scales),
+                (taps, inner),
+                (out, out_stride),
+                (cols, inner),
+                n,
+                DenseGroups::ONE,
+            )
+            .map_err(|error| format!("draft main_proj: {error}"))?;
+        } else {
+            // The tiled weight: tile t's K-blocks at t * k_blocks * 1024 bytes, its scales at
+            // t * k_blocks.
+            let k_blocks = inner / 32;
+            launch_opt(
+                self.cuda,
+                OptKind::F32aF32o,
+                &OptArgs {
+                    a: taps,
+                    a_scales: 0,
+                    w: draft.main_proj.0 + (first_tile * k_blocks * 1024) as u64,
+                    ws: draft.main_proj.1 + (first_tile * k_blocks) as u64,
+                    out,
+                    cols: cols as u32,
+                    inner: (draft_taps() * dim) as u32,
+                    tokens: n as u32,
+                    a_tok_stride: (draft_taps() * dim) as u64,
+                    out_tok_stride: out_stride as u64,
+                    groups: 1,
+                    a_grp_stride: 0,
+                    w_grp_stride: 0,
+                    s_grp_stride: 0,
+                    out_grp_stride: 0,
+                    k_stride_blocks: 0,
+                },
+            )
+            .map_err(|error| format!("draft main_proj: {error}"))?;
+        }
         if let Some((world, rank)) = split {
             let chunk = dim / world;
             self.exchange_slots(
@@ -857,6 +966,8 @@ impl DeviceLayer<'_> {
                 u64::from(self.eps.to_bits()),
                 main_codes,
                 main_scales,
+                // The dense format route reads the normed rows unquantised: written in place.
+                if draft.dense.is_some() { main_x } else { 0 },
             ],
         )?;
         let (cos, sin) = self.draft_rope();
@@ -866,16 +977,29 @@ impl DeviceLayer<'_> {
         // lanes' offsets, as the window rings do).
         let table = self.row_table(rows, &segs).filter(|_| sp.is_none());
         for (index, stage) in draft.stages.iter().enumerate() {
-            self.draft_gemv(
-                OptKind::Fp8aBf16o,
-                main_codes,
-                main_scales,
-                stage.wkv,
-                b.kv_latent,
-                latent,
-                dim,
-                n,
-            )
+            if let Some(route) = draft.dense.as_ref() {
+                self.draft_dense(
+                    route,
+                    DenseIo::new(RowForm::F32, RowForm::Bf16),
+                    stage.wkv,
+                    (main_x, dim),
+                    (b.kv_latent, latent),
+                    (latent, dim),
+                    n,
+                    DenseGroups::ONE,
+                )
+            } else {
+                self.draft_gemv(
+                    OptKind::Fp8aBf16o,
+                    main_codes,
+                    main_scales,
+                    stage.wkv,
+                    b.kv_latent,
+                    latent,
+                    dim,
+                    n,
+                )
+            }
             .map_err(|error| format!("draft seed wkv: {error}"))?;
             if let (Some(table), Some(first)) = (table, segs.first()) {
                 let ring = self.seg_draft_ring(stage, index, first);
@@ -1328,28 +1452,35 @@ impl DeviceLayer<'_> {
                 0,
                 1,
             )?;
-            self.draft_gemv(
-                OptKind::Fp8aBf16o,
-                b.act_codes,
-                b.act_scales,
-                stage.wq_a,
-                b.q_lora,
-                lora,
-                dim,
-                n,
-            )
-            .map_err(|error| format!("draft wq_a: {error}"))?;
-            self.draft_gemv(
-                OptKind::Fp8aBf16o,
-                b.act_codes,
-                b.act_scales,
-                stage.wkv,
-                b.kv_latent,
-                latent,
-                dim,
-                n,
-            )
-            .map_err(|error| format!("draft wkv: {error}"))?;
+            for (w, out, cols, what) in [
+                (stage.wq_a, b.q_lora, lora, "wq_a"),
+                (stage.wkv, b.kv_latent, latent, "wkv"),
+            ] {
+                if let Some(route) = draft.dense.as_ref() {
+                    self.draft_dense(
+                        route,
+                        DenseIo::new(RowForm::F32, RowForm::Bf16),
+                        w,
+                        (b.normed, dim),
+                        (out, cols),
+                        (cols, dim),
+                        n,
+                        DenseGroups::ONE,
+                    )
+                } else {
+                    self.draft_gemv(
+                        OptKind::Fp8aBf16o,
+                        b.act_codes,
+                        b.act_scales,
+                        w,
+                        out,
+                        cols,
+                        dim,
+                        n,
+                    )
+                }
+                .map_err(|error| format!("draft {what}: {error}"))?;
+            }
             self.row_norm(
                 span(b.q_lora, n * lora * 2),
                 span(stage.q_norm, lora * 2),
@@ -1359,17 +1490,30 @@ impl DeviceLayer<'_> {
                 0,
                 d as u64,
             )?;
-            rows.quantise_bf16(self.cuda, b.q_normed, b.q_codes, b.q_scales, lora, n)?;
-            self.draft_gemv(
-                OptKind::Fp8aBf16o,
-                b.q_codes,
-                b.q_scales,
-                stage.wq_b,
-                b.q,
-                q_cols,
-                lora,
-                n,
-            )
+            if let Some(route) = draft.dense.as_ref() {
+                self.draft_dense(
+                    route,
+                    DenseIo::new(RowForm::Bf16, RowForm::Bf16),
+                    stage.wq_b,
+                    (b.q_normed, lora),
+                    (b.q, q_cols),
+                    (q_cols, lora),
+                    n,
+                    DenseGroups::ONE,
+                )
+            } else {
+                rows.quantise_bf16(self.cuda, b.q_normed, b.q_codes, b.q_scales, lora, n)?;
+                self.draft_gemv(
+                    OptKind::Fp8aBf16o,
+                    b.q_codes,
+                    b.q_scales,
+                    stage.wq_b,
+                    b.q,
+                    q_cols,
+                    lora,
+                    n,
+                )
+            }
             .map_err(|error| format!("draft wq_b: {error}"))?;
             if let (Some(table), Some(first)) = (table, blocks.first()) {
                 let ring = self.seg_draft_ring(stage, index, first);
@@ -1479,7 +1623,7 @@ impl DeviceLayer<'_> {
                     )?;
                 }
             }
-            self.draft_output(rows, stage, n)?;
+            self.draft_output(rows, draft, stage, n)?;
             self.draft_reduce("all_reduce", b.attn_out, b.reduced, n)?;
             self.rows_post(rows, n, b.hc_rows, b.attn_mix, b.reduced, b.stream)?;
             self.rows_seam(
@@ -1529,11 +1673,56 @@ impl DeviceLayer<'_> {
     }
 
     /// wo_a over both groups, the bf16 quantiser, wo_b.
-    fn draft_output(&self, rows: &RowsState, stage: &Stage, n: usize) -> Result<(), String> {
+    fn draft_output(
+        &self,
+        rows: &RowsState,
+        draft: &DraftState,
+        stage: &Stage,
+        n: usize,
+    ) -> Result<(), String> {
         let b = rows.b;
         let geometry = self.out_geometry;
         let groups = geometry.groups as u64;
         let (cols, inner) = (geometry.o_lora_rank as u64, geometry.group_inner as u64);
+        if let Some(route) = draft.dense.as_ref() {
+            let format = crate::plan::description().plan().dense_stored_format();
+            let io = DenseIo::new(RowForm::Bf16, RowForm::Bf16);
+            let (c, k) = (cols as usize, inner as usize);
+            self.draft_dense(
+                route,
+                io,
+                stage.wo_a,
+                (b.attn_body, k * groups as usize),
+                (b.attn_lo, c * groups as usize),
+                (c, k),
+                n,
+                DenseGroups {
+                    count: groups as usize,
+                    a: inner,
+                    out: cols,
+                    weight: (c * k * format.values().bytes_per_value()) as u64,
+                    scales: if format.is_unscaled() {
+                        0
+                    } else {
+                        format.scale_count(c, k) as u64
+                    },
+                },
+            )
+            .map_err(|error| format!("draft wo_a: {error}"))?;
+            let lo = c * groups as usize;
+            return self
+                .draft_dense(
+                    route,
+                    io,
+                    stage.wo_b,
+                    (b.attn_lo, lo),
+                    (b.attn_out, geometry.hidden),
+                    (geometry.hidden, lo),
+                    n,
+                    DenseGroups::ONE,
+                )
+                .map_err(|error| format!("draft wo_b: {error}"));
+        }
         draft_launch(
             self.cuda,
             OptKind::Bf16aBf16o,
@@ -1606,29 +1795,49 @@ impl DeviceLayer<'_> {
         )?;
         let local = rows.shared_local;
         let [(w1, s1), (w3, s3), (w2, s2)] = stage.shared;
-        draft_launch(
-            self.cuda,
-            OptKind::F32aF32o,
-            &OptArgs {
-                a: b.seam_row,
-                a_scales: 0,
-                w: w1,
-                ws: s1,
-                out: b.shared_gate,
-                cols: local as u32,
-                inner: dim as u32,
-                tokens: n as u32,
-                a_tok_stride: dim as u64,
-                out_tok_stride: local as u64,
-                groups: 2,
-                a_grp_stride: 0,
-                w_grp_stride: w3.wrapping_sub(w1),
-                s_grp_stride: s3.wrapping_sub(s1),
-                out_grp_stride: (n * local) as u64,
-                k_stride_blocks: 0,
-            },
-        )
-        .map_err(|error| format!("draft shared gate/up: {error}"))?;
+        if let Some(route) = draft.dense.as_ref() {
+            let io = DenseIo::new(RowForm::F32, RowForm::F32);
+            for (w, out, what) in [
+                ((w1, s1), b.shared_gate, "gate"),
+                ((w3, s3), b.shared_gate + (n * local * 4) as u64, "up"),
+            ] {
+                self.draft_dense(
+                    route,
+                    io,
+                    w,
+                    (b.seam_row, dim),
+                    (out, local),
+                    (local, dim),
+                    n,
+                    DenseGroups::ONE,
+                )
+                .map_err(|error| format!("draft shared {what}: {error}"))?;
+            }
+        } else {
+            draft_launch(
+                self.cuda,
+                OptKind::F32aF32o,
+                &OptArgs {
+                    a: b.seam_row,
+                    a_scales: 0,
+                    w: w1,
+                    ws: s1,
+                    out: b.shared_gate,
+                    cols: local as u32,
+                    inner: dim as u32,
+                    tokens: n as u32,
+                    a_tok_stride: dim as u64,
+                    out_tok_stride: local as u64,
+                    groups: 2,
+                    a_grp_stride: 0,
+                    w_grp_stride: w3.wrapping_sub(w1),
+                    s_grp_stride: s3.wrapping_sub(s1),
+                    out_grp_stride: (n * local) as u64,
+                    k_stride_blocks: 0,
+                },
+            )
+            .map_err(|error| format!("draft shared gate/up: {error}"))?;
+        }
         rows.swiglu(
             self.cuda,
             b.shared_gate,
@@ -1638,28 +1847,42 @@ impl DeviceLayer<'_> {
             n * local,
         )
         .map_err(|error| format!("draft shared swiglu: {error}"))?;
-        draft_launch(
-            self.cuda,
-            OptKind::F32aF32o,
-            &OptArgs {
-                a: b.shared_swiglu,
-                a_scales: 0,
-                w: w2,
-                ws: s2,
-                out: b.shared_out,
-                cols: dim as u32,
-                inner: local as u32,
-                tokens: n as u32,
-                a_tok_stride: local as u64,
-                out_tok_stride: dim as u64,
-                groups: 1,
-                a_grp_stride: 0,
-                w_grp_stride: 0,
-                s_grp_stride: 0,
-                out_grp_stride: 0,
-                k_stride_blocks: 0,
-            },
-        )
+        if let Some(route) = draft.dense.as_ref() {
+            // The arena holds this rank's [dim][local] slice of the down as stored.
+            self.draft_dense(
+                route,
+                DenseIo::new(RowForm::F32, RowForm::F32),
+                (w2, s2),
+                (b.shared_swiglu, local),
+                (b.shared_out, dim),
+                (dim, local),
+                n,
+                DenseGroups::ONE,
+            )
+        } else {
+            draft_launch(
+                self.cuda,
+                OptKind::F32aF32o,
+                &OptArgs {
+                    a: b.shared_swiglu,
+                    a_scales: 0,
+                    w: w2,
+                    ws: s2,
+                    out: b.shared_out,
+                    cols: dim as u32,
+                    inner: local as u32,
+                    tokens: n as u32,
+                    a_tok_stride: local as u64,
+                    out_tok_stride: dim as u64,
+                    groups: 1,
+                    a_grp_stride: 0,
+                    w_grp_stride: 0,
+                    s_grp_stride: 0,
+                    out_grp_stride: 0,
+                    k_stride_blocks: 0,
+                },
+            )
+        }
         .map_err(|error| format!("draft shared down: {error}"))?;
         if let Some(route) = draft.routed_format.as_ref() {
             return route.run(

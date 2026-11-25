@@ -1200,29 +1200,43 @@ impl DeviceLayer<'_> {
             (n * heads) as u32,
         )?;
         let lora = self.projections[0].cols as usize;
-        launch_opt(
-            cuda,
-            OptKind::Fp8aBf16o,
-            &OptArgs {
-                a: b.q_codes,
-                a_scales: b.q_scales,
-                w: wq_b.0,
-                ws: wq_b_scales.0,
-                out: b.idx_query,
-                cols: index_cols as u32,
-                inner: lora as u32,
-                tokens: n as u32,
-                a_tok_stride: lora as u64,
-                out_tok_stride: index_cols as u64,
-                groups: 1,
-                a_grp_stride: 0,
-                w_grp_stride: 0,
-                s_grp_stride: 0,
-                out_grp_stride: 0,
-                k_stride_blocks: 0,
-            },
-        )
-        .map_err(|error| refusal(&format!("wq_b: {error}")))?;
+        if let Some(route) = self.layer_dense(layer).indexer {
+            self.index_query_dense(
+                route,
+                wq_b,
+                wq_b_scales,
+                b.q_normed,
+                b.idx_query,
+                index_cols,
+                lora,
+                n,
+            )
+            .map_err(|error| refusal(&format!("wq_b: {error}")))?;
+        } else {
+            launch_opt(
+                cuda,
+                OptKind::Fp8aBf16o,
+                &OptArgs {
+                    a: b.q_codes,
+                    a_scales: b.q_scales,
+                    w: wq_b.0,
+                    ws: wq_b_scales.0,
+                    out: b.idx_query,
+                    cols: index_cols as u32,
+                    inner: lora as u32,
+                    tokens: n as u32,
+                    a_tok_stride: lora as u64,
+                    out_tok_stride: index_cols as u64,
+                    groups: 1,
+                    a_grp_stride: 0,
+                    w_grp_stride: 0,
+                    s_grp_stride: 0,
+                    out_grp_stride: 0,
+                    k_stride_blocks: 0,
+                },
+            )
+            .map_err(|error| refusal(&format!("wq_b: {error}")))?;
+        }
         self.bulk_rope(bulk, b.idx_query, index_dim, heads, n, p0, 1)?;
         sparkflash_kernels::pool_group_launch::launch_fp4_round_trip(
             cuda,

@@ -21,7 +21,7 @@
 //
 //   opt_draft_taps        the hc-mean of a row's stream into one tap slot (grid 20 x rows).
 //   opt_draft_norm_quant  RMSNorm of f32 rows by a bf16 weight, then the MX FP8 activation codes
-//                         (grid rows).
+//                         (grid rows), and the normed rows as f32 when a buffer is given.
 //   opt_draft_attn        the block attention: every row of the block attends the stage ring's last
 //                         min(d, 128) positions and all of the block's own rows (grid heads x rows;
 //                         with a row table, several sequences' blocks).
@@ -140,11 +140,12 @@ OD_TAPS_ENTRY(opt_draft_taps_4096h2c2t_sm121)
 #define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_HIDDEN
 static_assert(OD_HIDDEN % 32u == 0u, "the quantiser blocks are 32 wide");
 extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
-    const float *__restrict__ x_all,
+    const float *x_all,
     const __nv_bfloat16 *__restrict__ weight,
     const float eps,
     uint8_t *__restrict__ codes_all,
-    uint8_t *__restrict__ scales_all) {
+    uint8_t *__restrict__ scales_all,
+    float *normed_all) {
     OPT_PDL_ENTRY();
     __shared__ float s_part[8];
     const uint32_t y = blockIdx.x;
@@ -173,6 +174,9 @@ extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
         const float inv_scale = 1.0f / spark_ue8m0_decode(scale);
         codes[c] = spark_fp8_e4m3_encode(v * inv_scale);
         if (lane == 0u) scales[qb] = scale;
+        // The unquantised (BF16-rounded) row too, for a reader on the dense format route. It may
+        // be x itself: each value is read and written by the one thread, in that order.
+        if (normed_all != nullptr) normed_all[(uint64_t)y * OD_HIDDEN + c] = v;
     }
 }
 #undef OD_HIDDEN

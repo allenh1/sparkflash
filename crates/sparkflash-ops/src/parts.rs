@@ -775,6 +775,32 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "flash_mla_csa2_sm121",
                 &[Precision::Bf16, Precision::Fp8E4M3, Precision::MxFp8],
             ),
+            // The projections in a dense class the released MXFP8 bodies do not read: the shared
+            // tile's dense mode (kernels/dense_format_sm121.cu).
+            deepseek_sym("dense_format_f32a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_f32a_f32o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_f32a_f32o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_f32a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_f32a_bf16o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_f32a_bf16o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_bf16a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_bf16a_f32o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_bf16a_f32o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_bf16a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_bf16a_bf16o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_bf16a_bf16o_bf16_sm121", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -873,6 +899,32 @@ pub const CATALOGUE: &[PartKernel] = &[
             deepseek_sym("opt_rows_hostw_f32w_f32o", &[Precision::F32]),
             deepseek_sym("scale_index_weights_bf16_to_f32", &[Precision::F32]),
             deepseek_sym("ref_select_sm121", &[Precision::MxFp8]),
+            // The query projection (wq_b) in a non-released dense class, on the shared tile's
+            // dense mode.
+            deepseek_sym("dense_format_f32a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_f32a_f32o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_f32a_f32o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_f32a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_f32a_bf16o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_f32a_bf16o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_bf16a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_bf16a_f32o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_bf16a_f32o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_bf16a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_bf16a_bf16o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_bf16a_bf16o_bf16_sm121", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -1524,12 +1576,24 @@ pub const CATALOGUE: &[PartKernel] = &[
             // format from the instance list.
             deepseek_sym("routed_format_gate_up_fp8_sm121", &[Precision::Fp8E4M3]),
             deepseek_sym("routed_format_down_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym("routed_format_gate_up_fp8_bf16_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "routed_format_gate_up_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
             deepseek_sym("routed_format_down_fp8_bf16_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym("routed_format_gate_up_nvfp4_qwen_sm121", &[Precision::NvFp4]),
+            deepseek_sym(
+                "routed_format_gate_up_nvfp4_qwen_sm121",
+                &[Precision::NvFp4],
+            ),
             deepseek_sym("routed_format_down_nvfp4_qwen_sm121", &[Precision::NvFp4]),
-            deepseek_sym("routed_format_gate_up_nvfp4_inkling_sm121", &[Precision::NvFp4]),
-            deepseek_sym("routed_format_down_nvfp4_inkling_sm121", &[Precision::NvFp4]),
+            deepseek_sym(
+                "routed_format_gate_up_nvfp4_inkling_sm121",
+                &[Precision::NvFp4],
+            ),
+            deepseek_sym(
+                "routed_format_down_nvfp4_inkling_sm121",
+                &[Precision::NvFp4],
+            ),
             deepseek_sym("routed_format_gate_up_mxfp8_row_sm121", &[Precision::MxFp8]),
             deepseek_sym("routed_format_down_mxfp8_row_sm121", &[Precision::MxFp8]),
         ],
@@ -2164,14 +2228,52 @@ pub const CATALOGUE: &[PartKernel] = &[
             // (kernels/routed_format_sm121.cu) at the stage's top-k.
             deepseek_sym("routed_format_gate_up_fp8_sm121", &[Precision::Fp8E4M3]),
             deepseek_sym("routed_format_down_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym("routed_format_gate_up_fp8_bf16_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "routed_format_gate_up_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
             deepseek_sym("routed_format_down_fp8_bf16_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym("routed_format_gate_up_nvfp4_qwen_sm121", &[Precision::NvFp4]),
+            deepseek_sym(
+                "routed_format_gate_up_nvfp4_qwen_sm121",
+                &[Precision::NvFp4],
+            ),
             deepseek_sym("routed_format_down_nvfp4_qwen_sm121", &[Precision::NvFp4]),
-            deepseek_sym("routed_format_gate_up_nvfp4_inkling_sm121", &[Precision::NvFp4]),
-            deepseek_sym("routed_format_down_nvfp4_inkling_sm121", &[Precision::NvFp4]),
+            deepseek_sym(
+                "routed_format_gate_up_nvfp4_inkling_sm121",
+                &[Precision::NvFp4],
+            ),
+            deepseek_sym(
+                "routed_format_down_nvfp4_inkling_sm121",
+                &[Precision::NvFp4],
+            ),
             deepseek_sym("routed_format_gate_up_mxfp8_row_sm121", &[Precision::MxFp8]),
             deepseek_sym("routed_format_down_mxfp8_row_sm121", &[Precision::MxFp8]),
+            // The stage's dense projections in a non-released dense class, on the shared tile's
+            // dense mode.
+            deepseek_sym("dense_format_f32a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_f32a_f32o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_f32a_f32o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_f32a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_f32a_bf16o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_f32a_bf16o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_bf16a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_bf16a_f32o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_bf16a_f32o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_bf16a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_bf16a_bf16o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_bf16a_bf16o_bf16_sm121", &[Precision::Bf16]),
         ],
         true,
     ),

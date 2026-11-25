@@ -175,10 +175,6 @@ pub(super) struct RowsKernels {
     /// opt_rows_hostw_{bf16w, f32w}_f32o_ring: the compressor's projections of every lane's rows
     /// into their rings in one launch each (none in an older cubin, or SPARKFLASH_ROWS_RING=0).
     hostw_ring: Option<[Kernel; 2]>,
-    /// opt_mma_hostw_bf16a_bf16w: a BF16-stored projection over BF16 activation rows. The row
-    /// hostw kernels take f32 rows, so a seam that has BF16 rows (q_normed, the attention body,
-    /// the o latent) uses this one instead.
-    hostw_bf16a: Kernel,
     /// A step's completed compressor groups, every lane's at once (none in an older cubin, or
     /// SPARKFLASH_ROWS_GROUPS=0).
     groups: Option<GroupKernels>,
@@ -534,10 +530,6 @@ impl RowsState {
         } else {
             None
         };
-        let (mma, _sha) = cached_cubin(&kernel_dir.join("opt_mma_sm121.cubin"))
-            .map_err(|error| format!("rows: {error}"))?;
-        let (mma_module, hostw_bf16a) = cuda.load_named(&mma, "opt_mma_hostw_bf16a_bf16w")?;
-        modules.push(mma_module);
         let kernels = RowsKernels {
             _modules: modules,
             seam,
@@ -562,7 +554,6 @@ impl RowsState {
             rank_permute,
             hostw,
             hostw_ring,
-            hostw_bf16a,
             groups,
             prefetch_l2,
             prologue,
@@ -2429,17 +2420,17 @@ impl DeviceLayer<'_> {
         let b = rows.b;
         let dim = self.dim;
         let tokens = n as u32;
-        // A BF16-stored attention projection is read by the host-weight bodies from the arena's
-        // row-major bytes. The packed arrangement has no device loader yet, so it is refused by
-        // name rather than read as row-major BF16 words.
-        let stored = crate::plan::operand(Some(layer), sparkflash_model::Part::MlaAttention).stored;
-        let bf16_weight =
-            stored.values() == sparkflash_model::format::FormatValues::Bf16 && stored.is_unscaled();
-        if stored.layout() == sparkflash_model::format::FormatLayout::Packed {
-            return Err(format!(
-                "rows: layer {layer}'s attention weights are stored in the packed BF16 form, which the device loader does not arrange yet"
-            ));
-        }
+        // An attention projection stored in a class the released MXFP8 bodies do not read runs on
+        // the dense format route: the unquantised rows in (the f32 normed row, the BF16 q row),
+        // BF16 rows out, the reference's arithmetic.
+        let dense = self.layer_dense(layer).attention;
+        let dense_io = |input| {
+            sparkflash_kernels::dense_format::DenseIo::new(
+                input,
+                sparkflash_kernels::dense_format::RowForm::Bf16,
+            )
+        };
+        use sparkflash_kernels::dense_format::{DenseGroups, DenseMatrix, DenseRows, RowForm};
         let gemv = |name: &str,
                     a: u64,
                     a_scales: u64,
@@ -2451,22 +2442,27 @@ impl DeviceLayer<'_> {
                 .weights
                 .pair(layer, name)
                 .map_err(|error| format!("rows {name}: {error}"))?;
-            if bf16_weight {
-                // opt_rows_hostw_bf16w: f32 activation rows against row-major BF16 weights.
-                return self.cuda.launch(
-                    rows.kernels.hostw[0],
-                    ((cols / 32) as u32, tokens, 1),
-                    (32, 1, 1),
-                    &[
-                        a,
-                        w.0,
-                        out,
-                        cols as u64,
-                        inner as u64,
-                        inner as u64,
-                        cols as u64,
-                    ],
-                );
+            if let Some(route) = dense {
+                return route
+                    .project(
+                        self.cuda,
+                        dense_io(RowForm::F32),
+                        &DenseMatrix {
+                            weight: w.0,
+                            scales: ws.0,
+                            cols,
+                            inner,
+                        },
+                        &DenseRows {
+                            a,
+                            a_stride: inner,
+                            out,
+                            out_stride: cols,
+                            tokens: n,
+                        },
+                        DenseGroups::ONE,
+                    )
+                    .map_err(|error| format!("rows {name}: {error}"));
             }
             launch_opt_rows(
                 self.cuda,
@@ -2494,7 +2490,7 @@ impl DeviceLayer<'_> {
             .map_err(|error| format!("rows {name}: {error}"))
         };
         let lora = rows.lora_cols;
-        let (act, act_scales) = if bf16_weight {
+        let (act, act_scales) = if dense.is_some() {
             (b.normed, 0)
         } else {
             (b.act_codes, b.act_scales)
@@ -2514,31 +2510,36 @@ impl DeviceLayer<'_> {
             layer as u32,
             p0 as u64,
         )?;
-        if bf16_weight {
-            let (w, _) = self
+        if let Some(route) = dense {
+            let (w, ws) = self
                 .weights
                 .pair(layer, "wq_b")
                 .map_err(|error| format!("rows wq_b: {error}"))?;
-            // opt_mma_hostw_bf16a_bf16w: BF16 activation rows (q_normed) against row-major BF16.
-            self.cuda.launch(
-                rows.kernels.hostw_bf16a,
-                (
-                    (rows.q_cols as u32).div_ceil(128),
-                    (tokens).div_ceil(128),
-                    1,
-                ),
-                (256, 1, 1),
-                &[
-                    b.q_normed,
-                    w.0,
-                    b.q,
-                    rows.q_cols as u64,
-                    lora as u64,
-                    tokens as u64,
-                    lora as u64,
-                    rows.q_cols as u64,
-                ],
-            )?;
+            route
+                .project(
+                    self.cuda,
+                    dense_io(RowForm::Bf16),
+                    &DenseMatrix {
+                        weight: w.0,
+                        scales: ws.0,
+                        cols: rows.q_cols,
+                        inner: lora,
+                    },
+                    &DenseRows {
+                        a: b.q_normed,
+                        a_stride: lora,
+                        out: b.q,
+                        out_stride: rows.q_cols,
+                        tokens: n,
+                    },
+                    DenseGroups::ONE,
+                )
+                .map_err(|error| format!("rows wq_b: {error}"))?;
+            // A released-class indexer beside a routed attention still reads the quantised q row
+            // rows_query_kv leaves in q_codes.
+            if self.layer_dense(layer).indexer.is_none() {
+                rows.quantise_bf16(self.cuda, b.q_normed, b.q_codes, b.q_scales, lora, n)?;
+            }
         } else {
             rows.quantise_bf16(self.cuda, b.q_normed, b.q_codes, b.q_scales, lora, n)?;
             gemv("wq_b", b.q_codes, b.q_scales, b.q, rows.q_cols, lora)?;
@@ -3125,30 +3126,43 @@ impl DeviceLayer<'_> {
             )?;
             // ref_select quantises q_normed exactly as rows_query_kv already did into q_codes.
             let lora = rows.lora_cols;
-            launch_opt_rows(
-                cuda,
-                OptKind::Fp8aBf16o,
-                &OptArgs {
-                    a: b.q_codes,
-                    a_scales: b.q_scales,
-                    w: wq_b.0,
-                    ws: wq_b_scales.0,
-                    out: b.idx_query,
-                    cols: index_cols as u32,
-                    inner: lora as u32,
-                    tokens: n as u32,
-                    a_tok_stride: lora as u64,
-                    out_tok_stride: index_cols as u64,
-                    groups: 1,
-                    a_grp_stride: 0,
-                    w_grp_stride: 0,
-                    s_grp_stride: 0,
-                    out_grp_stride: 0,
-                    k_stride_blocks: 0,
-                },
-                R_MAX,
-            )
-            .map_err(|error| format!("rows indexer wq_b: {error}"))?;
+            if let Some(route) = self.layer_dense(layer).indexer {
+                self.index_query_dense(
+                    route,
+                    wq_b,
+                    wq_b_scales,
+                    b.q_normed,
+                    b.idx_query,
+                    index_cols,
+                    lora,
+                    n,
+                )?;
+            } else {
+                launch_opt_rows(
+                    cuda,
+                    OptKind::Fp8aBf16o,
+                    &OptArgs {
+                        a: b.q_codes,
+                        a_scales: b.q_scales,
+                        w: wq_b.0,
+                        ws: wq_b_scales.0,
+                        out: b.idx_query,
+                        cols: index_cols as u32,
+                        inner: lora as u32,
+                        tokens: n as u32,
+                        a_tok_stride: lora as u64,
+                        out_tok_stride: index_cols as u64,
+                        groups: 1,
+                        a_grp_stride: 0,
+                        w_grp_stride: 0,
+                        s_grp_stride: 0,
+                        out_grp_stride: 0,
+                        k_stride_blocks: 0,
+                    },
+                    R_MAX,
+                )
+                .map_err(|error| format!("rows indexer wq_b: {error}"))?;
+            }
             // The query rope of every row at once (per segment without the row table): the opt
             // rope's arithmetic is rope_rotate_rows_bf16's forward rotation.
             let pairs = self.rope_pairs as usize;
@@ -3561,6 +3575,157 @@ impl DeviceLayer<'_> {
         Ok(())
     }
 
+    /// The indexer's query projection on the dense format route: the BF16 q rows (before the
+    /// quantiser the released body reads) against a wq_b staged as stored, BF16 rows out.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn index_query_dense(
+        &self,
+        route: sparkflash_kernels::dense_format::DenseFormat,
+        wq_b: Deviceptr,
+        wq_b_scales: Deviceptr,
+        q_normed: u64,
+        out: u64,
+        index_cols: usize,
+        lora: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::dense_format::{
+            DenseGroups, DenseIo, DenseMatrix, DenseRows, RowForm,
+        };
+        route
+            .project(
+                self.cuda,
+                DenseIo::new(RowForm::Bf16, RowForm::Bf16),
+                &DenseMatrix {
+                    weight: wq_b.0,
+                    scales: wq_b_scales.0,
+                    cols: index_cols,
+                    inner: lora,
+                },
+                &DenseRows {
+                    a: q_normed,
+                    a_stride: lora,
+                    out,
+                    out_stride: index_cols,
+                    tokens: n,
+                },
+                DenseGroups::ONE,
+            )
+            .map_err(|error| format!("indexer wq_b: {error}"))
+    }
+
+    /// The shared expert on the dense format route: gate and up from the rows the FFN seam left
+    /// (a split chunk's gathered BF16 rows, or the f32 seam row), SwiGLU, then down, every
+    /// product the reference's unquantised one.
+    ///
+    /// The down projection reads whole weight rows, so a rank's slice of the reduction (TP > 1)
+    /// is refused by name rather than read with the wrong row stride.
+    fn shared_dense(
+        &self,
+        rows: &RowsState,
+        bulk: Option<&BulkState>,
+        route: sparkflash_kernels::dense_format::DenseFormat,
+        ops: SharedExpertDeviceLayer,
+        layer: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::dense_format::{
+            DenseGroups, DenseIo, DenseMatrix, DenseRows, RowForm,
+        };
+        let b = rows.b;
+        let dim = self.dim;
+        let local = rows.shared_local;
+        let shared = self
+            .shared
+            .as_ref()
+            .ok_or("rows: no shared expert operands")?;
+        let inter = shared.inter;
+        let format = crate::plan::shared_expert_format(layer)?;
+        let value_bytes = format.values().bytes_per_value() as u64;
+        let block = format.block().max(1);
+        let scale_bytes = format.scale_values().bytes() as u64;
+        let rank = self.tp_rank as u64;
+        let scaled = |pointer: Deviceptr, offset: u64| {
+            if pointer.0 == 0 {
+                0
+            } else {
+                pointer.0 + offset
+            }
+        };
+        // Gate/up rows `rank * local ..` of [inter][dim], and their scale rows.
+        let weight_offset = rank * (local * dim) as u64 * value_bytes;
+        let scale_offset = rank * ((local / block) * (dim / block)) as u64 * scale_bytes;
+        if !local.is_multiple_of(block) {
+            return Err(format!(
+                "rows shared: layer {layer}'s {local}-of-{inter} rank slice is not on the {block}-wide scale grid of {}",
+                format.describe()
+            ));
+        }
+        // The down weight is rank-major (build_shared_expert_device): this rank's [dim][local].
+        let down_offset = rank * (dim * local) as u64 * value_bytes;
+        let down_scale_offset = rank * (dim.div_ceil(block) * (local / block)) as u64 * scale_bytes;
+        let split = bulk.filter(|_| self.sp_rows(rows, n).is_some()).is_some();
+        let (a, input) = if split {
+            (b.ffn_x, RowForm::Bf16)
+        } else {
+            (b.seam_row, RowForm::F32)
+        };
+        let io = DenseIo::new(input, RowForm::F32);
+        for (index, (weight, scales)) in
+            [(ops.w1, ops.s1), (ops.w3, ops.s3)].into_iter().enumerate()
+        {
+            route
+                .project(
+                    self.cuda,
+                    io,
+                    &DenseMatrix {
+                        weight: weight.0 + weight_offset,
+                        scales: scaled(scales, scale_offset),
+                        cols: local,
+                        inner: dim,
+                    },
+                    &DenseRows {
+                        a,
+                        a_stride: dim,
+                        out: b.shared_gate + (index * n * local * 4) as u64,
+                        out_stride: local,
+                        tokens: n,
+                    },
+                    DenseGroups::ONE,
+                )
+                .map_err(|error| format!("rows shared gate/up: {error}"))?;
+        }
+        rows.swiglu(
+            self.cuda,
+            b.shared_gate,
+            b.shared_gate + (n * local * 4) as u64,
+            b.shared_swiglu,
+            self.swiglu_limit,
+            n * local,
+        )
+        .map_err(|error| format!("rows shared swiglu: {error}"))?;
+        route
+            .project(
+                self.cuda,
+                DenseIo::new(RowForm::F32, RowForm::F32),
+                &DenseMatrix {
+                    weight: ops.w2.0 + down_offset,
+                    scales: scaled(ops.s2, down_scale_offset),
+                    cols: dim,
+                    inner: local,
+                },
+                &DenseRows {
+                    a: b.shared_swiglu,
+                    a_stride: local,
+                    out: b.shared_out,
+                    out_stride: dim,
+                    tokens: n,
+                },
+                DenseGroups::ONE,
+            )
+            .map_err(|error| format!("rows shared down: {error}"))
+    }
+
     /// wo_a over both groups, the bf16 quantiser, wo_b.
     fn rows_output(&mut self, rows: &RowsState, layer: usize, n: usize) -> Result<(), String> {
         let b = rows.b;
@@ -3577,60 +3742,73 @@ impl DeviceLayer<'_> {
         let groups = geometry.groups as u64;
         let (cols, inner) = (geometry.o_lora_rank as u64, geometry.group_inner as u64);
         let tokens = n as u32;
-        let stored = crate::plan::operand(Some(layer), sparkflash_model::Part::MlaAttention).stored;
-        let bf16_weight =
-            stored.values() == sparkflash_model::format::FormatValues::Bf16 && stored.is_unscaled();
-        if stored.layout() == sparkflash_model::format::FormatLayout::Packed {
-            return Err(format!(
-                "rows output: layer {layer}'s attention weights are stored in the packed BF16 form, which the device loader does not arrange yet"
-            ));
-        }
-        if bf16_weight {
-            // wo_a groups its reduction; the host-weight body has no group stride, so one launch
-            // a group over the same BF16 rows. wo_b then reads the BF16 latent the body wrote.
-            let hostw = |a: u64,
-                         w: u64,
-                         out: u64,
-                         cols: u64,
-                         inner: u64,
-                         a_stride: u64,
-                         out_stride: u64| {
-                self.cuda.launch(
-                    rows.kernels.hostw_bf16a,
-                    ((cols as u32).div_ceil(128), tokens.div_ceil(128), 1),
-                    (256, 1, 1),
-                    &[
-                        a,
-                        w,
-                        out,
-                        cols,
-                        inner,
-                        u64::from(tokens),
-                        a_stride,
-                        out_stride,
-                    ],
-                )
+        if let Some(route) = self.layer_dense(layer).attention {
+            use sparkflash_kernels::dense_format::{
+                DenseGroups, DenseIo, DenseMatrix, DenseRows, RowForm,
             };
-            for group in 0..groups {
-                hostw(
-                    b.attn_body + group * inner * 2,
-                    wo_a.0.0 + group * cols * inner * 2,
-                    b.attn_lo + group * cols * 2,
-                    cols,
-                    inner,
-                    inner * groups,
-                    cols * groups,
-                )?;
-            }
-            return hostw(
-                b.attn_lo,
-                wo_b.0.0,
-                b.attn_out,
-                geometry.hidden as u64,
-                rows.lo_cols as u64,
-                rows.lo_cols as u64,
-                geometry.hidden as u64,
-            );
+            let io = DenseIo::new(RowForm::Bf16, RowForm::Bf16);
+            // wo_a groups its reduction on the grid's z axis: group g reads its heads' slice of
+            // the BF16 attention rows and its own [cols][inner] block of the weight.
+            let scales_per_group = if wo_a.1.0 == 0 {
+                0
+            } else {
+                let block = crate::plan::operand(Some(layer), sparkflash_model::Part::MlaAttention)
+                    .stored
+                    .block()
+                    .max(1) as u64;
+                (cols / block) * (inner / block)
+            };
+            let value_bytes =
+                crate::plan::operand(Some(layer), sparkflash_model::Part::MlaAttention)
+                    .stored
+                    .values()
+                    .bytes_per_value() as u64;
+            route
+                .project(
+                    self.cuda,
+                    io,
+                    &DenseMatrix {
+                        weight: wo_a.0.0,
+                        scales: wo_a.1.0,
+                        cols: cols as usize,
+                        inner: inner as usize,
+                    },
+                    &DenseRows {
+                        a: b.attn_body,
+                        a_stride: (inner * groups) as usize,
+                        out: b.attn_lo,
+                        out_stride: (cols * groups) as usize,
+                        tokens: n,
+                    },
+                    DenseGroups {
+                        count: groups as usize,
+                        a: inner,
+                        out: cols,
+                        weight: cols * inner * value_bytes,
+                        scales: scales_per_group,
+                    },
+                )
+                .map_err(|error| format!("rows wo_a: {error}"))?;
+            return route
+                .project(
+                    self.cuda,
+                    io,
+                    &DenseMatrix {
+                        weight: wo_b.0.0,
+                        scales: wo_b.1.0,
+                        cols: geometry.hidden,
+                        inner: rows.lo_cols,
+                    },
+                    &DenseRows {
+                        a: b.attn_lo,
+                        a_stride: rows.lo_cols,
+                        out: b.attn_out,
+                        out_stride: geometry.hidden,
+                        tokens: n,
+                    },
+                    DenseGroups::ONE,
+                )
+                .map_err(|error| format!("rows wo_b: {error}"));
         }
         launch_opt_rows(
             self.cuda,
@@ -3738,6 +3916,9 @@ impl DeviceLayer<'_> {
         let rank = self.tp_rank as u64;
         let dim_blocks = (dim / 32) as u64;
         let local_tiles = (local / 32) as u64;
+        if let Some(route) = self.layer_dense(layer).shared {
+            return self.shared_dense(rows, bulk, route, ops, layer, n);
+        }
         let gate_up = |a: u64| OptArgs {
             a,
             a_scales: 0,

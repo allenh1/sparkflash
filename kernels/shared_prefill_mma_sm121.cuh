@@ -45,6 +45,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -168,11 +169,12 @@ __device__ __forceinline__ float spm_scale(const ScaleT value) {
 // The activation is f32 split into bf16 head and remainder; the output is f32.
 template <int kFormat, bool kRoutedMoe, bool kLow, typename ScaleT = float,
           int kTableStride = 2, int kTableOffset = 0, bool kSlotRows = false,
-          bool kOutSlotRows = false, int kWide = 0>
+          bool kOutSlotRows = false, int kWide = 0, typename AT = float,
+          typename OutT = float>
 __device__ __forceinline__ void shared_prefill_mma_body(
-    const float *__restrict__ a, const uint8_t *__restrict__ w, const void *__restrict__ ws,
+    const AT *__restrict__ a, const uint8_t *__restrict__ w, const void *__restrict__ ws,
     const unsigned long long *__restrict__ table, const int4 *__restrict__ items,
-    float *__restrict__ out, uint32_t cols, uint32_t inner, uint32_t tokens,
+    OutT *__restrict__ out, uint32_t cols, uint32_t inner, uint32_t tokens,
     uint64_t a_tok_stride, uint64_t out_tok_stride, uint64_t a_grp_stride,
     uint64_t out_grp_stride, uint64_t w_grp_stride = 0, uint64_t ws_grp_stride = 0,
     const int *__restrict__ sorted = nullptr, uint32_t topk = 1,
@@ -183,6 +185,10 @@ __device__ __forceinline__ void shared_prefill_mma_body(
     constexpr bool kMx8r = kFormat == SPM_W_MX8R;
     constexpr bool kFoldWide = kFp4 && kWide == 1;
     constexpr bool kOutWide = kFp4 && kWide == 2;
+    // A BF16 activation row is read as stored (its low half is zero, so kLow adds nothing), and a
+    // BF16 output is the f32 accumulator rounded once at the store.
+    constexpr bool kBf16A = std::is_same<AT, __nv_bfloat16>::value;
+    constexpr bool kBf16Out = std::is_same<OutT, __nv_bfloat16>::value;
     __shared__ __align__(16) __nv_bfloat16 s_ah[GLM_BM * OB_LD];
     __shared__ __align__(16) __nv_bfloat16 s_al[kLow ? GLM_BM * OB_LD : 1];
     __shared__ __align__(16) __nv_bfloat16 s_w[GLM_BN * OB_LD];
@@ -267,7 +273,12 @@ __device__ __forceinline__ void shared_prefill_mma_body(
             (void)row;
             if (a_row[i] >= 0) {
                 const uint64_t e = (uint64_t)a_row[i] + (uint64_t)kb * 32u + c * 4u;
-                ra[i] = __ldg(reinterpret_cast<const uint4 *>(a + e));
+                if constexpr (kBf16A) {
+                    const uint2 r = __ldg(reinterpret_cast<const uint2 *>(a + e));
+                    ra[i] = make_uint4(r.x, r.y, 0u, 0u);
+                } else {
+                    ra[i] = __ldg(reinterpret_cast<const uint4 *>(a + e));
+                }
             } else {
                 ra[i] = make_uint4(0u, 0u, 0u, 0u);
             }
@@ -314,8 +325,18 @@ __device__ __forceinline__ void shared_prefill_mma_body(
             const uint32_t idx = tid + i * OM_THREADS;
             const uint32_t row = idx >> 3;
             const uint32_t c = idx & 7u;
-            const float v[4] = {__uint_as_float(ra[i].x), __uint_as_float(ra[i].y),
-                                __uint_as_float(ra[i].z), __uint_as_float(ra[i].w)};
+            float v[4];
+            if constexpr (kBf16A) {
+                v[0] = __uint_as_float(ra[i].x << 16);
+                v[1] = __uint_as_float(ra[i].x & 0xffff0000u);
+                v[2] = __uint_as_float(ra[i].y << 16);
+                v[3] = __uint_as_float(ra[i].y & 0xffff0000u);
+            } else {
+                v[0] = __uint_as_float(ra[i].x);
+                v[1] = __uint_as_float(ra[i].y);
+                v[2] = __uint_as_float(ra[i].z);
+                v[3] = __uint_as_float(ra[i].w);
+            }
             __nv_bfloat16 h[4], l[4];
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
@@ -478,7 +499,11 @@ __device__ __forceinline__ void shared_prefill_mma_body(
                 if constexpr (kOutWide) {
                     v = make_float2(__fmul_rn(v.x, wide), __fmul_rn(v.y, wide));
                 }
-                *reinterpret_cast<float2 *>(out + o) = v;
+                if constexpr (kBf16Out) {
+                    *reinterpret_cast<__nv_bfloat162 *>(out + o) = __floats2bfloat162_rn(v.x, v.y);
+                } else {
+                    *reinterpret_cast<float2 *>(out + o) = v;
+                }
             }
         }
     }

@@ -458,8 +458,9 @@ fn check_wo_a(
         .iter()
         .filter(|spec| spec.name.ends_with("attn.wo_a.weight"))
         .map(|spec| {
-            HeaderEntry::new(spec.name.clone(), spec.dtype.name(), spec.shape.clone())
-                .with_format(tp4_resident::tensor_format(plan, &spec.name, spec.dtype.name()))
+            HeaderEntry::new(spec.name.clone(), spec.dtype.name(), spec.shape.clone()).with_format(
+                tp4_resident::tensor_format(plan, &spec.name, spec.dtype.name()),
+            )
         });
     let resident = match ResidentPlan::plan(0, world, entries) {
         Ok(resident) => resident,

@@ -50,6 +50,7 @@ pub mod compressed_cache_ref;
 pub mod compressor_staging;
 pub mod cuda_driver;
 pub mod cuda_harness;
+pub mod dense_format;
 pub mod device_trace;
 pub mod engram_convert_launch;
 pub mod engram_embed_launch;

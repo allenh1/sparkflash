@@ -342,7 +342,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "layers.{layer}.attn.wq_a.weight"
 part = "mla_attention"
 role = "attention"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["q_lora", "hidden"]
 split = "whole"
 repeat = "layers"
@@ -362,7 +362,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "layers.{layer}.attn.wq_b.weight"
 part = "mla_attention"
 role = "attention"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["heads * head_dim", "q_lora"]
 split = "rows"
 repeat = "layers"
@@ -382,7 +382,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "layers.{layer}.attn.wkv.weight"
 part = "mla_attention"
 role = "attention"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["head_dim", "hidden"]
 split = "whole"
 repeat = "layers"
@@ -402,7 +402,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "layers.{layer}.attn.wo_a.weight"
 part = "mla_attention"
 role = "attention"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["o_groups * o_lora", "heads * head_dim / o_groups"]
 split = "rows"
 repeat = "layers"
@@ -422,7 +422,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "layers.{layer}.attn.wo_b.weight"
 part = "mla_attention"
 role = "attention"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["hidden", "o_groups * o_lora"]
 split = "columns"
 repeat = "layers"
@@ -476,7 +476,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "layers.{layer}.ffn.shared_experts.w1.weight"
 part = "moe"
 role = "shared_expert"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["shared_width", "hidden"]
 split = "rows"
 repeat = "layers"
@@ -496,7 +496,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "layers.{layer}.ffn.shared_experts.w2.weight"
 part = "moe"
 role = "shared_expert"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["hidden", "shared_width"]
 split = "columns"
 repeat = "layers"
@@ -516,7 +516,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "layers.{layer}.ffn.shared_experts.w3.weight"
 part = "moe"
 role = "shared_expert"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["shared_width", "hidden"]
 split = "rows"
 repeat = "layers"
@@ -640,7 +640,7 @@ when = { attention = "mla", ffn = "moe", array = "compress_ratios", gt = 1 }
 name = "layers.{layer}.attn.indexer.wq_b.weight"
 part = "sparse_indexer"
 role = "indexer"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["index_heads * index_dim", "q_lora"]
 split = "whole"
 repeat = "listed_layers"
@@ -880,7 +880,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "mtp.{stage}.attn.wq_a.weight"
 part = "mtp"
 role = "mtp"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["q_lora", "hidden"]
 split = "whole"
 repeat = "mtp_stages"
@@ -900,7 +900,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "mtp.{stage}.attn.wq_b.weight"
 part = "mtp"
 role = "mtp"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["heads * head_dim", "q_lora"]
 split = "whole"
 repeat = "mtp_stages"
@@ -920,7 +920,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "mtp.{stage}.attn.wkv.weight"
 part = "mtp"
 role = "mtp"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["head_dim", "hidden"]
 split = "whole"
 repeat = "mtp_stages"
@@ -940,7 +940,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "mtp.{stage}.attn.wo_a.weight"
 part = "mtp"
 role = "mtp"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["o_groups * o_lora", "heads * head_dim / o_groups"]
 split = "whole"
 repeat = "mtp_stages"
@@ -960,7 +960,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "mtp.{stage}.attn.wo_b.weight"
 part = "mtp"
 role = "mtp"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["hidden", "o_groups * o_lora"]
 split = "whole"
 repeat = "mtp_stages"
@@ -1010,7 +1010,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "mtp.{stage}.ffn.shared_experts.w1.weight"
 part = "mtp"
 role = "mtp"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["shared_width", "hidden"]
 split = "whole"
 repeat = "mtp_stages"
@@ -1030,7 +1030,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "mtp.{stage}.ffn.shared_experts.w2.weight"
 part = "mtp"
 role = "mtp"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["hidden", "shared_width"]
 split = "whole"
 repeat = "mtp_stages"
@@ -1050,7 +1050,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "mtp.{stage}.ffn.shared_experts.w3.weight"
 part = "mtp"
 role = "mtp"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["shared_width", "hidden"]
 split = "whole"
 repeat = "mtp_stages"
@@ -1133,7 +1133,7 @@ when = { attention = "mla", ffn = "moe" }
 name = "mtp.{mtp_targets - mtp_targets}.main_proj.weight"
 part = "mtp"
 role = "mtp"
-dtype = "f8e4m3"
+dtype = "dense"
 shape = ["hidden", "mtp_targets * hidden"]
 split = "whole"
 repeat = "mtp"
