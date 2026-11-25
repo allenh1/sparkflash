@@ -3307,14 +3307,45 @@ fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
         Some(declared) => declared.format(block, scale.as_deref()),
         None => dense_format,
     };
-    let mtp_expert_format = mtp_expert
+    let mut mtp_expert_format = mtp_expert
         .as_ref()
         .map(|declared| declared.format(block, scale.as_deref()));
+    let (mut dense_format, mut expert_format) = (dense_format, expert_format);
+    // The activation scheme says whether an FP8 tile's input is quantised: `dynamic` (and a
+    // release that states none, as every FP8 tile release has been read) quantises each input
+    // tile at run time; `none` keeps the inputs unquantised, the weights alone FP8 (W8A16).
+    // Any other scheme names input scales or a recipe this parser does not read, so it is
+    // refused rather than served as `dynamic`.
+    let activation = optional_string(config, "activation_scheme");
+    match activation.as_deref() {
+        None | Some("dynamic") => {}
+        Some("none") => {
+            for format in [Some(&mut dense_format), Some(&mut expert_format)]
+                .into_iter()
+                .chain([mtp_expert_format.as_mut()])
+                .flatten()
+            {
+                if let WeightFormat::Fp8Tile {
+                    dynamic_activations,
+                    ..
+                } = format
+                {
+                    *dynamic_activations = false;
+                }
+            }
+        }
+        Some(other) => {
+            return Err(invalid(format!(
+                "quantization_config.activation_scheme is {other}; the parser reads `dynamic` \
+                 (inputs quantised at run time) or `none` (FP8 weights, unquantised inputs)"
+            )));
+        }
+    }
     Ok(Quantization {
         method,
         block,
         scale,
-        activation: optional_string(config, "activation_scheme"),
+        activation,
         expert: expert_text.or_else(|| expert.map(|declared| declared.name)),
         expert_formats,
         dense_format,
@@ -3808,6 +3839,38 @@ mod tests {
         assert_eq!(nvfp4.quantization.mtp_expert_format, Some(tile(false)));
         before.quantization.mtp_expert_format = Some(tile(false));
         assert_eq!(nvfp4, before);
+    }
+
+    /// The declared activation scheme decides whether an FP8 tile's input is quantised: `none`
+    /// keeps the weights FP8 and the inputs unquantised, and a scheme the parser does not read is
+    /// refused by name rather than served as `dynamic`.
+    #[test]
+    fn the_activation_scheme_decides_whether_fp8_inputs_are_quantised() {
+        let text = include_str!("../config/qwen36_flash_35b_a3b_fp8.hf.json");
+        assert!(text.contains(r#""activation_scheme": "dynamic""#));
+        let tile = |dynamic_activations| WeightFormat::Fp8Tile {
+            block_m: 128,
+            block_n: 128,
+            scale_dtype: ScaleDType::F32,
+            dynamic_activations,
+        };
+        let none = text.replace(
+            r#""activation_scheme": "dynamic""#,
+            r#""activation_scheme": "none""#,
+        );
+        let declared = Architecture::from_json(&none).expect("weight-only FP8");
+        assert_eq!(declared.quantization.dense_format, tile(false));
+        assert_eq!(declared.quantization.expert_format, tile(false));
+        assert_eq!(declared.quantization.activation.as_deref(), Some("none"));
+        let refused = text.replace(
+            r#""activation_scheme": "dynamic""#,
+            r#""activation_scheme": "static""#,
+        );
+        let error = Architecture::from_json(&refused).expect_err("a static scheme is not read");
+        assert!(
+            error.to_string().contains("activation_scheme is static"),
+            "{error}"
+        );
     }
 
     fn count<F: Fn(&Layer) -> bool>(architecture: &Architecture, predicate: F) -> usize {
