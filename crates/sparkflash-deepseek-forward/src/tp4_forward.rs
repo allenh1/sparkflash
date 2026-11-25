@@ -12884,17 +12884,33 @@ impl<'a> DeviceLayer<'a> {
         // The per-rank wo_a/wo_b geometry: config-derived, then checked against every layer's plan
         // B12x shard, so a transposed or world-mismatched plan is an open refusal and not a launch
         // that reads the wrong bytes.
-        let out_geometry = sparkflash_kernels::attention_operands::OutputGeometry::new(
-            config.o_groups,
-            world,
-            usize::try_from(q_cols_u32 / kv_cols).map_err(|_| {
-                "layer device: the per-rank head count does not fit a usize".to_owned()
-            })?,
-            config.head_dim,
-            config.o_lora_rank,
-            dim,
-        )
-        .map_err(|error| format!("layer device: attention output geometry: {error}"))?;
+        let heads_per_rank = usize::try_from(q_cols_u32 / kv_cols)
+            .map_err(|_| "layer device: the per-rank head count does not fit a usize".to_owned())?;
+        // A stated stack's absorbed MLA has a plain output projection and no groups: a geometry
+        // with no group sizes no grouped-output span, and no release launch reads it.
+        let out_geometry = if crate::plan::stated_stack() {
+            sparkflash_kernels::attention_operands::OutputGeometry {
+                o_groups: 0,
+                world,
+                groups: 0,
+                heads_per_rank,
+                head_width: config.head_dim,
+                heads_per_group: 0,
+                group_inner: 0,
+                o_lora_rank: 0,
+                hidden: dim,
+            }
+        } else {
+            sparkflash_kernels::attention_operands::OutputGeometry::new(
+                config.o_groups,
+                world,
+                heads_per_rank,
+                config.head_dim,
+                config.o_lora_rank,
+                dim,
+            )
+            .map_err(|error| format!("layer device: attention output geometry: {error}"))?
+        };
         if let Some(plan) = plan {
             for layer in (0..config.n_layers).filter(|&layer| crate::plan::release_mla(layer)) {
                 for (name, want) in [
