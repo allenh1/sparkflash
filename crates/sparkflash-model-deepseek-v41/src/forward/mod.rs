@@ -412,19 +412,6 @@ impl InferenceEngine {
         self.tp.as_ref()
     }
 
-    /// The exact f32 gather seam for a source that serves row-sharded attention/head weights.
-    ///
-    /// The source must answer `head.weight` (stages 1-2: `wq_b` and `wo_a` too; stage 3 adds
-    /// `wo_b`) with this rank's row slice, and the batch-18 shard plan must give every rank a
-    /// contiguous row block in rank order. The engine multiplies its local rows and gathers the
-    /// pieces in ascending rank order with [crate::parallel_tp::BitGather], which is a byte copy:
-    /// no value is rounded, so the result is bit-identical to the replicated computation. A source
-    /// that serves a shard with no seam configured is refused rather than silently multiplying a
-    /// partial weight.
-    ///
-    /// The MTP/DSpark stage (`prefill_with_taps`/`decode_with_taps` and the dspark block) reads its
-    /// own attention weights whole and is not wired to this seam, so a sharded source must not be
-    /// used on a path that runs those taps: the TP=4 host driver never does.
     /// Hashes raw tokenizer ids through `token_map` from now on, as the reference does
     /// (engram.py:166): the map comes from
     /// `sparkflash_engram::compress::compressed_token_map` over the checkpoint's tokenizer.
@@ -446,6 +433,19 @@ impl InferenceEngine {
         self.engram_token_map.as_deref()
     }
 
+    /// The exact f32 gather seam for a source that serves row-sharded attention/head weights.
+    ///
+    /// The source must answer `head.weight` (stages 1-2: `wq_b` and `wo_a` too; stage 3 adds
+    /// `wo_b`) with this rank's row slice, and the batch-18 shard plan must give every rank a
+    /// contiguous row block in rank order. The engine multiplies its local rows and gathers the
+    /// pieces in ascending rank order with [crate::parallel_tp::BitGather], which is a byte copy:
+    /// no value is rounded, so the result is bit-identical to the replicated computation. A source
+    /// that serves a shard with no seam configured is refused rather than silently multiplying a
+    /// partial weight.
+    ///
+    /// The MTP/DSpark stage (`prefill_with_taps`/`decode_with_taps` and the dspark block) reads its
+    /// own attention weights whole and is not wired to this seam, so a sharded source must not be
+    /// used on a path that runs those taps: the TP=4 host driver never does.
     #[must_use]
     pub fn with_bit_gather(mut self, gather: Box<dyn crate::parallel_tp::BitGather>) -> Self {
         self.gather = Some(crate::parallel_tp::BitGatherHandle::new(gather));
