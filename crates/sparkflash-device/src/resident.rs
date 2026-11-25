@@ -297,6 +297,12 @@ pub fn classify(name: &str) -> Result<Option<Classification>, ShardError> {
                 classified(Group::AttentionColumn, ShardRule::Column)
             }
             "wo_b.weight" | "wo_b.scale" => classified(Group::AttentionRow, ShardRule::Row),
+            // A grouped-query block (`gqa_attention`): the query, key and value projections by
+            // their output rows (a rank's heads), the output projection by its inner axis.
+            "wq.weight" | "wq.scale" | "wk.weight" | "wk.scale" | "wv.weight" | "wv.scale" => {
+                classified(Group::AttentionColumn, ShardRule::Column)
+            }
+            "wo.weight" | "wo.scale" => classified(Group::AttentionRow, ShardRule::Row),
             "attn_sink" => classified(Group::AttentionSink, ShardRule::Column),
             other if other.starts_with("indexer.") || other.starts_with("compressor.") => {
                 classified(Group::AttentionAux, ShardRule::Replicated)
@@ -975,6 +981,37 @@ mod tests {
     }
 
     #[test]
+    fn a_grouped_query_block_splits_by_heads_then_the_inner_axis() {
+        for (leaf, group, rule) in [
+            (
+                "wq.weight",
+                ResidentGroup::AttentionColumn,
+                ShardRule::Column,
+            ),
+            (
+                "wk.weight",
+                ResidentGroup::AttentionColumn,
+                ShardRule::Column,
+            ),
+            (
+                "wv.scale",
+                ResidentGroup::AttentionColumn,
+                ShardRule::Column,
+            ),
+            ("wo.weight", ResidentGroup::AttentionRow, ShardRule::Row),
+        ] {
+            let name = format!("layers.0.attn.{leaf}");
+            let classification = classify(&name).expect("known").expect("resident");
+            assert_eq!(
+                (classification.group, classification.rule),
+                (group, Some(rule)),
+                "{name}"
+            );
+        }
+        assert!(classify("layers.0.attn.wx.weight").is_err());
+    }
+
+    #[test]
     fn every_released_name_shape_is_classified_with_the_reference_rule() {
         let cases: &[(&str, ResidentGroup, Placement, Option<ShardRule>)] = &[
             (
@@ -1518,7 +1555,10 @@ mod tests {
         // format route) is stored with its scale plane beside it: two buffers, both required.
         let mut tiled = wq_a.clone();
         tiled.format = Some(sparkflash_model::format::StoredFormat::FP8_E4M3_TILE_128);
-        assert!(!tiled.operand_layout().is_b12x(), "the 128-wide tile is stored, not B12x");
+        assert!(
+            !tiled.operand_layout().is_b12x(),
+            "the 128-wide tile is stored, not B12x"
+        );
         assert!(
             check_operand_bind(&tiled, 0x1000, 0x2000).is_ok(),
             "a scaled stored class binds its codes and its stored scale plane"
