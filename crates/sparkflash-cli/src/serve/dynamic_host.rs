@@ -798,41 +798,14 @@ fn gqa_attention(
     apply_rope(&mut keys, kv_heads, head_dim, attention, position)?;
     cache.k.extend_from_slice(&keys);
     cache.v.extend_from_slice(&value);
-    let groups = heads / kv_heads.max(1);
-    let scale = (head_dim as f32).sqrt().recip();
-    let mut out = vec![0.0f32; query_width];
-    for head in 0..heads {
-        let kv_head = head / groups;
-        let mut scores = Vec::with_capacity(cache.k.len() / kv_width);
-        for position in 0..cache.k.len() / kv_width {
-            let key = &cache.k[position * kv_width + kv_head * head_dim
-                ..position * kv_width + (kv_head + 1) * head_dim];
-            let query = &queries[head * head_dim..(head + 1) * head_dim];
-            scores.push(
-                query
-                    .iter()
-                    .zip(key)
-                    .map(|(query, key)| query * key)
-                    .sum::<f32>()
-                    * scale,
-            );
-        }
-        let probabilities = softmax(&scores);
-        let target = &mut out[head * head_dim..(head + 1) * head_dim];
-        for (position, probability) in probabilities.iter().enumerate() {
-            let value = &cache.v[position * kv_width + kv_head * head_dim
-                ..position * kv_width + (kv_head + 1) * head_dim];
-            for (slot, value) in target.iter_mut().zip(value) {
-                *slot += probability * value;
-            }
-        }
-        if let Some(gates) = &gates {
-            for (slot, gate) in target
-                .iter_mut()
-                .zip(&gates[head * head_dim..(head + 1) * head_dim])
-            {
-                *slot *= sigmoid(*gate);
-            }
+    let mut out = sparkflash_weights::gqa::attend(
+        &queries,
+        (&cache.k, &cache.v),
+        (heads, kv_heads, head_dim),
+    );
+    if let Some(gates) = &gates {
+        for (slot, gate) in out.iter_mut().zip(gates) {
+            *slot *= sigmoid(*gate);
         }
     }
     let (_, _, projected) = matrix(source, o, &out)?;
@@ -884,21 +857,14 @@ fn apply_rope(
             }
         }
     }
-    let half = rotated / 2;
-    let pairs = half;
     let theta = attention.rope.theta.max(1.0) as f32;
-    for head in 0..heads {
-        let base = head * head_dim;
-        for pair in 0..pairs {
-            let frequency = 1.0 / theta.powf((2 * pair) as f32 / rotated as f32) / scaling;
-            let angle = position as f32 * frequency;
-            let (sin, cos) = angle.sin_cos();
-            let left = values[base + pair];
-            let right = values[base + pair + half];
-            values[base + pair] = left * cos - right * sin;
-            values[base + pair + half] = left * sin + right * cos;
-        }
-    }
+    sparkflash_weights::gqa::rotate_half(
+        values,
+        (heads, head_dim),
+        rotated,
+        (theta, scaling),
+        position,
+    );
     Ok(())
 }
 
@@ -1147,7 +1113,11 @@ fn moe_ffn(
     let activation = (moe.activation, moe.clamp);
     let (_, _, logits) = matrix(source, router, input)?;
     let probabilities = match moe.score {
-        Score::Softmax => softmax(&logits),
+        Score::Softmax => {
+            let mut probabilities = logits.clone();
+            sparkflash_weights::linalg::softmax(&mut probabilities);
+            probabilities
+        }
         Score::Sigmoid => logits.iter().map(|value| sigmoid(*value)).collect(),
         Score::SqrtSoftPlus => logits
             .iter()
@@ -1237,18 +1207,6 @@ fn moe_ffn(
         }
     }
     Ok(out)
-}
-
-fn softmax(values: &[f32]) -> Vec<f32> {
-    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut out: Vec<f32> = values.iter().map(|value| (value - max).exp()).collect();
-    let total: f32 = out.iter().sum();
-    if total > 0.0 {
-        for value in &mut out {
-            *value /= total;
-        }
-    }
-    out
 }
 
 fn argmax(values: &[f32]) -> Option<usize> {
