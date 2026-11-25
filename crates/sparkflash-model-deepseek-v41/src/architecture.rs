@@ -107,9 +107,47 @@ impl ModelConfig {
             .count();
         check(
             "MLA layers",
-            self.n_layers - (self.gqa_layers.len() + self.gdn_layers.len()).min(self.n_layers),
+            self.n_layers
+                - (self.gqa_layers.len() + self.gdn_layers.len() + self.kda_layers.len())
+                    .min(self.n_layers),
             mla,
         )?;
+        // A block is Kimi Delta Attention where the typed configuration names it one, with the
+        // typed geometry.
+        for (index, layer) in architecture.layers.iter().enumerate() {
+            let kda = match &layer.attention.kind {
+                AttentionKind::Kda(kda) => Some(kda),
+                _ => None,
+            };
+            check_flag(
+                "Kimi Delta Attention layer",
+                index,
+                kda.is_some(),
+                self.kda_layers.contains(&index),
+            )?;
+            if let (Some(kda), Some(geometry)) = (kda, self.kda) {
+                check("Kimi Delta Attention heads", geometry.heads, kda.heads)?;
+                check(
+                    "Kimi Delta Attention head width",
+                    geometry.head_dim,
+                    kda.head_dim,
+                )?;
+                check(
+                    "Kimi Delta Attention conv taps",
+                    geometry.conv,
+                    kda.conv_kernel,
+                )?;
+                if geometry.lower_bound.to_bits() != kda.lower_bound.to_bits() {
+                    return Err(ConfigError::Invalid {
+                        field: "Kimi Delta Attention gate bound",
+                        detail: format!(
+                            "the typed configuration says {}, the shared architecture says {}",
+                            geometry.lower_bound, kda.lower_bound
+                        ),
+                    });
+                }
+            }
+        }
         // A block is a Gated DeltaNet where the typed configuration names it one, with the typed
         // geometry.
         for (index, layer) in architecture.layers.iter().enumerate() {
@@ -363,6 +401,42 @@ mod tests {
         architecture.layers[0].ffn = moe;
         let error = config.cross_check(&architecture).expect_err("drift");
         assert!(error.to_string().contains("dense FFN layer"), "{error}");
+    }
+
+    /// A Kimi Delta Attention block in the GLM-5.3-Flash spelling parses on both sides and
+    /// agrees; a `kda_layers` that disagrees with `layer_types` is refused by name.
+    #[test]
+    fn a_kda_block_agrees_and_a_disagreeing_schedule_is_refused() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(CARRIED_RELEASE).expect("carried json");
+        let text = document
+            .get_mut("text_config")
+            .unwrap_or_else(|| panic!("the carried release has a text_config"));
+        let layers = text["num_hidden_layers"].as_u64().expect("layers") as usize;
+        let mut types = vec![serde_json::json!("compressed_attention"); layers];
+        types[0] = serde_json::json!("linear_attention");
+        text["layer_types"] = serde_json::json!(types);
+        text["compress_ratios"][0] = serde_json::json!(0);
+        text["linear_attn_config"] = serde_json::json!({
+            "num_heads": 16,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
+            "kda_layers": [0],
+            "full_attn_layers": (1..layers).collect::<Vec<_>>(),
+        });
+        let json = document.to_string();
+        let config = ModelConfig::from_released_json(&json).expect("typed config");
+        assert_eq!(config.kda_layers, vec![0]);
+        assert!(config.gdn_layers.is_empty());
+        let architecture = architecture_from_json(&json).expect("shared architecture");
+        config
+            .cross_check(&architecture)
+            .expect("a KDA first block agrees");
+        document["text_config"]["linear_attn_config"]["kda_layers"] = serde_json::json!([1]);
+        let error = ModelConfig::from_released_json(&document.to_string())
+            .expect_err("a disagreeing schedule");
+        assert!(error.to_string().contains("kda_layers"), "{error}");
     }
 
     #[test]

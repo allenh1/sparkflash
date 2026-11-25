@@ -266,6 +266,8 @@ pub enum Mixer {
     Gqa(GqaGeometry),
     /// A Gated DeltaNet, with the stack's geometry.
     Gdn(GdnGeometry),
+    /// Kimi Delta Attention, with the stack's geometry.
+    Kda(KdaGeometry),
 }
 
 /// The hyperparameters of one DeepSeek-V4.1-Flash-shaped model.
@@ -811,8 +813,9 @@ impl ModelConfig {
         self.vision_n_layers.is_some_and(|layers| layers > 0)
     }
 
-    /// The token mixer of backbone block `layer`: grouped-query attention or a Gated DeltaNet
-    /// where [Self::gqa_layers] or [Self::gdn_layers] lists it, with the stack's geometry, and MLA
+    /// The token mixer of backbone block `layer`: grouped-query attention, a Gated DeltaNet or
+    /// Kimi Delta Attention where [Self::gqa_layers], [Self::gdn_layers] or [Self::kda_layers]
+    /// lists it, with the stack's geometry, and MLA
     /// otherwise. Every reader of a block's mixer asks here, so a stacked block has one answer.
     ///
     /// # Errors
@@ -822,6 +825,11 @@ impl ModelConfig {
         if self.gdn_layers.contains(&layer) {
             return self.gdn.map(Mixer::Gdn).ok_or_else(|| {
                 format!("block {layer} is a Gated DeltaNet and the stack has no geometry")
+            });
+        }
+        if self.kda_layers.contains(&layer) {
+            return self.kda.map(Mixer::Kda).ok_or_else(|| {
+                format!("block {layer} is Kimi Delta Attention and the stack has no geometry")
             });
         }
         if self.gqa_layers.contains(&layer) {
@@ -885,7 +893,9 @@ impl ModelConfig {
 mod released {
     use serde::Deserialize;
 
-    use super::{ConfigError, GdnGeometry, GqaGeometry, ModelConfig, default_gate_temp};
+    use super::{
+        ConfigError, GdnGeometry, GqaGeometry, KdaGeometry, ModelConfig, default_gate_temp,
+    };
 
     use sparkflash_model::architecture::GDN_LAYER_TYPE;
 
@@ -980,6 +990,10 @@ mod released {
         /// The conv's taps.
         #[serde(default)]
         linear_conv_kernel_dim: Option<usize>,
+        /// The Kimi Delta Attention geometry (the GLM-5.3-Flash spelling). Beside it the
+        /// `linear_attention` blocks are KDA, not a Gated DeltaNet.
+        #[serde(default)]
+        linear_attn_config: Option<LinearAttnConfig>,
         /// The Gated DeltaNet's output gate; SiLU, the Qwen3-Next default, is the only one a
         /// DeepSeek-shaped stack runs.
         #[serde(default)]
@@ -1110,6 +1124,21 @@ mod released {
         num_attention_heads: usize,
         num_key_value_heads: usize,
         head_dim: usize,
+    }
+
+    /// `text_config.linear_attn_config`: the Kimi Delta Attention blocks' geometry. Every width
+    /// is required; the block lists, when stated, must name the `layer_types` blocks.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LinearAttnConfig {
+        num_heads: usize,
+        head_dim: usize,
+        short_conv_kernel_size: usize,
+        gate_lower_bound: f64,
+        #[serde(default)]
+        kda_layers: Option<Vec<usize>>,
+        #[serde(default)]
+        full_attn_layers: Option<Vec<usize>>,
     }
 
     /// `vision_config`: the tower the released checkpoint carries.
@@ -1328,6 +1357,7 @@ mod released {
 
         let mut gqa_layers = Vec::new();
         let mut gdn_layers = Vec::new();
+        let mut kda_layers = Vec::new();
         if let Some(types) = text.layer_types.as_ref() {
             if types.len() != text.num_hidden_layers {
                 return Err(ConfigError::Invalid {
@@ -1343,6 +1373,9 @@ mod released {
                 match kind.as_str() {
                     "compressed_attention" => {}
                     sparkflash_model::architecture::GQA_LAYER_TYPE => gqa_layers.push(layer),
+                    GDN_LAYER_TYPE if text.linear_attn_config.is_some() => {
+                        kda_layers.push(layer);
+                    }
                     GDN_LAYER_TYPE => gdn_layers.push(layer),
                     other => {
                         return Err(ConfigError::Invalid {
@@ -1381,6 +1414,60 @@ mod released {
                 });
             }
             (None, true) => None,
+        };
+        let kda = match (&text.linear_attn_config, kda_layers.is_empty()) {
+            (Some(linear), false) => {
+                if let Some(stated) = linear.kda_layers.as_ref().filter(|s| **s != kda_layers) {
+                    return Err(ConfigError::Invalid {
+                        field: "text_config.linear_attn_config.kda_layers",
+                        detail: format!(
+                            "names {stated:?} and layer_types makes {kda_layers:?} linear_attention"
+                        ),
+                    });
+                }
+                if let Some(full) = linear.full_attn_layers.as_ref() {
+                    let others: Vec<usize> = (0..text.num_hidden_layers)
+                        .filter(|layer| !kda_layers.contains(layer))
+                        .collect();
+                    if *full != others {
+                        return Err(ConfigError::Invalid {
+                            field: "text_config.linear_attn_config.full_attn_layers",
+                            detail: format!(
+                                "names {full:?} and layer_types leaves {others:?} as attention"
+                            ),
+                        });
+                    }
+                }
+                if linear.num_heads == 0
+                    || linear.head_dim == 0
+                    || linear.short_conv_kernel_size == 0
+                    || !linear.gate_lower_bound.is_finite()
+                {
+                    return Err(ConfigError::Invalid {
+                        field: "text_config.linear_attn_config",
+                        detail: format!(
+                            "{} heads of {} with a {}-tap conv and lower bound {}; Kimi Delta Attention needs nonzero widths, one tap or more and a finite bound",
+                            linear.num_heads,
+                            linear.head_dim,
+                            linear.short_conv_kernel_size,
+                            linear.gate_lower_bound
+                        ),
+                    });
+                }
+                Some(KdaGeometry {
+                    heads: linear.num_heads,
+                    head_dim: linear.head_dim,
+                    conv: linear.short_conv_kernel_size,
+                    lower_bound: linear.gate_lower_bound,
+                })
+            }
+            (Some(_), true) => {
+                return Err(ConfigError::Invalid {
+                    field: "text_config.linear_attn_config",
+                    detail: "the document states Kimi Delta Attention geometry and no block is linear_attention".to_owned(),
+                });
+            }
+            (None, _) => None,
         };
         let linear = [
             text.linear_num_key_heads,
@@ -1473,8 +1560,8 @@ mod released {
             gqa,
             gdn_layers,
             gdn,
-            kda_layers: Vec::new(),
-            kda: None,
+            kda_layers,
+            kda,
             absorbed_latent: None,
             n_layers: text.num_hidden_layers,
             n_mtp_layers: text.num_nextn_predict_layers,

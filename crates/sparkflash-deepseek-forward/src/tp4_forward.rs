@@ -14345,7 +14345,7 @@ impl<'a> DeviceLayer<'a> {
                     .map(Some),
                     _ => Ok(None),
                 };
-            // A grouped-query or Gated DeltaNet block's projections have no released body: the
+            // A grouped-query or recurrent block's projections have no released body: the
             // route opens for whatever class they are stored in, and refuses by name one it has
             // no entry for.
             let foreign = |part: Part| match description.operand(Some(layer), part) {
@@ -14361,7 +14361,11 @@ impl<'a> DeviceLayer<'a> {
                 None => Ok(None),
             };
             let grouped = foreign(Part::GqaAttention)?;
-            let recurrent = foreign(Part::GdnScan)?;
+            // A recurrent block is a Gated DeltaNet or Kimi Delta Attention; a stack holds one.
+            let recurrent = match foreign(Part::GdnScan)? {
+                Some(route) => Some(route),
+                None => foreign(Part::KdaScan)?,
+            };
             routes.push(LayerDense {
                 attention: open(Part::MlaAttention, attention)?,
                 indexer: open(Part::SparseIndexer, indexer)?,
@@ -15577,10 +15581,16 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                 "layer device: layer {layer} is a grouped-query attention block, which the one-token stage loop has no stage for; it runs on the rows path"
             ));
         }
-        // Nor a recurrent stage: a Gated DeltaNet block runs on the rows path.
+        // Nor a recurrent stage: a Gated DeltaNet or Kimi Delta Attention block runs on the rows
+        // path.
         if crate::plan::block_has_part(layer, sparkflash_model::Part::GdnScan) {
             return Err(format!(
                 "layer device: layer {layer} is a Gated DeltaNet block, which the one-token stage loop has no stage for; it runs on the rows path"
+            ));
+        }
+        if crate::plan::block_has_part(layer, sparkflash_model::Part::KdaScan) {
+            return Err(format!(
+                "layer device: layer {layer} is a Kimi Delta Attention block, which the one-token stage loop has no stage for; it runs on the rows path"
             ));
         }
         // The one-token loop has no dense MLP stage: a dense-FFN block runs on the rows path.

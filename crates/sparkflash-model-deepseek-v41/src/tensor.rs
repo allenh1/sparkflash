@@ -148,6 +148,52 @@ pub const GDN_TENSORS: GdnTensors = GdnTensors {
     norm: "attn.norm.weight",
 };
 
+/// A Kimi Delta Attention block's tensors, named below its `layers.N.` prefix with the
+/// GLM-5.3-Flash leaf names, stored as that release stores them: every projection and conv BF16,
+/// `A_log` and `dt_bias` f32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdaTensors {
+    /// The query, key and value projections, `[width][dim]` each.
+    pub qkv: [&'static str; 3],
+    /// Their convs, `[width][1][taps]` each.
+    pub conv: [&'static str; 3],
+    /// The forget gate's low-rank pair: `[head_dim][dim]`, then `[width][head_dim]`.
+    pub forget: [&'static str; 2],
+    /// The output gate's low-rank pair, the same shapes.
+    pub gate: [&'static str; 2],
+    /// The write strength's projection, one row a head.
+    pub b: &'static str,
+    /// The decay's log scale, one a head.
+    pub a_log: &'static str,
+    /// The decay's step bias, one a channel.
+    pub dt_bias: &'static str,
+    /// The gated norm's weight, the head width.
+    pub norm: &'static str,
+    /// The output projection, `dim` rows over the width.
+    pub out: &'static str,
+}
+
+/// The Kimi Delta Attention block's tensor names.
+pub const KDA_TENSORS: KdaTensors = KdaTensors {
+    qkv: [
+        "attn.q_proj.weight",
+        "attn.k_proj.weight",
+        "attn.v_proj.weight",
+    ],
+    conv: [
+        "attn.q_conv1d.weight",
+        "attn.k_conv1d.weight",
+        "attn.v_conv1d.weight",
+    ],
+    forget: ["attn.f_a_proj.weight", "attn.f_b_proj.weight"],
+    gate: ["attn.g_a_proj.weight", "attn.g_b_proj.weight"],
+    b: "attn.b_proj.weight",
+    a_log: "attn.A_log",
+    dt_bias: "attn.dt_bias",
+    norm: "attn.o_norm.weight",
+    out: "attn.o_proj.weight",
+};
+
 /// A routed expert's three matrices, by the leaf name the plan gives each under
 /// `ffn.experts.N`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,6 +478,37 @@ impl TensorPlan {
                 DType::BF16,
                 vec![gdn.value_dim],
             );
+        } else if let Mixer::Kda(kda) = mixer {
+            // A Kimi Delta Attention block, as GLM-5.3-Flash stores it, and none of MLA's
+            // tensors.
+            let width = kda.heads * kda.head_dim;
+            let names = KDA_TENSORS;
+            let bf16 = |plan: &mut Self, name: &str, shape: Vec<usize>| {
+                plan.plain(&format!("{prefix}.{name}"), DType::BF16, shape);
+            };
+            for name in names.qkv {
+                bf16(self, name, vec![width, dim]);
+            }
+            for name in names.conv {
+                bf16(self, name, vec![width, 1, kda.conv]);
+            }
+            for [low, high] in [names.forget, names.gate] {
+                bf16(self, low, vec![kda.head_dim, dim]);
+                bf16(self, high, vec![width, kda.head_dim]);
+            }
+            bf16(self, names.b, vec![kda.heads, dim]);
+            self.plain(
+                &format!("{prefix}.{}", names.a_log),
+                DType::F32,
+                vec![kda.heads],
+            );
+            self.plain(
+                &format!("{prefix}.{}", names.dt_bias),
+                DType::F32,
+                vec![width],
+            );
+            bf16(self, names.norm, vec![kda.head_dim]);
+            bf16(self, names.out, vec![dim, width]);
         } else {
             self.dense(&format!("{prefix}.attn.wq_a"), config.q_lora_rank, dim);
             self.dense(&format!("{prefix}.attn.wq_b"), heads, config.q_lora_rank);

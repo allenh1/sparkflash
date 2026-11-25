@@ -283,6 +283,35 @@ pub fn rank_attention_geometry(
                     (names.norm, (gdn.value_dim, 1)),
                 ]
             }
+            // A Kimi Delta Attention block split by heads, as its layout states: q, k, v, their
+            // convs, the second halves of the gates, the write strength and the decay vectors
+            // take the rank's heads; f_a, g_a and the norm stay whole, and o_proj splits its
+            // inner axis (a partial the base sums).
+            Mixer::Kda(kda) => {
+                let heads = split(kda.heads, "heads", "Kimi Delta Attention")?;
+                let width = heads * kda.head_dim;
+                let low = kda.head_dim;
+                let names = tensor::KDA_TENSORS;
+                let mut shapes = Vec::new();
+                for name in names.qkv {
+                    shapes.push((name, (width, dim)));
+                }
+                for name in names.conv {
+                    shapes.push((name, (width, kda.conv)));
+                }
+                for [first, second] in [names.forget, names.gate] {
+                    shapes.push((first, (low, dim)));
+                    shapes.push((second, (width, low)));
+                }
+                shapes.extend([
+                    (names.b, (heads, dim)),
+                    (names.a_log, (heads, 1)),
+                    (names.dt_bias, (width, 1)),
+                    (names.norm, (kda.head_dim, 1)),
+                    (names.out, (dim, width)),
+                ]);
+                shapes
+            }
             Mixer::Mla => Vec::new(),
         };
         if !stacked.is_empty() {

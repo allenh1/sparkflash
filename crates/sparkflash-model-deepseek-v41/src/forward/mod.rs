@@ -1682,7 +1682,27 @@ impl InferenceEngine {
             what: format!("layer {layer} attention"),
             detail,
         })?;
-        if matches!(mixer, Mixer::Gdn(_)) {
+        if matches!(mixer, Mixer::Kda(_)) {
+            // A Kimi Delta Attention block runs every head on the host, as a Gated DeltaNet
+            // block does.
+            if attention.is_some() {
+                return Err(EngineError::Shape {
+                    what: format!("layer {layer} attention"),
+                    detail: "a Kimi Delta Attention block runs on the host; a device projection backend is MLA's and cannot run it".to_owned(),
+                });
+            }
+            recurrent::kda_attention_forward(
+                config,
+                layer,
+                &prefix,
+                &scratch.attn_in,
+                start_pos,
+                &mut state.recurrent[layer],
+                source,
+                &mut scratch.attn_out,
+                self.limit,
+            )?;
+        } else if matches!(mixer, Mixer::Gdn(_)) {
             // A Gated DeltaNet block computes its mixer whole on every rank, as a grouped-query
             // block does: the host path has no recurrent shard.
             if attention.is_some() {

@@ -438,20 +438,71 @@ pub(super) type ScanDims = ((u32, u32, u32), (u32, u32, u32));
 /// its rows in, one region pair per recurrent block in block order.
 #[derive(Debug, Clone)]
 pub(super) struct RecurrentRows {
-    pub(super) chunk: sparkflash_ops::gdn::GdnChunk,
+    pub(super) body: RecurrentBody,
     pub(super) scan: (sparkflash_ops::roles::Bound, ScanDims),
     pub(super) geometry: sparkflash_ops::gdn::GdnGeometry,
-    pub(super) rows: sparkflash_ops::roles::GdnRows,
     pub(super) snapshots: Option<sparkflash_kernels::checkpoint::VerifySnapshots>,
 }
 
-/// The stack's Gated DeltaNet geometry as the chunk kernels take it, whole, or `None` for a stack
-/// with no recurrent block.
+/// A recurrent stack's chunk kernels and f32 rows: a Gated DeltaNet's, or Kimi Delta
+/// Attention's with the scratch its three convs join in (`[3 width][taps]` BF16, the order the
+/// conv reads them).
+pub(super) enum RecurrentBody {
+    Gdn {
+        chunk: sparkflash_ops::gdn::GdnChunk,
+        rows: sparkflash_ops::roles::GdnRows,
+    },
+    Kda {
+        chunk: sparkflash_ops::gdn::KdaChunk,
+        rows: sparkflash_ops::roles::KdaRows,
+        conv: Deviceptr,
+        lower_bound: f32,
+    },
+}
+
+/// The stack's recurrent blocks in block order: its Gated DeltaNet blocks, or its Kimi Delta
+/// Attention blocks. A stack holds one kind (the open refuses both).
+pub(super) fn recurrent_layers() -> &'static [usize] {
+    let values = crate::plan::description().values();
+    if values.gdn_layers.is_empty() {
+        &values.kda_layers
+    } else {
+        &values.gdn_layers
+    }
+}
+
+/// The stack's recurrent geometry as the chunk kernels take it, or `None` for a stack with no
+/// recurrent block: a Gated DeltaNet's whole (every rank runs every head), Kimi Delta
+/// Attention's at this rank's heads (its layout splits it by heads).
 ///
 /// # Errors
-/// Recurrent blocks and no geometry.
+/// Recurrent blocks and no geometry, both kinds in one stack, or heads that do not divide by the
+/// world.
 pub(super) fn recurrent_geometry() -> Result<Option<sparkflash_ops::gdn::GdnGeometry>, String> {
     let values = crate::plan::description().values();
+    if !values.kda_layers.is_empty() {
+        if !values.gdn_layers.is_empty() {
+            return Err(format!(
+                "rows recurrent blocks: the stack holds Gated DeltaNet blocks {:?} and Kimi Delta Attention blocks {:?}; the rows path runs one kind",
+                values.gdn_layers, values.kda_layers
+            ));
+        }
+        let kda = values
+            .kda
+            .ok_or("rows Kimi Delta Attention: the stack has KDA blocks and no geometry")?;
+        let world = crate::plan::description().plan().tp().world();
+        if world == 0 || !kda.heads.is_multiple_of(world) {
+            return Err(format!(
+                "rows Kimi Delta Attention: {} heads do not split over {world} ranks",
+                kda.heads
+            ));
+        }
+        return Ok(Some(sparkflash_ops::gdn::GdnGeometry::kda(
+            kda.heads / world,
+            kda.head_dim,
+            kda.conv,
+        )));
+    }
     if values.gdn_layers.is_empty() {
         return Ok(None);
     }
@@ -471,7 +522,7 @@ pub(super) fn recurrent_geometry() -> Result<Option<sparkflash_ops::gdn::GdnGeom
 /// delta-rule state: the order a lane lays them out, its checkpoint copies them and a verify pass
 /// snapshots them.
 pub(super) fn recurrent_sizes(geometry: &sparkflash_ops::gdn::GdnGeometry) -> Vec<usize> {
-    let blocks = crate::plan::description().values().gdn_layers.len();
+    let blocks = recurrent_layers().len();
     (0..blocks)
         .flat_map(|_| [geometry.conv_bytes(), geometry.state_bytes()])
         .collect()
@@ -483,12 +534,10 @@ pub(super) fn recurrent_sizes(geometry: &sparkflash_ops::gdn::GdnGeometry) -> Ve
 /// # Errors
 /// A block that is not recurrent.
 pub(super) fn recurrent_block(layer: usize) -> Result<usize, String> {
-    crate::plan::description()
-        .values()
-        .gdn_layers
+    recurrent_layers()
         .iter()
         .position(|&block| block == layer)
-        .ok_or_else(|| format!("rows layer {layer}: the block is not a Gated DeltaNet"))
+        .ok_or_else(|| format!("rows layer {layer}: the block is not recurrent"))
 }
 
 impl RecurrentRows {
@@ -504,21 +553,27 @@ impl RecurrentRows {
     ) -> Result<Self, String> {
         use sparkflash_model::Target;
         use sparkflash_ops::OpPlan;
-        use sparkflash_ops::gdn::{ChunkConv, GatedNorm, GdnChunk};
-        use sparkflash_ops::images::{Image, qwen4_scan_cubin};
+        use sparkflash_ops::gdn::{ChunkConv, GatedNorm, GdnChunk, KdaChunk};
+        use sparkflash_ops::images::{Image, qwen4_exp_cubin, qwen4_scan_cubin};
         use sparkflash_ops::plan::Precision;
         use sparkflash_ops::resolver::{Availability, PlanContext};
-        use sparkflash_ops::roles::{Bound, GdnRows};
+        use sparkflash_ops::roles::{Bound, GdnRows, KdaRows};
         use sparkflash_ops::scan::{ScanKind, ScanPlan};
-        let what = |error: String| format!("rows Gated DeltaNet: {error}");
+        let values = crate::plan::description().values();
+        let kda = values.kda.filter(|_| !values.kda_layers.is_empty());
+        let (kind, name) = match kda {
+            Some(_) => (ScanKind::Kda, "Kimi Delta Attention"),
+            None => (ScanKind::Gdn, "Gated DeltaNet"),
+        };
+        let what = |error: String| format!("rows {name}: {error}");
         let plan = ScanPlan::for_rank(
             PlanContext::new(Target::Sm121, Availability::Embedded),
             crate::plan::description().plan(),
-            ScanKind::Gdn,
+            kind,
             R_MAX,
         )
         .map_err(|error| what(error.to_string()))?
-        .ok_or_else(|| what("the plan resolves no Gated DeltaNet scan".to_owned()))?;
+        .ok_or_else(|| what(format!("the plan resolves no {name} scan")))?;
         let launch = plan.launch();
         let scan = |symbol: &'static str| {
             Bound::new(
@@ -530,27 +585,65 @@ impl RecurrentRows {
             )
             .map_err(what)
         };
-        let chunk = GdnChunk::new(
-            ChunkConv::new(scan("q4p_gdn_conv")?, scan("q4p_gdn_conv_state")?).map_err(what)?,
-            scan("q4p_gdn_prep")?,
-            GatedNorm::new(scan("q4p_gdn_gate")?).map_err(what)?,
-        )
-        .map_err(what)?;
+        let conv_kernels =
+            || ChunkConv::new(scan("q4p_gdn_conv")?, scan("q4p_gdn_conv_state")?).map_err(what);
+        let gate = || GatedNorm::new(scan("q4p_gdn_gate")?).map_err(what);
         let (conv, value, heads) = (
             geometry.conv_width(),
             geometry.value_width(),
             geometry.heads,
         );
         let mut carve = |floats: usize| alloc(floats * 4).map(Deviceptr);
-        let body = GdnRows {
-            raw: carve(rows * conv)?,
-            z: carve(rows * value)?,
-            b: carve(rows * heads)?,
-            a: carve(rows * heads)?,
-            mixed: carve(rows * conv)?,
-            qk: carve(geometry.qk_floats(rows))?,
-            decay: carve(rows * 2 * heads)?,
-            attended: carve(rows * value)?,
+        let body = match kda {
+            None => RecurrentBody::Gdn {
+                chunk: GdnChunk::new(conv_kernels()?, scan("q4p_gdn_prep")?, gate()?)
+                    .map_err(what)?,
+                rows: GdnRows {
+                    raw: carve(rows * conv)?,
+                    z: carve(rows * value)?,
+                    b: carve(rows * heads)?,
+                    a: carve(rows * heads)?,
+                    mixed: carve(rows * conv)?,
+                    qk: carve(geometry.qk_floats(rows))?,
+                    decay: carve(rows * 2 * heads)?,
+                    attended: carve(rows * value)?,
+                },
+            },
+            Some(kda) => {
+                let decay = Bound::new(
+                    cuda,
+                    Image::Qwen4Exp,
+                    qwen4_exp_cubin(),
+                    KdaChunk::DECAY,
+                    Precision::Bf16,
+                )
+                .map_err(what)?;
+                let chunk = KdaChunk::new(conv_kernels()?, decay, scan(KdaChunk::PREP)?, gate()?)
+                    .map_err(what)?;
+                // f_a and g_a are whole: one head's width a row.
+                let low = kda.head_dim;
+                let rows = KdaRows {
+                    raw: carve(rows * conv)?,
+                    f_a: carve(rows * low)?,
+                    g_a: carve(rows * low)?,
+                    b: carve(rows * heads)?,
+                    mixed: carve(rows * conv)?,
+                    forget: carve(rows * value)?,
+                    gate: carve(rows * value)?,
+                    decay: carve(rows * value)?,
+                    qk: carve(geometry.qk_floats(rows))?,
+                    decay_beta: carve(rows * 2 * heads)?,
+                    attended: carve(rows * value)?,
+                };
+                // The joined convs, BF16: half a float a weight, rounded up.
+                let joined = carve((conv * geometry.taps).div_ceil(2))?;
+                RecurrentBody::Kda {
+                    chunk,
+                    rows,
+                    conv: joined,
+                    lower_bound: kda.lower_bound as f32,
+                }
+            }
         };
         let snapshots = if verify {
             let sizes = recurrent_sizes(&geometry);
@@ -563,10 +656,9 @@ impl RecurrentRows {
             None
         };
         Ok(Self {
-            chunk,
+            body,
             scan: (scan(launch.kernel.symbol)?, (launch.grid, launch.block)),
             geometry,
-            rows: body,
             snapshots,
         })
     }
@@ -1205,6 +1297,34 @@ impl sparkflash_ops::roles::DeviceCx for RowsCx<'_> {
             })
     }
 
+    fn project_strided(
+        &self,
+        linear: &RouteLinear,
+        input: Deviceptr,
+        (output, stride): (Deviceptr, usize),
+        rows: usize,
+    ) -> Result<(), sparkflash_model::backend::BackendError> {
+        use sparkflash_kernels::dense_format::{DenseGroups, DenseRows};
+        linear
+            .route
+            .project(
+                self.cuda,
+                linear.io,
+                &linear.matrix,
+                &DenseRows {
+                    a: input.0,
+                    a_stride: linear.matrix.inner,
+                    out: output.0,
+                    out_stride: stride,
+                    tokens: rows,
+                },
+                DenseGroups::ONE,
+            )
+            .map_err(|error| {
+                sparkflash_model::backend::BackendError::new(ROWS_CX, error.to_string())
+            })
+    }
+
     fn sum(
         &self,
         _partial: Deviceptr,
@@ -1621,6 +1741,10 @@ impl DeviceLayer<'_> {
                     self.run_layer_gdn(rows, layer, p0, n)?;
                     attention_pending = true;
                 }
+                Part::KdaScan if !attention_pending => {
+                    self.run_layer_kda(rows, layer, p0, n)?;
+                    attention_pending = true;
+                }
                 Part::DenseMlp if attention_pending => {
                     self.run_dense_mlp(rows, layer, n)?;
                     attention_pending = false;
@@ -1822,33 +1946,36 @@ impl DeviceLayer<'_> {
         )
     }
 
-    /// A Gated DeltaNet block: the previous layer's post and the entry seam
-    /// ([Self::run_layer_attn_seam]), the shared recurrent body ([sparkflash_ops::roles::GdnLayer])
-    /// over the seam's f32 rows with its five projections on the dense format route and each
-    /// sequence's conv history and state in its lane, then the block's BF16 rows as the attention's
-    /// sum: the projections are whole on every rank, so every rank runs every head and one rank's
-    /// rows are the sum, copied into the reduced rows at every world. A verify pass (`keep_recurrent`) leaves each region's state after
-    /// each row in the snapshot slab, for the kept row's commit ([Self::commit_recurrent]). A
-    /// split chunk is refused: the body projects whole rows.
-    fn run_layer_gdn(
-        &mut self,
-        rows: &RowsState,
+    /// A recurrent block's pass setup, shared by both kinds: the refusal of a split chunk (the
+    /// body projects whole rows), the rows state's recurrent rows, the block's dense format route,
+    /// and each segment's conv history and state in its lane, with the verify slab's slots on a
+    /// verify pass (`keep_recurrent`).
+    fn recurrent_pass<'r>(
+        &self,
+        rows: &'r RowsState,
         layer: usize,
-        p0: usize,
-        n: usize,
-    ) -> Result<(), String> {
-        use sparkflash_kernels::dense_format::{DenseIo, DenseMatrix, RowForm};
+        (p0, n): (usize, usize),
+        name: &str,
+    ) -> Result<
+        (
+            &'r RecurrentRows,
+            sparkflash_kernels::dense_format::DenseFormat,
+            Vec<LaneSegment>,
+        ),
+        String,
+    > {
         if self.sp_rows(rows, n).is_some() {
             return Err(format!(
-                "rows layer {layer}: a split chunk reached a Gated DeltaNet block; the body projects whole rows (enable_prefill_sp)"
+                "rows layer {layer}: a split chunk reached a {name} block; the body projects whole rows (enable_prefill_sp)"
             ));
         }
-        let recurrent = rows.recurrent.as_ref().ok_or_else(|| {
-            format!("rows layer {layer}: the rows state carved no Gated DeltaNet rows")
-        })?;
+        let recurrent = rows
+            .recurrent
+            .as_ref()
+            .ok_or_else(|| format!("rows layer {layer}: the rows state carved no {name} rows"))?;
         let route = self.layer_dense(layer).recurrent.ok_or_else(|| {
             format!(
-                "rows layer {layer}: the Gated DeltaNet block has no dense format route (attach_dense_format)"
+                "rows layer {layer}: the {name} block has no dense format route (attach_dense_format)"
             )
         })?;
         let block = recurrent_block(layer)?;
@@ -1863,7 +1990,7 @@ impl DeviceLayer<'_> {
         };
         let lanes = self.lanes.as_ref().ok_or_else(|| {
             format!(
-                "rows layer {layer}: a Gated DeltaNet block keeps its state in the lanes, and none are attached"
+                "rows layer {layer}: a {name} block keeps its state in the lanes, and none are attached"
             )
         })?;
         let segments = self
@@ -1882,7 +2009,7 @@ impl DeviceLayer<'_> {
                     .copied()
                     .flatten()
                     .ok_or_else(|| {
-                        format!("rows layer {layer}: lane {lane} holds no Gated DeltaNet state")
+                        format!("rows layer {layer}: lane {lane} holds no {name} state")
                     })?;
                 let snapshots = match snapshots {
                     Some(slab) => vec![
@@ -1902,6 +2029,36 @@ impl DeviceLayer<'_> {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        Ok((recurrent, route, segments))
+    }
+
+    /// A Gated DeltaNet block: the previous layer's post and the entry seam
+    /// ([Self::run_layer_attn_seam]), the shared recurrent body ([sparkflash_ops::roles::GdnLayer])
+    /// over the seam's f32 rows with its five projections on the dense format route and each
+    /// sequence's conv history and state in its lane, then the block's BF16 rows as the attention's
+    /// sum: the projections are whole on every rank, so every rank runs every head and one rank's
+    /// rows are the sum, copied into the reduced rows at every world. A verify pass (`keep_recurrent`) leaves each region's state after
+    /// each row in the snapshot slab, for the kept row's commit ([Self::commit_recurrent]). A
+    /// split chunk is refused: the body projects whole rows.
+    fn run_layer_gdn(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::dense_format::{DenseIo, DenseMatrix, RowForm};
+        let (recurrent, route, segments) =
+            self.recurrent_pass(rows, layer, (p0, n), "Gated DeltaNet")?;
+        let RecurrentBody::Gdn {
+            chunk,
+            rows: scratch,
+        } = &recurrent.body
+        else {
+            return Err(format!(
+                "rows layer {layer}: a Gated DeltaNet block in a stack whose recurrent rows are Kimi Delta Attention's"
+            ));
+        };
         let bind = self
             .attention
             .ok_or_else(|| format!("rows layer {layer}: no attention bind"))?;
@@ -1952,15 +2109,137 @@ impl DeviceLayer<'_> {
         let b = rows.b;
         body.run(
             &RowsCx::new(self.cuda, n, None).with_segments(&segments),
-            (&recurrent.chunk, recurrent.scan),
+            (chunk, recurrent.scan),
             &geometry,
-            &recurrent.rows,
+            scratch,
             (Deviceptr(b.normed), Deviceptr(b.attn_out)),
             (crate::plan::description().values().norm_eps as f32, false),
         )
         .map_err(|error| format!("rows layer {layer}: {error}"))?;
         self.cuda
             .copy_dtod_async(&Deviceptr(b.reduced), &Deviceptr(b.attn_out), n * dim * 2)
+    }
+
+    /// A Kimi Delta Attention block (GLM-5.3-Flash's linear attention), split by heads as its
+    /// layout states: the previous layer's post and the entry seam ([Self::run_layer_attn_seam]),
+    /// the shared body ([sparkflash_ops::roles::KdaLayer]) over the seam's f32 rows with this
+    /// rank's heads, its projections on the dense format route and each sequence's conv history
+    /// and state in its lane, then `o_proj`'s BF16 partial through the base's reduce. The three
+    /// convs are joined into one `[3 width][taps]` buffer for the conv each pass. A verify pass
+    /// (`keep_recurrent`) leaves each region's state after each row in the snapshot slab, as a
+    /// Gated DeltaNet's does.
+    fn run_layer_kda(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::dense_format::{DenseIo, DenseMatrix, RowForm};
+        let (recurrent, route, segments) =
+            self.recurrent_pass(rows, layer, (p0, n), "Kimi Delta Attention")?;
+        let RecurrentBody::Kda {
+            chunk,
+            rows: scratch,
+            conv: joined,
+            lower_bound,
+        } = &recurrent.body
+        else {
+            return Err(format!(
+                "rows layer {layer}: a Kimi Delta Attention block in a stack whose recurrent rows are a Gated DeltaNet's"
+            ));
+        };
+        let bind = self
+            .attention
+            .ok_or_else(|| format!("rows layer {layer}: no attention bind"))?;
+        let lookup = |tail: &str| -> Result<(Deviceptr, Deviceptr), String> {
+            let name = crate::plan::layer_claim(layer, tail);
+            bind.pointers
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("rows layer {layer}: the bind has no {name}"))
+        };
+        let dim = self.dim;
+        let geometry = recurrent.geometry;
+        let (width, heads, low, taps) = (
+            geometry.value_width(),
+            geometry.heads,
+            geometry.key_dim,
+            geometry.taps,
+        );
+        let linear = |tail: &str, (cols, inner): (usize, usize), output: RowForm| {
+            lookup(tail).map(|(weight, scales)| RouteLinear {
+                route,
+                matrix: DenseMatrix {
+                    weight: weight.0,
+                    scales: scales.0,
+                    cols,
+                    inner,
+                },
+                io: DenseIo::new(RowForm::F32, output),
+            })
+        };
+        let names = sparkflash_engine::tensor::KDA_TENSORS;
+        let qkv = [
+            linear(names.qkv[0], (width, dim), RowForm::F32)?,
+            linear(names.qkv[1], (width, dim), RowForm::F32)?,
+            linear(names.qkv[2], (width, dim), RowForm::F32)?,
+        ];
+        let forget = (
+            linear(names.forget[0], (low, dim), RowForm::F32)?,
+            linear(names.forget[1], (width, low), RowForm::F32)?,
+        );
+        let gate = (
+            linear(names.gate[0], (low, dim), RowForm::F32)?,
+            linear(names.gate[1], (width, low), RowForm::F32)?,
+        );
+        let write = linear(names.b, (heads, dim), RowForm::F32)?;
+        let out = linear(names.out, (dim, width), RowForm::Bf16)?;
+        let vector = |tail: &str| lookup(tail).map(|(weight, _)| weight);
+        let conv_bytes = width * taps * 2;
+        for (index, tail) in names.conv.iter().enumerate() {
+            self.cuda.copy_dtod_async(
+                &joined.offset(index * conv_bytes),
+                &vector(tail)?,
+                conv_bytes,
+            )?;
+        }
+        let body = sparkflash_ops::roles::KdaLayer {
+            qkv: [&qkv[0], &qkv[1], &qkv[2]],
+            forget: (&forget.0, &forget.1),
+            gate: (&gate.0, &gate.1),
+            b: &write,
+            out: &out,
+            conv: *joined,
+            decay: (vector(names.a_log)?, vector(names.dt_bias)?),
+            norm: vector(names.norm)?,
+        };
+        self.run_layer_attn_seam(rows, layer, p0, n)?;
+        let b = rows.b;
+        let world = self.routed_geometry.world;
+        let share = (world > 1)
+            .then(|| sparkflash_model::TpPlan::new(world, self.tp_rank))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        body.run(
+            &RowsCx::new(self.cuda, n, share).with_segments(&segments),
+            (chunk, recurrent.scan),
+            &geometry,
+            scratch,
+            (Deviceptr(b.normed), Deviceptr(b.attn_out)),
+            (
+                crate::plan::description().values().norm_eps as f32,
+                *lower_bound,
+            ),
+        )
+        .map_err(|error| format!("rows layer {layer}: {error}"))?;
+        self.reduce_layer_rows(
+            rows,
+            "all_reduce",
+            span(b.attn_out, n * dim * 2),
+            span(b.reduced, n * dim * 2),
+            n,
+        )
     }
 
     /// A dense-FFN block's MLP: the attention's post and the FFN seam (the fused block's

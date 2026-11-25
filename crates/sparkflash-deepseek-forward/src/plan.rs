@@ -1652,6 +1652,7 @@ pub const fn forward_has_body(part: Part) -> bool {
             | Part::MlaAttention
             | Part::GqaAttention
             | Part::GdnScan
+            | Part::KdaScan
             | Part::Csa2Compression
             | Part::SparseIndexer
             | Part::Moe
@@ -1705,7 +1706,12 @@ const FUSED_PARTS: [Part; 8] = [
 pub const fn runs_alone(part: Part) -> bool {
     matches!(
         part,
-        Part::MlaAttention | Part::GqaAttention | Part::GdnScan | Part::DenseMlp | Part::Moe
+        Part::MlaAttention
+            | Part::GqaAttention
+            | Part::GdnScan
+            | Part::KdaScan
+            | Part::DenseMlp
+            | Part::Moe
     )
 }
 
@@ -1714,7 +1720,7 @@ pub const fn runs_alone(part: Part) -> bool {
 pub const fn is_attention(part: Part) -> bool {
     matches!(
         part,
-        Part::MlaAttention | Part::GqaAttention | Part::GdnScan
+        Part::MlaAttention | Part::GqaAttention | Part::GdnScan | Part::KdaScan
     )
 }
 
@@ -1723,7 +1729,7 @@ pub const fn is_attention(part: Part) -> bool {
 /// until its body takes interleaved chunks, and the scan says so.
 #[must_use]
 pub const fn interleaves(part: Part) -> bool {
-    !matches!(part, Part::GqaAttention | Part::GdnScan)
+    !matches!(part, Part::GqaAttention | Part::GdnScan | Part::KdaScan)
 }
 
 /// The first language block part with no body for interleaved prompt chunks ([interleaves]), and

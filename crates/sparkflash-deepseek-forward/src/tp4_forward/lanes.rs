@@ -393,15 +393,10 @@ impl<'a> DeviceLayer<'a> {
         let mut recurrent_sizes = Vec::new();
         if let Some(geometry) = super::rows::recurrent_geometry()? {
             recurrent_sizes = super::rows::recurrent_sizes(&geometry);
-            for (block, &layer) in crate::plan::description()
-                .values()
-                .gdn_layers
-                .iter()
-                .enumerate()
-            {
-                let slot = recurrent.get_mut(layer).ok_or_else(|| {
-                    format!("lanes: Gated DeltaNet block {layer} of {layers} layers")
-                })?;
+            for (block, &layer) in super::rows::recurrent_layers().iter().enumerate() {
+                let slot = recurrent
+                    .get_mut(layer)
+                    .ok_or_else(|| format!("lanes: recurrent block {layer} of {layers} layers"))?;
                 *slot = Some((
                     layout.state(recurrent_sizes[2 * block]),
                     layout.state(recurrent_sizes[2 * block + 1]),

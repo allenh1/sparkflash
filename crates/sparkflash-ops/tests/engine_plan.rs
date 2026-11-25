@@ -1231,6 +1231,54 @@ fn a_gated_deltanet_block_in_an_mla_stack_scans_every_head_at_any_world() {
     }
 }
 
+/// A Kimi Delta Attention block inside the DeepSeek stack (GLM's `linear_attn_config`
+/// spelling) splits by heads as the DeepSeek layout states it: each rank scans its share, and
+/// the plan carries the block's GLM-named tensors and none of MLA's.
+#[test]
+fn a_kda_block_in_the_deepseek_stack_scans_its_ranks_share_of_the_heads() {
+    let mut root: serde_json::Value = serde_json::from_str(DEEPSEEK).expect("DeepSeek config");
+    let text = root["text_config"].as_object_mut().expect("text_config");
+    let layers = text["num_hidden_layers"].as_u64().expect("layers") as usize;
+    let mut types = vec![serde_json::Value::from("compressed_attention"); layers];
+    types[0] = serde_json::Value::from(sparkflash_model::architecture::GDN_LAYER_TYPE);
+    text.insert("layer_types".into(), serde_json::Value::from(types));
+    text.insert(
+        "linear_attn_config".into(),
+        serde_json::json!({
+            "num_heads": 16,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+            "gate_lower_bound": -5.0,
+            "kda_layers": [0],
+        }),
+    );
+    text["compress_ratios"][0] = serde_json::Value::from(0);
+    let architecture = Architecture::from_json(&root.to_string()).expect("one KDA block");
+    for world in [1, 2, 4] {
+        for rank in 0..world {
+            let plan =
+                EnginePlan::for_architecture(architecture.clone(), Target::Sm121, world, rank)
+                    .unwrap_or_else(|error| panic!("TP{world}/{rank}: {error}"));
+            let share = 16 / world;
+            let scan = plan
+                .requirements()
+                .find(|requirement| requirement.part == Part::KdaScan)
+                .expect("the KDA block's scan");
+            assert_eq!(
+                (scan.geometry.heads, scan.geometry.head_offset),
+                (share, rank * share),
+                "TP{world}/{rank}"
+            );
+            assert!(
+                !plan
+                    .requirements()
+                    .any(|requirement| requirement.part == Part::GdnScan),
+                "TP{world}/{rank}: a KDA block is not a Gated DeltaNet"
+            );
+        }
+    }
+}
+
 /// GLM's KDA blocks sit in an MLA stack too, but the layout states their projections split by
 /// rows, so each rank scans its share of the 64 heads. The split is the layout's statement, not
 /// a rule about recurrent blocks in an MLA stack. The stack-wide attention facts are the sparse

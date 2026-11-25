@@ -128,6 +128,17 @@ path = "text_config.initializer_range"
 ignore = "the producer's training-time weight initialization range; this family derives no inference geometry from it"
 
 [[keys]]
+# config.json text_config.linear_attn_config.kda_layers: the KDA layer schedule, which
+# layer_types also states (the parse refuses a disagreement).
+path = "text_config.linear_attn_config.kda_layers"
+fact = "language.linear_attention.kda_layers"
+
+[[keys]]
+# config.json text_config.linear_attn_config.full_attn_layers: the MLA layer schedule, likewise.
+path = "text_config.linear_attn_config.full_attn_layers"
+fact = "language.linear_attention.full_attn_layers"
+
+[[keys]]
 # config.json text_config.use_cache: a producer output switch for returning the KV cache; serving always keeps the cache.
 path = "text_config.use_cache"
 ignore = "a producer output switch for returning the KV cache; serving always keeps the cache"
@@ -140,6 +151,7 @@ order = [
   "mla_attention",
   "gqa_attention",
   "gdn_scan",
+  "kda_scan",
   "csa2_compression",
   "sparse_indexer",
   "moe",
@@ -678,6 +690,163 @@ shape = ["gdn_value_dim"]
 split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
+
+# A Kimi Delta Attention layer inside the MLA stack (text_config.layer_types names it
+# linear_attention and text_config.linear_attn_config holds its heads, head width, conv taps and
+# gate bound, the GLM-5.3-Flash spelling): q, k and v [width, hidden] with their own convs
+# [width, 1, taps], the low-rank forget (f_a, f_b) and output-gate (g_a, g_b) projections, the
+# write strength b, A_log and dt_bias f32, the gated norm and o_proj, stored as GLM-5.3-Flash
+# stores them. The block splits by heads: the per-head tensors by rows, the low-rank inputs
+# f_a and g_a and the norm whole, and o_proj by columns, whose partial the base sums.
+[[tensor]]
+name = "layers.{layer}.attn.q_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.k_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.v_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.q_conv1d.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", 1, "kda_conv"]
+split = "conv"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.k_conv1d.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", 1, "kda_conv"]
+split = "conv"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.v_conv1d.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", 1, "kda_conv"]
+split = "conv"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.f_a_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.f_b_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "kda_head_dim"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.g_a_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_head_dim", "hidden"]
+split = "whole"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.g_b_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_width", "kda_head_dim"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.b_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_heads", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.A_log"
+part = "kda_scan"
+role = "attention"
+dtype = "f32"
+shape = ["kda_heads"]
+split = "vector"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.dt_bias"
+part = "kda_scan"
+role = "attention"
+dtype = "f32"
+shape = ["kda_width"]
+split = "vector"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.o_norm.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["kda_head_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "kda" }
+
+[[tensor]]
+name = "layers.{layer}.attn.o_proj.weight"
+part = "kda_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["hidden", "kda_width"]
+split = "columns"
+repeat = "layers"
+when = { attention = "kda" }
 
 # model.py:798-809: the router matrix is BF16 (the index has no ffn.gate.scale) and its two
 # f32 biases are [routed]; bias_vl exists because the checkpoint has a vision tower.

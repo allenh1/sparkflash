@@ -134,9 +134,7 @@ pub(super) fn decoder_warm() -> usize {
 /// leave it wrong.
 pub(super) fn recurrent_decoder_block() -> Option<usize> {
     let encoder = encoder_layers();
-    crate::plan::description()
-        .values()
-        .gdn_layers
+    super::rows::recurrent_layers()
         .iter()
         .copied()
         .find(|&layer| layer >= encoder)

@@ -100,6 +100,7 @@ _LONG_B = [2000 + index for index in range(270)]
 VARIANT_PROMPTS = {
     "gdn-dense": PROMPTS + [PROMPTS[2] + [306, 307, 308]],
     "gdn-decoder": [_LONG_A, _LONG_B, _LONG_A + [6000 + index for index in range(20)]],
+    "kda-dense": PROMPTS + [PROMPTS[2] + [306, 307, 308]],
 }
 
 
@@ -187,6 +188,28 @@ STORED_FORMATS = {
             "intermediate_size": 1024,
             "layer_types": ["linear_attention"] + ["compressed_attention"] * 7,
             **GDN_GEOMETRY,
+        },
+    },
+    # Kimi Delta Attention as the first block, in the GLM-5.3-Flash spelling (linear_attn_config:
+    # 16 heads of 128, a 4-tap conv, the forget gate bounded at -5), split by heads at worlds 2
+    # and 4, with the dense-mlp variant's gated MLP on the BF16 dense route. The stack after it is
+    # the fixture's MLA.
+    "kda-dense": {
+        "quant_method": "bf16",
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+        "text_config": {
+            "first_k_dense_replace": 1,
+            "intermediate_size": 1024,
+            "layer_types": ["linear_attention"] + ["compressed_attention"] * 7,
+            "linear_attn_config": {
+                "num_heads": 16,
+                "head_dim": 128,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0,
+                "kda_layers": [0],
+                "full_attn_layers": [1, 2, 3, 4, 5, 6, 7],
+            },
         },
     },
     # The same Gated DeltaNet as the last block, above the encoder layers, with its compress
@@ -1023,6 +1046,9 @@ TIE_BAND_VARIANTS = {
     "gqa-dense": _FAST_MATH,
     "gdn-dense": _FAST_MATH,
     "gdn-decoder": _FAST_MATH,
+    # The device splits KDA's heads and sums o_proj's BF16 partials; the host runs every head and
+    # rounds the whole sum once.
+    "kda-dense": _FAST_MATH + "; the device sums the split heads' BF16 partials",
 }
 
 
