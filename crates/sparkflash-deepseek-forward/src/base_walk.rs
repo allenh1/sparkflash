@@ -190,7 +190,11 @@ impl Walk for BaseWalk {
     type Vision = NoVision;
 
     const CAPABILITIES: WalkCapabilities = WalkCapabilities {
-        passes: PassMask::TOKEN_ROWS.union(PassMask::BULK),
+        // The verify pass is the drafter's own command ([`BaseDrafter::verify`]), so a walk of
+        // one is refused below.
+        passes: PassMask::TOKEN_ROWS
+            .union(PassMask::BULK)
+            .union(PassMask::VERIFY),
         segments: Segments::Many,
         state: StateKind::Positional,
         // Word for word the arm's rows in `sparkflash_model::ARM_LEDGERS`; the generated
@@ -309,7 +313,7 @@ impl Walk for BaseWalk {
                     CODE,
                     format!(
                         "the DeepSeek base walk runs a prompt chunk and a token row a sequence, \
-                         not a {kind:?} pass"
+                         not a {kind:?} pass; its verify is the drafter's"
                     ),
                 ));
             }
