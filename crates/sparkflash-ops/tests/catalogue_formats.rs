@@ -79,19 +79,25 @@ fn the_mxfp4_experts_are_not_nvfp4_or_mxfp8() {
             let Some(format) = symbol.format else {
                 continue;
             };
+            // The format route's NVFP4 bodies are E2M1 codes too, with a per-16 scale and a
+            // tensor scale: each 4-bit body accepts its own arithmetic and not the other's.
             if format.values() == sparkflash_model::format::FormatValues::Fp4E2M1 {
+                let own = precision_of_stored(format);
                 assert!(
-                    symbol.accepts(Precision::MxFp4),
-                    "{} decodes {} but does not accept MXFP4",
+                    symbol.accepts(own),
+                    "{} decodes {} but does not accept {own:?}",
                     symbol.name,
                     format.describe()
                 );
-                assert_eq!(
-                    precision_of_stored(format),
-                    Precision::MxFp4,
-                    "{}: a 4-bit format is its own arithmetic",
-                    symbol.name
-                );
+                for other in [Precision::MxFp4, Precision::NvFp4] {
+                    assert!(
+                        other == own || !symbol.accepts(other),
+                        "{} decodes {} but also accepts {other:?}: a 4-bit format is its own \
+                         arithmetic",
+                        symbol.name,
+                        format.describe()
+                    );
+                }
             }
         }
     }
