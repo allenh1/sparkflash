@@ -575,6 +575,58 @@ pub fn decoder_resume(skip_end: usize, start: usize, target: usize, warm: usize)
     }
 }
 
+/// Where a prefill to `target` saves a recurrent stack's state, the state its cache rows do not
+/// hold: the last multiple of `step` (the rows' resume granularity) at or below the prompt's last
+/// row, so a later prompt that shares the prompt resumes there. `None` when that is row 0 (a
+/// prompt that resumes at 0 starts over anyway) or `step` is 0.
+///
+/// The point is the base's "save at the prompt's end" at its resume granularity: a prefill is cut
+/// there ([save_cut]), the state copied out, and the rest of the prompt runs on.
+///
+/// ```
+/// use sparkflash_runtime::tick::save_point;
+/// assert_eq!(save_point(300, 2), Some(298));
+/// assert_eq!(save_point(301, 2), Some(300));
+/// assert_eq!(save_point(2, 2), None);
+/// assert_eq!(save_point(300, 0), None);
+/// ```
+#[must_use]
+pub fn save_point(target: usize, step: usize) -> Option<usize> {
+    let last = target.saturating_sub(1);
+    let point = last.checked_div(step)? * step;
+    (point > 0).then_some(point)
+}
+
+/// Where a prefill chunk from row `p` of a prefill to `target` must end at the latest: the save
+/// point while the chunk starts below it, else the prompt's end.
+///
+/// ```
+/// use sparkflash_runtime::tick::save_cut;
+/// assert_eq!(save_cut(0, 300, Some(298)), 298);
+/// assert_eq!(save_cut(298, 300, Some(298)), 300);
+/// assert_eq!(save_cut(10, 300, None), 300);
+/// ```
+#[must_use]
+pub fn save_cut(p: usize, target: usize, save: Option<usize>) -> usize {
+    save.filter(|&point| p < point).unwrap_or(target)
+}
+
+/// Where a prompt sharing a lane's prefix up to `start` resumes a recurrent stack whose lane
+/// saved its state at `point`: there, when the point is at or below `start` (the state is put back
+/// to it), else row 0 (the state starts over). A recurrent state resumes only where it was saved.
+///
+/// ```
+/// use sparkflash_runtime::tick::recurrent_start;
+/// assert_eq!(recurrent_start(500, Some(298)), 298);
+/// assert_eq!(recurrent_start(298, Some(298)), 298);
+/// assert_eq!(recurrent_start(200, Some(298)), 0);
+/// assert_eq!(recurrent_start(200, None), 0);
+/// ```
+#[must_use]
+pub fn recurrent_start(start: usize, point: Option<usize>) -> usize {
+    point.filter(|&point| point <= start).unwrap_or(0)
+}
+
 /// Whether a prefill from `start` to `target` takes the bulk chunks.
 #[must_use]
 pub fn bulk_from(
@@ -950,8 +1002,9 @@ pub mod replay {
     use super::{
         Clock, Decision, DecodePlan, DecodeShare, InjectedClock, LaneCandidate, ShareClock,
         StepModel, TickHost, TickRows, TickTrace, TogetherHost, band, bulk_budget, bulk_from,
-        common_prefix, decode_plan, decoder_resume, pick_lane, prefill_order, reusable_shared,
-        runs_decoder, skip_end_after, tick_chunks, tick_prefill, tick_rows, whole_chunk_fits,
+        common_prefix, decode_plan, decoder_resume, pick_lane, prefill_order, recurrent_start,
+        reusable_shared, runs_decoder, save_cut, save_point, skip_end_after, tick_chunks,
+        tick_prefill, tick_rows, whole_chunk_fits,
     };
     use crate::share_rows;
 
@@ -980,6 +1033,10 @@ pub mod replay {
         pub share_floor: f64,
         pub model: StepModel,
         pub k: usize,
+        /// A stack with a recurrent state: the resume granularity its prefills save the state
+        /// at ([save_point]); a prompt resumes a lane only at its saved point
+        /// ([recurrent_start]). `None`: no recurrent state.
+        pub save_step: Option<usize>,
     }
 
     impl Config {
@@ -1005,6 +1062,7 @@ pub mod replay {
                 share_floor: 0.2,
                 model: (23.0, 4.0, 23.0, 4.0, 2.3),
                 k: 5,
+                save_step: None,
             }
         }
 
@@ -1069,6 +1127,8 @@ pub mod replay {
         seq: Option<u64>,
         used: u64,
         skip_end: usize,
+        /// The position the lane's recurrent state was saved at ([Config::save_step]).
+        point: Option<usize>,
     }
 
     /// A replayable scheduler state.
@@ -1298,6 +1358,12 @@ pub mod replay {
                         self.cfg.decoder_warm,
                     );
                 }
+                if self.cfg.save_step.is_some() {
+                    start = recurrent_start(start, self.lanes[lane].point);
+                    if start == 0 {
+                        self.lanes[lane].point = None;
+                    }
+                }
                 let bulk = bulk_from(
                     target,
                     start,
@@ -1343,6 +1409,7 @@ pub mod replay {
             let from = self.seqs[index].pos;
             let lane = self.seqs[index].lane?;
             let id = self.seqs[index].id;
+            let save = self.cfg.save_step.and_then(|step| save_point(target, step));
             let mut ran = 0;
             if bulk {
                 let cap = self.cfg.bulk_cap;
@@ -1363,6 +1430,8 @@ pub mod replay {
                     |_, _| None,
                 );
                 for (p, rows) in chunks {
+                    // A recurrent stack's chunk ends at its save point (one way: no chunk follows).
+                    let rows = rows.min(save_cut(p, target, save) - p);
                     self.trace.record(
                         self.tick,
                         self.clock.now_ms(),
@@ -1382,6 +1451,9 @@ pub mod replay {
                             || runs_decoder(p, rows, target, self.cfg.decoder_warm),
                     );
                     ran += rows;
+                    if Some(p + rows) == save {
+                        self.lanes[lane].point = save;
+                    }
                 }
             } else {
                 let steps = tick_rows(
@@ -1396,7 +1468,7 @@ pub mod replay {
                     if p == target {
                         break;
                     }
-                    let n = self.cfg.rows_max.min(target - p);
+                    let n = self.cfg.rows_max.min(save_cut(p, target, save) - p);
                     self.trace.record(
                         self.tick,
                         self.clock.now_ms(),
@@ -1416,6 +1488,9 @@ pub mod replay {
                     );
                     p += n;
                     ran += n;
+                    if Some(p) == save {
+                        self.lanes[lane].point = save;
+                    }
                 }
                 self.seqs[index].pos = p;
             }
