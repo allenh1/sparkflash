@@ -625,6 +625,18 @@ pub fn active() -> &'static ModelProfile {
     })
 }
 
+/// The installed profile, or the environment-resolved default, without installing it: a read
+/// made before a boot has set its own environment (the serve's flag checks, ahead of the device
+/// epoch's speculation switch) must not freeze the process's profile without that switch.
+#[must_use]
+pub fn peek() -> ModelProfile {
+    ACTIVE.get().cloned().unwrap_or_else(|| {
+        let mut profile = ModelProfile::default();
+        let _ = profile.apply_process_env();
+        profile
+    })
+}
+
 /// The environment overrides this module owns, with the typed field each sets.
 ///
 /// A value the field does not accept is refused rather than silently ignored. These names are

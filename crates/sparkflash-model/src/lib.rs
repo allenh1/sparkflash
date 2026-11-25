@@ -103,7 +103,7 @@ pub use parts::{Part, PartSet, Target, built, is_built};
 pub use prof::StageProfiler;
 pub use profile::{
     DepthMode, DraftLogitsKernel, DrafterProfile, ModelProfile, PlanProfile, ProfileError,
-    active as active_profile, install_active,
+    active as active_profile, install_active, peek as peek_profile,
 };
 pub use prompt::{PromptCodec, PromptError};
 pub use prompt_ranks::{MergedAlternative, MergedPosition};
