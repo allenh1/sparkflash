@@ -105,7 +105,11 @@ mod tests {
         rotate_half(&mut row, (1, 4), 4, (10_000.0, 1.0), 0);
         assert_eq!(row, vec![1.0, 2.0, 3.0, 4.0]);
         // Two query heads share one key/value head: one cached row attends to itself whole.
-        let out = attend(&[1.0, 0.0, 0.0, 1.0], (&[0.5, 0.5], &[3.0, -2.0]), (2, 1, 2));
+        let out = attend(
+            &[1.0, 0.0, 0.0, 1.0],
+            (&[0.5, 0.5], &[3.0, -2.0]),
+            (2, 1, 2),
+        );
         assert_eq!(out, vec![3.0, -2.0, 3.0, -2.0]);
     }
 

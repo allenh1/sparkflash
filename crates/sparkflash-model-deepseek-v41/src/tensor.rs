@@ -245,11 +245,9 @@ impl TensorPlan {
         };
         let _ = n_activated;
 
-        if let (false, true, Some(gqa)) = (
-            mtp,
-            config.gqa_layers.contains(&layer),
-            config.gqa.as_ref(),
-        ) {
+        if let (false, true, Some(gqa)) =
+            (mtp, config.gqa_layers.contains(&layer), config.gqa.as_ref())
+        {
             // A grouped-query block: its four projections in the dense class, and none of MLA's
             // low-rank query, latent, grouped output, sink or norms.
             let query = gqa.heads * gqa.head_dim;

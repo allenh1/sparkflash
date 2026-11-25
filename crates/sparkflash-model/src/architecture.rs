@@ -4365,7 +4365,10 @@ mod tests {
 
     /// A DeepSeek-shaped stack with one grouped-query layer: layer 0 is `gqa_attention`, read
     /// from `gqa_attn_config` alone, and every other layer keeps the stack's MLA.
-    fn deepseek_with_gqa_layer(nested: serde_json::Value, ratio: usize) -> Result<Architecture, ConfigError> {
+    fn deepseek_with_gqa_layer(
+        nested: serde_json::Value,
+        ratio: usize,
+    ) -> Result<Architecture, ConfigError> {
         let mut root: Value = serde_json::from_str(DEEPSEEK).expect("DeepSeek config");
         let text = root["text_config"].as_object_mut().expect("text_config");
         let layers = text["num_hidden_layers"].as_u64().expect("layers") as usize;
@@ -4382,22 +4385,35 @@ mod tests {
         let nested = serde_json::json!({"num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128});
         let architecture = deepseek_with_gqa_layer(nested.clone(), 0).expect("one GQA layer");
         let first = &architecture.layers[0].attention;
-        assert!(matches!(first.kind, AttentionKind::Gqa { kv_heads: 8, .. }), "{:?}", first.kind);
+        assert!(
+            matches!(first.kind, AttentionKind::Gqa { kv_heads: 8, .. }),
+            "{:?}",
+            first.kind
+        );
         assert_eq!((first.heads, first.head_dim), (32, 128));
         assert!(first.compression.is_none() && first.indexer.is_none());
         // The stack's YaRN scaling is MLA's; the grouped-query layer rotates every float of a
         // head at the stack's base, unscaled.
         assert!(first.rope.scaling.is_none(), "{:?}", first.rope);
         assert_eq!(first.rope.rotated_dims, 128);
-        assert!(matches!(architecture.layers[1].attention.kind, AttentionKind::Mla { .. }));
+        assert!(matches!(
+            architecture.layers[1].attention.kind,
+            AttentionKind::Mla { .. }
+        ));
         assert_eq!(architecture.layers[1].attention.head_dim, 512);
         // A compressing grouped-query layer and a nested object that leaves a width out are
         // refused by name.
         let compressing = deepseek_with_gqa_layer(nested, 4).expect_err("ratio 4");
-        assert!(compressing.to_string().contains("compresses nothing"), "{compressing}");
+        assert!(
+            compressing.to_string().contains("compresses nothing"),
+            "{compressing}"
+        );
         let short = serde_json::json!({"num_attention_heads": 32, "head_dim": 128});
         let missing = deepseek_with_gqa_layer(short, 0).expect_err("no kv heads");
-        assert!(missing.to_string().contains("num_key_value_heads"), "{missing}");
+        assert!(
+            missing.to_string().contains("num_key_value_heads"),
+            "{missing}"
+        );
     }
 
     #[test]
@@ -5118,7 +5134,10 @@ mod tests {
             let architecture = Architecture::from_json(&text).expect("the release parses");
             assert_eq!(
                 architecture.quantization.expert_format,
-                WeightFormat::NvFp4 { group_size: 16, wide },
+                WeightFormat::NvFp4 {
+                    group_size: 16,
+                    wide
+                },
                 "{name}"
             );
         }

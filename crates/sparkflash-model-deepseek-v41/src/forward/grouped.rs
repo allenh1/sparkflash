@@ -221,7 +221,15 @@ mod tests {
         let mut whole_cache = GroupedCache::default();
         let mut whole = Vec::new();
         grouped_attention_forward(
-            &config, 1, "layers.1", &x, 0, &mut whole_cache, &source, &mut whole, limit,
+            &config,
+            1,
+            "layers.1",
+            &x,
+            0,
+            &mut whole_cache,
+            &source,
+            &mut whole,
+            limit,
         )
         .unwrap();
         let mut split_cache = GroupedCache::default();
@@ -242,7 +250,12 @@ mod tests {
             .unwrap();
             split.extend_from_slice(&out);
         }
-        let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(bits(&whole), bits(&split));
         assert_eq!(bits(&whole_cache.keys), bits(&split_cache.keys));
         assert_eq!(whole_cache.len(config.gqa.as_ref().unwrap()), 5);
@@ -292,9 +305,17 @@ mod tests {
         let mut split = SequenceState::new(&config);
         split_engine.prefill(&mut split, &prompt[..2]).unwrap();
         let two = split_engine.prefill(&mut split, &prompt[2..]).unwrap();
-        let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(bits(&one.logits), bits(&two.logits));
-        assert_eq!(whole.grouped[1].len(config.gqa.as_ref().unwrap()), prompt.len());
+        assert_eq!(
+            whole.grouped[1].len(config.gqa.as_ref().unwrap()),
+            prompt.len()
+        );
         assert!(whole.grouped[0].is_empty());
         let next = whole_engine.decode(&mut whole, 7).unwrap();
         let next_split = split_engine.decode(&mut split, 7).unwrap();

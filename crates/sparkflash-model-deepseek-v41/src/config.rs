@@ -1233,7 +1233,9 @@ mod released {
             (Some(_), true) => {
                 return Err(ConfigError::Invalid {
                     field: "text_config.gqa_attn_config",
-                    detail: "the document states grouped-query geometry and no block is gqa_attention".to_owned(),
+                    detail:
+                        "the document states grouped-query geometry and no block is gqa_attention"
+                            .to_owned(),
                 });
             }
             (None, true) => None,
