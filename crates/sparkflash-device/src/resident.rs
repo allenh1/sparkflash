@@ -297,6 +297,9 @@ pub fn classify(name: &str) -> Result<Option<Classification>, ShardError> {
                 classified(Group::AttentionColumn, ShardRule::Column)
             }
             "wo_b.weight" | "wo_b.scale" => classified(Group::AttentionRow, ShardRule::Row),
+            // An absorbed block's expansion (`absorbed_mla`): its nope-key and value rows per
+            // head, so a rank's heads by their output rows like the query's.
+            "wkv_b.weight" | "wkv_b.scale" => classified(Group::AttentionColumn, ShardRule::Column),
             // A grouped-query block (`gqa_attention`): the query, key and value projections by
             // their output rows (a rank's heads), the output projection by its inner axis.
             "wq.weight" | "wq.scale" | "wk.weight" | "wk.scale" | "wv.weight" | "wv.scale" => {
@@ -400,7 +403,12 @@ pub fn classify(name: &str) -> Result<Option<Classification>, ShardError> {
         | "main_norm.weight"
         | "markov_head.embed.weight"
         | "markov_head.head.weight"
-        | "confidence_head.proj.weight" => classified(Group::MtpHeads, ShardRule::Replicated),
+        | "confidence_head.proj.weight"
+        // A next-token module's input pair (`eh_proj` over the two normed halves).
+        | "eh_proj.weight"
+        | "eh_proj.scale"
+        | "enorm.weight"
+        | "hnorm.weight" => classified(Group::MtpHeads, ShardRule::Replicated),
         _ => Err(unknown()),
     }
 }
