@@ -1580,6 +1580,11 @@ pub const CATALOGUE: &[PartKernel] = &[
             ),
             deepseek_sym("routed_format_gate_up_mxfp8_row_sm121", &[Precision::MxFp8]),
             deepseek_sym("routed_format_down_mxfp8_row_sm121", &[Precision::MxFp8]),
+            // A split chunk's gathered BF16 rows widened to f32 for the combine.
+            deepseek_sym(
+                "routed_format_widen_sm121",
+                &[Precision::Bf16, Precision::F32],
+            ),
         ],
         true,
     ),
@@ -2195,6 +2200,10 @@ pub const CATALOGUE: &[PartKernel] = &[
             deepseek_sym("opt_draft_logits_fp8", &[Precision::MxFp8]),
             deepseek_sym("opt_draft_taps", &[Precision::Bf16]),
             deepseek_sym("opt_draft_norm_quant", &[Precision::Bf16, Precision::F32]),
+            deepseek_sym(
+                "opt_draft_norm_quant_normed",
+                &[Precision::Bf16, Precision::F32],
+            ),
             deepseek_sym("opt_mma_bf16a_fp8row_f32o", &[Precision::MxFp8]),
             deepseek_sym("opt_mma_head_fp8t_f32o", &[Precision::MxFp8]),
             // The MTP stage's routed experts are the backbone's MXFP4 arithmetic in the k3 forms
@@ -2232,6 +2241,11 @@ pub const CATALOGUE: &[PartKernel] = &[
             ),
             deepseek_sym("routed_format_gate_up_mxfp8_row_sm121", &[Precision::MxFp8]),
             deepseek_sym("routed_format_down_mxfp8_row_sm121", &[Precision::MxFp8]),
+            // A split chunk's gathered BF16 rows widened to f32 for the combine.
+            deepseek_sym(
+                "routed_format_widen_sm121",
+                &[Precision::Bf16, Precision::F32],
+            ),
         ],
         true,
     ),

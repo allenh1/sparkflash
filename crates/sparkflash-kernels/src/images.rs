@@ -567,6 +567,7 @@ impl Image {
                 "opt_draft_markov_seqs",
                 "opt_draft_markov_seqs_mma",
                 "opt_draft_norm_quant",
+                "opt_draft_norm_quant_normed",
                 "opt_draft_pick_prob",
                 "opt_draft_pick_seqs",
                 "opt_draft_taps",

@@ -108,6 +108,9 @@ struct DraftKernels {
     _modules: Vec<Module>,
     taps: Kernel,
     norm_quant: Kernel,
+    /// The same body also writing the normed rows, for the dense format route; None on the
+    /// released dense class.
+    norm_quant_normed: Option<Kernel>,
     attn: Kernel,
     logits: Kernel,
     head_quant: Kernel,
@@ -287,6 +290,19 @@ impl DraftState {
         };
         let taps = load("opt_draft_sm121.cubin", "opt_draft_taps")?;
         let norm_quant = load("opt_draft_sm121.cubin", "opt_draft_norm_quant")?;
+        // The stages' dense class: the released MXFP8 grid runs the B12x bodies, any other class
+        // the dense format route the plan's Mtp instance claims entries for. That route reads the
+        // normed rows unquantised, from the norm body's second entry in its own cubin, so the
+        // released cubin keeps its bytes.
+        let dense_class = crate::plan::description().plan().dense_stored_format();
+        let norm_quant_normed = if super::released_dense(dense_class) {
+            None
+        } else {
+            Some(load(
+                "opt_draft_dense_sm121.cubin",
+                "opt_draft_norm_quant_normed",
+            )?)
+        };
         let attn = load("opt_draft_sm121.cubin", "opt_draft_attn")?;
         let logits = load("opt_draft_sm121.cubin", "opt_draft_logits")?;
         let head_quant = load("opt_draft_sm121.cubin", "opt_draft_head_fp8")?;
@@ -370,6 +386,7 @@ impl DraftState {
             _modules: modules,
             taps,
             norm_quant,
+            norm_quant_normed,
             attn,
             logits,
             head_quant,
@@ -479,9 +496,6 @@ impl DraftState {
             });
         }
 
-        // The stages' dense class: the released MXFP8 grid runs the B12x bodies, any other class
-        // the dense format route the plan's Mtp instance claims entries for.
-        let dense_class = crate::plan::description().plan().dense_stored_format();
         let dense = if super::released_dense(dense_class) {
             None
         } else {
@@ -957,20 +971,21 @@ impl DeviceLayer<'_> {
                 ],
             )?;
         }
-        self.cuda.launch(
-            draft.kernels.norm_quant,
-            (n as u32, 1, 1),
-            (256, 1, 1),
-            &[
-                main_x,
-                draft.main_norm,
-                u64::from(self.eps.to_bits()),
-                main_codes,
-                main_scales,
-                // The dense format route reads the normed rows unquantised: written in place.
-                if draft.dense.is_some() { main_x } else { 0 },
-            ],
-        )?;
+        let norm_args = [
+            main_x,
+            draft.main_norm,
+            u64::from(self.eps.to_bits()),
+            main_codes,
+            main_scales,
+            // The dense format route reads the normed rows unquantised: written in place.
+            main_x,
+        ];
+        let (norm_kernel, norm_args) = match draft.kernels.norm_quant_normed {
+            Some(normed) => (normed, &norm_args[..]),
+            None => (draft.kernels.norm_quant, &norm_args[..5]),
+        };
+        self.cuda
+            .launch(norm_kernel, (n as u32, 1, 1), (256, 1, 1), norm_args)?;
         let (cos, sin) = self.draft_rope();
         let latent = self.head_width as usize;
         let segs = self.step_segs(p0, n);

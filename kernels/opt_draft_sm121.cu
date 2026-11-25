@@ -21,7 +21,8 @@
 //
 //   opt_draft_taps        the hc-mean of a row's stream into one tap slot (grid 20 x rows).
 //   opt_draft_norm_quant  RMSNorm of f32 rows by a bf16 weight, then the MX FP8 activation codes
-//                         (grid rows), and the normed rows as f32 when a buffer is given.
+//                         (grid rows). opt_draft_norm_quant_normed also writes the normed rows as
+//                         f32 for the dense format route, from its own cubin (opt_draft_dense).
 //   opt_draft_attn        the block attention: every row of the block attends the stage ring's last
 //                         min(d, 128) positions and all of the block's own rows (grid heads x rows;
 //                         with a row table, several sequences' blocks).
@@ -60,6 +61,7 @@
 // loads and a second shape can be built into a cubin of its own.
 #if     !defined(SPARK_INSTANCE_OPT_DRAFT_TAPS_HIDDEN) && \
     !defined(SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_HIDDEN) && \
+    !defined(SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_NORMED_HIDDEN) && \
     !defined(SPARK_INSTANCE_OPT_DRAFT_ATTN_HIDDEN) && \
     !defined(SPARK_INSTANCE_OPT_DRAFT_LOGITS_HIDDEN) && \
     !defined(SPARK_INSTANCE_OPT_DRAFT_HEAD_FP8_HIDDEN) && \
@@ -136,35 +138,38 @@ OD_TAPS_ENTRY(opt_draft_taps_4096h2c2t_sm121)
 
 // Row y: x_all + y * HIDDEN normalised by weight, rounded to bf16, then quantised in 32-value
 // blocks (UE8M0 scale, E4M3 codes) into codes_all + y * HIDDEN and scales_all + y * HIDDEN/32.
-#if defined(SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_HIDDEN)
-#define OD_HIDDEN SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_HIDDEN
-static_assert(OD_HIDDEN % 32u == 0u, "the quantiser blocks are 32 wide");
-extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
+// The one body serves both entries: the released opt_draft_norm_quant, and the dense format
+// route's opt_draft_norm_quant_normed, which also writes the unquantised (BF16-rounded) row to
+// normed_all. That row may be x itself: each value is read and written by the one thread, in
+// that order, so the normed entry's x is not __restrict__. The normed entry is compiled into
+// its own cubin, so the released cubin keeps its bytes.
+template <uint32_t HIDDEN, bool NORMED>
+__device__ __forceinline__ void od_norm_quant_rows(
     const float *x_all,
     const __nv_bfloat16 *__restrict__ weight,
     const float eps,
     uint8_t *__restrict__ codes_all,
     uint8_t *__restrict__ scales_all,
     float *normed_all) {
-    OPT_PDL_ENTRY();
+    static_assert(HIDDEN % 32u == 0u, "the quantiser blocks are 32 wide");
     __shared__ float s_part[8];
     const uint32_t y = blockIdx.x;
     const uint32_t t = threadIdx.x;
     const uint32_t lane = t & 31u;
     const uint32_t warp = t >> 5;
-    const float *x = x_all + (uint64_t)y * OD_HIDDEN;
+    const float *x = x_all + (uint64_t)y * HIDDEN;
     float sum = 0.0f;
-    for (uint32_t c = t; c < OD_HIDDEN; c += 256u) sum = fmaf(x[c], x[c], sum);
+    for (uint32_t c = t; c < HIDDEN; c += 256u) sum = fmaf(x[c], x[c], sum);
     sum = od_warp_sum(sum);
     if (lane == 0u) s_part[warp] = sum;
     __syncthreads();
     float total = 0.0f;
 #pragma unroll
     for (int w = 0; w < 8; ++w) total += s_part[w];
-    const float inv = rsqrtf(total / (float)OD_HIDDEN + eps);
-    uint8_t *codes = codes_all + (uint64_t)y * OD_HIDDEN;
-    uint8_t *scales = scales_all + (uint64_t)y * (OD_HIDDEN / 32u);
-    for (uint32_t qb = warp; qb < OD_HIDDEN / 32u; qb += 8u) {
+    const float inv = rsqrtf(total / (float)HIDDEN + eps);
+    uint8_t *codes = codes_all + (uint64_t)y * HIDDEN;
+    uint8_t *scales = scales_all + (uint64_t)y * (HIDDEN / 32u);
+    for (uint32_t qb = warp; qb < HIDDEN / 32u; qb += 8u) {
         const uint32_t c = qb * 32u + lane;
         const float v = __bfloat162float(__float2bfloat16_rn(x[c] * inv * __bfloat162float(weight[c])));
         float amax = fabsf(v);
@@ -174,12 +179,35 @@ extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
         const float inv_scale = 1.0f / spark_ue8m0_decode(scale);
         codes[c] = spark_fp8_e4m3_encode(v * inv_scale);
         if (lane == 0u) scales[qb] = scale;
-        // The unquantised (BF16-rounded) row too, for a reader on the dense format route. It may
-        // be x itself: each value is read and written by the one thread, in that order.
-        if (normed_all != nullptr) normed_all[(uint64_t)y * OD_HIDDEN + c] = v;
+        if constexpr (NORMED) normed_all[(uint64_t)y * HIDDEN + c] = v;
     }
 }
-#undef OD_HIDDEN
+
+#if defined(SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_HIDDEN)
+extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
+    const float *__restrict__ x_all,
+    const __nv_bfloat16 *__restrict__ weight,
+    const float eps,
+    uint8_t *__restrict__ codes_all,
+    uint8_t *__restrict__ scales_all) {
+    OPT_PDL_ENTRY();
+    od_norm_quant_rows<SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_HIDDEN, false>(
+        x_all, weight, eps, codes_all, scales_all, nullptr);
+}
+#endif
+
+#if defined(SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_NORMED_HIDDEN)
+extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant_normed(
+    const float *x_all,
+    const __nv_bfloat16 *__restrict__ weight,
+    const float eps,
+    uint8_t *__restrict__ codes_all,
+    uint8_t *__restrict__ scales_all,
+    float *normed_all) {
+    OPT_PDL_ENTRY();
+    od_norm_quant_rows<SPARK_INSTANCE_OPT_DRAFT_NORM_QUANT_NORMED_HIDDEN, true>(
+        x_all, weight, eps, codes_all, scales_all, normed_all);
+}
 #endif
 
 // ---------------------------------------------------------------------------------------------

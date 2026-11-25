@@ -433,6 +433,22 @@ latent = 512
 window = 128
 markov_rank = 256
 
+# The dense format route's norm entry: the released body, also writing the normed rows. Its own
+# cubin, so the released opt_draft_sm121 keeps its bytes.
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_norm_quant_normed"
+cubin = "opt_draft_dense_sm121"
+family = "drafter"
+format = "bf16"
+catalogue = "deepseek-mtp"
+hidden = 5120
+hc = 4
+taps = 3
+latent = 512
+window = 128
+markov_rank = 256
+
 [[instance]]
 source = "opt_draft_sm121.cu"
 entry = "opt_draft_attn"
@@ -3176,6 +3192,22 @@ markov_rank = 256
 source = "opt_draft_sm121.cu"
 entry = "opt_draft_norm_quant"
 cubin = "opt_draft_sm121_s2"
+family = "drafter"
+format = "bf16"
+catalogue = "deepseek-mtp"
+hidden = 4096
+hc = 4
+taps = 2
+latent = 512
+window = 128
+markov_rank = 256
+
+# The dense format route's norm entry: the released body, also writing the normed rows. Its own
+# cubin, so the released opt_draft_sm121_s2 keeps its bytes.
+[[instance]]
+source = "opt_draft_sm121.cu"
+entry = "opt_draft_norm_quant_normed"
+cubin = "opt_draft_dense_sm121_s2"
 family = "drafter"
 format = "bf16"
 catalogue = "deepseek-mtp"
