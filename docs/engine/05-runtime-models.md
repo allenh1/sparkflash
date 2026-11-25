@@ -292,7 +292,8 @@ pass, target.
    statements of 5.2: format is more than a decode step, and only the dense arm's parts plug in
    unchanged.
 4. **GLM runs on the base and its crate is deleted.** Its one bit change, checked as in 3.3. Its
-   vision tower runs as a stack here.
+   vision tower runs as a stack here. The work is broken down in
+   [08-glm-on-the-base.md](08-glm-on-the-base.md).
 5. **Qwen, Inkling, dense, Dory**, one at a time, each with its own bit change and A/B.
 6. **Serving and weights have no model dispatch.** 5.3 and 5.4. Can run beside 4 and 5.
 7. **Demonstration:** a model the owner picks, onboarded with zero Rust unless it has a new part
