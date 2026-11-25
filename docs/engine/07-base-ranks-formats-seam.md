@@ -808,6 +808,124 @@ a class and still requires one for an unscaled tensor. The released classes are 
 the unchanged branch. The nvfp4 rows come from an earlier build of the same day; the end-of-milestone
 battery reruns every variant on one build.
 
+### 3.2 The end battery (2026-11-25)
+
+The battery ran on one build of each side: the reference `da5f4d71` (the milestone's base,
+`onboard/sprint2`), the tip `80ea17e4`, and the fix `7a235451`. The fix restored the released
+drafter cubin and moved the format routes' loads into their own images' entries. The commits after
+it change tests, the layout plan's MXFP8 dense class, lint rewrites and cfg gates. Rule 1 was
+measured again at the final tip `8e40d743` (below).
+
+**Rule 1 (the released DeepSeek).** At `80ea17e4` the open manifest differed from production
+(record line 4, launch 5497): `opt_draft_sm121.cubin` had moved (`6b6fe79b` against production's
+`12743980`). The fix keeps the released drafter's norm entry in the released cubin, and puts the
+dense route's normed entry in `opt_draft_dense_sm121.cubin`. At `7a235451` the cubin is
+byte-identical to production. Production `prod6` against the fix, four alternating pairs:
+
+| measure | prod6 median | fix median | difference |
+|---|---|---|---|
+| prefill | 6,895.67 | 6,893.98 | -0.02% |
+| decode_1 | 100.58 | 100.14 | -0.4% |
+| decode_8 | 28.84 | 28.80 | -0.1% |
+
+All four pairs are identical on the manifest (93,386 records on ranks 0-2, 93,394 on rank 3),
+the launch trace (254,743 launches; 255,332 on rank 3) and the tick trace (253 decisions). The
+m2 baseline against the fix is identical on the same three.
+
+At the final tip `8e40d743` (binary `60bc8a2d`, 153 cubins, every cubin equal to the fix build's,
+`opt_draft_sm121.cubin` equal to production's), two more alternating pairs against `prod6` and
+one against the m2 baseline are identical on manifest, launch and tick on every rank. Speed:
+prod 100.54, 100.34 against the tip's 100.41, 100.68 (decode_1); prod 28.72, 28.73 against
+28.94, 28.78 (decode_8); prefill prod 6,448, 6,773 against 6,487, 7,118; draft accept 0.786 for
+all four. DeepSeek `269f7b99` was restored
+after the battery and answered `IDENTICAL to reference: 5 of 5`.
+
+**Second shape (item 2, `80ea17e4`, worlds 2 and 4).** PASS with exact ids: fp8-f32, fp8-bf16,
+bf16, packed-bf16, dense-mlp at world 2. PASS under the tie band `B = 0.2`: mx-fp8-row, joint
+(`nvfp4-qwen@0-3`, `mx-fp8-row@4-7`), gqa-dense, gdn-dense, gdn-decoder. The exact-id runs of
+released and both nvfp4 variants (worlds 2 and 4), and of dense-mlp at world 4, diverge. Released
+and nvfp4-qwen diverge at the same places (prompt 1 position 4, prompt 2 position 6). Every one of
+those partings is a host near-tie that goes to the host's second choice (gaps 0.005 to 0.036 at
+world 2 prompt 1 position 4, world 2 prompt 2 position 6, world 4 prompt 1 position 2, and dense-mlp
+world 4 prompt 2 position 0), and nothing parts outside the host's top eight. The nvfp4 variants'
+host reference is byte-identical to released's, so they part at the same places. Under the
+owner's decision of 2026-11-24 (§3.1) there is no exact-id bar at W > 1 on the synthetic
+fixture: worlds 2 and 4 are proved by opening, binding and serving it, and all four did. They
+pass that bar. The tie band stays where §3 puts it, on the regrouping and foreign-part variants;
+the script still refuses it for these four, and no rerun was needed.
+
+**Served gates (item 3), reference against tip, same cubins:**
+
+| arm | lanes (alone; four at once) | sampled lanes | interleave | turns |
+|---|---|---|---|---|
+| Qwen3.8 | ref 64.2; 80.9, 83.7. tip 64.8; 81.9, 83.8 | ref 40.2; 49.1, 47.1. tip 40.2; 48.1, 48.2 | FAIL on both (RDMA row length, below) | FAIL on both |
+| GLM-5.3-Flash | ref 27.2; 45.5, 46.0. tip 22.7; 37.0, 56.5 | ref 34.4; 40.5, 45.3. tip 32.9; 36.1, 46.7 | PASS on both | FAIL on both |
+| Inkling-2-Small | ref does not open (no reference) . tip 28.7; 29.1, 29.0 | tip 28.4; 28.0, 28.1 | PASS | FAIL |
+| Dory1.0-4B | ref 33.1; 110.9, 111.4. tip 33.3; 111.4, 110.9 | ref 28.2; 71.0, 70.9. tip 28.3; 70.6, 70.3 | d2 flaky on both (ref FAIL, PASS; tip FAIL, FAIL, PASS) | PASS on both |
+| dense TP4 | ref 252.2; 550.8, 554.5. tip 246.4; 541.0, 542.7 | ref 174.9; 278.2, 277.9. tip 173.0; 273.2, 272.4 | PASS | FAIL on both |
+
+GLM's tip number alone (22.7 against 27.2) was rerun as an A/B on the fix build, three
+alternating rounds on the same cubins:
+
+| GLM-5.3-Flash | lanes alone | four at once | sampled alone | sampled four at once |
+|---|---|---|---|---|
+| reference, round 1 | 44.4 | 56.0, 54.7 | 38.9 | 46.0, 46.9 |
+| fix, round 1 | 45.2 | 56.4, 56.3 | 38.7 | 46.6, 47.4 |
+| fix, round 2 | 44.9 | 55.5, 56.5 | 38.8 | 46.5, 47.0 |
+| fix, round 3 | 44.5 | 55.9, 55.9 | 38.6 | 46.2, 47.1 |
+
+GLM is level with the reference, and the battery's 22.7 and 27.2 were both noise. The reference's
+rounds 2 and 3 did not open: the lead ran out of memory at load, each time just after a fix-build
+GLM group had stopped. The restore of DeepSeek right after the last fix round hit the same
+out-of-memory and was relaunched once the memory was back. A group that loads straight after
+another one's stop can find the last one's memory still held.
+
+The turns failures are the same on both builds. Every turn reports `cached 0`. Rank 0 logs the
+reuse (`prefix reuse by text ... 25 to forward`), so the reuse happens and the count is not
+reported. The think-dropped turn also differs from cold on dense. The Qwen interleave failure is
+the same on both builds: `direct-RDMA exchange: protocol violation: rank N published a row length
+that is not the one this round sent`. A traced rerun (`SPARKFLASH_GROUP_TRACE`) shows every rank
+replaying the same frames in the same order up to the failing step (`[(3, 9664)]`, a lone
+member's round, exchange round 7489). Rank 1 alone sent a different row length. The frames carry
+each member's token only, and every rank decides the round's rows itself: whether a held answer
+covers the token, and the chain's depth from its own drafter confidence. So one rank's draft
+decision went its own way. The fold sums the ranks in rank order, so a reduced row is the same
+on every rank. The divergence therefore comes from a replicated computation or from state local
+to one rank.
+
+**The plan-manifest test against the real checkpoint** passes at the reference and fails at
+`7a235451` (the MXFP8 dense class planned as BF16, `layers.0.attn.wkv.weight` 5,242,880 bytes
+against 2,621,440) and at `18233320` (ten `routed_format_*` symbols the baseline does not list).
+`05f04f7f` fixes both: the layout splits an MXFP8 dense weight as its E4M3 codes, and the test
+leaves out the format routes' symbols. At `7f970c43` it passes, 2 of 2, against the real checkpoint.
+
+**Conformance (generated tests, lead, `80ea17e4`):** sparkflash-runtime 14, dense 9, Dory 9, GLM
+9, Qwen4-Exp 9, Inkling 9, all PASS.
+
+**Laptop (Qwen3.8 fixture and the workspace).** The Qwen3.8 fixture's `four` line moved against
+the 2026-11-21 record. The bisect names `70cff11` ("conformance: a decode run's every step is a
+token"), which touches `sparkflash-runtime/src/conformance.rs` only. Before it, the engine's run
+kept only each tick's last step; now it collects every step in order. The record moved because
+the harness now measures every step, not because lanes step differently. The tip is
+deterministic (two runs equal), and its record is the new reference. The tests that failed
+first on m3 and pass now: kernel_lookup (`7a235451`), sequence_fixture ×2, released_config,
+kernel_instances and the kernel baseline list (`0851f545`), layout_deepseek_v41 TP4 and
+deepseek_plan_manifest (`05f04f7f`: the layout's MXFP8 dense class was planned as BF16), and
+nine clippy lints in the forward crate (`c9e1605b`). The other failures are the same at the
+reference. They are listed in the pre-existing set: serve_http, cli plan_aware, the GLM and
+Qwen engine_builder tiny, Dory kv_plan, qwen35 BF16 refusal, and the laptop's CUDA 13.4
+baseline.
+
+Two more fixes came out of the laptop's standalone builds. The kernel baseline list now names the
+two format routes beside the NVFP4 prefill source as probed but not baselined, since their cubins
+are second-shape builds with no stem cubin to pin. `VERIFY_ROWS` and `released_dense` are now
+gated on the cuda build with the code that uses them, so the forward crate builds alone without
+the device (`7f970c43`, `8e40d743`). DeepSeek `269f7b99` was serving at the end, `5 of 5` identical
+to the reference.
+
+Left open, each its own task: turns prefix reuse reporting (`cached 0`) on every arm; the Qwen
+interleave RDMA row-length violation; Dory's interleave d2 flake; `SPARKFLASH_TICK_TRACE=1` treats the value as a file path.
+
 ## 4. The work
 
 ### R. Ranks
