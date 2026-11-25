@@ -1184,3 +1184,44 @@ fn a_non_replicated_qwen_mtp_is_not_a_tp4_global() {
         .find(|requirement| requirement.part == Part::Mtp)
         .expect("the GLM TP4 boot plan carries its replicated MTP stage");
 }
+
+/// A Gated DeltaNet block inside the DeepSeek stack runs whole on every rank (its tensors are
+/// replicated), so its scan is planned over every head at any world. A scan planned over the
+/// stack's per-rank share would launch on only that share of the heads.
+#[test]
+fn a_gated_deltanet_block_in_an_mla_stack_scans_every_head_at_any_world() {
+    let mut root: serde_json::Value = serde_json::from_str(DEEPSEEK).expect("DeepSeek config");
+    let text = root["text_config"].as_object_mut().expect("text_config");
+    let layers = text["num_hidden_layers"].as_u64().expect("layers") as usize;
+    let mut types = vec![serde_json::Value::from("compressed_attention"); layers];
+    types[0] = serde_json::Value::from(sparkflash_model::architecture::GDN_LAYER_TYPE);
+    text.insert("layer_types".into(), serde_json::Value::from(types));
+    for (key, value) in [
+        ("linear_num_key_heads", 4),
+        ("linear_num_value_heads", 8),
+        ("linear_key_head_dim", 64),
+        ("linear_value_head_dim", 32),
+        ("linear_conv_kernel_dim", 4),
+    ] {
+        text.insert(key.into(), serde_json::Value::from(value));
+    }
+    text["compress_ratios"][0] = serde_json::Value::from(0);
+    let architecture = Architecture::from_json(&root.to_string()).expect("one GDN block");
+    for world in [1, 2, 4] {
+        for rank in 0..world {
+            let plan =
+                EnginePlan::for_architecture(architecture.clone(), Target::Sm121, world, rank)
+                    .unwrap_or_else(|error| panic!("TP{world}/{rank}: {error}"));
+            let scan = plan
+                .requirements()
+                .find(|requirement| requirement.part == Part::GdnScan)
+                .expect("the GDN block's scan");
+            let geometry = scan.geometry;
+            assert_eq!(
+                (geometry.heads, geometry.head_offset, geometry.kv_heads, geometry.kv_head_offset),
+                (4, 0, 8, 0),
+                "TP{world}/{rank}"
+            );
+        }
+    }
+}

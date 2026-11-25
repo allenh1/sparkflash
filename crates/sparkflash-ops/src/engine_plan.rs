@@ -874,7 +874,7 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
         mla_stack && matches!(layer.attention.kind, AttentionKind::Gqa { .. })
     };
     let foreign_gdn = |layer: &sparkflash_model::architecture::Layer| {
-        mla_stack && matches!(layer.attention.kind, AttentionKind::Gdn(_))
+        whole_recurrent_block(architecture, layer)
     };
     let first = architecture
         .layers
@@ -1711,6 +1711,23 @@ fn global_requirements(
     Ok(globals)
 }
 
+/// Whether `layer` is a Gated DeltaNet block inside an MLA stack. The DeepSeek base runs such a
+/// block through the shared body, whole on every rank: its tensors are replicated
+/// (`sparkflash-device` `resident.rs`) and no sum follows it. So the block states its own facts
+/// (`gdn_*`), and its scan is planned over the block's whole heads at any world, never the
+/// stack's per-rank share.
+fn whole_recurrent_block(
+    architecture: &Architecture,
+    layer: &sparkflash_model::architecture::Layer,
+) -> bool {
+    use sparkflash_model::architecture::AttentionKind;
+    matches!(layer.attention.kind, AttentionKind::Gdn(_))
+        && architecture
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }))
+}
+
 fn geometry_for(
     part: Part,
     layer: &sparkflash_model::architecture::Layer,
@@ -1783,6 +1800,14 @@ fn geometry_for(
         },
         Part::GdnScan => match &attention.kind {
             AttentionKind::Gdn(gdn) => {
+                // A block the stack runs whole on every rank scans every head at any world.
+                let whole;
+                let tp = if whole_recurrent_block(architecture, layer) {
+                    whole = TpPlan::new(1, 0)?;
+                    &whole
+                } else {
+                    tp
+                };
                 let key = split(tp, gdn.key_heads, TpAxis::Heads, 1)?;
                 let value = split(tp, gdn.value_heads, TpAxis::KvHeads, 1)?;
                 geometry.heads = key.padded;
