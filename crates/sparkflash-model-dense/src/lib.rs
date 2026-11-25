@@ -100,8 +100,9 @@ use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
 use sparkflash_ops::roles::{
-    Bound, Combine, ExpertRows, ExpertShape, GqaAttention, GqaRows, GqaShape, Injection, Launcher,
-    ManifoldMixer, Norm, Router, RouterRows, RouterRule, SplitSwiGlu, TokenExperts,
+    Bound, Combine, ExpertRows, ExpertShape, GatedMlp, GqaAttention, GqaRows, GqaShape, Injection,
+    Launcher, ManifoldMixer, MlpRows, Norm, Router, RouterRows, RouterRule, SplitSwiGlu,
+    TokenExperts,
 };
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
@@ -584,6 +585,37 @@ struct Mlp {
     gate: Proj,
     up: Proj,
     down: Proj,
+}
+
+impl Mlp {
+    /// `output = down(silu(gate(normed)) * up(normed))` over the pass's rows on the shared
+    /// [GatedMlp] body, in the MLP scratch, the gate and up clamped first under `clamp`.
+    fn run(
+        &self,
+        cx: &PassCx<'_>,
+        clamp: Option<f32>,
+        output: Deviceptr,
+    ) -> Result<(), BackendError> {
+        let b = cx.b;
+        GatedMlp {
+            gate: &self.gate,
+            up: &self.up,
+            down: &self.down,
+            width: self.gate.rows(),
+        }
+        .run(
+            cx,
+            &cx.shared.kernels.swiglu,
+            &MlpRows {
+                input: b.normed,
+                gate: b.ffn_gate,
+                up: b.ffn_up,
+                output,
+            },
+            cx.rows,
+            clamp,
+        )
+    }
 }
 
 /// A layer's dense SwiGLU MLP on the device ([sparkflash_model::Part::DenseMlp]).
@@ -2865,33 +2897,11 @@ impl Shared {
             .run(self, plan.zero_centred(self.zero_centred), rows)
     }
 
-    /// `output = down(silu(gate(normed)) * up(normed))` over `rows`, in the MLP scratch, the gate
-    /// and up clamped first under the layer's `clamp`.
-    fn mlp(
-        &self,
-        mlp: &Mlp,
-        clamp: Option<f32>,
-        b: &Buffers,
-        output: Deviceptr,
-        rows: usize,
-        policy: Option<WidePolicy>,
-    ) -> Result<(), BackendError> {
-        self.project(&mlp.gate, b, b.normed.0, b.ffn_gate.0, rows, policy)?;
-        self.project(&mlp.up, b, b.normed.0, b.ffn_up.0, rows, policy)?;
-        let count = rows * mlp.gate.rows();
-        self.kernels
-            .swiglu
-            .run(self, (b.ffn_gate, b.ffn_up, b.ffn_up), count, clamp)?;
-        self.project(&mlp.down, b, b.ffn_up.0, output.0, rows, policy)
-    }
-
     /// A routed layer's MLP over `rows` into `b.projected`: the router on the row GEMV (so a
     /// prompt row picks the experts its decode row would), `q4e_route`, the shared plan's runs,
     /// the BF16 token passes, the shared expert and its gate, and the combine.
     fn routed(&self, part: &RoutedExperts, cx: &PassCx<'_>) -> Result<(), BackendError> {
-        let &PassCx {
-            b, rows, policy, ..
-        } = cx;
+        let &PassCx { b, rows, .. } = cx;
         let (
             Some(routed),
             RoutedExperts {
@@ -2956,7 +2966,7 @@ impl Shared {
             shape.clamp,
         )?;
         match shared {
-            Some(mlp) => self.mlp(mlp, shape.clamp, b, b.shared_out, rows, policy)?,
+            Some(mlp) => mlp.run(cx, shape.clamp, b.shared_out)?,
             // The combine always adds a shared row; a layer without one adds zeros.
             None => self
                 .cuda

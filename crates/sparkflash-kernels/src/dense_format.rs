@@ -177,7 +177,10 @@ impl DenseFormat {
         if rows.tokens == 0 || groups.count == 0 {
             return Ok(());
         }
-        if matrix.cols == 0 || matrix.cols % 32 != 0 || matrix.inner == 0 || matrix.inner % 32 != 0
+        if matrix.cols == 0
+            || !matrix.cols.is_multiple_of(32)
+            || matrix.inner == 0
+            || !matrix.inner.is_multiple_of(32)
         {
             return Err(format!(
                 "dense format: a {}x{} matrix is not cut by the tile's 32-wide steps",
@@ -192,13 +195,13 @@ impl DenseFormat {
         }
         // The tile reads an input row four values a load and stores two outputs at a time.
         let a_unit = 16 / io.input.bytes();
-        if rows.a_stride as u64 % a_unit != 0 || groups.a % a_unit != 0 {
+        if !(rows.a_stride as u64).is_multiple_of(a_unit) || !groups.a.is_multiple_of(a_unit) {
             return Err(format!(
                 "dense format: input stride {} / group stride {} is not a whole {a_unit}-value load",
                 rows.a_stride, groups.a
             ));
         }
-        if rows.out_stride % 2 != 0 || groups.out % 2 != 0 {
+        if !rows.out_stride.is_multiple_of(2) || !groups.out.is_multiple_of(2) {
             return Err(format!(
                 "dense format: output stride {} / group stride {} splits a stored pair",
                 rows.out_stride, groups.out

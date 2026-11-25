@@ -537,15 +537,7 @@ impl PartExec<Dense> for DenseMlp {
     }
 
     fn rows(&self, pass: &mut PassCx<'_>) -> Result<(), BackendError> {
-        let b = pass.b;
-        pass.shared.mlp(
-            &self.mlp,
-            self.clamp,
-            b,
-            b.projected,
-            pass.rows,
-            pass.policy,
-        )
+        self.mlp.run(pass, self.clamp, pass.b.projected)
     }
 
     // The token body is the prompt body: the pass's policy and its row count pick each

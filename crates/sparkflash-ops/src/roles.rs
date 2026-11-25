@@ -1099,6 +1099,58 @@ impl SplitSwiGlu {
     }
 }
 
+/// A gated MLP's three projections in the arm's own format, `width` the gate's (and the up's)
+/// rows as the rank holds them: `down(silu(gate(x)) * up(x))`.
+///
+/// The dense arm's MLPs and shared experts and DeepSeek's dense-MLP blocks run this one body: each
+/// arm brings its projection dispatch ([DeviceCx::project]) and its SwiGLU kernels.
+#[derive(Debug, Clone, Copy)]
+pub struct GatedMlp<'a, L: ?Sized> {
+    /// The gate projection.
+    pub gate: &'a L,
+    /// The up projection.
+    pub up: &'a L,
+    /// The down projection.
+    pub down: &'a L,
+    /// The gate's rows as the rank holds them.
+    pub width: usize,
+}
+
+/// Where a [GatedMlp] pass reads and writes: the normed rows, the gate's and the up's scratch
+/// (the up's also takes the SwiGLU's product) and the down's output.
+#[derive(Debug, Clone, Copy)]
+pub struct MlpRows {
+    /// The normed rows the gate and the up read.
+    pub input: Deviceptr,
+    /// The gate's scratch, `[rows][width]` f32.
+    pub gate: Deviceptr,
+    /// The up's scratch, `[rows][width]` f32, then the SwiGLU's product the down reads.
+    pub up: Deviceptr,
+    /// The down's output.
+    pub output: Deviceptr,
+}
+
+impl<L: ?Sized> GatedMlp<'_, L> {
+    /// The MLP over `rows` rows on `cx`, the gate and up clamped to `limit` first when given.
+    ///
+    /// # Errors
+    /// A projection the arm does not run, a limit without the clamped body, or the driver's
+    /// refusal.
+    pub fn run<C: DeviceCx<Linear = L>>(
+        &self,
+        cx: &C,
+        swiglu: &SplitSwiGlu,
+        at: &MlpRows,
+        rows: usize,
+        limit: Option<f32>,
+    ) -> Result<(), BackendError> {
+        cx.project(self.gate, at.input, at.gate, rows)?;
+        cx.project(self.up, at.input, at.up, rows)?;
+        swiglu.run(cx, (at.gate, at.up, at.up), rows * self.width, limit)?;
+        cx.project(self.down, at.up, at.output, rows)
+    }
+}
+
 /// SwiGLU over fused gate-up rows under a limit, `q4e_swiglu_limited` (GLM's MLPs and experts):
 /// each `[2 * width]` row's halves into a `[width]` row, a block a 256-float slice of a row.
 #[derive(Clone, Copy, Debug)]
