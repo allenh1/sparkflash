@@ -5,9 +5,12 @@ Status: work breakdown, 2026-11-25. It details milestone 4 of
 [milestone 3](07-base-ranks-formats-seam.md) the base runs at one, two and four ranks, takes FP8
 tiles, BF16, NVFP4 and row-scaled MXFP8, and runs a foreign part through the seam, all proved on
 synthetic checkpoints. This milestone moves the first real model onto it. GLM-5.3-Flash runs on
-DeepSeek's forward from its description. Every operation the base has runs on the base's body,
-and that move is GLM's one declared bit change. GLM's own parts come across as shared part kinds.
-The vision tower runs as a stack. Then `crates/sparkflash-model-glm5-next` is deleted.
+DeepSeek's forward from its description. The base supplies the engine: the tick, the lanes, the
+plan walk, the seam and the kernel templates. It does not supply GLM's arithmetic. Every GLM part
+computes what the producer's reference computes, at the precision GLM serves today, either as an
+instance of a shared body or as a shared part kind of its own. The move may reorder sums, and that
+is GLM's one declared bit change. The vision tower runs as a stack. Then
+`crates/sparkflash-model-glm5-next` is deleted.
 
 Line numbers are the tree's at `m3/finish` `bdeb563a`.
 
@@ -22,7 +25,9 @@ Line numbers are the tree's at `m3/finish` `bdeb563a`.
 | Attention | V3-form MLA: `q_a`/`q_b`, `kv_a_proj_with_mqa`, `kv_b`; NoPE (`qk_rope_head_dim` 0); 64 heads of 256; q-LoRA 1,536, kv-LoRA 512; plain `o_proj`; no sink, no window | V4 MLA: one 512-wide latent (`wkv`), 64 rotated dimensions, a sink per head, a 128-position window, CSA2 compression, grouped `wo_a`/`wo_b` |
 | Selection | indexer of 32 heads of 128 over raw positions, top-2,048, keys pooled by 4 with a gate and a position table, LayerNorm key norm with a bias, tail always selected | indexer over the compressed keys, top-512 |
 | Recurrence | KDA in 34 layers: 64 heads of 128, short convolution 4, per-channel forget gate | none in the release (GDN on the synthetic only) |
-| Residual | mHC, `hc_mult` 4, 20 Sinkhorn steps, the mix weight in BF16 | mHC, the same, the mix weight in F32 |
+| Residual | mHC, `hc_mult` 4, 20 Sinkhorn steps. The mix weight is BF16 and reads an unquantised input. The norm epsilon is `rms_norm_eps` (1e-5). The head folds the streams by their mean | mHC on the same schedule. The mix weight is F32 and reads a quantised input. The norm epsilon is 1e-20. The head folds with `hc_pre` and the last pre-mix |
+| Between operations | f32 streams, and f32 partials on the wire. Nothing is rounded to BF16 between operations. The producer's own dtype is BF16, so this is the finer evaluation of the same function | module outputs rounded to BF16 as its reference casts them, and a BF16 wire |
+| Input to an FP8 linear | `activation_scheme: dynamic`: E4M3 codes on 128-column tiles, the scale `amax / 448` in f32 with no power-of-two rounding. A BF16 linear reads its input unquantised | the release's W8A8 quantiser on the BF16 module output, with power-of-two scales |
 | FFN | 3 dense (12,288), then 42 MoE: 288 experts, top-8, one shared, sigmoid `noaux_tc` with a correction bias, scale 2.5, `swiglu_limit` 10 | MoE: 384 experts, top-6, `sqrtsoftplus` with two biases |
 | Stored format | FP8 E4M3 on 128 x 128 tiles with f32 inverse scales (dense, shared and routed); BF16 KDA, `kv_b`, indexer, embedding and head | MXFP8 dense on 32-tiles, MXFP4 experts |
 | Draft | one V3-form MTP layer (`enorm`, `hnorm`, `eh_proj`, a sparse-MLA and MoE block, shared head); DFlash 2 block drafter when the profile names one | the DSpark stage (`main_proj`, Markov head, confidence head) |
@@ -120,7 +125,14 @@ synthetic checkpoint, as in milestone 3.
   bias, are pooled by four with a gate and a position table, and always include the tail. The
   shared role still says `not_moved("pooled indexer", ...)` (`roles.rs:2048`, `:2062`).
 * **The mix.** The shared role still says `not_moved("manifold mix", ...)` for GLM's `mix_in`,
-  `mix_out` and head fold (`roles.rs:1901-1916`). The base's mHC reads an F32 mix weight.
+  `mix_out` and head fold (`roles.rs:1901-1916`). The base's mHC body is DeepSeek's instance:
+  an F32 mix weight on a quantised input, a norm epsilon of 1e-20, BF16-rounded streams
+  (`hc_pre_bf16`, `hc_post_bf16`), and a head fold through the last pre-mix. GLM's differs in each
+  (`sparkflash-weights/src/mhc.rs`, `forward.rs:1105`).
+* **Precision and recipe are DeepSeek's.** The base rounds module outputs to BF16, reduces on a
+  BF16 wire, and quantises an FP8 linear's input with DeepSeek's W8A8 recipe. None of the three
+  is an argument today. GLM serves f32 streams and an f32 wire, and quantises with its own
+  release's recipe (`quant::quantize_activation_fp8_tiles`).
 * **Fusion across foreign blocks.** S2 runs a foreign block by landing the residual and calling
   parts. Milestone 3 left the frame that carries the pending result across the boundary for
   later, as
@@ -152,20 +164,51 @@ synthetic checkpoint, as in milestone 3.
 
 1. **Nothing changes for the released DeepSeek** unless the change is declared under rule 3.
    Every step is held to `scripts/open-manifest-ab.py`: manifest, launch trace, tick trace, speed.
-2. **GLM takes one declared bit change.** It is the move of every shared operation onto the
-   base's body, together with the base's BF16 reduce wire. It is declared as numerics version 4
-   and checked as plan 05 section 3.3 and [NUMERICS.md](../NUMERICS.md) say:
-   * coherent output on the served gate's prompts, greedy and sampled;
-   * teacher-forced drift against the version-3 reference and the anchor, inside bars written
-     into this document before the move. The NUMERICS.md defaults are the ceiling: top-1 at least
-     0.90, mean absolute NLL delta at most 1.0 nat. Tighter bars come from what each reorder
-     costs, measured on the synthetic checkpoint first.
+2. **GLM computes what its producer computes. The move may only reorder sums.** The base is the
+   engine and the template library, not the arithmetic. What a GLM part computes is fixed by the
+   checkpoint's config, its tensor index and the producer reference the layout cites
+   (`modeling_glm5_next.py`), at the operand precisions version 3 serves.
+   * **The function is GLM's.** The pool rule and the always-selected tail, the router rule, the
+     head fold, the clamps and every epsilon come from the description. Where the base's body
+     computes a different function, GLM's is its own instance or its own part kind. A GLM fact is
+     never changed to fit a body.
+   * **No operand is narrowed.** Each pass keeps the precisions it has at version 3: f32 streams,
+     f32 partials on the wire, the release's activation recipe into FP8 linears, a BF16 linear's
+     input as that pass reads it today, the f32 Sinkhorn. Where the base's body fixes a narrower
+     one (BF16 module outputs, the BF16 wire, DeepSeek's activation quantiser), the precision
+     becomes an argument of the one template and GLM instantiates its own.
+   * **What may change is the order of f32 sums:** a different split-K, a tile, a fused launch,
+     the rank fold. That is the reassociation kind of [NUMERICS.md](../NUMERICS.md) section 2 and
+     the only kind plan 05 section 3.3 permits for a move. It is declared as numerics version 4
+     and checked by:
+     * coherent output on the served gate's prompts, greedy and sampled;
+     * teacher-forced drift against the version-3 reference, inside a reassociation bar written
+       here before the move. The ceiling is top-1 agreement of at least 99 %, a mean absolute NLL
+       delta of at most 0.01 nat, and no flipped position where the reference's top two were more
+       than 0.1 nat apart. A confident flip is a defect to find, not a number to accept. Tighter
+       numbers come from the synthetic checkpoint first;
+     * against the anchor, version 4 no further than version 3 by more than that bar.
+
+     For scale: Qwen's TP floor is one flip and a mean KL of 2.3e-04, and Qwen's tensor-core
+     decode moved 7.0e-04 nat at 99.39 %. GLM's E4M3 cache, a declared precision trade, is 96.8 %
+     and 4.3e-02 nat. GLM's version 2 measured 93.4 % and 0.137 nat, and its cause was never
+     separated (the body's order, or the prefill chunking). A reorder may cost more on GLM than
+     on Qwen: one ulp can move an activation code at a quantiser boundary. If the synthetic shows
+     that a pure reorder cannot meet the ceiling, the number and its cause go to the owner before
+     the move. The ceiling is not raised afterwards. The NUMERICS.md card bars (0.90, 1.0 nat)
+     would pass every number above, so they are not this move's bar.
+   * **A precision change is not part of this milestone.** A BF16 wire, BF16 streams (which the
+     producer's own dtype would allow) or a tensor-core body on rounded activations may each buy
+     speed. Each is measured and brought to the owner as its own opt-in profile, as NUMERICS.md
+     section 2 says. None rides in under version 4.
 
    A change that claims the same arithmetic stays bit-equal: the KDA body, the DFlash 2 drafter,
-   the converted file.
+   the converted file, and the f32 sum in rank order on the base's exchange.
 3. **The faster body is the one copy.** Before each operation moves, GLM's body and the base's
    are measured at every row count GLM serves (1, 4, 8, prompt chunks), and at the positions that
-   matter for attention (2k, 13k, 100k, 1M). The faster one is kept.
+   matter for attention (2k, 13k, 100k, 1M). The faster one is kept. Only bodies that compute
+   GLM's function at GLM's operand precisions compete (rule 2). A faster body that narrows an
+   operand or computes a neighbouring function is not a candidate.
    * If GLM's body is faster for an operation DeepSeek runs, it becomes the shared body. DeepSeek
      then takes its own one-time change under the same check: a numerics version, an A/B, and
      never slower.
@@ -196,14 +239,30 @@ synthetic checkpoint, as in milestone 3.
     world's own split (07 section 3), at worlds 1, 2 and 4, on the device arm.
   * Exact ids are the bar. The tie band applies only where 07 section 3 already admits it (a
     device kernel the host cannot reproduce), with the band measured or stated as there.
+* **The producer reference, for the text model.** The crate, its host reference and the base
+  all read the producer through one reading, ours. Two captures check that reading from outside
+  it (plan 05 section 5.6):
+  * On the `glm` synthetic variant, the producer's own classes (`transformers` at the revision
+    the layout cites, f32, CPU) run the tiny checkpoint, and the shared host reference matches
+    their logits inside a tolerance written before the run. This checks the wiring part by part:
+    the mix and its epsilons, the pool and the tail, the router, the head fold, the activation
+    recipe.
+  * On the real checkpoint, a producer-side stack that serves it (vLLM has, on these four nodes)
+    is teacher-forced on the anchor's tokens once, before the move. That distance is recorded
+    for the crate build. The base build must be no further than the crate build by more than
+    rule 2's bar. If no producer-side stack can be stood up, that is said here, and the synthetic
+    capture stands alone.
 * **The crate against the base on the same checkpoint.** On the synthetic checkpoint the crate's
   device arm and the base's are run teacher-forced. This is the drift check's small form: it
-  measures each operation's reorder in isolation, and the version-4 bars are set from it.
+  measures each operation's reorder in isolation, and the version-4 bars are set from it. A part
+  whose drift is larger than a reorder of its sums can explain is a changed function or a
+  narrowed operand, and it is fixed, not declared.
 * **The suite.** `conformance!(DeepSeekBase)` passes on the `glm` variant: whole = chunked =
   token with a long prompt, continued = cold through a KDA save point, rewound = cold, drafted =
   plain with MTP and with DFlash 2, alone = four, and TP 1 = 2 = 4.
 * **The real checkpoint, four nodes.**
-  * The version-4 numerics capture against the reference and the anchor, inside the stated bars.
+  * The version-4 numerics capture against the version-3 reference and the anchor, inside rule
+    2's bars.
   * The served gate on the base build: lanes, sampled lanes, interleave and turns. Turns fail
     today on every arm. The bar here is no new failure, and the same failure as the crate build.
   * Rule 4's speed table, the base build against the crate build on alternated fresh boots.
@@ -227,7 +286,10 @@ synthetic checkpoint, as in milestone 3.
   compression and candidate pool for CSA2, `dspark_*` for the DSpark stage, Engram's for Engram.
   GLM's facts come from the layout: the MLA form (absorbed V3 or V4 latent), `kv_b`'s widths,
   the KDA geometry, the indexer's pool, gate, position table, key norm and tail rule, the mix
-  weight's format, and the router rule.
+  weight's format and its norm epsilon, the head fold, the router rule and its accumulator
+  (`moe_router_dtype`), and the activation recipe (`quantization_config.activation_scheme`).
+  The stream and wire precisions are the numerics profile's, not the layout's: they are how a
+  model is served, and version 3's are f32.
 * **V2. The split is data.** The layout states each recurrent block's split. GLM's KDA splits by
   heads, and the `gdn-*` synthetic variants state whole. `whole_recurrent_block` is deleted, and
   the test that holds every head on every rank reads the stated split.
@@ -251,15 +313,22 @@ synthetic checkpoint, as in milestone 3.
     winning body. BF16 was slower in serve on GLM's body for reasons outside its own code (the
     model doc, *Context*).
 * **A2. The latent cache.** The E4M3 latent with four f32 block scales a position is a
-  positional lane region, beside the base's own cache form, chosen by the layout's cache fact.
-  The f32 latent stays the parity form for tests. Prefix adoption, the slide and the 1M window
-  work on it as on the base's.
+  positional lane region, beside the base's own cache form. It is a serving trade the release
+  does not make (96.8 % top-1 against the anchor, [v1](../numerics/glm53/v1-e4m3-window.md)), so
+  it is chosen by the profile, not stated by the layout as a model fact. It stays the default,
+  as served today. The f32 latent stays selectable through the shared switch: it is the anchor's
+  arithmetic and the parity form for tests. Prefix adoption, the slide and the 1M window work on
+  it as on the base's.
 * **A3. The pooled indexer as a part kind.** GLM's keys (`wk` from the hidden, LayerNorm with a
   bias), the gated pool of four with its position table, the always-selected tail, top-2,048,
   and the MTP's shared selection (`index_share_for_mtp_iteration`).
-  * Decided here, with the arithmetic compared against the producer reference: it is either the
-    base's CSA2 compression and indexer at new instance arguments, or the shared pool and score
-    bodies the Qwen attention already uses.
+  * The arithmetic is the producer's, as the crate runs it today on the shared pool and score
+    bodies (`q4e_indexer_pool_body`, `q4e_indexer_score_body`): a pooled key is a per-channel
+    softmax over the pool's four tokens of gate plus position, the pool covers the index keys
+    only, and attention still reads the raw positions of the chosen pools. Those bodies are the
+    part kind. The base's CSA2 compression pools the latents themselves and is a different
+    operation. A CSA2 body is reused for the pooling step only if it is shown to be that same
+    function on the same operands, bit for bit. GLM's selection is never reshaped to CSA2's.
   * The `not_moved("pooled indexer")` stubs go.
 * **A4. The bulk prefill attention.** `glm_prefill_mla_attend` and the per-head MMA against the
   base's prompt attention, under the same rule.
@@ -293,11 +362,19 @@ synthetic checkpoint, as in milestone 3.
 
 ### M. The residual, the FFN, the head and the sum
 
-* **M1. mHC.** The base's manifold body runs GLM's mix. The BF16 weight widens exactly to f32 at
-  load, or the format becomes the body's argument if that is faster. The head fold is the
-  base's. The `not_moved("manifold mix")` stubs go.
-* **M2. Dense MLP and shared expert.** F3's FP8-tile bodies at GLM's widths. For decode, GLM's
-  tiled row GEMV (version 3) is measured against the base's token path, and the faster is kept.
+* **M1. mHC.** One manifold template, with what differs between the two models as arguments:
+  the mix weight's format, whether its input is quantised, the norm epsilon, the stream
+  precision, and the head fold. GLM's instance is today's arithmetic (`ManifoldMixer`,
+  `q4e_mhc_in`, `q4e_mhc_post`): a BF16 weight widened exactly to f32 on an unquantised input,
+  `rms_norm_eps`, f32 streams, and the mean of the streams at the head. DeepSeek's instance is
+  unchanged. The base's fold (`hc_pre` with the last pre-mix) and its BF16 rounding are not
+  applied to GLM. The `not_moved("manifold mix")` stubs go.
+* **M2. Dense MLP and shared expert.** F3's FP8-tile bodies at GLM's widths, with GLM's
+  activation recipe: the input is quantised on 128-column tiles at `amax / 448` in f32, as the
+  release's dynamic scheme does. The base's own activation quantiser is not applied. For decode,
+  GLM's tiled row GEMV (version 3) is measured against a base token body on the same operands,
+  and the faster is kept. A body that does not read the release's quantised activation is not a
+  candidate (rule 3).
 * **M3. The router.** The base's router takes the rule: sigmoid `noaux_tc` with the correction
   bias, renormalised, scaled by 2.5. The 288-expert, top-8 instance.
 * **M4. Routed experts.** The FP8-tile routed route (`routed_format_sm121`) at GLM's widths. TP
@@ -305,9 +382,11 @@ synthetic checkpoint, as in milestone 3.
 * **M5. Embedding and head.** GLM's embedding is whole on every rank and the base's is split by
   rows. The split is the layout's statement, so GLM's file states it. The head is BF16 rows at a
   vocabulary of 154,880 on the base's head and its reduction, with the argmax slices.
-* **M6. The sum.** The base's BF16 wire and RDMA exchange replace GLM's f32 wire and its
-  one-shot/two-shot switch. This is part of version 4's declared change, measured on the
-  synthetic checkpoint first.
+* **M6. The sum.** The base's reduce takes the wire format as an argument (`ops::tp::Wire`
+  already names `F32` and `Bf16`). GLM stays on f32, summed in rank order, on the base's RDMA
+  exchange, which replaces its one-shot/two-shot switch. That is the same arithmetic and stays
+  bit-equal. A BF16 wire rounds each rank's partial before the sum. It is a precision change,
+  outside this milestone (rule 2).
 * Done when the `glm` variant's dense, MoE and head parts agree at worlds 1, 2 and 4, and rule 1
   holds for the shared bodies.
 
@@ -405,5 +484,7 @@ As in milestones 2 and 3:
 * A step that cannot be made free for the released DeepSeek is reverted, measured and brought to
   the owner.
 * The same holds for a GLM row that rule 4 cannot recover.
+* A step that can be made only by changing what GLM computes, or by narrowing an operand, is not
+  taken. The measurement is brought to the owner as a precision change of its own.
 * Aborting a step is acceptable. A slower DeepSeek is not, and neither is a slower GLM shipped
   under the name of the move.
