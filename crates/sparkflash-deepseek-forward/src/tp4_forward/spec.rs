@@ -1726,13 +1726,23 @@ impl DeviceLayer<'_> {
                             recurrent.geometry.conv_width(),
                             recurrent.geometry.value_width(),
                         );
-                        let g = recurrent.rows;
-                        buffers.extend([
-                            ("gdn_raw", g.raw.0, n * conv * 4),
-                            ("gdn_z", g.z.0, n * value * 4),
-                            ("gdn_mixed", g.mixed.0, n * conv * 4),
-                            ("gdn_gated", g.attended.0, n * value * 4),
-                        ]);
+                        match &recurrent.body {
+                            super::rows::RecurrentBody::Gdn { rows: g, .. } => {
+                                buffers.extend([
+                                    ("gdn_raw", g.raw.0, n * conv * 4),
+                                    ("gdn_z", g.z.0, n * value * 4),
+                                    ("gdn_mixed", g.mixed.0, n * conv * 4),
+                                    ("gdn_gated", g.attended.0, n * value * 4),
+                                ]);
+                            }
+                            super::rows::RecurrentBody::Kda { rows: g, .. } => {
+                                buffers.extend([
+                                    ("kda_raw", g.raw.0, n * conv * 4),
+                                    ("kda_mixed", g.mixed.0, n * conv * 4),
+                                    ("kda_attended", g.attended.0, n * value * 4),
+                                ]);
+                            }
+                        }
                     }
                     self.rows_dump(dir, &name, &buffers, p0, n)?;
                 }

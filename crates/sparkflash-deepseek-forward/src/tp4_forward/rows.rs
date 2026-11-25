@@ -447,6 +447,7 @@ pub(super) struct RecurrentRows {
 /// A recurrent stack's chunk kernels and f32 rows: a Gated DeltaNet's, or Kimi Delta
 /// Attention's with the scratch its three convs join in (`[3 width][taps]` BF16, the order the
 /// conv reads them).
+#[derive(Debug, Clone)]
 pub(super) enum RecurrentBody {
     Gdn {
         chunk: sparkflash_ops::gdn::GdnChunk,
