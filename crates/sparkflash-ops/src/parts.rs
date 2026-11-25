@@ -1533,7 +1533,7 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::Moe,
         Image::Deepseek,
-        &[
+        with_dense_format![
             deepseek_sym("b12x_mxfp4_moe_stored_sm121", &[Precision::MxFp4]),
             deepseek_sym("opt_moe_gate_up_sm121", &[Precision::MxFp4]),
             deepseek_sym("opt_moe_gate_up_k3_sm121", &[Precision::MxFp4]),
