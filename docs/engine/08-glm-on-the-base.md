@@ -1,6 +1,6 @@
 # Milestone 4: GLM runs on the base, and its crate is deleted
 
-Status: work breakdown, 2026-11-25. It details milestone 4 of
+Status: in progress, 2026-11-25 (`bc37795c`); see *Progress* below. It details milestone 4 of
 [05-runtime-models.md](05-runtime-models.md) (section 5.2, "Then the models move"). After
 [milestone 3](07-base-ranks-formats-seam.md) the base runs at one, two and four ranks, takes FP8
 tiles, BF16, NVFP4 and row-scaled MXFP8, and runs a foreign part through the seam, all proved on
@@ -13,6 +13,43 @@ puts each value in the producer's type, and that is GLM's one declared bit chang
 tower runs as a stack. Then `crates/sparkflash-model-glm5-next` is deleted.
 
 Line numbers are the tree's at `m3/finish` `bdeb563a`.
+
+## Progress (2026-11-25, `bc37795c`)
+
+GLM's text stack runs on the base from its description, on the device rows path, and the
+`glm-wiring` synthetic passes at worlds 1, 2 and 4 on four nodes (section 3: seam-gated, ids
+reported, a change from the approved split that awaits the owner's review). Nothing is served
+from the base yet, and the crate is not deleted. "Landed" below means it is in the tree and runs
+under that proof. A line's own measurements, where it asks for them, are not yet taken unless
+they are named.
+
+| Line | State | Where |
+|---|---|---|
+| V1 value table by part | landed | `43fa53db`, `36323243` |
+| V2 the split is data | landed | `83f22afe`, `f9782ba0` (resident plan) |
+| V3 facts leave the crate | in part: the base reads the description; the crate's own parse and `include_str!`s remain until S5 | `43fa53db` |
+| A1 absorbed MLA | landed on the stated walk; the measurement against GLM's four-launch split is not taken | `cca81db7`, `63e6c220`, `84a98d8d` |
+| A2 latent cache | in part: the stated lane region holds the E4M3 latent and block scales; the profile switch, prefix adoption, slide and 1M window are not proved | `stated.rs` |
+| A3 pooled indexer | landed | `cca81db7`, `63e6c220` |
+| A4 bulk prefill attention | not started | |
+| K1 one KDA body | landed | `03209028`, `83f22afe` |
+| K2 the split | landed | `83f22afe`, `f9782ba0` |
+| K3-K5 state, chunks, fusion | in part: prompts walk in 64-row chunks on the stated walk; kept-state turns and fusion across the boundary are not proved | `dbb94c78`, `63ed499c` |
+| M1 mHC | landed | `cca81db7`, `9e079a17` |
+| M2-M4 dense, router, routed experts | landed on the stated FFN | `87190912`, `070d13b5`, `1cabde0b` |
+| M5 embedding and head | landed on the stated walk | `stated.rs` |
+| M6 the sum on the BF16 wire | landed; the RDMA exchange is not proved for GLM | `fb0ee21d` |
+| D1-D3 drafting | not started | |
+| I1-I3 vision tower | not started | |
+| W1 converted ranks | not started (it needs the stated splits in `convert_rank_with_source`) | |
+| W2 synthetic writer | landed for the `glm` and `glm-wiring` variants | `45ec0a05`, `b716c1a3` |
+| S1-S5 serving, codec, kernels, numerics v4, deletion | not started | |
+| Proof: synthetic, worlds 1, 2, 4 | `glm-wiring` PASS (seams), `glm` reported | `69ce489d`, section 3 |
+| Proof: producer capture, real checkpoint, suite, tower, released DeepSeek | not started | |
+
+Open fault: a forward refused at world above 1 is written only to the rank's evidence file
+(`tp4-token-r<rank>.json`), because the refusal is reported after the TCP collective walk, which
+waits on peers. The rank logs show a group that never becomes ready.
 
 ## 1. What the tree says today
 
