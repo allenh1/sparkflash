@@ -12225,7 +12225,10 @@ impl<'a> DeviceLayer<'a> {
         // reference seam hands it `min(position + 1, window_size)` rows. A config whose window is
         // not the pinned 128 is refused here, at open, rather than producing a launch whose window
         // the kernel would truncate silently.
-        if config.window_size != sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW {
+        // A stated stack runs no CSA2 attention (its absorbed MLA has no window).
+        if !crate::plan::stated_stack()
+            && config.window_size != sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW
+        {
             return Err(format!(
                 "layer device: the config's window is {} rows but the pinned CSA2 sequence entry attends the released {}",
                 config.window_size,
