@@ -144,7 +144,23 @@ which is the same single sum. World W is compared against the host arm's own out
 to that file exactly. Drift between a world's reference and the global one is printed with the
 prompts that differ and the top-2 logprob gap at the first divergence rather than tolerated,
 because a difference that moves a token is the failure the rule exists to attribute; token ids
-are never compared with a tolerance.
+are never compared with a tolerance, with one stated exception below.
+
+**The one exception: a measured tie band for the regrouping variants (owner-approved
+2026-11-24).** The two variants whose expert sum is not regrouping-invariant, `mx-fp8-row` and
+`joint-nvfp4-mxfp8-row` (the script's `REGROUPING_VARIANT`), may run with `--tie-band B`. Every
+other variant is refused the flag and stays on exact ids. Under the band every position is still
+compared in the reference's context. At a divergence the device's id must be one of the reference's
+eight recorded alternatives (`.tops.json`), at most `B` nats under the reference's choice; the
+device is then re-run from the reference's prefix through that position, and the next stretch is
+held to exact ids again. An id outside the alternatives, or a gap above `B`, fails. `B` is measured,
+not chosen. On the synthetic fixture with row-scaled E4M3 experts, regrouping the host arm's own sum
+(its world-2 and world-4 splits against world 1, 186 and 185 shared alternatives) moves a logprob by at
+most 0.0986 nats. Two orders can each drift that far in opposite directions, so `B = 0.2`. The limit
+is stated plainly: this fixture's logits are near-uniform (median top-1 to top-2 gap 0.089 nats over
+its 24 positions), so on it the band admits most alternatives and the check is mainly that the
+device's choice is a recorded alternative and that every stretch between ties is exact. A checkpoint
+with real margins makes the same rule much tighter.
 
 ### 3.1 Where the proof stands (review of `1ef7a6ca`, 2026-11-23)
 
@@ -756,6 +772,29 @@ order the sweep's refusals fall:
    and BF16 classes, and the layout's dense-class dtypes for the MLA tensors.
 4. **The catalogue claims** for each symbol, so the open resolves them.
 
+**The sweep after the served routes (2026-11-24, world 1, one GPU).** Every non-released
+variant now runs on the device arm at world 1 and agrees with `host-reference-w1.json`. Seven
+of them agree on exact ids. The two regrouping variants agree under the measured tie band
+(section 3, `B = 0.2`).
+
+| variant | build | result |
+|---|---|---|
+| nvfp4-qwen, nvfp4-inkling | sweep `e` | PASS, exact ids |
+| bf16, packed-bf16 | `0a9c8214` (binary `57f397d6`) | PASS, exact ids |
+| dense-mlp (a dense-FFN prefix in the dense class) | `0a9c8214` (binary `57f397d6`) | PASS, exact ids |
+| fp8-f32, fp8-bf16 | `8d8bf22` (binary `42759ebb`) | PASS, exact ids |
+| mx-fp8-row | `8d8bf22` (binary `42759ebb`) | PASS at 2 ties: prompt 0 position 4 (0.023 nats), prompt 2 position 1 (0.165) |
+| joint (`nvfp4-qwen@0-3`, `mx-fp8-row@4-7`) | `8d8bf22` (binary `42759ebb`) | PASS at 4 ties: prompt 0 positions 1 and 3 (0.061, 0.018), prompt 2 positions 2 and 7 (0.019, 0.023) |
+
+Before `e5a6755e` both FP8-tile variants failed with layer 0's attention output entirely zero.
+Embedding and normed rows matched the host (max difference 1.06e-5). The attention bind gave every
+non-B12x stored tensor its own weight pointer in the scale slot, so the dense format route read a
+128-wide FP8 class's codes as its scales. A scaled stored class now binds its `{stem}.scale` plane,
+and is refused by name when that plane is absent. `check_operand_bind` requires two buffers for such
+a class and still requires one for an unscaled tensor. The released classes are all B12x and take
+the unchanged branch. The nvfp4 rows come from an earlier build of the same day; the end-of-milestone
+battery reruns every variant on one build.
+
 ## 4. The work
 
 ### R. Ranks
@@ -1181,7 +1220,7 @@ is pending the lead's window with:
 
 ```
 python3 scripts/second-shape.py run \
-  --released /home/allenh1/sparkflash/.agents/worktrees/f4-mxfp8/reference \
+  --released <released> \
   --out /tmp/f4-mxfp8 --device --released-cubins <cubins> \
   --binary target/release/sparkflash \
   --writer target/release/examples/write-synthetic-checkpoint \
