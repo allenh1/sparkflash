@@ -547,9 +547,10 @@ fn the_ops_crate_is_a_workspace_member() {
 /// sharding in `tp4_host.rs`) has to live beside the shard it rearranges. That read is part of the
 /// debt the DeepSeek fold owes: it moves into `sparkflash-model::packed_bf16` with the rest of the
 /// packed form, and the gate falls back to the fold it was lowered by.
-/// Milestone 3 (2026-11-25) left 35,943 measured, with the DeepSeek base's conformance fixture
-/// beside the serving chain it boots (`serve/device.rs`), so the gate is one above it.
-const CLI_SOURCE_LINE_LIMIT: usize = 35_944;
+/// Milestone 3 (2026-11-25) left 35,939 measured, formatted, with the DeepSeek base's conformance
+/// fixture beside the serving chain it boots (`serve/device.rs`) reading the architecture's one
+/// first-MoE lookup, so the gate is one above it.
+const CLI_SOURCE_LINE_LIMIT: usize = 35_940;
 
 #[test]
 fn the_deepseek_forward_is_out_of_the_cli_and_the_cli_is_below_34k_lines() {

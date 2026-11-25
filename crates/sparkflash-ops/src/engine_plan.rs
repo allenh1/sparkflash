@@ -873,20 +873,13 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
     let foreign_gqa = |layer: &sparkflash_model::architecture::Layer| {
         mla_stack && matches!(layer.attention.kind, AttentionKind::Gqa { .. })
     };
-    let foreign_gdn = |layer: &sparkflash_model::architecture::Layer| {
-        whole_recurrent_block(architecture, layer)
-    };
+    let foreign_gdn =
+        |layer: &sparkflash_model::architecture::Layer| whole_recurrent_block(architecture, layer);
     let first = architecture
         .layers
         .iter()
         .find(|layer| !foreign_gqa(layer) && !foreign_gdn(layer));
-    let first_moe = architecture
-        .layers
-        .iter()
-        .find_map(|layer| match &layer.ffn {
-            sparkflash_model::architecture::Ffn::Moe(moe) => Some(moe),
-            sparkflash_model::architecture::Ffn::Dense(_) => None,
-        });
+    let first_moe = architecture.first_moe();
     let first_hyper = architecture
         .layers
         .iter()

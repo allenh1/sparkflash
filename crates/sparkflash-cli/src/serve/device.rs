@@ -1964,11 +1964,11 @@ mod base_conformance {
     use super::{DeviceServeOptions, Tp4ServeOptions, chain_args, epoch_env};
     use sparkflash_deepseek_forward::base_walk::{BaseWalk, CODE, PROMPT_ROWS, layout};
     use sparkflash_deepseek_forward::device_link::{WalkRequest, install_walk, take_walk};
-    use sparkflash_model::architecture::Ffn;
+    use sparkflash_deepseek_forward::tp4_forward::{VERIFY_ROWS, step_wall};
+    use sparkflash_model::TpPlan;
     use sparkflash_model::backend::BackendError;
     use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
     use sparkflash_runtime::testing::ArmProfile;
-    use sparkflash_deepseek_forward::tp4_forward::{VERIFY_ROWS, step_wall};
     use sparkflash_runtime::{ArmFixture, DraftBudget, Fixture, FormatRule, Limits};
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -2015,16 +2015,17 @@ mod base_conformance {
             max_model_len: CONTEXT,
             evidence_dir: evidence,
         };
-        let local = std::net::IpAddr::from([127, 0, 0, 1]);
         let tp4 = Tp4ServeOptions {
             rank: 0,
             world_size: 1,
-            peers: vec![local],
+            peers: vec![std::net::Ipv4Addr::LOCALHOST.into()],
             base_port: 29_651,
             control_port: 29_751,
             device: None,
         };
-        device.boot_check(Some(&checkpoint), 1).map_err(fixture_error)?;
+        device
+            .boot_check(Some(&checkpoint), 1)
+            .map_err(fixture_error)?;
         let args = chain_args(&checkpoint, tokenizer, &tp4, &device).map_err(fixture_error)?;
         let cubins = cubins.display().to_string();
         // SAFETY: the checks run one at a time (`--test-threads=1`) and the epoch's thread has
@@ -2076,16 +2077,11 @@ mod base_conformance {
             let architecture = sparkflash_model::Architecture::from_checkpoint_dir(&checkpoint)
                 .map_err(fixture_error)?;
             let moe = architecture
-                .layers
-                .iter()
-                .find_map(|layer| match &layer.ffn {
-                    Ffn::Moe(moe) => Some(moe),
-                    Ffn::Dense(_) => None,
-                })
+                .first_moe()
                 .ok_or_else(|| fixture_error("the checkpoint has no routed-expert layer"))?;
-            let tp = sparkflash_model::TpPlan::new(1, 0).map_err(|error| fixture_error(error.detail))?;
-            let tensors = ArchitectureTensorPlan::served_and_mtp(&architecture, tp)
-                .map_err(fixture_error)?;
+            let tp = TpPlan::new(1, 0).map_err(|error| fixture_error(error.detail))?;
+            let tensors =
+                ArchitectureTensorPlan::served_and_mtp(&architecture, tp).map_err(fixture_error)?;
             let (bytes, floor) = sparkflash_runtime::token_bytes(
                 tensors.rank_bytes(),
                 tensors.role_bytes(Role::Experts),

@@ -1792,10 +1792,7 @@ impl Builder {
                 "the Qwen MTP stage needs a full- or sparse-attention layer".to_owned(),
             ));
         };
-        let Some(moe) = arch.layers.iter().find_map(|layer| match &layer.ffn {
-            Ffn::Moe(moe) => Some(moe),
-            Ffn::Dense(_) => None,
-        }) else {
+        let Some(moe) = arch.first_moe() else {
             return Err(PlanError::Invalid(
                 "the Qwen MTP stage needs a MoE layer".to_owned(),
             ));
@@ -2505,10 +2502,7 @@ impl Builder {
             Role::Mtp,
             Role::Mtp,
         )?;
-        let Some(moe) = arch.layers.iter().find_map(|layer| match &layer.ffn {
-            Ffn::Moe(moe) => Some(moe),
-            Ffn::Dense(_) => None,
-        }) else {
+        let Some(moe) = arch.first_moe() else {
             return Err(PlanError::Invalid(
                 "the GLM MTP stage needs a MoE layer".to_owned(),
             ));

@@ -926,6 +926,15 @@ pub struct Vision {
 }
 
 impl Architecture {
+    /// The first layer's routed experts, in forward order; None for a model with no MoE layer.
+    #[must_use]
+    pub fn first_moe(&self) -> Option<&Moe> {
+        self.layers.iter().find_map(|layer| match &layer.ffn {
+            Ffn::Moe(moe) => Some(moe),
+            Ffn::Dense(_) => None,
+        })
+    }
+
     /// Parse a released Hugging Face `config.json`.
     ///
     /// # Errors
