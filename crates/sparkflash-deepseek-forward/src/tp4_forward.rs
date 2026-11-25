@@ -18202,7 +18202,14 @@ fn run_forward_loop(
     // are read, decoded and hashed ONCE here and borrowed by every position. The seam arithmetic
     // and the recorded predictor/base/norm digests are the same bytes the per-call read path
     // produced; only the per-layer mhc_entry.arena_reads drops from 4 to 0.
-    let layer_seams = build_layer_seam_cache(&cuda, arena, request, n_layers)?;
+    // The release seam's host-decoded mix tensors; a stated stack's mix runs on the device from
+    // its own types (the stated walk), so it decodes none and a host seam that reached it refuses.
+    let seam_layers = if crate::plan::stated_stack() {
+        0
+    } else {
+        n_layers
+    };
+    let layer_seams = build_layer_seam_cache(&cuda, arena, request, seam_layers)?;
     setup_trace("layer seams");
     // M2 Phase 2A: the tail stage and the final-norm weight are position-independent, so they are
     // opened/read ONCE at run scope and borrowed by every head position. Bytes are identical (same
