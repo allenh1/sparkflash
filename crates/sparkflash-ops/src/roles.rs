@@ -218,6 +218,10 @@ pub struct SegmentRows<'a> {
     /// The part's regions in this sequence's lane, in the order the part declares them. A
     /// positional region is backed up to `position + rows` rows.
     pub regions: &'a [Deviceptr],
+    /// A verify pass's snapshot slabs, one for each of the part's recurrent regions in their
+    /// order: slab r holds `rows` copies of its region a region's bytes apart, copy t the region
+    /// as it stood after the segment's row t. Empty when the pass keeps none.
+    pub snapshots: &'a [Deviceptr],
 }
 
 /// The launch half of a body's host: every launch on the host's stream, in the order the body
@@ -1560,6 +1564,164 @@ impl<L: ?Sized> GqaLayer<'_, L> {
             )?;
         }
         cx.project(self.o, rows.attended, output, count)
+    }
+}
+
+/// The f32 rows a Gated DeltaNet layer works in, a row a token, at the rank's share of its heads.
+#[derive(Clone, Copy, Debug)]
+pub struct GdnRows {
+    /// The fused q/k/v projection, `[rows][conv_width]`.
+    pub raw: Deviceptr,
+    /// The output gate's projection, `[rows][value_width]`.
+    pub z: Deviceptr,
+    /// The beta logits, `[rows][heads]`.
+    pub b: Deviceptr,
+    /// The decay logits, `[rows][heads]`.
+    pub a: Deviceptr,
+    /// The convolved rows, `[rows][conv_width]`.
+    pub mixed: Deviceptr,
+    /// The normalised q and k ([crate::gdn::GdnGeometry::qk_floats]).
+    pub qk: Deviceptr,
+    /// Each row's (decay, beta) per value head.
+    pub decay: Deviceptr,
+    /// The raw head outputs and, in place, their gated norm, `[rows][value_width]`.
+    pub attended: Deviceptr,
+}
+
+/// A Gated DeltaNet layer's projections in the arm's own format and its other weights: the
+/// fused q/k/v, output gate, beta and decay projections of the normed rows; then a segment at a
+/// time the conv over its rows from its history and the history advanced past them; the prep
+/// over every row; a segment at a time the scan from its state, in place; the gated norm over
+/// every row; and `out_proj` of the normed heads.
+///
+/// Every row count takes these kernels, so a row's bits do not depend on what it shares a pass
+/// with. A segment's regions are its conv history and its delta-rule state; a verify pass's
+/// segment hands a snapshot slab for each ([SegmentRows::snapshots]), and the conv and the scan
+/// leave the state after each of its rows there.
+///
+/// The dense arm's Gated DeltaNet layers and DeepSeek's recurrent blocks on its dense format
+/// route run this one body: each host brings its projection dispatch ([DeviceCx::project]) and
+/// its segments' state regions ([DeviceCx::segments]).
+#[derive(Debug, Clone, Copy)]
+pub struct GdnLayer<'a, L: ?Sized> {
+    /// The fused q/k/v projection.
+    pub qkv: &'a L,
+    /// The output gate's projection.
+    pub z: &'a L,
+    /// The beta logits' projection.
+    pub b: &'a L,
+    /// The decay logits' projection.
+    pub a: &'a L,
+    /// `out_proj`.
+    pub out: &'a L,
+    /// The conv weights, BF16 `[conv_width][taps]`.
+    pub conv: Deviceptr,
+    /// The decay vectors, `A_log` and `dt_bias`.
+    pub decay: (Deviceptr, Deviceptr),
+    /// The gated norm's gains, BF16 a value head's width.
+    pub norm: Deviceptr,
+}
+
+impl<L: ?Sized> GdnLayer<'_, L> {
+    /// The layer over the pass's rows on `cx`: `input`'s normed rows into `output`'s projected
+    /// ones, through `rows`' scratch, the scan on `scan` at its launch, the gated norm at `eps`
+    /// with a sigmoid gate when `sigmoid` (else SiLU).
+    ///
+    /// # Errors
+    /// A segment whose regions are not one conv history and one state, or whose snapshots are
+    /// neither none nor one for each; a projection the arm does not run; or the driver's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run<C: DeviceCx<Linear = L>>(
+        &self,
+        cx: &C,
+        (chunk, scan): (&crate::gdn::GdnChunk, (Bound, Launch)),
+        geometry: &crate::gdn::GdnGeometry,
+        rows: &GdnRows,
+        (input, output): (Deviceptr, Deviceptr),
+        (eps, sigmoid): (f32, bool),
+    ) -> Result<(), BackendError> {
+        let count = cx.rows();
+        let width = geometry.conv_width();
+        let conv = (width, geometry.taps);
+        cx.project(self.qkv, input, rows.raw, count)?;
+        cx.project(self.z, input, rows.z, count)?;
+        cx.project(self.b, input, rows.b, count)?;
+        cx.project(self.a, input, rows.a, count)?;
+        let state = |segment: &SegmentRows<'_>| -> Result<_, BackendError> {
+            let &[history, state] = segment.regions else {
+                return Err(BackendError::new(
+                    ROLE,
+                    format!(
+                        "a Gated DeltaNet segment holds {} state regions, not a conv history and a state",
+                        segment.regions.len()
+                    ),
+                ));
+            };
+            let keep = |slab: Deviceptr, bytes: usize| (slab.0, segment.rows, (bytes / 4) as u64);
+            let snapshots = match *segment.snapshots {
+                [] => ((0, 0, 0), (0, 0, 0)),
+                [windows, states] => (
+                    keep(windows, geometry.conv_bytes()),
+                    keep(states, geometry.state_bytes()),
+                ),
+                ref other => {
+                    return Err(BackendError::new(
+                        ROLE,
+                        format!(
+                            "a Gated DeltaNet segment hands {} snapshot slabs, not none or one for each of its two regions",
+                            other.len()
+                        ),
+                    ));
+                }
+            };
+            Ok((history, state, snapshots))
+        };
+        for segment in cx.segments() {
+            let (history, _, (windows, _)) = state(&segment)?;
+            let at = segment.first * width * 4;
+            let rows_in = crate::gdn::ConvRows {
+                raw: rows.raw.offset(at),
+                history,
+                weight: self.conv,
+                out: rows.mixed.offset(at),
+            };
+            chunk.conv.run(cx, &rows_in, conv, segment.rows, windows)?;
+        }
+        chunk.prep(
+            cx,
+            geometry,
+            (rows.mixed, rows.a, rows.b),
+            self.decay,
+            (rows.qk, rows.decay),
+            count,
+        )?;
+        let qk_row = geometry.key_heads * crate::gdn::gdn_qk_row(geometry.key_dim) * 4;
+        for segment in cx.segments() {
+            let (_, state, (_, states)) = state(&segment)?;
+            let first = segment.first;
+            chunk.scan(
+                cx,
+                scan,
+                geometry,
+                (
+                    rows.qk.offset(first * qk_row),
+                    rows.decay.offset(first * geometry.heads * 8),
+                    rows.mixed.offset(first * width * 4),
+                ),
+                (state, state),
+                rows.attended.offset(first * geometry.value_width() * 4),
+                segment.rows,
+                states,
+            )?;
+        }
+        chunk.gate.run(
+            cx,
+            (rows.attended, rows.z, self.norm, rows.attended),
+            (geometry.heads, geometry.value_dim),
+            (eps, sigmoid),
+            count,
+        )?;
+        cx.project(self.out, rows.attended, output, count)
     }
 }
 

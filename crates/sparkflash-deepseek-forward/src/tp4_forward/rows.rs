@@ -1006,6 +1006,7 @@ impl sparkflash_ops::roles::DeviceCx for RowsCx<'_> {
                 rows: segment.rows,
                 position: segment.position,
                 regions: &segment.regions,
+                snapshots: &[],
             })
     }
 

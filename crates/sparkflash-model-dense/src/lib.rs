@@ -87,7 +87,7 @@ use sparkflash_ops::formats::{
     Bf16, F32 as F32Format, FormatKind, Fp8E4m3, Mat, NvFp4, PackedBf16, PackedOrder, Scales,
     Tensor, upload as upload_format,
 };
-use sparkflash_ops::gdn::{ChunkConv, ConvRows, GatedNorm, GdnChunk, GdnGeometry, gdn_qk_row};
+use sparkflash_ops::gdn::{ChunkConv, GatedNorm, GdnChunk, GdnGeometry};
 use sparkflash_ops::gemv::{
     CudaHandle, E4M3_TILE, GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3Tile, TILED_GEMV_BLOCKS,
     TILED_GEMV_PARTIALS, gemv_e4m3_tile,
@@ -497,7 +497,7 @@ struct Gqa {
 #[derive(Debug, Clone)]
 struct Gdn {
     shape: Shape,
-    weights: GdnLayer,
+    weights: GdnWeights,
     o: Proj,
     /// The conv history and the delta-rule state.
     state: [Region; 2],
@@ -507,7 +507,7 @@ struct Gdn {
 /// decay logits', the conv (BF16 `[conv_width][taps]`), the decay vectors and the gated norm (BF16
 /// a value head's width).
 #[derive(Debug, Clone)]
-struct GdnLayer {
+struct GdnWeights {
     qkv: Proj,
     z: Proj,
     b: Proj,
@@ -2148,7 +2148,7 @@ impl Uploads<'_> {
             geometry.value_width(),
         )];
         let value_heads = [Run::Rows(cut.value_heads, heads)];
-        let weights = GdnLayer {
+        let weights = GdnWeights {
             qkv: self.proj_runs(qkv, (all.conv_width(), hidden), &qkv_runs)?,
             z: self.proj_runs(z, (all.value_width(), hidden), &values)?,
             b: self.proj_runs(b, (all.heads, hidden), &value_heads)?,
@@ -2539,93 +2539,6 @@ impl Shared {
                 self.call(self.kernels.sum_slots, call)
             }),
         }
-    }
-
-    /// A Gated DeltaNet layer over the normed rows in `b.normed`, into `b.attended`: the
-    /// projections over every row; a segment at a time, the conv over its rows from its history
-    /// and its history advanced past them; the prep over every row; a segment at a time, the scan
-    /// from its state, in place; and the gated norm over every row. Every row count takes these
-    /// kernels, so a row's bits do not depend on what it shares a walk with.
-    fn linear(&self, part: &Gdn, cx: &PassCx<'_>) -> Result<(), BackendError> {
-        let &PassCx {
-            b,
-            segments,
-            rows,
-            policy,
-            index,
-            slot,
-            ..
-        } = cx;
-        let gdn = &part.weights;
-        let refuse = |message: String| Err(BackendError::new(DEVICE, message));
-        let (Some(kernels), Some(linear)) = (self.kernels.gdn, part.shape.linear) else {
-            return refuse(format!("layer {index} has no Gated DeltaNet kernels"));
-        };
-        let geometry = linear.geometry;
-        let width = geometry.conv_width();
-        let conv = (width, geometry.taps);
-        self.project(&gdn.qkv, b, b.normed.0, b.gdn_raw.0, rows, policy)?;
-        self.project(&gdn.z, b, b.normed.0, b.gdn_z.0, rows, policy)?;
-        self.project(&gdn.b, b, b.normed.0, b.gdn_b.0, rows, policy)?;
-        self.project(&gdn.a, b, b.normed.0, b.gdn_a.0, rows, policy)?;
-        let chunk = &kernels.chunk;
-        let mut first = 0usize;
-        for (sequence, tokens) in segments {
-            let &[history, _] = sequence.lane.regions[slot].as_slice() else {
-                return refuse(format!(
-                    "layer {index}'s lane part holds no recurrent state"
-                ));
-            };
-            let count = tokens.len();
-            let at = first * width * 4;
-            let conv_rows = ConvRows {
-                raw: b.gdn_raw.offset(at),
-                history,
-                weight: gdn.conv,
-                out: b.gdn_mixed.offset(at),
-            };
-            chunk.conv.run(self, &conv_rows, conv, count, (0, 0, 0))?;
-            first += count;
-        }
-        chunk.prep(
-            self,
-            &geometry,
-            (b.gdn_mixed, b.gdn_a, b.gdn_b),
-            (gdn.a_log, gdn.dt_bias),
-            (b.gdn_qk, b.gdn_decay),
-            rows,
-        )?;
-        let qk_row = geometry.key_heads * gdn_qk_row(geometry.key_dim) * 4;
-        let mut first = 0usize;
-        for (sequence, tokens) in segments {
-            let &[_, state] = sequence.lane.regions[slot].as_slice() else {
-                return refuse(format!(
-                    "layer {index}'s lane part holds no recurrent state"
-                ));
-            };
-            let count = tokens.len();
-            chunk.scan(
-                self,
-                (kernels.scan, kernels.scan_launch),
-                &geometry,
-                (
-                    b.gdn_qk.offset(first * qk_row),
-                    b.gdn_decay.offset(first * geometry.heads * 8),
-                    b.gdn_mixed.offset(first * width * 4),
-                ),
-                (state, state),
-                b.attended.offset(first * geometry.value_width() * 4),
-                count,
-            )?;
-            first += count;
-        }
-        chunk.gate.run(
-            self,
-            (b.attended, b.gdn_z, gdn.norm, b.attended),
-            (geometry.heads, geometry.value_dim),
-            (self.eps, linear.sigmoid),
-            rows,
-        )
     }
 
     /// `output[rows][proj.rows] = input[rows][proj.columns] x projᵀ` in the projection's format,

@@ -36,7 +36,7 @@ use sparkflash_ops::moe::Launch;
 use sparkflash_ops::naming::{LayerNames, TensorNames};
 use sparkflash_ops::projection::WidePolicy;
 pub use sparkflash_ops::roles::SegmentRows;
-use sparkflash_ops::roles::{DeviceCx, GqaLayer, GqaRows, Launcher};
+use sparkflash_ops::roles::{DeviceCx, GdnLayer, GdnRows, GqaLayer, GqaRows, Launcher};
 use sparkflash_ops::widen::LedgerRow;
 use sparkflash_runtime::{PartExec, PartHost, PartRegistry, RankSplit, Region};
 use sparkflash_weights::WeightSource;
@@ -167,6 +167,7 @@ impl PassCx<'_> {
                 rows: tokens.len(),
                 position: sequence.position(),
                 regions: &sequence.lane.regions[self.slot],
+                snapshots: &[],
             };
             first += tokens.len();
             segment
@@ -521,16 +522,43 @@ impl PartExec<Dense> for Gdn {
         RankSplit::Summed
     }
 
+    /// The shared Gated DeltaNet body ([GdnLayer]) on the arm's projections, each segment's
+    /// conv history and state in its lane, no snapshot kept.
     fn rows(&self, pass: &mut PassCx<'_>) -> Result<(), BackendError> {
         let (shared, b) = (pass.shared, pass.b);
-        shared.linear(self, pass)?;
-        shared.project(
-            &self.o,
-            b,
-            b.attended.0,
-            b.projected.0,
-            pass.rows,
-            pass.policy,
+        let index = pass.index;
+        let refuse = |message: String| Err(BackendError::new(DEVICE, message));
+        let (Some(kernels), Some(linear)) = (shared.kernels.gdn, self.shape.linear) else {
+            return refuse(format!("layer {index} has no Gated DeltaNet kernels"));
+        };
+        let weights = &self.weights;
+        let layer = GdnLayer {
+            qkv: &weights.qkv,
+            z: &weights.z,
+            b: &weights.b,
+            a: &weights.a,
+            out: &self.o,
+            conv: weights.conv,
+            decay: (weights.a_log, weights.dt_bias),
+            norm: weights.norm,
+        };
+        let rows = GdnRows {
+            raw: b.gdn_raw,
+            z: b.gdn_z,
+            b: b.gdn_b,
+            a: b.gdn_a,
+            mixed: b.gdn_mixed,
+            qk: b.gdn_qk,
+            decay: b.gdn_decay,
+            attended: b.attended,
+        };
+        layer.run(
+            &*pass,
+            (&kernels.chunk, (kernels.scan, kernels.scan_launch)),
+            &linear.geometry,
+            &rows,
+            (b.normed, b.projected),
+            (shared.eps, linear.sigmoid),
         )
     }
 

@@ -1309,6 +1309,7 @@ impl DeviceSequence {
             (from, to),
             self.linear_out,
             rows,
+            (0, 0, 0),
         )?;
         Ok(true)
     }

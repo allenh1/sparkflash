@@ -188,7 +188,9 @@ impl GdnGeometry {
 
     /// The scan's arguments over `rows` rows (`q4p_gdn_scan` and its other geometries, launched on
     /// the [crate::scan::ScanPlan]'s grid): from the state in `from` to the state in `to` (which
-    /// may be `from`), the raw head outputs into `out`, and no per-row snapshot.
+    /// may be `from`), the raw head outputs into `out`. A verify's `snapshot` is (states, rows,
+    /// region stride in floats): region r receives the state after row r, for the first `rows`
+    /// rows; (0, 0, 0) keeps none.
     #[must_use]
     pub const fn scan_args(
         &self,
@@ -196,6 +198,7 @@ impl GdnGeometry {
         (from, to): (u64, u64),
         out: u64,
         rows: usize,
+        (snapshot, snapshot_rows, region_stride): (u64, usize, u64),
     ) -> [u64; 15] {
         [
             qk,
@@ -210,9 +213,9 @@ impl GdnGeometry {
             self.value_dim as u64,
             self.groups() as u64,
             rows as u64,
-            0,
-            0,
-            0,
+            snapshot,
+            snapshot_rows as u64,
+            region_stride,
         ]
     }
 }
@@ -529,6 +532,7 @@ impl GdnChunk {
         (from, to): (Deviceptr, Deviceptr),
         out: Deviceptr,
         rows: usize,
+        snapshot: (u64, usize, u64),
     ) -> Result<(), BackendError> {
         let name = scan.kernel().name();
         if !GDN_SCANS.contains(&name) {
@@ -541,7 +545,13 @@ impl GdnChunk {
         cx.launch(
             scan,
             launch,
-            &geometry.scan_args((qk.0, decay_beta.0, mixed.0), (from.0, to.0), out.0, rows),
+            &geometry.scan_args(
+                (qk.0, decay_beta.0, mixed.0),
+                (from.0, to.0),
+                out.0,
+                rows,
+                snapshot,
+            ),
         )
     }
 }
@@ -575,8 +585,12 @@ mod tests {
         assert_eq!((prep.grid, prep.block), ((2, 9, 1), (128, 1, 1)));
         assert_eq!(prep.args, [1, 2, 3, 4, 5, 6, 7, 256, 2, 4, 128, 2]);
         assert_eq!(
-            geometry.scan_args((1, 2, 3), (4, 5), 6, 9),
+            geometry.scan_args((1, 2, 3), (4, 5), 6, 9, (0, 0, 0)),
             [1, 2, 3, 4, 5, 6, 256, 2, 4, 128, 2, 9, 0, 0, 0]
+        );
+        assert_eq!(
+            geometry.scan_args((1, 2, 3), (4, 5), 6, 9, (7, 3, 8)),
+            [1, 2, 3, 4, 5, 6, 256, 2, 4, 128, 2, 9, 7, 3, 8]
         );
         let gate = gated_norm((1, 2, 3, 1), (4, 128), 1e-6, true, 9);
         assert_eq!((gate.grid, gate.block), ((4, 9, 1), (128, 1, 1)));
