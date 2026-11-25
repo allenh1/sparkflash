@@ -698,6 +698,30 @@ pub struct ReferenceWeights {
     plan: TensorPlan,
 }
 
+/// The source the host reference reads a checkpoint through. The release's spelling is
+/// [ReferenceWeights]: it serves the *stored* forms (`wo_a` as F8E4M3 plus its own scale grid,
+/// exactly as the plan names it) after verifying the checkpoint, where the loader's `get` would
+/// convert `wo_a` to BF16 with the scale applied, which a F8E4M3 spec then reads as twice the bytes
+/// it expects. A `described` checkpoint (another architecture's spelling,
+/// [crate::described::checkpoint_config]) opens under the names its layout gives the base
+/// ([sparkflash_model::layout::open_checkpoint]); its layout states what is stored, so the
+/// release's plan is not checked against it.
+///
+/// # Errors
+/// As [ReferenceWeights::open], or the described open.
+pub fn reference_source(
+    dir: &Path,
+    index_path: &Path,
+    plan: &TensorPlan,
+    described: bool,
+) -> Result<Box<dyn WeightSource>, WeightError> {
+    Ok(if described {
+        Box::new(sparkflash_model::layout::open_checkpoint(dir, index_path)?)
+    } else {
+        Box::new(ReferenceWeights::open(dir, index_path, plan)?)
+    })
+}
+
 impl ReferenceWeights {
     /// Verifies the checkpoint against the plan, then opens the raw source the reference reads.
     ///

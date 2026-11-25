@@ -146,6 +146,7 @@ use sparkflash_engine::forward::{
     InferenceEngine, SamplerOptions, Sampling, SequenceState, StepOutput,
 };
 use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT, finite_argmax};
+#[cfg(test)]
 use sparkflash_engine::loader::ReferenceWeights;
 #[cfg(feature = "tp4-serve")]
 use sparkflash_engine::prompt_ranks::MergedPosition;
@@ -1682,6 +1683,8 @@ enum Weights {
         dir: PathBuf,
         /// The index file describing them.
         index: PathBuf,
+        /// A described config ([sparkflash_engine::described::checkpoint_config]): read by layout.
+        layout: bool,
     },
     /// Test-only: every weight byte is zero, so the forward's logits are finite (all-zero) and the
     /// acceptance rule has a genuinely measurable served path without a checkpoint.
@@ -1727,16 +1730,17 @@ fn checkpoint_recipe(path: &Path, tokenizer: &Path) -> Result<Recipe, String> {
             config_path.display()
         )
     })?;
-    let config = ModelConfig::from_json(&text).map_err(|error| {
-        format!(
-            "--checkpoint {}: {} is not a usable model configuration: {error}",
-            dir.display(),
-            config_path.display()
-        )
-    })?;
+    let (config, layout) =
+        sparkflash_engine::described::checkpoint_config(&text).map_err(|error| {
+            format!(
+                "--checkpoint {}: {} is not a usable model configuration: {error}",
+                dir.display(),
+                config_path.display()
+            )
+        })?;
     Ok(Recipe {
         config,
-        weights: Weights::Checkpoint { dir, index },
+        weights: Weights::Checkpoint { dir, index, layout },
         tokenizer: tokenizer.to_path_buf(),
         // The caller attaches --engram-dir after resolving the source; a checkpoint recipe
         // itself does not know where a packed store lives.
@@ -3315,21 +3319,15 @@ fn build_engine(recipe: &Recipe, element_limit: usize) -> Result<InferenceEngine
             &plan,
             SYNTHETIC_WEIGHT_SEED,
         ))),
-        Weights::Checkpoint { dir, index } => {
-            // The reference pass decodes the *stored* forms: `wo_a` is F8E4M3 plus its own scale
-            // grid, exactly as the plan names it. [ReferenceWeights] is the source that serves
-            // those bytes and verifies the checkpoint first; the loader's `get` instead converts
-            // `wo_a` to BF16 with the scale applied, which a F8E4M3 spec then reads as twice the
-            // bytes it expects (linalg::decode_by_name -> quant::check_len). Serving through the
-            // converted form failed on layer 0, and this is the seam that used to do it.
-            let reference = ReferenceWeights::open(dir, index, &plan).map_err(|error| {
-                format!(
-                    "--checkpoint {}: the shards do not match the planned model: {error}",
-                    dir.display()
-                )
-            })?;
-            Box::new(reference)
-        }
+        Weights::Checkpoint { dir, index, layout } => sparkflash_engine::loader::reference_source(
+            dir, index, &plan, *layout,
+        )
+        .map_err(|error| {
+            format!(
+                "--checkpoint {}: the shards do not match the planned model: {error}",
+                dir.display()
+            )
+        })?,
         #[cfg(all(test, panic = "unwind"))]
         Weights::Panicking { seed, name } => Box::new(PanickingSource {
             name,

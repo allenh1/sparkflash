@@ -507,6 +507,25 @@ pub fn from_config(text: &str) -> Result<ModelConfig, ConfigError> {
     )
 }
 
+/// A checkpoint's `config.json` text as the base reads it, and whether it was described: the
+/// release's own spelling as it always parsed ([ModelConfig::from_json]), else another
+/// architecture's spelling through its description ([host_config]).
+///
+/// # Errors
+/// Neither reading opens the text; both refusals are named.
+pub fn checkpoint_config(text: &str) -> Result<(ModelConfig, bool), ConfigError> {
+    match ModelConfig::from_json(text) {
+        Ok(config) => Ok((config, false)),
+        Err(typed) => host_config(text)
+            .map(|config| (config, true))
+            .map_err(|described| {
+                format!(
+                    "as the release's spelling, {typed}; as a described architecture, {described}"
+                )
+            }),
+    }
+}
+
 /// The host forward's open: [from_config], refused first for every wiring fact the host does not
 /// run ([refuse_unrun_wiring] at [HOST_RUNS]).
 ///
