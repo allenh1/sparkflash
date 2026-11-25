@@ -57,7 +57,6 @@ use serde_json::{Value, json};
 use sparkflash_device::resident::{
     CHAIN_LAYERS, HeaderEntry, MTP_LAYERS, OperandLayout, ResidentPlan,
 };
-use sparkflash_engine::safetensors::{CheckpointIndex, SafeTensorsSource};
 
 /// The stage name in --run-stage.
 pub const STAGE: &str = "attn-operands";

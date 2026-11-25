@@ -69,7 +69,10 @@ fn main() -> Result<(), String> {
     let dir = Path::new(&checkpoint);
     let text = std::fs::read_to_string(dir.join("config.json"))
         .map_err(|error| format!("{}: {error}", dir.join("config.json").display()))?;
-    let config = ModelConfig::from_json(&text).map_err(|error| format!("config: {error}"))?;
+    // The value table from the checkpoint's description, the route the device forward reads
+    // through its plan, so the reference and the device open one table.
+    let config: ModelConfig = sparkflash_model_deepseek_v41::described::host_config(&text)
+        .map_err(|error| format!("config: {error}"))?;
     let source =
         sparkflash_model::layout::open_checkpoint(dir, &dir.join("model.safetensors.index.json"))
             .map_err(|error| format!("checkpoint: {error}"))?;

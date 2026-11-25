@@ -1540,6 +1540,11 @@ const fn absorbed(part: Part) -> bool {
 /// A block carries a part the forward has no body for, or a block that is not fused carries a
 /// part that does not run on its own; the message names the block and the part.
 pub fn language_steps(plan: &EnginePlan) -> Result<Vec<BlockSteps>, ConfigError> {
+    sparkflash_engine::described::refuse_unrun_wiring(
+        plan.model_facts(),
+        "forward open: the device forward",
+        &sparkflash_engine::described::BASE_RUNS,
+    )?;
     let mut steps = Vec::new();
     for stack in plan.stacks() {
         if stack.kind != sparkflash_model::StackKind::Language {
@@ -1917,8 +1922,19 @@ mod tests {
                 assert_eq!(values.compress_rope_theta.to_bits(), 0f64.to_bits());
                 assert_eq!(values.index_topk, 2048);
                 assert_eq!(values.dense_ffn_layers, vec![0, 1, 2]);
-                let refusal = language_steps(&plan).expect_err("no KDA body yet");
-                assert!(refusal.contains("KdaScan"), "{refusal}");
+                // The absorbed latent, its probabilities, the pooled indexer and GLM's mix are
+                // not built on the device yet: the open names each, and runs none of V4's in
+                // their place.
+                let refusal = language_steps(&plan).expect_err("GLM's sparse layers");
+                for unrun in [
+                    "language.mla_attention.form = absorbed",
+                    "language.mla_attention.probabilities = query",
+                    "language.indexer.pool_compress = true",
+                    "language.manifold_hyper_connection.head_fold = mean",
+                ] {
+                    assert!(refusal.contains(unrun), "{unrun}: {refusal}");
+                }
+                assert!(!refusal.contains("kda_scan"), "{refusal}");
             }
         }
     }

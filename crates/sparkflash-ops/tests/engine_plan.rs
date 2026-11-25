@@ -1343,7 +1343,21 @@ fn the_glm_layout_names_every_tensor_by_a_base_slot() {
         missing.is_empty(),
         "GLM tensors without a slot: {missing:?}"
     );
-    assert_eq!(names.len(), tensors.len());
+    let dense = tensors
+        .iter()
+        .filter(|tensor| {
+            matches!(
+                tensor.dtype,
+                sparkflash_model::layout::LayoutDtype::Dense
+                    | sparkflash_model::layout::LayoutDtype::Expert
+            )
+        })
+        .count();
+    assert_eq!(names.len(), tensors.len() + dense);
+    assert_eq!(
+        names.get("model.language_model.layers.3.self_attn.q_a_proj.weight_scale_inv"),
+        Some(&"layers.3.attn.wq_a.scale".to_owned())
+    );
     let mtp = glm.layers.len();
     for (stored, base) in [
         ("lm_head.weight".to_owned(), "head.weight".to_owned()),
@@ -1372,7 +1386,7 @@ fn the_glm_layout_names_every_tensor_by_a_base_slot() {
         for stack in plan.stacks() {
             for block in &stack.blocks {
                 for instance in &block.parts {
-                    for claim in &instance.claims {
+                    for claim in instance.claims.iter().filter(|claim| claim.slot.is_some()) {
                         assert_eq!(
                             Some(claim.base_name()),
                             names.get(&claim.name).map(String::as_str),
@@ -1391,4 +1405,52 @@ fn the_glm_layout_names_every_tensor_by_a_base_slot() {
             .expect("the DeepSeek names")
             .is_empty()
     );
+}
+
+/// The host reference and the device forward fill one value table from one description: the
+/// host from the config text (sparkflash_model_deepseek_v41::described::from_config), the device
+/// from its plan's facts and resolved dense format. Both routes agree, and for the released
+/// DeepSeek both are the table the DeepSeek config parser reads.
+#[test]
+fn the_host_and_the_plan_fill_one_value_table() {
+    use sparkflash_model_deepseek_v41::config::ModelConfig;
+    use sparkflash_model_deepseek_v41::described;
+    let route = |text: &str| {
+        let plan = EnginePlan::from_json(text, Target::Sm121, 4, 0).expect("plan");
+        described::from_facts(
+            plan.model_facts(),
+            plan.architecture(),
+            plan.stored_format(sparkflash_model::Part::DenseMlp, None),
+        )
+    };
+    let released = ModelConfig::from_json(DEEPSEEK).expect("the DeepSeek parser");
+    assert_eq!(described::from_config(DEEPSEEK).expect("host"), released);
+    assert_eq!(route(DEEPSEEK).expect("plan"), released);
+    let glm = glm_bf16();
+    for text in [GLM, glm.as_str()] {
+        assert_eq!(
+            described::from_config(text).map_err(|error| error.to_string()),
+            route(text).map_err(|error| error.to_string()),
+        );
+    }
+}
+
+/// The host and the device each refuse the wiring they have not built, by name: GLM's absorbed
+/// latent and pooled indexer are named, the released DeepSeek opens, and the KDA facts the shared
+/// body runs are not named.
+#[test]
+fn an_arm_refuses_the_wiring_it_does_not_run_by_name() {
+    use sparkflash_model_deepseek_v41::described;
+    described::host_config(DEEPSEEK).expect("the released DeepSeek opens on the host");
+    let refusal = described::host_config(GLM).expect_err("GLM's sparse layers on the host");
+    for unrun in [
+        "language.mla_attention.form = absorbed",
+        "language.sparse_indexer.scores = f32",
+        "language.indexer.pool_compress = true",
+        "language.draft.indexer_shared = true",
+        "language.manifold_hyper_connection.mix_input = f32",
+    ] {
+        assert!(refusal.contains(unrun), "{unrun}: {refusal}");
+    }
+    assert!(!refusal.contains("kda_scan") && !refusal.contains("router_dtype"), "{refusal}");
 }

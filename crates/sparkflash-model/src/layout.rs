@@ -2994,6 +2994,17 @@ pub fn checkpoint_names(
             ));
         }
         names.insert(tensor.name.clone(), slot.clone());
+        // A block-scaled weight's inverse scale sits beside it under the checkpoint's own
+        // spelling (`weight_scale_inv`); the base reads the same multiplier as `.scale`. A BF16
+        // store has none, and the opener keeps only the pairs the index holds.
+        if matches!(tensor.dtype, LayoutDtype::Dense | LayoutDtype::Expert)
+            && let (Some(stored), Some(base)) = (
+                tensor.name.strip_suffix(".weight"),
+                slot.strip_suffix(".weight"),
+            )
+        {
+            names.insert(format!("{stored}.weight_scale_inv"), format!("{base}.scale"));
+        }
     }
     if let Some(tensor) = tensors
         .iter()
@@ -3031,7 +3042,10 @@ pub fn open_checkpoint(
     };
     let architecture =
         Architecture::from_path(&config).map_err(|error| malformed(error.to_string()))?;
-    let names = checkpoint_names(&architecture).map_err(|error| malformed(error.to_string()))?;
+    let mut names =
+        checkpoint_names(&architecture).map_err(|error| malformed(error.to_string()))?;
+    // An unloaded tensor, or the scale of a weight stored plain, need not be in the index.
+    names.retain(|stored, _| source.index().weight_map.contains_key(stored));
     if names.is_empty() {
         return Ok(source);
     }

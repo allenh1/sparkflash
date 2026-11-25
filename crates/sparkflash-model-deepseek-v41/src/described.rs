@@ -80,6 +80,72 @@ fn boolean(facts: &BTreeMap<String, FactValue>, name: &str, default: bool) -> bo
     }
 }
 
+/// The wiring facts a layout states that are not part sizes: how a part computes (its form, the
+/// type a value is held in, the fold at the head). An arm that runs none of a stated value must
+/// refuse the description by that name, never run its own arithmetic in the model's place.
+const WIRING_FLAGS: [&str; 2] = ["language.indexer.pool_compress", "language.draft.indexer_shared"];
+
+fn wiring_value(value: &FactValue) -> String {
+    match value {
+        FactValue::Text(text) => text.clone(),
+        FactValue::Bool(flag) => flag.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The wiring the base runs today, on the host and on the device: the single-latent MLA, the
+/// head fold through the last pre-mix, the shared f32 KDA body, f32 norm and router sums.
+pub const BASE_RUNS: [(&str, &str); 8] = [
+    ("language.mla_attention.form", "latent"),
+    ("language.manifold_hyper_connection.head_fold", "last_pre_mix"),
+    ("language.kda_scan.decay", "f32"),
+    ("language.kda_scan.recurrence", "f32"),
+    ("language.kda_scan.state", "f32"),
+    ("language.kda_scan.output_norm", "f32"),
+    ("language.rms_norm.accumulate", "f32"),
+    ("language.moe.router_dtype", "float32"),
+];
+
+/// Refuse every stated wiring fact whose value is not in `runs` (`(fact, value)` pairs): a
+/// `language.<part>.<name>` fact, and the pooled indexer's and the shared draft selection's flags
+/// when they are on. An arm passes what it computes; a fact it has not built is named, with the
+/// value the model states.
+///
+/// # Errors
+/// The facts the arm does not run, joined into one refusal.
+pub fn refuse_unrun_wiring(
+    facts: &BTreeMap<String, FactValue>,
+    arm: &str,
+    runs: &[(&str, &str)],
+) -> Result<(), ConfigError> {
+    let mut unrun = Vec::new();
+    for (name, value) in facts {
+        let wiring = WIRING_FLAGS.contains(&name.as_str())
+            || name
+                .strip_prefix("language.")
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(part, _)| sparkflash_model::Part::parse(part).is_some());
+        if !wiring || matches!(value, FactValue::Bool(false)) {
+            continue;
+        }
+        let value = wiring_value(value);
+        if !runs
+            .iter()
+            .any(|(fact, ran)| *fact == name.as_str() && *ran == value)
+        {
+            unrun.push(format!("{name} = {value}"));
+        }
+    }
+    if unrun.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{arm} does not run what the description states: {}",
+            unrun.join(", ")
+        ))
+    }
+}
+
 /// Fill the model-wide value object from a description's facts
 /// ([Architecture::model_facts]) and its dense class's stored format.
 ///
@@ -273,4 +339,35 @@ pub fn from_facts(
         vision_max_wh_ratio: opt_float(facts, "vision_max_wh_ratio"),
         vision_rope_theta: opt_float(facts, "vision_rope_theta"),
     })
+}
+
+/// A described checkpoint's values from its `config.json` text alone: the architecture, its
+/// facts, and the dense class it states. The host reference opens through this ([host_config]), and the device
+/// forward reads the same facts through its plan (the plan's per-part formats agree with the
+/// architecture's on every carried description; ops' engine_plan tests hold the two routes
+/// equal).
+///
+/// # Errors
+/// The config does not parse, or a fact the value table needs is missing.
+pub fn from_config(text: &str) -> Result<ModelConfig, ConfigError> {
+    let architecture = Architecture::from_json(text).map_err(|error| error.to_string())?;
+    let facts = architecture.model_facts();
+    from_facts(
+        &facts,
+        &architecture,
+        architecture
+            .stored_format(sparkflash_model::Part::DenseMlp)
+            .map(sparkflash_model::architecture::WeightFormat::stored_format),
+    )
+}
+
+/// The host forward's open: [from_config], refused first for every wiring fact the host does not
+/// run ([refuse_unrun_wiring] at [BASE_RUNS]).
+///
+/// # Errors
+/// As [from_config], and the wiring the host has not built, by name.
+pub fn host_config(text: &str) -> Result<ModelConfig, ConfigError> {
+    let architecture = Architecture::from_json(text).map_err(|error| error.to_string())?;
+    refuse_unrun_wiring(&architecture.model_facts(), "the host forward", &BASE_RUNS)?;
+    from_config(text)
 }

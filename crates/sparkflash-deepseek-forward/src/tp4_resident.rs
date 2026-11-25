@@ -43,7 +43,7 @@ use sparkflash_device::resident::{
     CHAIN_LAYERS, HeaderEntry, MTP_LAYERS, ReadEvidence, ResidentPlan,
 };
 use sparkflash_device::shard::StoredShard;
-use sparkflash_engine::safetensors::{CheckpointIndex, SafeTensorsSource};
+use sparkflash_engine::safetensors::SafeTensorsSource;
 
 /// The evidence schema version this stage writes (S5.1 conventions).
 pub const SCHEMA_VERSION: u32 = 1;
