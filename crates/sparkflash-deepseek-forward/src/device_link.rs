@@ -292,6 +292,8 @@ pub enum WalkCommand {
 pub struct WalkDescription {
     /// The lanes the scheduler holds (one without the device exchange).
     pub lanes: usize,
+    /// The most sequences one token pass steps.
+    pub members: usize,
     /// The most positions a sequence may reach.
     pub context: usize,
     /// The resume boundaries' step: a sequence goes back only to a multiple of it.

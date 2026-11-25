@@ -1261,6 +1261,16 @@ fn epoch_args(
     let checkpoint = options.checkpoint.as_ref().ok_or(
         "--tp4-device requires --checkpoint DIR: the four ranks serve one released sharded checkpoint",
     )?;
+    chain_args(checkpoint, options.tokenizer.clone(), tp4, device)
+}
+
+/// [`epoch_args`] for `checkpoint` and `tokenizer` (the default tokenizer when `None`).
+fn chain_args(
+    checkpoint: &std::path::Path,
+    tokenizer: Option<PathBuf>,
+    tp4: &Tp4ServeOptions,
+    device: &DeviceServeOptions,
+) -> Result<Vec<String>, String> {
     let positions = device.positions();
     let cubins = device.cubins.display().to_string();
     let peers = tp4
@@ -1273,7 +1283,7 @@ fn epoch_args(
     // one-token prompt (id 0, the BOS), which the serving loop never runs.
     let ids = vec!["0"; positions].join(",");
     // The Engram n-grams hash the compressed ids of the tokenizer the requests are encoded with.
-    let tokenizer = match options.tokenizer.clone() {
+    let tokenizer = match tokenizer {
         Some(path) => path,
         None => default_tokenizer()?,
     };
@@ -1318,19 +1328,26 @@ fn epoch_args(
     Ok(args)
 }
 
+/// The environment an epoch reads: its DSpark branch from SPARKFLASH_DSPARK, and the router
+/// bounds max_tokens by the context SPARK_MAX_SEQ_LEN names.
+///
+/// # Safety
+/// No other thread may read or write the environment while this runs.
+unsafe fn epoch_env(device: &DeviceServeOptions) {
+    unsafe {
+        std::env::set_var("SPARKFLASH_DSPARK", "1");
+        std::env::set_var(MAX_SEQ_LEN_ENV, device.max_model_len.to_string());
+    }
+}
+
 /// Runs one rank of the device serving group until its epoch ends.
 pub(super) fn run(
     options: &ServeOptions,
     tp4: &Tp4ServeOptions,
     device: &DeviceServeOptions,
 ) -> ExitCode {
-    // SAFETY: no thread has been started yet, so nothing reads the environment concurrently. The
-    // epoch takes its DSpark branch from SPARKFLASH_DSPARK, and the router bounds max_tokens by
-    // the context SPARK_MAX_SEQ_LEN names.
-    unsafe {
-        std::env::set_var("SPARKFLASH_DSPARK", "1");
-        std::env::set_var(MAX_SEQ_LEN_ENV, device.max_model_len.to_string());
-    }
+    // SAFETY: no thread has been started yet, so nothing reads the environment concurrently.
+    unsafe { epoch_env(device) };
     if let Err(message) = device.boot_check(options.checkpoint.as_deref(), tp4.world_size) {
         eprintln!("sparkflash serve: {message}");
         return ExitCode::from(EXIT_REFUSED);
@@ -1938,4 +1955,172 @@ mod tests {
         assert_eq!(reasoning, "Tail </think>");
         assert_eq!(content, "Body");
     }
+}
+
+/// The DeepSeek base's generated conformance checks: one device epoch at world 1, its walk
+/// server driven through [`sparkflash_deepseek_forward::base_walk::BaseWalk`].
+#[cfg(all(test, feature = "cuda"))]
+mod base_conformance {
+    use super::{DeviceServeOptions, Tp4ServeOptions, chain_args, epoch_env};
+    use sparkflash_deepseek_forward::base_walk::{BaseWalk, CODE, PROMPT_ROWS, layout};
+    use sparkflash_deepseek_forward::device_link::{WalkRequest, install_walk, take_walk};
+    use sparkflash_model::architecture::Ffn;
+    use sparkflash_model::backend::BackendError;
+    use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
+    use sparkflash_runtime::testing::ArmProfile;
+    use sparkflash_runtime::{ArmFixture, Fixture, FormatRule, Limits};
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::sync::mpsc::Sender;
+
+    /// The context the fixture's epoch opens: room for the checks' longest prompt and tokens.
+    const CONTEXT: usize = 4_096;
+
+    fn fixture_error(error: impl std::fmt::Display) -> BackendError {
+        BackendError::new("fixture", error.to_string())
+    }
+
+    /// The directory `name` names; unset is a fixture error naming what writes it.
+    fn named(name: &str) -> Result<PathBuf, BackendError> {
+        match std::env::var_os(name) {
+            Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
+            _ => Err(fixture_error(format!(
+                "{name} is unset: the DeepSeek base fixture is a synthetic checkpoint and its \
+                 staged cubins, which `scripts/second-shape.py run --device` writes \
+                 (SPARKFLASH_CONFORMANCE_CHECKPOINT, SPARKFLASH_CONFORMANCE_CUBINS, and \
+                 optionally SPARKFLASH_CONFORMANCE_TOKENIZER)"
+            ))),
+        }
+    }
+
+    /// The walk server of the one epoch a process opens: the chain's plan, profile and link are
+    /// the process's, so every fixture is a fresh handle on the same epoch.
+    fn epoch() -> Result<Sender<WalkRequest>, BackendError> {
+        static EPOCH: OnceLock<Result<Sender<WalkRequest>, String>> = OnceLock::new();
+        EPOCH
+            .get_or_init(|| open_epoch().map_err(|error| error.message().to_owned()))
+            .clone()
+            .map_err(fixture_error)
+    }
+
+    fn open_epoch() -> Result<Sender<WalkRequest>, BackendError> {
+        let checkpoint = named("SPARKFLASH_CONFORMANCE_CHECKPOINT")?;
+        let cubins = named("SPARKFLASH_CONFORMANCE_CUBINS")?;
+        let tokenizer = std::env::var_os("SPARKFLASH_CONFORMANCE_TOKENIZER").map(PathBuf::from);
+        let evidence = std::env::temp_dir().join(format!("sf-base-conf-{}", std::process::id()));
+        std::fs::create_dir_all(&evidence).map_err(fixture_error)?;
+        let device = DeviceServeOptions {
+            cubins: cubins.clone(),
+            max_model_len: CONTEXT,
+            evidence_dir: evidence,
+        };
+        let local = std::net::IpAddr::from([127, 0, 0, 1]);
+        let tp4 = Tp4ServeOptions {
+            rank: 0,
+            world_size: 1,
+            peers: vec![local],
+            base_port: 29_651,
+            control_port: 29_751,
+            device: None,
+        };
+        device.boot_check(Some(&checkpoint), 1).map_err(fixture_error)?;
+        let args = chain_args(&checkpoint, tokenizer, &tp4, &device).map_err(fixture_error)?;
+        let cubins = cubins.display().to_string();
+        // SAFETY: the checks run one at a time (`--test-threads=1`) and the epoch's thread has
+        // not started; a variable the caller set is left as it is.
+        unsafe {
+            epoch_env(&device);
+            for (name, value) in [
+                ("SPARKFLASH_HEAD_SCREEN", "0"),
+                ("SPARKFLASH_UNPINNED_SECOND_SHAPE", "1"),
+                ("SPARKFLASH_LEAN_HEAD", "1"),
+                ("SPARK_COMM_REDUCE", "nccl"),
+                ("SPARK_COMM_PEERS", "127.0.0.1"),
+                ("SPARKFLASH_CUBINS", cubins.as_str()),
+            ] {
+                if std::env::var_os(name).is_none() {
+                    std::env::set_var(name, value);
+                }
+            }
+        }
+        let sender = install_walk();
+        std::thread::Builder::new()
+            .name("deepseek-base-epoch".to_owned())
+            .spawn(move || {
+                let code = crate::device_chain::run(args.into_iter());
+                eprintln!("deepseek base conformance: the epoch ended ({code:?})");
+                // Commands still queued fail rather than wait on a server that never starts.
+                drop(take_walk());
+            })
+            .map_err(fixture_error)?;
+        Ok(sender)
+    }
+
+    /// The DeepSeek base at world 1 on the checkpoint SPARKFLASH_CONFORMANCE_CHECKPOINT names.
+    pub struct DeepSeekBase;
+
+    impl ArmFixture for DeepSeekBase {
+        type Walk = BaseWalk;
+
+        fn fixture(world: usize) -> Result<Fixture<BaseWalk>, BackendError> {
+            if world > 1 {
+                return Err(BackendError::new(
+                    "group",
+                    "the base opens one device epoch a process; its worlds 2 and 4 are \
+                     `scripts/second-shape.py run --device --world 2,4`",
+                ));
+            }
+            let walk = BaseWalk::new(epoch()?)?;
+            let checkpoint = named("SPARKFLASH_CONFORMANCE_CHECKPOINT")?;
+            let architecture = sparkflash_model::Architecture::from_checkpoint_dir(&checkpoint)
+                .map_err(fixture_error)?;
+            let moe = architecture
+                .layers
+                .iter()
+                .find_map(|layer| match &layer.ffn {
+                    Ffn::Moe(moe) => Some(moe),
+                    Ffn::Dense(_) => None,
+                })
+                .ok_or_else(|| fixture_error("the checkpoint has no routed-expert layer"))?;
+            let tp = sparkflash_model::TpPlan::new(1, 0).map_err(|error| fixture_error(error.detail))?;
+            let tensors = ArchitectureTensorPlan::served_and_mtp(&architecture, tp)
+                .map_err(fixture_error)?;
+            let (bytes, floor) = sparkflash_runtime::token_bytes(
+                tensors.rank_bytes(),
+                tensors.role_bytes(Role::Experts),
+                moe.routed_experts,
+                moe.active_experts,
+            );
+            let bulk_rows = walk.description().bulk_rows;
+            let fixture = Fixture::new(
+                walk,
+                format!("the DeepSeek checkpoint at {}", checkpoint.display()),
+                bytes,
+                floor,
+                FormatRule::classes(&architecture.quantization),
+                None,
+            );
+            // Past twice the bulk path's fewest rows, so a split prompt's halves both take it.
+            Ok(match bulk_rows {
+                0 => fixture,
+                rows => fixture.with_long_prompt(2 * rows + 64),
+            })
+        }
+
+        fn tick_engine() -> bool {
+            true
+        }
+    }
+
+    /// What the base states: its widest prompt pass, the serving lanes' 32 members, and the
+    /// chunks a 5,000-row prompt runs in. The profile's checks read the layout's kind, so its
+    /// bytes a row are a placeholder for the epoch's.
+    fn stated() -> ArmProfile {
+        let limits = Limits::new(PROMPT_ROWS, 1_048_576).with_members(32);
+        ArmProfile::new("DeepSeek", layout(1), limits)
+            .with_code(CODE)
+            .prompt(limits, 5_000, &[4_096, 904])
+    }
+
+    sparkflash_runtime::conformance!(DeepSeekBase, profile: stated());
 }

@@ -90,6 +90,8 @@ libc = { workspace = true }
 io-uring = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The DeepSeek base's generated conformance checks (`serve/device.rs`).
+sparkflash-runtime = { workspace = true }
 sparkflash-deepseek-forward = { workspace = true, features = ["test-support"] }
 # The `--checkpoint` fixture tests build a tiny safetensors checkpoint in a temporary directory.
 tempfile = { workspace = true }

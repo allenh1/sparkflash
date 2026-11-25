@@ -72,6 +72,12 @@ impl Batch<'_, '_, '_> {
         }
         Ok(WalkDescription {
             lanes: self.lanes.len(),
+            // Several sequences' rows in one step need the exchange (`token_rows`).
+            members: if self.exchange.is_some() {
+                self.lanes.len().min(R_MAX)
+            } else {
+                1
+            },
             context: self.room,
             resume_step: self.device.resume_step(),
             exchange: self.exchange.is_some(),

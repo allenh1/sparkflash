@@ -77,6 +77,15 @@ pub struct BaseWalk {
     drafter: Absent<&'static str>,
 }
 
+/// The walk's state: one positional region of `row_bytes` a row.
+#[must_use]
+pub fn layout(row_bytes: usize) -> StateLayout {
+    StateLayout::new(vec![Region::Positional {
+        name: "kv",
+        bytes_per_row: row_bytes,
+    }])
+}
+
 impl BaseWalk {
     /// A walk over the epoch serving `sender`'s commands.
     ///
@@ -91,10 +100,7 @@ impl BaseWalk {
         Ok(Self {
             link,
             description,
-            layout: StateLayout::new(vec![Region::Positional {
-                name: "kv",
-                bytes_per_row: description.row_bytes,
-            }]),
+            layout: layout(description.row_bytes),
             drafter: Absent("the DeepSeek base walk drafts nothing yet"),
         })
     }
@@ -205,7 +211,7 @@ impl Walk for BaseWalk {
     }
 
     fn limits(&self) -> Limits {
-        Limits::new(PROMPT_ROWS, self.description.context).with_members(self.description.lanes)
+        Limits::new(PROMPT_ROWS, self.description.context).with_members(self.description.members)
     }
 
     fn drafter(&self) -> &Absent<&'static str> {
