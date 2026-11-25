@@ -945,10 +945,26 @@ pub fn bind_rank_attention(
                         shard.name, weight.bytes, shard.dtype
                     ));
                 }
-                // No scale grid exists for a stored tensor. The weight pointer is repeated so the
-                // tuple stays non-null; consumers must select the stored path by dtype and never
-                // read this second field (currently only the host CompressorCache reads wgate).
-                bound.insert(shard.name.clone(), (weight.ptr, weight.ptr));
+                // A scaled stored class (a dense FP8 class the B12x bodies do not read) keeps its
+                // scale plane as stored, beside the weight: the dense format route reads that
+                // plane, so the pair carries it, and a missing plane is refused rather than the
+                // codes read as their own scales. An unscaled tensor has no plane; the weight
+                // pointer is repeated so the tuple stays non-null, and its consumers select the
+                // stored path by dtype and never read the second field.
+                let scaled = shard.format.is_some_and(|format| !format.is_unscaled());
+                let scales = if scaled {
+                    let scale_name = format!("{}.scale", shard.name.trim_end_matches(".weight"));
+                    let plane = arena.slice(&scale_name).ok_or_else(|| {
+                        format!(
+                            "{scale_name}: no arena slice for the stored scale plane of the scaled class {}",
+                            shard.name
+                        )
+                    })?;
+                    plane.ptr
+                } else {
+                    weight.ptr
+                };
+                bound.insert(shard.name.clone(), (weight.ptr, scales));
             }
         }
     }

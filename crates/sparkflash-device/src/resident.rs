@@ -507,8 +507,9 @@ pub struct GroupTotals {
 ///
 /// This is the census half of the four-rank operand path: the arena bind reports the two device
 /// pointers it bound per weight, and the forward refuses a tensor whose pair cannot be the planned
-/// layout. B12x needs two live and distinct buffers (the tiled codes and the scale grid); a stored
-/// tensor repeats its one pointer in the scale slot. A null pointer, a shared pointer for a B12x
+/// layout. B12x needs two live and distinct buffers (the tiled codes and the scale grid), and so
+/// does a scaled stored class (its codes and its stored scale plane); an unscaled stored tensor
+/// repeats its one pointer in the scale slot. A null pointer, a shared pointer for a B12x
 /// operand, or a distinct pointer for a stored tensor is a reported refusal carrying the tensor
 /// name, never a launch.
 ///
@@ -545,7 +546,17 @@ pub fn check_operand_bind(
                     layout.as_str()
                 ));
             }
-            if scale_pointer != 0 && scale_pointer != weight_pointer {
+            // A scaled stored class keeps its scale plane as stored, its own buffer beside the
+            // codes; an unscaled tensor has none and repeats its one pointer.
+            let scaled = shard.format.is_some_and(|format| !format.is_unscaled());
+            if scaled && (scale_pointer == 0 || scale_pointer == weight_pointer) {
+                return Err(format!(
+                    "{}: plan says {} with a stored scale plane but the bind gave scale {scale_pointer:#x} (weight {weight_pointer:#x}); refusing to launch",
+                    shard.name,
+                    layout.as_str()
+                ));
+            }
+            if !scaled && scale_pointer != 0 && scale_pointer != weight_pointer {
                 return Err(format!(
                     "{}: plan says {} but the bind returned a distinct scale pointer {scale_pointer:#x} (weight {weight_pointer:#x}); refusing to launch",
                     shard.name,
@@ -1502,6 +1513,23 @@ mod tests {
             distinct.contains("q_norm.weight") && distinct.contains("distinct scale pointer"),
             "{distinct}"
         );
+
+        // A scaled class the B12x bodies do not read (128-wide FP8 tiles, read by the dense
+        // format route) is stored with its scale plane beside it: two buffers, both required.
+        let mut tiled = wq_a.clone();
+        tiled.format = Some(sparkflash_model::format::StoredFormat::FP8_E4M3_TILE_128);
+        assert!(!tiled.operand_layout().is_b12x(), "the 128-wide tile is stored, not B12x");
+        assert!(
+            check_operand_bind(&tiled, 0x1000, 0x2000).is_ok(),
+            "a scaled stored class binds its codes and its stored scale plane"
+        );
+        let codes_as_scales = check_operand_bind(&tiled, 0x1000, 0x1000)
+            .expect_err("a scaled stored class cannot read its codes as its scales");
+        assert!(
+            codes_as_scales.contains("stored scale plane") && codes_as_scales.contains("wq_a"),
+            "{codes_as_scales}"
+        );
+        check_operand_bind(&tiled, 0x1000, 0).expect_err("a missing scale plane is refused");
     }
 
     #[test]
