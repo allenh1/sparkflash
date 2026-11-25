@@ -756,7 +756,7 @@ pub fn geometry_from_plan(
             format.same_arithmetic(sparkflash_model::format::StoredFormat::MXFP4_ROW_32)
         })
     };
-    use sparkflash_model_deepseek_v41::tensor::{ExpertLeaf, routed_matrix};
+    use sparkflash_engine::tensor::{ExpertLeaf, routed_matrix};
     let down = |layer: usize| routed_matrix(&format!("layers.{layer}"), 0, ExpertLeaf::Down);
     let layer = (0..)
         .map_while(|layer| {

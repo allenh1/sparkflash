@@ -1784,7 +1784,7 @@ impl DeviceLayer<'_> {
                 io: DenseIo::new(RowForm::F32, output),
             })
         };
-        let names = sparkflash_model_deepseek_v41::tensor::GQA_TENSORS;
+        let names = sparkflash_engine::tensor::GQA_TENSORS;
         let q = linear(names.q, (query, dim), RowForm::F32)?;
         let k = linear(names.k, (kv, dim), RowForm::F32)?;
         let v = linear(names.v, (kv, dim), RowForm::F32)?;
@@ -1930,7 +1930,7 @@ impl DeviceLayer<'_> {
                 io: DenseIo::new(RowForm::F32, output),
             })
         };
-        let names = sparkflash_model_deepseek_v41::tensor::GDN_TENSORS;
+        let names = sparkflash_engine::tensor::GDN_TENSORS;
         let qkv = linear(names.qkv, (conv, dim), RowForm::F32)?;
         let z = linear(names.z, (value, dim), RowForm::F32)?;
         let beta = linear(names.b, (heads, dim), RowForm::F32)?;

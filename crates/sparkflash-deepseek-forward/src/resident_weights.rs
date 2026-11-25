@@ -37,12 +37,12 @@ use sparkflash_device::arena::{
     ArenaAllocator, ArenaTensor, ResidentArena, TensorLayout, tile_b12x,
 };
 use sparkflash_device::resident::{OperandLayout, ResidentGroup, ResidentPlan};
+use sparkflash_engine::config::Mixer;
+use sparkflash_engine::tensor::{self, scale_of};
 use sparkflash_engine::weights::WeightSource;
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
 use sparkflash_model::format::StoredFormat;
-use sparkflash_model_deepseek_v41::config::Mixer;
-use sparkflash_model_deepseek_v41::tensor::{self, scale_of};
 /// Host seams are row-major BF16 weights with no scale grid and no device kernel; they are
 /// computed on the host (CompressorCache / IndexerWeights) and must never enter the device bind.
 fn is_host_seam_weight(name: &str) -> bool {
