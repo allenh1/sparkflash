@@ -264,7 +264,8 @@ pub fn rank_attention_geometry(
             continue;
         }
         // A Gated DeltaNet block: every projection whole on every rank, as the resident plan
-        // keeps it.
+        // keeps it, and the conv, decay vectors and gated norm its body reads beside them (BF16,
+        // bound by their stored bytes).
         if config.gdn_layers.contains(&layer) {
             let gdn = config.gdn.ok_or_else(|| {
                 format!("rank_attention_geometry: block {layer} is a Gated DeltaNet and the stack has no geometry")
@@ -276,6 +277,10 @@ pub fn rank_attention_geometry(
                 ("attn.in_proj_b.weight", (gdn.value_heads, config.dim)),
                 ("attn.in_proj_a.weight", (gdn.value_heads, config.dim)),
                 ("attn.out_proj.weight", (config.dim, value)),
+                ("attn.conv1d.weight", (2 * key + value, gdn.conv)),
+                ("attn.A_log", (gdn.value_heads, 1)),
+                ("attn.dt_bias", (gdn.value_heads, 1)),
+                ("attn.norm.weight", (gdn.value_dim, 1)),
             ] {
                 map.insert(crate::plan::layer_claim(layer, tail).to_owned(), shape);
             }

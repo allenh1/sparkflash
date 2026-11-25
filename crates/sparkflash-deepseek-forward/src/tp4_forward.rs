@@ -7989,6 +7989,9 @@ pub(crate) struct LayerDense {
     pub(crate) indexer: Option<sparkflash_kernels::dense_format::DenseFormat>,
     pub(crate) shared: Option<sparkflash_kernels::dense_format::DenseFormat>,
     pub(crate) grouped: Option<sparkflash_kernels::dense_format::DenseFormat>,
+    /// A Gated DeltaNet block's projections (`in_proj_qkv`, `in_proj_z`, `in_proj_b`,
+    /// `in_proj_a`, `out_proj`): like a grouped-query block's, no released body reads them.
+    pub(crate) recurrent: Option<sparkflash_kernels::dense_format::DenseFormat>,
 }
 
 #[cfg(feature = "cuda")]
@@ -7998,6 +8001,7 @@ impl LayerDense {
             || self.indexer.is_some()
             || self.shared.is_some()
             || self.grouped.is_some()
+            || self.recurrent.is_some()
     }
 }
 
@@ -11920,6 +11924,9 @@ struct DeviceLayer<'a> {
     /// The rows step's segments when it serves several lanes at once (empty: one sequence).
     #[cfg(feature = "cuda")]
     segs: Vec<lanes::Seg>,
+    /// A verify pass is running: the rows step's recurrent blocks leave each row's state in the
+    /// snapshot slab, for the kept row's commit (`commit_recurrent`). False outside a verify.
+    keep_recurrent: bool,
 }
 
 /// One position's attention window metadata, produced by `reference_seam` and `ref_select`.
@@ -13109,6 +13116,7 @@ impl<'a> DeviceLayer<'a> {
             kv_cache_off: false,
             #[cfg(feature = "cuda")]
             segs: Vec::new(),
+            keep_recurrent: false,
         })
     }
 
@@ -14320,24 +14328,29 @@ impl<'a> DeviceLayer<'a> {
                     .map(Some),
                     _ => Ok(None),
                 };
-            // A grouped-query block's projections have no released body: the route opens for
-            // whatever class they are stored in, and refuses by name one it has no entry for.
-            let grouped = match description.operand(Some(layer), Part::GqaAttention) {
-                Some(operand) => Some(open_dense_format(
+            // A grouped-query or Gated DeltaNet block's projections have no released body: the
+            // route opens for whatever class they are stored in, and refuses by name one it has
+            // no entry for.
+            let foreign = |part: Part| match description.operand(Some(layer), part) {
+                Some(operand) => open_dense_format(
                     self.cuda,
                     kernel_dir,
                     Some(layer),
-                    Part::GqaAttention,
+                    part,
                     operand.stored,
-                    &format!("layer {layer} {:?}", Part::GqaAttention),
-                )?),
-                None => None,
+                    &format!("layer {layer} {part:?}"),
+                )
+                .map(Some),
+                None => Ok(None),
             };
+            let grouped = foreign(Part::GqaAttention)?;
+            let recurrent = foreign(Part::GdnScan)?;
             routes.push(LayerDense {
                 attention: open(Part::MlaAttention, attention)?,
                 indexer: open(Part::SparseIndexer, indexer)?,
                 shared: open(mlp_part, mlp.map(|mlp| mlp.format))?,
                 grouped,
+                recurrent,
             });
         }
         if routes.iter().any(LayerDense::any) {
@@ -15558,6 +15571,12 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         if crate::plan::block_has_part(layer, sparkflash_model::Part::GqaAttention) {
             return Err(format!(
                 "layer device: layer {layer} is a grouped-query attention block, which the one-token stage loop has no stage for; it runs on the rows path"
+            ));
+        }
+        // Nor a recurrent stage: a Gated DeltaNet block runs on the rows path.
+        if crate::plan::block_has_part(layer, sparkflash_model::Part::GdnScan) {
+            return Err(format!(
+                "layer device: layer {layer} is a Gated DeltaNet block, which the one-token stage loop has no stage for; it runs on the rows path"
             ));
         }
         // The one-token loop has no dense MLP stage: a dense-FFN block runs on the rows path.
