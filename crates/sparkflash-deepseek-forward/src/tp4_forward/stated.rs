@@ -1214,9 +1214,9 @@ impl DeviceLayer<'_> {
     }
 
     /// The FFN over the normed rows into the BF16 rows the reduce sums (`attn_out`).
-    fn stated_ffn(
+    fn stated_ffn<'s>(
         &self,
-        (stated, state): (&StatedDevice, &StatedRows),
+        (stated, state): (&'s StatedDevice, &'s StatedRows),
         ffn: &FfnTensors,
         b: super::rows::RowsBuffers,
         layer: usize,
@@ -1229,7 +1229,7 @@ impl DeviceLayer<'_> {
         let dim = self.dim;
         let limit = crate::plan::description().values().swiglu_limit as f32;
         let [_, swiglu, combine, narrow] = stated.token;
-        let linear = |matrix: TiledMatrix, held: bool| TiledLinear {
+        let linear = |matrix: TiledMatrix, held: bool| TiledLinear::<'s> {
             body: &stated.tiled,
             scratch: &state.scratch,
             matrix,
@@ -1238,7 +1238,7 @@ impl DeviceLayer<'_> {
             stage: None,
         };
         // One gated MLP over `count` rows from `input` into `output` (f32, held).
-        let mlp = |cx: &RowsCx<'_, TiledLinear<'_>>,
+        let mlp = |cx: &RowsCx<'_, TiledLinear<'s>>,
                    body: &Mlp,
                    input: Deviceptr,
                    output: Deviceptr,
