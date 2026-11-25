@@ -166,8 +166,11 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
     // has is an instance build (`nvfp4_prefill_sm121_i512` and its siblings), so there is no stem
     // cubin for the baseline to compile and pin. It is named here rather than in the script so the
     // exemption is one statement with a reason, and the assertion below keeps it strict: the source
-    // must be probed, must exist, and must not appear in the manifest.
-    const PROBED_NOT_BASELINED: &[&str] = &["nvfp4_prefill_sm121"];
+    // must be probed, must exist, and must not appear in the manifest. The two format routes are
+    // the same case: their cubins are second-shape builds, one per weight format, and no stem
+    // cubin exists for the baseline to pin.
+    const PROBED_NOT_BASELINED: &[&str] =
+        &["nvfp4_prefill_sm121", "dense_format_sm121", "routed_format_sm121"];
     let mut expected_probed = sorted_listed
         .iter()
         .map(|name| (*name).to_owned())

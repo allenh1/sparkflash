@@ -84,6 +84,7 @@ mod spec;
 mod vision;
 
 /// The most rows one verify step of the base holds, its anchors included.
+#[cfg(feature = "cuda")]
 pub const VERIFY_ROWS: usize = rows::R_MAX;
 
 /// What the base's shared verify step costs, as the runtime's row share reads it: the profile's
