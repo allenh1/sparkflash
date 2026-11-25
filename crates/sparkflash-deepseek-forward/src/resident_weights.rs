@@ -1555,10 +1555,14 @@ pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
             shared.insert(base.clone());
             shared.insert(scale_of(&base));
         }
-        for part in [RouterPart::Weight, RouterPart::Bias, RouterPart::BiasVl] {
+        for part in [RouterPart::Weight, RouterPart::Bias] {
             router.insert(
                 crate::plan::layer_claim(layer, &format!("ffn.gate.{}", part.as_str())).to_owned(),
             );
+        }
+        // The image-span bias is a vision stack's: a stack whose gate has none claims none.
+        if let Some(name) = crate::plan::layer_claim_if(layer, "ffn.gate.bias_vl") {
+            router.insert(name.to_owned());
         }
     }
     MoeExpectedSets {

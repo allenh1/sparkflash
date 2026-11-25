@@ -14205,15 +14205,24 @@ impl<'a> DeviceLayer<'a> {
                 .ok_or_else(|| {
                     format!("layer device router: the bind has no gate bias for layer {layer}")
                 })?;
-            let bias_vl = bind
+            // The image-span bias where the layer claims one; a stack without it keeps a null
+            // entry, which the vision route refuses by name.
+            let claims_vl = crate::plan::layer_claim_if(layer, "ffn.gate.bias_vl").is_some();
+            let bias_vl = match bind
                 .moe
                 .router
                 .get(&(layer, crate::resident_weights::RouterPart::BiasVl))
                 .copied()
-                .ok_or_else(|| {
-                    format!("layer device router: the bind has no gate bias_vl for layer {layer}")
-                })?;
-            if gate.0 == 0 || bias.0 == 0 || bias_vl.0 == 0 {
+            {
+                Some(pointer) => pointer,
+                None if !claims_vl => Deviceptr(0),
+                None => {
+                    return Err(format!(
+                        "layer device router: the bind has no gate bias_vl for layer {layer}"
+                    ));
+                }
+            };
+            if gate.0 == 0 || bias.0 == 0 || (claims_vl && bias_vl.0 == 0) {
                 return Err(format!(
                     "layer device router: layer {layer} bound a null router pointer; refusing to launch"
                 ));

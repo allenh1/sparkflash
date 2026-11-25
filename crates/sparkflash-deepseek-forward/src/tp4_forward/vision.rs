@@ -324,6 +324,7 @@ impl DeviceLayer<'_> {
             .router_vl
             .as_ref()
             .and_then(|biases| biases.get(layer).copied())
+            .filter(|bias| bias.0 != 0)
             .ok_or_else(|| format!("vision route: layer {layer} has no bias_vl"))?;
         self.cuda.launch(
             vision.route,
