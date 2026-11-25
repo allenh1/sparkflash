@@ -1316,7 +1316,10 @@ stack.
   * **Under the tie band.** The owner approved the band for foreign-part variants on 2026-11-24.
     `gqa-dense` runs under it at `B = 0.2` (section 3) and passes at world 1 with one tie:
     prompt 1, position 1, gap 0.0039 nats.
-  * **Not yet run:** a grouped-query block at world 2 or 4.
+  * **Worlds 2 and 4** (the four-node group, 2026-11-25, binary `6c534be6`, band 0.2). PASS at
+    both. World 2 has one tie: prompt 2, position 7, gap 0.0095. World 4 has two: prompt 1,
+    position 1, gap 0.0019, and the same 0.0095 tie. So the row split of wq/wk/wv and the inner
+    split of wo serve.
 * **S3** (`917ef5f5` .. `ab87fd5f`). `gdn-dense` makes block 0 a Gated DeltaNet block over a
   dense MLP. `gdn-decoder` makes block 7, above the encoder layers, a Gated DeltaNet block over
   the MoE. The base runs the block on the rows path through the dense arm's body,
@@ -1346,7 +1349,22 @@ stack.
     * With prefix reuse off, the device gives the same ids, so resuming changes no bits.
     * Layer 0's output agrees with the host on 8083 of 8192 BF16 values (max |diff| 2.0e-3,
       rms 0.19). The normed rows agree to 9e-6.
-  * **Not yet run:** world 2 or 4; the laptop has one GPU.
+  * **Worlds 2 and 4** (the four-node group, 2026-11-25). The first run, at `b7544349`, failed both
+    GDN variants from position 0. The block is whole on every rank, but the rank plan still split
+    its heads by the stack's world, and the scan sizes its grid from that plan. So each rank
+    scanned `value_heads / W` heads, and the other heads' rows were stale.
+    * A world-1 against world-2 dump located it. Layer 0's normed rows and all four projections
+      were bit-identical. The first difference was the scan's gated output, at a relative L2 of
+      0.714, which is close to the square root of 1/2. The NCCL exchange fails in the same way, so
+      the direct-RDMA exchange is not involved.
+    * `f18f04d0` names the whole block once (`whole_recurrent_block` in `engine_plan.rs`), for the
+      facts and for the scan's geometry. A test holds every head on every rank at worlds 1, 2
+      and 4. A recurrent layer outside an MLA stack keeps its split.
+    * With the fix (binary `6c534be6`, band 0.2), `gdn-decoder` passes at worlds 2 and 4 on exact
+      ids.
+    * `gdn-dense` passes at both worlds. World 2 has two ties: prompt 1, position 4, gap 0.0045,
+      and prompt 3, position 7, gap 0.0004. World 4 has the 0.0045 tie.
+    * `gqa-dense` passes unchanged.
 
 ## 5. Order
 
