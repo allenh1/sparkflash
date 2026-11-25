@@ -1589,6 +1589,7 @@ pub const fn forward_has_body(part: Part) -> bool {
             | Part::ManifoldHyperConnection
             | Part::MlaAttention
             | Part::GqaAttention
+            | Part::GdnScan
             | Part::Csa2Compression
             | Part::SparseIndexer
             | Part::Moe
@@ -1633,13 +1634,14 @@ const FUSED_PARTS: [Part; 8] = [
 
 /// Whether the base runs `part` on its own, outside the fused halves: the MLA attention (its
 /// entry seam, its sublayers and its post), the grouped-query attention (the same entry seam, the
-/// shared [sparkflash_ops::roles::GqaLayer] body and the base's reduce) and the dense gated MLP
-/// (its seam, the shared [sparkflash_ops::roles::GatedMlp] body and its post).
+/// shared [sparkflash_ops::roles::GqaLayer] body and the base's reduce), the Gated DeltaNet scan
+/// (the same seam, the shared [sparkflash_ops::roles::GdnLayer] body and the reduce) and the dense
+/// gated MLP (its seam, the shared [sparkflash_ops::roles::GatedMlp] body and its post).
 #[must_use]
 pub const fn runs_alone(part: Part) -> bool {
     matches!(
         part,
-        Part::MlaAttention | Part::GqaAttention | Part::DenseMlp
+        Part::MlaAttention | Part::GqaAttention | Part::GdnScan | Part::DenseMlp
     )
 }
 
@@ -1648,7 +1650,7 @@ pub const fn runs_alone(part: Part) -> bool {
 /// until its body takes interleaved chunks, and the scan says so.
 #[must_use]
 pub const fn interleaves(part: Part) -> bool {
-    !matches!(part, Part::GqaAttention)
+    !matches!(part, Part::GqaAttention | Part::GdnScan)
 }
 
 /// The first language block part with no body for interleaved prompt chunks ([interleaves]), and
