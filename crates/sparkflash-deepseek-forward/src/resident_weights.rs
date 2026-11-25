@@ -45,7 +45,15 @@ use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
 use sparkflash_model::format::StoredFormat;
 /// Host seams are row-major BF16 weights with no scale grid and no device kernel; they are
 /// computed on the host (CompressorCache / IndexerWeights) and must never enter the device bind.
+///
+/// A stated stack has no host seam: its pooled indexer's keys and head weights are device
+/// operands of the stated walk.
 fn is_host_seam_weight(name: &str) -> bool {
+    !crate::plan::stated_stack() && is_release_host_seam(name)
+}
+
+/// The release's host-seam names ([is_host_seam_weight]).
+fn is_release_host_seam(name: &str) -> bool {
     name.contains(".compressor.wgate.")
         || name.contains(".compressor.wkv.")
         || name.contains("indexer.weights_proj.")
@@ -310,6 +318,52 @@ pub fn rank_attention_geometry(
                     (names.norm, (kda.head_dim, 1)),
                     (names.out, (dim, width)),
                 ]);
+                shapes
+            }
+            // A stated stack's absorbed MLA: q_a, the kv_a latent and their norms whole, the
+            // query's and kv_b's rows by the rank's heads, o_proj's inner axis (a partial the
+            // base sums); its pooled indexer whole on every rank.
+            Mixer::Mla if crate::plan::stated_stack() => {
+                let latent = config.absorbed_latent.ok_or_else(|| {
+                    format!(
+                        "rank_attention_geometry: layer {layer} is a stated MLA without the absorbed latent"
+                    )
+                })?;
+                let heads = split(config.n_heads, "heads", "the absorbed MLA")?;
+                let query = heads * config.head_dim;
+                let mut shapes: Vec<(&str, (usize, usize))> = vec![
+                    ("attn.wq_a.weight", (config.q_lora_rank, dim)),
+                    ("attn.q_norm.weight", (config.q_lora_rank, 1)),
+                    ("attn.wq_b.weight", (query, config.q_lora_rank)),
+                    ("attn.wkv.weight", (latent.kv_lora_rank, dim)),
+                    ("attn.kv_norm.weight", (latent.kv_lora_rank, 1)),
+                    (
+                        "attn.wkv_b.weight",
+                        (
+                            heads * (config.head_dim + latent.v_head_dim),
+                            latent.kv_lora_rank,
+                        ),
+                    ),
+                    ("attn.wo.weight", (dim, heads * latent.v_head_dim)),
+                ];
+                if config.index_source_layers.contains(&layer) {
+                    let (index_heads, index_dim) = (config.index_n_heads, config.index_head_dim);
+                    shapes.extend([
+                        (
+                            "attn.indexer.wq_b.weight",
+                            (index_heads * index_dim, config.q_lora_rank),
+                        ),
+                        ("attn.indexer.wk.weight", (index_dim, dim)),
+                        ("attn.indexer.k_norm.weight", (index_dim, 1)),
+                        ("attn.indexer.k_norm.bias", (index_dim, 1)),
+                        ("attn.indexer.weights_proj.weight", (index_heads, dim)),
+                        ("attn.indexer.kpool_gate", (index_dim, dim)),
+                        (
+                            "attn.indexer.kpool_ape",
+                            (config.stated().index_pool, index_dim),
+                        ),
+                    ]);
+                }
                 shapes
             }
             Mixer::Mla => Vec::new(),
