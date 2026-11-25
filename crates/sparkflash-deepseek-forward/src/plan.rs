@@ -339,7 +339,7 @@ impl Description {
                 })
             })
             .unwrap_or_default();
-        let steps = language_steps(&plan)?;
+        let steps = language_steps(&plan, &values)?;
         Ok(Self {
             plan,
             values,
@@ -1450,6 +1450,110 @@ pub enum BlockSteps {
     /// Any other block: the pending residual lands, then each part runs on its own, in plan
     /// order, its delta folded back before the next one reads the rows.
     Parts(Vec<Part>),
+    /// A block of a stack whose description states its producer's value types beside the
+    /// release's ([sparkflash_engine::config::StatedWiring]): its token mixer and its FFN, each
+    /// between the manifold mix's entry and its leave on the stated stream.
+    Stated(StatedBlock),
+}
+
+/// The token mixer of a [BlockSteps::Stated] block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatedMixer {
+    /// Kimi Delta Attention, split by heads.
+    Kda,
+    /// The absorbed MLA over the positions the pooled indexer picks: this block's own indexer
+    /// (`own_indexer`), or the selection the block before it left.
+    Absorbed {
+        /// The block runs its own indexer.
+        own_indexer: bool,
+    },
+}
+
+/// The FFN of a [BlockSteps::Stated] block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatedFfn {
+    /// One gated MLP.
+    Dense,
+    /// The routed experts and the shared expert.
+    Moe,
+}
+
+/// A [BlockSteps::Stated] block: its token mixer, then its FFN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatedBlock {
+    /// The token mixer.
+    pub mixer: StatedMixer,
+    /// The FFN.
+    pub ffn: StatedFfn,
+}
+
+/// The parts a [BlockSteps::Stated] block may carry: the manifold mix and its norms, one token
+/// mixer (KDA, or the MLA with its indexer) and one FFN.
+const STATED_PARTS: [Part; 7] = [
+    Part::RmsNorm,
+    Part::ManifoldHyperConnection,
+    Part::KdaScan,
+    Part::MlaAttention,
+    Part::SparseIndexer,
+    Part::DenseMlp,
+    Part::Moe,
+];
+
+/// The stated walk's reading of block `index`'s parts.
+///
+/// # Errors
+/// A part outside [STATED_PARTS], a block without one token mixer and one FFN, an MLA without
+/// the absorbed latent, or a block that shares a selection no block before it made; each names
+/// the block.
+fn stated_block(
+    index: usize,
+    parts: &[Part],
+    values: &ModelConfig,
+    selection_before: bool,
+) -> Result<StatedBlock, ConfigError> {
+    if let Some(part) = parts.iter().find(|part| !STATED_PARTS.contains(part)) {
+        return Err(format!(
+            "forward open: block {index} carries the {part:?} part, which the stated walk has no body for"
+        ));
+    }
+    let has = |part| parts.contains(&part);
+    let mixer = match (has(Part::KdaScan), has(Part::MlaAttention)) {
+        (true, false) => StatedMixer::Kda,
+        (false, true) => {
+            if values.absorbed_latent.is_none() {
+                return Err(format!(
+                    "forward open: block {index}'s MLA states no absorbed latent; the stated walk runs the absorbed form only"
+                ));
+            }
+            let own_indexer = values.index_source_layers.contains(&index);
+            if !own_indexer && !selection_before {
+                return Err(format!(
+                    "forward open: block {index} shares an indexer, and the block before it makes no selection"
+                ));
+            }
+            StatedMixer::Absorbed { own_indexer }
+        }
+        _ => {
+            return Err(format!(
+                "forward open: block {index} carries no one token mixer the stated walk runs (KdaScan or MlaAttention)"
+            ));
+        }
+    };
+    if has(Part::SparseIndexer) && mixer == StatedMixer::Kda {
+        return Err(format!(
+            "forward open: block {index}'s indexer belongs to an MLA the block does not carry"
+        ));
+    }
+    let ffn = match (has(Part::DenseMlp), has(Part::Moe)) {
+        (true, false) => StatedFfn::Dense,
+        (false, true) => StatedFfn::Moe,
+        _ => {
+            return Err(format!(
+                "forward open: block {index} carries no one FFN the stated walk runs (DenseMlp or Moe)"
+            ));
+        }
+    };
+    Ok(StatedBlock { mixer, ffn })
 }
 
 /// The parts the fused halves cover. A block of only these, carrying both the attention and the
@@ -1541,11 +1645,21 @@ const fn absorbed(part: Part) -> bool {
 /// # Errors
 /// A block carries a part the forward has no body for, or a block that is not fused carries a
 /// part that does not run on its own; the message names the block and the part.
-pub fn language_steps(plan: &EnginePlan) -> Result<Vec<BlockSteps>, ConfigError> {
+pub fn language_steps(
+    plan: &EnginePlan,
+    values: &ModelConfig,
+) -> Result<Vec<BlockSteps>, ConfigError> {
+    // A stack that states its producer's types runs the stated walk, whose forms are the
+    // host's; any other runs the base's own.
+    let stated = !values.stated().is_release();
     sparkflash_engine::described::refuse_unrun_wiring(
         plan.model_facts(),
         "forward open: the device forward",
-        &sparkflash_engine::described::BASE_RUNS,
+        if stated {
+            &sparkflash_engine::described::HOST_RUNS
+        } else {
+            &sparkflash_engine::described::BASE_RUNS
+        },
     )?;
     let mut steps = Vec::new();
     for stack in plan.stacks() {
@@ -1560,6 +1674,23 @@ pub fn language_steps(plan: &EnginePlan) -> Result<Vec<BlockSteps>, ConfigError>
                         block.index, instance.part
                     ));
                 }
+            }
+            if stated {
+                let parts: Vec<Part> = block.parts.iter().map(|instance| instance.part).collect();
+                let selection_before = matches!(
+                    steps.last(),
+                    Some(BlockSteps::Stated(StatedBlock {
+                        mixer: StatedMixer::Absorbed { .. },
+                        ..
+                    }))
+                );
+                steps.push(BlockSteps::Stated(stated_block(
+                    block.index,
+                    &parts,
+                    values,
+                    selection_before,
+                )?));
+                continue;
             }
             let has = |part| block.parts.iter().any(|instance| instance.part == part);
             let fused = has(Part::MlaAttention)
@@ -1619,7 +1750,7 @@ pub fn language_steps(plan: &EnginePlan) -> Result<Vec<BlockSteps>, ConfigError>
 /// # Errors
 /// As [language_steps].
 pub fn check_language_parts(description: &Description) -> Result<(), ConfigError> {
-    language_steps(description.plan()).map(|_| ())
+    language_steps(description.plan(), description.values()).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1894,8 +2025,8 @@ mod tests {
 
     /// GLM-5.3-Flash's description fills the value table by part at every world: the KDA
     /// geometry and schedule, the absorbed latent, and zeros for the rotary, grouped-output and
-    /// compressor facts it plans no part for. The open then names KDA as the part the base has
-    /// no body for yet.
+    /// compressor facts it plans no part for. Its stated wiring opens every block on the stated
+    /// walk.
     #[test]
     fn the_glm_description_fills_the_value_table_by_part() {
         const GLM: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
@@ -1924,19 +2055,23 @@ mod tests {
                 assert_eq!(values.compress_rope_theta.to_bits(), 0f64.to_bits());
                 assert_eq!(values.index_topk, 2048);
                 assert_eq!(values.dense_ffn_layers, vec![0, 1, 2]);
-                // The absorbed latent, its probabilities, the pooled indexer and GLM's mix are
-                // not built on the device yet: the open names each, and runs none of V4's in
-                // their place.
-                let refusal = language_steps(&plan).expect_err("GLM's sparse layers");
-                for unrun in [
-                    "language.mla_attention.form = absorbed",
-                    "language.mla_attention.probabilities = query",
-                    "language.indexer.pool_compress = true",
-                    "language.manifold_hyper_connection.head_fold = mean",
-                ] {
-                    assert!(refusal.contains(unrun), "{unrun}: {refusal}");
+                // The stated stack opens on the stated walk: KDA blocks, the absorbed MLA with
+                // its own indexer or the selection before it, a dense prefix and the MoE.
+                let steps = language_steps(&plan, &values)
+                    .unwrap_or_else(|error| panic!("GLM TP{world}/{rank}: {error}"));
+                assert_eq!(steps.len(), 45);
+                for (block, step) in steps.iter().enumerate() {
+                    let BlockSteps::Stated(stated) = step else {
+                        panic!("block {block} is not on the stated walk: {step:?}");
+                    };
+                    let kda = values.kda_layers.contains(&block);
+                    assert_eq!(stated.mixer == StatedMixer::Kda, kda, "block {block}");
+                    if let StatedMixer::Absorbed { own_indexer } = stated.mixer {
+                        assert_eq!(own_indexer, values.index_source_layers.contains(&block));
+                    }
+                    let dense = values.dense_ffn_layers.contains(&block);
+                    assert_eq!(stated.ffn == StatedFfn::Dense, dense, "block {block}");
                 }
-                assert!(!refusal.contains("kda_scan"), "{refusal}");
             }
         }
     }

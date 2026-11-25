@@ -62,6 +62,8 @@ mod draft;
 mod lanes;
 #[cfg(feature = "cuda")]
 pub(crate) mod rows;
+#[cfg(feature = "cuda")]
+mod stated;
 
 /// The number of hidden streams the row kernels are built for (kernels/opt_rows_sm121.cu's
 /// `OR_S_HC`). A plan that states another count is refused before a row is written: the gather

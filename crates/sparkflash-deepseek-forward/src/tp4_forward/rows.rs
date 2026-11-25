@@ -1751,6 +1751,9 @@ impl DeviceLayer<'_> {
             crate::plan::BlockSteps::Parts(parts) => {
                 self.run_block_parts(rows, layer, parts, p0, n)
             }
+            crate::plan::BlockSteps::Stated(block) => {
+                self.run_block_stated(rows, layer, *block, p0, n)
+            }
         }
     }
 
