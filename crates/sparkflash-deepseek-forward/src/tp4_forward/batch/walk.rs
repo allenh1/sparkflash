@@ -70,14 +70,6 @@ impl Batch<'_, '_, '_> {
     }
 
     fn walk_describe(&self) -> Result<WalkDescription, String> {
-        // The walk declares positional state: a recurrent block's saved points would need the
-        // runtime's checkpoint, which this server does not keep.
-        if self.device.has_recurrent() {
-            return Err(
-                "the walk server keeps positional state only, and this stack has a recurrent block"
-                    .to_owned(),
-            );
-        }
         Ok(WalkDescription {
             lanes: self.lanes.len(),
             // Several sequences' rows in one step need the exchange (`token_rows`).
@@ -92,6 +84,7 @@ impl Batch<'_, '_, '_> {
             slack: super::super::lanes::SLIDE_KEEP
                 .saturating_sub(2 * sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW),
             row_bytes: self.device.lane_row_bytes(),
+            recurrent_bytes: self.device.recurrent_bytes(),
             bulk_rows: if self.inputs.bulk.is_some() && self.exchange.is_some() {
                 bulk_min()
             } else {
@@ -159,8 +152,11 @@ impl Batch<'_, '_, '_> {
         self.forget(lane)
     }
 
-    /// Moves the sequence on `lane` back to `to`: the start, or a resume boundary its windows
-    /// still hold, as a placed prompt resumes ([Batch::place]).
+    /// Moves the sequence on `lane` back to `to` as a placed prompt resumes ([Batch::place]):
+    /// its counters go to the resume boundary at or below `to`, a recurrent block's to the
+    /// lane's saved point ([recurrent_start]) when that is no later, else to the start; the rows
+    /// from there to `to` run again, so the sequence stands at `to` with its state as a cold
+    /// prompt of those rows leaves it.
     fn walk_rewind(&mut self, lane: usize, to: usize) -> Result<(), String> {
         let index = self.walk_seq(lane)?;
         let pos = self.seqs[index].pos;
@@ -170,25 +166,32 @@ impl Batch<'_, '_, '_> {
         if to == pos {
             return Ok(());
         }
-        if to == 0 {
+        let mut start = self.device.resume_boundary(to);
+        if self.device.has_recurrent() {
+            start = recurrent_start(start, self.device.recurrent_point(lane));
+        }
+        if slid_past(self.device.lane_floor(lane), start) {
+            start = 0;
+        }
+        if start == 0 {
             self.forget(lane)?;
-        } else if self.device.resume_boundary(to) != to {
-            return Err(format!(
-                "walk: a rewind to {to} is not a resume boundary (a multiple of {})",
-                self.device.resume_step()
-            ));
-        } else if slid_past(self.device.lane_floor(lane), to) {
-            return Err(format!(
-                "walk: lane {lane}'s windows slid past a rewind to {to}"
-            ));
         }
         self.enter(lane)?;
-        self.device.rewind_rows(to);
+        self.device.rewind_rows(start);
+        // From the start the replay's first chunk zeroes the recurrent state itself.
+        if start > 0 {
+            self.device.recurrent_resume(lane, start)?;
+        }
         let seq = &mut self.seqs[index];
-        seq.tokens.truncate(to);
-        seq.prompt_len = to;
-        seq.pos = to;
+        let replay = seq.tokens[start..to].to_vec();
+        let sampler = seq.sampler;
+        seq.tokens.truncate(start);
+        seq.prompt_len = start;
+        seq.pos = start;
         seq.walk_bulk_end = None;
+        if !replay.is_empty() {
+            self.walk_prefill(index, lane, &replay, sampler, false)?;
+        }
         Ok(())
     }
 
@@ -202,6 +205,20 @@ impl Batch<'_, '_, '_> {
         more: bool,
     ) -> Result<u32, String> {
         let index = self.walk_seq(lane)?;
+        self.walk_prefill(index, lane, rows, sampler, more)
+    }
+
+    /// Runs `rows` as prompt rows of sequence `index` on `lane` through the placed prompt's own
+    /// prefill bodies, which save a recurrent block's state at the chunk's last resume boundary
+    /// ([Batch::save_point]); answers the last row's pick.
+    fn walk_prefill(
+        &mut self,
+        index: usize,
+        lane: usize,
+        rows: &[u32],
+        sampler: Sampler,
+        more: bool,
+    ) -> Result<u32, String> {
         if rows.is_empty() {
             return Err("walk: an empty prompt chunk".to_owned());
         }
@@ -232,6 +249,11 @@ impl Batch<'_, '_, '_> {
         seq.reused = (seq.walk_bulk_end != Some(p)).then_some(p);
         self.enter(lane)?;
         self.device.rewind_rows(p);
+        // A prompt from the start begins its recurrent state at zero, as a placed one does
+        // ([Batch::place]); a later chunk continues the live state the last one left.
+        if p == 0 {
+            self.device.recurrent_resume(lane, 0)?;
+        }
         let mut pick = None;
         while self.seqs[index].pos < target {
             let first = if bulk {

@@ -2119,7 +2119,7 @@ mod base_conformance {
     /// checks read the layout's kind, so its bytes a row are a placeholder for the epoch's.
     fn stated() -> ArmProfile {
         let limits = Limits::new(PROMPT_ROWS, 1_048_576).with_members(32);
-        ArmProfile::new("DeepSeek", layout(1), limits)
+        ArmProfile::new("DeepSeek", layout(1, 0), limits)
             .with_code(CODE)
             .drafting(5, DraftBudget::OnePass(VERIFY_ROWS))
             .with_wall(step_wall())

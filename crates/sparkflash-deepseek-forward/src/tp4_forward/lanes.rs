@@ -769,6 +769,13 @@ impl<'a> DeviceLayer<'a> {
             .is_some_and(|lanes| !lanes.checkpoints.is_empty())
     }
 
+    /// The bytes one lane's live recurrent state holds (0 for a stack with no recurrent block).
+    pub(super) fn recurrent_bytes(&self) -> usize {
+        self.lanes
+            .as_ref()
+            .map_or(0, |lanes| lanes.recurrent_sizes.iter().sum())
+    }
+
     /// The position lane `lane`'s recurrent checkpoint holds, when it holds one.
     pub(super) fn recurrent_point(&self, lane: usize) -> Option<usize> {
         self.lanes

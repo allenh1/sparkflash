@@ -267,7 +267,9 @@ pub enum WalkCommand {
     Open,
     /// The sequence on `lane` ends and the lane's memory goes back.
     Release { lane: usize },
-    /// The sequence on `lane` goes back to position `to`.
+    /// The sequence on `lane` goes back to position `to`: its counters to the resume point at
+    /// or below it (a recurrent block's saved point, or the start), and the rows after that point
+    /// run again.
     Rewind { lane: usize, to: usize },
     /// Prompt rows on `lane` in one pass, the last row headed under `sampler`; answers one pick.
     /// `more` says more rows of the same prompt follow, so the next chunk continues this one's
@@ -316,6 +318,8 @@ pub struct WalkDescription {
     pub slack: usize,
     /// A lane's bytes a position, for the runtime's chunk policy.
     pub row_bytes: usize,
+    /// A lane's live recurrent state's bytes, or 0 when the stack has no recurrent block.
+    pub recurrent_bytes: usize,
     /// The fewest prompt rows a chunk takes the bulk path with, or 0 when it never does.
     pub bulk_rows: usize,
     /// The drafts a block proposes, or 0 when the epoch drafts nothing.

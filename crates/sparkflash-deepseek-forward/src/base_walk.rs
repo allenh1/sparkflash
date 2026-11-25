@@ -80,13 +80,21 @@ pub struct BaseWalk {
     drafter: BaseDrafter,
 }
 
-/// The walk's state: one positional region of `row_bytes` a row.
+/// The walk's state: one positional region of `row_bytes` a row, and a recurrent region of
+/// `recurrent_bytes` when the stack holds a Gated DeltaNet block.
 #[must_use]
-pub fn layout(row_bytes: usize) -> StateLayout {
-    StateLayout::new(vec![Region::Positional {
+pub fn layout(row_bytes: usize, recurrent_bytes: usize) -> StateLayout {
+    let mut regions = vec![Region::Positional {
         name: "kv",
         bytes_per_row: row_bytes,
-    }])
+    }];
+    if recurrent_bytes > 0 {
+        regions.push(Region::Recurrent {
+            name: "gated-deltanet",
+            bytes: recurrent_bytes,
+        });
+    }
+    StateLayout::new(regions)
 }
 
 impl BaseWalk {
@@ -102,7 +110,7 @@ impl BaseWalk {
         };
         Ok(Self {
             description,
-            layout: layout(description.row_bytes),
+            layout: layout(description.row_bytes, description.recurrent_bytes),
             drafter: BaseDrafter {
                 link: link.clone(),
                 description,
@@ -196,7 +204,8 @@ impl Walk for BaseWalk {
             .union(PassMask::BULK)
             .union(PassMask::VERIFY),
         segments: Segments::Many,
-        state: StateKind::Positional,
+        // A stack may hold a Gated DeltaNet block; the epoch's layout says whether this one does.
+        state: StateKind::Both,
         // Word for word the arm's rows in `sparkflash_model::ARM_LEDGERS`; the generated
         // profile test holds them equal.
         compute: ComputeDeclaration {
@@ -354,8 +363,13 @@ impl Walk for BaseWalk {
             .collect()
     }
 
-    /// A rewind moves the position counters, which only a resume boundary leaves whole.
+    /// A rewind moves the position counters, which only a resume boundary leaves whole. A stack
+    /// with a recurrent block keeps the prompt's end: the runtime checkpoints there, and the
+    /// server resumes the lane from its saved recurrent point and runs the rows after it again.
     fn rewind_point(&self, prompt: usize) -> usize {
+        if self.description.recurrent_bytes > 0 {
+            return prompt;
+        }
         prompt - prompt % self.description.resume_step.max(1)
     }
 
