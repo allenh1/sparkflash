@@ -1697,10 +1697,27 @@ impl DeviceLayer<'_> {
             self.set_seam_weights(*weights);
             let Some(dir) = dump.as_deref().filter(|_| Self::block_fused(layer)) else {
                 self.run_layer_rows(rows, layer, p0, n)?;
-                // A block that runs its parts one at a time: its stream out.
+                // A block that runs its parts one at a time: what its attention left (a
+                // grouped-query block's f32 rows too) and its stream out.
                 if let Some(dir) = dump.as_deref() {
                     let name = format!("L{layer:02}");
-                    self.rows_dump(dir, &name, &[("stream", b.stream, n * hc * dim * 4)], p0, n)?;
+                    let mut buffers = vec![
+                        ("attn_normed", b.normed, n * dim * 4),
+                        ("attn_out_bf16", b.attn_out, n * dim * 2),
+                        ("attn_reduced_bf16", b.reduced, n * dim * 2),
+                        ("stream", b.stream, n * hc * dim * 4),
+                    ];
+                    if let Some(grouped) = rows.grouped.as_ref() {
+                        let (query, kv) = (grouped.shape.query_width(), grouped.shape.kv_width());
+                        let g = grouped.rows;
+                        buffers.extend([
+                            ("gqa_query", g.query.0, n * query * 4),
+                            ("gqa_key", g.key.0, n * kv * 4),
+                            ("gqa_value", g.value.0, n * kv * 4),
+                            ("gqa_attended", g.attended.0, n * query * 4),
+                        ]);
+                    }
+                    self.rows_dump(dir, &name, &buffers, p0, n)?;
                 }
                 continue;
             };
