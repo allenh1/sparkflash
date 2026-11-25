@@ -160,6 +160,9 @@ pub struct Classification {
     pub placement: Placement,
     /// The sharding rule; \`None\` for a disk-only tensor whose on-demand read is the Engram packer's.
     pub rule: Option<ShardRule>,
+    /// Whether the layout's split decides the rule ([HeaderEntry::split]): a recurrent block's
+    /// tensors, whose split is the description's statement rather than one rule of their name.
+    pub stated: bool,
 }
 
 impl Classification {
@@ -168,6 +171,18 @@ impl Classification {
             group,
             placement: Placement::Resident,
             rule: Some(rule),
+            stated: false,
+        }
+    }
+
+    /// A tensor whose rank split the layout states: `whole` is the rule a single rank holds it
+    /// by, and a group of more than one rank takes the stated split ([ResidentPlan::plan_with_tp]).
+    const fn stated(group: ResidentGroup) -> Self {
+        Self {
+            group,
+            placement: Placement::Resident,
+            rule: Some(ShardRule::Replicated),
+            stated: true,
         }
     }
 
@@ -176,6 +191,7 @@ impl Classification {
             group,
             placement: Placement::Disk,
             rule: None,
+            stated: false,
         }
     }
 }
@@ -194,6 +210,11 @@ pub struct HeaderEntry {
     /// The bind's authority: a tensor's operand layout is derived from its format, not from the
     /// dtype word, and a tensor with no stated format binds as stored bytes.
     pub format: Option<sparkflash_model::format::StoredFormat>,
+    /// The rank split the layout states for this tensor, when the execution plan claims it.
+    ///
+    /// A recurrent block's tensors take it ([Classification::stated]); every other tensor keeps
+    /// the rule of its name.
+    pub split: Option<ShardRule>,
 }
 
 impl HeaderEntry {
@@ -205,7 +226,15 @@ impl HeaderEntry {
             dtype: dtype.into(),
             shape,
             format: None,
+            split: None,
         }
+    }
+
+    /// The same entry with the rank split the layout states for it.
+    #[must_use]
+    pub fn with_split(mut self, split: Option<ShardRule>) -> Self {
+        self.split = split;
+        self
     }
 
     /// The same entry with the format the execution plan resolved for it.
@@ -306,20 +335,19 @@ pub fn classify(name: &str) -> Result<Option<Classification>, ShardError> {
                 classified(Group::AttentionColumn, ShardRule::Column)
             }
             "wo.weight" | "wo.scale" => classified(Group::AttentionRow, ShardRule::Row),
-            // A Gated DeltaNet block (`linear_attention`) runs whole on every rank: its fused
-            // q/k/v rows split as three runs and its conv by the same channels, which no single
-            // shard rule states.
+            // A recurrent block's tensors split as its layout states: a Gated DeltaNet's
+            // (`linear_attention`) whole on every rank, Kimi Delta Attention's (`kda_scan`) by
+            // heads with its low-rank `f_a`/`g_a` and output norm whole.
             "in_proj_qkv.weight" | "in_proj_qkv.scale" | "in_proj_z.weight" | "in_proj_z.scale"
             | "in_proj_b.weight" | "in_proj_b.scale" | "in_proj_a.weight" | "in_proj_a.scale"
             | "out_proj.weight" | "out_proj.scale" | "conv1d.weight" | "A_log" | "dt_bias"
-            | "norm.weight" => classified(Group::AttentionReplicated, ShardRule::Replicated),
-            // A Kimi Delta Attention block (`kda_scan`) runs whole on every rank too: its three
-            // short convolutions, low-rank forget and gate pairs, beta, decay and output norm.
-            "q_proj.weight" | "q_proj.scale" | "k_proj.weight" | "k_proj.scale"
-            | "v_proj.weight" | "v_proj.scale" | "q_conv1d.weight" | "k_conv1d.weight"
-            | "v_conv1d.weight" | "f_a_proj.weight" | "f_b_proj.weight" | "g_a_proj.weight"
-            | "g_b_proj.weight" | "b_proj.weight" | "o_norm.weight" | "o_proj.weight"
-            | "o_proj.scale" => classified(Group::AttentionReplicated, ShardRule::Replicated),
+            | "norm.weight" | "q_proj.weight" | "q_proj.scale" | "k_proj.weight"
+            | "k_proj.scale" | "v_proj.weight" | "v_proj.scale" | "q_conv1d.weight"
+            | "k_conv1d.weight" | "v_conv1d.weight" | "f_a_proj.weight" | "f_b_proj.weight"
+            | "g_a_proj.weight" | "g_b_proj.weight" | "b_proj.weight" | "o_norm.weight"
+            | "o_proj.weight" | "o_proj.scale" => {
+                Ok(Some(Classification::stated(Group::AttentionReplicated)))
+            }
             "attn_sink" => classified(Group::AttentionSink, ShardRule::Column),
             other if other.starts_with("indexer.") || other.starts_with("compressor.") => {
                 classified(Group::AttentionAux, ShardRule::Replicated)
@@ -678,9 +706,24 @@ impl ResidentPlan {
                     entry.name
                 )));
             }
-            let Some(classification) = classify(&entry.name)? else {
+            let Some(mut classification) = classify(&entry.name)? else {
                 continue;
             };
+            if classification.stated && tp.world() > 1 {
+                let rule = entry.split.ok_or_else(|| {
+                    ShardError::Plan(format!(
+                        "{}: a recurrent block's tensor splits as its layout states, and the plan states no split for it at TP{}",
+                        entry.name,
+                        tp.world()
+                    ))
+                })?;
+                classification.rule = Some(rule);
+                classification.group = match rule {
+                    ShardRule::Replicated => ResidentGroup::AttentionReplicated,
+                    ShardRule::Column => ResidentGroup::AttentionColumn,
+                    ShardRule::Row => ResidentGroup::AttentionRow,
+                };
+            }
             let stored_bytes = entry.byte_len()?;
             let (shard_bytes, shard_shape, ranges) = match classification.rule {
                 None => (0, Vec::new(), 0),
@@ -1029,32 +1072,46 @@ mod tests {
     }
 
     #[test]
-    fn a_kimi_delta_attention_block_is_whole_on_every_rank() {
-        for leaf in [
-            "q_proj.weight",
-            "k_proj.scale",
-            "v_proj.weight",
-            "q_conv1d.weight",
-            "v_conv1d.weight",
-            "f_a_proj.weight",
-            "g_b_proj.weight",
-            "b_proj.weight",
-            "A_log",
-            "dt_bias",
-            "o_norm.weight",
-            "o_proj.weight",
-        ] {
-            let name = format!("layers.3.attn.{leaf}");
-            let classification = classify(&name).expect("known").expect("resident");
-            assert_eq!(
-                (classification.group, classification.rule),
-                (
-                    ResidentGroup::AttentionReplicated,
-                    Some(ShardRule::Replicated)
-                ),
-                "{name}"
-            );
-        }
+    fn a_kimi_delta_attention_block_splits_as_its_layout_states() {
+        // Eight heads of 64 over a 256-wide hidden: q by its rank's head rows, the conv by the
+        // same channels, the decay vector by heads, f_a whole and o_proj by its inner axis.
+        let entries = || {
+            [
+                ("q_proj.weight", "BF16", vec![512, 256], Some(ShardRule::Column)),
+                ("q_conv1d.weight", "BF16", vec![512, 1, 4], Some(ShardRule::Column)),
+                ("A_log", "F32", vec![8], Some(ShardRule::Column)),
+                ("f_a_proj.weight", "BF16", vec![64, 256], Some(ShardRule::Replicated)),
+                ("o_proj.weight", "BF16", vec![256, 512], Some(ShardRule::Row)),
+            ]
+            .into_iter()
+            .map(|(leaf, dtype, shape, split)| {
+                entry(&format!("layers.0.attn.{leaf}"), dtype, &shape).with_split(split)
+            })
+            .collect::<Vec<_>>()
+        };
+        let plan = ResidentPlan::plan(1, 4, entries()).expect("a stated split plans");
+        let shape = |leaf: &str| {
+            let name = format!("layers.0.attn.{leaf}");
+            let shard = plan.shards().iter().find(|shard| shard.name == name).expect("planned");
+            (shard.group, shard.shard_shape.clone())
+        };
+        assert_eq!(shape("q_proj.weight"), (ResidentGroup::AttentionColumn, vec![128, 256]));
+        assert_eq!(shape("q_conv1d.weight"), (ResidentGroup::AttentionColumn, vec![128, 1, 4]));
+        assert_eq!(shape("A_log"), (ResidentGroup::AttentionColumn, vec![2]));
+        assert_eq!(shape("f_a_proj.weight"), (ResidentGroup::AttentionReplicated, vec![64, 256]));
+        assert_eq!(shape("o_proj.weight"), (ResidentGroup::AttentionRow, vec![256, 128]));
+
+        // One rank holds every tensor whole whatever the layout states.
+        let whole = ResidentPlan::plan(0, 1, entries()).expect("one rank");
+        assert!(whole.shards().iter().all(|shard| shard.shard_shape == shard.stored_shape));
+
+        // A group with no stated split is refused by name, never held whole silently.
+        let unstated = entries().into_iter().map(|entry| entry.with_split(None));
+        let refusal = ResidentPlan::plan(0, 2, unstated)
+            .expect_err("no stated split")
+            .to_string();
+        assert!(refusal.contains("layers.0.attn.q_proj.weight"), "{refusal}");
+        assert!(refusal.contains("states no split"), "{refusal}");
     }
 
     #[test]

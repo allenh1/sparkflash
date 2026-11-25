@@ -1404,6 +1404,28 @@ pub fn tensor_format(
     }
 }
 
+/// The rank split the layout states for each tensor the plan claims, by the name the base reads
+/// it by ([sparkflash_ops::engine_plan::PlanTensor::base_name]). A split no single shard rule
+/// states (a tiled or expert run, shared key/value rows) is left out: those tensors keep the rule
+/// of their name.
+pub fn tensor_splits(
+    plan: &sparkflash_ops::engine_plan::EnginePlan,
+) -> BTreeMap<String, sparkflash_device::shard::ShardRule> {
+    use sparkflash_device::shard::ShardRule;
+    plan.tensors()
+        .iter()
+        .filter_map(|tensor| {
+            let rule = match tensor.split.as_str() {
+                "whole" => ShardRule::Replicated,
+                "rows" | "conv" | "vector" => ShardRule::Column,
+                "columns" => ShardRule::Row,
+                _ => return None,
+            };
+            Some((tensor.base_name().to_owned(), rule))
+        })
+        .collect()
+}
+
 /// The expert format of the block that claims a routed expert's weight, or `None` for a tensor
 /// that is not one (a scale plane, the shared expert, a dense projection).
 fn routed_expert_format(
@@ -1450,6 +1472,7 @@ fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize)
                 })?;
             // The source's index, not the file's: it answers to the layout's slots.
             let index = source.index();
+            let splits = tensor_splits(&plan);
             let mut entries = Vec::with_capacity(index.weight_map.len());
             for name in index.names() {
                 let header = source
@@ -1461,7 +1484,8 @@ fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize)
                 let format = tensor_format(&plan, name, &tensor.dtype);
                 entries.push(
                     HeaderEntry::new(name.to_string(), tensor.dtype.clone(), tensor.shape.clone())
-                        .with_format(format),
+                        .with_format(format)
+                        .with_split(splits.get(name).copied()),
                 );
             }
             let seen = entries.len();
@@ -1499,12 +1523,19 @@ pub fn entries_from_tensor_index(path: &Path) -> Result<Vec<HeaderEntry>, String
             path.display()
         )
     })?;
+    let installed = crate::plan::installed();
+    let splits = installed
+        .map(|description| tensor_splits(description.plan()))
+        .unwrap_or_default();
     Ok(map
         .into_iter()
         .map(|(name, tensor)| {
-            let format = crate::plan::installed()
+            let format = installed
                 .and_then(|description| tensor_format(description.plan(), &name, &tensor.dtype));
-            HeaderEntry::new(name, tensor.dtype, tensor.shape).with_format(format)
+            let split = splits.get(&name).copied();
+            HeaderEntry::new(name, tensor.dtype, tensor.shape)
+                .with_format(format)
+                .with_split(split)
         })
         .collect())
 }
