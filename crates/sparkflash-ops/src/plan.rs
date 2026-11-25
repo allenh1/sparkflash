@@ -1096,6 +1096,10 @@ pub struct ShapeConstraint {
     pub max_top_k: Option<usize>,
     /// Most heads this implementation addresses.
     pub max_heads: Option<usize>,
+    /// Widest hidden row this implementation addresses.
+    pub max_hidden: Option<usize>,
+    /// Widest head this implementation addresses.
+    pub max_head_dim: Option<usize>,
     /// Fewest residual streams this implementation accepts.
     pub min_streams: Option<usize>,
     /// Most residual streams this implementation accepts.
@@ -1179,6 +1183,8 @@ impl ShapeConstraint {
         max_experts: None,
         max_top_k: None,
         max_heads: None,
+        max_hidden: None,
+        max_head_dim: None,
         min_streams: None,
         max_streams: None,
         min_window: None,
@@ -1409,6 +1415,20 @@ impl ShapeConstraint {
     #[must_use]
     pub const fn max_heads(mut self, max: usize) -> Self {
         self.max_heads = Some(max);
+        self
+    }
+
+    /// Cap the hidden width this implementation addresses.
+    #[must_use]
+    pub const fn max_hidden(mut self, max: usize) -> Self {
+        self.max_hidden = Some(max);
+        self
+    }
+
+    /// Cap the head width this implementation addresses.
+    #[must_use]
+    pub const fn max_head_dim(mut self, max: usize) -> Self {
+        self.max_head_dim = Some(max);
         self
     }
 
@@ -1655,6 +1675,8 @@ impl ShapeConstraint {
         at_most("experts", geometry.experts, self.max_experts)?;
         at_most("top-k", geometry.top_k, self.max_top_k)?;
         at_most("heads", geometry.heads, self.max_heads)?;
+        at_most("hidden", geometry.hidden, self.max_hidden)?;
+        at_most("head width", geometry.head_dim, self.max_head_dim)?;
         at_least("streams", geometry.streams, self.min_streams)?;
         at_most("streams", geometry.streams, self.max_streams)?;
         at_least("window", geometry.window, self.min_window)?;

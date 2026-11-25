@@ -516,6 +516,24 @@ impl KernelResolver {
                 entry.image.name()
             ));
         }
+        // The GLM images' bodies take their widths at run time, so their shape rules state the
+        // kernels' bounds rather than one release's widths. Like the canonical DeepSeek body,
+        // they answer only for the family that names them: a plan of another family is not
+        // handed a body because its widths happen to fit. A synthetic requirement names no
+        // family and is answered by shape alone.
+        if matches!(
+            entry.image,
+            Image::GlmAttention | Image::GlmDecode | Image::GlmPrefill | Image::GlmMoe
+        ) && requirement
+            .geometry
+            .model
+            .is_some_and(|model| model != ModelFamily::Glm && model != ModelFamily::Other)
+        {
+            return Err(format!(
+                "{} is the GLM arm's body, not this plan's",
+                entry.image.name()
+            ));
+        }
         if let Err(reason) = entry.shape.accepts(&requirement.geometry) {
             return Err(format!("{}: {reason}", entry.image.name()));
         }

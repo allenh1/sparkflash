@@ -20,7 +20,7 @@ use sparkflash_ops::OpPlan;
 use sparkflash_ops::engine_plan::{EnginePlan, PartRequirement, PrecisionPolicy};
 use sparkflash_ops::gemm::GroupedMoeGemmPlan;
 use sparkflash_ops::plan::{
-    GroupedFp8Body, KernelId, KernelPhase, PartGeometry, Precision, StreamId,
+    GroupedFp8Body, KernelId, KernelPhase, ModelFamily, PartGeometry, Precision, StreamId,
 };
 use sparkflash_ops::resolver::{Availability, KernelResolver, PlanContext, ResolvedKernel};
 use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
@@ -390,6 +390,9 @@ fn both_qwen_arms_resolve_their_own_dense_prefill_body() {
                 positions: plan.architecture().max_position_embeddings,
                 world: 1,
                 rank: 0,
+                // The arm's requirement names its family: a GLM body that fits the widths is
+                // not Qwen's.
+                model: Some(ModelFamily::Qwen),
                 ..PartGeometry::new()
             },
             format: sparkflash_ops::engine_plan::format_of_precision(plan.precision().dense),
@@ -479,6 +482,7 @@ fn the_qwen_fp8_arm_boot_checks_both_passes_at_tp4() {
                 positions: plan.architecture().max_position_embeddings,
                 world,
                 rank: 0,
+                model: Some(ModelFamily::Qwen),
                 ..PartGeometry::new()
             },
             format: sparkflash_ops::engine_plan::format_of_precision(plan.precision().dense),
@@ -1435,14 +1439,25 @@ fn the_host_and_the_plan_fill_one_value_table() {
     }
 }
 
-/// The host and the device each refuse the wiring they have not built, by name: GLM's absorbed
-/// latent and pooled indexer are named, the released DeepSeek opens, and the KDA facts the shared
-/// body runs are not named.
+/// Each arm refuses the wiring it has not built, by name: the host runs GLM's described wiring on
+/// its whole-model path, the device's base walk names GLM's absorbed latent and pooled indexer,
+/// the released DeepSeek opens on both, and the KDA facts the shared body runs are not named.
 #[test]
 fn an_arm_refuses_the_wiring_it_does_not_run_by_name() {
     use sparkflash_model_deepseek_v41::described;
     described::host_config(DEEPSEEK).expect("the released DeepSeek opens on the host");
-    let refusal = described::host_config(GLM).expect_err("GLM's sparse layers on the host");
+    described::host_config(GLM).expect("GLM's described wiring opens on the host");
+    let facts = |text: &str| {
+        EnginePlan::from_json(text, Target::Sm121, 1, 0)
+            .expect("plan")
+            .model_facts()
+            .clone()
+    };
+    described::refuse_unrun_wiring(&facts(DEEPSEEK), "the device", &described::BASE_RUNS)
+        .expect("the released DeepSeek's wiring is the base's");
+    let refusal =
+        described::refuse_unrun_wiring(&facts(GLM), "the device", &described::BASE_RUNS)
+            .expect_err("GLM's stated wiring on the base walk");
     for unrun in [
         "language.mla_attention.form = absorbed",
         "language.sparse_indexer.scores = f32",

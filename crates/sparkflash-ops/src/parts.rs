@@ -136,12 +136,22 @@ pub struct PartKernel {
 /// head to 1024, key head to 256), so it carries the same list.
 const SCAN_HEAD_PAIRS: &[(usize, usize)] = &[(64, 64), (128, 128), (128, 256)];
 
-/// The head-width template the shared KDA scan serves.
+/// The head-width templates the shared KDA scan serves.
 ///
-/// The image now exports `q4p_kda_scan_64_64` and `q4p_kda_scan_128_256` beside `q4p_kda_scan`,
-/// but the GLM-5.3 host launches only `q4p_kda_scan` with a 128-wide key head and `GDN_VALUE` = 128
-/// value head, so the catalogue claims only the template the host can actually select.
-const KDA_SCAN_HEAD_PAIRS: &[(usize, usize)] = &[(128, 128)];
+/// The image exports `q4p_kda_scan_64_64` and `q4p_kda_scan_128_256` beside `q4p_kda_scan`
+/// (`kernels/qwen4_scan_sm121.cu`), and the shared role launches any of the three
+/// ([crate::gdn::KDA_SCANS]), so the pairs are the GDN scan's.
+const KDA_SCAN_HEAD_PAIRS: &[(usize, usize)] = SCAN_HEAD_PAIRS;
+
+/// The widest hidden row the GLM decode image's bodies address: the manifold mixer holds
+/// `Q4E_MHC_COLUMNS` (16) 256-wide column groups a stream (`kernels/glm_decode_sm121.cu:715`).
+/// The GLM bodies otherwise take their widths at run time, in whole 128-value FP8 tiles.
+const GLM_MAX_HIDDEN: usize = 16 * 256;
+
+/// The GLM indexer's score bodies stage at most 32 heads of at most 128 values
+/// (`Q4E_GLM_MAX_INDEX_HEADS`, `Q4E_GLM_MAX_INDEX_DIM`).
+const GLM_MAX_INDEX_HEADS: usize = 32;
+const GLM_MAX_INDEX_DIM: usize = 128;
 
 /// The vision patch side Inkling-2-Small's tower is released at.
 ///
@@ -235,7 +245,8 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // by name before a weight is read rather than launched on a body compiled for another shape.
         (Part::MlaAttention, Image::Deepseek) => CATALOGUE_DEEPSEEK_MLA,
         (Part::MlaAttention, Image::GlmAttention | Image::GlmDecode) => ShapeConstraint::ANY
-            .hidden_equals(4096)
+            .hidden_multiple(128)
+            .max_hidden(GLM_MAX_HIDDEN)
             .head_dim_multiple(16)
             .groups_between(0, 0)
             .positions(0, 1 << 21),
@@ -256,14 +267,14 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .head_dim_equals(128)
             .max_heads(8),
         (Part::SparseIndexer, Image::GlmDecode) => ShapeConstraint::ANY
-            .hidden_equals(4096)
-            .head_dim_equals(128)
-            .max_heads(32),
+            .hidden_multiple(128)
+            .max_hidden(GLM_MAX_HIDDEN)
+            .max_head_dim(GLM_MAX_INDEX_DIM)
+            .max_heads(GLM_MAX_INDEX_HEADS),
         (Part::GqaAttention, Image::Qwen4Attn) => ShapeConstraint::ANY
             .head_dim_multiple(16)
             .gqa_groups(GQA_GROUPS),
-        // GDN instantiates the templated scan at all three pairs; KDA's host selects only the
-        // 128/128 template it was released against.
+        // GDN and KDA instantiate the templated scan at all three pairs.
         (Part::GdnScan, Image::Qwen4Scan | Image::Qwen4Exp) => ShapeConstraint::ANY
             .head_pairs(SCAN_HEAD_PAIRS)
             .window_between(2, 9),
@@ -271,11 +282,11 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .head_pairs(KDA_SCAN_HEAD_PAIRS)
             .window_between(2, 9),
         (Part::DenseMlp, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROWS_MLP,
-        // GLM's bulk-prefill MLP is compiled for the 4096-wide release, like its DenseGemm
-        // entry. A 2560-wide Qwen MLP must not match it and launch glm_prefill_* on a body
-        // compiled for another width.
+        // GLM's bulk-prefill GEMMs take rows, columns and outputs at run time
+        // (`kernels/glm_prefill_sm121.cu`) in whole 128-value FP8 tiles; the plan's family, not
+        // a pinned width, keeps them from answering another arm.
         (Part::DenseMlp, Image::GlmPrefill) => ShapeConstraint::ANY
-            .hidden_equals(4096)
+            .hidden_multiple(128)
             .intermediate_multiple(16),
         (Part::DenseMlp, Image::Qwen4Exp) => ShapeConstraint::ANY
             .hidden_equals(2560)
@@ -295,7 +306,8 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .hidden_equals(2560)
             .intermediate_multiple(16),
         (Part::DenseMlp, Image::GlmDecode) => ShapeConstraint::ANY
-            .hidden_equals(4096)
+            .hidden_multiple(128)
+            .max_hidden(GLM_MAX_HIDDEN)
             .intermediate_multiple(16),
         // DeepSeek's routed experts are the MXFP4 (NVFP4 in the ops vocabulary) shape. The
         // instance list names the hidden width, the rank-local 576 real columns and the padded
@@ -308,10 +320,9 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .max_experts(512)
             .max_top_k(64),
         (Part::Moe, Image::GlmMoe | Image::GlmDecode) => ShapeConstraint::ANY
-            .hidden_equals(4096)
+            .hidden_multiple(128)
+            .max_hidden(GLM_MAX_HIDDEN)
             .intermediate_multiple(16)
-            .experts_equals(288)
-            .top_k_equals(8)
             .max_experts(512)
             .max_top_k(64),
         // Inkling's routed experts are a scalar dequantise over runtime columns, so the
@@ -336,7 +347,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // name. The plan's family keeps this canonical body from answering another arm.
         (Part::DenseGemm, Image::Deepseek) => ShapeConstraint::ANY.hidden_multiple(128),
         (Part::DenseGemm, Image::Qwen4Prefill) => ShapeConstraint::ANY.hidden_equals(2560),
-        (Part::DenseGemm, Image::GlmPrefill) => ShapeConstraint::ANY.hidden_equals(4096),
+        (Part::DenseGemm, Image::GlmPrefill) => ShapeConstraint::ANY.hidden_multiple(128),
         // q4e_gemv_bf16 / q4e_gemm_bf16 take rows and columns as runtime arguments: the GEMV
         // walks `row < rows` over a runtime `columns` (`kernels/qwen4_exp_sm121.cu:407-456`)
         // and the GEMM guards only `columns <= 0` and `batch > QG_TOKENS`
@@ -347,12 +358,12 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // form requires each output width to be a multiple of 32 (`:69-81`), a fact the
         // geometry has no field for. It is the same body the Dory MLP entry names.
         (Part::DenseGemm, Image::Dory) => ShapeConstraint::ANY,
-        (Part::DenseGemm, Image::GlmDecode) => ShapeConstraint::ANY.hidden_equals(4096),
+        (Part::DenseGemm, Image::GlmDecode) => ShapeConstraint::ANY.hidden_multiple(128),
         (Part::Activation, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROWS_ACTIVATION,
         (Part::Activation, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_equals(2560),
         (Part::Activation, Image::Qwen4Prefill) => ShapeConstraint::ANY.hidden_equals(2560),
         (Part::Activation, Image::GlmMoe | Image::GlmDecode) => {
-            ShapeConstraint::ANY.hidden_equals(4096)
+            ShapeConstraint::ANY.hidden_multiple(128)
         }
         (Part::Rope, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROPE,
         (Part::Rope, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_equals(2560),
@@ -383,7 +394,8 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::Quantize, _) => ShapeConstraint::ANY,
         // Only the GLM decode image exports a LayerNorm body; RMSNorm is a different part and
         // the resolver must never fall back to it.
-        (Part::LayerNorm, Image::GlmDecode) => ShapeConstraint::ANY.hidden_equals(4096),
+        // q4e_layer_norm takes its row width at run time.
+        (Part::LayerNorm, Image::GlmDecode) => ShapeConstraint::ANY,
         // The router bodies that exist are the two instances in kernels/instances.toml: 384
         // experts top-6 and the MTP 128 top-3. The old rule admitted any count up to 512, which
         // no built body serves.
@@ -393,7 +405,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .max_experts(512)
             .max_top_k(64),
         (Part::MoeRouter, Image::GlmDecode) => ShapeConstraint::ANY
-            .hidden_equals(4096)
+            .hidden_multiple(128)
             .max_experts(512)
             .max_top_k(64),
         (Part::MoeCombine, Image::Deepseek) => CATALOGUE_DEEPSEEK_ROWS_COMBINE,
@@ -410,10 +422,9 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .max_experts(512)
             .max_top_k(64),
         (Part::GroupedMoeGemm, Image::GlmMoe | Image::GlmDecode) => ShapeConstraint::ANY
-            .hidden_equals(4096)
+            .hidden_multiple(128)
+            .max_hidden(GLM_MAX_HIDDEN)
             .intermediate_multiple(16)
-            .experts_equals(288)
-            .top_k_equals(8)
             .max_experts(512)
             .max_top_k(64),
         (Part::MoePlan, Image::MoePlan) => ShapeConstraint::ANY,
@@ -426,6 +437,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .streams_between(2, 5),
         (Part::ManifoldHyperConnection, Image::GlmDecode) => ShapeConstraint::ANY
             .hidden_multiple(256)
+            .max_hidden(GLM_MAX_HIDDEN)
             .streams_between(2, 5),
         // The Engram bodies take the residual width as a launch word (engram_write_launch's
         // `dim`), so the compiled head width is the only shape the entry fixes. The released
@@ -1023,6 +1035,14 @@ pub const CATALOGUE: &[PartKernel] = &[
             ),
             pre(
                 "q4p_kda_scan",
+                &[Precision::Bf16, Precision::F32, Precision::Fp8E4M3],
+            ),
+            pre(
+                "q4p_kda_scan_64_64",
+                &[Precision::Bf16, Precision::F32, Precision::Fp8E4M3],
+            ),
+            pre(
+                "q4p_kda_scan_128_256",
                 &[Precision::Bf16, Precision::F32, Precision::Fp8E4M3],
             ),
             pre(
