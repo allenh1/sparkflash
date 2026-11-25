@@ -251,3 +251,105 @@ pub fn take() -> Option<Box<dyn DeviceLink>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
 }
+
+/// One command of the runtime's walk ([`crate::base_walk::BaseWalk`]) to the device forward.
+///
+/// The conformance fixture drives the base through the shared runtime's [`sparkflash_runtime::Walk`]
+/// contract instead of the serving link: each command is one of the contract's operations on one
+/// lane, run on the epoch's own thread (the forward's state is not `Send`) by
+/// [`crate::tp4_forward`]'s walk server, which reuses the serving scheduler's prefill and token
+/// rows bodies. Only a one-rank epoch takes it; a group's ranks would need the commands mirrored.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WalkCommand {
+    /// The epoch's limits ([`WalkDescription`]).
+    Describe,
+    /// A lane for a new sequence at position 0; answers [`WalkAnswer::Opened`].
+    Open,
+    /// The sequence on `lane` ends and the lane's memory goes back.
+    Release { lane: usize },
+    /// The sequence on `lane` goes back to position `to`.
+    Rewind { lane: usize, to: usize },
+    /// Prompt rows on `lane` in one pass, the last row headed under `sampler`; answers one pick.
+    Chunk {
+        lane: usize,
+        rows: Vec<u32>,
+        sampler: sparkflash_model::gumbel::GumbelSampler,
+    },
+    /// One token row a lane, in one step, each headed under its own sampler; answers one pick a
+    /// row, in order.
+    Tokens {
+        rows: Vec<(usize, u32, sparkflash_model::gumbel::GumbelSampler)>,
+    },
+    /// Whether the sequence on `lane` can be backed for `positions` positions.
+    Room { lane: usize, positions: usize },
+}
+
+/// What the walk server knows about the epoch, for [`sparkflash_runtime::Limits`] and the rewind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkDescription {
+    /// The lanes the scheduler holds (one without the device exchange).
+    pub lanes: usize,
+    /// The most positions a sequence may reach.
+    pub context: usize,
+    /// The resume boundaries' step: a sequence goes back only to a multiple of it.
+    pub resume_step: usize,
+    /// Whether the rows' embeddings and samples are exchanged on the device.
+    pub exchange: bool,
+    /// How many positions past a rewind point a sequence may write and still go back to it: the
+    /// window rings a lane keeps behind its position, less the two windows a resume reads.
+    pub slack: usize,
+    /// A lane's bytes a position, for the runtime's chunk policy.
+    pub row_bytes: usize,
+}
+
+/// The walk server's answer to one [`WalkCommand`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum WalkAnswer {
+    /// [`WalkCommand::Describe`].
+    Described(WalkDescription),
+    /// [`WalkCommand::Open`]: the lane.
+    Opened(usize),
+    /// A command with nothing to answer.
+    Done,
+    /// The picks of a [`WalkCommand::Chunk`] or [`WalkCommand::Tokens`].
+    Picks(Vec<u32>),
+    /// [`WalkCommand::Room`].
+    Room(bool),
+}
+
+/// One command and where its answer goes.
+pub struct WalkRequest {
+    /// The command.
+    pub command: WalkCommand,
+    /// The answer, or the server's refusal.
+    pub reply: std::sync::mpsc::Sender<Result<WalkAnswer, String>>,
+}
+
+static WALK: Mutex<Option<std::sync::mpsc::Receiver<WalkRequest>>> = Mutex::new(None);
+
+/// Installs the walk the next device forward epoch serves ([`WalkCommand`]); answers the end the
+/// walk sends its commands to.
+pub fn install_walk() -> std::sync::mpsc::Sender<WalkRequest> {
+    let (send, receive) = std::sync::mpsc::channel();
+    *WALK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receive);
+    send
+}
+
+/// Takes the installed walk, if any: the forward loop serves its commands until every sender is
+/// gone.
+pub fn take_walk() -> Option<std::sync::mpsc::Receiver<WalkRequest>> {
+    WALK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// Whether the next device epoch serves (a link or a walk is installed): it then holds lanes.
+pub fn serving() -> bool {
+    installed()
+        || WALK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+}

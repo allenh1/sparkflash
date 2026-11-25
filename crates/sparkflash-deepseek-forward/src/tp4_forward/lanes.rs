@@ -673,6 +673,13 @@ impl<'a> DeviceLayer<'a> {
             .is_none_or(|lanes| lanes.fits(rows, ahead))
     }
 
+    /// One lane's bytes over its positions, rounded up (0 without lanes).
+    pub(super) fn lane_row_bytes(&self) -> usize {
+        self.lanes.as_ref().map_or(0, |lanes| {
+            lanes.shape.stride.div_ceil(self.max_positions.max(1))
+        })
+    }
+
     /// The lanes attached, or 0.
     pub(super) fn lane_count(&self) -> usize {
         self.lanes.as_ref().map_or(0, |lanes| lanes.count())

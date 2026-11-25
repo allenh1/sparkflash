@@ -17852,7 +17852,7 @@ fn run_forward_loop(
         .speculation
         .enabled
         .unwrap_or(false);
-    let lanes_planned = dspark && planned_lanes(crate::device_link::installed())? > 0;
+    let lanes_planned = dspark && planned_lanes(crate::device_link::serving())? > 0;
     let gathered_positions = if lanes_planned {
         prompt_len.clamp(1, full_positions)
     } else {
@@ -18581,13 +18581,24 @@ fn run_forward_loop(
         // `sparkflash serve --tp4-device` installs a link before the epoch: serve its requests
         // instead of the one-shot generation.
         let link = crate::device_link::take();
+        // The conformance fixture's walk ([crate::base_walk]): its commands run on this epoch's
+        // thread. Its sequences are this process's, so a group (whose workers would need every
+        // command mirrored) and a serving link beside it are refused by name.
+        let walk = crate::device_link::take_walk();
+        if walk.is_some() && (link.is_some() || request.world != 1) {
+            return Err(format!(
+                "the walk server runs one rank with no serving link (world {}, link {})",
+                request.world,
+                link.is_some()
+            ));
+        }
         // Serving with the vision cubin staged takes images (DECISIONS.md D59): every rank opens the
         // routing kernel, the tower rank the tower too.
         if link.is_some() && crate::device_link::vision_enabled(dir) {
             device.open_vision(dir, request.weights, chunk.max(rows::R_MAX))?;
         }
         device.replicate_embedding(bind.tail.embed.0)?;
-        let lane_count = planned_lanes(link.is_some())?;
+        let lane_count = planned_lanes(link.is_some() || walk.is_some())?;
         if lane_count > 0 {
             device.attach_lanes(&lanes::LaneGeometry {
                 count: lane_count,
@@ -18668,9 +18679,12 @@ fn run_forward_loop(
             .speculation
             .dspark_steps
             .unwrap_or(usize::MAX);
-        match link {
-            Some(mut link) => spec::serve(device, rows, &drafter, &inputs, k, link.as_mut())?,
-            None => spec::run_spec(device, rows, &drafter, &inputs, k, max_new)?,
+        match (link, walk) {
+            (Some(mut link), _) => {
+                spec::serve(device, rows, &drafter, &inputs, k, link.as_mut())?;
+            }
+            (None, Some(walk)) => spec::serve_walk(device, rows, &drafter, &inputs, k, &walk)?,
+            (None, None) => spec::run_spec(device, rows, &drafter, &inputs, k, max_new)?,
         }
         device.release_vision();
         if let Some(table) = device.embed_table.take() {

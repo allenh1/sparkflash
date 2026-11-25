@@ -78,6 +78,8 @@ use sparkflash_vision::IMAGE_TOKEN_ID;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod walk;
+
 /// A tick's call to rank 0's link with the next tick's room and hold, made once the decode
 /// step's device work is queued ([`crate::device_link::DeviceLink::ahead`]).
 pub(super) type Ahead<'a> = &'a mut dyn FnMut(usize, bool) -> Result<(), String>;
@@ -266,9 +268,56 @@ struct Seq {
     verify_ms: f64,
     phase_ms: [f64; 4],
     reused: Option<usize>,
+    /// The end of the walk's last bulk chunk of this sequence, while nothing else has run on it
+    /// since ([Batch::walk_mode]): a chunk that starts there appends to the packed-key store.
+    walk_bulk_end: Option<usize>,
 }
 
 impl Seq {
+    /// A sequence waiting for a lane, with nothing run yet.
+    #[allow(clippy::too_many_arguments)]
+    fn waiting(
+        id: u64,
+        tokens: Vec<u32>,
+        images: &[VisionImage],
+        prompt_len: usize,
+        max_new: usize,
+        sampler: Sampler,
+        constraint: Option<sparkflash_api::constrained::TokenConstraint>,
+        stop_ids: &[u32],
+        exact: bool,
+        policy: DepthPolicy,
+    ) -> Self {
+        Self {
+            id,
+            tokens,
+            images: images.to_vec(),
+            prompt_len,
+            max_new,
+            sampler,
+            constraint,
+            refused: None,
+            stop_ids: stop_ids.to_vec(),
+            exact,
+            lane: None,
+            pos: 0,
+            phase: Phase::Waiting,
+            policy,
+            done: false,
+            admitted: Instant::now(),
+            prefill_ms: 0.0,
+            decode_started: None,
+            steps: 0,
+            accepted: 0,
+            verified: 0,
+            draft_ms: 0.0,
+            verify_ms: 0.0,
+            phase_ms: [0.0; 4],
+            reused: None,
+            walk_bulk_end: None,
+        }
+    }
+
     fn emitted(&self) -> usize {
         self.tokens.len() - self.prompt_len
     }
@@ -312,6 +361,24 @@ fn constraint_refusal(
         .advance(id)
         .err()
         .map(|error| format!("structured output: token {id} leaves the schema: {error}"))
+}
+
+/// Refuses an id past the vocabulary: the device embedding reads row `id` of the table
+/// unchecked, and an id past it would fault the context.
+fn in_vocabulary(ids: &[u32]) -> Result<(), String> {
+    match ids.iter().find(|&&id| id as usize >= crate::plan::vocab()) {
+        Some(&id) => Err(format!(
+            "token {id} is outside the {}-token vocabulary",
+            crate::plan::vocab()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Whether a lane whose window rings start at `floor` has slid past a resume at `start`: the rows
+/// a resume starts read both windows behind it, the layers' and the drafter's.
+fn slid_past(floor: usize, start: usize) -> bool {
+    floor > 0 && start < floor + 2 * sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW
 }
 
 /// A lane as the scheduler sees it.
@@ -698,17 +765,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 self.room
             ));
         }
-        // The device embedding reads row `id` of the table unchecked: an id past the vocabulary
-        // would fault the context, so it is refused here by name.
-        if let Some(&id) = prompt
-            .iter()
-            .find(|&&id| id as usize >= crate::plan::vocab())
-        {
-            return Err(format!(
-                "token {id} is outside the {}-token vocabulary",
-                crate::plan::vocab()
-            ));
-        }
+        in_vocabulary(prompt)?;
         let mut tokens = prompt.to_vec();
         if !images.is_empty() {
             if !self.device.has_vision() || self.exchange.is_none() {
@@ -732,12 +789,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 next = span.end();
             }
         }
-        if !sampler.is_greedy() && self.exchange.is_none() {
-            return Err(
-                "sampling needs the device exchange (SPARKFLASH_DEVICE_GATHER=0 turns it off); only greedy requests are served"
-                    .to_owned(),
-            );
-        }
+        self.servable(&sampler)?;
         if self.seqs.iter().any(|seq| seq.id == id) {
             return Err(format!("sequence {id} is already on the device"));
         }
@@ -762,34 +814,30 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             ),
             None => None,
         };
-        self.seqs.push(Seq {
+        self.seqs.push(Seq::waiting(
             id,
             tokens,
-            images: images.to_vec(),
-            prompt_len: prompt.len(),
+            images,
+            prompt.len(),
             max_new,
             sampler,
             constraint,
-            refused: None,
-            stop_ids: stop_ids.to_vec(),
+            stop_ids,
             exact,
-            lane: None,
-            pos: 0,
-            phase: Phase::Waiting,
             policy,
-            done: false,
-            admitted: Instant::now(),
-            prefill_ms: 0.0,
-            decode_started: None,
-            steps: 0,
-            accepted: 0,
-            verified: 0,
-            draft_ms: 0.0,
-            verify_ms: 0.0,
-            phase_ms: [0.0; 4],
-            reused: None,
-        });
+        ));
         self.keep_awake();
+        Ok(())
+    }
+
+    /// Refuses a sampler this epoch cannot run: anything but greedy needs the device exchange.
+    fn servable(&self, sampler: &Sampler) -> Result<(), String> {
+        if !sampler.is_greedy() && self.exchange.is_none() {
+            return Err(
+                "sampling needs the device exchange (SPARKFLASH_DEVICE_GATHER=0 turns it off); only greedy requests are served"
+                    .to_owned(),
+            );
+        }
         Ok(())
     }
 
@@ -1257,10 +1305,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             }
             // A lane whose window rings slid past the resume point cannot resume there (the rows
             // start reads need both windows, the layers' and the drafter's, behind it).
-            let floor = self.device.lane_floor(lane);
-            if floor > 0
-                && start < floor + 2 * sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW
-            {
+            if slid_past(self.device.lane_floor(lane), start) {
                 self.forget(lane)?;
                 start = 0;
             }
@@ -1428,9 +1473,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             return Ok(());
         }
         let floor = self.device.lane_floor(src).max(self.device.lane_floor(own));
-        if floor > 0
-            && start < floor + 2 * sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW
-        {
+        if slid_past(floor, start) {
             return Ok(());
         }
         if !self.device.copy_lane_prefix(own, src, start)? {
@@ -2547,14 +2590,15 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         Ok(n)
     }
 
-    /// One plain rows step over the sequences `group` (up to R_MAX, each its own lane): each
-    /// sequence's anchor is one row at its own position, sampled under its own sampler.
-    fn plain_step(
+    /// The device rows of one plain step over the sequences `group` (each its own lane): each
+    /// sequence's anchor `tokens[pos]` is one row at its own position, headed under its own
+    /// sampler and constraint. Answers the rows run and each row's pick; the positions and tokens
+    /// are the caller's to advance.
+    fn token_rows(
         &mut self,
         group: &[usize],
-        out: &mut Vec<Emission>,
         ahead: Ahead<'_>,
-    ) -> Result<usize, String> {
+    ) -> Result<(usize, Vec<(u32, f32)>), String> {
         let (rows, inputs, draft) = (self.rows, self.inputs, self.draft);
         let exchange = self
             .exchange
@@ -2638,7 +2682,18 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             Ok::<_, String>(picks)
         })();
         self.device.clear_segments();
-        let picks = result?;
+        Ok((n, result?))
+    }
+
+    /// One plain rows step over the sequences `group` (up to R_MAX, each its own lane): each
+    /// sequence's anchor is one row at its own position, sampled under its own sampler.
+    fn plain_step(
+        &mut self,
+        group: &[usize],
+        out: &mut Vec<Emission>,
+        ahead: Ahead<'_>,
+    ) -> Result<usize, String> {
+        let (n, picks) = self.token_rows(group, ahead)?;
         for (row, &index) in group.iter().enumerate() {
             let seq = &mut self.seqs[index];
             let pos = seq.pos;

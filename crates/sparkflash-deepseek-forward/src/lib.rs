@@ -24,6 +24,7 @@
 
 #[cfg(feature = "cuda")]
 pub mod attention_device;
+pub mod base_walk;
 pub mod chain_timing;
 #[cfg(feature = "cuda")]
 pub mod device_counters;

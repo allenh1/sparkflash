@@ -2163,6 +2163,32 @@ pub(super) fn serve(
     })
 }
 
+/// The conformance fixture's walk ([crate::device_link::WalkCommand]) on the serving scheduler:
+/// each command runs on this thread, through the scheduler's own prefill and token-rows bodies,
+/// until every sender is gone. The runtime owns reuse and the chunks here, so the scheduler runs
+/// in its walk mode ([Batch::walk_mode]).
+pub(super) fn serve_walk(
+    device: &mut DeviceLayer<'_>,
+    rows: &RowsState,
+    draft: &DraftState,
+    inputs: &SpecInputs<'_>,
+    k: usize,
+    walk: &std::sync::mpsc::Receiver<crate::device_link::WalkRequest>,
+) -> Result<(), String> {
+    std::thread::scope(|scope| {
+        let pools = Pools::start(scope, inputs);
+        let mut batch = Batch::new(device, rows, draft, inputs, &pools, k)?;
+        batch.walk_mode();
+        println!("walk server: {}", batch.describe());
+        while let Ok(request) = walk.recv() {
+            let answer = batch.walk_command(request.command);
+            // A walk that left before its answer loses only that answer.
+            let _ = request.reply.send(answer);
+        }
+        Ok(())
+    })
+}
+
 /// [`serve`]'s warm-up and tick loop on its scheduler.
 fn serve_ticks(
     batch: &mut Batch<'_, '_, '_>,
