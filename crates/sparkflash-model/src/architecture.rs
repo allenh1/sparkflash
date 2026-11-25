@@ -2265,6 +2265,10 @@ struct Schedule<'a> {
 /// another attention (a DeepSeek-shaped MLA stack): its geometry is `gqa_attn_config`'s.
 pub const GQA_LAYER_TYPE: &str = "gqa_attention";
 
+/// The layer type that names a Gated DeltaNet block (the Qwen3-Next spelling); its geometry is
+/// the stack's `linear_*` keys, and inside an MLA stack it compresses nothing.
+pub const GDN_LAYER_TYPE: &str = "linear_attention";
+
 /// The keys a stack spells for its own attention (MLA, its compressor and its indexer, and the
 /// rotary scaling its long context is trained under) that a `gqa_attention` layer does not
 /// inherit: its geometry, and any rotary scaling, is the nested object's alone.
@@ -2357,6 +2361,20 @@ fn attention(
             candidate_pool: None,
         };
         return attention(&view, index, "full_attention", 0, &plain);
+    }
+    if layer_type.contains("linear") {
+        // A recurrent layer keeps one state, never a compressed cache, and no layer reads its
+        // keys or its index scores.
+        if ratio > 0 {
+            return Err(invalid(format!(
+                "layer {index} is {layer_type:?} with compress ratio {ratio}; a linear-attention layer compresses nothing"
+            )));
+        }
+        if schedule.index_sources.contains(&index) || schedule.kv_sources.contains(&index) {
+            return Err(invalid(format!(
+                "layer {index} is {layer_type:?} and is named an index or key source; a linear-attention layer is neither"
+            )));
+        }
     }
     let heads = required_usize(text, "num_attention_heads", "text_config")?;
     if heads == 0 {
@@ -4413,6 +4431,56 @@ mod tests {
         assert!(
             missing.to_string().contains("num_key_value_heads"),
             "{missing}"
+        );
+    }
+
+    #[test]
+    fn a_gdn_layer_in_an_mla_stack_reads_the_linear_keys() {
+        let with_gdn = |ratio: usize| {
+            let mut root: Value = serde_json::from_str(DEEPSEEK).expect("DeepSeek config");
+            let text = root["text_config"].as_object_mut().expect("text_config");
+            let layers = text["num_hidden_layers"].as_u64().expect("layers") as usize;
+            let mut types = vec![Value::from("compressed_attention"); layers];
+            types[0] = Value::from(GDN_LAYER_TYPE);
+            text.insert("layer_types".into(), Value::from(types));
+            for (key, value) in [
+                ("linear_num_key_heads", 4),
+                ("linear_num_value_heads", 8),
+                ("linear_key_head_dim", 64),
+                ("linear_value_head_dim", 32),
+                ("linear_conv_kernel_dim", 4),
+            ] {
+                text.insert(key.into(), Value::from(value));
+            }
+            text["compress_ratios"][0] = Value::from(ratio);
+            Architecture::from_json(&root.to_string())
+        };
+        let architecture = with_gdn(0).expect("one GDN layer");
+        let first = &architecture.layers[0].attention;
+        assert!(
+            matches!(
+                first.kind,
+                AttentionKind::Gdn(Gdn {
+                    key_heads: 4,
+                    value_heads: 8,
+                    key_dim: 64,
+                    value_dim: 32,
+                    conv_kernel: 4,
+                    ..
+                })
+            ),
+            "{:?}",
+            first.kind
+        );
+        assert!(first.compression.is_none() && first.indexer.is_none());
+        assert!(matches!(
+            architecture.layers[1].attention.kind,
+            AttentionKind::Mla { .. }
+        ));
+        let compressing = with_gdn(4).expect_err("ratio 4");
+        assert!(
+            compressing.to_string().contains("compresses nothing"),
+            "{compressing}"
         );
     }
 

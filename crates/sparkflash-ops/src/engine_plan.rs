@@ -869,10 +869,17 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
         .layers
         .iter()
         .any(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }));
+    // A Gated DeltaNet layer in an MLA stack likewise carries its own geometry (`gdn_*`).
     let foreign_gqa = |layer: &sparkflash_model::architecture::Layer| {
         mla_stack && matches!(layer.attention.kind, AttentionKind::Gqa { .. })
     };
-    let first = architecture.layers.iter().find(|layer| !foreign_gqa(layer));
+    let foreign_gdn = |layer: &sparkflash_model::architecture::Layer| {
+        mla_stack && matches!(layer.attention.kind, AttentionKind::Gdn(_))
+    };
+    let first = architecture
+        .layers
+        .iter()
+        .find(|layer| !foreign_gqa(layer) && !foreign_gdn(layer));
     let first_moe = architecture
         .layers
         .iter()
@@ -1021,6 +1028,23 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
             FactValue::Integer(gqa.attention.rope.rotated_dims as i64),
         );
         put("gqa_rope_theta", FactValue::Float(gqa.attention.rope.theta));
+    }
+    let gdn_layers: Vec<&sparkflash_model::architecture::Layer> = architecture
+        .layers
+        .iter()
+        .filter(|layer| foreign_gdn(layer))
+        .collect();
+    if let Some(AttentionKind::Gdn(gdn)) = gdn_layers.first().map(|layer| &layer.attention.kind) {
+        let indices = gdn_layers.iter().map(|layer| layer.index as i64).collect();
+        put("gdn_layers", FactValue::Integers(indices));
+        put("gdn_key_heads", FactValue::Integer(gdn.key_heads as i64));
+        put(
+            "gdn_value_heads",
+            FactValue::Integer(gdn.value_heads as i64),
+        );
+        put("gdn_key_dim", FactValue::Integer(gdn.key_dim as i64));
+        put("gdn_value_dim", FactValue::Integer(gdn.value_dim as i64));
+        put("gdn_conv", FactValue::Integer(gdn.conv_kernel as i64));
     }
     if let Some(moe) = first_moe {
         put("moe_inter_dim", FactValue::Integer(moe.intermediate as i64));

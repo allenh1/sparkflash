@@ -200,6 +200,22 @@ pub struct GqaGeometry {
     pub theta: f64,
 }
 
+/// A Gated DeltaNet layer's geometry in a DeepSeek-shaped stack (`text_config.linear_*`, the
+/// Qwen3-Next spelling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GdnGeometry {
+    /// Key heads (`linear_num_key_heads`).
+    pub key_heads: usize,
+    /// Value heads, a whole multiple of the key heads (`linear_num_value_heads`).
+    pub value_heads: usize,
+    /// A key head's width (`linear_key_head_dim`).
+    pub key_dim: usize,
+    /// A value head's width (`linear_value_head_dim`).
+    pub value_dim: usize,
+    /// The conv's taps (`linear_conv_kernel_dim`).
+    pub conv: usize,
+}
+
 /// The hyperparameters of one DeepSeek-V4.1-Flash-shaped model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -223,6 +239,13 @@ pub struct ModelConfig {
     /// The grouped-query layers' geometry (`gqa_attn_config`); `None` without one.
     #[serde(default)]
     pub gqa: Option<GqaGeometry>,
+    /// The backbone blocks whose token mixer is a Gated DeltaNet instead of MLA (`layer_types`
+    /// naming `linear_attention`), ascending. The released stack has none.
+    #[serde(default)]
+    pub gdn_layers: Vec<usize>,
+    /// The Gated DeltaNet layers' geometry; `None` without one.
+    #[serde(default)]
+    pub gdn: Option<GdnGeometry>,
     /// Backbone blocks.
     pub n_layers: usize,
     /// DSpark MTP stages, which the checkpoint names `mtp.{0..n_mtp_layers-1}`.
@@ -468,6 +491,8 @@ impl ModelConfig {
             dense_inter_dim: 0,
             gqa_layers: Vec::new(),
             gqa: None,
+            gdn_layers: Vec::new(),
+            gdn: None,
             n_layers: 2,
             n_mtp_layers: 1,
             dspark_block_size: 2,
@@ -767,7 +792,9 @@ impl ModelConfig {
 mod released {
     use serde::Deserialize;
 
-    use super::{ConfigError, GqaGeometry, ModelConfig, default_gate_temp};
+    use super::{ConfigError, GdnGeometry, GqaGeometry, ModelConfig, default_gate_temp};
+
+    use sparkflash_model::architecture::GDN_LAYER_TYPE;
 
     /// The released document's top-level object.
     #[derive(Deserialize)]
@@ -837,13 +864,29 @@ mod released {
         /// The dense gated MLP's intermediate width; read only beside `first_k_dense_replace`.
         #[serde(default)]
         intermediate_size: Option<usize>,
-        /// Each block's token mixer: `compressed_attention` (MLA) or `gqa_attention`; absent in
-        /// the release, where every block is MLA.
+        /// Each block's token mixer: `compressed_attention` (MLA), `gqa_attention` or
+        /// `linear_attention` (Gated DeltaNet); absent in the release, where every block is MLA.
         #[serde(default)]
         layer_types: Option<Vec<String>>,
         /// The `gqa_attention` blocks' geometry; required beside one.
         #[serde(default)]
         gqa_attn_config: Option<GqaAttnConfig>,
+        /// The `linear_attention` (Gated DeltaNet) blocks' key heads; required beside one, with
+        /// the four widths below.
+        #[serde(default)]
+        linear_num_key_heads: Option<usize>,
+        /// Their value heads.
+        #[serde(default)]
+        linear_num_value_heads: Option<usize>,
+        /// A key head's width.
+        #[serde(default)]
+        linear_key_head_dim: Option<usize>,
+        /// A value head's width.
+        #[serde(default)]
+        linear_value_head_dim: Option<usize>,
+        /// The conv's taps.
+        #[serde(default)]
+        linear_conv_kernel_dim: Option<usize>,
         /// Backbone blocks.
         num_hidden_layers: usize,
         /// DSpark stages; the runtime name is `n_mtp_layers`.
@@ -1187,6 +1230,7 @@ mod released {
         }
 
         let mut gqa_layers = Vec::new();
+        let mut gdn_layers = Vec::new();
         if let Some(types) = text.layer_types.as_ref() {
             if types.len() != text.num_hidden_layers {
                 return Err(ConfigError::Invalid {
@@ -1202,11 +1246,12 @@ mod released {
                 match kind.as_str() {
                     "compressed_attention" => {}
                     sparkflash_model::architecture::GQA_LAYER_TYPE => gqa_layers.push(layer),
+                    GDN_LAYER_TYPE => gdn_layers.push(layer),
                     other => {
                         return Err(ConfigError::Invalid {
                             field: "text_config.layer_types",
                             detail: format!(
-                                "block {layer} is {other:?}; a block is compressed_attention or {:?}",
+                                "block {layer} is {other:?}; a block is compressed_attention, {:?} or {GDN_LAYER_TYPE:?}",
                                 sparkflash_model::architecture::GQA_LAYER_TYPE
                             ),
                         });
@@ -1240,6 +1285,63 @@ mod released {
             }
             (None, true) => None,
         };
+        let linear = [
+            text.linear_num_key_heads,
+            text.linear_num_value_heads,
+            text.linear_key_head_dim,
+            text.linear_value_head_dim,
+            text.linear_conv_kernel_dim,
+        ];
+        let gdn = match (linear, gdn_layers.is_empty()) {
+            (
+                [
+                    Some(key_heads),
+                    Some(value_heads),
+                    Some(key_dim),
+                    Some(value_dim),
+                    Some(conv),
+                ],
+                false,
+            ) => {
+                if key_heads == 0
+                    || key_dim == 0
+                    || value_dim == 0
+                    || value_heads % key_heads != 0
+                    || conv == 0
+                {
+                    return Err(ConfigError::Invalid {
+                        field: "text_config.linear_num_value_heads",
+                        detail: format!(
+                            "{value_heads} value heads over {key_heads} key heads with a {conv}-tap conv; a Gated DeltaNet needs nonzero head widths, a whole number of value heads a key head and one tap or more"
+                        ),
+                    });
+                }
+                Some(GdnGeometry {
+                    key_heads,
+                    value_heads,
+                    key_dim,
+                    value_dim,
+                    conv,
+                })
+            }
+            (_, false) => {
+                return Err(ConfigError::Invalid {
+                    field: "text_config.linear_num_key_heads",
+                    detail: format!(
+                        "blocks {gdn_layers:?} are Gated DeltaNet and the document does not state all of linear_num_key_heads, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim and linear_conv_kernel_dim"
+                    ),
+                });
+            }
+            (linear, true) if linear.iter().any(Option::is_some) => {
+                return Err(ConfigError::Invalid {
+                    field: "text_config.linear_num_key_heads",
+                    detail: format!(
+                        "the document states Gated DeltaNet geometry and no block is {GDN_LAYER_TYPE}"
+                    ),
+                });
+            }
+            (_, true) => None,
+        };
         Ok(ModelConfig {
             vocab_size: text.vocab_size,
             dim: text.hidden_size,
@@ -1260,6 +1362,8 @@ mod released {
             },
             gqa_layers: gqa_layers.clone(),
             gqa,
+            gdn_layers,
+            gdn,
             n_layers: text.num_hidden_layers,
             n_mtp_layers: text.num_nextn_predict_layers,
             dspark_block_size: text.dspark_block_size,

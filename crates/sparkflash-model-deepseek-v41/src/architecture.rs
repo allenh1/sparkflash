@@ -107,9 +107,42 @@ impl ModelConfig {
             .count();
         check(
             "MLA layers",
-            self.n_layers - self.gqa_layers.len().min(self.n_layers),
+            self.n_layers - (self.gqa_layers.len() + self.gdn_layers.len()).min(self.n_layers),
             mla,
         )?;
+        // A block is a Gated DeltaNet where the typed configuration names it one, with the typed
+        // geometry.
+        for (index, layer) in architecture.layers.iter().enumerate() {
+            let gdn = match &layer.attention.kind {
+                AttentionKind::Gdn(gdn) => Some(gdn),
+                _ => None,
+            };
+            check_flag(
+                "Gated DeltaNet layer",
+                index,
+                gdn.is_some(),
+                self.gdn_layers.contains(&index),
+            )?;
+            if let (Some(gdn), Some(geometry)) = (gdn, self.gdn) {
+                check(
+                    "Gated DeltaNet key heads",
+                    geometry.key_heads,
+                    gdn.key_heads,
+                )?;
+                check(
+                    "Gated DeltaNet value heads",
+                    geometry.value_heads,
+                    gdn.value_heads,
+                )?;
+                check("Gated DeltaNet key width", geometry.key_dim, gdn.key_dim)?;
+                check(
+                    "Gated DeltaNet value width",
+                    geometry.value_dim,
+                    gdn.value_dim,
+                )?;
+                check("Gated DeltaNet conv taps", geometry.conv, gdn.conv_kernel)?;
+            }
+        }
         // A block is grouped-query attention where the typed configuration names it one, with
         // the typed geometry.
         for (index, layer) in architecture.layers.iter().enumerate() {
