@@ -1446,32 +1446,36 @@ fn part_symbols(architecture: &Architecture) -> Vec<PartSymbols> {
             image: "deepseek",
             symbols: entry.symbols.iter().map(|symbol| symbol.name).collect(),
         })
-        .chain(grouped_query_route(architecture))
+        .chain(foreign_part_routes(architecture))
         .collect()
 }
 
-/// A grouped-query block inside the DeepSeek stack: the base runs the shared grouped-query body
-/// with its four projections on the dense format route, so the part claims the route's entries,
-/// as the DeepSeek image's dense-FFN part catalogues them. A stack with no such block claims
-/// nothing more.
-fn grouped_query_route(architecture: &Architecture) -> Option<PartSymbols> {
-    if !architecture.parts().contains(Part::GqaAttention) {
-        return None;
-    }
-    let mlp = crate::parts::CATALOGUE.iter().find(|entry| {
+/// A grouped-query or Gated DeltaNet block inside the DeepSeek stack: the base runs the shared
+/// body ([crate::roles::GqaLayer], [crate::roles::GdnLayer]) with the block's projections on the
+/// dense format route, so the part claims the route's entries, as the DeepSeek image's dense-FFN
+/// part catalogues them. A stack with neither block claims nothing more.
+fn foreign_part_routes(architecture: &Architecture) -> Vec<PartSymbols> {
+    let parts = architecture.parts();
+    let Some(mlp) = crate::parts::CATALOGUE.iter().find(|entry| {
         entry.part == Part::DenseMlp && entry.image == sparkflash_kernels::images::Image::Deepseek
-    })?;
-    Some(PartSymbols {
-        part: Part::GqaAttention,
-        block: None,
-        image: "deepseek",
-        symbols: mlp
-            .symbols
-            .iter()
-            .map(|symbol| symbol.name)
-            .filter(|name| name.starts_with("dense_format_"))
-            .collect(),
-    })
+    }) else {
+        return Vec::new();
+    };
+    [Part::GqaAttention, Part::GdnScan]
+        .into_iter()
+        .filter(|part| parts.contains(*part))
+        .map(|part| PartSymbols {
+            part,
+            block: None,
+            image: "deepseek",
+            symbols: mlp
+                .symbols
+                .iter()
+                .map(|symbol| symbol.name)
+                .filter(|name| name.starts_with("dense_format_"))
+                .collect(),
+        })
+        .collect()
 }
 /// The scale tensor a weight tensor's name implies, for the two layout spellings.
 fn layout_scale_name(name: &str) -> Option<String> {

@@ -584,6 +584,18 @@ pub fn scan(inputs: ScanInputs<'_>) -> ScanReport {
                 .to_owned(),
         );
     }
+    // A Gated DeltaNet block likewise; and its state is a recurrence, so the base runs every
+    // prompt row through it (the decoder skip stays off when the block sits in the decoder) and
+    // resumes a prefix only at a saved state.
+    if parts.contains(Part::GdnScan) && parts.contains(Part::MlaAttention) {
+        report.coverage_notes.push(
+            "gdn_scan inside an MLA stack has no body for interleaved prompt chunks: the base \
+             runs this stack's prompt chunks one at a time (one prefill way), every prompt row \
+             through the recurrent block (no decoder skip over it), and resumes a prefix only \
+             at a saved state"
+                .to_owned(),
+        );
+    }
     // The layout's claimed tensors are the row's evidence: their stored dtypes decide the
     // format and precision, their shapes decide the shape. The plan already resolved the
     // format per part; the stored shape comes from the shared tensor plan's claim for the first
