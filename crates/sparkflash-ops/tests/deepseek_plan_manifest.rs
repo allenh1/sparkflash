@@ -103,9 +103,16 @@ fn the_plan_reproduces_the_deepseek_baseline_manifest() {
             );
         }
     }
+    // The plan also carries facts the value object reads only through a part and never
+    // serializes for the released stack: the MLA latent's widths (read by the absorbed form) and
+    // the layout's wiring facts under `language.`. Each is named here; any other fact the
+    // baseline lacks is a difference.
+    const PLAN_ONLY: [&str; 2] = ["kv_lora_rank", "v_head_dim"];
+    let plan_only = |name: &str| PLAN_ONLY.contains(&name) || name.starts_with("language.");
     let plan_model: BTreeMap<String, serde_json::Value> = plan
         .model_facts()
         .iter()
+        .filter(|(name, _)| !(plan_only(name) && !baseline_model.contains_key(*name)))
         .map(|(name, value)| (name.clone(), fact_json(value)))
         .collect();
     assert_eq!(
