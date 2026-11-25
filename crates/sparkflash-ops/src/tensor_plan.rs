@@ -3216,7 +3216,7 @@ mod layout_equality {
 
     #[test]
     fn the_worked_layout_reproduces_the_family_planner() {
-        let text = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+        let text = include_str!("../../../models/configs/glm53_flash.hf.json");
         let architecture = Architecture::from_json(text).expect("the carried config");
         for world in [1usize, 2, 4] {
             let tp = TpPlan::for_architecture(&architecture, world, 0).expect("a TP plan");

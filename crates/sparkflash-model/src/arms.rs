@@ -559,9 +559,7 @@ impl Arm for Glm {
         &["glm5_next"]
     }
     fn profile_toml(&self) -> Option<&'static str> {
-        Some(include_str!(
-            "../../sparkflash-model-glm5-next/config/glm53_flash.toml"
-        ))
+        Some(include_str!("../../../models/profiles/glm53_flash.toml"))
     }
     fn default_context(&self) -> usize {
         GLM53_CONTEXT_TOKENS

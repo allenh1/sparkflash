@@ -69,6 +69,11 @@ pub struct Architecture {
     pub inkling: Option<Inkling>,
     /// Shape facts a matching layout resolved from config keys, by layout name.
     pub layout_vars: BTreeMap<String, i64>,
+    /// The wiring facts a matching layout read that no typed field above holds, by the layout's
+    /// fact path (`language.moe.router_dtype`, `language.manifold_hyper_connection.head_fold`).
+    /// The plan publishes each one under that path, so a backend reads it from the part that
+    /// needs it and a stack whose layout does not state it carries no such fact.
+    pub layout_facts: BTreeMap<String, crate::layout::LayoutValue>,
 }
 
 /// The Inkling-2 text stack geometry that has no equivalent in the other releases.
@@ -1089,6 +1094,7 @@ impl Architecture {
             tokens,
             inkling,
             layout_vars: BTreeMap::new(),
+            layout_facts: BTreeMap::new(),
         })
     }
 
@@ -3747,7 +3753,7 @@ mod tests {
 
     const DEEPSEEK: &str =
         include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
-    const GLM: &str = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const GLM: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
     const QWEN: &str =
         include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
 
@@ -4833,7 +4839,7 @@ mod tests {
     fn the_released_documents_declare_nothing_unmodelled() {
         for text in [
             include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json"),
-            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+            include_str!("../../../models/configs/glm53_flash.hf.json"),
             include_str!(
                 "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
             ),
@@ -4863,7 +4869,7 @@ mod tests {
         ),
         (
             "glm",
-            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+            include_str!("../../../models/configs/glm53_flash.hf.json"),
         ),
         (
             "inkling",
@@ -4897,27 +4903,32 @@ mod tests {
     /// check that only the new field at its default differs, and pin the new digests.
     #[test]
     fn the_released_parses_are_pinned_and_switch_nothing_on() {
+        // Every digest moved with the layout's carried facts (`layout_facts`, 2026-11-25):
+        // with that field emptied and its line removed, each {:#?} text hashes to its earlier
+        // pin (0xcf23_f963_2748_5934, 0xd96e_8b8c_c35c_0cd0, 0xf412_f70b_154f_43b3,
+        // 0xbd42_c066_93ef_621a, 0xaa4c_55d5_0a90_dc5e, 0xf1eb_7c37_44b7_d05a,
+        // 0x9440_176c_7d30_7627), so no other field moved.
         let pinned = [
             // DeepSeek's layout resolves the Engram, compressor, indexer, target, scale-grid,
             // draft-noise and vision-token arrays into layout_vars, so its parse carries those
             // entries; the joint declaration adds the per-block expert formats, which is the one
             // field that moved this digest from 0x4632_a934_d263_eaa1 (measured 2026-11-24, and
             // the only difference in the {:#?} text).
-            0xcf23_f963_2748_5934,
+            0x4604_1c34_ec88_4dd1,
             // Dory's layout supplies layout_vars (the attention and MLP widths), so its
             // parse carries those four facts and does not hash at the field's default. Its
             // digest moved with the DeepSeek one, by the same joint expert-format field.
-            0xd96e_8b8c_c35c_0cd0,
+            0x7946_daf1_9c6c_9d3a,
             // GLM, Inkling and the two Qwen releases carry the same joint expert-format field, so
             // all four digests moved with DeepSeek's on the same measurement.
-            0xf412_f70b_154f_43b3,
+            0xd11a_54dd_0552_163b,
             // Inkling's layout learns the tower's rotary-plus-grid position, LayerNorm and
             // erf-GELU wiring, its relative-attention switches, and its [vars] resolve the MTP
             // and convolution shape facts.
-            0xbd42_c066_93ef_621a,
-            0xaa4c_55d5_0a90_dc5e,
-            0xf1eb_7c37_44b7_d05a,
-            0x9440_176c_7d30_7627,
+            0x58a5_5123_bdf0_554c,
+            0xe125_71f7_d485_a808,
+            0x810f_439c_45e8_588c,
+            0xb762_2ecd_8b42_6c89,
         ];
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");

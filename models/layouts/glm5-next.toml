@@ -169,6 +169,82 @@ part = "vision_position"
 name = "position"
 value = "rotary"
 
+# The language stack's wiring that no config key states, each from the producer reference.
+# The stream and every module output take the config's dtype; the producer casts to f32 only
+# where a fact below says so, and the base computes in no wider and no narrower type.
+#
+# modeling_glm5_next.py:74-79: the RMSNorm takes its mean square in f32 and casts the
+# normalised value back to the input dtype before the weight.
+[[stacks.language.parts]]
+part = "rms_norm"
+[[stacks.language.parts.facts]]
+name = "accumulate"
+value = "f32"
+
+# modeling_glm5_next.py:300-303: the flattened streams are widened to f32, normed with the
+# weightless norm (215, at rms_norm_eps) and mixed by the BF16 weight widened to f32, with no
+# activation quantiser on the input; 304-324: the coefficients and the Sinkhorn stay f32;
+# 1336-1346: post and comb are cast to the stream dtype before the stream update; 336 and
+# 1510: the head folds the streams by their unweighted mean.
+[[stacks.language.parts]]
+part = "manifold_hyper_connection"
+[[stacks.language.parts.facts]]
+name = "mix_input"
+value = "f32"
+[[stacks.language.parts.facts]]
+name = "coefficients"
+value = "f32"
+[[stacks.language.parts.facts]]
+name = "stream_update"
+value = { key = "text_config.dtype" }
+[[stacks.language.parts.facts]]
+name = "head_fold"
+value = "mean"
+
+# modeling_glm5_next.py: the sparse layers are the V3 form, q_a/q_b, kv_a_proj_with_mqa and
+# kv_b with a plain o_proj (the tensor index below proves each), absorbed through kv_b; 1093:
+# the softmax runs in f32 and its probabilities are cast back to the query's dtype.
+[[stacks.language.parts]]
+part = "mla_attention"
+[[stacks.language.parts.facts]]
+name = "form"
+value = "absorbed"
+[[stacks.language.parts.facts]]
+name = "softmax"
+value = "f32"
+[[stacks.language.parts.facts]]
+name = "probabilities"
+value = "query"
+
+# modeling_glm5_next.py:862 and 866: the pooled scores and the head weights are f32; 999: the
+# pool's gate-plus-position logits take their softmax in f32.
+[[stacks.language.parts]]
+part = "sparse_indexer"
+[[stacks.language.parts.facts]]
+name = "scores"
+value = "f32"
+[[stacks.language.parts.facts]]
+name = "pool_softmax"
+value = "f32"
+
+# modeling_glm5_next.py:357-358: the forget gate and decay are f32; 476 and 533: the chunked
+# and recurrent forms run in f32; 763: the recurrent state is stored f32; 385-391: the gated
+# output norm is strict f32, weight and gate included.
+[[stacks.language.parts]]
+part = "kda_scan"
+[[stacks.language.parts.facts]]
+name = "decay"
+value = "f32"
+[[stacks.language.parts.facts]]
+name = "recurrence"
+value = "f32"
+[[stacks.language.parts.facts]]
+name = "state"
+value = "f32"
+[[stacks.language.parts.facts]]
+name = "output_norm"
+value = "f32"
+
 # The language backbone.
 [[tensor]]
 name = "model.language_model.embed_tokens.weight"

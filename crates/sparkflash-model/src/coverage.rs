@@ -488,7 +488,7 @@ mod tests {
         ),
         (
             "GLM-5.3-Flash",
-            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+            include_str!("../../../models/configs/glm53_flash.hf.json"),
         ),
         (
             "Qwen3.8-Flash-Next-NVFP4",

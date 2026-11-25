@@ -811,7 +811,7 @@ mod tests {
         let ckpt = tempfile::tempdir().expect("ckpt");
         fs::write(
             ckpt.path().join("config.json"),
-            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+            include_str!("../../../models/configs/glm53_flash.hf.json"),
         )
         .expect("write config");
         let error = run_lines(&[

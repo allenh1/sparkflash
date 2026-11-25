@@ -233,7 +233,7 @@ impl VisionConfig {
 /// The `model_type` a released GLM-5.3 `config.json` names.
 pub const MODEL_TYPE: &str = "glm5_next";
 
-const CARRIED_CONFIG: &str = include_str!("../config/glm53_flash.hf.json");
+const CARRIED_CONFIG: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
 
 impl Glm5NextConfig {
     /// The released `zai-org/GLM-5.3-Flash` configuration carried in this crate.
@@ -1020,7 +1020,7 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("a temp directory");
         std::fs::write(
             directory.join("config.json"),
-            include_str!("../config/glm53_flash.hf.json"),
+            include_str!("../../../models/configs/glm53_flash.hf.json"),
         )
         .expect("config.json");
         std::fs::write(
@@ -1044,7 +1044,7 @@ mod tests {
     #[test]
     fn a_document_without_an_eos_is_refused() {
         let mut document: serde_json::Value =
-            serde_json::from_str(include_str!("../config/glm53_flash.hf.json"))
+            serde_json::from_str(include_str!("../../../models/configs/glm53_flash.hf.json"))
                 .expect("the carried document");
         document
             .get_mut("text_config")

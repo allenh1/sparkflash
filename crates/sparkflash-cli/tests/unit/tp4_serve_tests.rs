@@ -139,8 +139,7 @@ fn every_rank_of_a_group_derives_the_same_window() {
 
 #[test]
 fn a_checkpoint_names_its_pack_from_its_own_config() {
-    const GLM: &str =
-        include_str!("../../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const GLM: &str = include_str!("../../../../models/configs/glm53_flash.hf.json");
     const QWEN: &str =
         include_str!("../../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
     const DEEPSEEK: &str = include_str!(
@@ -1175,7 +1174,7 @@ fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
         ),
         (
             "GLM",
-            include_str!("../../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+            include_str!("../../../../models/configs/glm53_flash.hf.json"),
         ),
     ] {
         let dir = tempfile::tempdir().expect("a temporary checkpoint");

@@ -228,8 +228,7 @@ mod tests {
     use super::*;
 
     /// A released document, so the fixture exercises the parser the arms actually read.
-    const DOCUMENT: &str =
-        include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const DOCUMENT: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
 
     fn architecture() -> Architecture {
         Architecture::from_json(DOCUMENT).expect("the released document parses")

@@ -226,6 +226,31 @@ pub struct GdnGeometry {
     pub conv: usize,
 }
 
+/// A Kimi Delta Attention layer's geometry in a DeepSeek-shaped stack
+/// (`text_config.linear_attn_config`, the GLM-5.3-Flash spelling).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct KdaGeometry {
+    /// Heads (`num_heads`); the query, key and value share them.
+    pub heads: usize,
+    /// One head's width (`head_dim`).
+    pub head_dim: usize,
+    /// The short convolution's taps (`short_conv_kernel_size`).
+    pub conv: usize,
+    /// The forget gate's lower bound (`gate_lower_bound`).
+    pub lower_bound: f64,
+}
+
+/// The absorbed (V3-form) MLA's latent: the queries read the key/value latent through `kv_b`'s
+/// key rows, and the mixed latent leaves through its value rows. A stack whose layout states
+/// the single-latent form has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbsorbedLatent {
+    /// The key/value latent's width (`kv_lora_rank`).
+    pub kv_lora_rank: usize,
+    /// One head's value width (`v_head_dim`).
+    pub v_head_dim: usize,
+}
+
 /// Whether a width is zero: a stack without the block it sizes, whose field the open manifest
 /// leaves out so the released configuration records the fields it always has.
 fn is_zero(value: &usize) -> bool {
@@ -273,6 +298,17 @@ pub struct ModelConfig {
     /// The Gated DeltaNet layers' geometry; `None` without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gdn: Option<GdnGeometry>,
+    /// The backbone blocks whose token mixer is Kimi Delta Attention instead of MLA
+    /// (`linear_attn_config.kda_layers`), ascending. The released stack has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kda_layers: Vec<usize>,
+    /// The Kimi Delta Attention layers' geometry; `None` without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda: Option<KdaGeometry>,
+    /// The absorbed MLA's latent, when the layout states that form; `None` for the released
+    /// single-latent form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absorbed_latent: Option<AbsorbedLatent>,
     /// Backbone blocks.
     pub n_layers: usize,
     /// DSpark MTP stages, which the checkpoint names `mtp.{0..n_mtp_layers-1}`.
@@ -526,6 +562,9 @@ impl ModelConfig {
             gqa: None,
             gdn_layers: Vec::new(),
             gdn: None,
+            kda_layers: Vec::new(),
+            kda: None,
+            absorbed_latent: None,
             n_layers: 2,
             n_mtp_layers: 1,
             dspark_block_size: 2,
@@ -1434,6 +1473,9 @@ mod released {
             gqa,
             gdn_layers,
             gdn,
+            kda_layers: Vec::new(),
+            kda: None,
+            absorbed_latent: None,
             n_layers: text.num_hidden_layers,
             n_mtp_layers: text.num_nextn_predict_layers,
             dspark_block_size: text.dspark_block_size,

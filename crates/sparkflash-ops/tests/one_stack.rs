@@ -178,7 +178,7 @@ fn the_vision_stack_parts_match_the_plan_and_the_declared_set() {
         ),
         (
             "glm",
-            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+            include_str!("../../../models/configs/glm53_flash.hf.json"),
         ),
         (
             "inkling",
@@ -262,7 +262,8 @@ fn the_scan_agrees_with_the_plan_on_every_released_config() {
     use sparkflash_ops::{Availability, EnginePlan, KernelPhase, KernelResolver, ScanInputs, scan};
 
     let crates = workspace_root().join("crates");
-    let mut configs = Vec::new();
+    // The configs a model crate still carries, and the ones that left their crates for `models/`.
+    let mut directories = vec![workspace_root().join("models").join("configs")];
     for entry in std::fs::read_dir(&crates).expect("the crates directory") {
         let directory = entry.expect("a crate entry").path();
         let Some(name) = directory
@@ -272,10 +273,13 @@ fn the_scan_agrees_with_the_plan_on_every_released_config() {
         else {
             continue;
         };
-        if !name.starts_with("sparkflash-model-") {
-            continue;
+        if name.starts_with("sparkflash-model-") {
+            directories.push(directory.join("config"));
         }
-        let Ok(files) = std::fs::read_dir(directory.join("config")) else {
+    }
+    let mut configs = Vec::new();
+    for directory in directories {
+        let Ok(files) = std::fs::read_dir(directory) else {
             continue;
         };
         for file in files {
@@ -599,7 +603,7 @@ fn each_released_vision_tower_is_a_stack_of_named_components() {
         include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
     const INKLING: &str =
         include_str!("../../sparkflash-model-inkling2/config/inkling2_small.hf.json");
-    const GLM: &str = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const GLM: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
     const QWEN: &str =
         include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
 

@@ -322,9 +322,8 @@ Attribution:
   pooling, scores and pick, and the routed experts' FP8 GEMV) is an independent
   implementation of the arithmetic of the host reference above; no Transformers
   or FLA source is copied.
-- The released configuration carried under
-  crates/sparkflash-model-glm5-next/config/ is Z.ai's config.json from
-  zai-org/GLM-5.3-Flash, MIT License.
+- The released configuration carried as models/configs/glm53_flash.hf.json is
+  Z.ai's config.json from zai-org/GLM-5.3-Flash, MIT License.
 
 --------------------------------------------------------------------------------
 10. Thinking Machines Inkling-2 and Hugging Face Transformers (Inkling-2-Small)

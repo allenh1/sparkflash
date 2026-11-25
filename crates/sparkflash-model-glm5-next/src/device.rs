@@ -7792,9 +7792,10 @@ mod tests {
     /// still read as a typed field; the serve check refuses `on` on this version.
     #[test]
     fn the_shipped_profile_decodes_on_the_row_gemv() {
-        let mut profile =
-            sparkflash_model::ModelProfile::from_toml(include_str!("../config/glm53_flash.toml"))
-                .expect("the shipped GLM profile");
+        let mut profile = sparkflash_model::ModelProfile::from_toml(include_str!(
+            "../../../models/profiles/glm53_flash.toml"
+        ))
+        .expect("the shipped GLM profile");
         assert_eq!(profile.decode.tensor_cores, None, "the file names no value");
         profile
             .apply_env(|name| (name == "SPARKFLASH_DECODE_MMA").then(|| "on".to_owned()))

@@ -1490,8 +1490,7 @@ mod tests {
         config
     }
 
-    const GLM_CONFIG: &str =
-        include_str!("../../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const GLM_CONFIG: &str = include_str!("../../../../models/configs/glm53_flash.hf.json");
     const QWEN_CONFIG: &str =
         include_str!("../../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
     const DEEPSEEK_CONFIG: &str = include_str!(

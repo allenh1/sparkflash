@@ -26,7 +26,7 @@ The counts come from the released configuration named in each file's `source`:
 
 - `qwen38.json`: `crates/sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json`,
   48 decoder layers x 512 routed experts.
-- `glm53.json`: `crates/sparkflash-model-glm5-next/config/glm53_flash.hf.json`, 45 decoder
+- `glm53.json`: `models/configs/glm53_flash.hf.json`, 45 decoder
   layers; the first 3 are dense and the remaining 42 have 288 routed experts.
 - `deepseek-v41.json`: `crates/sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json`,
   40 decoder layers x 384 routed experts.

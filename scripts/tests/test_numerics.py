@@ -795,7 +795,7 @@ class DeclarationTests(unittest.TestCase):
         # unregistered), so membership is not required - only a name, and a registered model
         # must have a profile.
         repo = NUMERICS.REPO
-        on_disk = sorted(repo.glob(NUMERICS.PROFILE_GLOB))
+        on_disk = sorted(path for glob in NUMERICS.PROFILE_GLOBS for path in repo.glob(glob))
         self.assertGreaterEqual(len(on_disk), 3)
         registry = NUMERICS.parse_registry((repo / NUMERICS.REGISTRY).read_text(), NUMERICS.REGISTRY)
         models = {entry["model"] for entry in registry["config"]}

@@ -1564,6 +1564,21 @@ probe = "hash"
                     }),
             );
         }
+        // The profiles that left their crates for `models/profiles`.
+        let moved = crates
+            .parent()
+            .expect("the workspace")
+            .join("models/profiles");
+        if let Ok(files) = std::fs::read_dir(moved) {
+            profiles.extend(
+                files
+                    .map(|file| file.expect("a profile").path())
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension == "toml")
+                    }),
+            );
+        }
         assert!(profiles.len() >= 3, "found only {profiles:?}");
         for path in profiles {
             let shown = path.display();

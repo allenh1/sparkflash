@@ -27,7 +27,7 @@ use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
 
 const DEEPSEEK: &str =
     include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
-const GLM: &str = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+const GLM: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
 const QWEN_NVFP4: &str =
     include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
 const QWEN_FP8: &str =
@@ -1185,9 +1185,9 @@ fn a_non_replicated_qwen_mtp_is_not_a_tp4_global() {
         .expect("the GLM TP4 boot plan carries its replicated MTP stage");
 }
 
-/// A Gated DeltaNet block inside the DeepSeek stack runs whole on every rank (its tensors are
-/// replicated), so its scan is planned over every head at any world. A scan planned over the
-/// stack's per-rank share would launch on only that share of the heads.
+/// A Gated DeltaNet block inside the DeepSeek stack runs whole on every rank: the layout states
+/// every one of its tensors whole, so its scan is planned over every head at any world. A scan
+/// planned over the stack's per-rank share would launch on only that share of the heads.
 #[test]
 fn a_gated_deltanet_block_in_an_mla_stack_scans_every_head_at_any_world() {
     let mut root: serde_json::Value = serde_json::from_str(DEEPSEEK).expect("DeepSeek config");
@@ -1227,6 +1227,50 @@ fn a_gated_deltanet_block_in_an_mla_stack_scans_every_head_at_any_world() {
                 (4, 0, 8, 0),
                 "TP{world}/{rank}"
             );
+        }
+    }
+}
+
+/// GLM's KDA blocks sit in an MLA stack too, but the layout states their projections split by
+/// rows, so each rank scans its share of the 64 heads. The split is the layout's statement, not
+/// a rule about recurrent blocks in an MLA stack. The stack-wide attention facts are the sparse
+/// MLA layers', and the KDA blocks carry their own.
+#[test]
+fn glm_kda_blocks_scan_their_ranks_share_of_the_heads() {
+    for world in [1, 2, 4] {
+        for rank in 0..world {
+            let plan = EnginePlan::from_json(GLM, Target::Sm121, world, rank)
+                .unwrap_or_else(|error| panic!("GLM TP{world}/{rank}: {error}"));
+            let share = 64 / world;
+            let scans: Vec<_> = plan
+                .requirements()
+                .filter(|requirement| requirement.part == Part::KdaScan)
+                .collect();
+            assert_eq!(scans.len(), 34, "TP{world}/{rank}: one scan a KDA block");
+            for scan in scans {
+                assert_eq!(
+                    (scan.geometry.heads, scan.geometry.head_offset),
+                    (share, rank * share),
+                    "TP{world}/{rank}"
+                );
+            }
+            let facts = plan.model_facts();
+            let int = |name: &str| match facts.get(name) {
+                Some(sparkflash_model::stack::FactValue::Integer(value)) => *value,
+                other => panic!("TP{world}/{rank}: {name} is {other:?}"),
+            };
+            assert_eq!(int("kda_heads"), 64);
+            assert_eq!(int("kda_head_dim"), 128);
+            assert_eq!(int("kda_conv"), 4);
+            assert_eq!(int("n_heads"), 64, "the sparse MLA layers' heads");
+            assert_eq!(int("head_dim"), 256, "the sparse MLA layers' query width");
+            match facts.get("kda_layers") {
+                Some(sparkflash_model::stack::FactValue::Integers(layers)) => {
+                    assert_eq!(layers.len(), 34);
+                    assert!(!layers.contains(&3) && layers.contains(&0));
+                }
+                other => panic!("kda_layers is {other:?}"),
+            }
         }
     }
 }

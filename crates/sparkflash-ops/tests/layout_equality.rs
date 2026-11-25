@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn a_changed_vocabulary_is_the_first_difference() {
-        let text = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+        let text = include_str!("../../../models/configs/glm53_flash.hf.json");
         let architecture = Architecture::from_json(text).expect("the carried config");
         let tp = TpPlan::for_architecture(&architecture, 1, 0).expect("a TP plan");
         let reference =

@@ -173,6 +173,7 @@ fn hybrid() -> Architecture {
         mtp: None,
         tokens: sparkflash_model::architecture::Tokens::default(),
         layout_vars: std::collections::BTreeMap::new(),
+        layout_facts: std::collections::BTreeMap::new(),
     }
 }
 

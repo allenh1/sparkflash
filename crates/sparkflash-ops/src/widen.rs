@@ -322,7 +322,7 @@ mod tests {
     use super::*;
     use crate::formats::{Bf16, NvFp4};
 
-    const GLM: &str = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const GLM: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
 
     #[test]
     fn a_widen_needs_a_reason_and_writes_a_record() {

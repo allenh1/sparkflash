@@ -197,6 +197,21 @@ value = false
 name = "downsample"
 value = "unfold"
 
+# The language stack's wiring that no config key states. inference/model.py:644 and 706: the
+# attention keeps one latent, kv_norm(wkv(x)), which every head reads as its key and value;
+# 1268: the head folds the streams through the last block's pre-mix, layer.hc_pre(h, pre_mix).
+[[stacks.language.parts]]
+part = "mla_attention"
+[[stacks.language.parts.facts]]
+name = "form"
+value = "latent"
+
+[[stacks.language.parts]]
+part = "manifold_hyper_connection"
+[[stacks.language.parts.facts]]
+name = "head_fold"
+value = "last_pre_mix"
+
 # The language backbone. model.py:1204-1209 creates the final norm, model.py:1194-1203 the
 # embedding and head; tie_word_embeddings is false in the released config.
 
@@ -522,13 +537,15 @@ when = { attention = "gqa" }
 # the dense class (the fused q/k/v rows, the output gate z, the beta and decay logits b and a,
 # and the output), and the conv, the decay vectors and the gated norm BF16 as the Qwen3-Next
 # release stores them. No cache, no sink and no compression: the layer keeps one recurrent state.
+# Every tensor is stated whole: the base runs this block on every rank, every head, with no sum
+# after it, and the plan reads the block's split from these statements.
 [[tensor]]
 name = "layers.{layer}.attn.in_proj_qkv.weight"
 part = "gdn_scan"
 role = "attention"
 dtype = "dense"
 shape = ["2 * gdn_key_width + gdn_value_width", "hidden"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -538,7 +555,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "f8e8m0"
 shape = ["(2 * gdn_key_width + gdn_value_width) / quant_block[0]", "(hidden) / quant_block[0]"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -548,7 +565,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "dense"
 shape = ["gdn_value_width", "hidden"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -558,7 +575,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "f8e8m0"
 shape = ["(gdn_value_width) / quant_block[0]", "(hidden) / quant_block[0]"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -568,7 +585,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "dense"
 shape = ["gdn_value_heads", "hidden"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -578,7 +595,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "f8e8m0"
 shape = ["(gdn_value_heads) / quant_block[0]", "(hidden) / quant_block[0]"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -588,7 +605,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "dense"
 shape = ["gdn_value_heads", "hidden"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -598,7 +615,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "f8e8m0"
 shape = ["(gdn_value_heads) / quant_block[0]", "(hidden) / quant_block[0]"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -608,7 +625,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "dense"
 shape = ["hidden", "gdn_value_width"]
-split = "columns"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -618,7 +635,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "f8e8m0"
 shape = ["(hidden) / quant_block[0]", "(gdn_value_width) / quant_block[0]"]
-split = "columns"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -628,7 +645,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "bf16"
 shape = ["2 * gdn_key_width + gdn_value_width", 1, "gdn_conv"]
-split = "conv"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -638,7 +655,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "bf16"
 shape = ["gdn_value_heads"]
-split = "vector"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 
@@ -648,7 +665,7 @@ part = "gdn_scan"
 role = "attention"
 dtype = "bf16"
 shape = ["gdn_value_heads"]
-split = "vector"
+split = "whole"
 repeat = "layers"
 when = { attention = "gdn" }
 

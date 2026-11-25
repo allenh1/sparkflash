@@ -156,6 +156,9 @@ TOKEN_ID_PREFIX = "token_id:"
 # registry model it configures (`model`), which a sparkflash-model test holds to the descriptor its
 # weights select; a profile that names none fails the declaration check.
 PROFILE_GLOB = "crates/sparkflash-model-*/config/*.toml"
+# The profiles that left their crates (docs/engine/08-glm-on-the-base.md, V3).
+MOVED_PROFILE_GLOB = "models/profiles/*.toml"
+PROFILE_GLOBS = (PROFILE_GLOB, MOVED_PROFILE_GLOB)
 # Where the serving side lists the profile settings an invariance gate holds to the same bits. The
 # check trusts the list, so the list is in the diff it judges.
 CLASSIFICATION = "crates/sparkflash-model/src/numerics.rs"
@@ -1197,9 +1200,12 @@ def entry_snippet(reference: dict, reference_path: str, registered: dict | None 
 
 
 def is_profile(path: str) -> bool:
-    """Whether a repository path is an arm profile: [PROFILE_GLOB], matched whole."""
+    """Whether a repository path is an arm profile: one of [PROFILE_GLOBS], matched whole."""
     pure = PurePosixPath(path)
-    return len(pure.parts) == len(PurePosixPath(PROFILE_GLOB).parts) and pure.match(PROFILE_GLOB)
+    return any(
+        len(pure.parts) == len(PurePosixPath(glob).parts) and pure.match(glob)
+        for glob in PROFILE_GLOBS
+    )
 
 
 def profile_settings(data: bytes | None, origin: str) -> dict:
@@ -1935,7 +1941,7 @@ def run_ci(base_argument: str | None) -> int:
     # would accept a registry the next release aborts on.
     parsed, rust_state = rust_registry_check(REPO / REGISTRY)
     # The working tree, not HEAD: a local run checks what is about to be committed too.
-    paths = (NUMERICS, "docs/numerics", f":(glob){PROFILE_GLOB}", CLASSIFICATION)
+    paths = (NUMERICS, "docs/numerics", *(f":(glob){glob}" for glob in PROFILE_GLOBS), CLASSIFICATION)
     diff = git("diff", "--name-status", "--no-renames", base, "--", *paths).stdout.decode()
     untracked = git("ls-files", "--others", "--exclude-standard", "--", *paths).stdout.decode()
     changed = {}

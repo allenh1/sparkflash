@@ -32,7 +32,7 @@ use sparkflash_model::architecture::{
 
 use crate::config::{Glm5NextConfig, IndexerKind, LayerKind, MODEL_TYPE, MlpKind};
 
-const CARRIED_CONFIG: &str = include_str!("../config/glm53_flash.hf.json");
+const CARRIED_CONFIG: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
 
 /// Parse a released Hugging Face `config.json` into the shared canonical [Architecture].
 ///
@@ -210,6 +210,7 @@ pub fn tiny_architecture() -> Architecture {
         }),
         tokens: sparkflash_model::architecture::Tokens::default(),
         layout_vars: std::collections::BTreeMap::new(),
+        layout_facts: std::collections::BTreeMap::new(),
     }
 }
 

@@ -343,6 +343,8 @@ impl EnginePlan {
         for requirement in &mut globals {
             requirement.geometry.model = Some(model);
         }
+        let stacks = plan_stacks(&architecture);
+        let whole = whole_recurrent_blocks(&architecture, &stacks);
         let steps = architecture.steps();
         if steps.len() != architecture.layers.len() {
             return Err(PlanError::Invalid(format!(
@@ -365,7 +367,7 @@ impl EnginePlan {
                 );
                 requirements.push(PartRequirement {
                     part: *part,
-                    geometry: geometry_for(*part, layer, &architecture, &tp)?,
+                    geometry: geometry_for(*part, layer, &architecture, &tp, &whole)?,
                     format: format.unwrap_or_else(|| format_of_precision(precision.dense)),
                 });
             }
@@ -378,7 +380,7 @@ impl EnginePlan {
                 }
                 // A layout also claims the layer's norms, which are shared global parts rather
                 // than steps of the block walk. Only a part the walk can place gets a row here.
-                let Ok(geometry) = geometry_for(*part, layer, &architecture, &tp) else {
+                let Ok(geometry) = geometry_for(*part, layer, &architecture, &tp, &whole) else {
                     continue;
                 };
                 let role = if *part == Part::ShortConv {
@@ -410,7 +412,6 @@ impl EnginePlan {
             });
         }
         let model_facts = model_facts(&architecture);
-        let stacks = plan_stacks(&architecture);
         let tensors = plan_tensors(&architecture, &tp, &stacks);
         let symbols = part_symbols(&architecture);
         Ok(Self {
@@ -860,6 +861,20 @@ fn winning_format(entries: Vec<(StoredFormat, usize)>) -> Option<StoredFormat> {
 ///
 /// The names are the baseline manifest's names, not a second vocabulary: a value the forward
 /// reads at open is carried here once, on the plan, so a backend never re-parses the checkpoint.
+/// A layout fact as a plan fact. A list of names has no plan form of its own and is published
+/// as its names joined by commas, in the layout's order.
+fn layout_fact(value: &sparkflash_model::LayoutValue) -> FactValue {
+    use sparkflash_model::LayoutValue;
+    match value {
+        LayoutValue::Bool(value) => FactValue::Bool(*value),
+        LayoutValue::Integer(value) => FactValue::Integer(*value),
+        LayoutValue::Float(value) => FactValue::Float(*value),
+        LayoutValue::String(value) => FactValue::Text(value.clone()),
+        LayoutValue::Integers(values) => FactValue::Integers(values.clone()),
+        LayoutValue::Strings(values) => FactValue::Text(values.join(",")),
+    }
+}
+
 fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
     let mut facts = BTreeMap::new();
     use sparkflash_model::architecture::AttentionKind;
@@ -869,16 +884,23 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
         .layers
         .iter()
         .any(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }));
-    // A Gated DeltaNet layer in an MLA stack likewise carries its own geometry (`gdn_*`).
     let foreign_gqa = |layer: &sparkflash_model::architecture::Layer| {
         mla_stack && matches!(layer.attention.kind, AttentionKind::Gqa { .. })
     };
-    let foreign_gdn =
-        |layer: &sparkflash_model::architecture::Layer| whole_recurrent_block(architecture, layer);
+    // A recurrent layer (Gated DeltaNet or Kimi Delta Attention) in an MLA stack likewise
+    // carries its own geometry (`gdn_*`, `kda_*`), so the stack-wide attention facts are the MLA
+    // layers'. Whether such a block runs split or whole is the layout's statement
+    // ([whole_recurrent_blocks]), not a fact of its kind.
+    let foreign_gdn = |layer: &sparkflash_model::architecture::Layer| {
+        mla_stack && matches!(layer.attention.kind, AttentionKind::Gdn(_))
+    };
+    let foreign_kda = |layer: &sparkflash_model::architecture::Layer| {
+        mla_stack && matches!(layer.attention.kind, AttentionKind::Kda(_))
+    };
     let first = architecture
         .layers
         .iter()
-        .find(|layer| !foreign_gqa(layer) && !foreign_gdn(layer));
+        .find(|layer| !foreign_gqa(layer) && !foreign_gdn(layer) && !foreign_kda(layer));
     let first_moe = architecture.first_moe();
     let first_hyper = architecture
         .layers
@@ -1038,6 +1060,35 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
         put("gdn_key_dim", FactValue::Integer(gdn.key_dim as i64));
         put("gdn_value_dim", FactValue::Integer(gdn.value_dim as i64));
         put("gdn_conv", FactValue::Integer(gdn.conv_kernel as i64));
+    }
+    let kda_layers: Vec<&sparkflash_model::architecture::Layer> = architecture
+        .layers
+        .iter()
+        .filter(|layer| foreign_kda(layer))
+        .collect();
+    if let Some(AttentionKind::Kda(kda)) = kda_layers.first().map(|layer| &layer.attention.kind) {
+        let indices = kda_layers.iter().map(|layer| layer.index as i64).collect();
+        put("kda_layers", FactValue::Integers(indices));
+        put("kda_heads", FactValue::Integer(kda.heads as i64));
+        put("kda_head_dim", FactValue::Integer(kda.head_dim as i64));
+        put("kda_conv", FactValue::Integer(kda.conv_kernel as i64));
+        put("kda_lower_bound", FactValue::Float(kda.lower_bound));
+    }
+    // The MLA latent's widths: the absorbed form's key/value latent and value head, which the
+    // layout's `language.mla_attention.form` says it reads through `kv_b`.
+    if let Some(AttentionKind::Mla {
+        kv_lora_rank,
+        v_head_dim,
+        ..
+    }) = first.map(|layer| &layer.attention.kind)
+    {
+        put("kv_lora_rank", FactValue::Integer(*kv_lora_rank as i64));
+        put("v_head_dim", FactValue::Integer(*v_head_dim as i64));
+    }
+    // The wiring facts the layout states and no typed field holds, under the layout's path. A
+    // stack whose layout does not state one carries no such fact.
+    for (name, value) in &architecture.layout_facts {
+        put(name, layout_fact(value));
     }
     if let Some(moe) = first_moe {
         put("moe_inter_dim", FactValue::Integer(moe.intermediate as i64));
@@ -1704,21 +1755,39 @@ fn global_requirements(
     Ok(globals)
 }
 
-/// Whether `layer` is a Gated DeltaNet block inside an MLA stack. The DeepSeek base runs such a
-/// block through the shared body, whole on every rank: its tensors are replicated
-/// (`sparkflash-device` `resident.rs`) and no sum follows it. So the block states its own facts
-/// (`gdn_*`), and its scan is planned over the block's whole heads at any world, never the
-/// stack's per-rank share.
-fn whole_recurrent_block(
+/// The recurrent blocks the layout states whole: every tensor the block's scan claims is
+/// `split = "whole"`, so every rank holds and runs every head and no sum follows the block. A
+/// block whose scan claims any split tensor runs its rank's share of the heads; a whole tensor
+/// in it (GLM's low-rank `f_a` and `g_a`) is whole on every rank by its own statement.
+fn whole_recurrent_blocks(
     architecture: &Architecture,
-    layer: &sparkflash_model::architecture::Layer,
-) -> bool {
+    stacks: &[Stack],
+) -> std::collections::BTreeSet<usize> {
     use sparkflash_model::architecture::AttentionKind;
-    matches!(layer.attention.kind, AttentionKind::Gdn(_))
-        && architecture
-            .layers
-            .iter()
-            .any(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }))
+    let recurrent: std::collections::BTreeSet<usize> = architecture
+        .layers
+        .iter()
+        .filter(|layer| {
+            matches!(
+                layer.attention.kind,
+                AttentionKind::Gdn(_) | AttentionKind::Kda(_)
+            )
+        })
+        .map(|layer| layer.index)
+        .collect();
+    stacks
+        .iter()
+        .flat_map(|stack| &stack.blocks)
+        .filter(|block| recurrent.contains(&block.index))
+        .filter(|block| {
+            block.parts.iter().any(|instance| {
+                matches!(instance.part, Part::GdnScan | Part::KdaScan)
+                    && !instance.claims.is_empty()
+                    && instance.claims.iter().all(|claim| claim.split == "whole")
+            })
+        })
+        .map(|block| block.index)
+        .collect()
 }
 
 fn geometry_for(
@@ -1726,7 +1795,15 @@ fn geometry_for(
     layer: &sparkflash_model::architecture::Layer,
     architecture: &Architecture,
     tp: &TpPlan,
+    whole_blocks: &std::collections::BTreeSet<usize>,
 ) -> Result<PartGeometry, PlanError> {
+    // A recurrent block the layout states whole scans every head at any world.
+    let whole_plan = TpPlan::new(1, 0)?;
+    let recurrent_tp = if whole_blocks.contains(&layer.index) {
+        &whole_plan
+    } else {
+        tp
+    };
     let hidden = architecture.hidden_size;
     let positions = architecture.max_position_embeddings;
     let mut geometry = PartGeometry {
@@ -1793,16 +1870,8 @@ fn geometry_for(
         },
         Part::GdnScan => match &attention.kind {
             AttentionKind::Gdn(gdn) => {
-                // A block the stack runs whole on every rank scans every head at any world.
-                let whole;
-                let tp = if whole_recurrent_block(architecture, layer) {
-                    whole = TpPlan::new(1, 0)?;
-                    &whole
-                } else {
-                    tp
-                };
-                let key = split(tp, gdn.key_heads, TpAxis::Heads, 1)?;
-                let value = split(tp, gdn.value_heads, TpAxis::KvHeads, 1)?;
+                let key = split(recurrent_tp, gdn.key_heads, TpAxis::Heads, 1)?;
+                let value = split(recurrent_tp, gdn.value_heads, TpAxis::KvHeads, 1)?;
                 geometry.heads = key.padded;
                 geometry.head_offset = key.offset;
                 geometry.kv_heads = value.padded;
@@ -1819,7 +1888,7 @@ fn geometry_for(
         },
         Part::KdaScan => match &attention.kind {
             AttentionKind::Kda(kda) => {
-                let heads = split(tp, kda.heads, TpAxis::Heads, 1)?;
+                let heads = split(recurrent_tp, kda.heads, TpAxis::Heads, 1)?;
                 geometry.heads = heads.padded;
                 geometry.head_offset = heads.offset;
                 geometry.head_dim = kda.head_dim;

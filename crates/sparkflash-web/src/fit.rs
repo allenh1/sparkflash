@@ -1073,7 +1073,7 @@ mod tests {
         include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
     const QWEN36: &str =
         include_str!("../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json");
-    const GLM: &str = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const GLM: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
     const DEEPSEEK: &str =
         include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
 

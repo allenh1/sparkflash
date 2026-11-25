@@ -247,6 +247,7 @@ pub(crate) fn tiny_architecture() -> Architecture {
             vision_end_token_id: Some(5),
         },
         layout_vars: std::collections::BTreeMap::new(),
+        layout_facts: std::collections::BTreeMap::new(),
     }
 }
 

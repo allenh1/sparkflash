@@ -876,10 +876,7 @@ pub(crate) mod tests {
                 "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
             )
             .to_owned(),
-            "glm5_next" => {
-                include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json")
-                    .to_owned()
-            }
+            "glm5_next" => include_str!("../../../models/configs/glm53_flash.hf.json").to_owned(),
             "qwen4_exp" => include_str!(
                 "../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json"
             )
@@ -1119,7 +1116,7 @@ pub(crate) mod tests {
             ),
             (
                 "glm",
-                include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+                include_str!("../../../models/configs/glm53_flash.hf.json"),
             ),
             (
                 "qwen fp8",

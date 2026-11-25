@@ -1,7 +1,7 @@
 {
   "schema": "sparkflash-numerics-expert-layout/1",
   "model": "zai-org/GLM-5.3-Flash",
-  "source": "crates/sparkflash-model-glm5-next/config/glm53_flash.hf.json: num_hidden_layers=45, n_routed_experts=288, n_shared_experts=1, mlp_layer_types (the first 3 layers are dense; first_k_dense_replace=3)",
+  "source": "models/configs/glm53_flash.hf.json: num_hidden_layers=45, n_routed_experts=288, n_shared_experts=1, mlp_layer_types (the first 3 layers are dense; first_k_dense_replace=3)",
   "note": "The routed decoder layers a coverage dump must reach. The checkpoint's one MTP layer (layer 45, 288 routed experts) is a draft pass and is listed under draft_layers, not judged by this dump yet; docs/NUMERICS.md section 5 says so.",
   "layers": [
     {

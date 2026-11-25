@@ -101,7 +101,52 @@ fn boolean(facts: &BTreeMap<String, FactValue>, name: &str, default: bool) -> bo
 /// than inventing a value for a field the description left out.
 pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
     let facts = plan.model_facts();
+    // A fact is required only when a part that reads it is planned: the rotary base and its
+    // YaRN bounds for a rotated attention, the grouped output's widths for an MLA with groups,
+    // the compressor's base for a compressed layer, the indexer's for an indexed one. A stack
+    // without the part carries zero, as the open manifest records an absent width.
+    let rotated = int(facts, "rope_head_dim")? > 0;
+    let grouped = plan.architecture().layers.iter().any(|layer| {
+        matches!(
+            layer.attention.kind,
+            sparkflash_model::architecture::AttentionKind::Mla {
+                groups: Some(_),
+                ..
+            }
+        )
+    });
+    let indexed = !integers(facts, "index_source_layers")?.is_empty();
     let compress_ratios = integers(facts, "compress_ratios")?;
+    let compressed = compress_ratios.iter().any(|ratio| *ratio > 0);
+    let by_part_int = |planned: bool, name: &str| -> Result<usize, ConfigError> {
+        if planned {
+            int(facts, name)
+        } else {
+            Ok(opt_int(facts, name).unwrap_or(0))
+        }
+    };
+    let by_part_float = |planned: bool, name: &str| -> Result<f64, ConfigError> {
+        if planned {
+            float(facts, name)
+        } else {
+            Ok(opt_float(facts, name).unwrap_or(0.0))
+        }
+    };
+    let absorbed_latent = match facts
+        .get("language.mla_attention.form")
+        .and_then(FactValue::as_text)
+    {
+        Some("absorbed") => Some(sparkflash_engine::config::AbsorbedLatent {
+            kv_lora_rank: int(facts, "kv_lora_rank")?,
+            v_head_dim: int(facts, "v_head_dim")?,
+        }),
+        Some("latent") | None => None,
+        Some(other) => {
+            return Err(format!(
+                "the layout states the MLA form `{other}`; the base knows `latent` (one key/value latent every head reads) and `absorbed` (the V3 form through kv_b)"
+            ));
+        }
+    };
     let n_layers = int(facts, "n_layers")?;
     let n_mtp_layers = opt_int(facts, "n_mtp_layers").unwrap_or(0);
     if compress_ratios.len() != n_layers + n_mtp_layers {
@@ -133,6 +178,20 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
             }),
             None => None,
         },
+        kda_layers: match facts.get("kda_layers") {
+            Some(_) => integers(facts, "kda_layers")?,
+            None => Vec::new(),
+        },
+        kda: match facts.get("kda_layers") {
+            Some(_) => Some(sparkflash_engine::config::KdaGeometry {
+                heads: int(facts, "kda_heads")?,
+                head_dim: int(facts, "kda_head_dim")?,
+                conv: int(facts, "kda_conv")?,
+                lower_bound: float(facts, "kda_lower_bound")?,
+            }),
+            None => None,
+        },
+        absorbed_latent,
         gdn_layers: match facts.get("gdn_layers") {
             Some(_) => integers(facts, "gdn_layers")?,
             None => Vec::new(),
@@ -168,19 +227,19 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
         head_dim: int(facts, "head_dim")?,
         rope_head_dim: int(facts, "rope_head_dim")?,
         norm_eps: float(facts, "norm_eps")?,
-        o_groups: int(facts, "o_groups")?,
-        o_lora_rank: int(facts, "o_lora_rank")?,
+        o_groups: by_part_int(grouped, "o_groups")?,
+        o_lora_rank: by_part_int(grouped, "o_lora_rank")?,
         window_size: opt_int(facts, "window_size").unwrap_or(0),
         kv_source_layers: integers(facts, "kv_source_layers")?,
         index_source_layers: integers(facts, "index_source_layers")?,
-        original_seq_len: int(facts, "original_seq_len")?,
-        rope_theta: float(facts, "rope_theta")?,
-        rope_factor: float(facts, "rope_factor")?,
-        beta_fast: float(facts, "beta_fast")?,
-        beta_slow: float(facts, "beta_slow")?,
-        index_n_heads: int(facts, "index_n_heads")?,
-        index_head_dim: int(facts, "index_head_dim")?,
-        index_topk: int(facts, "index_topk")?,
+        original_seq_len: by_part_int(rotated, "original_seq_len")?,
+        rope_theta: by_part_float(rotated, "rope_theta")?,
+        rope_factor: by_part_float(rotated, "rope_factor")?,
+        beta_fast: by_part_float(rotated, "beta_fast")?,
+        beta_slow: by_part_float(rotated, "beta_slow")?,
+        index_n_heads: by_part_int(indexed, "index_n_heads")?,
+        index_head_dim: by_part_int(indexed, "index_head_dim")?,
+        index_topk: by_part_int(indexed, "index_topk")?,
         candidate_source_layer: int(facts, "candidate_source_layer")?,
         candidate_topk_blocks: int(facts, "candidate_topk_blocks")?,
         candidate_block_size: int(facts, "candidate_block_size")?,
@@ -209,7 +268,7 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
                 || "ue8m0".to_owned(),
                 |format| format.scale_values().name().to_owned(),
             ),
-        compress_rope_theta: float(facts, "compress_rope_theta")?,
+        compress_rope_theta: by_part_float(compressed, "compress_rope_theta")?,
         compress_ratios,
         image_token_id: u32::try_from(opt_int(facts, "image_token_id").unwrap_or(0))
             .map_err(|_| "the plan's image token does not fit u32".to_owned())?,
@@ -328,6 +387,9 @@ pub fn tiny_values() -> ModelConfig {
         gqa: None,
         gdn_layers: Vec::new(),
         gdn: None,
+        kda_layers: Vec::new(),
+        kda: None,
+        absorbed_latent: None,
         n_layers: 2,
         n_mtp_layers: 1,
         dspark_block_size: 2,
@@ -2047,5 +2109,53 @@ mod tests {
             return;
         };
         check_language_parts(description).expect("every DeepSeek language part has a body");
+    }
+
+    /// GLM-5.3-Flash's description fills the value table by part at every world: the KDA
+    /// geometry and schedule, the absorbed latent, and zeros for the rotary, grouped-output and
+    /// compressor facts it plans no part for. The open then names KDA as the part the base has
+    /// no body for yet.
+    #[test]
+    fn the_glm_description_fills_the_value_table_by_part() {
+        const GLM: &str = include_str!("../../../models/configs/glm53_flash.hf.json");
+        for world in [1, 2, 4] {
+            for rank in 0..world {
+                let plan = EnginePlan::from_json(GLM, Target::Sm121, world, rank)
+                    .unwrap_or_else(|error| panic!("GLM TP{world}/{rank}: {error}"));
+                let values = values_from_plan(&plan)
+                    .unwrap_or_else(|error| panic!("GLM TP{world}/{rank}: {error}"));
+                assert_eq!(values.n_layers, 45);
+                assert_eq!(values.dim, 4096);
+                assert_eq!((values.n_heads, values.head_dim), (64, 256));
+                assert_eq!(values.kda_layers.len(), 34);
+                assert!(!values.kda_layers.contains(&3));
+                let kda = values.kda.expect("the KDA geometry");
+                assert_eq!((kda.heads, kda.head_dim, kda.conv), (64, 128, 4));
+                assert_eq!(
+                    values.absorbed_latent,
+                    Some(sparkflash_engine::config::AbsorbedLatent {
+                        kv_lora_rank: 512,
+                        v_head_dim: 256,
+                    })
+                );
+                assert_eq!(values.rope_head_dim, 0);
+                assert_eq!((values.o_groups, values.o_lora_rank), (0, 0));
+                assert_eq!(values.compress_rope_theta.to_bits(), 0f64.to_bits());
+                assert_eq!(values.index_topk, 2048);
+                assert_eq!(values.dense_ffn_layers, vec![0, 1, 2]);
+                let refusal = language_steps(&plan).expect_err("no KDA body yet");
+                assert!(refusal.contains("KdaScan"), "{refusal}");
+            }
+        }
+    }
+
+    /// The released description keeps its single-latent form and every V4 fact.
+    #[test]
+    fn the_released_values_keep_the_single_latent_form() {
+        let values = released_values().expect("the released values");
+        assert_eq!(values.absorbed_latent, None);
+        assert!(values.kda_layers.is_empty() && values.kda.is_none());
+        assert!(values.rope_head_dim > 0 && values.o_groups > 0);
+        assert!(values.compress_rope_theta > 0.0);
     }
 }

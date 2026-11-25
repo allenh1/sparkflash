@@ -1021,6 +1021,11 @@ impl Layout {
             .filter(|name| !applied.contains(*name))
             .cloned()
             .collect();
+        for name in &carried {
+            architecture
+                .layout_facts
+                .insert(name.clone(), facts[name].clone());
+        }
         coverage.carry_facts(carried);
         Ok(facts)
     }
