@@ -101,6 +101,10 @@ pub struct Region {
     pub min_rows: usize,
     /// Whether the part is a window ring that gives its old rows back.
     pub slides: bool,
+    /// Whether the part is a recurrent state: the state after the sequence's last position, not
+    /// a row a position, so a prefix of it means nothing and [LaneSpan::copy_prefix] leaves it to
+    /// the arm (which copies a state saved at the prefix's end, if it holds one).
+    pub state: bool,
 }
 
 impl Region {
@@ -151,6 +155,7 @@ impl Layout {
             row_bytes,
             min_rows,
             slides: false,
+            state: false,
         });
     }
 
@@ -160,6 +165,16 @@ impl Layout {
         if let Some(region) = self.regions.last_mut() {
             region.slides = true;
         }
+    }
+
+    /// [Self::reserve] and one recurrent state's region over it, `len` bytes a sequence touches
+    /// whole ([Region::state]).
+    pub fn state(&mut self, len: usize) -> usize {
+        let offset = self.part(len, 0, 0);
+        if let Some(region) = self.regions.last_mut() {
+            region.state = true;
+        }
+        offset
     }
 
     /// [Self::reserve] and one region over it.
@@ -458,8 +473,8 @@ impl LaneSpan {
     }
 
     /// Copies every part `src` holds for positions `..rows` into this span (the window rings from
-    /// row `floor`, at or above both spans' floors), backing it that far first. Returns false,
-    /// copying nothing, when the pool cannot back it.
+    /// row `floor`, at or above both spans' floors; no recurrent state, [Region::state]), backing
+    /// it that far first. Returns false, copying nothing, when the pool cannot back it.
     ///
     /// # Errors
     /// A driver failure backing this span or queueing a copy.
@@ -475,7 +490,7 @@ impl LaneSpan {
         if !self.ensure(device, shape, pool, rows)? {
             return Ok(false);
         }
-        for region in &shape.regions {
+        for region in shape.regions.iter().filter(|region| !region.state) {
             let (from, to) = region.live(rows, floor);
             if from < to {
                 let at = (region.offset + from) as u64;
@@ -1074,6 +1089,30 @@ mod tests {
         assert_eq!(copies.len(), 2);
         assert_eq!(copies[0].2, 200 * 64);
         assert_eq!(copies[1].2, (200 - 128) * 16);
+    }
+
+    #[test]
+    fn a_prefix_copy_leaves_a_recurrent_state_alone() {
+        let mut layout = Layout::default();
+        layout.part(4096 * 64, 64, 0);
+        let state = layout.state(512);
+        let shape = layout.finish(1024, 16);
+        assert!(shape.regions[1].state && shape.regions[1].row_bytes == 0);
+        assert_eq!(state, 4096 * 64);
+        let device = Fake::default();
+        let mut pool = ChunkPool::new(1024, 1 << 20);
+        let mut span = LaneSpan::new(0, &shape);
+        assert!(span.ensure(&device, &shape, &mut pool, 16).unwrap());
+        let mut copy = LaneSpan::new(shape.stride as u64, &shape);
+        assert!(
+            copy.copy_prefix(&device, &shape, &mut pool, &span, 16, 0)
+                .unwrap()
+        );
+        // The state is backed whole, and only the positional part's rows are copied.
+        assert_eq!(copy.mapped(), span.mapped());
+        let copies = device.copies.borrow();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].2, 16 * 64);
     }
 
     #[test]
