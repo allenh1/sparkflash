@@ -7986,6 +7986,7 @@ struct SharedExpertWorkspace {
 
 /// Whether the base's released dense bodies read `format`: E4M3 on the 32 x 32 power-of-two
 /// grid, whichever arrangement it is stored in (the arena tiles it for them).
+#[cfg(feature = "cuda")]
 #[must_use]
 pub(crate) fn released_dense(format: sparkflash_model::format::StoredFormat) -> bool {
     format.same_arithmetic(sparkflash_model::format::StoredFormat::MXFP8_32)
