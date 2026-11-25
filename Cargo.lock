@@ -2379,6 +2379,7 @@ dependencies = [
  "sparkflash-model-inkling2",
  "sparkflash-model-qwen4-exp",
  "sparkflash-ops",
+ "sparkflash-runtime",
  "sparkflash-scheduler",
  "sparkflash-serve",
  "sparkflash-trace",
