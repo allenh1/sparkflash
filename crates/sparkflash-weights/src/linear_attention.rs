@@ -223,9 +223,256 @@ pub fn rms_norm_gated(
         .collect()
 }
 
+/// One Gated DeltaNet layer's recurrent state on the host: the raw fused q/k/v rows before the
+/// next (oldest first, at most `taps - 1`, the [causal_conv] history) and each value head's
+/// `[key_dim][value_dim]` delta-rule state (empty before the first token).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GdnState {
+    /// The conv history.
+    pub conv_history: Vec<Vec<f32>>,
+    /// Each value head's state.
+    pub recurrent: Vec<Vec<f32>>,
+}
+
+/// A Gated DeltaNet layer's heads on the host: the key heads q and k come in, the value heads
+/// (a whole multiple of them) v and the state, each head's floats, and the conv's taps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GdnHeads {
+    /// The key heads.
+    pub key_heads: usize,
+    /// The value heads.
+    pub value_heads: usize,
+    /// A key head's floats.
+    pub key_dim: usize,
+    /// A value head's floats.
+    pub value_dim: usize,
+    /// The conv's taps.
+    pub taps: usize,
+}
+
+impl GdnHeads {
+    /// A key row's floats (the q part, or the k part, of the fused row).
+    #[must_use]
+    pub const fn key_width(&self) -> usize {
+        self.key_heads * self.key_dim
+    }
+
+    /// A value row's floats.
+    #[must_use]
+    pub const fn value_width(&self) -> usize {
+        self.value_heads * self.value_dim
+    }
+
+    /// The fused q/k/v row's floats, which the conv runs over.
+    #[must_use]
+    pub const fn conv_width(&self) -> usize {
+        2 * self.key_width() + self.value_width()
+    }
+}
+
+/// A Gated DeltaNet layer's weights past its projections, as f32: the conv `[conv_width][taps]`,
+/// the per-value-head `A_log` and `dt_bias`, and the gated norm's gains (a value head's width).
+#[derive(Debug, Clone, Copy)]
+pub struct GdnTensors<'a> {
+    /// The conv.
+    pub conv: &'a [f32],
+    /// `A_log`.
+    pub a_log: &'a [f32],
+    /// `dt_bias`.
+    pub dt_bias: &'a [f32],
+    /// The gated norm's gains.
+    pub norm: &'a [f32],
+}
+
+/// The activations a pack's Gated DeltaNet takes, its own numerics: the conv's (SiLU), the output
+/// gate's, the softplus of the decay and the sigmoid of beta.
+#[derive(Clone, Copy)]
+pub struct GdnActivations<'a> {
+    /// After the conv.
+    pub conv: &'a dyn Fn(f32) -> f32,
+    /// On the output gate.
+    pub gate: &'a dyn Fn(f32) -> f32,
+    /// `softplus`, inside the decay.
+    pub softplus: &'a dyn Fn(f32) -> f32,
+    /// `sigmoid`, of beta.
+    pub sigmoid: &'a dyn Fn(f32) -> f32,
+}
+
+/// One token through a Gated DeltaNet layer after its projections: the fused row `raw` convolved
+/// over `state`'s history (then appended to it), each value head's q and k from its key head
+/// L2-normalised (q scaled by `1 / sqrt(key_dim)`), the decay `exp(-exp(A_log) softplus(a +
+/// dt_bias))` and `beta = sigmoid(b)`, the delta-rule step on each head's state, and each head's
+/// gated RMSNorm by `z` at `epsilon`. Returns the normed heads, `[value_width]`, which `out_proj`
+/// takes.
+///
+/// # Errors
+/// A projection or a tensor whose length is not the heads', by name.
+pub fn gdn_token(
+    heads: GdnHeads,
+    tensors: GdnTensors<'_>,
+    (raw, z, b, a): (Vec<f32>, &[f32], &[f32], &[f32]),
+    state: &mut GdnState,
+    epsilon: f32,
+    activations: GdnActivations<'_>,
+) -> Result<Vec<f32>, String> {
+    let GdnHeads {
+        value_heads,
+        key_dim,
+        value_dim,
+        taps,
+        ..
+    } = heads;
+    let (key_width, value_width, width) =
+        (heads.key_width(), heads.value_width(), heads.conv_width());
+    let lengths = [
+        ("the fused q/k/v projection", raw.len(), width),
+        ("the output gate's projection", z.len(), value_width),
+        ("in_proj_b", b.len(), value_heads),
+        ("in_proj_a", a.len(), value_heads),
+        ("the conv", tensors.conv.len(), width * taps),
+        ("A_log", tensors.a_log.len(), value_heads),
+        ("dt_bias", tensors.dt_bias.len(), value_heads),
+        ("the gated norm", tensors.norm.len(), value_dim),
+    ];
+    for (name, got, want) in lengths {
+        if got != want {
+            return Err(format!(
+                "the Gated DeltaNet's {name} holds {got} floats, expected {want}"
+            ));
+        }
+    }
+    if heads.key_heads == 0 || value_heads % heads.key_heads != 0 {
+        return Err(format!(
+            "{value_heads} Gated DeltaNet value heads over {} key heads",
+            heads.key_heads
+        ));
+    }
+    let convolved = causal_conv(
+        std::slice::from_ref(&raw),
+        &state.conv_history,
+        tensors.conv,
+        width,
+        taps,
+        activations.conv,
+    );
+    let mixed = &convolved[0];
+    let groups = value_heads / heads.key_heads;
+    let scale = (key_dim as f32).sqrt().recip();
+    let mut qn = vec![0.0f32; value_heads * key_dim];
+    let mut kn = vec![0.0f32; value_heads * key_dim];
+    for head in 0..value_heads {
+        let source = (head / groups) * key_dim;
+        let span = head * key_dim..(head + 1) * key_dim;
+        l2_normalise(
+            &mixed[source..source + key_dim],
+            scale,
+            &mut qn[span.clone()],
+        );
+        l2_normalise(
+            &mixed[key_width + source..key_width + source + key_dim],
+            1.0,
+            &mut kn[span],
+        );
+    }
+    let values = &mixed[2 * key_width..2 * key_width + value_width];
+    if state.recurrent.is_empty() {
+        state.recurrent = vec![vec![0.0f32; key_dim * value_dim]; value_heads];
+    }
+    let mut core = vec![0.0f32; value_width];
+    for head in 0..value_heads {
+        let decay = (-tensors.a_log[head].exp()
+            * (activations.softplus)(a[head] + tensors.dt_bias[head]))
+        .exp();
+        let beta = (activations.sigmoid)(b[head]);
+        let (keys, values_at) = (
+            head * key_dim..(head + 1) * key_dim,
+            head * value_dim..(head + 1) * value_dim,
+        );
+        delta_rule_step(
+            &mut state.recurrent[head],
+            Decay::Head(decay),
+            &kn[keys.clone()],
+            &values[values_at.clone()],
+            beta,
+            &qn[keys],
+            &mut core[values_at],
+        );
+    }
+    let mut normed = vec![0.0f32; value_width];
+    for head in 0..value_heads {
+        let span = head * value_dim..(head + 1) * value_dim;
+        let gated = rms_norm_gated(
+            &core[span.clone()],
+            tensors.norm,
+            &z[span.clone()],
+            epsilon,
+            activations.gate,
+        );
+        normed[span].copy_from_slice(&gated);
+    }
+    advance_conv_history(&mut state.conv_history, vec![raw], taps);
+    Ok(normed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gated_deltanet_token_reads_its_key_head_and_keeps_its_state() {
+        let heads = GdnHeads {
+            key_heads: 1,
+            value_heads: 2,
+            key_dim: 2,
+            value_dim: 2,
+            taps: 2,
+        };
+        let width = heads.conv_width();
+        assert_eq!(width, 8);
+        let conv: Vec<f32> = (0..width * 2).map(|i| 0.1 * (i % 3) as f32 + 0.2).collect();
+        let tensors = GdnTensors {
+            conv: &conv,
+            a_log: &[0.1, -0.2],
+            dt_bias: &[0.0, 0.5],
+            norm: &[1.0, 0.5],
+        };
+        let identity = |x: f32| x;
+        let softplus = |x: f32| (1.0 + x.exp()).ln();
+        let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+        let activations = GdnActivations {
+            conv: &identity,
+            gate: &identity,
+            softplus: &softplus,
+            sigmoid: &sigmoid,
+        };
+        let raw: Vec<f32> = (0..width).map(|i| i as f32 * 0.25 - 0.5).collect();
+        let mut state = GdnState::default();
+        let z = [1.0, 2.0, 0.5, 1.5];
+        let out = gdn_token(
+            heads,
+            tensors,
+            (raw.clone(), &z, &[0.3, -0.3], &[0.2, 0.1]),
+            &mut state,
+            1e-6,
+            activations,
+        )
+        .expect("token");
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|value| value.is_finite()));
+        assert_eq!(state.conv_history, vec![raw.clone()]);
+        assert_eq!(state.recurrent.len(), 2);
+        assert!(state.recurrent.iter().all(|head| head.len() == 4));
+        let short = gdn_token(
+            heads,
+            tensors,
+            (raw[1..].to_vec(), &z, &[0.3, -0.3], &[0.2, 0.1]),
+            &mut state,
+            1e-6,
+            activations,
+        )
+        .unwrap_err();
+        assert!(short.contains("fused q/k/v"), "{short}");
+    }
 
     #[test]
     fn a_head_decay_is_a_channel_decay_with_one_value() {

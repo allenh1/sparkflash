@@ -37,7 +37,7 @@ use sparkflash_model::{
 use sparkflash_weights::DType;
 use sparkflash_weights::linalg::{ScaleGrid, apply_scales, decode_by_name};
 use sparkflash_weights::linear_attention::{
-    Decay, advance_conv_history, causal_conv, delta_rule_step, l2_normalise, rms_norm_gated,
+    GdnActivations, GdnHeads, GdnState, GdnTensors, gdn_token,
 };
 use sparkflash_weights::weights::WeightSource;
 
@@ -408,13 +408,6 @@ struct SessionShared {
 struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
-}
-
-/// One Gated DeltaNet layer's recurrent state.
-#[derive(Default)]
-struct GdnState {
-    conv_history: Vec<Vec<f32>>,
-    recurrent: Vec<Vec<f32>>,
 }
 
 pub(crate) struct HostSession {
@@ -868,7 +861,6 @@ fn apply_rope(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 fn gdn_attention(
     source: &dyn WeightSource,
     names: &LayerNames,
@@ -892,134 +884,41 @@ fn gdn_attention(
     else {
         return Err("a GDN layer carries another attention's tensors".to_owned());
     };
-    let key_width = gdn.key_heads * gdn.key_dim;
-    let value_width = gdn.value_heads * gdn.value_dim;
-    let width = 2 * key_width + value_width;
+    let heads = GdnHeads {
+        key_heads: gdn.key_heads,
+        value_heads: gdn.value_heads,
+        key_dim: gdn.key_dim,
+        value_dim: gdn.value_dim,
+        taps: gdn.conv_kernel,
+    };
     let (_, _, raw) = matrix(source, qkv, input)?;
-    if raw.len() != width {
-        return Err(format!(
-            "the GDN fused projection is {}, expected {width}",
-            raw.len()
-        ));
-    }
     let conv_kernel =
         decode_host_tensor(source, conv, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
-    if conv_kernel.len() != width * gdn.conv_kernel {
-        return Err(format!(
-            "{conv} holds {} values, expected [{width}, 1, {}]",
-            conv_kernel.len(),
-            gdn.conv_kernel
-        ));
-    }
-    let convolved = causal_conv(
-        std::slice::from_ref(&raw),
-        &state.conv_history,
-        &conv_kernel,
-        width,
-        gdn.conv_kernel,
-        silu,
-    );
     let (_, _, z_values) = matrix(source, z, input)?;
     let (_, _, b_values) = matrix(source, b, input)?;
     let (_, _, a_values) = matrix(source, a, input)?;
-    if z_values.len() != value_width {
-        return Err(format!(
-            "{z} is {} wide, expected {value_width}",
-            z_values.len()
-        ));
-    }
-    for (name, values) in [("in_proj_b", &b_values), ("in_proj_a", &a_values)] {
-        if values.len() != gdn.value_heads {
-            return Err(format!(
-                "the GDN {name} projection is {} wide, expected {} value heads",
-                values.len(),
-                gdn.value_heads
-            ));
-        }
-    }
     let (_, _, a_log_values) = matrix_or_vector(source, a_log)?;
     let (_, _, dt_values) = matrix_or_vector(source, dt_bias)?;
     let (_, _, norm_values) = matrix_or_vector(source, norm)?;
-    if a_log_values.len() != gdn.value_heads || dt_values.len() != gdn.value_heads {
-        return Err(format!(
-            "the GDN decay vectors are {}/{} wide, expected {}",
-            a_log_values.len(),
-            dt_values.len(),
-            gdn.value_heads
-        ));
-    }
-    if norm_values.len() != gdn.value_dim {
-        return Err(format!(
-            "{norm} holds {} values, expected {}",
-            norm_values.len(),
-            gdn.value_dim
-        ));
-    }
-    let mixed = &convolved[0];
-    let groups = gdn.value_heads / gdn.key_heads.max(1);
-    let mut queries = vec![0.0f32; gdn.value_heads * gdn.key_dim];
-    let mut keys = vec![0.0f32; gdn.value_heads * gdn.key_dim];
-    for head in 0..gdn.value_heads {
-        let source_head = head / groups.max(1);
-        for dim in 0..gdn.key_dim {
-            queries[head * gdn.key_dim + dim] = mixed[source_head * gdn.key_dim + dim];
-            keys[head * gdn.key_dim + dim] = mixed[key_width + source_head * gdn.key_dim + dim];
-        }
-    }
-    let values = &mixed[2 * key_width..2 * key_width + value_width];
-    let mut qn = vec![0.0f32; queries.len()];
-    let mut kn = vec![0.0f32; keys.len()];
-    let scale = (gdn.key_dim as f32).sqrt().recip();
-    for ((q, k), (q_out, k_out)) in queries
-        .chunks(gdn.key_dim)
-        .zip(keys.chunks(gdn.key_dim))
-        .zip(qn.chunks_mut(gdn.key_dim).zip(kn.chunks_mut(gdn.key_dim)))
-    {
-        l2_normalise(q, scale, q_out);
-        l2_normalise(k, 1.0, k_out);
-    }
-    if state.recurrent.is_empty() {
-        state.recurrent = (0..gdn.value_heads)
-            .map(|_| vec![0.0f32; gdn.key_dim * gdn.value_dim])
-            .collect();
-    }
-    let mut core = vec![0.0f32; value_width];
-    for head in 0..gdn.value_heads {
-        let a_log = a_log_values.get(head).copied().ok_or_else(|| {
-            format!(
-                "A_log holds {} values, {head} requested",
-                a_log_values.len()
-            )
-        })?;
-        let dt = dt_values
-            .get(head)
-            .copied()
-            .ok_or_else(|| format!("dt_bias holds {} values, {head} requested", dt_values.len()))?;
-        let decay =
-            (-a_log.exp() * softplus(a_values.get(head).copied().unwrap_or(0.0) + dt)).exp();
-        let beta = sigmoid(b_values.get(head).copied().unwrap_or(0.0));
-        delta_rule_step(
-            &mut state.recurrent[head],
-            Decay::Head(decay),
-            &kn[head * gdn.key_dim..(head + 1) * gdn.key_dim],
-            &values[head * gdn.value_dim..(head + 1) * gdn.value_dim],
-            beta,
-            &qn[head * gdn.key_dim..(head + 1) * gdn.key_dim],
-            &mut core[head * gdn.value_dim..(head + 1) * gdn.value_dim],
-        );
-    }
-    let mut normed = vec![0.0f32; value_width];
-    for head in 0..gdn.value_heads {
-        let gated = rms_norm_gated(
-            &core[head * gdn.value_dim..(head + 1) * gdn.value_dim],
-            &norm_values,
-            &z_values[head * gdn.value_dim..(head + 1) * gdn.value_dim],
-            epsilon,
-            activation_of(gdn.output_gate),
-        );
-        normed[head * gdn.value_dim..(head + 1) * gdn.value_dim].copy_from_slice(&gated);
-    }
-    advance_conv_history(&mut state.conv_history, vec![raw], gdn.conv_kernel);
+    let gate = activation_of(gdn.output_gate);
+    let normed = gdn_token(
+        heads,
+        GdnTensors {
+            conv: &conv_kernel,
+            a_log: &a_log_values,
+            dt_bias: &dt_values,
+            norm: &norm_values,
+        },
+        (raw, &z_values, &b_values, &a_values),
+        state,
+        epsilon,
+        GdnActivations {
+            conv: &silu,
+            gate: &gate,
+            softplus: &softplus,
+            sigmoid: &sigmoid,
+        },
+    )?;
     let (_, _, projected) = matrix(source, out, &normed)?;
     if projected.len() != input.len() {
         return Err(format!(
