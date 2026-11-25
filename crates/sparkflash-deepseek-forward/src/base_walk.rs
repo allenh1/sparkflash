@@ -20,17 +20,20 @@
 //! prefill and token-rows bodies. A prompt chunk takes whichever of the bulk chunks and the
 //! exact rows steps the scheduler would pick for it, and its last row is headed on the device;
 //! a token pass is the plain step's rows, every row headed. The head answers those picks, so
-//! the walk keeps no logits. The conformance fixture in `sparkflash-cli` opens the epoch.
+//! the walk keeps no logits. Its [`BaseDrafter`] is the shared speculative step's: a DSpark
+//! block a member, one verify rows step over the members. The conformance fixture in
+//! `sparkflash-cli` opens the epoch.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Sender};
 
-use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
+use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
 use sparkflash_model::gumbel::GumbelSampler;
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
-    Absent, ComputeDeclaration, HeadRow, LaneState, Limits, NoVision, Pass, PassKind, PassMask,
-    Region, Residual, Segment, Segments, StateKind, StateLayout, Walk, WalkCapabilities,
-    check_checkpoint, check_rewind,
+    ComputeDeclaration, Draft, DraftBudget, Drafter, HeadRow, LaneState, Limits,
+    NoVision, Pass, PassKind, PassMask, Region, Residual, Segment, Segments, StateKind, StateLayout,
+    StepWall, Walk, WalkCapabilities, check_checkpoint, check_rewind,
 };
 
 use crate::device_link::{WalkAnswer, WalkCommand, WalkDescription, WalkRequest};
@@ -74,7 +77,7 @@ pub struct BaseWalk {
     link: Link,
     description: WalkDescription,
     layout: StateLayout,
-    drafter: Absent<&'static str>,
+    drafter: BaseDrafter,
 }
 
 /// The walk's state: one positional region of `row_bytes` a row.
@@ -98,10 +101,13 @@ impl BaseWalk {
             other => return Err(unexpected(&other)),
         };
         Ok(Self {
-            link,
             description,
             layout: layout(description.row_bytes),
-            drafter: Absent("the DeepSeek base walk drafts nothing yet"),
+            drafter: BaseDrafter {
+                link: link.clone(),
+                description,
+            },
+            link,
         })
     }
 
@@ -120,6 +126,10 @@ pub struct BaseSeq {
     sampler: GumbelSampler,
     /// Why the request's sampling cannot be served, raised at its next pass.
     refused: Option<String>,
+    /// The answers the last verify kept: each accepted draft, as the engine feeds it, and the
+    /// model's token after it.
+    held: VecDeque<(u32, u32)>,
+    speculation: Speculation,
 }
 
 impl Drop for BaseSeq {
@@ -141,6 +151,7 @@ impl LaneState for BaseSeq {
 
     fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
         check_rewind(CODE, to, self.pos)?;
+        self.held.clear();
         self.link.call(WalkCommand::Rewind {
             lane: self.lane,
             to,
@@ -175,7 +186,7 @@ impl Residual for BaseHidden {
 impl Walk for BaseWalk {
     type Seq = BaseSeq;
     type Hidden = BaseHidden;
-    type Drafter = Absent<&'static str>;
+    type Drafter = BaseDrafter;
     type Vision = NoVision;
 
     const CAPABILITIES: WalkCapabilities = WalkCapabilities {
@@ -207,6 +218,8 @@ impl Walk for BaseWalk {
             pos: 0,
             sampler: GumbelSampler::GREEDY,
             refused: None,
+            held: VecDeque::new(),
+            speculation: Speculation::default(),
         })
     }
 
@@ -214,7 +227,7 @@ impl Walk for BaseWalk {
         Limits::new(PROMPT_ROWS, self.description.context).with_members(self.description.members)
     }
 
-    fn drafter(&self) -> &Absent<&'static str> {
+    fn drafter(&self) -> &BaseDrafter {
         &self.drafter
     }
 
@@ -344,5 +357,140 @@ impl Walk for BaseWalk {
 
     fn rewind_slack(&self) -> usize {
         self.description.slack
+    }
+}
+
+/// The base's DSpark drafter: the epoch's draft block after each anchor, and one rows step of
+/// the shared speculative step verifying every member's anchor and the drafts the runtime's
+/// row share gave it. The server keeps the anchor and the agreeing drafts; the sequence holds
+/// the model's answers to the drafts it kept until the engine feeds them.
+pub struct BaseDrafter {
+    link: Link,
+    description: WalkDescription,
+}
+
+impl BaseDrafter {
+    /// The rule the verify's rows follow: the anchors and the drafts fit one rows step.
+    fn rule(&self) -> DraftBudget {
+        DraftBudget::OnePass(self.description.verify_rows)
+    }
+}
+
+impl Drafter<BaseWalk> for BaseDrafter {
+    const PRESENT: bool = true;
+    /// The member's picks over its kept rows, the last its next token.
+    type Rows = Vec<u32>;
+
+    fn drafts(&self) -> bool {
+        self.description.depth > 0
+    }
+
+    fn wall(&self) -> &dyn StepWall {
+        &self.description.wall
+    }
+
+    fn open_round(&self, seq: &mut BaseSeq, token: u32) -> Result<Draft, BackendError> {
+        if let Some(&(fed, answer)) = seq.held.front() {
+            if fed != token {
+                return Err(BackendError::new(
+                    CODE,
+                    format!(
+                        "the engine fed token {token} where the verify kept {fed}; a round that \
+                         did not accept the drafts must be drafted again"
+                    ),
+                ));
+            }
+            seq.held.pop_front();
+            return Ok(Draft::Held(StepOutput {
+                next_token: Some(answer),
+                ..StepOutput::default()
+            }));
+        }
+        if let Some(refused) = seq.refused.clone() {
+            return Err(BackendError::new(CODE, refused));
+        }
+        match self.link.call(WalkCommand::Draft {
+            lane: seq.lane,
+            anchor: token,
+            sampler: seq.sampler,
+        })? {
+            WalkAnswer::Chain { drafts, confidence } => Ok(Draft::Chain { confidence, drafts }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    fn verify(
+        &self,
+        _walk: &BaseWalk,
+        segments: &mut [Segment<'_, BaseSeq>],
+        _depths: &[usize],
+    ) -> Result<Vec<Vec<u32>>, BackendError> {
+        let members = segments
+            .iter()
+            .map(|segment| (segment.seq.lane, segment.rows.to_vec()))
+            .collect();
+        match self.link.call(WalkCommand::Verify { members })? {
+            WalkAnswer::Verified(answers) if answers.len() == segments.len() => Ok(answers),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    fn settle(
+        &self,
+        seq: &mut BaseSeq,
+        chunk: &[u32],
+        rows: Vec<u32>,
+    ) -> Result<StepOutput, BackendError> {
+        let Some(kept) = rows.len().checked_sub(1).filter(|&kept| kept < chunk.len()) else {
+            return Err(BackendError::new(
+                CODE,
+                format!(
+                    "a verify of {} rows answered {} picks",
+                    chunk.len(),
+                    rows.len()
+                ),
+            ));
+        };
+        seq.pos += kept + 1;
+        seq.held = chunk[1..=kept].iter().copied().zip(rows[1..].iter().copied()).collect();
+        if chunk.len() > 1 {
+            seq.speculation.verify_steps += 1;
+            seq.speculation.drafts_proposed += chunk.len() - 1;
+            seq.speculation.drafts_accepted += kept;
+        }
+        Ok(StepOutput {
+            next_token: Some(rows[0]),
+            ..StepOutput::default()
+        })
+    }
+
+    fn budget(&self, seqs: usize) -> usize {
+        self.rule().rows(seqs, self.description.depth)
+    }
+
+    fn ready(&self, seq: &BaseSeq, token: u32) -> bool {
+        seq.held.front().is_some_and(|&(fed, _)| fed == token)
+    }
+
+    /// The counters stay where the verify left them: a turn that continues from a shorter
+    /// history goes back to its rewind point at its next prompt.
+    fn give_back(&self, seq: &mut BaseSeq, _to: usize) -> Result<(), BackendError> {
+        seq.held.clear();
+        Ok(())
+    }
+
+    fn speculation(&self, seq: &BaseSeq) -> Speculation {
+        seq.speculation
+    }
+
+    fn floor(&self) -> f64 {
+        self.description.floor
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "DSpark blocks of {} drafts, verified in the shared speculative step's rows",
+            self.description.depth
+        )
     }
 }

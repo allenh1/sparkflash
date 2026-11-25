@@ -58,6 +58,14 @@ impl Batch<'_, '_, '_> {
             WalkCommand::Room { lane, positions } => {
                 self.walk_room(lane, positions).map(WalkAnswer::Room)
             }
+            WalkCommand::Draft {
+                lane,
+                anchor,
+                sampler,
+            } => self.walk_draft(lane, anchor, sampler),
+            WalkCommand::Verify { members } => {
+                self.walk_verify(&members).map(WalkAnswer::Verified)
+            }
         }
     }
 
@@ -89,6 +97,10 @@ impl Batch<'_, '_, '_> {
             } else {
                 0
             },
+            depth: self.k,
+            verify_rows: R_MAX,
+            wall: super::super::step_wall(),
+            floor: self.spec_floor.unwrap_or(0.0),
         })
     }
 
@@ -251,21 +263,11 @@ impl Batch<'_, '_, '_> {
             }
             in_vocabulary(&[token])?;
             self.servable(&sampler)?;
-            let next = self.seqs[index].pos + 1;
-            if next > self.room || !self.grow(lane, next + draft::draft_block() + self.k + 2)? {
-                return Err(format!(
-                    "a sequence of {next} tokens does not fit the device's lane memory or its {}-token context",
-                    self.room
-                ));
-            }
+            self.walk_grow(lane, index)?;
             group.push(index);
         }
         for (&index, &(_, token, sampler)) in group.iter().zip(rows) {
-            let seq = &mut self.seqs[index];
-            seq.sampler = sampler;
-            seq.tokens.truncate(seq.pos);
-            seq.tokens.push(token);
-            seq.prompt_len = seq.tokens.len();
+            self.walk_anchor(index, token, sampler);
         }
         let (_, picks) = self.token_rows(&group, &mut |_, _| Ok(()))?;
         for &index in &group {
@@ -274,6 +276,108 @@ impl Batch<'_, '_, '_> {
             seq.walk_bulk_end = None;
         }
         Ok(picks.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// Backs sequence `index` on `lane` for its next row and a verify step past it.
+    fn walk_grow(&mut self, lane: usize, index: usize) -> Result<(), String> {
+        let next = self.seqs[index].pos + 1;
+        if next > self.room || !self.grow(lane, next + draft::draft_block() + self.k + 2)? {
+            return Err(format!(
+                "a sequence of {next} tokens does not fit the device's lane memory or its {}-token context",
+                self.room
+            ));
+        }
+        Ok(())
+    }
+
+    /// Puts `token` at sequence `index`'s position, its next row, under `sampler`.
+    fn walk_anchor(&mut self, index: usize, token: u32, sampler: Sampler) {
+        let seq = &mut self.seqs[index];
+        seq.sampler = sampler;
+        seq.tokens.truncate(seq.pos);
+        seq.tokens.push(token);
+        seq.prompt_len = seq.tokens.len();
+        seq.walk_bulk_end = None;
+    }
+
+    /// The draft block after `anchor` on `lane`: the scheduler's own draft pass
+    /// ([Batch::draft_group]) at the epoch's depth, with the depth policy's chance of each
+    /// leading run. The runtime shares the verify rows; the anchor waits for the verify.
+    fn walk_draft(
+        &mut self,
+        lane: usize,
+        anchor: u32,
+        sampler: Sampler,
+    ) -> Result<WalkAnswer, String> {
+        let index = self.walk_seq(lane)?;
+        in_vocabulary(&[anchor])?;
+        self.servable(&sampler)?;
+        self.walk_grow(lane, index)?;
+        self.walk_anchor(index, anchor, sampler);
+        let depth = self.k.min(R_MAX - 1);
+        let (drafts, probs) = self
+            .draft_group(&[index], depth)?
+            .pop()
+            .ok_or("walk: the draft pass answered no block")?;
+        let confidence = self.seqs[index].policy.chain(&probs);
+        Ok(WalkAnswer::Chain { drafts, confidence })
+    }
+
+    /// One verify step over the members' chunks ([Batch::verify_segments], the shared
+    /// speculative step's own), each member keeping its anchor and the drafts its picks agree
+    /// with ([Batch::keep_verified]); answers each member's picks over the kept rows.
+    fn walk_verify(&mut self, members: &[(usize, Vec<u32>)]) -> Result<Vec<Vec<u32>>, String> {
+        let rows: usize = members.iter().map(|(_, chunk)| chunk.len()).sum();
+        if members.is_empty() || rows > R_MAX {
+            return Err(format!(
+                "walk: a verify holds 1 to {R_MAX} rows over at least one member, not {rows} over {}",
+                members.len()
+            ));
+        }
+        let mut group = Vec::with_capacity(members.len());
+        let mut depths = Vec::with_capacity(members.len());
+        for (lane, chunk) in members {
+            let index = self.walk_seq(*lane)?;
+            let seq = &self.seqs[index];
+            if group.contains(&index) {
+                return Err(format!("walk: lane {lane} appears twice in one verify"));
+            }
+            if chunk.first() != seq.tokens.get(seq.pos) || seq.tokens.len() != seq.pos + 1 {
+                return Err(format!(
+                    "walk: lane {lane}'s verify starts at {:?}, not at the anchor its draft opened",
+                    chunk.first()
+                ));
+            }
+            in_vocabulary(chunk)?;
+            group.push(index);
+            depths.push(chunk.len() - 1);
+        }
+        for ((&index, (_, chunk)), &depth) in group.iter().zip(members).zip(&depths) {
+            let seq = &mut self.seqs[index];
+            seq.verified += depth;
+            seq.tokens.extend_from_slice(&chunk[1..]);
+        }
+        let (_, segs, picks) = self.verify_segments(&group, &depths, &mut |_, _| Ok(()))?;
+        let mut answers = Vec::with_capacity(group.len());
+        for ((&index, (_, chunk)), seg) in group.iter().zip(members).zip(&segs) {
+            let depth = seg.n - 1;
+            let mut m = 0usize;
+            while m < depth && chunk[1 + m] == picks[seg.row0 + m].0 {
+                m += 1;
+            }
+            let seq = &mut self.seqs[index];
+            seq.steps += 1;
+            seq.accepted += m;
+            seq.tokens.truncate(seq.pos + 1 + m);
+            self.keep_verified(index, seg, m)?;
+            answers.push(
+                picks[seg.row0..=seg.row0 + m]
+                    .iter()
+                    .map(|&(id, _)| id)
+                    .collect(),
+            );
+        }
+        Ok(answers)
     }
 
     fn walk_room(&self, lane: usize, positions: usize) -> Result<bool, String> {

@@ -2745,14 +2745,85 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         out: &mut Vec<Emission>,
         ahead: Ahead<'_>,
     ) -> Result<usize, String> {
-        let (rows, inputs, draft, k) = (self.rows, self.inputs, self.draft, self.k);
-        let exchange = self
-            .exchange
-            .ok_or("decode: several sequences need the exchange")?;
+        let k = self.k;
+        if self.exchange.is_none() {
+            return Err("decode: several sequences need the exchange".to_owned());
+        }
         let floor = self.spec_floor.unwrap_or(0.0);
         // The step's reads land in the decode staging.
         self.wait_ahead()?;
         let t0 = Instant::now();
+        // No sequence can take more draft rows than the anchors leave, so none drafts deeper.
+        let drafted = self.draft_group(group, k.min(R_MAX - group.len()))?;
+        let t1 = Instant::now();
+        let chains: Vec<Vec<f64>> = group
+            .iter()
+            .zip(&drafted)
+            .map(|(&index, (_, probs))| self.seqs[index].policy.chain(probs))
+            .collect();
+        let model = super::spec::batch_step_cost();
+        let depths = share_rows(&chains, R_MAX - group.len(), floor, model);
+        for ((&index, (drafts, _)), &depth) in group.iter().zip(&drafted).zip(&depths) {
+            let seq = &mut self.seqs[index];
+            let pos = seq.pos;
+            seq.verified += depth;
+            seq.tokens.truncate(pos + 1);
+            seq.tokens.extend_from_slice(&drafts[..depth]);
+        }
+        let (n, segs, picks) = self.verify_segments(group, &depths, ahead)?;
+        let (draft_ms, verify_ms) = (
+            (t1 - t0).as_secs_f64() * 1e3,
+            t1.elapsed().as_secs_f64() * 1e3,
+        );
+        for ((&index, (drafts, probs)), seg) in group.iter().zip(&drafted).zip(&segs) {
+            let depth = seg.n - 1;
+            let seq = &mut self.seqs[index];
+            let pos = seq.pos;
+            let mut m = 0usize;
+            while m < depth && drafts[m] == picks[seg.row0 + m].0 {
+                m += 1;
+            }
+            seq.policy.observe(probs, depth, m);
+            seq.steps += 1;
+            seq.accepted += m;
+            seq.draft_ms += draft_ms;
+            seq.verify_ms += verify_ms;
+            let mut step = drafts[..m].to_vec();
+            step.push(picks[seg.row0 + m].0);
+            let emitted = seq.emitted() - depth;
+            let finish = cut_step(&mut step, emitted, seq.max_new, &seq.stop_ids, seq.exact);
+            if self.print {
+                println!(
+                    "spec multi step {}: seq {} pos {pos} drafts {drafts:?} probs {probs:.3?} depth {depth} accepted {m}",
+                    seq.steps, seq.id
+                );
+            }
+            seq.tokens.truncate(pos + 1);
+            seq.tokens.extend_from_slice(&step);
+            if let Some(finish) = finish {
+                self.finish(index, finish, pos, step, out)?;
+                continue;
+            }
+            let id = seq.id;
+            self.keep_verified(index, seg, m)?;
+            out.push(Emission {
+                seq: id,
+                tokens: step,
+                done: None,
+            });
+        }
+        Ok(n)
+    }
+
+    /// Each sequence of `group`'s draft block from its anchor `tokens[pos]`, `depth` deep, in
+    /// passes of up to [DraftState::pass_seqs] blocks ([DeviceLayer::draft_blocks]): the drafts
+    /// and the drafter's probability of each.
+    fn draft_group(
+        &mut self,
+        group: &[usize],
+        depth: usize,
+    ) -> Result<Vec<(Vec<u32>, Vec<f32>)>, String> {
+        let (rows, inputs, draft) = (self.rows, self.inputs, self.draft);
         let blocks = group
             .iter()
             .map(|&index| {
@@ -2765,8 +2836,6 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        // No sequence can take more draft rows than the anchors leave, so none drafts deeper.
-        let depth = k.min(R_MAX - group.len());
         let mut drafted = Vec::with_capacity(blocks.len());
         for pass in blocks.chunks(draft.pass_seqs()) {
             drafted.extend(self.device.draft_blocks(
@@ -2778,24 +2847,30 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 depth,
             )?);
         }
-        let t1 = Instant::now();
-        let chains: Vec<Vec<f64>> = group
-            .iter()
-            .zip(&drafted)
-            .map(|(&index, (_, probs))| self.seqs[index].policy.chain(probs))
-            .collect();
-        let model = super::spec::batch_step_cost();
-        let depths = share_rows(&chains, R_MAX - group.len(), floor, model);
+        Ok(drafted)
+    }
+
+    /// One rows step verifying each sequence of `group` as its own segment: its anchor and the
+    /// `depths[j]` drafts after it, already in `tokens[pos..]`. Every row is headed under its
+    /// sequence's sampler and seeds its lane's drafter rings. Answers the rows, the segments
+    /// and each row's pick; the acceptance is the caller's.
+    fn verify_segments(
+        &mut self,
+        group: &[usize],
+        depths: &[usize],
+        ahead: Ahead<'_>,
+    ) -> Result<(usize, Vec<Seg>, Vec<(u32, f32)>), String> {
+        let (rows, inputs, draft) = (self.rows, self.inputs, self.draft);
+        let exchange = self
+            .exchange
+            .ok_or("decode: several sequences need the exchange")?;
         let mut segs = Vec::with_capacity(group.len());
         let mut ids = Vec::with_capacity(R_MAX * 4);
         let mut parts = Vec::new();
         let mut row0 = 0;
-        for ((&index, (drafts, _)), &depth) in group.iter().zip(&drafted).zip(&depths) {
-            let seq = &mut self.seqs[index];
+        for (&index, &depth) in group.iter().zip(depths) {
+            let seq = &self.seqs[index];
             let (pos, n) = (seq.pos, depth + 1);
-            seq.verified += depth;
-            seq.tokens.truncate(pos + 1);
-            seq.tokens.extend_from_slice(&drafts[..depth]);
             segs.push(Seg {
                 lane: seq.lane.ok_or("decode: no lane")?,
                 p0: pos,
@@ -2868,55 +2943,21 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             Ok::<_, String>(picks)
         })();
         self.device.clear_segments();
-        let picks = result?;
-        let (draft_ms, verify_ms) = (
-            (t1 - t0).as_secs_f64() * 1e3,
-            t1.elapsed().as_secs_f64() * 1e3,
-        );
-        for ((&index, (drafts, probs)), seg) in group.iter().zip(&drafted).zip(&segs) {
-            let depth = seg.n - 1;
-            let seq = &mut self.seqs[index];
-            let pos = seq.pos;
-            let mut m = 0usize;
-            while m < depth && drafts[m] == picks[seg.row0 + m].0 {
-                m += 1;
-            }
-            seq.policy.observe(probs, depth, m);
-            seq.steps += 1;
-            seq.accepted += m;
-            seq.draft_ms += draft_ms;
-            seq.verify_ms += verify_ms;
-            let mut step = drafts[..m].to_vec();
-            step.push(picks[seg.row0 + m].0);
-            let emitted = seq.emitted() - depth;
-            let finish = cut_step(&mut step, emitted, seq.max_new, &seq.stop_ids, seq.exact);
-            if self.print {
-                println!(
-                    "spec multi step {}: seq {} pos {pos} drafts {drafts:?} probs {probs:.3?} depth {depth} accepted {m}",
-                    seq.steps, seq.id
-                );
-            }
-            seq.tokens.truncate(pos + 1);
-            seq.tokens.extend_from_slice(&step);
-            if let Some(finish) = finish {
-                self.finish(index, finish, pos, step, out)?;
-                continue;
-            }
-            seq.pos = pos + m + 1;
-            let id = seq.id;
-            // The recurrent state ran every verify row; it keeps the last accepted row's.
-            if m + 1 < seg.n {
-                self.device.commit_recurrent(rows, seg.lane, seg.row0 + m)?;
-            }
-            self.enter(seg.lane)?;
-            self.device.rewind_rows(pos + m + 1);
-            out.push(Emission {
-                seq: id,
-                tokens: step,
-                done: None,
-            });
+        Ok((n, segs, result?))
+    }
+
+    /// Keeps the anchor and the first `m` drafts of sequence `index`'s verify segment `seg`:
+    /// its position moves past them, and its lane's state goes back to there.
+    fn keep_verified(&mut self, index: usize, seg: &Seg, m: usize) -> Result<(), String> {
+        let pos = self.seqs[index].pos;
+        self.seqs[index].pos = pos + m + 1;
+        // The recurrent state ran every verify row; it keeps the last accepted row's.
+        if m + 1 < seg.n {
+            self.device.commit_recurrent(self.rows, seg.lane, seg.row0 + m)?;
         }
-        Ok(n)
+        self.enter(seg.lane)?;
+        self.device.rewind_rows(pos + m + 1);
+        Ok(())
     }
 }
 

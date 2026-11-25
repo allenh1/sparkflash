@@ -1968,7 +1968,8 @@ mod base_conformance {
     use sparkflash_model::backend::BackendError;
     use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
     use sparkflash_runtime::testing::ArmProfile;
-    use sparkflash_runtime::{ArmFixture, Fixture, FormatRule, Limits};
+    use sparkflash_deepseek_forward::tp4_forward::{VERIFY_ROWS, step_wall};
+    use sparkflash_runtime::{ArmFixture, DraftBudget, Fixture, FormatRule, Limits};
     use std::path::PathBuf;
     use std::sync::OnceLock;
     use std::sync::mpsc::Sender;
@@ -2112,15 +2113,18 @@ mod base_conformance {
         }
     }
 
-    /// What the base states: its widest prompt pass, the serving lanes' 32 members, and the
-    /// chunks a 5,000-row prompt runs in. The profile's checks read the layout's kind, so its
-    /// bytes a row are a placeholder for the epoch's.
+    /// What the base states: its widest prompt pass, the serving lanes' 32 members, the
+    /// released plan's DSpark block of 5 drafts (`plan::draft_depth`) in one verify rows step
+    /// at the profile's band model, and the chunks a 5,000-row prompt runs in. The profile's
+    /// checks read the layout's kind, so its bytes a row are a placeholder for the epoch's.
     fn stated() -> ArmProfile {
         let limits = Limits::new(PROMPT_ROWS, 1_048_576).with_members(32);
         ArmProfile::new("DeepSeek", layout(1), limits)
             .with_code(CODE)
+            .drafting(5, DraftBudget::OnePass(VERIFY_ROWS))
+            .with_wall(step_wall())
             .prompt(limits, 5_000, &[4_096, 904])
     }
 
-    sparkflash_runtime::conformance!(DeepSeekBase, profile: stated());
+    sparkflash_runtime::conformance!(DeepSeekBase, profile: stated(), rounds);
 }

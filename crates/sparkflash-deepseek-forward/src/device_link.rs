@@ -285,10 +285,21 @@ pub enum WalkCommand {
     },
     /// Whether the sequence on `lane` can be backed for `positions` positions.
     Room { lane: usize, positions: usize },
+    /// The draft block after `anchor` on `lane`, its rows' picks under `sampler`; answers
+    /// [`WalkAnswer::Chain`]. The anchor is the sequence's next row, not yet walked.
+    Draft {
+        lane: usize,
+        anchor: u32,
+        sampler: sparkflash_model::gumbel::GumbelSampler,
+    },
+    /// One rows step verifying each member's lane and chunk (its drafted anchor, then the
+    /// drafts kept for it), every member its own segment; each keeps its anchor and the drafts
+    /// its picks agree with. Answers [`WalkAnswer::Verified`].
+    Verify { members: Vec<(usize, Vec<u32>)> },
 }
 
 /// What the walk server knows about the epoch, for [`sparkflash_runtime::Limits`] and the rewind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WalkDescription {
     /// The lanes the scheduler holds (one without the device exchange).
     pub lanes: usize,
@@ -307,6 +318,14 @@ pub struct WalkDescription {
     pub row_bytes: usize,
     /// The fewest prompt rows a chunk takes the bulk path with, or 0 when it never does.
     pub bulk_rows: usize,
+    /// The drafts a block proposes, or 0 when the epoch drafts nothing.
+    pub depth: usize,
+    /// The most rows one verify step holds, its anchors included.
+    pub verify_rows: usize,
+    /// What a shared verify step costs, for the runtime's row share.
+    pub wall: sparkflash_runtime::BandWall,
+    /// The least chance a draft must have to be given a verify row.
+    pub floor: f64,
 }
 
 /// The walk server's answer to one [`WalkCommand`].
@@ -322,6 +341,11 @@ pub enum WalkAnswer {
     Picks(Vec<u32>),
     /// [`WalkCommand::Room`].
     Room(bool),
+    /// [`WalkCommand::Draft`]: the drafts, and the chance each leading run is accepted.
+    Chain { drafts: Vec<u32>, confidence: Vec<f64> },
+    /// [`WalkCommand::Verify`]: each member's picks for its anchor and the drafts it kept, the
+    /// last one the model's own next token.
+    Verified(Vec<Vec<u32>>),
 }
 
 /// One command and where its answer goes.

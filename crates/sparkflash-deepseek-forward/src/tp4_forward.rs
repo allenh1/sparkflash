@@ -83,6 +83,17 @@ mod spec;
 #[cfg(feature = "cuda")]
 mod vision;
 
+/// The most rows one verify step of the base holds, its anchors included.
+pub const VERIFY_ROWS: usize = rows::R_MAX;
+
+/// What the base's shared verify step costs, as the runtime's row share reads it: the profile's
+/// band model ([spec::batch_step_cost]).
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn step_wall() -> sparkflash_runtime::BandWall {
+    sparkflash_runtime::tick::band(spec::batch_step_cost())
+}
+
 /// The safety interlock flag: without it, `--forward` produces a refusal envelope naming it.
 pub const PREFLIGHT_FLAG: &str = "--forward-preflight";
 
