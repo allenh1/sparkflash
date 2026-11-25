@@ -1366,6 +1366,51 @@ stack.
       and prompt 3, position 7, gap 0.0004. World 4 has the 0.0045 tie.
     * `gqa-dense` passes unchanged.
 
+* **S4** (`075db3b7` .. `c7f4faad`). The base implements the runtime's walk contract and passes
+  `conformance!(DeepSeekBase)` and its profile form at world 1.
+  * **How it runs.** A walk link in the forward crate serves the walk's commands through the
+    serving scheduler (`spec::serve_walk`, `BaseWalk`). The walk's token step and the drafter's
+    draft/verify/keep steps are carved out of `plain_step` and `spec_multi_step`, and serving
+    calls the same carved functions. The fixture is in `sparkflash-cli` (`serve/device.rs`, one
+    chain per process).
+  * **The carve changed no launch.** Before and after it, a fixed workload (a 400-row prompt, a
+    short one, then two at once) gives the same launch manifest (3,526 records), the same launch
+    count (17,240), the same 86 tick decisions and the same answers, on both the shared plan and
+    the plain plan. One argument of `opt_rows_store_u32` moves between runs of the same binary,
+    because it depends on which concurrent request arrives first.
+  * **The suite reaches the bulk prefill.** It adds a 256-row prompt (`Fixture::with_long_prompt`),
+    so whole = chunked and continued = cold go through the bulk prefill (564 to 632 bulk
+    launches). On these checkpoints the warm-server resume break (D67) did not appear.
+  * **Recurrent stacks** (`9d100392`). The walk declares the Gated DeltaNet region (state kind
+    `Both`). A rewind resumes where placing a prompt resumes: the resume boundary, clamped to
+    the lane's saved point. From there it replays the rows to the rewind through the prompt's own
+    prefill, which saves at batch.rs's save point. continued = cold on the GDN checkpoints
+    resumes from a real saved point (126 rows for the long prompt) and replays after it.
+    rewound = cold falls back to a cold restart there, because the runtime keeps a checkpoint
+    only at the prompt's end.
+  * **The checks themselves were wrong for an accepted draft** (`70cff11c`). When a verify accepts
+    a draft, the engine answers with several steps. `engine_decode` kept only the first of them
+    and `engine_four` only the last. No arm had tested an accepted draft before; on run-11 every
+    draft is rejected. On gdn-dense prompt 3 accepts its first draft, so alone = four failed
+    there, while the serve path itself agreed. Both helpers now keep every step in order.
+    drafted = plain now runs all four conformance prompts (`435e7cee`). Every arm's generated
+    checks use these helpers, so the end battery reruns them.
+
+  | check (world 1, laptop) | run-11 | gdn-dense | gdn-decoder |
+  |---|---|---|---|
+  | whole = chunked = token, with the 256-row prompt | PASS | PASS | PASS |
+  | continued = cold, with 256 rows continued at 128 | PASS | PASS | PASS |
+  | rewound = cold | PASS | PASS | PASS |
+  | drafted = plain, four prompts | PASS | PASS | PASS |
+  | alone = four | PASS | PASS | PASS |
+  | no unrecorded widening | PASS | PASS | PASS |
+  | profile and rounds (no device) | 13 PASS | 13 PASS | 13 PASS |
+  | TP 1 = 2 = 4 | SKIP (`group`): worlds 2 and 4 are `second-shape.py run --device` | | |
+  | bits equal the record | SKIP: `SPARKFLASH_BITS_RECORD` unset | | |
+
+  The profile states the draft depth as 5, the released plan's block, because the profile cannot
+  read the plan without a device.
+
 ## 5. Order
 
 1. The close of milestone 2 lands first: everything here is tested on its synthetic checkpoint.
