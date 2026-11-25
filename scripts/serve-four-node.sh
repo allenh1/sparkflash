@@ -267,7 +267,10 @@ rank_env() {
     # not the bytes the baseline pins. It must reach every rank (a rank that refused the staged
     # cubin while its peers loaded it is the same split as a rank that stood down).
     # RUST_BACKTRACE is a diagnostic: a rank's open refusal that panics names its frames.
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|DENSE|SPEC|DRAFT|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE|GROUP_TRACE|LAUNCH_TRACE|OPEN_MANIFEST|SETUP_TRACE|NUMERICS|UNPINNED_SECOND_SHAPE|ON_BASE)' || true) $(compgen -e | grep -x RUST_BACKTRACE || true); do
+    # SPARKFLASH_ROWS_DUMP (the first prefill pass's per-layer rows) and SPARKFLASH_WARMUP are a
+    # seam check's pair: warm-up is a collective walk, so a rank that skipped it while its peers
+    # ran it would hang the group, and the dump is only the client's pass with warm-up off.
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|DENSE|SPEC|DRAFT|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE|GROUP_TRACE|LAUNCH_TRACE|OPEN_MANIFEST|SETUP_TRACE|NUMERICS|UNPINNED_SECOND_SHAPE|ON_BASE|ROWS_DUMP|WARMUP)' || true) $(compgen -e | grep -x RUST_BACKTRACE || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0

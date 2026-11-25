@@ -47,6 +47,11 @@ fails the run. Token ids are compared with a tolerance only under `--tie-band`, 
 variant in TIE_BAND_VARIANTS (each with its reason) at a band measured from the reference's own
 drift between worlds.
 
+A variant in SEAM_GATED is held on its prefill seams instead: the host reference writes one
+prompt's boundary table, every world's device group dumps that prompt's first prefill pass
+(SPARKFLASH_ROWS_DUMP, warm-up off), and each layer's median row distance must stay under the
+variant's measured bar. Its ids are still compared and printed, but only reported.
+
 Every requested world runs in one invocation. A world that fails is recorded and the run goes on
 to the next one; the closing summary gives each world's verdict, and the exit code is 1 when any
 world failed. The checkpoint and each world's reference carry a `.plan` sidecar holding a hash of
@@ -69,12 +74,15 @@ rank logs under `<out>/logs-{world}/` before the ranks stop.
 from __future__ import annotations
 
 import argparse
+import array
 import hashlib
 import json
+import math
 import os
 import shlex
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -1006,6 +1014,14 @@ def run_world(
         group_env = env_for_world(
             args, out, checkpoint, tokenizer, staged, world, node_list, peer_list
         )
+        seam_gated = args.stored_format in SEAM_GATED
+        seam_dir = out / f"seam-w{world}"
+        if seam_gated:
+            # Rank 0's dump is the stream every rank holds after its reduce; warm-up off so the
+            # first pass is the seam prompt's, on every rank (warm-up is a collective walk).
+            shutil.rmtree(seam_dir, ignore_errors=True)
+            group_env["SPARKFLASH_ROWS_DUMP"] = str(seam_dir)
+            group_env["SPARKFLASH_WARMUP"] = "0"
         launcher = str(ROOT / "scripts/serve-four-node.sh")
         started = False
         agreed = 1
@@ -1016,6 +1032,10 @@ def run_world(
             if result.returncode != 0:
                 raise WorldFailure(f"the {world}-rank device group did not start")
             wait_ready(url, logs=out / f"logs-serve-{world}")
+            if seam_gated:
+                prompt = variant_prompts(args.stored_format)[SEAM_GATED[args.stored_format]["prompt"]]
+                post_prompt(url, prompt)
+                check_seams(args.stored_format, world, seam_dir, out / "seam-host")
             agreed = run(
                 [
                     sys.executable,
@@ -1042,11 +1062,19 @@ def run_world(
                 # rank 0's file and has already hidden a worker failure.
                 run([launcher, "collect"], env=group_env)
                 run([launcher, "stop"], env=group_env)
+        if agreed != 0 and seam_gated:
+            print(
+                f"second-shape: world {world} ids differ from {expected_for_check.name}, "
+                f"reported: {SEAM_GATED[args.stored_format]['reason']}"
+            )
+            return "the device group's seams held; its ids are reported"
         if agreed != 0:
             raise WorldFailure(
                 f"the {world}-rank device group did not agree with "
                 f"{expected_for_check.name}"
             )
+        if seam_gated:
+            return f"the device group's seams held and it agreed with {expected_for_check.name}"
         return f"the device group agreed with {expected_for_check.name}"
 
     # One host: the host arm itself is the check when no device arm is asked for. World 1 is
@@ -1126,6 +1154,112 @@ REPORTED = {
     "glm": "the release's dynamic FP8 activations amplify the mixer's rounding past any tie on the "
     "near-uniform fixture; glm-wiring gates the same stack, the producer capture its numerics",
 }
+
+
+# The variants whose wiring is gated on the prefill seams instead of on ids, each with the prompt
+# whose first pass both sides dump, the bar, and the reason. On a fixture with random weights the
+# routers and the sparse indexer carry near-ties (a top-2 margin down to 5e-5), so the BF16 stream's
+# rounding flips an expert or a pool on a few rows a layer and those rows move by 1e-1 to 3e-1,
+# then spread through attention; ids follow them past any tie. The median row is held instead:
+# a wiring fault (a head split, a partial sum, a mixer coefficient, an expert's rows) moves every
+# row, while a flip moves a few. The bar is measured, never chosen: twice the largest median the
+# worlds measure, rounded up. Ids are still compared and printed, as a report.
+SEAM_GATED = {
+    "glm-wiring": {
+        "prompt": 3,
+        "bar": 5e-2,
+        "reason": "the fixture's near-tied routers and indexer flip a few rows a layer under the "
+        "BF16 stream's rounding; the median row holds the wiring",
+    },
+}
+
+# A row this many times its layer's median is counted as a discrete flip in the report.
+SEAM_FLIP_FACTOR = 10.0
+
+
+def read_f32(path: Path) -> list[float]:
+    values = array.array("f")
+    values.frombytes(path.read_bytes())
+    return values.tolist()
+
+
+def seam_drift(device: Path, host: Path) -> list[tuple[str, int, float, float, int]]:
+    """Each layer's stream out on the device against the host reference's, row by row.
+
+    Returns (layer, rows, median, max, flipped rows) a layer: each row's relative L2 distance of
+    the device's `L<n>-stream.bin` (f32 [rows, hc, dim], the first prefill pass) from the host's
+    `L<n>-residual_out.f32` over the rows the device's pass held."""
+    shapes = json.loads((host / "shapes.json").read_text())
+    layers = sorted(
+        name[: -len("-residual_out.f32")]
+        for name in shapes
+        if name.endswith("-residual_out.f32")
+    )
+    if not layers:
+        raise WorldFailure(f"{host} holds no layer's residual_out")
+    table = []
+    for layer in layers:
+        shape = shapes[f"{layer}-residual_out.f32"]
+        width = 1
+        for extent in shape[1:]:
+            width *= extent
+        stream = device / f"{layer}-stream.bin"
+        if not stream.is_file():
+            raise WorldFailure(f"the device group dumped no {stream.name} in {device}")
+        got = read_f32(stream)
+        want = read_f32(host / f"{layer}-residual_out.f32")
+        if len(got) % width or len(got) // width > shape[0]:
+            raise WorldFailure(
+                f"{stream.name} holds {len(got)} values, not rows of {width} within the host's "
+                f"{shape[0]}"
+            )
+        distances = []
+        for row in range(len(got) // width):
+            a = got[row * width : (row + 1) * width]
+            b = want[row * width : (row + 1) * width]
+            difference = math.sqrt(sum((x - y) * (x - y) for x, y in zip(a, b)))
+            norm = math.sqrt(sum(y * y for y in b))
+            distances.append(difference / norm if norm else difference)
+        median = statistics.median(distances)
+        flipped = sum(1 for value in distances if value > SEAM_FLIP_FACTOR * median)
+        table.append((layer, len(distances), median, max(distances), flipped))
+    return table
+
+
+def post_prompt(url: str, prompt: list[int]) -> None:
+    """One greedy token for `prompt`, so the group's first prefill pass is that prompt's."""
+    body = json.dumps(
+        {"model": MODEL, "prompt": prompt, "max_tokens": 1, "temperature": 0.0}
+    ).encode()
+    request = urllib.request.Request(
+        url + "/v1/completions", data=body, headers={"content-type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=600) as answer:
+            answer.read()
+    except urllib.error.HTTPError as error:
+        raise WorldFailure(
+            f"the server refused the seam prompt ({error.code}): "
+            f"{error.read().decode(errors='replace')}"
+        ) from error
+
+
+def check_seams(variant: str, world: int, device: Path, host: Path) -> None:
+    """Hold each layer's median row to the variant's bar, and print the table."""
+    gate = SEAM_GATED[variant]
+    table = seam_drift(device, host)
+    worst = max(median for _, _, median, _, _ in table)
+    for layer, rows, median, largest, flipped in table:
+        print(
+            f"  seam {layer}: median {median:.3e} max {largest:.3e} over {rows} rows; "
+            f"{flipped} row(s) past {SEAM_FLIP_FACTOR:g}x the median"
+        )
+    if worst > gate["bar"]:
+        raise WorldFailure(
+            f"the {world}-rank device group's largest median seam is {worst:.3e}, past the bar "
+            f"{gate['bar']:g}"
+        )
+    print(f"second-shape: world {world} seams hold: largest median {worst:.3e} <= {gate['bar']:g}")
 
 
 def run_test(args: argparse.Namespace) -> int:
@@ -1209,6 +1343,29 @@ def run_test(args: argparse.Namespace) -> int:
     global_file.write_text(result.stdout)
     global_ids = json.loads(global_file.read_text())
     print(f"second-shape: host reference {result.stdout.strip()}")
+    if args.stored_format in SEAM_GATED:
+        if not args.device:
+            fail(f"{args.stored_format} is gated on the device's seams; it runs with --device")
+        # The reference's boundary table for the seam prompt's prefill, which every world's
+        # device dump is held to.
+        seam_host = out / "seam-host"
+        shutil.rmtree(seam_host, ignore_errors=True)
+        seam_prompts = out / "seam-prompt.json"
+        index = SEAM_GATED[args.stored_format]["prompt"]
+        seam_prompts.write_text(json.dumps([variant_prompts(args.stored_format)[index]]))
+        result = run(
+            [
+                args.reference,
+                str(checkpoint),
+                str(seam_prompts),
+                "1",
+                str(seam_host),
+                *(("--tokenizer", tokenizer) if engram else ()),
+            ],
+            stdout=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            fail("the host reference did not write the seam table")
 
     worlds = [int(world) for world in args.world.split(",") if world.strip()]
     if not worlds:
