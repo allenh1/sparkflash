@@ -187,6 +187,114 @@ impl Checkpoint {
 }
 
 /// One copy on `stream`, or on the default stream.
+/// A verify pass's snapshots of a stack's recurrent regions, a copy a pass row: the kernels that
+/// advance a region over a pass's rows also leave it as it stood after each row (the Gated
+/// DeltaNet conv and scan, under sparkflash-ops' `SegmentRows::snapshots`), so a verify that keeps fewer rows
+/// than it ran commits the kept row's copy instead of running the rows again.
+///
+/// The slab holds, for each region in the order a lane lists them ([Checkpoint]'s sizes), `rows`
+/// copies one region's bytes apart; a region's run starts 256-byte aligned. It is one pass's: the
+/// copies are read before the next verify pass writes them.
+#[derive(Debug, Clone)]
+pub struct VerifySnapshots {
+    slab: Deviceptr,
+    sizes: Vec<usize>,
+    rows: usize,
+}
+
+impl VerifySnapshots {
+    /// The slab's bytes for regions of `sizes` bytes over `rows` pass rows (never zero, so the
+    /// slab is a real allocation).
+    #[must_use]
+    pub fn slab_bytes(sizes: &[usize], rows: usize) -> usize {
+        sizes
+            .iter()
+            .map(|bytes| (bytes * rows).next_multiple_of(ALIGN))
+            .sum::<usize>()
+            .max(ALIGN)
+    }
+
+    /// Snapshots in `slab` ([Self::slab_bytes] of `sizes` and `rows`).
+    #[must_use]
+    pub fn new(slab: Deviceptr, sizes: Vec<usize>, rows: usize) -> Self {
+        Self { slab, sizes, rows }
+    }
+
+    /// The pass rows the slab holds.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The regions the slab holds.
+    #[must_use]
+    pub fn regions(&self) -> usize {
+        self.sizes.len()
+    }
+
+    /// Region `region`'s copy of pass row `row`: a segment whose first row is `row` hands this as
+    /// the region's snapshot slab, its later rows' copies a region's bytes apart.
+    ///
+    /// # Errors
+    /// A region or a row the slab does not hold.
+    pub fn slot(&self, region: usize, row: usize) -> Result<Deviceptr, String> {
+        if region >= self.sizes.len() || row >= self.rows {
+            return Err(format!(
+                "the verify snapshots hold {} region(s) over {} row(s), not region {region} row {row}",
+                self.sizes.len(),
+                self.rows
+            ));
+        }
+        let start: usize = self.sizes[..region]
+            .iter()
+            .map(|bytes| (bytes * self.rows).next_multiple_of(ALIGN))
+            .sum();
+        Ok(self.slab.offset(start + row * self.sizes[region]))
+    }
+
+    /// Copies every region's copy of pass row `row` into the sequence's `live` regions: its state
+    /// after that row, the last a verify kept.
+    ///
+    /// # Errors
+    /// A row the slab does not hold, a region count that is not the slab's, or the copy's failure.
+    pub fn commit_with(
+        &self,
+        row: usize,
+        live: &[Deviceptr],
+        mut copy: impl FnMut(&Deviceptr, &Deviceptr, usize) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if live.len() != self.sizes.len() {
+            return Err(format!(
+                "the verify snapshots hold {} region(s) and were handed {}",
+                self.sizes.len(),
+                live.len()
+            ));
+        }
+        for (region, (live, &bytes)) in live.iter().zip(&self.sizes).enumerate() {
+            if bytes > 0 {
+                copy(live, &self.slot(region, row)?, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [Self::commit_with] on `stream` (the device's current stream when `None`).
+    ///
+    /// # Errors
+    /// As [Self::commit_with].
+    pub fn commit(
+        &self,
+        cuda: &Cuda,
+        stream: Option<&RunStream>,
+        row: usize,
+        live: &[Deviceptr],
+    ) -> Result<(), String> {
+        self.commit_with(row, live, |dst, src, bytes| {
+            copy(cuda, stream, dst, src, bytes)
+        })
+    }
+}
+
 fn copy(
     cuda: &Cuda,
     stream: Option<&RunStream>,
@@ -249,6 +357,39 @@ mod tests {
     }
 
     /// A restore to a point the copies do not hold, or of other regions, copies nothing.
+    #[test]
+    fn a_commit_copies_the_kept_rows_snapshot_of_each_region() {
+        let sizes = vec![100, 0, 300];
+        assert_eq!(
+            VerifySnapshots::slab_bytes(&sizes, 4),
+            512 + 1200_usize.next_multiple_of(256)
+        );
+        let snapshots = VerifySnapshots::new(Deviceptr(0x10000), sizes, 4);
+        assert_eq!(snapshots.slot(0, 2).unwrap().0, 0x10000 + 200);
+        assert_eq!(snapshots.slot(2, 1).unwrap().0, 0x10000 + 512 + 300);
+        assert!(snapshots.slot(0, 4).is_err() && snapshots.slot(3, 0).is_err());
+        let live = [Deviceptr(0xA000), Deviceptr(0xB000), Deviceptr(0xC000)];
+        let (copies, record) = log();
+        snapshots
+            .commit_with(3, &live, |dst, src, bytes| {
+                record(&copies, dst, src, bytes);
+                Ok(())
+            })
+            .expect("commit");
+        assert_eq!(
+            copies.take(),
+            vec![
+                (0xA000, 0x10000 + 300, 100),
+                (0xC000, 0x10000 + 512 + 900, 300)
+            ]
+        );
+        assert!(
+            snapshots
+                .commit_with(0, &live[..2], |_, _, _| Ok(()))
+                .is_err()
+        );
+    }
+
     #[test]
     fn a_restore_needs_the_point_and_the_layout() {
         let mut checkpoint = Checkpoint::new(Deviceptr(0x10000), vec![64]);
