@@ -1601,6 +1601,14 @@ impl DeviceLayer<'_> {
                 let merge = merge && chunks.len() > 1 && !self.routed_format_serves(layer);
                 self.set_seam_weights(*weights);
                 let slot = engram_layers.iter().position(|&target| target == layer);
+                // A block that runs its parts one at a time takes each chunk through them whole.
+                if !Self::block_fused(layer) {
+                    for &(rows, lane, p0, n, _) in chunks {
+                        self.enter_lane(lane)?;
+                        self.run_layer_rows(rows, layer, p0, n)?;
+                    }
+                    continue;
+                }
                 for &(rows, lane, p0, n, task) in chunks {
                     self.enter_lane(lane)?;
                     if let (Some(reads), Some((task, pinned)), Some(slot)) = (reads, task, slot) {
@@ -1687,7 +1695,7 @@ impl DeviceLayer<'_> {
         }
         for (layer, weights) in staged.iter().enumerate() {
             self.set_seam_weights(*weights);
-            let Some(dir) = dump.as_deref() else {
+            let Some(dir) = dump.as_deref().filter(|_| Self::block_fused(layer)) else {
                 self.run_layer_rows(rows, layer, p0, n)?;
                 continue;
             };

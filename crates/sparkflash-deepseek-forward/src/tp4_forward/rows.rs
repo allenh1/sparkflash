@@ -1120,8 +1120,68 @@ impl DeviceLayer<'_> {
         p0: usize,
         n: usize,
     ) -> Result<(), String> {
-        self.run_layer_attn(rows, layer, p0, n)?;
-        self.run_layer_ffn(rows, layer, p0, n)
+        match crate::plan::description().block_steps(layer)? {
+            crate::plan::BlockSteps::Fused => {
+                self.run_layer_attn(rows, layer, p0, n)?;
+                self.run_layer_ffn(rows, layer, p0, n)
+            }
+            crate::plan::BlockSteps::Parts(parts) => {
+                self.run_block_parts(rows, layer, parts, p0, n)
+            }
+        }
+    }
+
+    /// Whether the rows path runs `layer` on the fused halves ([crate::plan::BlockSteps::Fused]).
+    /// A layer past the stack is the head's, which reads the landed stream like a fused block.
+    pub(super) fn block_fused(layer: usize) -> bool {
+        crate::plan::description()
+            .block_steps(layer)
+            .map_or(true, |steps| {
+                matches!(steps, crate::plan::BlockSteps::Fused)
+            })
+    }
+
+    /// A block the fused halves do not cover: the residual is landed (the queued reduce and the
+    /// post behind it; the previous block never defers its post into a block like this), then
+    /// each part runs on its own in plan order, its delta folded back before the next reads the
+    /// stream.
+    fn run_block_parts(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        parts: &[sparkflash_model::Part],
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        self.rows_ar_wait(rows, n)?;
+        if let Some(previous) = rows.post_pending.take() {
+            return Err(format!(
+                "rows layer {layer}: layer {previous} deferred its post into a block that runs its parts one at a time"
+            ));
+        }
+        for &part in parts {
+            if !crate::plan::runs_alone(part) {
+                return Err(format!(
+                    "rows layer {layer}: the {part:?} part has no body of its own on the rows path"
+                ));
+            }
+            self.run_part_alone(rows, layer, part, p0, n)?;
+        }
+        Ok(())
+    }
+
+    /// One part of a block outside the fused halves, on the landed stream.
+    fn run_part_alone(
+        &mut self,
+        _rows: &RowsState,
+        layer: usize,
+        part: sparkflash_model::Part,
+        _p0: usize,
+        _n: usize,
+    ) -> Result<(), String> {
+        Err(format!(
+            "rows layer {layer}: the {part:?} part runs alone, and the rows path has no body for it"
+        ))
     }
 
     /// The layer's attention half: the previous layer's post (fused into the entry seam when it
@@ -1533,6 +1593,7 @@ impl DeviceLayer<'_> {
         let last = self.seam_layer(next, "rows post").is_err();
         let defer = bulk
             && !last
+            && Self::block_fused(next)
             && !self.engram_rows.contains(&next)
             && !rows
                 .taps
