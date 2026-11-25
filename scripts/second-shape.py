@@ -54,7 +54,7 @@ the file instead of rewriting it.
 The host arm runs on a CPU host; `--device` needs a GPU host. `compare` is what `--check`
 calls while the group is up; it is also usable alone against a group someone else started. With
 `--dump` it writes the served ids as the same JSON list of lists the host reference writes and
-exits 0; a sidecar beside the dump records the top-2 alternatives each position saw.
+exits 0; a sidecar beside the dump records the top alternatives each position saw.
 
 For a four-node device run (SPARK_NODES set), `--out` must be an absolute directory that exists
 and is writable on every node at the same path: the checkpoint, the world's staged cubins and,
@@ -85,6 +85,8 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURE = ROOT / "crates/sparkflash-deepseek-forward/tests/fixtures/second-shape/config.json"
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 # The end-of-sequence id the configuration names; the host reference stops after writing it.
+# The alternatives a reference capture records at each position (the served token included).
+TOPS = 8
 EOS = 1
 PROMPTS = [[100, 101, 102, 103], [200, 201, 202], [300, 301, 302, 303, 304, 305]]
 # A sidecar beside a reference or the checkpoint records the hash of every input that produced the
@@ -357,7 +359,7 @@ def parse_token_id(token: object) -> int:
 def request_completion(
     args: argparse.Namespace, prompt: list[int], max_tokens: int | None = None
 ) -> tuple[list[int], list[list[list[float]]]]:
-    """One greedy completion, its ids, and the top-2 alternatives each generated position saw.
+    """One greedy completion, its ids, and the top alternatives each generated position saw.
 
     Under `--ids token-ids` (the device arm, which serves no logprobs) the ids are the choice's
     `token_ids` and no alternatives are known."""
@@ -370,9 +372,9 @@ def request_completion(
     if args.ids == "token-ids":
         fields["return_token_ids"] = True
     else:
-        # The engine's Top(n) selection includes the served token; asking for two alternatives
-        # leaves the served token plus its nearest rival, which is the gap.
-        fields["logprobs"] = 2
+        # The engine's Top(n) selection includes the served token: the served token and its
+        # nearest rivals, so a divergence can be placed among the reference's own choices.
+        fields["logprobs"] = TOPS
         fields["return_tokens_as_token_ids"] = True
     body = json.dumps(fields).encode()
     request = urllib.request.Request(
@@ -463,7 +465,7 @@ def compare(args: argparse.Namespace) -> int:
             gaps.append(tops)
             print(f"second-shape: prompt {index} captured ({len(ids)} tokens)")
         Path(args.dump).write_text(json.dumps(captured, indent=2) + "\n")
-        Path(str(args.dump) + ".top2.json").write_text(json.dumps(gaps) + "\n")
+        Path(str(args.dump) + ".tops.json").write_text(json.dumps(gaps) + "\n")
         print(f"second-shape: wrote {len(captured)} prompt(s) to {args.dump}")
         return 0
     if not args.expected:
@@ -473,9 +475,9 @@ def compare(args: argparse.Namespace) -> int:
         fail(f"{args.expected} holds {len(expected)} prompt(s), {args.prompts} holds {len(prompts)}")
     expected_tops = None
     if args.tie_band is not None:
-        tops_file = Path(str(args.expected) + ".top2.json")
+        tops_file = Path(str(args.expected) + ".tops.json")
         if not tops_file.is_file():
-            fail(f"--tie-band needs the reference's top-2 sidecar {tops_file}")
+            fail(f"--tie-band needs the reference's alternatives sidecar {tops_file}")
         expected_tops = json.loads(tops_file.read_text())
     passed = True
     for index, prompt in enumerate(prompts):
@@ -504,15 +506,15 @@ def forced_ties(
     want_tops: list[list[list[float]]],
     band: float,
 ) -> list[int] | None:
-    """The positions where the device took the reference's runner-up at a tie, or None.
+    """The positions where the device took another of the reference's near-tied choices, or None.
 
     For a format whose sum is not regrouping-invariant (`run --tie-band`), any two accumulation
     orders part at the reference's near-ties, so a free-running comparison stops meaning anything
     after the first one. Every position is still compared under the reference's own context: at
-    a divergence the device's id must be the reference's second choice and the reference's top-2
-    gap there at most `band` nats; the device then continues from the reference's prefix through
-    that position, and the next stretch is held to the reference again, to the last token. Any
-    other divergence is a mismatch."""
+    a divergence the device's id must be among the reference's recorded alternatives there, at
+    most `band` nats under the reference's choice; the device then continues from the
+    reference's prefix through that position, and the next stretch is held to the reference
+    again, to the last token. Any other divergence is a mismatch."""
     ties: list[int] = []
     base = 0
     while got != want[base:]:
@@ -521,17 +523,26 @@ def forced_ties(
             print(f"  prompt length differs from the reference at position {at}")
             return None
         alternatives = want_tops[at] if at < len(want_tops) else []
-        if len(alternatives) < 2:
-            print(f"  position {at}: the reference recorded no runner-up")
+        device = got[at - base]
+        if not alternatives or int(alternatives[0][0]) != want[at]:
+            print(f"  position {at}: the reference recorded no alternatives for its choice")
             return None
-        (top_id, top_lp), (second_id, second_lp) = alternatives[:2]
-        gap = top_lp - second_lp
-        if int(top_id) != want[at] or int(second_id) != got[at - base] or gap > band:
+        top_lp = alternatives[0][1]
+        device_lp = next(
+            (value for token, value in alternatives if int(token) == device), None
+        )
+        if device_lp is None or top_lp - device_lp > band:
+            where = (
+                f"not among the reference's {len(alternatives)} recorded choices"
+                if device_lp is None
+                else f"{top_lp - device_lp:.6g} nats under it"
+            )
             print(
-                f"  position {at}: device {got[at - base]} against reference {want[at]} "
-                f"(runner-up {int(second_id)}, gap {gap:.6g}, band {band:.6g}) is not a tie"
+                f"  position {at}: device {device} against reference {want[at]} is {where} "
+                f"(band {band:.6g}): not a tie"
             )
             return None
+        gap = top_lp - device_lp
         print(f"  position {at}: a tie (gap {gap:.6g} <= {band:.6g}); forcing the reference prefix")
         ties.append(at)
         base = at + 1
@@ -755,7 +766,7 @@ def run_world(
     # from a live group before any device arm is launched. The sidecar records the inputs that
     # produced it, so an unchanged checkpoint, world, prompt list and token budget reuse it.
     expected_file = out / f"host-reference-w{world}.json"
-    tops_file = Path(str(expected_file) + ".top2.json")
+    tops_file = Path(str(expected_file) + ".tops.json")
     plan_file = Path(str(expected_file) + ".plan")
     plan = reference_plan(config, world, PROMPTS, args.max_tokens)
     if reference_reusable(expected_file, plan_file, plan) and tops_file.is_file():
@@ -1076,7 +1087,7 @@ def main() -> int:
     compare_parser.add_argument("--expected", help="the ids to compare with (required without --dump)")
     compare_parser.add_argument(
         "--dump",
-        help="write the served ids as a JSON list of lists, plus FILE.top2.json, and exit 0",
+        help="write the served ids as a JSON list of lists, plus FILE.tops.json, and exit 0",
     )
     compare_parser.add_argument("--model", default=MODEL)
     compare_parser.add_argument("--max-tokens", type=int, default=8)
@@ -1091,9 +1102,9 @@ def main() -> int:
     compare_parser.add_argument(
         "--tie-band",
         type=float,
-        help="accept a divergence only where the device takes the reference's runner-up and the "
-        "reference's top-2 gap is at most this many nats, then continue from the reference's "
-        "prefix (a format whose sum is not regrouping-invariant; default: exact ids)",
+        help="accept a divergence only where the device's id is at most this many nats under the "
+        "reference's choice among the reference's recorded alternatives, then continue from the "
+        "reference's prefix (a format whose sum is not regrouping-invariant; default: exact ids)",
     )
     compare_parser.set_defaults(func=compare)
 
