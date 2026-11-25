@@ -1360,6 +1360,11 @@ pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
     let mut shared: BTreeSet<String> = BTreeSet::new();
     let mut router: BTreeSet<String> = BTreeSet::new();
     for layer in 0..config.n_layers {
+        // A dense-FFN block carries no MoE class: its gated MLP is staged with the shared experts'
+        // gather ([crate::plan::layer_mlp]).
+        if !crate::plan::block_has_part(layer, sparkflash_model::Part::Moe) {
+            continue;
+        }
         // A layer whose expert format carries an NVFP4 convention stores its two factors beside
         // every matrix; the set names them so a plan that dropped one is refused here.
         let wide = config

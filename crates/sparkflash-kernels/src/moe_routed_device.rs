@@ -814,7 +814,25 @@ impl ExpertPointerTable {
     /// Refuses zero layers or zero experts, and refuses a zero address: the arena resolves every
     /// bound slice, so a zero address is a wiring defect that would otherwise become a kernel
     /// reading the null page.
-    pub fn build<F>(layers: usize, experts: usize, mut slice: F) -> Result<Self, String>
+    pub fn build<F>(layers: usize, experts: usize, slice: F) -> Result<Self, String>
+    where
+        F: FnMut(usize, RoutedMatrix, usize) -> (u64, u64),
+    {
+        Self::build_with_absent(layers, experts, |_| false, slice)
+    }
+
+    /// [Self::build] over a stack where the layers `absent` names carry no routed experts (a
+    /// dense-FFN block): their entries are zero words, which no launch reads since such a layer
+    /// never runs the routed path. Every other layer's addresses are refused when null.
+    ///
+    /// # Errors
+    /// As [Self::build].
+    pub fn build_with_absent<F>(
+        layers: usize,
+        experts: usize,
+        absent: impl Fn(usize) -> bool,
+        mut slice: F,
+    ) -> Result<Self, String>
     where
         F: FnMut(usize, RoutedMatrix, usize) -> (u64, u64),
     {
@@ -826,6 +844,10 @@ impl ExpertPointerTable {
         }
         let mut words = Vec::with_capacity(layers * ROUTED_MATRICES * experts * 2);
         for layer in 0..layers {
+            if absent(layer) {
+                words.resize(words.len() + ROUTED_MATRICES * experts * 2, 0);
+                continue;
+            }
             for matrix in RoutedMatrix::ALL {
                 for expert in 0..experts {
                     let (weight, scales) = slice(layer, matrix, expert);

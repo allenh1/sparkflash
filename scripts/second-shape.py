@@ -120,6 +120,15 @@ STORED_FORMATS = {
     "joint-nvfp4-mxfp8-row": {
         "expert_dtype": "nvfp4-qwen@0-3,mx-fp8-row@4-7",
     },
+    # A block with no experts: the first layer a dense-FFN block (one gated MLP 1024 wide in
+    # the MoE's place, no router), the stack after it the fixture's. The dense class is BF16, so
+    # the MLP runs on the dense format route; the blocks after it keep the released experts.
+    "dense-mlp": {
+        "quant_method": "bf16",
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4",
+        "text_config": {"first_k_dense_replace": 1, "intermediate_size": 1024},
+    },
 }
 
 
@@ -242,6 +251,8 @@ def variant_config(name: str, out: Path) -> Path:
     if declared is not None:
         declared = dict(declared)
         block = declared.pop("block", None)
+        # A variant may also change the stack's shape (which blocks carry experts).
+        document["text_config"].update(declared.pop("text_config", {}))
         quantization = document["quantization_config"]
         quantization.update(declared)
         if "quant_method" in declared:

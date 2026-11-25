@@ -41,9 +41,10 @@
 //! test.
 //!
 //! The released document carries no `first_k_dense_replace`, `n_group` or `topk_group`, and neither
-//! does the runtime one: they are DeepSeek-V3-era fields, every V4.1 block is a MoE block
-//! (model.py:929) and the gate is an ungrouped top-k over all routed experts (model.py:808-823), so
-//! nothing in this crate needs them. `gate.bias_vl` is absent for a different reason: it is a tensor
+//! does the runtime one: they are DeepSeek-V3-era fields, every released V4.1 block is a MoE block
+//! (model.py:929) and the gate is an ungrouped top-k over all routed experts (model.py:808-823). A
+//! document that does carry `first_k_dense_replace` (with the dense `intermediate_size`) gets that
+//! many leading blocks whose FFN is one dense gated MLP; the grouped gate stays unread. `gate.bias_vl` is absent for a different reason: it is a tensor
 //! rather than a config field, present only where the vision tower exists (model.py:807), and the
 //! text path never reads it (forward/moe.rs:461).
 
@@ -193,6 +194,13 @@ pub struct ModelConfig {
     pub dim: usize,
     /// Intermediate width of one routed expert.
     pub moe_inter_dim: usize,
+    /// The backbone blocks whose FFN is one dense gated MLP instead of the MoE block
+    /// (`first_k_dense_replace`), ascending. The released stack has none.
+    #[serde(default)]
+    pub dense_ffn_layers: Vec<usize>,
+    /// The dense gated MLP's intermediate width (`intermediate_size`); zero without one.
+    #[serde(default)]
+    pub dense_inter_dim: usize,
     /// Backbone blocks.
     pub n_layers: usize,
     /// DSpark MTP stages, which the checkpoint names `mtp.{0..n_mtp_layers-1}`.
@@ -434,6 +442,8 @@ impl ModelConfig {
             vocab_size: 128,
             dim: 64,
             moe_inter_dim: 32,
+            dense_ffn_layers: Vec::new(),
+            dense_inter_dim: 0,
             n_layers: 2,
             n_mtp_layers: 1,
             dspark_block_size: 2,
@@ -797,6 +807,12 @@ mod released {
         hidden_size: usize,
         /// One routed expert's intermediate width.
         moe_intermediate_size: usize,
+        /// The leading blocks whose FFN is one dense gated MLP; absent in the release.
+        #[serde(default)]
+        first_k_dense_replace: Option<usize>,
+        /// The dense gated MLP's intermediate width; read only beside `first_k_dense_replace`.
+        #[serde(default)]
+        intermediate_size: Option<usize>,
         /// Backbone blocks.
         num_hidden_layers: usize,
         /// DSpark stages; the runtime name is `n_mtp_layers`.
@@ -1134,6 +1150,20 @@ mod released {
             vocab_size: text.vocab_size,
             dim: text.hidden_size,
             moe_inter_dim: text.moe_intermediate_size,
+            dense_ffn_layers: (0..text.first_k_dense_replace.unwrap_or(0)).collect(),
+            dense_inter_dim: match (text.first_k_dense_replace, text.intermediate_size) {
+                (Some(dense), Some(width)) if dense > 0 => width,
+                (Some(dense), None) if dense > 0 => {
+                    return Err(ConfigError::Invalid {
+                        field: "text_config.intermediate_size",
+                        detail: format!(
+                            "first_k_dense_replace names {dense} dense blocks but the document \
+                             states no dense intermediate_size"
+                        ),
+                    });
+                }
+                _ => 0,
+            },
             n_layers: text.num_hidden_layers,
             n_mtp_layers: text.num_nextn_predict_layers,
             dspark_block_size: text.dspark_block_size,

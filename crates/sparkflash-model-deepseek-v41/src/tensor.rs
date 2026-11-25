@@ -299,6 +299,15 @@ impl TensorPlan {
             self.plain(&format!("{prefix}.hc_{twin}_scale"), DType::F32, vec![3]);
         }
 
+        // A dense-FFN block carries one gated MLP in the dense class and no router or experts.
+        if !mtp && config.dense_ffn_layers.contains(&layer) {
+            let inter = config.dense_inter_dim;
+            self.dense(&format!("{prefix}.ffn.w1"), inter, dim);
+            self.dense(&format!("{prefix}.ffn.w2"), dim, inter);
+            self.dense(&format!("{prefix}.ffn.w3"), inter, dim);
+            return;
+        }
+
         // The router weight carries no scale in the index, so it is not block-scaled (see the
         // module documentation): BF16 here, settled against a real header in a later slice.
         self.plain(

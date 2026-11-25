@@ -966,6 +966,25 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
             put("o_lora_rank", FactValue::Integer(groups.rank as i64));
         }
     }
+    // The layers whose FFN is one dense gated MLP, and its width: a stack that mixes them with
+    // MoE layers (`first_k_dense_replace`) runs them as their own part.
+    let dense_layers: Vec<i64> = architecture
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(_, layer)| matches!(layer.ffn, sparkflash_model::architecture::Ffn::Dense(_)))
+        .map(|(index, _)| index as i64)
+        .collect();
+    if let Some(dense) = architecture.layers.iter().find_map(|layer| match &layer.ffn {
+        sparkflash_model::architecture::Ffn::Dense(dense) => Some(dense),
+        sparkflash_model::architecture::Ffn::Moe(_) => None,
+    }) {
+        put("dense_ffn_layers", FactValue::Integers(dense_layers));
+        put(
+            "dense_inter_dim",
+            FactValue::Integer(dense.intermediate as i64),
+        );
+    }
     if let Some(moe) = first_moe {
         put("moe_inter_dim", FactValue::Integer(moe.intermediate as i64));
         put(

@@ -114,6 +114,11 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
         vocab_size: int(facts, "vocab_size")?,
         dim: int(facts, "dim")?,
         moe_inter_dim: int(facts, "moe_inter_dim")?,
+        dense_ffn_layers: match facts.get("dense_ffn_layers") {
+            Some(_) => integers(facts, "dense_ffn_layers")?,
+            None => Vec::new(),
+        },
+        dense_inter_dim: opt_int(facts, "dense_inter_dim").unwrap_or(0),
         n_layers,
         n_mtp_layers,
         dspark_block_size: opt_int(facts, "dspark_block_size").unwrap_or(0),
@@ -289,6 +294,8 @@ pub fn tiny_values() -> ModelConfig {
         vocab_size: 128,
         dim: 64,
         moe_inter_dim: 32,
+        dense_ffn_layers: Vec::new(),
+        dense_inter_dim: 0,
         n_layers: 2,
         n_mtp_layers: 1,
         dspark_block_size: 2,
@@ -1197,6 +1204,54 @@ pub fn shared_expert_format(
         })
 }
 
+/// The gated MLP a layer's FFN runs on its dense projections: a MoE block's shared expert beside
+/// its routed experts, or a dense-FFN block's one MLP in their place.
+#[derive(Debug, Clone, Copy)]
+pub struct LayerMlp {
+    /// The claim segment its `w1`/`w2`/`w3` live under (`ffn.shared_experts`, or `ffn`).
+    pub segment: &'static str,
+    /// Its whole intermediate width, every rank's slice together.
+    pub inter: usize,
+    /// Its stored format.
+    pub format: sparkflash_model::format::StoredFormat,
+    /// Whether it is a dense-FFN block's MLP (no router and no routed experts beside it).
+    pub dense: bool,
+}
+
+/// Layer `block`'s gated MLP ([LayerMlp]).
+///
+/// # Errors
+/// The plan states no format for it, by layer.
+pub fn layer_mlp(block: usize) -> Result<LayerMlp, ConfigError> {
+    let values = description().config();
+    if block_has_part(block, Part::DenseMlp) {
+        let format = description()
+            .plan()
+            .stored_format(Part::DenseMlp, Some(block))
+            .ok_or_else(|| format!("the plan states no stored format for layer {block}'s dense MLP"))?;
+        return Ok(LayerMlp {
+            segment: "ffn",
+            inter: values.dense_inter_dim,
+            format,
+            dense: true,
+        });
+    }
+    Ok(LayerMlp {
+        segment: "ffn.shared_experts",
+        inter: values.moe_inter_dim * values.n_shared_experts.max(1),
+        format: shared_expert_format(block)?,
+        dense: false,
+    })
+}
+
+/// The widest gated MLP of the stack ([layer_mlp]), whole: what a buffer every layer's MLP shares
+/// is sized by.
+#[must_use]
+pub fn widest_mlp() -> usize {
+    let values = description().config();
+    (values.moe_inter_dim * values.n_shared_experts.max(1)).max(values.dense_inter_dim)
+}
+
 /// The layer `block` claims a tensor whose name ends with `tail`.
 ///
 /// The name is the claim's own string; a plan that does not claim it is a refusal, never a
@@ -1494,6 +1549,7 @@ pub const fn forward_has_body(part: Part) -> bool {
             | Part::Csa2Compression
             | Part::SparseIndexer
             | Part::Moe
+            | Part::DenseMlp
             | Part::Engram
             | Part::Mtp
             | Part::Embedding
@@ -1532,14 +1588,27 @@ const FUSED_PARTS: [Part; 8] = [
     Part::Engram,
 ];
 
-/// Whether the base runs `part` on its own, outside the fused halves.
-///
-/// None does yet: the base's own parts run only inside the halves, so a block that is not fused
-/// is refused by the part that has no body of its own.
+/// Whether the base runs `part` on its own, outside the fused halves: the MLA attention (its
+/// entry seam, its sublayers and its post) and the dense gated MLP (its seam, the shared
+/// [sparkflash_ops::roles::GatedMlp] body and its post).
 #[must_use]
 pub const fn runs_alone(part: Part) -> bool {
-    let _ = part;
-    false
+    matches!(part, Part::MlaAttention | Part::DenseMlp)
+}
+
+/// The sublayers a part that runs alone carries inside its own body: the norms and the stream
+/// mixers (every part's seam and post), the compression and the indexer (the attention's), and
+/// the Engram write (the attention seam's).
+const fn absorbed(part: Part) -> bool {
+    matches!(
+        part,
+        Part::RmsNorm
+            | Part::HyperConnection
+            | Part::ManifoldHyperConnection
+            | Part::Csa2Compression
+            | Part::SparseIndexer
+            | Part::Engram
+    )
 }
 
 /// Each language block's steps, in block order.
@@ -1578,6 +1647,13 @@ pub fn language_steps(plan: &EnginePlan) -> Result<Vec<BlockSteps>, ConfigError>
             // each part must run alone, and the first one that cannot names the refusal.
             let mut parts = Vec::new();
             for instance in &block.parts {
+                let sublayer = matches!(
+                    instance.part,
+                    Part::Csa2Compression | Part::SparseIndexer
+                );
+                if absorbed(instance.part) && (!sublayer || has(Part::MlaAttention)) {
+                    continue;
+                }
                 if !runs_alone(instance.part) {
                     let why = match instance.part {
                         Part::Moe if !has(Part::MlaAttention) => {

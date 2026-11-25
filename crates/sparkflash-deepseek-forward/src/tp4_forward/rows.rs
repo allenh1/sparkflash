@@ -572,6 +572,9 @@ impl RowsState {
             .as_ref()
             .ok_or("rows: no shared expert operands")?;
         let shared_local = shared.inter / device.routed_geometry.world;
+        // The MLP scratch holds the widest gated MLP's slice: the shared experts', or a dense-FFN
+        // block's when it is wider.
+        let mlp_local = (crate::plan::widest_mlp() / device.routed_geometry.world).max(shared_local);
         let top_k = device.routed_geometry.top_k;
         let experts = device.routed_geometry.experts;
         let mask_bytes = candidate_mask_words(device.max_positions) * 4;
@@ -650,8 +653,8 @@ impl RowsState {
             delta_f32: alloc(d * dim * 4)?,
             delta_bf16: alloc(d * dim * 2)?,
             moe_reduced: alloc(d * dim * 2)?,
-            shared_gate: alloc(2 * d * shared_local * 4)?,
-            shared_swiglu: alloc(d * shared_local * 4)?,
+            shared_gate: alloc(2 * d * mlp_local * 4)?,
+            shared_swiglu: alloc(d * mlp_local * 4)?,
             shared_out: alloc(d * dim * 4)?,
             selected: alloc(r * selected_stride * 4)?,
             attn_scores: alloc(R_MAX * attn_heads * attn_max_attended * 4)?,
@@ -1145,6 +1148,10 @@ impl DeviceLayer<'_> {
     /// post behind it; the previous block never defers its post into a block like this), then
     /// each part runs on its own in plan order, its delta folded back before the next reads the
     /// stream.
+    ///
+    /// The attention's delta is folded by the seam of the FFN part behind it, as in a fused
+    /// block (the mHC post and the next seam are one pass over the stream); an attention with no
+    /// FFN part behind it is posted on its own.
     fn run_block_parts(
         &mut self,
         rows: &RowsState,
@@ -1153,35 +1160,86 @@ impl DeviceLayer<'_> {
         p0: usize,
         n: usize,
     ) -> Result<(), String> {
+        use sparkflash_model::Part;
         self.rows_ar_wait(rows, n)?;
         if let Some(previous) = rows.post_pending.take() {
             return Err(format!(
                 "rows layer {layer}: layer {previous} deferred its post into a block that runs its parts one at a time"
             ));
         }
+        let mut attention_pending = false;
         for &part in parts {
             if !crate::plan::runs_alone(part) {
                 return Err(format!(
                     "rows layer {layer}: the {part:?} part has no body of its own on the rows path"
                 ));
             }
-            self.run_part_alone(rows, layer, part, p0, n)?;
+            match part {
+                Part::MlaAttention if !attention_pending => {
+                    self.run_layer_attn(rows, layer, p0, n)?;
+                    attention_pending = true;
+                }
+                Part::DenseMlp if attention_pending => {
+                    self.run_dense_mlp(rows, layer, n)?;
+                    attention_pending = false;
+                }
+                Part::DenseMlp => {
+                    return Err(format!(
+                        "rows layer {layer}: the dense MLP's seam folds the attention's delta, and no attention part runs before it"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "rows layer {layer}: the {part:?} part runs alone, and the rows path has no body for it in this order"
+                    ));
+                }
+            }
+        }
+        if attention_pending {
+            let b = rows.b;
+            self.rows_ar_wait(rows, n)?;
+            let residual = if rows.bulk.is_some() && n > R_MAX {
+                b.stream
+            } else {
+                b.hc_rows
+            };
+            self.rows_post(rows, n, residual, b.attn_mix, b.reduced, b.stream)?;
         }
         Ok(())
     }
 
-    /// One part of a block outside the fused halves, on the landed stream.
-    fn run_part_alone(
-        &mut self,
-        _rows: &RowsState,
-        layer: usize,
-        part: sparkflash_model::Part,
-        _p0: usize,
-        _n: usize,
-    ) -> Result<(), String> {
-        Err(format!(
-            "rows layer {layer}: the {part:?} part runs alone, and the rows path has no body for it"
-        ))
+    /// A dense-FFN block's MLP: the attention's post and the FFN seam (the fused block's
+    /// [Self::run_layer_ffn_seam]), the MLP's rank slice on the dense format route from the
+    /// seam's f32 rows into the bf16 sums, then the fused block's reduce and post
+    /// ([Self::ffn_rest_tail]).
+    fn run_dense_mlp(&mut self, rows: &RowsState, layer: usize, n: usize) -> Result<(), String> {
+        if self.sp_rows(rows, n).is_some() {
+            return Err(format!(
+                "rows layer {layer}: a split chunk reached a dense-FFN block; the device keeps a stack with one whole (enable_prefill_sp)"
+            ));
+        }
+        self.run_layer_ffn_seam(rows, layer, n)?;
+        let route = self.layer_dense(layer).shared.ok_or_else(|| {
+            format!(
+                "rows layer {layer}: the dense MLP has no dense format route (attach_dense_format)"
+            )
+        })?;
+        let ops = self
+            .shared
+            .as_ref()
+            .and_then(|shared| shared.layers.get(layer).copied())
+            .ok_or_else(|| format!("rows layer {layer}: the dense MLP was not gathered"))?;
+        let b = rows.b;
+        self.shared_dense(
+            rows,
+            None,
+            route,
+            ops,
+            layer,
+            n,
+            (b.delta_bf16, sparkflash_kernels::dense_format::RowForm::Bf16),
+        )?;
+        self.ffn_rest_tail(rows, layer, n)
     }
 
     /// The layer's attention half: the previous layer's post (fused into the entry seam when it
@@ -3681,6 +3739,7 @@ impl DeviceLayer<'_> {
     ///
     /// The down projection reads whole weight rows, so a rank's slice of the reduction (TP > 1)
     /// is refused by name rather than read with the wrong row stride.
+    #[allow(clippy::too_many_arguments)]
     fn shared_dense(
         &self,
         rows: &RowsState,
@@ -3689,19 +3748,18 @@ impl DeviceLayer<'_> {
         ops: SharedExpertDeviceLayer,
         layer: usize,
         n: usize,
+        out: (Deviceptr, sparkflash_kernels::dense_format::RowForm),
     ) -> Result<(), String> {
         use sparkflash_kernels::dense_format::{
             DenseGroups, DenseIo, DenseMatrix, DenseRows, RowForm,
         };
         let b = rows.b;
         let dim = self.dim;
-        let local = rows.shared_local;
-        let shared = self
-            .shared
-            .as_ref()
-            .ok_or("rows: no shared expert operands")?;
-        let inter = shared.inter;
-        let format = crate::plan::shared_expert_format(layer)?;
+        // The layer's own MLP: a MoE block's shared experts, or a dense-FFN block's one MLP,
+        // whose width may differ (the scratch is sized by the widest, `RowsState::open`).
+        let inter = ops.inter;
+        let local = inter / self.routed_geometry.world;
+        let format = crate::plan::layer_mlp(layer)?.format;
         let value_bytes = format.values().bytes_per_value() as u64;
         let block = format.block().max(1);
         let scale_bytes = format.scale_values().bytes() as u64;
@@ -3765,10 +3823,11 @@ impl DeviceLayer<'_> {
             n * local,
         )
         .map_err(|error| format!("rows shared swiglu: {error}"))?;
+        let (out, form) = out;
         route
             .project(
                 self.cuda,
-                DenseIo::new(RowForm::F32, RowForm::F32),
+                DenseIo::new(RowForm::F32, form),
                 &DenseMatrix {
                     weight: ops.w2.0 + down_offset,
                     scales: scaled(ops.s2, down_scale_offset),
@@ -3778,7 +3837,7 @@ impl DeviceLayer<'_> {
                 &DenseRows {
                     a: b.shared_swiglu,
                     a_stride: local,
-                    out: b.shared_out,
+                    out,
                     out_stride: dim,
                     tokens: n,
                 },
@@ -3978,7 +4037,15 @@ impl DeviceLayer<'_> {
         let dim_blocks = (dim / 32) as u64;
         let local_tiles = (local / 32) as u64;
         if let Some(route) = self.layer_dense(layer).shared {
-            return self.shared_dense(rows, bulk, route, ops, layer, n);
+            return self.shared_dense(
+                rows,
+                bulk,
+                route,
+                ops,
+                layer,
+                n,
+                (b.shared_out, sparkflash_kernels::dense_format::RowForm::F32),
+            );
         }
         let gate_up = |a: u64| OptArgs {
             a,

@@ -1933,7 +1933,10 @@ impl InferenceEngine {
         // that returns `false` for a chunk is refused below rather than silently falling back to the
         // host block: on the sharded path that fallback would compute the global experts.
         let chunk_positions = scratch.ffn_in.len() / config.dim;
+        // A dense-FFN block runs its one gated MLP here; no backend seam stands for it.
+        let dense_ffn = config.dense_ffn_layers.contains(&layer);
         let device_moe = match moe.as_deref_mut() {
+            _ if dense_ffn => false,
             Some(backend) if chunk_positions > 1 => backend.ffn_chunk(
                 config,
                 layer,
@@ -1955,7 +1958,25 @@ impl InferenceEngine {
             )?,
             None => false,
         };
-        if let Some(tp) = &self.tp {
+        if dense_ffn {
+            let local = match &self.tp {
+                Some(tp) => Some(tp.local_width("intermediate_size", config.dense_inter_dim)?),
+                None => None,
+            };
+            moe::dense_mlp_forward(
+                config,
+                &prefix,
+                &scratch.ffn_in,
+                source,
+                self.limit,
+                &mut scratch.moe,
+                &mut scratch.ffn_out,
+                local,
+            )?;
+            if let Some(tp) = &self.tp {
+                tp.all_reduce(&mut scratch.ffn_out)?;
+            }
+        } else if let Some(tp) = &self.tp {
             // The one Phase-1 TP seam: the routed experts are this rank's shards, the shared
             // expert is replicated, and the routed sum crosses one all-reduce per layer.
             moe::routed_forward_sharded(

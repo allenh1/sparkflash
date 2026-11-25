@@ -251,7 +251,7 @@ impl MoeScratch {
     pub fn for_config(cfg: &ModelConfig) -> Self {
         let widest = cfg.n_routed_experts.max(cfg.dspark_n_routed_experts);
         let widest_topk = cfg.n_activated_experts.max(cfg.dspark_n_activated_experts);
-        let inter = cfg.moe_inter_dim * cfg.n_shared_experts.max(1);
+        let inter = (cfg.moe_inter_dim * cfg.n_shared_experts.max(1)).max(cfg.dense_inter_dim);
         MoeScratch {
             scores: vec![0.0; widest],
             selected: Vec::with_capacity(widest_topk),
@@ -299,6 +299,16 @@ impl MoeScratch {
                     .expect("a String cannot fail to be written to");
                 (
                     cfg.moe_inter_dim * cfg.n_shared_experts.max(1),
+                    cfg.dense_grid().unwrap_or(ScaleGrid::Block32),
+                    sparkflash_model::format::NvFp4Wide::None,
+                )
+            }
+            ExpertBody::Dense => {
+                self.base.clear();
+                write!(self.base, "{prefix}.ffn")
+                    .expect("a String cannot fail to be written to");
+                (
+                    local_inter.unwrap_or(cfg.dense_inter_dim),
                     cfg.dense_grid().unwrap_or(ScaleGrid::Block32),
                     sparkflash_model::format::NvFp4Wide::None,
                 )
@@ -364,6 +374,9 @@ enum ExpertBody {
     /// The shared expert: `{{prefix}}.ffn.shared_experts`, FP8 with 32x32 block scales
     /// (model.py:836, 887).
     Shared,
+    /// A dense-FFN block's one gated MLP: `{{prefix}}.ffn`, in the dense class like the shared
+    /// expert, `dense_inter_dim` wide.
+    Dense,
 }
 
 /// The three weights of one expert body, as stored (a fused view on a release source), with its
@@ -1042,6 +1055,50 @@ pub fn moe_forward(
 ) -> Result<(), EngineError> {
     routed_forward(cfg, prefix, x, src, limit, scratch, out)?;
     add_shared_expert(cfg, prefix, x, src, limit, scratch, out)
+}
+
+/// A dense-FFN block ([ModelConfig::dense_ffn_layers]): `out = w2(silu(w1 x) * w3 x)` per
+/// token, the shared expert's arithmetic ([expert_body]) on the block's own `{{prefix}}.ffn`
+/// weights. `local_inter` is a TP rank's slice of the width (its partial, summed by the caller).
+///
+/// # Errors
+/// A shape that is not whole tokens, or a weight the source refuses.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_mlp_forward(
+    cfg: &ModelConfig,
+    prefix: &str,
+    x: &[f32],
+    src: &dyn WeightSource,
+    limit: usize,
+    scratch: &mut MoeScratch,
+    out: &mut [f32],
+    local_inter: Option<usize>,
+) -> Result<(), EngineError> {
+    let dim = cfg.dim;
+    if dim == 0 || !x.len().is_multiple_of(dim) || out.len() != x.len() {
+        return Err(shape_error(
+            "the dense MLP",
+            format!(
+                "dim {dim}, {} input values and {} output values do not describe whole tokens",
+                x.len(),
+                out.len()
+            ),
+        ));
+    }
+    let dense = scratch.read_expert(cfg, src, prefix, ExpertBody::Dense, limit, local_inter)?;
+    for (row, input) in out.chunks_exact_mut(dim).zip(x.chunks_exact(dim)) {
+        expert_body(
+            cfg,
+            input,
+            &dense,
+            1.0,
+            &mut scratch.gate_branch,
+            &mut scratch.up_branch,
+            &mut scratch.expert_out,
+        )?;
+        row.copy_from_slice(&scratch.expert_out);
+    }
+    Ok(())
 }
 
 /// Adds the dense shared expert to an already-computed routed contribution (the c4b device path).

@@ -518,15 +518,28 @@ pub fn run_layer_zero_with_embedding(
     );
     let mut scratch = MoeScratch::for_config(config);
     let mut ffn_out = vec![0.0f32; dim];
-    moe::moe_forward(
-        config,
-        prefix,
-        &pre_ffn_hidden,
-        source,
-        limit,
-        &mut scratch,
-        &mut ffn_out,
-    )?;
+    if config.dense_ffn_layers.contains(&0) {
+        moe::dense_mlp_forward(
+            config,
+            prefix,
+            &pre_ffn_hidden,
+            source,
+            limit,
+            &mut scratch,
+            &mut ffn_out,
+            None,
+        )?;
+    } else {
+        moe::moe_forward(
+            config,
+            prefix,
+            &pre_ffn_hidden,
+            source,
+            limit,
+            &mut scratch,
+            &mut ffn_out,
+        )?;
+    }
 
     let residual = post_attention_hidden.clone();
     let mut residual_out = vec![0.0f32; width];

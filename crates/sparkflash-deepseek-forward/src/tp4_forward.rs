@@ -7515,10 +7515,9 @@ fn gather_shared_expert_source(
     })?;
     let dim = config.dim;
     let world = request.world;
-    let inter = config
-        .moe_inter_dim
-        .checked_mul(config.n_shared_experts.max(1))
-        .ok_or_else(|| "shared expert gather: the intermediate width overflows".to_string())?;
+    // A MoE block's shared expert, or a dense-FFN block's one MLP: the same gated MLP split.
+    let mlp = crate::plan::layer_mlp(layer)?;
+    let inter = mlp.inter;
     if world == 0 || !inter.is_multiple_of(world) {
         return Err(format!(
             "shared expert gather: intermediate width {inter} does not split over {world} ranks"
@@ -7533,7 +7532,7 @@ fn gather_shared_expert_source(
     let dim_blocks = dim / 32;
     let inter_blocks = inter / 32;
     let shard_blocks = local_inter / 32;
-    let prefix = crate::plan::layer_prefix(layer, "ffn.shared_experts");
+    let prefix = crate::plan::layer_prefix(layer, mlp.segment);
     let mut local_reads = 0usize;
     let mut gather_calls = 0usize;
     let mut tensors = std::collections::BTreeMap::new();
@@ -7543,7 +7542,7 @@ fn gather_shared_expert_source(
     // operand the layer does not carry and not from the routed experts' class beside them. The
     // gather checks the plan's format, not the checkpoint's dtype word; a plan that states none
     // refuses here by name.
-    let shared_format = crate::plan::shared_expert_format(layer)?;
+    let shared_format = mlp.format;
     let want_values = match shared_format.values() {
         sparkflash_model::format::FormatValues::Fp8E4M3 => "F8_E4M3",
         sparkflash_model::format::FormatValues::Bf16 => "BF16",
@@ -7848,6 +7847,9 @@ struct SharedExpertDevice {
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy)]
 struct SharedExpertDeviceLayer {
+    /// The MLP's whole intermediate width, every rank's slice together (a dense-FFN block's may
+    /// differ from the shared experts').
+    inter: usize,
     w1: sparkflash_kernels::cuda_driver::Deviceptr,
     s1: sparkflash_kernels::cuda_driver::Deviceptr,
     w3: sparkflash_kernels::cuda_driver::Deviceptr,
@@ -8068,10 +8070,14 @@ fn build_shared_expert_device(
         "shared expert (device): the loop was built without the model config".to_string()
     })?;
     let dim = config.dim;
+    // The shared experts' width (the token arms' scratch and the released bodies' strides); a
+    // dense-FFN block's MLP is staged at its own width ([crate::plan::layer_mlp]) and the budget
+    // takes the widest.
     let inter = config
         .moe_inter_dim
         .checked_mul(config.n_shared_experts.max(1))
         .ok_or_else(|| "shared expert (device): the intermediate width overflows".to_string())?;
+    let widest = crate::plan::widest_mlp().max(inter);
     if shared.len() != request.n_layers {
         return Err(format!(
             "shared expert (device): {} gathered layers for {} layers in the loop",
@@ -8093,8 +8099,8 @@ fn build_shared_expert_device(
         load_pinned_addition(kernel_dir, crate::plan::handles().swiglu, "shared expert")?;
     let (swiglu_module, swiglu) = cuda.load_swiglu_quant(&swiglu_cubin)?;
     // One B12x weight buffer and one scale grid per tensor, plus the per-token scratch.
-    let weight_bytes = (2 * inter * dim + dim * inter) as u64;
-    let scale_bytes = (2 * (inter / 32) * (dim / 32) + (dim / 32) * (inter / 32)) as u64;
+    let weight_bytes = (2 * widest * dim + dim * widest) as u64;
+    let scale_bytes = (2 * (widest / 32) * (dim / 32) + (dim / 32) * (widest / 32)) as u64;
     // The per-token scratch of both arms: the coded arm's row plus the f32 arm's five f32 buffers
     // (a_f32 20 KB, gate/up/swiglu 9.2 KB each, out_f32 20 KB).
     let workspace_bytes =
@@ -8115,9 +8121,17 @@ fn build_shared_expert_device(
     let mut layers = Vec::with_capacity(shared.len());
     for (layer, gather) in shared.iter().enumerate() {
         let source: &dyn WeightSource = &gather.source;
-        let base = crate::plan::layer_prefix(layer, "ffn.shared_experts");
-        let shared_format = crate::plan::shared_expert_format(layer)?;
+        let mlp = crate::plan::layer_mlp(layer)?;
+        let base = crate::plan::layer_prefix(layer, mlp.segment);
+        let shared_format = mlp.format;
+        let inter = mlp.inter;
         let released = released_dense(shared_format);
+        if mlp.dense && released {
+            return Err(format!(
+                "shared expert (device): layer {layer} is a dense-FFN block stored as {}, which only the released shared-expert bodies read; its MLP runs on the dense format route",
+                shared_format.describe()
+            ));
+        }
         // The released class is tiled for the B12x bodies; any other is uploaded as stored for
         // the dense format route, its scale plane (if it has one) beside it.
         let (s1, s3, s2) = if shared_format.is_unscaled() {
@@ -8193,6 +8207,7 @@ fn build_shared_expert_device(
         let s3 = upload(&s3, "w3.scale")?;
         let s2 = upload(&s2, "w2.scale")?;
         layers.push(SharedExpertDeviceLayer {
+            inter,
             w1,
             s1,
             w3,
@@ -13921,6 +13936,16 @@ impl<'a> DeviceLayer<'a> {
             .try_borrow()
             .map_err(|_| "layer device: the run's reduce handle is already borrowed".to_owned())?
             .has_bulk();
+        // A split chunk's rows live on their own rank between the fused halves; a block that
+        // runs its parts one at a time reads every row, so such a stack keeps chunks whole.
+        let parts = (0..crate::plan::description().values().n_layers)
+            .find(|&layer| !Self::block_fused(layer));
+        if let Some(layer) = parts.filter(|_| bulk && world > 1) {
+            eprintln!(
+                "layer device: bulk chunks stay whole over the {world} ranks: block {layer} runs its parts one at a time, which reads every row"
+            );
+            return Ok(());
+        }
         if bulk && world > 1 {
             self.prefill_sp = Some(world);
         }
@@ -14060,6 +14085,12 @@ impl<'a> DeviceLayer<'a> {
         let mut layers = Vec::with_capacity(self.compress_ratio.len());
         let mut biases_vl = Vec::with_capacity(self.compress_ratio.len());
         for layer in 0..self.compress_ratio.len() {
+            // A dense-FFN block has no router: its entry is null and nothing routes on it.
+            if !crate::plan::block_has_part(layer, sparkflash_model::Part::Moe) {
+                layers.push((Deviceptr(0), Deviceptr(0)));
+                biases_vl.push(Deviceptr(0));
+                continue;
+            }
             let gate = bind
                 .moe
                 .router
@@ -14142,11 +14173,15 @@ impl<'a> DeviceLayer<'a> {
                 self.compress_ratio.len()
             ));
         }
-        let table =
-            ExpertPointerTable::build(n_layers, geometry.experts, |layer, matrix, expert| {
+        let table = ExpertPointerTable::build_with_absent(
+            n_layers,
+            geometry.experts,
+            |layer| !crate::plan::block_has_part(layer, sparkflash_model::Part::Moe),
+            |layer, matrix, expert| {
                 let bind = routed[layer][expert][matrix.index()];
                 (bind.weight.0, bind.scales.0)
-            })?;
+            },
+        )?;
         // Capacity for a verify step's rows (`rows::R_MAX`); the M=1 step runs one token.
         let plan = MoeRoutedPlan::new(
             moe_geometry,
@@ -14189,7 +14224,15 @@ impl<'a> DeviceLayer<'a> {
             let indexer = description
                 .operand(Some(layer), Part::SparseIndexer)
                 .map(|operand| operand.stored);
-            let shared = description.plan().shared_expert_format(layer);
+            // The layer's gated MLP: a MoE block's shared expert, claimed by the MoE part, or a
+            // dense-FFN block's one MLP, claimed by its own part. `build_shared_expert_device`
+            // refuses a layer that states no format.
+            let mlp = crate::plan::layer_mlp(layer).ok();
+            let mlp_part = if mlp.is_some_and(|mlp| mlp.dense) {
+                Part::DenseMlp
+            } else {
+                Part::Moe
+            };
             let open =
                 |part: Part, format: Option<sparkflash_model::format::StoredFormat>| match format {
                     Some(format) if !released_dense(format) => open_dense_format(
@@ -14206,8 +14249,7 @@ impl<'a> DeviceLayer<'a> {
             routes.push(LayerDense {
                 attention: open(Part::MlaAttention, attention)?,
                 indexer: open(Part::SparseIndexer, indexer)?,
-                // The shared expert's tensors are claimed by the MoE part.
-                shared: open(Part::Moe, shared)?,
+                shared: open(mlp_part, mlp.map(|mlp| mlp.format))?,
             });
         }
         if routes.iter().any(LayerDense::any) {
@@ -14245,17 +14287,27 @@ impl<'a> DeviceLayer<'a> {
         let Some(routed) = self.routed.as_ref() else {
             return Err("layer device routed format: no routed shard was attached".to_owned());
         };
+        // A dense-FFN block has no experts (`None`): like a released layer, the route never
+        // reads its rows.
         let formats = (0..routed.len())
-            .map(routed_expert_format)
+            .map(|layer| {
+                if crate::plan::block_has_part(layer, sparkflash_model::Part::Moe) {
+                    routed_expert_format(layer).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        let released = |format: &StoredFormat| format.same_arithmetic(StoredFormat::MXFP4_ROW_32);
+        let released = |format: &Option<StoredFormat>| {
+            format.is_none_or(|format| format.same_arithmetic(StoredFormat::MXFP4_ROW_32))
+        };
         if formats.iter().all(released) {
             return Ok(());
         }
         let what = |layer: usize| {
             format!(
                 "layer device routed format: layer {layer} stores its experts as {}",
-                formats[layer].describe()
+                formats[layer].map_or_else(|| "nothing".to_owned(), |format| format.describe())
             )
         };
         let first = formats
@@ -14279,13 +14331,13 @@ impl<'a> DeviceLayer<'a> {
         let description = crate::plan::description();
         let mut layers = Vec::with_capacity(formats.len());
         for (layer, format) in formats.iter().enumerate() {
-            if released(format) {
+            let Some(format) = format.filter(|_| !released(format)) else {
                 layers.push(None);
                 continue;
-            }
+            };
             let entry = |prefix: &str| {
                 description
-                    .symbol_decoding(Some(layer), sparkflash_model::Part::Moe, prefix, *format)
+                    .symbol_decoding(Some(layer), sparkflash_model::Part::Moe, prefix, format)
                     .map_err(|error| format!("{}: {error}", what(layer)))
             };
             layers.push(Some(FormatEntries {
@@ -14328,7 +14380,9 @@ impl<'a> DeviceLayer<'a> {
         let geometry = self.routed_geometry;
         let mut table = Vec::with_capacity(routed.len() * geometry.experts * TABLE_STRIDE);
         let factor = |layer: usize, expert: usize, matrix| -> Result<f32, String> {
-            let wide = formats[layer].tensor_wide();
+            let Some(wide) = formats[layer].map(|format| format.tensor_wide()) else {
+                return Ok(0.0);
+            };
             if wide.leaves().is_none() {
                 return Ok(0.0);
             }
@@ -15045,6 +15099,17 @@ impl<'a> DeviceLayer<'a> {
         let n_layers = self.compress_ratio.len();
         let mut layers = Vec::with_capacity(n_layers);
         for layer in 0..n_layers {
+            // A dense-FFN block binds no routed experts (null slices, never launched).
+            if !crate::plan::block_has_part(layer, sparkflash_model::Part::Moe) {
+                layers.push(vec![
+                    [crate::resident_weights::MatrixBind {
+                        weight: Deviceptr(0),
+                        scales: Deviceptr(0),
+                    }; 3];
+                    geometry.experts
+                ]);
+                continue;
+            }
             let format = routed_expert_format(layer)?;
             let mut experts = Vec::with_capacity(geometry.experts);
             for expert in 0..geometry.experts {
@@ -15401,6 +15466,12 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         let has_attention =
             crate::plan::block_has_part(layer, sparkflash_model::Part::MlaAttention);
         let has_ffn = crate::plan::block_has_part(layer, sparkflash_model::Part::Moe);
+        // The one-token loop has no dense MLP stage: a dense-FFN block runs on the rows path.
+        if crate::plan::block_has_part(layer, sparkflash_model::Part::DenseMlp) {
+            return Err(format!(
+                "layer device: layer {layer} is a dense-FFN block, which the one-token stage loop has no stage for; it runs on the rows path"
+            ));
+        }
         let outcome = (|| {
             if has_engram {
                 run_stage!("engram_write", self.engram_write(layer, position));
@@ -18946,6 +19017,11 @@ fn run_forward_loop(
                     request.native_rounding.mhc,
                 )?;
                 probe::count("attention_residual");
+                if crate::plan::block_has_part(layer, sparkflash_model::Part::DenseMlp) {
+                    return Err(format!(
+                        "layer {layer} is a dense-FFN block, which the host-seam loop has no stage for; it runs on the rows path"
+                    ));
+                }
                 let ffn_seams =
                     run_layer_ffn_seams(cached_seams, request, &attention_residual, &entry.pre)?;
                 probe::count("ffn_seams");

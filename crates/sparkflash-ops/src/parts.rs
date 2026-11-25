@@ -509,6 +509,43 @@ const fn deepseek_sym(name: &'static str, precisions: &[Precision]) -> KernelSym
     KernelSymbol::both(name, precisions, ComputeClass::TensorCore, RowBand::ALL)
 }
 
+/// A DeepSeek part's symbol list ending in the dense format route's entries: the shared tile's
+/// dense mode (kernels/dense_format_sm121.cu), one entry an activation, output and weight class.
+/// Every part whose projections can be stored in a class the released bodies do not read lists
+/// them, from this one place.
+macro_rules! with_dense_format {
+    ($($symbol:expr),* $(,)?) => {
+        &[
+            $($symbol,)*
+            deepseek_sym("dense_format_f32a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_f32a_f32o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_f32a_f32o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_f32a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_f32a_bf16o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_f32a_bf16o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_bf16a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_bf16a_f32o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_bf16a_f32o_bf16_sm121", &[Precision::Bf16]),
+            deepseek_sym("dense_format_bf16a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
+            deepseek_sym(
+                "dense_format_bf16a_bf16o_fp8_bf16_sm121",
+                &[Precision::Fp8E4M3],
+            ),
+            deepseek_sym("dense_format_bf16a_bf16o_bf16_sm121", &[Precision::Bf16]),
+        ]
+    };
+}
+
+
 /// A bulk-prefill symbol accepting exactly these precisions.
 const fn pre(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
     KernelSymbol::prefill(name, precisions, ComputeClass::Elementwise, RowBand::ALL)
@@ -732,7 +769,7 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::MlaAttention,
         Image::Deepseek,
-        &[
+        with_dense_format![
             deepseek_sym(
                 "opt_bulk_attn",
                 &[Precision::Bf16, Precision::Fp8E4M3, Precision::MxFp8],
@@ -775,32 +812,6 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "flash_mla_csa2_sm121",
                 &[Precision::Bf16, Precision::Fp8E4M3, Precision::MxFp8],
             ),
-            // The projections in a dense class the released MXFP8 bodies do not read: the shared
-            // tile's dense mode (kernels/dense_format_sm121.cu).
-            deepseek_sym("dense_format_f32a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_f32a_f32o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_f32a_f32o_bf16_sm121", &[Precision::Bf16]),
-            deepseek_sym("dense_format_f32a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_f32a_bf16o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_f32a_bf16o_bf16_sm121", &[Precision::Bf16]),
-            deepseek_sym("dense_format_bf16a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_bf16a_f32o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_bf16a_f32o_bf16_sm121", &[Precision::Bf16]),
-            deepseek_sym("dense_format_bf16a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_bf16a_bf16o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_bf16a_bf16o_bf16_sm121", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -878,7 +889,7 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::SparseIndexer,
         Image::Deepseek,
-        &[
+        with_dense_format![
             deepseek_sym("opt_ref_select_fast", &[Precision::MxFp8]),
             deepseek_sym("opt_mma_index_scores", &[Precision::MxFp8]),
             deepseek_sym("opt_select_scores", &[Precision::MxFp8]),
@@ -899,32 +910,6 @@ pub const CATALOGUE: &[PartKernel] = &[
             deepseek_sym("opt_rows_hostw_f32w_f32o", &[Precision::F32]),
             deepseek_sym("scale_index_weights_bf16_to_f32", &[Precision::F32]),
             deepseek_sym("ref_select_sm121", &[Precision::MxFp8]),
-            // The query projection (wq_b) in a non-released dense class, on the shared tile's
-            // dense mode.
-            deepseek_sym("dense_format_f32a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_f32a_f32o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_f32a_f32o_bf16_sm121", &[Precision::Bf16]),
-            deepseek_sym("dense_format_f32a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_f32a_bf16o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_f32a_bf16o_bf16_sm121", &[Precision::Bf16]),
-            deepseek_sym("dense_format_bf16a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_bf16a_f32o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_bf16a_f32o_bf16_sm121", &[Precision::Bf16]),
-            deepseek_sym("dense_format_bf16a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_bf16a_bf16o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_bf16a_bf16o_bf16_sm121", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -1060,7 +1045,7 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::DenseMlp,
         Image::Deepseek,
-        &[
+        with_dense_format![
             deepseek_sym(
                 "swiglu_mxfp8_quant_sm121",
                 &[Precision::Bf16, Precision::F32, Precision::MxFp8],
@@ -2193,7 +2178,7 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::Mtp,
         Image::Deepseek,
-        &[
+        with_dense_format![
             deepseek_sym("opt_draft_fold_prob", &[Precision::Bf16, Precision::F32]),
             deepseek_sym("opt_draft_pick_prob", &[Precision::Bf16, Precision::F32]),
             deepseek_sym("opt_draft_embed_blocks", &[Precision::Bf16]),
@@ -2248,32 +2233,6 @@ pub const CATALOGUE: &[PartKernel] = &[
             ),
             deepseek_sym("routed_format_gate_up_mxfp8_row_sm121", &[Precision::MxFp8]),
             deepseek_sym("routed_format_down_mxfp8_row_sm121", &[Precision::MxFp8]),
-            // The stage's dense projections in a non-released dense class, on the shared tile's
-            // dense mode.
-            deepseek_sym("dense_format_f32a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_f32a_f32o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_f32a_f32o_bf16_sm121", &[Precision::Bf16]),
-            deepseek_sym("dense_format_f32a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_f32a_bf16o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_f32a_bf16o_bf16_sm121", &[Precision::Bf16]),
-            deepseek_sym("dense_format_bf16a_f32o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_bf16a_f32o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_bf16a_f32o_bf16_sm121", &[Precision::Bf16]),
-            deepseek_sym("dense_format_bf16a_bf16o_fp8_sm121", &[Precision::Fp8E4M3]),
-            deepseek_sym(
-                "dense_format_bf16a_bf16o_fp8_bf16_sm121",
-                &[Precision::Fp8E4M3],
-            ),
-            deepseek_sym("dense_format_bf16a_bf16o_bf16_sm121", &[Precision::Bf16]),
         ],
         true,
     ),
