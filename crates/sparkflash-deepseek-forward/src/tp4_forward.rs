@@ -12752,7 +12752,14 @@ impl<'a> DeviceLayer<'a> {
                 .and_then(|slot| slot.get_or_insert(layer).into());
         }
         let mut rope_pairs = 0usize;
-        for (class, representative) in representatives.iter().enumerate() {
+        // A stated stack rotates nothing (its absorbed MLA states no rotated dimensions), so it
+        // builds no table.
+        let rope_classes = if crate::plan::stated_stack() {
+            &representatives[..0]
+        } else {
+            &representatives[..]
+        };
+        for (class, representative) in rope_classes.iter().enumerate() {
             let span = match class {
                 0 => buffers.workspace.rope_tables_plain,
                 _ => buffers.workspace.rope_tables_compressed,
