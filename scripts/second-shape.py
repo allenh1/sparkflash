@@ -347,7 +347,7 @@ def parse_token_id(token: object) -> int:
 
 
 def request_completion(
-    args: argparse.Namespace, prompt: list[int]
+    args: argparse.Namespace, prompt: list[int], max_tokens: int | None = None
 ) -> tuple[list[int], list[list[list[float]]]]:
     """One greedy completion, its ids, and the top-2 alternatives each generated position saw.
 
@@ -356,7 +356,7 @@ def request_completion(
     fields: dict[str, object] = {
         "model": args.model,
         "prompt": prompt,
-        "max_tokens": args.max_tokens,
+        "max_tokens": args.max_tokens if max_tokens is None else max_tokens,
         "temperature": 0.0,
     }
     if args.ids == "token-ids":
@@ -463,12 +463,21 @@ def compare(args: argparse.Namespace) -> int:
     expected = json.loads(Path(args.expected).read_text())
     if len(expected) != len(prompts):
         fail(f"{args.expected} holds {len(expected)} prompt(s), {args.prompts} holds {len(prompts)}")
+    expected_tops = None
+    if args.tie_band is not None:
+        tops_file = Path(str(args.expected) + ".top2.json")
+        if not tops_file.is_file():
+            fail(f"--tie-band needs the reference's top-2 sidecar {tops_file}")
+        expected_tops = json.loads(tops_file.read_text())
     passed = True
     for index, prompt in enumerate(prompts):
         got, tops = request_completion(args, prompt)
         want = expected[index]
         status = "ok" if got == want else "MISMATCH"
-        if got != want:
+        if got != want and expected_tops is not None:
+            ties = forced_ties(args, prompt, got, want, expected_tops[index], args.tie_band)
+            status = "MISMATCH" if ties is None else f"ok at {len(ties)} tie(s) {ties}"
+        if status == "MISMATCH":
             passed = False
         print(f"second-shape: prompt {index} {status} ({len(got)} tokens)")
         if got != want:
@@ -477,6 +486,51 @@ def compare(args: argparse.Namespace) -> int:
             report_divergence(got, want, tops)
     print(f"second-shape: VERDICT {'PASS' if passed else 'FAIL'}")
     return 0 if passed else 1
+
+
+def forced_ties(
+    args: argparse.Namespace,
+    prompt: list[int],
+    got: list[int],
+    want: list[int],
+    want_tops: list[list[list[float]]],
+    band: float,
+) -> list[int] | None:
+    """The positions where the device took the reference's runner-up at a tie, or None.
+
+    For a format whose sum is not regrouping-invariant (`run --tie-band`), any two accumulation
+    orders part at the reference's near-ties, so a free-running comparison stops meaning anything
+    after the first one. Every position is still compared under the reference's own context: at
+    a divergence the device's id must be the reference's second choice and the reference's top-2
+    gap there at most `band` nats; the device then continues from the reference's prefix through
+    that position, and the next stretch is held to the reference again, to the last token. Any
+    other divergence is a mismatch."""
+    ties: list[int] = []
+    base = 0
+    while got != want[base:]:
+        at = base + first_divergence(got, want[base:])
+        if at >= len(want) or at - base >= len(got):
+            print(f"  prompt length differs from the reference at position {at}")
+            return None
+        alternatives = want_tops[at] if at < len(want_tops) else []
+        if len(alternatives) < 2:
+            print(f"  position {at}: the reference recorded no runner-up")
+            return None
+        (top_id, top_lp), (second_id, second_lp) = alternatives[:2]
+        gap = top_lp - second_lp
+        if int(top_id) != want[at] or int(second_id) != got[at - base] or gap > band:
+            print(
+                f"  position {at}: device {got[at - base]} against reference {want[at]} "
+                f"(runner-up {int(second_id)}, gap {gap:.6g}, band {band:.6g}) is not a tie"
+            )
+            return None
+        print(f"  position {at}: a tie (gap {gap:.6g} <= {band:.6g}); forcing the reference prefix")
+        ties.append(at)
+        base = at + 1
+        if base >= len(want):
+            return ties
+        got, _ = request_completion(args, prompt + want[:base], len(want) - base)
+    return ties
 
 
 def differing_prompts(expected: list[list[int]], global_ids: list[list[int]]) -> list[int]:
@@ -809,6 +863,7 @@ def run_world(
                     "60",
                     "--ids",
                     "token-ids",
+                    *(("--tie-band", str(args.tie_band)) if args.tie_band is not None else ()),
                 ]
             ).returncode
         finally:
@@ -860,7 +915,19 @@ def run_world(
     return f"the host group agreed with {expected_for_check.name}"
 
 
+# The variants whose routed-expert sum is not regrouping-invariant: row-scaled E4M3 codes change
+# their f32 bits when the sum is regrouped (the released E2M1 arm does not), measured by
+# `the_row_scaled_expert_split_rounds_where_the_released_arm_regroups_exactly`. Only these may run
+# with --tie-band; every other variant is held to exact ids.
+REGROUPING_VARIANT = {"mx-fp8-row", "joint-nvfp4-mxfp8-row"}
+
+
 def run_test(args: argparse.Namespace) -> int:
+    if args.tie_band is not None and args.stored_format not in REGROUPING_VARIANT:
+        fail(
+            f"--tie-band is for a variant whose sum is not regrouping-invariant "
+            f"({', '.join(sorted(REGROUPING_VARIANT))}); {args.stored_format} is held to exact ids"
+        )
     if args.device:
         require_nccl_library()
     all_nodes = os.environ.get("SPARK_NODES", "").split()
@@ -987,6 +1054,12 @@ def main() -> int:
     )
     run_parser.add_argument("--port", type=int, default=8126)
     run_parser.add_argument("--max-tokens", type=int, default=8)
+    run_parser.add_argument(
+        "--tie-band",
+        type=float,
+        help="hold the device arm to the reference at every position but its near-ties (see "
+        "compare --tie-band); only for a format whose sum is not regrouping-invariant",
+    )
     run_parser.set_defaults(func=run_test)
 
     compare_parser = subs.add_parser("compare")
@@ -1006,6 +1079,13 @@ def main() -> int:
         choices=("logprobs", "token-ids"),
         help="where the ids come from: logprobs (with the top-2 gaps) or the choice's token_ids "
         "(the device arm, which serves no logprobs)",
+    )
+    compare_parser.add_argument(
+        "--tie-band",
+        type=float,
+        help="accept a divergence only where the device takes the reference's runner-up and the "
+        "reference's top-2 gap is at most this many nats, then continue from the reference's "
+        "prefix (a format whose sum is not regrouping-invariant; default: exact ids)",
     )
     compare_parser.set_defaults(func=compare)
 
