@@ -303,6 +303,15 @@ pub fn classify(name: &str) -> Result<Option<Classification>, ShardError> {
                 classified(Group::AttentionColumn, ShardRule::Column)
             }
             "wo.weight" | "wo.scale" => classified(Group::AttentionRow, ShardRule::Row),
+            // A Gated DeltaNet block (`linear_attention`) runs whole on every rank: its fused
+            // q/k/v rows split as three runs and its conv by the same channels, which no single
+            // shard rule states.
+            "in_proj_qkv.weight" | "in_proj_qkv.scale" | "in_proj_z.weight"
+            | "in_proj_z.scale" | "in_proj_b.weight" | "in_proj_b.scale" | "in_proj_a.weight"
+            | "in_proj_a.scale" | "out_proj.weight" | "out_proj.scale" | "conv1d.weight"
+            | "A_log" | "dt_bias" | "norm.weight" => {
+                classified(Group::AttentionReplicated, ShardRule::Replicated)
+            }
             "attn_sink" => classified(Group::AttentionSink, ShardRule::Column),
             other if other.starts_with("indexer.") || other.starts_with("compressor.") => {
                 classified(Group::AttentionAux, ShardRule::Replicated)
@@ -978,6 +987,29 @@ mod tests {
             assert_eq!(classification.rule, Some(rule), "{name}");
         }
         assert!(classify("layers.0.ffn.w4.weight").is_err());
+    }
+
+    #[test]
+    fn a_gated_deltanet_block_is_whole_on_every_rank() {
+        for leaf in [
+            "in_proj_qkv.weight",
+            "in_proj_z.scale",
+            "in_proj_b.weight",
+            "in_proj_a.weight",
+            "out_proj.weight",
+            "conv1d.weight",
+            "A_log",
+            "dt_bias",
+            "norm.weight",
+        ] {
+            let name = format!("layers.7.attn.{leaf}");
+            let classification = classify(&name).expect("known").expect("resident");
+            assert_eq!(
+                (classification.group, classification.rule),
+                (ResidentGroup::AttentionReplicated, Some(ShardRule::Replicated)),
+                "{name}"
+            );
+        }
     }
 
     #[test]

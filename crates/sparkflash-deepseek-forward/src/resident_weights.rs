@@ -263,6 +263,24 @@ pub fn rank_attention_geometry(
             }
             continue;
         }
+        // A Gated DeltaNet block: every projection whole on every rank, as the resident plan
+        // keeps it.
+        if config.gdn_layers.contains(&layer) {
+            let gdn = config.gdn.ok_or_else(|| {
+                format!("rank_attention_geometry: block {layer} is a Gated DeltaNet and the stack has no geometry")
+            })?;
+            let (key, value) = (gdn.key_heads * gdn.key_dim, gdn.value_heads * gdn.value_dim);
+            for (tail, shape) in [
+                ("attn.in_proj_qkv.weight", (2 * key + value, config.dim)),
+                ("attn.in_proj_z.weight", (value, config.dim)),
+                ("attn.in_proj_b.weight", (gdn.value_heads, config.dim)),
+                ("attn.in_proj_a.weight", (gdn.value_heads, config.dim)),
+                ("attn.out_proj.weight", (config.dim, value)),
+            ] {
+                map.insert(crate::plan::layer_claim(layer, tail).to_owned(), shape);
+            }
+            continue;
+        }
         // Replicated: the whole projection on every rank.
         map.insert(
             crate::plan::layer_claim(layer, "attn.wq_a.weight").to_owned(),
