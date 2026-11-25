@@ -6933,7 +6933,9 @@ impl<'a> SeamDevice<'a> {
                 .map_err(|error| shape(format!("{scale_name}: {error}")))?
         };
         let mut allocated = 0usize;
-        let mut upload = |bytes: &[u8], what: &str| -> Result<Deviceptr, _> {
+        let mut upload = |bytes: &[u8],
+                          what: &str|
+         -> Result<Deviceptr, sparkflash_engine::linalg::EngineError> {
             if bytes.is_empty() {
                 return Ok(Deviceptr(0));
             }

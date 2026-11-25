@@ -882,7 +882,8 @@ impl DeviceLayer<'_> {
             if split.is_some() && !first_col.is_multiple_of(block) {
                 return Err(format!(
                     "draft main_proj: a rank's first column {first_col} is not on the {block}-wide \
-                     scale grid of the dense class {format}"
+                     scale grid of the dense class {}",
+                    format.describe()
                 ));
             }
             let weight =

@@ -3684,7 +3684,7 @@ impl DeviceLayer<'_> {
     fn shared_dense(
         &self,
         rows: &RowsState,
-        bulk: Option<&BulkState>,
+        bulk: Option<&super::bulk::BulkState>,
         route: sparkflash_kernels::dense_format::DenseFormat,
         ops: SharedExpertDeviceLayer,
         layer: usize,
