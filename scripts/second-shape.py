@@ -43,7 +43,9 @@ world's ids as `host-reference-w{W}.json`. World 1 is compared with the global
 `host-reference.json` and must equal it; the device group at world W is compared with that
 world's file, exactly. Each world's file is also reported against the global one, with the
 prompts that differ and the top-2 logprob gap at the first divergence, but that drift never
-fails the run. Token ids are never compared with a tolerance.
+fails the run. Token ids are compared with a tolerance only under `--tie-band`, and only for a
+variant in TIE_BAND_VARIANTS (each with its reason) at a band measured from the reference's own
+drift between worlds.
 
 Every requested world runs in one invocation. A world that fails is recorded and the run goes on
 to the next one; the closing summary gives each world's verdict, and the exit code is 1 when any
@@ -527,7 +529,7 @@ def forced_ties(
 ) -> list[int] | None:
     """The positions where the device took another of the reference's near-tied choices, or None.
 
-    For a format whose sum is not regrouping-invariant (`run --tie-band`), any two accumulation
+    For a variant the device cannot match bit for bit (`run --tie-band`), any two accumulation
     orders part at the reference's near-ties, so a free-running comparison stops meaning anything
     after the first one. Every position is still compared under the reference's own context: at
     a divergence the device's id must be among the reference's recorded alternatives there, at
@@ -953,19 +955,36 @@ def run_world(
     return f"the host group agreed with {expected_for_check.name}"
 
 
-# The variants whose routed-expert sum is not regrouping-invariant: row-scaled E4M3 codes change
-# their f32 bits when the sum is regrouped (the released E2M1 arm does not), measured by
-# `the_row_scaled_expert_split_rounds_where_the_released_arm_regroups_exactly`. Only these may run
-# with --tie-band; every other variant is held to exact ids.
-REGROUPING_VARIANT = {"mx-fp8-row", "joint-nvfp4-mxfp8-row"}
+# The variants the device arm cannot match the host reference on bit for bit, each with its
+# reason. Only these may run with --tie-band, and each one's band is measured, never chosen: twice
+# the largest |logprob| difference of shared alternatives between the host reference at one rank
+# and at two and four, rounded up (the drift the reference's own regrouping shows). Every other
+# variant is held to exact ids.
+_FAST_MATH = (
+    "the foreign part's device kernels use fast-math __expf and split partials the host "
+    "reference cannot reproduce"
+)
+TIE_BAND_VARIANTS = {
+    # Row-scaled E4M3 codes change their f32 bits when the routed-expert sum is regrouped (the
+    # released E2M1 arm does not), measured by
+    # `the_row_scaled_expert_split_rounds_where_the_released_arm_regroups_exactly`.
+    "mx-fp8-row": "the regrouped E4M3 routed-expert sum is not regrouping-invariant",
+    "joint-nvfp4-mxfp8-row": "the regrouped E4M3 routed-expert sum is not regrouping-invariant",
+    "gqa-dense": _FAST_MATH,
+    "gdn-dense": _FAST_MATH,
+    "gdn-decoder": _FAST_MATH,
+}
 
 
 def run_test(args: argparse.Namespace) -> int:
-    if args.tie_band is not None and args.stored_format not in REGROUPING_VARIANT:
+    if args.tie_band is not None and args.stored_format not in TIE_BAND_VARIANTS:
         fail(
-            f"--tie-band is for a variant whose sum is not regrouping-invariant "
-            f"({', '.join(sorted(REGROUPING_VARIANT))}); {args.stored_format} is held to exact ids"
+            f"--tie-band is for a variant the device cannot match bit for bit "
+            f"({', '.join(sorted(TIE_BAND_VARIANTS))}); {args.stored_format} is held to exact ids"
         )
+    if args.tie_band is not None:
+        print(f"tie band {args.tie_band} for {args.stored_format}: "
+              f"{TIE_BAND_VARIANTS[args.stored_format]}")
     if args.device:
         require_nccl_library()
     all_nodes = os.environ.get("SPARK_NODES", "").split()
@@ -1096,7 +1115,7 @@ def main() -> int:
         "--tie-band",
         type=float,
         help="hold the device arm to the reference at every position but its near-ties (see "
-        "compare --tie-band); only for a format whose sum is not regrouping-invariant",
+        "compare --tie-band); only for a variant in TIE_BAND_VARIANTS, at its measured band",
     )
     run_parser.set_defaults(func=run_test)
 
@@ -1123,7 +1142,7 @@ def main() -> int:
         type=float,
         help="accept a divergence only where the device's id is at most this many nats under the "
         "reference's choice among the reference's recorded alternatives, then continue from the "
-        "reference's prefix (a format whose sum is not regrouping-invariant; default: exact ids)",
+        "reference's prefix (a variant in TIE_BAND_VARIANTS; default: exact ids)",
     )
     compare_parser.set_defaults(func=compare)
 
