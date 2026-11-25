@@ -48,6 +48,23 @@ fn gdn_symbols(key_dim: usize, value_dim: usize) -> &'static [&'static str] {
     }
 }
 
+/// The KDA scan template for a head's key and value widths, then the token path's decay. The
+/// scan bodies return without writing when the value width is not their template's, so a width
+/// no template serves is refused here, by name.
+fn kda_symbols(key_dim: usize, value_dim: usize) -> Result<&'static [&'static str], OpError> {
+    match (key_dim, value_dim) {
+        (128, 128) => Ok(&["q4p_kda_scan", "q4e_kda_decay"]),
+        (64, 64) => Ok(&["q4p_kda_scan_64_64", "q4e_kda_decay"]),
+        (128, 256) => Ok(&["q4p_kda_scan_128_256", "q4e_kda_decay"]),
+        _ => Err(OpError::shape(
+            "linear-attention scan",
+            format!(
+                "no KDA scan template takes {key_dim}-wide keys and {value_dim}-wide values (128/128, 64/64 or 128/256)"
+            ),
+        )),
+    }
+}
+
 /// The scan's recurrence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanKind {
@@ -151,7 +168,7 @@ impl ScanPlan {
         geometry.v_head = value_dim;
         let symbols: &[&'static str] = match kind {
             ScanKind::Gdn => gdn_symbols(key_dim, value_dim),
-            ScanKind::Kda => &["q4p_kda_scan", "q4e_kda_decay"],
+            ScanKind::Kda => kda_symbols(key_dim, value_dim)?,
         };
         // Resolve the geometry this plan will launch, not the requirement's original one: the
         // schedule's head widths are the template the kernel must accept.
@@ -346,5 +363,19 @@ impl OpPlan for ScanPlan {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_kda_scan_takes_the_template_of_its_head_widths_and_refuses_the_rest() {
+        assert_eq!(kda_symbols(128, 128).unwrap()[0], "q4p_kda_scan");
+        assert_eq!(kda_symbols(64, 64).unwrap()[0], "q4p_kda_scan_64_64");
+        assert_eq!(kda_symbols(128, 256).unwrap()[0], "q4p_kda_scan_128_256");
+        let refused = kda_symbols(96, 96).unwrap_err().to_string();
+        assert!(refused.contains("96-wide keys"), "{refused}");
     }
 }
