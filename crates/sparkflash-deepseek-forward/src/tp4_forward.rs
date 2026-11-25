@@ -8828,6 +8828,39 @@ fn planned_b12x_geometry(
     }
 }
 
+/// One planned attention matrix's (cols, inner) geometry: a B12x operand's tile geometry, or,
+/// where the layer's attention is a class the dense format route reads, the stored shard's
+/// `[cols][inner]` shape.
+///
+/// # Errors
+/// As [planned_b12x_geometry] for a released class; a stored shard that is not two-dimensional.
+#[cfg(feature = "cuda")]
+fn planned_matrix_geometry(
+    plan: &sparkflash_device::resident::ResidentPlan,
+    layer: usize,
+    name: &str,
+) -> Result<(usize, usize), String> {
+    let routed = crate::plan::description()
+        .operand(Some(layer), sparkflash_model::Part::MlaAttention)
+        .is_some_and(|operand| !released_dense(operand.stored));
+    match plan.operand_layout(name) {
+        Some(sparkflash_device::resident::OperandLayout::Stored { .. }) if routed => {
+            let shard = plan
+                .shards()
+                .iter()
+                .find(|shard| shard.name == name)
+                .ok_or_else(|| format!("the rank plan does not carry {name}"))?;
+            match shard.shard_shape.as_slice() {
+                &[cols, inner] => Ok((cols, inner)),
+                other => Err(format!(
+                    "{name} is a {other:?} shard; the dense format route reads a matrix"
+                )),
+            }
+        }
+        _ => planned_b12x_geometry(plan, name),
+    }
+}
+
 /// Runs the layer-0 wq_a and wkv dense B12x projections from the B12x arena weights.
 ///
 /// Loads a WS-D addition's cubin from the window's staged directory and fails closed unless the
@@ -12805,7 +12838,7 @@ impl<'a> DeviceLayer<'a> {
                         out_geometry.wo_b_shape(),
                     ),
                 ] {
-                    let got = planned_b12x_geometry(plan, name)
+                    let got = planned_matrix_geometry(plan, layer, name)
                         .map_err(|error| format!("layer device: {error}"))?;
                     if got != want {
                         return Err(format!(
