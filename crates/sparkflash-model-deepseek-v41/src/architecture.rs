@@ -106,12 +106,26 @@ impl ModelConfig {
             .filter(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }))
             .count();
         check("MLA layers", self.n_layers, mla)?;
+        // A block is a dense gated MLP where the typed configuration names it one
+        // (`first_k_dense_replace`), and MoE everywhere else.
+        for (index, layer) in architecture.layers.iter().enumerate() {
+            check_flag(
+                "dense FFN layer",
+                index,
+                matches!(layer.ffn, Ffn::Dense(_)),
+                self.dense_ffn_layers.contains(&index),
+            )?;
+        }
         let moe = architecture
             .layers
             .iter()
             .filter(|layer| matches!(layer.ffn, Ffn::Moe(_)))
             .count();
-        check("MoE layers", self.n_layers, moe)?;
+        check(
+            "MoE layers",
+            self.n_layers - self.dense_ffn_layers.len().min(self.n_layers),
+            moe,
+        )?;
         Ok(())
     }
 
@@ -248,6 +262,27 @@ mod tests {
             .cross_check_plan(&plan, &architecture)
             .expect_err("drift");
         assert!(error.to_string().contains("compressed layer"), "{error}");
+    }
+
+    #[test]
+    fn a_dense_ffn_prefix_agrees_and_a_drift_names_the_block() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(CARRIED_RELEASE).expect("carried json");
+        let text = document
+            .get_mut("text_config")
+            .unwrap_or_else(|| panic!("the carried release has a text_config"));
+        text["first_k_dense_replace"] = serde_json::json!(1);
+        text["intermediate_size"] = serde_json::json!(4096);
+        let json = document.to_string();
+        let config = ModelConfig::from_released_json(&json).expect("typed config");
+        let mut architecture = architecture_from_json(&json).expect("shared architecture");
+        config
+            .cross_check(&architecture)
+            .expect("a dense first block agrees");
+        let moe = architecture.layers[1].ffn.clone();
+        architecture.layers[0].ffn = moe;
+        let error = config.cross_check(&architecture).expect_err("drift");
+        assert!(error.to_string().contains("dense FFN layer"), "{error}");
     }
 
     #[test]
