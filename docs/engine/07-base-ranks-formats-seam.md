@@ -162,6 +162,19 @@ its 24 positions), so on it the band admits most alternatives and the check is m
 device's choice is a recorded alternative and that every stretch between ties is exact. A checkpoint
 with real margins makes the same rule much tighter.
 
+**The same band for the foreign-part variants (owner-approved 2026-11-24).** The owner widened the
+exception to the variants whose device part runs a kernel the host cannot reproduce:
+`gqa-dense` and `gdn-dense`, whose device kernels use the fast-math `__expf` and split partials,
+and `gdn-decoder` (the script's `TIE_BAND_VARIANTS`, each with its reason). The owner's rule is that
+"tie gates are a last resort, but expected in some cases". The flag is the same and so is the
+check. For these variants the band cannot be measured the way the regrouping band was. Their host
+references at worlds 1, 2 and 4 agree to the bit: zero drift over 512 shared alternatives. So they
+take the largest band measured among the tie variants, `B = 0.2`, and the doc says so rather than
+calling it measured. The ties they actually take are far inside it: 0.0039 nats (`gqa-dense`) and
+0.0022 nats (`gdn-dense`), one each. `gdn-decoder` needs no tie. A checkpoint with real margins, or
+a host that emulates the device's exponential, would let these bands be measured. Until then a
+tie above 0.01 nats on these variants is investigated before it is accepted.
+
 ### 3.1 Where the proof stands (review of `1ef7a6ca`, 2026-11-23)
 
 Every result recorded below under R1, R2, F1, F2 and F3, and the second shape of milestone 2,
@@ -1301,7 +1314,8 @@ stack.
     this fixture. Prompt 1 position 1 is a three-way tie within 0.004 nats, and the device takes
     the third choice.
   * **Under the tie band.** The owner approved the band for foreign-part variants on 2026-11-24.
-    `gqa-dense` runs under it (bands and ties below, with S3).
+    `gqa-dense` runs under it at `B = 0.2` (section 3) and passes at world 1 with one tie:
+    prompt 1, position 1, gap 0.0039 nats.
   * **Not yet run:** a grouped-query block at world 2 or 4.
 * **S3** (`917ef5f5` .. `ab87fd5f`). `gdn-dense` makes block 0 a Gated DeltaNet block over a
   dense MLP. `gdn-decoder` makes block 7, above the encoder layers, a Gated DeltaNet block over
