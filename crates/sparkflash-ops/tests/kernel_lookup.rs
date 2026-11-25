@@ -54,7 +54,7 @@ const EXEMPTIONS: &[Exemption] = &[
     Exemption {
         crate_name: "sparkflash-deepseek-forward",
         file: "src/tp4_forward/rows.rs",
-        sites: 3,
+        sites: 2,
         why: "not converted yet: phase 7 runs by arm",
     },
     Exemption {

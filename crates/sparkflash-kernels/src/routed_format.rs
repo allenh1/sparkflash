@@ -29,7 +29,8 @@
 //! The expert table is `[layer][expert][9]` words: (weight, scales, wide) for w1, w3 and w2, where
 //! `wide` is the f32 bit pattern of an NVFP4 convention's tensor-wide factor (zero elsewhere).
 //! Which entries a layer launches is the plan's choice, made at open from the catalogue symbols
-//! that decode the layer's format; a layer with no entries is the released path's, and
+//! that decode the layer's format, and this module loads them from its image ([FormatEntries::load],
+//! [SharedKernels::load]); a layer with no entries is the released path's, and
 //! [RoutedFormatDevice::serves] says which.
 //!
 //! The buffers hold [RoutedFormatDevice::capacity] tokens; a longer step runs in pieces of that
@@ -49,6 +50,12 @@ pub const ITEM_ROWS: usize = 128;
 pub const CUBIN: &str = "routed_format_sm121.cubin";
 /// The entry that widens a split chunk's gathered BF16 rows into f32 rows ([SharedKernels::widen]).
 pub const WIDEN: &str = "routed_format_widen_sm121";
+/// The image the base's clamped SwiGLU ([SharedKernels::swiglu]) lives in.
+pub const SWIGLU_CUBIN: &str = "opt_rows_sm121.cubin";
+/// The base's clamped SwiGLU entry in [SWIGLU_CUBIN].
+const SWIGLU: &str = "opt_rows_shared_swiglu";
+/// The slot plan's entry in the build's embedded plan image.
+const PLAN: &str = "moe_plan";
 /// The output columns one tile block computes (GLM_BN).
 const TILE_COLS: usize = 128;
 /// The block the tile entries run (OM_THREADS).
@@ -80,6 +87,62 @@ pub struct SharedKernels {
     pub combine: Kernel,
     /// `routed_format_widen_sm121`: a split chunk's gathered BF16 rows into f32 rows.
     pub widen: Kernel,
+}
+
+impl FormatEntries {
+    /// A block's two entries from the format image `cubin` ([CUBIN]'s bytes), by the catalogue
+    /// symbols that decode the block's format.
+    ///
+    /// # Errors
+    /// An entry the image does not export.
+    pub fn load(
+        cuda: &Cuda,
+        cubin: &[u8],
+        gate_up: &'static str,
+        down: &'static str,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            gate_up: load_entry(cuda, cubin, gate_up)?,
+            down: load_entry(cuda, cubin, down)?,
+        })
+    }
+}
+
+impl SharedKernels {
+    /// The kernels every format block shares: the slot plan from the build's embedded plan image,
+    /// the base's SwiGLU from `rows` ([SWIGLU_CUBIN]'s bytes) and the widen entry from the format
+    /// image `format` ([CUBIN]'s bytes). `combine` is the caller's routed combine, loaded at its
+    /// own top-k.
+    ///
+    /// # Errors
+    /// A build that embeds no plan image, or an entry an image does not export.
+    pub fn load(
+        cuda: &Cuda,
+        format: &[u8],
+        rows: &[u8],
+        combine: Kernel,
+        plan_threads: u32,
+    ) -> Result<Self, String> {
+        let plan_image = crate::images::moe_plan_cubin();
+        if plan_image.is_empty() {
+            return Err("this build embeds no routed-expert plan cubin".to_owned());
+        }
+        Ok(Self {
+            plan: load_entry(cuda, plan_image, PLAN)?,
+            plan_threads,
+            swiglu: load_entry(cuda, rows, SWIGLU)?,
+            combine,
+            widen: load_entry(cuda, format, WIDEN)?,
+        })
+    }
+}
+
+/// One entry of `cubin`. Its module stays loaded for the process, as every by-name load of the
+/// route's images does.
+fn load_entry(cuda: &Cuda, cubin: &[u8], name: &'static str) -> Result<Kernel, String> {
+    cuda.load_named(cubin, name)
+        .map(|(_module, kernel)| kernel)
+        .map_err(|error| format!("load {name}: {error}"))
 }
 
 /// The geometry one rank's routed experts have.

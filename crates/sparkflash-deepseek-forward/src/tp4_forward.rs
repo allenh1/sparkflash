@@ -8039,23 +8039,15 @@ pub(crate) fn open_dense_format(
         "dense format: {what} stores its projections as {}",
         format.describe()
     );
-    let (cubin, _sha) = cached_cubin(&kernel_dir.join("dense_format_sm121.cubin"))
+    let (cubin, _sha) = cached_cubin(&kernel_dir.join(DenseFormat::CUBIN))
         .map_err(|error| format!("{what}, which only the dense format route reads: {error}"))?;
     let description = crate::plan::description();
-    let mut entries = Vec::with_capacity(DenseIo::ALL.len());
-    for io in DenseIo::ALL {
-        let symbol = description
+    let mut symbols = [""; 4];
+    for (symbol, io) in symbols.iter_mut().zip(DenseIo::ALL) {
+        *symbol = description
             .symbol_decoding(block, part, io.prefix(), format)
             .map_err(|error| format!("{what}: {error}"))?;
-        // The modules stay loaded for the process, as every by-name load here does.
-        let (_module, kernel) = cuda
-            .load_named(&cubin, symbol)
-            .map_err(|error| format!("{what}: load {symbol}: {error}"))?;
-        entries.push(kernel);
     }
-    let entries = entries
-        .try_into()
-        .map_err(|_| format!("{what}: the route has four row forms"))?;
     // The entries index one fixed square scale grid; a scaled class stored on another is
     // refused here, not read off the wrong scales.
     let scale_block = (!format.is_unscaled()).then(|| format.block());
@@ -8067,10 +8059,8 @@ pub(crate) fn open_dense_format(
             DenseFormat::SCALE_BLOCK
         ));
     }
-    Ok(DenseFormat {
-        entries,
-        scale_block,
-    })
+    DenseFormat::load(cuda, &cubin, symbols, scale_block)
+        .map_err(|error| format!("{what}: {error}"))
 }
 
 /// The rows one bulk prefill chunk takes, SPARKFLASH_PREFILL_CHUNK (8 or less keeps every prompt
@@ -14449,13 +14439,6 @@ impl<'a> DeviceLayer<'a> {
                 what(first)
             )
         })?;
-        let load = |name: &'static str| -> Result<sparkflash_kernels::cuda_driver::Kernel, String> {
-            // The modules stay loaded for the process, as every by-name load here does.
-            self.cuda
-                .load_named(&cubin, name)
-                .map(|(_module, kernel)| kernel)
-                .map_err(|error| format!("layer device routed format: load {name}: {error}"))
-        };
         let description = crate::plan::description();
         let mut layers = Vec::with_capacity(formats.len());
         for (layer, format) in formats.iter().enumerate() {
@@ -14468,10 +14451,15 @@ impl<'a> DeviceLayer<'a> {
                     .symbol_decoding(Some(layer), sparkflash_model::Part::Moe, prefix, format)
                     .map_err(|error| format!("{}: {error}", what(layer)))
             };
-            layers.push(Some(FormatEntries {
-                gate_up: load(entry("routed_format_gate_up_")?)?,
-                down: load(entry("routed_format_down_")?)?,
-            }));
+            layers.push(Some(
+                FormatEntries::load(
+                    &self.cuda,
+                    &cubin,
+                    entry("routed_format_gate_up_")?,
+                    entry("routed_format_down_")?,
+                )
+                .map_err(|error| format!("{}: {error}", what(layer)))?,
+            ));
         }
         let opt = self.moe_opt_kernels.as_ref().ok_or_else(|| {
             format!(
@@ -14479,30 +14467,17 @@ impl<'a> DeviceLayer<'a> {
                 what(first)
             )
         })?;
-        let plan_image = sparkflash_kernels::images::moe_plan_cubin();
-        if plan_image.is_empty() {
-            return Err(format!(
-                "{}: this build embeds no routed-expert plan cubin",
-                what(first)
-            ));
-        }
-        let (_plan_module, plan) = self
-            .cuda
-            .load_named(plan_image, "moe_plan")
-            .map_err(|error| format!("layer device routed format: load moe_plan: {error}"))?;
-        let (rows_cubin, _sha) = cached_cubin(&kernel_dir.join("opt_rows_sm121.cubin"))
-            .map_err(|error| format!("layer device routed format: {error}"))?;
-        let (_swiglu_module, swiglu) = self
-            .cuda
-            .load_named(&rows_cubin, "opt_rows_shared_swiglu")
-            .map_err(|error| format!("layer device routed format: load SwiGLU: {error}"))?;
-        let shared = SharedKernels {
-            plan,
-            plan_threads: sparkflash_model::active_profile().plan.block_threads(),
-            swiglu,
-            combine: opt.dedup[2].1,
-            widen: load(sparkflash_kernels::routed_format::WIDEN)?,
-        };
+        let (rows_cubin, _sha) =
+            cached_cubin(&kernel_dir.join(sparkflash_kernels::routed_format::SWIGLU_CUBIN))
+                .map_err(|error| format!("layer device routed format: {error}"))?;
+        let shared = SharedKernels::load(
+            &self.cuda,
+            &cubin,
+            &rows_cubin,
+            opt.dedup[2].1,
+            sparkflash_model::active_profile().plan.block_threads(),
+        )
+        .map_err(|error| format!("{}: {error}", what(first)))?;
         // The table: every layer's rows, the released layers' too (the route never reads them),
         // so a layer's base is its index times the layer stride.
         let geometry = self.routed_geometry;

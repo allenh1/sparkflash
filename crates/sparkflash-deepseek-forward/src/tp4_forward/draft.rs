@@ -382,6 +382,18 @@ impl DraftState {
         } else {
             (None, None)
         };
+        // The format route sums its slots with the drafter's own top-k combine: the dedup chain's
+        // when it runs, else loaded for the route alone (the released MXFP4 stages load none).
+        let route_combine = if released_experts() {
+            None
+        } else if let Some([_, _, combine]) = dedup {
+            Some(combine)
+        } else {
+            Some(load(
+                "opt_moe_sm121.cubin",
+                crate::plan::handles().mtp_combine,
+            )?)
+        };
         let kernels = DraftKernels {
             _modules: modules,
             taps,
@@ -540,7 +552,7 @@ impl DraftState {
         } else {
             None
         };
-        let routed_format = open_routed_format(device, arena, kernel_dir)?;
+        let routed_format = open_routed_format(device, arena, kernel_dir, route_combine)?;
         let r = R_MAX;
         Ok(Self {
             routed_format,
@@ -618,6 +630,15 @@ impl DraftState {
     }
 }
 
+/// Whether the drafter's stages store their experts as the released MXFP4, which the released
+/// bodies read (no format route).
+fn released_experts() -> bool {
+    crate::plan::description()
+        .values()
+        .expert_format()
+        .same_arithmetic(sparkflash_model::format::StoredFormat::MXFP4_ROW_32)
+}
+
 /// The drafter's format route, when its stages' expert format is not the released MXFP4.
 ///
 /// A stage's experts take the class's format (the ranges a joint declaration states are the
@@ -628,14 +649,15 @@ fn open_routed_format(
     device: &DeviceLayer<'_>,
     arena: &sparkflash_device::arena::ResidentArena,
     kernel_dir: &Path,
+    combine: Option<Kernel>,
 ) -> Result<Option<sparkflash_kernels::routed_format::RoutedFormatDevice>, String> {
     use sparkflash_kernels::routed_format::{
-        FormatEntries, RoutedFormatDevice, RoutedFormatGeometry, SharedKernels, matrix_words,
+        CUBIN, FormatEntries, RoutedFormatDevice, RoutedFormatGeometry, SWIGLU_CUBIN,
+        SharedKernels, matrix_words,
     };
-    use sparkflash_model::format::StoredFormat;
     let description = crate::plan::description();
     let format = description.values().expert_format();
-    if format.same_arithmetic(StoredFormat::MXFP4_ROW_32) {
+    if released_experts() {
         return Ok(None);
     }
     let cuda = device.cuda;
@@ -643,14 +665,12 @@ fn open_routed_format(
         "draft: the stages store their experts as {}",
         format.describe()
     );
-    let load = |file: &str, name: &'static str| -> Result<Kernel, String> {
-        let (cubin, _sha) = cached_cubin(&kernel_dir.join(file))
-            .map_err(|error| format!("{what}, which only the format route reads: {error}"))?;
-        // The modules stay loaded for the process, as every by-name load here does.
-        cuda.load_named(&cubin, name)
-            .map(|(_module, kernel)| kernel)
-            .map_err(|error| format!("{what}: load {name}: {error}"))
+    let image = |file: &str| {
+        cached_cubin(&kernel_dir.join(file))
+            .map(|(cubin, _sha)| cubin)
+            .map_err(|error| format!("{what}, which only the format route reads: {error}"))
     };
+    let cubin = image(CUBIN)?;
     // The MoE part claims the format entries; any backbone block's instance names them.
     let entry = |prefix: &str| -> Result<&'static str, String> {
         (0..description.values().n_layers)
@@ -661,35 +681,23 @@ fn open_routed_format(
             })
             .ok_or_else(|| format!("{what}: the plan claims no `{prefix}*` entry decoding it"))
     };
-    let entries = FormatEntries {
-        gate_up: load(
-            sparkflash_kernels::routed_format::CUBIN,
-            entry("routed_format_gate_up_")?,
-        )?,
-        down: load(
-            sparkflash_kernels::routed_format::CUBIN,
-            entry("routed_format_down_")?,
-        )?,
-    };
-    let plan_image = sparkflash_kernels::images::moe_plan_cubin();
-    if plan_image.is_empty() {
-        return Err(format!(
-            "{what}: this build embeds no routed-expert plan cubin"
-        ));
-    }
-    let (_plan_module, plan) = cuda
-        .load_named(plan_image, "moe_plan")
-        .map_err(|error| format!("{what}: load moe_plan: {error}"))?;
-    let shared = SharedKernels {
-        plan,
-        plan_threads: sparkflash_model::active_profile().plan.block_threads(),
-        swiglu: load("opt_rows_sm121.cubin", "opt_rows_shared_swiglu")?,
-        combine: load("opt_moe_sm121.cubin", crate::plan::handles().mtp_combine)?,
-        widen: load(
-            sparkflash_kernels::routed_format::CUBIN,
-            sparkflash_kernels::routed_format::WIDEN,
-        )?,
-    };
+    let entries = FormatEntries::load(
+        cuda,
+        &cubin,
+        entry("routed_format_gate_up_")?,
+        entry("routed_format_down_")?,
+    )
+    .map_err(|error| format!("{what}: {error}"))?;
+    let combine = combine
+        .ok_or_else(|| format!("{what}: the drafter loaded no top-k combine for the route"))?;
+    let shared = SharedKernels::load(
+        cuda,
+        &cubin,
+        &image(SWIGLU_CUBIN)?,
+        combine,
+        sparkflash_model::active_profile().plan.block_threads(),
+    )
+    .map_err(|error| format!("{what}: {error}"))?;
     let ptr = |name: &str| -> Result<Deviceptr, String> {
         arena
             .device_ptr(name)

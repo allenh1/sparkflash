@@ -25,7 +25,8 @@
 //! grid's z axis.
 //!
 //! Which entries a projection launches is the plan's choice, made at open from the catalogue
-//! symbols that decode the projection's class ([DenseIo::prefix]); this module only launches them.
+//! symbols that decode the projection's class ([DenseIo::prefix]); this module loads those symbols
+//! from its image ([DenseFormat::load]) and launches them.
 
 use crate::cuda_driver::{Cuda, Kernel};
 
@@ -167,6 +168,35 @@ pub struct DenseFormat {
 impl DenseFormat {
     /// The side of the scale grid every scaled entry indexes (`col >> 7`, `k >> 7`).
     pub const SCALE_BLOCK: usize = 128;
+    /// The image every dense format entry lives in.
+    pub const CUBIN: &str = "dense_format_sm121.cubin";
+
+    /// A class's four row-form entries from the dense format image `cubin` ([Self::CUBIN]'s
+    /// bytes), by the catalogue symbols that decode the class, in [DenseIo::ALL] order. Their
+    /// modules stay loaded for the process, as every by-name load of the route's image does.
+    ///
+    /// # Errors
+    /// An entry the image does not export.
+    pub fn load(
+        cuda: &Cuda,
+        cubin: &[u8],
+        symbols: [&'static str; 4],
+        scale_block: Option<usize>,
+    ) -> Result<Self, String> {
+        let mut entries = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            let (_module, kernel) = cuda
+                .load_named(cubin, symbol)
+                .map_err(|error| format!("load {symbol}: {error}"))?;
+            entries.push(kernel);
+        }
+        Ok(Self {
+            entries: entries
+                .try_into()
+                .map_err(|_| "the route has four row forms".to_owned())?,
+            scale_block,
+        })
+    }
 }
 
 impl DenseFormat {
