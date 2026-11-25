@@ -1335,7 +1335,7 @@ pub fn layer_prefix(block: usize, segment: &str) -> &'static str {
 /// The block claims no tensor.
 #[must_use]
 pub fn layer_root(block: usize) -> &'static str {
-    let name = layer_claim_any(block, "attn_norm.weight");
+    let name = layer_claim(block, "attn_norm.weight");
     let at = name
         .match_indices('.')
         .nth(1)
