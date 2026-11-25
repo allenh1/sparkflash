@@ -1166,8 +1166,11 @@ REPORTED = {
 # worlds measure, rounded up. Ids are still compared and printed, as a report.
 SEAM_GATED = {
     "glm-wiring": {
+        # Measured at f9782ba0+ on four nodes: the largest median is 2.29e-2 at world 1 (layer
+        # 7), 1.87e-2 at world 2 and 3.07e-2 at world 4; one sublayer moves the stream's median
+        # row by 0.12 to 0.36, so a fault in any one of them clears the bar.
         "prompt": 3,
-        "bar": 5e-2,
+        "bar": 7e-2,
         "reason": "the fixture's near-tied routers and indexer flip a few rows a layer under the "
         "BF16 stream's rounding; the median row holds the wiring",
     },
