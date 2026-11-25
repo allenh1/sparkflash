@@ -1717,6 +1717,23 @@ impl DeviceLayer<'_> {
                             ("gqa_attended", g.attended.0, n * query * 4),
                         ]);
                     }
+                    if let Some(recurrent) = rows
+                        .recurrent
+                        .as_ref()
+                        .filter(|_| super::rows::recurrent_block(layer).is_ok())
+                    {
+                        let (conv, value) = (
+                            recurrent.geometry.conv_width(),
+                            recurrent.geometry.value_width(),
+                        );
+                        let g = recurrent.rows;
+                        buffers.extend([
+                            ("gdn_raw", g.raw.0, n * conv * 4),
+                            ("gdn_z", g.z.0, n * value * 4),
+                            ("gdn_mixed", g.mixed.0, n * conv * 4),
+                            ("gdn_gated", g.attended.0, n * value * 4),
+                        ]);
+                    }
                     self.rows_dump(dir, &name, &buffers, p0, n)?;
                 }
                 continue;

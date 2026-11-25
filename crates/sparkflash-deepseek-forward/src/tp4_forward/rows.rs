@@ -344,6 +344,8 @@ pub(super) struct RowsState {
     pub(super) head_params: sparkflash_kernels::cuda_driver::HostMapped,
     /// A stack with a grouped-query block: the shared body's kernels and rows (None without one).
     pub(super) grouped: Option<GroupedRows>,
+    /// A stack with a Gated DeltaNet block: the shared body's kernels and rows (None without one).
+    pub(super) recurrent: Option<RecurrentRows>,
 }
 
 /// A grouped-query block's body on the rows path ([sparkflash_ops::roles::GqaLayer]): the shared
@@ -421,6 +423,151 @@ impl GroupedRows {
                 partials: carve(partials)?,
                 attended: carve(rows * query)?,
             },
+        })
+    }
+}
+
+/// A Gated DeltaNet block's body on the rows path ([sparkflash_ops::roles::GdnLayer]): the scan
+/// image's chunk kernels and the scan the rank's plan resolves; the block's geometry, whole (its
+/// projections are whole on every rank, so every rank runs every head and no sum follows); the f32
+/// rows the body works in, as many as the state's rows; and, on the exact rows state (the one
+/// verify passes run on), the slab a verify pass leaves each recurrent region's state after each of
+/// its rows in, one region pair per recurrent block in block order.
+#[derive(Debug, Clone)]
+pub(super) struct RecurrentRows {
+    pub(super) chunk: sparkflash_ops::gdn::GdnChunk,
+    pub(super) scan: (
+        sparkflash_ops::roles::Bound,
+        ((u32, u32, u32), (u32, u32, u32)),
+    ),
+    pub(super) geometry: sparkflash_ops::gdn::GdnGeometry,
+    pub(super) rows: sparkflash_ops::roles::GdnRows,
+    pub(super) snapshots: Option<sparkflash_kernels::checkpoint::VerifySnapshots>,
+}
+
+/// The stack's Gated DeltaNet geometry as the chunk kernels take it, whole, or `None` for a stack
+/// with no recurrent block.
+///
+/// # Errors
+/// Recurrent blocks and no geometry.
+pub(super) fn recurrent_geometry() -> Result<Option<sparkflash_ops::gdn::GdnGeometry>, String> {
+    let values = crate::plan::description().values();
+    if values.gdn_layers.is_empty() {
+        return Ok(None);
+    }
+    let gdn = values
+        .gdn
+        .ok_or("rows Gated DeltaNet: the stack has recurrent blocks and no geometry")?;
+    Ok(Some(sparkflash_ops::gdn::GdnGeometry {
+        key_heads: gdn.key_heads,
+        heads: gdn.value_heads,
+        key_dim: gdn.key_dim,
+        value_dim: gdn.value_dim,
+        taps: gdn.conv,
+    }))
+}
+
+/// Each recurrent block's two regions' bytes in block order, its conv history and then its
+/// delta-rule state: the order a lane lays them out, its checkpoint copies them and a verify pass
+/// snapshots them.
+pub(super) fn recurrent_sizes(geometry: &sparkflash_ops::gdn::GdnGeometry) -> Vec<usize> {
+    let blocks = crate::plan::description().values().gdn_layers.len();
+    (0..blocks)
+        .flat_map(|_| [geometry.conv_bytes(), geometry.state_bytes()])
+        .collect()
+}
+
+/// Block `layer`'s place among the stack's recurrent blocks: its regions' pair in
+/// [recurrent_sizes].
+///
+/// # Errors
+/// A block that is not recurrent.
+pub(super) fn recurrent_block(layer: usize) -> Result<usize, String> {
+    crate::plan::description()
+        .values()
+        .gdn_layers
+        .iter()
+        .position(|&block| block == layer)
+        .ok_or_else(|| format!("rows layer {layer}: the block is not a Gated DeltaNet"))
+}
+
+impl RecurrentRows {
+    /// Loads the scan image's chunk kernels and the scan the installed plan resolves, and carves
+    /// `rows` rows of `geometry` with `alloc`; `verify` also carves the snapshot slab of
+    /// [R_MAX] pass rows.
+    fn open(
+        cuda: &Cuda,
+        geometry: sparkflash_ops::gdn::GdnGeometry,
+        rows: usize,
+        verify: bool,
+        alloc: &mut impl FnMut(usize) -> Result<u64, String>,
+    ) -> Result<Self, String> {
+        use sparkflash_model::Target;
+        use sparkflash_ops::OpPlan;
+        use sparkflash_ops::gdn::{ChunkConv, GatedNorm, GdnChunk};
+        use sparkflash_ops::images::{Image, qwen4_scan_cubin};
+        use sparkflash_ops::plan::Precision;
+        use sparkflash_ops::resolver::{Availability, PlanContext};
+        use sparkflash_ops::roles::{Bound, GdnRows};
+        use sparkflash_ops::scan::{ScanKind, ScanPlan};
+        let what = |error: String| format!("rows Gated DeltaNet: {error}");
+        let plan = ScanPlan::for_rank(
+            PlanContext::new(Target::Sm121, Availability::Embedded),
+            crate::plan::description().plan(),
+            ScanKind::Gdn,
+            R_MAX,
+        )
+        .map_err(|error| what(error.to_string()))?
+        .ok_or_else(|| what("the plan resolves no Gated DeltaNet scan".to_owned()))?;
+        let launch = plan.launch();
+        let scan = |symbol: &'static str| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Scan,
+                qwen4_scan_cubin(),
+                symbol,
+                Precision::Bf16,
+            )
+            .map_err(what)
+        };
+        let chunk = GdnChunk::new(
+            ChunkConv::new(scan("q4p_gdn_conv")?, scan("q4p_gdn_conv_state")?).map_err(what)?,
+            scan("q4p_gdn_prep")?,
+            GatedNorm::new(scan("q4p_gdn_gate")?).map_err(what)?,
+        )
+        .map_err(what)?;
+        let (conv, value, heads) = (
+            geometry.conv_width(),
+            geometry.value_width(),
+            geometry.heads,
+        );
+        let mut carve = |floats: usize| alloc(floats * 4).map(Deviceptr);
+        let body = GdnRows {
+            raw: carve(rows * conv)?,
+            z: carve(rows * value)?,
+            b: carve(rows * heads)?,
+            a: carve(rows * heads)?,
+            mixed: carve(rows * conv)?,
+            qk: carve(geometry.qk_floats(rows))?,
+            decay: carve(rows * 2 * heads)?,
+            attended: carve(rows * value)?,
+        };
+        let snapshots = if verify {
+            let sizes = recurrent_sizes(&geometry);
+            let bytes = sparkflash_kernels::checkpoint::VerifySnapshots::slab_bytes(&sizes, R_MAX);
+            let slab = Deviceptr(alloc(bytes)?);
+            Some(sparkflash_kernels::checkpoint::VerifySnapshots::new(
+                slab, sizes, R_MAX,
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            chunk,
+            scan: (scan(launch.kernel.symbol)?, (launch.grid, launch.block)),
+            geometry,
+            rows: body,
+            snapshots,
         })
     }
 }
@@ -777,6 +924,17 @@ impl RowsState {
             Some(shape) => Some(GroupedRows::open(cuda, shape, d, &mut alloc)?),
             None => None,
         };
+        // A stack with no recurrent block carves nothing here.
+        let recurrent = match recurrent_geometry()? {
+            Some(geometry) => Some(RecurrentRows::open(
+                cuda,
+                geometry,
+                d,
+                r == R_MAX,
+                &mut alloc,
+            )?),
+            None => None,
+        };
         let head_params = cuda.alloc_host_mapped(R_MAX * 8 * 4, &mut 0)?;
         Ok(Self {
             kernels,
@@ -784,6 +942,7 @@ impl RowsState {
             allocations,
             head_params,
             grouped,
+            recurrent,
             q_cols,
             lora_cols,
             kv_cols,
@@ -975,6 +1134,9 @@ pub(super) struct LaneSegment {
     pub(super) rows: usize,
     pub(super) position: usize,
     pub(super) regions: Vec<Deviceptr>,
+    /// Where a verify pass leaves each region's state after each of the segment's rows: none, or
+    /// one slab a region ([sparkflash_ops::roles::SegmentRows::snapshots]).
+    pub(super) snapshots: Vec<Deviceptr>,
 }
 
 impl sparkflash_ops::roles::Launcher for RowsCx<'_> {
@@ -1006,7 +1168,7 @@ impl sparkflash_ops::roles::DeviceCx for RowsCx<'_> {
                 rows: segment.rows,
                 position: segment.position,
                 regions: &segment.regions,
-                snapshots: &[],
+                snapshots: &segment.snapshots,
             })
     }
 
@@ -1368,15 +1530,22 @@ impl DeviceLayer<'_> {
     /// later position may have overwritten a row of the group still open at `next`. A multiple of
     /// every compress ratio leaves no group open.
     pub(super) fn resume_boundary(&self, next: usize) -> usize {
+        let step = self.resume_step();
+        next - next % step
+    }
+
+    /// The resume boundaries' step: the least multiple of every compress ratio. A recurrent
+    /// stack's prefill saves its state at the last multiple before the prompt's end
+    /// ([sparkflash_runtime::tick::save_point]), so the save sits on a point the rows can resume
+    /// from.
+    pub(super) fn resume_step(&self) -> usize {
         fn gcd(a: usize, b: usize) -> usize {
             if b == 0 { a } else { gcd(b, a % b) }
         }
-        let step = self
-            .compress_ratio
+        self.compress_ratio
             .iter()
             .filter(|&&ratio| ratio > 0)
-            .fold(1, |step, &ratio| step / gcd(step, ratio) * ratio);
-        next - next % step
+            .fold(1, |step, &ratio| step / gcd(step, ratio) * ratio)
     }
 
     /// One layer over rows p0..p0+n.
@@ -1445,6 +1614,10 @@ impl DeviceLayer<'_> {
                 }
                 Part::GqaAttention if !attention_pending => {
                     self.run_layer_grouped(rows, layer, p0, n)?;
+                    attention_pending = true;
+                }
+                Part::GdnScan if !attention_pending => {
+                    self.run_layer_gdn(rows, layer, p0, n)?;
                     attention_pending = true;
                 }
                 Part::DenseMlp if attention_pending => {
@@ -1571,6 +1744,7 @@ impl DeviceLayer<'_> {
                     rows: seg.n,
                     position: seg.p0,
                     regions: vec![Deviceptr(keys), Deviceptr(values)],
+                    snapshots: Vec::new(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -1633,6 +1807,152 @@ impl DeviceLayer<'_> {
             span(b.reduced, n * dim * 2),
             n,
         )
+    }
+
+    /// A Gated DeltaNet block: the previous layer's post and the entry seam
+    /// ([Self::run_layer_attn_seam]), the shared recurrent body ([sparkflash_ops::roles::GdnLayer])
+    /// over the seam's f32 rows with its five projections on the dense format route and each
+    /// sequence's conv history and state in its lane, then the block's BF16 rows as the attention's
+    /// sum: the projections are whole on every rank, so every rank runs every head and one rank's
+    /// rows are the sum (world 1 takes the base's reduce, which copies them; a wider group copies
+    /// them itself). A verify pass (`keep_recurrent`) leaves each region's state after
+    /// each row in the snapshot slab, for the kept row's commit ([Self::commit_recurrent]). A
+    /// split chunk is refused: the body projects whole rows.
+    fn run_layer_gdn(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::dense_format::{DenseIo, DenseMatrix, RowForm};
+        if self.sp_rows(rows, n).is_some() {
+            return Err(format!(
+                "rows layer {layer}: a split chunk reached a Gated DeltaNet block; the body projects whole rows (enable_prefill_sp)"
+            ));
+        }
+        let recurrent = rows.recurrent.as_ref().ok_or_else(|| {
+            format!("rows layer {layer}: the rows state carved no Gated DeltaNet rows")
+        })?;
+        let route = self.layer_dense(layer).recurrent.ok_or_else(|| {
+            format!(
+                "rows layer {layer}: the Gated DeltaNet block has no dense format route (attach_dense_format)"
+            )
+        })?;
+        let block = recurrent_block(layer)?;
+        let snapshots = match (self.keep_recurrent, recurrent.snapshots.as_ref()) {
+            (false, _) => None,
+            (true, Some(snapshots)) => Some(snapshots),
+            (true, None) => {
+                return Err(format!(
+                    "rows layer {layer}: a verify pass ran on a rows state with no snapshot slab"
+                ));
+            }
+        };
+        let lanes = self.lanes.as_ref().ok_or_else(|| {
+            format!(
+                "rows layer {layer}: a Gated DeltaNet block keeps its state in the lanes, and none are attached"
+            )
+        })?;
+        let segments = self
+            .step_segs(p0, n)
+            .iter()
+            .map(|seg| {
+                let lane = if seg.lane == super::lanes::NO_LANE {
+                    lanes.selected
+                } else {
+                    seg.lane
+                };
+                let (history, state) = lanes
+                    .pointers(lane)
+                    .recurrent
+                    .get(layer)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        format!("rows layer {layer}: lane {lane} holds no Gated DeltaNet state")
+                    })?;
+                let snapshots = match snapshots {
+                    Some(slab) => vec![
+                        slab.slot(2 * block, seg.row0)
+                            .map_err(|error| format!("rows layer {layer}: {error}"))?,
+                        slab.slot(2 * block + 1, seg.row0)
+                            .map_err(|error| format!("rows layer {layer}: {error}"))?,
+                    ],
+                    None => Vec::new(),
+                };
+                Ok(LaneSegment {
+                    first: seg.row0,
+                    rows: seg.n,
+                    position: seg.p0,
+                    regions: vec![Deviceptr(history), Deviceptr(state)],
+                    snapshots,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let bind = self
+            .attention
+            .ok_or_else(|| format!("rows layer {layer}: no attention bind"))?;
+        let lookup = |tail: &str| -> Result<(Deviceptr, Deviceptr), String> {
+            let name = crate::plan::layer_claim(layer, tail);
+            bind.pointers
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("rows layer {layer}: the bind has no {name}"))
+        };
+        let dim = self.dim;
+        let geometry = recurrent.geometry;
+        let (conv, value, heads) = (
+            geometry.conv_width(),
+            geometry.value_width(),
+            geometry.heads,
+        );
+        let linear = |tail: &str, (cols, inner): (usize, usize), output: RowForm| {
+            lookup(tail).map(|(weight, scales)| RouteLinear {
+                route,
+                matrix: DenseMatrix {
+                    weight: weight.0,
+                    scales: scales.0,
+                    cols,
+                    inner,
+                },
+                io: DenseIo::new(RowForm::F32, output),
+            })
+        };
+        let qkv = linear("attn.in_proj_qkv.weight", (conv, dim), RowForm::F32)?;
+        let z = linear("attn.in_proj_z.weight", (value, dim), RowForm::F32)?;
+        let beta = linear("attn.in_proj_b.weight", (heads, dim), RowForm::F32)?;
+        let decay = linear("attn.in_proj_a.weight", (heads, dim), RowForm::F32)?;
+        let out = linear("attn.out_proj.weight", (dim, value), RowForm::Bf16)?;
+        let vector = |tail: &str| lookup(tail).map(|(weight, _)| weight);
+        let body = sparkflash_ops::roles::GdnLayer {
+            qkv: &qkv,
+            z: &z,
+            b: &beta,
+            a: &decay,
+            out: &out,
+            conv: vector("attn.conv1d.weight")?,
+            decay: (vector("attn.A_log")?, vector("attn.dt_bias")?),
+            norm: vector("attn.norm.weight")?,
+        };
+        self.run_layer_attn_seam(rows, layer, p0, n)?;
+        let b = rows.b;
+        body.run(
+            &RowsCx::new(self.cuda, n, None).with_segments(&segments),
+            (&recurrent.chunk, recurrent.scan),
+            &geometry,
+            &recurrent.rows,
+            (Deviceptr(b.normed), Deviceptr(b.attn_out)),
+            (crate::plan::description().values().norm_eps as f32, false),
+        )
+        .map_err(|error| format!("rows layer {layer}: {error}"))?;
+        let (input, output) = (span(b.attn_out, n * dim * 2), span(b.reduced, n * dim * 2));
+        if self.routed_geometry.world == 1 {
+            self.reduce_layer_rows(rows, "all_reduce", input, output, n)
+        } else {
+            self.cuda
+                .copy_dtod_async(&Deviceptr(b.reduced), &Deviceptr(b.attn_out), n * dim * 2)
+        }
     }
 
     /// A dense-FFN block's MLP: the attention's post and the FFN seam (the fused block's

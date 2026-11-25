@@ -32,6 +32,7 @@
 //! sequence holds its compressed stores and index keys plus a few chunks of each window ring.
 
 use super::*;
+use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::lane_memory::{ChunkPool, LaneShape, LaneSpan, Layout};
 
 /// The physical memory every lane's chunks may hold together (SPARKFLASH_LANE_MEMORY_MB overrides
@@ -68,6 +69,11 @@ struct Offsets {
     /// Per layer, a grouped-query block's BF16 (keys, values) cache, position-addressed; `None`
     /// at every other block.
     grouped: Vec<Option<(usize, usize)>>,
+    /// Per layer, a Gated DeltaNet block's (conv history, state), each touched whole; `None` at
+    /// every other block.
+    recurrent: Vec<Option<(usize, usize)>>,
+    /// The recurrent regions' checkpoint arena, when the stack has recurrent blocks.
+    checkpoint: Option<usize>,
 }
 
 /// One lane's device pointers, as the DeviceLayer fields hold them.
@@ -81,6 +87,7 @@ pub(super) struct LanePointers {
     pub(super) index_keys: u64,
     pub(super) draft: Vec<(u64, u64)>,
     pub(super) grouped: Vec<Option<(u64, u64)>>,
+    pub(super) recurrent: Vec<Option<(u64, u64)>>,
 }
 
 /// The host counters of a lane's device state, swapped in and out with its pointers.
@@ -126,6 +133,11 @@ pub(super) struct Lanes<'a> {
     pub(super) host: Vec<LaneHost>,
     /// The lane whose pointers and counters the DeviceLayer holds.
     pub(super) selected: usize,
+    /// Per lane, its recurrent regions' rewind point in the lane's checkpoint arena; empty when
+    /// the stack has no recurrent block.
+    checkpoints: Vec<Checkpoint>,
+    /// The recurrent regions' bytes, in the checkpoint's order.
+    recurrent_sizes: Vec<usize>,
 }
 
 impl Lanes<'_> {
@@ -155,7 +167,28 @@ impl Lanes<'_> {
                 .iter()
                 .map(|part| part.map(|(keys, values)| (at(keys), at(values))))
                 .collect(),
+            recurrent: o
+                .recurrent
+                .iter()
+                .map(|part| part.map(|(history, state)| (at(history), at(state))))
+                .collect(),
         }
+    }
+
+    /// Lane `lane`'s recurrent regions in the checkpoint's order: each recurrent block's conv
+    /// history and state, in block order ([super::rows::recurrent_sizes]).
+    fn recurrent_live(&self, lane: usize) -> Vec<Deviceptr> {
+        self.pointers(lane)
+            .recurrent
+            .into_iter()
+            .flatten()
+            .flat_map(|(history, state)| [Deviceptr(history), Deviceptr(state)])
+            .collect()
+    }
+
+    /// Lane `lane`'s checkpoint, when the stack has recurrent blocks.
+    fn checkpoint(&self, lane: usize) -> Option<&Checkpoint> {
+        self.checkpoints.get(lane)
     }
 
     /// The rows lane `lane` has backed.
@@ -243,6 +276,9 @@ impl Lanes<'_> {
     /// A driver failure unmapping a chunk.
     pub(super) fn release(&mut self, lane: usize) -> Result<(), String> {
         self.spans[lane].release(self.cuda, &self.shape, &mut self.pool)?;
+        if let Some(checkpoint) = self.checkpoints.get_mut(lane) {
+            checkpoint.forget();
+        }
         if let Some(host) = self.host.get_mut(lane) {
             host.positions_begun = 0;
             host.appended_rows.iter_mut().for_each(|count| *count = 0);
@@ -352,6 +388,29 @@ impl<'a> DeviceLayer<'a> {
                 ));
             }
         }
+        // A Gated DeltaNet block's conv history and state, each a sequence's whole, then one
+        // checkpoint arena for them all: nothing at all for a stack with no recurrent block.
+        let mut recurrent = vec![None; layers];
+        let mut checkpoint = None;
+        let mut recurrent_sizes = Vec::new();
+        if let Some(geometry) = super::rows::recurrent_geometry()? {
+            recurrent_sizes = super::rows::recurrent_sizes(&geometry);
+            for (block, &layer) in crate::plan::description()
+                .values()
+                .gdn_layers
+                .iter()
+                .enumerate()
+            {
+                let slot = recurrent.get_mut(layer).ok_or_else(|| {
+                    format!("lanes: Gated DeltaNet block {layer} of {layers} layers")
+                })?;
+                *slot = Some((
+                    layout.state(recurrent_sizes[2 * block]),
+                    layout.state(recurrent_sizes[2 * block + 1]),
+                ));
+            }
+            checkpoint = Some(layout.state(Checkpoint::arena_bytes(&recurrent_sizes)));
+        }
         let shape = layout.finish(granularity, ROW_QUANTUM);
         let stride = shape.stride;
         let offsets = Offsets {
@@ -363,6 +422,8 @@ impl<'a> DeviceLayer<'a> {
             index_keys,
             draft,
             grouped,
+            recurrent,
+            checkpoint,
         };
 
         // The single sequence's state goes before the lanes take memory.
@@ -414,6 +475,17 @@ impl<'a> DeviceLayer<'a> {
                 count
             ],
             selected: usize::MAX,
+            checkpoints: checkpoint.map_or_else(Vec::new, |offset| {
+                (0..count)
+                    .map(|lane| {
+                        Checkpoint::new(
+                            Deviceptr(base + (lane * stride + offset) as u64),
+                            recurrent_sizes.clone(),
+                        )
+                    })
+                    .collect()
+            }),
+            recurrent_sizes,
         };
         eprintln!(
             "lanes: {count} lanes of {} MiB virtual each, {} MiB physical budget, {} KiB chunks",
@@ -685,5 +757,131 @@ impl<'a> DeviceLayer<'a> {
             host.appended_rows = counts;
         }
         Ok(true)
+    }
+    /// Whether the lanes hold recurrent state: the stack has a Gated DeltaNet block.
+    pub(super) fn has_recurrent(&self) -> bool {
+        self.lanes
+            .as_ref()
+            .is_some_and(|lanes| !lanes.checkpoints.is_empty())
+    }
+
+    /// The position lane `lane`'s recurrent checkpoint holds, when it holds one.
+    pub(super) fn recurrent_point(&self, lane: usize) -> Option<usize> {
+        self.lanes
+            .as_ref()
+            .and_then(|lanes| lanes.checkpoint(lane))
+            .and_then(Checkpoint::point)
+    }
+
+    /// Puts lane `lane`'s recurrent state at `start`, the position its rows resume from
+    /// ([sparkflash_runtime::tick::recurrent_start]): zero at 0 (the checkpoint forgets its
+    /// point, a prompt from the start saves its own), else the checkpoint's copy, which must hold
+    /// `start`. Nothing for a stack with no recurrent block. The lane must be backed.
+    ///
+    /// # Errors
+    /// A start that is neither 0 nor the checkpoint's point, or a driver failure.
+    pub(super) fn recurrent_resume(&mut self, lane: usize, start: usize) -> Result<(), String> {
+        let cuda = self.cuda;
+        let Some(lanes) = self
+            .lanes
+            .as_mut()
+            .filter(|lanes| !lanes.checkpoints.is_empty())
+        else {
+            return Ok(());
+        };
+        let live = lanes.recurrent_live(lane);
+        let checkpoint = lanes
+            .checkpoints
+            .get_mut(lane)
+            .ok_or_else(|| format!("lanes: no checkpoint for lane {lane}"))?;
+        if start == 0 {
+            checkpoint.forget();
+            for (region, &bytes) in live.iter().zip(&lanes.recurrent_sizes) {
+                cuda.memset_d8_async(*region, 0, bytes)?;
+            }
+            return Ok(());
+        }
+        checkpoint
+            .restore(cuda, None, &live, start)
+            .map_err(|error| format!("lanes: lane {lane} resumes at {start}: {error}"))
+    }
+
+    /// Saves lane `lane`'s recurrent state as the state after `point` positions: the prefill's
+    /// save at its resume boundary below the prompt's end. Nothing for a stack with no recurrent
+    /// block.
+    ///
+    /// # Errors
+    /// A driver failure.
+    pub(super) fn recurrent_save(&mut self, lane: usize, point: usize) -> Result<(), String> {
+        let cuda = self.cuda;
+        let Some(lanes) = self
+            .lanes
+            .as_mut()
+            .filter(|lanes| !lanes.checkpoints.is_empty())
+        else {
+            return Ok(());
+        };
+        let live = lanes.recurrent_live(lane);
+        lanes
+            .checkpoints
+            .get_mut(lane)
+            .ok_or_else(|| format!("lanes: no checkpoint for lane {lane}"))?
+            .save(cuda, None, &live, point)
+            .map_err(|error| format!("lanes: lane {lane} saves at {point}: {error}"))
+    }
+
+    /// Gives lane `dst` lane `src`'s recurrent state at `point`, the point `src`'s checkpoint
+    /// holds and the adopted prefix's length: `dst`'s live regions and its checkpoint, so it
+    /// resumes there and may resume there again. Nothing for a stack with no recurrent block.
+    ///
+    /// # Errors
+    /// A point `src` does not hold, or a driver failure.
+    pub(super) fn recurrent_adopt(
+        &mut self,
+        dst: usize,
+        src: usize,
+        point: usize,
+    ) -> Result<(), String> {
+        let cuda = self.cuda;
+        let Some(lanes) = self
+            .lanes
+            .as_mut()
+            .filter(|lanes| !lanes.checkpoints.is_empty())
+        else {
+            return Ok(());
+        };
+        let live = lanes.recurrent_live(dst);
+        lanes
+            .checkpoint(src)
+            .ok_or_else(|| format!("lanes: no checkpoint for lane {src}"))?
+            .restore(cuda, None, &live, point)
+            .map_err(|error| format!("lanes: lane {dst} adopts lane {src} at {point}: {error}"))?;
+        self.recurrent_save(dst, point)
+    }
+
+    /// Commits pass row `row`'s recurrent snapshots into lane `lane`'s live regions: the state
+    /// after the last row a verify kept. Nothing for a stack with no recurrent block.
+    ///
+    /// # Errors
+    /// A rows state without a snapshot slab, or a driver failure.
+    pub(super) fn commit_recurrent(
+        &self,
+        rows: &super::rows::RowsState,
+        lane: usize,
+        row: usize,
+    ) -> Result<(), String> {
+        let Some(lanes) = self
+            .lanes
+            .as_ref()
+            .filter(|lanes| !lanes.checkpoints.is_empty())
+        else {
+            return Ok(());
+        };
+        rows.recurrent
+            .as_ref()
+            .and_then(|recurrent| recurrent.snapshots.as_ref())
+            .ok_or("lanes: a verify kept fewer rows than it ran over a rows state with no snapshot slab")?
+            .commit(self.cuda, None, row, &lanes.recurrent_live(lane))
+            .map_err(|error| format!("lanes: lane {lane} commits row {row}: {error}"))
     }
 }
