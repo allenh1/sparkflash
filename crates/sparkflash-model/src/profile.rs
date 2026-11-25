@@ -98,6 +98,9 @@ pub struct RuntimeProfile {
     pub arena_hostmapped: Option<bool>,
     /// Verify every weight after loading.
     pub verify_weights: Option<bool>,
+    /// Serve a checkpoint whose family has a typed pack on the base forward from its description
+    /// instead (docs/engine/08-glm-on-the-base.md, S1).
+    pub on_base: Option<bool>,
     /// Directory holding converted rank files.
     pub converted_dir: Option<String>,
     /// Harness multi-row verify width.
@@ -636,6 +639,7 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_ARENA_MMAP", "runtime.arena_mmap"),
     ("SPARKFLASH_ARENA_HOSTMAPPED", "runtime.arena_hostmapped"),
     ("SPARKFLASH_VERIFY_WEIGHTS", "runtime.verify_weights"),
+    ("SPARKFLASH_ON_BASE", "runtime.on_base"),
     ("SPARKFLASH_CONVERTED_DIR", "runtime.converted_dir"),
     ("SPARKFLASH_ROWS", "runtime.rows"),
     ("SPARKFLASH_ROWS_FROM", "runtime.rows_from"),
@@ -1003,6 +1007,7 @@ const BOOL_FIELDS: &[(&str, BoolField)] = &[
         &mut p.runtime.arena_hostmapped
     }),
     ("runtime.verify_weights", |p| &mut p.runtime.verify_weights),
+    ("runtime.on_base", |p| &mut p.runtime.on_base),
     ("drafter.head_tiled", |p| &mut p.drafter.head_tiled),
     ("drafter.markov_mma", |p| &mut p.drafter.markov_mma),
     ("drafter.moe_dedup", |p| &mut p.drafter.moe_dedup),

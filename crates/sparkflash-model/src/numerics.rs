@@ -59,6 +59,7 @@ pub const ARCH_HOST: &str = "host";
 /// reference proves it - and it is not the proof that nothing else matters; the captured
 /// fingerprint is.
 pub const ARITHMETIC_FIELDS: &[&str] = &[
+    "runtime.on_base",
     "prefill.enabled",
     "prefill.chunk",
     "prefill.drafting_prompt",

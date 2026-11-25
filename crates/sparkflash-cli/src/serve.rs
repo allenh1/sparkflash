@@ -837,7 +837,9 @@ impl ServeOptions {
                 // server launches no kernel, so the loadable-image check belongs to the boot
                 // plan check (`check_checkpoint_plan`) and not to detection: a DeepSeek
                 // checkpoint with no SPARKFLASH_CUBINS still serves on the host.
-                if pack.is_reference() {
+                if pack.is_reference()
+                    || sparkflash_model::active_profile().runtime.on_base == Some(true)
+                {
                     // Keep `cli.model` unset so `run` takes the V4.1 reference/TP4 path.
                 } else {
                     let missing = pack::Pack::missing_parts(&directory);

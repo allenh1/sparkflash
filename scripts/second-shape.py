@@ -847,6 +847,9 @@ def env_for_world(
         # The certified head screen is built for the released 5,120-value rows (160 blocks of
         # 32); this shape serves its full 4,096-value rows (128 blocks) through that head.
         "SPARKFLASH_HEAD_SCREEN": "0",
+        # Every variant is the base's: a family that still has its own typed pack (GLM's) is
+        # served by the base from its description, which is what the variant proves.
+        "SPARKFLASH_ON_BASE": "1",
         # The second shape's cubins are built from the instance list, not pinned in the
         # released baseline; the open manifest records their hashes.
         "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",

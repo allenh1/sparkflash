@@ -260,11 +260,13 @@ rank_env() {
     # SPARKFLASH_NUMERICS_* are diagnostics too (the coverage and monitor dumps): a rank that
     # wrote its dump while its peers did not is a suite with missing inputs, and leaving them out
     # made a GLM coverage sweep produce no file at all (the recorders are constructed per rank).
+    # SPARKFLASH_ON_BASE (a family with a typed pack served on the base) picks the arm, so every
+    # rank must take the same one.
     # SPARKFLASH_UNPINNED_SECOND_SHAPE is the one escape a synthetic second-shape run needs: its
     # cubins are compiled for the fixture's shapes and staged under the released names, so they are
     # not the bytes the baseline pins. It must reach every rank (a rank that refused the staged
     # cubin while its peers loaded it is the same split as a rank that stood down).
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|DENSE|SPEC|DRAFT|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE|GROUP_TRACE|LAUNCH_TRACE|OPEN_MANIFEST|SETUP_TRACE|NUMERICS|UNPINNED_SECOND_SHAPE)' || true); do
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|DENSE|SPEC|DRAFT|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT|TICK_TRACE|GROUP_TRACE|LAUNCH_TRACE|OPEN_MANIFEST|SETUP_TRACE|NUMERICS|UNPINNED_SECOND_SHAPE|ON_BASE)' || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0
