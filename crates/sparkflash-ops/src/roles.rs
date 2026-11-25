@@ -1477,6 +1477,92 @@ impl GqaAttention {
     }
 }
 
+/// A grouped-query attention layer's four projections in the arm's own format and its q/k
+/// RMSNorm gains (each where the layer has them): the query, key and value projections of the
+/// normed rows, [GqaAttention]'s heads over every row, then a segment at a time the rotary, the
+/// cache append and the attention over the segment's `[keys, values]` regions, and the output
+/// projection of the attended heads.
+///
+/// The dense arm's grouped-query layers and DeepSeek's grouped-query blocks on its dense format
+/// route run this one body: each host brings its projection dispatch ([DeviceCx::project]) and
+/// its segments' cache regions ([DeviceCx::segments]).
+#[derive(Debug, Clone, Copy)]
+pub struct GqaLayer<'a, L: ?Sized> {
+    /// The query projection (the interleaved query-and-gate one on a gated layer).
+    pub q: &'a L,
+    /// The key projection.
+    pub k: &'a L,
+    /// The value projection.
+    pub v: &'a L,
+    /// The output projection.
+    pub o: &'a L,
+    /// The query heads' and the key heads' RMSNorm gains.
+    pub norms: (Option<Deviceptr>, Option<Deviceptr>),
+}
+
+impl<L: ?Sized> GqaLayer<'_, L> {
+    /// The layer over the pass's rows on `cx`: `input`'s normed rows into `output`'s projected
+    /// ones, through `rows`' scratch, the norms at `eps` (zero-centred when `zero_centred`).
+    ///
+    /// # Errors
+    /// A segment whose regions are not one key and one value cache, a projection the arm does not
+    /// run, or the driver's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run<C: DeviceCx<Linear = L>>(
+        &self,
+        cx: &C,
+        (attention, norm): (&GqaAttention, &Norm),
+        shape: GqaShape,
+        rows: &GqaRows,
+        (input, output): (Deviceptr, Deviceptr),
+        (eps, zero_centred): (f32, bool),
+    ) -> Result<(), BackendError> {
+        let count = cx.rows();
+        let projected = if shape.gated {
+            rows.interleaved
+        } else {
+            rows.query
+        };
+        cx.project(self.q, input, projected, count)?;
+        cx.project(self.k, input, rows.key, count)?;
+        cx.project(self.v, input, rows.value, count)?;
+        attention.heads(
+            cx,
+            norm,
+            shape,
+            rows,
+            self.norms,
+            (eps, zero_centred),
+            count,
+        )?;
+        for segment in cx.segments() {
+            let &[keys, values] = segment.regions else {
+                return Err(BackendError::new(
+                    ROLE,
+                    format!(
+                        "a grouped-query segment holds {} cache regions, not a key and a value one",
+                        segment.regions.len()
+                    ),
+                ));
+            };
+            let span = (segment.first, segment.rows);
+            attention.append(cx, shape, rows, (keys, values), segment.position, span)?;
+            // The partials are one segment's: the combine reads them before the next segment's
+            // attention writes them, both on the one stream.
+            attention.attend(
+                cx,
+                shape,
+                rows,
+                (keys, values),
+                segment.position,
+                span,
+                || Ok(()),
+            )?;
+        }
+        cx.project(self.o, rows.attended, output, count)
+    }
+}
+
 /// How a branch's rows reach the streams when the mix leaves the branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SumPath {

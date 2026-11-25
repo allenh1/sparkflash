@@ -100,9 +100,8 @@ use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
 use sparkflash_ops::roles::{
-    Bound, Combine, ExpertRows, ExpertShape, GatedMlp, GqaAttention, GqaRows, GqaShape, Injection,
-    Launcher, ManifoldMixer, MlpRows, Norm, Router, RouterRows, RouterRule, SplitSwiGlu,
-    TokenExperts,
+    Bound, Combine, ExpertRows, ExpertShape, GatedMlp, GqaAttention, GqaShape, Injection, Launcher,
+    ManifoldMixer, MlpRows, Norm, Router, RouterRows, RouterRule, SplitSwiGlu, TokenExperts,
 };
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
@@ -2540,85 +2539,6 @@ impl Shared {
                 self.call(self.kernels.sum_slots, call)
             }),
         }
-    }
-
-    /// A grouped-query attention layer over the normed rows in `b.normed`, into `b.attended`: the
-    /// row-wise projections and norms over every row, the rotary, cache appends and attention a
-    /// segment at a time.
-    fn attend(&self, part: &Gqa, cx: &PassCx<'_>) -> Result<(), BackendError> {
-        let &PassCx {
-            b,
-            segments,
-            rows,
-            policy,
-            index,
-            slot,
-            ..
-        } = cx;
-        let Gqa {
-            q,
-            k,
-            v,
-            q_norm,
-            k_norm,
-            ..
-        } = part;
-        let gqa = &self.kernels.gqa;
-        let shape = part.shape.gqa();
-        let projected_query = if shape.gated { b.interleaved } else { b.query };
-        self.project(q, b, b.normed.0, projected_query.0, rows, policy)?;
-        self.project(k, b, b.normed.0, b.key.0, rows, policy)?;
-        self.project(v, b, b.normed.0, b.value.0, rows, policy)?;
-        let heads = GqaRows {
-            interleaved: b.interleaved,
-            query: b.query,
-            gate: b.gate,
-            key: b.key,
-            value: b.value,
-            partials: b.partials,
-            attended: b.attended,
-        };
-        gqa.heads(
-            self,
-            &self.kernels.norm,
-            shape,
-            &heads,
-            (*q_norm, *k_norm),
-            (self.eps, self.zero_centred),
-            rows,
-        )?;
-        let mut first = 0usize;
-        for (sequence, tokens) in segments.iter() {
-            let count = tokens.len();
-            let position = sequence.position();
-            let &[keys, values] = sequence.lane.regions[slot].as_slice() else {
-                return Err(BackendError::new(
-                    DEVICE,
-                    format!("layer {index}'s lane part holds no key/value cache"),
-                ));
-            };
-            gqa.append(
-                self,
-                shape,
-                &heads,
-                (keys, values),
-                position,
-                (first, count),
-            )?;
-            // The partials are one segment's: the combine reads them before the next segment's
-            // attention writes them, both on the one stream.
-            gqa.attend(
-                self,
-                shape,
-                &heads,
-                (keys, values),
-                position,
-                (first, count),
-                || Ok(()),
-            )?;
-            first += count;
-        }
-        Ok(())
     }
 
     /// A Gated DeltaNet layer over the normed rows in `b.normed`, into `b.attended`: the

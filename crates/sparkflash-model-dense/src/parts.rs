@@ -36,7 +36,7 @@ use sparkflash_ops::moe::Launch;
 use sparkflash_ops::naming::{LayerNames, TensorNames};
 use sparkflash_ops::projection::WidePolicy;
 pub use sparkflash_ops::roles::SegmentRows;
-use sparkflash_ops::roles::{DeviceCx, Launcher};
+use sparkflash_ops::roles::{DeviceCx, GqaLayer, GqaRows, Launcher};
 use sparkflash_ops::widen::LedgerRow;
 use sparkflash_runtime::{PartExec, PartHost, PartRegistry, RankSplit, Region};
 use sparkflash_weights::WeightSource;
@@ -477,14 +477,29 @@ impl PartExec<Dense> for Gqa {
 
     fn rows(&self, pass: &mut PassCx<'_>) -> Result<(), BackendError> {
         let (shared, b) = (pass.shared, pass.b);
-        shared.attend(self, pass)?;
-        shared.project(
-            &self.o,
-            b,
-            b.attended.0,
-            b.projected.0,
-            pass.rows,
-            pass.policy,
+        let layer = GqaLayer {
+            q: &self.q,
+            k: &self.k,
+            v: &self.v,
+            o: &self.o,
+            norms: (self.q_norm, self.k_norm),
+        };
+        let rows = GqaRows {
+            interleaved: b.interleaved,
+            query: b.query,
+            gate: b.gate,
+            key: b.key,
+            value: b.value,
+            partials: b.partials,
+            attended: b.attended,
+        };
+        layer.run(
+            &*pass,
+            (&shared.kernels.gqa, &shared.kernels.norm),
+            self.shape.gqa(),
+            &rows,
+            (b.normed, b.projected),
+            (shared.eps, shared.zero_centred),
         )
     }
 
