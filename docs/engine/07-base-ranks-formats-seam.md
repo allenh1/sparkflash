@@ -1280,6 +1280,30 @@ stack.
 * Left for later: a frame that carries the pending result across a foreign boundary, so mixed
   stacks keep the fusion. It is a speed step for the models that move, and is measured then.
 
+**Where S stands (2026-11-24).**
+
+* **S1** (`7d7731e9`). The rows path runs each block by the steps the plan chose for it at open.
+  The released stack's blocks all get the four fused halves, unchanged. `dense-mlp`, a dense-FFN
+  prefix, runs its parts one at a time and passes on exact ids at world 1 (the F sweep above).
+* **S2** (`8f4ffe15` .. `8c596c1f`). `gqa-dense` makes the first block a grouped-query attention
+  over a dense MLP inside the MLA stack. It touches the layout, the writer and the geometry
+  (rotary, theta), and adds a host reference that shares the host rope and attend
+  (`sparkflash-weights` `gqa.rs`). The dense arm and the base now share one layer body,
+  `ops::roles::GqaLayer`. The dense arm moved onto it with unchanged bits: its tests pass with
+  `--include-ignored`, and its TP 1/2/4 bit records are equal. The base runs the block on the
+  rows path. It shards wq/wk/wv by rows and wo by its inner axis, and gives the block lane K/V
+  regions and scratch. The K/V cache and the output are BF16 on both sides.
+  * **Refused by name:** key/value heads that the world does not divide. The token stage loop
+    also refuses a grouped-query block.
+  * **Exact ids are not reachable.** The device GQA kernel uses the fast-math `__expf`, which
+    the host cannot reproduce. Layer 0's stream differs by 3.5e-4. The MLA layers after it
+    amplify that difference about 30x (layer 7's stream is 1.5e-2), as section 3 measured for
+    this fixture. Prompt 1 position 1 is a three-way tie within 0.004 nats, and the device takes
+    the third choice.
+  * **Under the tie band.** The owner approved the band for foreign-part variants on 2026-11-24.
+    `gqa-dense` runs under it (bands and ties below, with S3).
+  * **Not yet run:** a grouped-query block at world 2 or 4.
+
 ## 5. Order
 
 1. The close of milestone 2 lands first: everything here is tested on its synthetic checkpoint.
