@@ -9594,130 +9594,94 @@ top_k = 4
 source = "dense_format_sm121.cu"
 entry = "dense_format_f32a_f32o_fp8_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "fp8"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_f32a_f32o_fp8_bf16_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "fp8-bf16"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_f32a_f32o_bf16_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "bf16"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_f32a_bf16o_fp8_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "fp8"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_f32a_bf16o_fp8_bf16_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "fp8-bf16"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_f32a_bf16o_bf16_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "bf16"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_bf16a_f32o_fp8_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "fp8"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_bf16a_f32o_fp8_bf16_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "fp8-bf16"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_bf16a_f32o_bf16_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "bf16"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_bf16a_bf16o_fp8_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "fp8"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_bf16a_bf16o_fp8_bf16_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "fp8-bf16"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
 
 [[instance]]
 source = "dense_format_sm121.cu"
 entry = "dense_format_bf16a_bf16o_bf16_sm121"
 cubin = "dense_format_sm121_s2"
-family = "rows"
+family = "seams"
 format = "bf16"
 hidden = 4096
-intermediate = 128
-experts = 64
-top_k = 4
