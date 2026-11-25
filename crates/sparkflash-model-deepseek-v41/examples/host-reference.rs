@@ -25,6 +25,10 @@
 //! `--ids-compressed` is the opt-out: the prompts' ids are hashed as already compressed, which is
 //! only right for synthetic ids.
 //!
+//! `--tops FILE` also writes, beside the ids, each step's `TOPS` most likely ids as
+//! `[id, logprob]` pairs in descending order (a JSON list a prompt of lists a position), the
+//! sidecar a near-tie comparison reads the reference's own alternatives from.
+//!
 //! A fourth argument, `DUMP_DIR`, also writes the first prompt's prefill boundary table there:
 //! one little-endian f32 file a layer and tensor (`L<layer>-<name>.f32`) and `shapes.json`
 //! naming each file's shape, for a layer-by-layer comparison with a device arm's dump.
@@ -39,17 +43,22 @@ use sparkflash_model_deepseek_v41::forward::{InferenceEngine, SequenceState};
 const TENSOR_LIMIT: usize = 512 * 1024 * 1024;
 
 const USAGE: &str = "usage: host-reference CHECKPOINT PROMPTS.json MAX_TOKENS [DUMP_DIR] \
-                     [--tokenizer FILE | --ids-compressed]";
+                     [--tokenizer FILE | --ids-compressed] [--tops FILE]";
+
+/// How many alternatives `--tops` records a position, as many as the served comparison asks for.
+const TOPS: usize = 8;
 
 fn main() -> Result<(), String> {
     let mut positional = Vec::new();
     let mut tokenizer = None;
     let mut ids_compressed = false;
+    let mut tops_file = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--tokenizer" => tokenizer = Some(args.next().ok_or(USAGE)?),
             "--ids-compressed" => ids_compressed = true,
+            "--tops" => tops_file = Some(args.next().ok_or(USAGE)?),
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}; {USAGE}")),
             _ => positional.push(arg),
         }
@@ -105,6 +114,7 @@ fn main() -> Result<(), String> {
     }
     let eos = 1u32;
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(prompts.len());
+    let mut tops: Vec<Vec<Vec<(u32, f64)>>> = Vec::with_capacity(prompts.len());
     for prompt in &prompts {
         if prompt.is_empty() {
             return Err("a prompt has no tokens".to_string());
@@ -114,9 +124,13 @@ fn main() -> Result<(), String> {
             .prefill(&mut state, prompt)
             .map_err(|error| format!("prefill: {error}"))?;
         let mut tokens = Vec::with_capacity(max_tokens);
+        let mut alternatives = Vec::with_capacity(max_tokens);
         while tokens.len() < max_tokens {
             let Some(token) = step.next_token else { break };
             tokens.push(token);
+            if tops_file.is_some() {
+                alternatives.push(top_logprobs(&step.logits, token)?);
+            }
             if token == eos {
                 break;
             }
@@ -125,12 +139,42 @@ fn main() -> Result<(), String> {
                 .map_err(|error| format!("decode: {error}"))?;
         }
         out.push(tokens);
+        tops.push(alternatives);
+    }
+    if let Some(path) = tops_file {
+        let text = serde_json::to_string(&tops).map_err(|error| format!("tops: {error}"))?;
+        std::fs::write(&path, text + "\n").map_err(|error| format!("{path}: {error}"))?;
     }
     println!(
         "{}",
         serde_json::to_string(&out).map_err(|error| format!("serialise: {error}"))?
     );
     Ok(())
+}
+
+/// The `TOPS` largest log-probabilities of `logits`, descending, as `(id, logprob)`; the chosen
+/// `token` must lead them, so a reference whose choice is not its own argmax is refused.
+fn top_logprobs(logits: &[f32], token: u32) -> Result<Vec<(u32, f64)>, String> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let norm = logits
+        .iter()
+        .map(|value| (*value as f64 - max).exp())
+        .sum::<f64>()
+        .ln();
+    let mut order: Vec<u32> = (0..logits.len() as u32).collect();
+    order.sort_by(|a, b| logits[*b as usize].total_cmp(&logits[*a as usize]).then(a.cmp(b)));
+    let top: Vec<(u32, f64)> = order
+        .into_iter()
+        .take(TOPS)
+        .map(|id| (id, logits[id as usize] as f64 - max - norm))
+        .collect();
+    if top.first().map(|entry| entry.0) != Some(token) {
+        return Err(format!(
+            "the reference chose {token}, which does not lead its own logits ({:?})",
+            top.first()
+        ));
+    }
+    Ok(top)
 }
 
 /// The prefill boundary table of `prompt` as one f32 file a layer and tensor, and their shapes.

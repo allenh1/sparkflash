@@ -1091,6 +1091,10 @@ TIE_BAND_VARIANTS = {
     # The device splits KDA's heads and sums o_proj's BF16 partials; the host runs every head and
     # rounds the whole sum once.
     "kda-dense": _FAST_MATH + "; the device sums the split heads' BF16 partials",
+    # The stated GLM stack runs the same KDA kernels, and the device reduces the mix coefficients
+    # in its own order: layer 0's coefficients differ by ~1e-7, which flips BF16 ulps after the
+    # first FFN and grows to a 6% stream difference by layer 7 on the near-uniform fixture.
+    "glm": _FAST_MATH + "; the device reduces the mix coefficients in its own order",
 }
 
 
@@ -1162,6 +1166,10 @@ def run_test(args: argparse.Namespace) -> int:
             str(prompts_file),
             str(args.max_tokens),
             *(("--tokenizer", tokenizer) if engram else ()),
+            # The reference's own alternatives, which a stated stack's tie band reads (its every
+            # world is held to this whole-model file).
+            "--tops",
+            str(global_file) + ".tops.json",
         ],
         stdout=subprocess.PIPE,
         text=True,
