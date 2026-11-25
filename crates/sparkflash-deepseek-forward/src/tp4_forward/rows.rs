@@ -574,7 +574,8 @@ impl RowsState {
         let shared_local = shared.inter / device.routed_geometry.world;
         // The MLP scratch holds the widest gated MLP's slice: the shared experts', or a dense-FFN
         // block's when it is wider.
-        let mlp_local = (crate::plan::widest_mlp() / device.routed_geometry.world).max(shared_local);
+        let mlp_local =
+            (crate::plan::widest_mlp() / device.routed_geometry.world).max(shared_local);
         let top_k = device.routed_geometry.top_k;
         let experts = device.routed_geometry.experts;
         let mask_bytes = candidate_mask_words(device.max_positions) * 4;
@@ -774,7 +775,8 @@ impl RowsState {
         )
     }
 
-    /// The shared expert's SwiGLU over `inter` f32 elements (shared_swiglu_f32's arithmetic).
+    /// The shared expert's SwiGLU over `inter` f32 elements (shared_swiglu_f32's arithmetic), a
+    /// `limit` of 0 unclamped ([RowsSwiGlu]).
     pub(super) fn swiglu(
         &self,
         cuda: &Cuda,
@@ -784,12 +786,15 @@ impl RowsState {
         limit: f32,
         inter: usize,
     ) -> Result<(), String> {
-        cuda.launch(
-            self.kernels.swiglu,
-            ((inter as u32).div_ceil(256), 1, 1),
-            (256, 1, 1),
-            &[gate, up, out, u64::from(limit.to_bits()), inter as u64],
-        )
+        use sparkflash_ops::roles::SwiGluBody;
+        RowsSwiGlu(self.kernels.swiglu)
+            .swiglu(
+                &RowsCx::new(cuda, inter, None),
+                (Deviceptr(gate), Deviceptr(up), Deviceptr(out)),
+                inter,
+                (limit > 0.0).then_some(limit),
+            )
+            .map_err(|error| error.to_string())
     }
 
     /// Frees the row buffers (the modules drop with the state).
@@ -800,6 +805,151 @@ impl RowsState {
         if let Some(bulk) = self.bulk {
             bulk.release(cuda);
         }
+    }
+}
+
+const ROWS_CX: &str = "deepseek rows";
+
+/// DeepSeek's SwiGLU, `opt_rows_shared_swiglu`, as a role body's [sparkflash_ops::roles::SwiGluBody]:
+/// a limit of 0 is its unclamped form.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RowsSwiGlu(pub(super) Kernel);
+
+impl sparkflash_ops::roles::SwiGluBody for RowsSwiGlu {
+    fn swiglu<L: sparkflash_ops::roles::Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        (gate, up, out): (Deviceptr, Deviceptr, Deviceptr),
+        count: usize,
+        limit: Option<f32>,
+    ) -> Result<(), sparkflash_model::backend::BackendError> {
+        cx.launch(
+            self.0,
+            (((count as u32).div_ceil(256), 1, 1), (256, 1, 1)),
+            &[
+                gate.0,
+                up.0,
+                out.0,
+                u64::from(limit.unwrap_or(0.0).to_bits()),
+                count as u64,
+            ],
+        )
+    }
+}
+
+/// One of this rank's projections on the dense format route, as a role body's
+/// [sparkflash_ops::roles::DeviceCx::Linear]: the class's entries, the rank's matrix and the row
+/// forms it reads and writes. Its input rows are `inner` apart and its output rows `cols`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RouteLinear {
+    pub(super) route: sparkflash_kernels::dense_format::DenseFormat,
+    pub(super) matrix: sparkflash_kernels::dense_format::DenseMatrix,
+    pub(super) io: sparkflash_kernels::dense_format::DenseIo,
+}
+
+/// The rows path as a role body's device ([sparkflash_ops::roles::DeviceCx]): the run's stream,
+/// the pass's rows, this rank's share, and the dense format route as its projection
+/// ([RouteLinear]).
+///
+/// The base sums a part's partials itself, through its own reduce on the BF16 wire, so
+/// [sparkflash_ops::roles::DeviceCx::sum] refuses by name. The base carves no part state into a
+/// lane, so a pass has no segments: only a stateless body runs here, and the open path refuses
+/// a part with regions.
+pub(super) struct RowsCx<'c> {
+    cuda: &'c Cuda,
+    rows: usize,
+    share: Option<sparkflash_model::TpPlan>,
+}
+
+impl<'c> RowsCx<'c> {
+    pub(super) fn new(
+        cuda: &'c Cuda,
+        rows: usize,
+        share: Option<sparkflash_model::TpPlan>,
+    ) -> Self {
+        Self { cuda, rows, share }
+    }
+}
+
+impl sparkflash_ops::roles::Launcher for RowsCx<'_> {
+    fn launch(
+        &self,
+        kernel: impl Into<Kernel>,
+        (grid, block): ((u32, u32, u32), (u32, u32, u32)),
+        args: &[u64],
+    ) -> Result<(), sparkflash_model::backend::BackendError> {
+        let kernel = kernel.into();
+        self.cuda
+            .launch(kernel, grid, block, args)
+            .map_err(|error| sparkflash_model::backend::BackendError::new(ROWS_CX, error))
+    }
+}
+
+impl sparkflash_ops::roles::DeviceCx for RowsCx<'_> {
+    type Linear = RouteLinear;
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn segments(&self) -> impl Iterator<Item = sparkflash_ops::roles::SegmentRows<'_>> + '_ {
+        std::iter::empty()
+    }
+
+    fn share(&self) -> Option<sparkflash_model::TpPlan> {
+        self.share
+    }
+
+    fn project(
+        &self,
+        linear: &RouteLinear,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), sparkflash_model::backend::BackendError> {
+        use sparkflash_kernels::dense_format::{DenseGroups, DenseRows};
+        linear
+            .route
+            .project(
+                self.cuda,
+                linear.io,
+                &linear.matrix,
+                &DenseRows {
+                    a: input.0,
+                    a_stride: linear.matrix.inner,
+                    out: output.0,
+                    out_stride: linear.matrix.cols,
+                    tokens: rows,
+                },
+                DenseGroups::ONE,
+            )
+            .map_err(|error| {
+                sparkflash_model::backend::BackendError::new(ROWS_CX, error.to_string())
+            })
+    }
+
+    fn sum(
+        &self,
+        _partial: Deviceptr,
+        rows: usize,
+        width: usize,
+    ) -> Result<(), sparkflash_model::backend::BackendError> {
+        Err(sparkflash_model::backend::BackendError::new(
+            ROWS_CX,
+            format!(
+                "a body asked to sum {rows} rows of {width} floats; the base sums a part's partials on its own reduce, after the body"
+            ),
+        ))
+    }
+
+    fn upload(
+        &self,
+        to: Deviceptr,
+        bytes: &[u8],
+    ) -> Result<(), sparkflash_model::backend::BackendError> {
+        self.cuda.copy_htod(&to, bytes).map_err(|error| {
+            sparkflash_model::backend::BackendError::new(ROWS_CX, error.to_string())
+        })
     }
 }
 
@@ -1237,7 +1387,10 @@ impl DeviceLayer<'_> {
             ops,
             layer,
             n,
-            (b.delta_bf16, sparkflash_kernels::dense_format::RowForm::Bf16),
+            (
+                b.delta_bf16,
+                sparkflash_kernels::dense_format::RowForm::Bf16,
+            ),
         )?;
         self.ffn_rest_tail(rows, layer, n)
     }
@@ -3750,9 +3903,7 @@ impl DeviceLayer<'_> {
         n: usize,
         out: (Deviceptr, sparkflash_kernels::dense_format::RowForm),
     ) -> Result<(), String> {
-        use sparkflash_kernels::dense_format::{
-            DenseGroups, DenseIo, DenseMatrix, DenseRows, RowForm,
-        };
+        use sparkflash_kernels::dense_format::{DenseIo, DenseMatrix, RowForm};
         let b = rows.b;
         let dim = self.dim;
         // The layer's own MLP: a MoE block's shared experts, or a dense-FFN block's one MLP,
@@ -3789,61 +3940,76 @@ impl DeviceLayer<'_> {
         } else {
             (b.seam_row, RowForm::F32)
         };
-        let io = DenseIo::new(input, RowForm::F32);
-        for (index, (weight, scales)) in
-            [(ops.w1, ops.s1), (ops.w3, ops.s3)].into_iter().enumerate()
-        {
-            route
-                .project(
-                    self.cuda,
-                    io,
-                    &DenseMatrix {
-                        weight: weight.0 + weight_offset,
-                        scales: scaled(scales, scale_offset),
-                        cols: local,
-                        inner: dim,
-                    },
-                    &DenseRows {
-                        a,
-                        a_stride: dim,
-                        out: b.shared_gate + (index * n * local * 4) as u64,
-                        out_stride: local,
-                        tokens: n,
-                    },
-                    DenseGroups::ONE,
-                )
-                .map_err(|error| format!("rows shared gate/up: {error}"))?;
-        }
-        rows.swiglu(
-            self.cuda,
-            b.shared_gate,
-            b.shared_gate + (n * local * 4) as u64,
-            b.shared_swiglu,
-            self.swiglu_limit,
-            n * local,
-        )
-        .map_err(|error| format!("rows shared swiglu: {error}"))?;
+        let linear = |weight: u64, scales: u64, (cols, inner): (usize, usize), io| RouteLinear {
+            route,
+            matrix: DenseMatrix {
+                weight,
+                scales,
+                cols,
+                inner,
+            },
+            io,
+        };
+        let gate_up = DenseIo::new(input, RowForm::F32);
+        let gate = linear(
+            ops.w1.0 + weight_offset,
+            scaled(ops.s1, scale_offset),
+            (local, dim),
+            gate_up,
+        );
+        let up = linear(
+            ops.w3.0 + weight_offset,
+            scaled(ops.s3, scale_offset),
+            (local, dim),
+            gate_up,
+        );
         let (out, form) = out;
-        route
-            .project(
-                self.cuda,
-                DenseIo::new(RowForm::F32, form),
-                &DenseMatrix {
-                    weight: ops.w2.0 + down_offset,
-                    scales: scaled(ops.s2, down_scale_offset),
-                    cols: dim,
-                    inner: local,
-                },
-                &DenseRows {
-                    a: b.shared_swiglu,
-                    a_stride: local,
-                    out,
-                    out_stride: dim,
-                    tokens: n,
-                },
-                DenseGroups::ONE,
-            )
-            .map_err(|error| format!("rows shared down: {error}"))
+        let down = linear(
+            ops.w2.0 + down_offset,
+            scaled(ops.s2, down_scale_offset),
+            (dim, local),
+            DenseIo::new(RowForm::F32, form),
+        );
+        self.gated_mlp(rows, [&gate, &up, &down], local, (a, out), n)
+            .map_err(|error| format!("rows layer {layer} MLP: {error}"))
+    }
+
+    /// The shared [sparkflash_ops::roles::GatedMlp] body over `n` rows on the dense format
+    /// route: `[gate, up, down]` this rank's `local`-wide share, `(input, output)` its rows, the
+    /// gate and up in the rows' MLP scratch (the up's half takes the SwiGLU's product).
+    pub(super) fn gated_mlp(
+        &self,
+        rows: &RowsState,
+        [gate, up, down]: [&RouteLinear; 3],
+        local: usize,
+        (input, output): (u64, u64),
+        n: usize,
+    ) -> Result<(), String> {
+        let b = rows.b;
+        let world = self.routed_geometry.world;
+        let share = (world > 1)
+            .then(|| sparkflash_model::TpPlan::new(world, self.tp_rank))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        sparkflash_ops::roles::GatedMlp {
+            gate,
+            up,
+            down,
+            width: local,
+        }
+        .run(
+            &RowsCx::new(self.cuda, n, share),
+            &RowsSwiGlu(rows.kernels.swiglu),
+            &sparkflash_ops::roles::MlpRows {
+                input: Deviceptr(input),
+                gate: Deviceptr(b.shared_gate),
+                up: Deviceptr(b.shared_gate + (n * local * 4) as u64),
+                output: Deviceptr(output),
+            },
+            n,
+            (self.swiglu_limit > 0.0).then_some(self.swiglu_limit),
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// wo_a over both groups, the bf16 quantiser, wo_b.

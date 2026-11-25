@@ -1228,7 +1228,9 @@ pub fn layer_mlp(block: usize) -> Result<LayerMlp, ConfigError> {
         let format = description()
             .plan()
             .stored_format(Part::DenseMlp, Some(block))
-            .ok_or_else(|| format!("the plan states no stored format for layer {block}'s dense MLP"))?;
+            .ok_or_else(|| {
+                format!("the plan states no stored format for layer {block}'s dense MLP")
+            })?;
         return Ok(LayerMlp {
             segment: "ffn",
             inter: values.dense_inter_dim,
@@ -1647,10 +1649,7 @@ pub fn language_steps(plan: &EnginePlan) -> Result<Vec<BlockSteps>, ConfigError>
             // each part must run alone, and the first one that cannot names the refusal.
             let mut parts = Vec::new();
             for instance in &block.parts {
-                let sublayer = matches!(
-                    instance.part,
-                    Part::Csa2Compression | Part::SparseIndexer
-                );
+                let sublayer = matches!(instance.part, Part::Csa2Compression | Part::SparseIndexer);
                 if absorbed(instance.part) && (!sublayer || has(Part::MlaAttention)) {
                     continue;
                 }

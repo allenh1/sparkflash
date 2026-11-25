@@ -545,7 +545,6 @@ macro_rules! with_dense_format {
     };
 }
 
-
 /// A bulk-prefill symbol accepting exactly these precisions.
 const fn pre(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
     KernelSymbol::prefill(name, precisions, ComputeClass::Elementwise, RowBand::ALL)

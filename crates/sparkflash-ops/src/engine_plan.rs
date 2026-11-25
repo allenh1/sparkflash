@@ -975,10 +975,14 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
         .filter(|(_, layer)| matches!(layer.ffn, sparkflash_model::architecture::Ffn::Dense(_)))
         .map(|(index, _)| index as i64)
         .collect();
-    if let Some(dense) = architecture.layers.iter().find_map(|layer| match &layer.ffn {
-        sparkflash_model::architecture::Ffn::Dense(dense) => Some(dense),
-        sparkflash_model::architecture::Ffn::Moe(_) => None,
-    }) {
+    if let Some(dense) = architecture
+        .layers
+        .iter()
+        .find_map(|layer| match &layer.ffn {
+            sparkflash_model::architecture::Ffn::Dense(dense) => Some(dense),
+            sparkflash_model::architecture::Ffn::Moe(_) => None,
+        })
+    {
         put("dense_ffn_layers", FactValue::Integers(dense_layers));
         put(
             "dense_inter_dim",

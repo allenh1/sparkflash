@@ -1796,24 +1796,34 @@ impl DeviceLayer<'_> {
         )?;
         let local = rows.shared_local;
         let [(w1, s1), (w3, s3), (w2, s2)] = stage.shared;
-        if let Some(route) = draft.dense.as_ref() {
+        if let Some(&route) = draft.dense.as_ref() {
+            // The arena holds this rank's gate/up rows and its [dim][local] slice of the down
+            // as stored.
             let io = DenseIo::new(RowForm::F32, RowForm::F32);
-            for (w, out, what) in [
-                ((w1, s1), b.shared_gate, "gate"),
-                ((w3, s3), b.shared_gate + (n * local * 4) as u64, "up"),
-            ] {
-                self.draft_dense(
+            let linear = |(weight, scales): (u64, u64), (cols, inner): (usize, usize)| {
+                super::rows::RouteLinear {
                     route,
+                    matrix: DenseMatrix {
+                        weight,
+                        scales,
+                        cols,
+                        inner,
+                    },
                     io,
-                    w,
-                    (b.seam_row, dim),
-                    (out, local),
-                    (local, dim),
-                    n,
-                    DenseGroups::ONE,
-                )
-                .map_err(|error| format!("draft shared {what}: {error}"))?;
-            }
+                }
+            };
+            self.gated_mlp(
+                rows,
+                [
+                    &linear((w1, s1), (local, dim)),
+                    &linear((w3, s3), (local, dim)),
+                    &linear((w2, s2), (dim, local)),
+                ],
+                local,
+                (b.seam_row, b.shared_out),
+                n,
+            )
+            .map_err(|error| format!("draft shared expert: {error}"))?;
         } else {
             draft_launch(
                 self.cuda,
@@ -1838,29 +1848,15 @@ impl DeviceLayer<'_> {
                 },
             )
             .map_err(|error| format!("draft shared gate/up: {error}"))?;
-        }
-        rows.swiglu(
-            self.cuda,
-            b.shared_gate,
-            b.shared_gate + (n * local * 4) as u64,
-            b.shared_swiglu,
-            self.swiglu_limit,
-            n * local,
-        )
-        .map_err(|error| format!("draft shared swiglu: {error}"))?;
-        if let Some(route) = draft.dense.as_ref() {
-            // The arena holds this rank's [dim][local] slice of the down as stored.
-            self.draft_dense(
-                route,
-                DenseIo::new(RowForm::F32, RowForm::F32),
-                (w2, s2),
-                (b.shared_swiglu, local),
-                (b.shared_out, dim),
-                (dim, local),
-                n,
-                DenseGroups::ONE,
+            rows.swiglu(
+                self.cuda,
+                b.shared_gate,
+                b.shared_gate + (n * local * 4) as u64,
+                b.shared_swiglu,
+                self.swiglu_limit,
+                n * local,
             )
-        } else {
+            .map_err(|error| format!("draft shared swiglu: {error}"))?;
             draft_launch(
                 self.cuda,
                 OptKind::F32aF32o,
@@ -1883,8 +1879,8 @@ impl DeviceLayer<'_> {
                     k_stride_blocks: 0,
                 },
             )
+            .map_err(|error| format!("draft shared down: {error}"))?;
         }
-        .map_err(|error| format!("draft shared down: {error}"))?;
         if let Some(route) = draft.routed_format.as_ref() {
             return route.run(
                 self.cuda,

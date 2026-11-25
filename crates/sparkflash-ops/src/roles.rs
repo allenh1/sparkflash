@@ -1099,11 +1099,43 @@ impl SplitSwiGlu {
     }
 }
 
+/// The SwiGLU a [GatedMlp] runs between its projections: `out = silu(gate) * up` over `count`
+/// f32 elements, the gate clamped above and the up both ways at `limit` first when it is set.
+///
+/// The role's own body is [SplitSwiGlu]; a host that loads another kernel of the same
+/// arithmetic (DeepSeek's `opt_rows_shared_swiglu`) brings that instead.
+pub trait SwiGluBody {
+    /// The SwiGLU on `cx`'s stream.
+    ///
+    /// # Errors
+    /// A limit the body has no clamped form for, or the driver's refusal.
+    fn swiglu<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        io: (Deviceptr, Deviceptr, Deviceptr),
+        count: usize,
+        limit: Option<f32>,
+    ) -> Result<(), BackendError>;
+}
+
+impl SwiGluBody for SplitSwiGlu {
+    fn swiglu<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        io: (Deviceptr, Deviceptr, Deviceptr),
+        count: usize,
+        limit: Option<f32>,
+    ) -> Result<(), BackendError> {
+        self.run(cx, io, count, limit)
+    }
+}
+
 /// A gated MLP's three projections in the arm's own format, `width` the gate's (and the up's)
 /// rows as the rank holds them: `down(silu(gate(x)) * up(x))`.
 ///
-/// The dense arm's MLPs and shared experts and DeepSeek's dense-MLP blocks run this one body: each
-/// arm brings its projection dispatch ([DeviceCx::project]) and its SwiGLU kernels.
+/// The dense arm's MLPs and shared experts and DeepSeek's dense-MLP blocks and shared experts on
+/// its dense format route run this one body: each host brings its projection dispatch
+/// ([DeviceCx::project]) and its SwiGLU ([SwiGluBody]).
 #[derive(Debug, Clone, Copy)]
 pub struct GatedMlp<'a, L: ?Sized> {
     /// The gate projection.
@@ -1136,17 +1168,17 @@ impl<L: ?Sized> GatedMlp<'_, L> {
     /// # Errors
     /// A projection the arm does not run, a limit without the clamped body, or the driver's
     /// refusal.
-    pub fn run<C: DeviceCx<Linear = L>>(
+    pub fn run<C: DeviceCx<Linear = L>, S: SwiGluBody + ?Sized>(
         &self,
         cx: &C,
-        swiglu: &SplitSwiGlu,
+        swiglu: &S,
         at: &MlpRows,
         rows: usize,
         limit: Option<f32>,
     ) -> Result<(), BackendError> {
         cx.project(self.gate, at.input, at.gate, rows)?;
         cx.project(self.up, at.input, at.up, rows)?;
-        swiglu.run(cx, (at.gate, at.up, at.up), rows * self.width, limit)?;
+        swiglu.swiglu(cx, (at.gate, at.up, at.up), rows * self.width, limit)?;
         cx.project(self.down, at.up, at.output, rows)
     }
 }
