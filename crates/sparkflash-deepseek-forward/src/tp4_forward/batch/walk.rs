@@ -50,8 +50,9 @@ impl Batch<'_, '_, '_> {
                 lane,
                 rows,
                 sampler,
+                more,
             } => self
-                .walk_chunk(lane, &rows, sampler)
+                .walk_chunk(lane, &rows, sampler, more)
                 .map(|pick| WalkAnswer::Picks(vec![pick])),
             WalkCommand::Tokens { rows } => self.walk_tokens(&rows).map(WalkAnswer::Picks),
             WalkCommand::Room { lane, positions } => {
@@ -77,6 +78,11 @@ impl Batch<'_, '_, '_> {
             slack: super::super::lanes::SLIDE_KEEP
                 .saturating_sub(2 * sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW),
             row_bytes: self.device.lane_row_bytes(),
+            bulk_rows: if self.inputs.bulk.is_some() && self.exchange.is_some() {
+                bulk_min()
+            } else {
+                0
+            },
         })
     }
 
@@ -168,8 +174,15 @@ impl Batch<'_, '_, '_> {
         Ok(())
     }
 
-    /// Runs `rows` as prompt rows of the sequence on `lane` and answers the last row's pick.
-    fn walk_chunk(&mut self, lane: usize, rows: &[u32], sampler: Sampler) -> Result<u32, String> {
+    /// Runs `rows` as prompt rows of the sequence on `lane` and answers the last row's pick;
+    /// `more` keeps the chunk's packed-key run open for the prompt's next chunk.
+    fn walk_chunk(
+        &mut self,
+        lane: usize,
+        rows: &[u32],
+        sampler: Sampler,
+        more: bool,
+    ) -> Result<u32, String> {
         let index = self.walk_seq(lane)?;
         if rows.is_empty() {
             return Err("walk: an empty prompt chunk".to_owned());
@@ -196,8 +209,8 @@ impl Batch<'_, '_, '_> {
         seq.tokens.truncate(p);
         seq.tokens.extend_from_slice(rows);
         seq.prompt_len = target;
-        // A bulk chunk that does not continue this sequence's last one starts its packed-key run,
-        // as a placed prompt's first chunk does.
+        // A bulk chunk that does not continue the same prompt's last one starts its packed-key
+        // run, as a placed prompt's first chunk does.
         seq.reused = (seq.walk_bulk_end != Some(p)).then_some(p);
         self.enter(lane)?;
         self.device.rewind_rows(p);
@@ -212,7 +225,7 @@ impl Batch<'_, '_, '_> {
         }
         self.drop_reads(self.seqs[index].id)?;
         self.device.cuda.synchronize()?;
-        self.seqs[index].walk_bulk_end = bulk.then_some(target);
+        self.seqs[index].walk_bulk_end = (bulk && more).then_some(target);
         pick.ok_or_else(|| "walk: the chunk's last row was not headed".to_owned())
     }
 

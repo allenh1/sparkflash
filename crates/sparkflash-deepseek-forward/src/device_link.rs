@@ -270,10 +270,13 @@ pub enum WalkCommand {
     /// The sequence on `lane` goes back to position `to`.
     Rewind { lane: usize, to: usize },
     /// Prompt rows on `lane` in one pass, the last row headed under `sampler`; answers one pick.
+    /// `more` says more rows of the same prompt follow, so the next chunk continues this one's
+    /// packed-key run; a chunk after one without it starts a run, as a placed prompt does.
     Chunk {
         lane: usize,
         rows: Vec<u32>,
         sampler: sparkflash_model::gumbel::GumbelSampler,
+        more: bool,
     },
     /// One token row a lane, in one step, each headed under its own sampler; answers one pick a
     /// row, in order.
@@ -300,6 +303,8 @@ pub struct WalkDescription {
     pub slack: usize,
     /// A lane's bytes a position, for the runtime's chunk policy.
     pub row_bytes: usize,
+    /// The fewest prompt rows a chunk takes the bulk path with, or 0 when it never does.
+    pub bulk_rows: usize,
 }
 
 /// The walk server's answer to one [`WalkCommand`].

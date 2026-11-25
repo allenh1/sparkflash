@@ -50,7 +50,7 @@ fn long<W: Walk>(walk: &W) -> Vec<u32> {
     let rows = 40
         .min(walk.limits().context.saturating_sub(TOKENS + 1))
         .max(SHORT.len());
-    (0..rows as u32).map(|at| (at * 7 + 3) % 50 + 2).collect()
+    crate::conformance::long_prompt(rows)
 }
 
 /// The sampled run's sampling: seeded, so its draws repeat.

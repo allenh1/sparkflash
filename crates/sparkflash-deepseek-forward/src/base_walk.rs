@@ -260,6 +260,7 @@ impl Walk for BaseWalk {
                     lane: segment.seq.lane,
                     rows: segment.rows.to_vec(),
                     sampler: segment.seq.sampler,
+                    more: pass.prompt_end.is_some_and(|rest| rest > 0),
                 })?;
                 segment.seq.pos += n;
                 (n, picks.into_iter().map(|pick| (n - 1, pick)).collect())

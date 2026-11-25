@@ -239,6 +239,9 @@ pub struct Fixture<W: Walk> {
     /// The tick group rank 0's walk steps with, when the fixture is a group's ([`local_group`]):
     /// the checks then drive it as the group's rank 0.
     pub group: Option<TickGroup>,
+    /// The rows of a long prompt ([`long_prompt`]) the prompt and continued checks run as well,
+    /// when the arm's short prompts never reach a path its longer ones take.
+    pub long_prompt: Option<usize>,
 }
 
 impl<W: Walk> Fixture<W> {
@@ -260,7 +263,15 @@ impl<W: Walk> Fixture<W> {
             formats,
             keep,
             group: None,
+            long_prompt: None,
         }
+    }
+
+    /// The same fixture whose prompt and continued checks also run a prompt of `rows` rows.
+    #[must_use]
+    pub fn with_long_prompt(mut self, rows: usize) -> Self {
+        self.long_prompt = Some(rows);
+        self
     }
 
     /// The same fixture as rank 0 of `group`, the tick group its peers mirror.
@@ -499,6 +510,13 @@ const CONFORMANCE_THIRD: [u32; 7] = [3, 5, 11, 17, 23, 29, 31];
 /// A fourth prompt, for the four-at-once check.
 const CONFORMANCE_FOURTH: [u32; 7] = [2, 3, 5, 7, 11, 13, 17];
 
+/// A prompt of `rows` small ids that repeat no short cycle, for a check that needs more rows
+/// than the short prompts hold.
+#[must_use]
+pub fn long_prompt(rows: usize) -> Vec<u32> {
+    (0..rows as u32).map(|at| (at * 7 + 3) % 50 + 2).collect()
+}
+
 /// The token run a prompt is fed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptMode {
@@ -544,6 +562,34 @@ fn whole_prompt_equals_chunked<A: ArmFixture>() -> Result<CheckOutcome, BackendE
                 &fixture.source,
             ));
         }
+    }
+    // A long prompt runs whole, in two chunks and through the engine. Its token-by-token run is
+    // not compared: a prompt long enough for an arm's wide path takes it whole and chunked, and a
+    // token a pass never does.
+    if let Some(rows) = fixture.long_prompt {
+        let prompt = long_prompt(rows);
+        let whole = direct_run(&fixture.walk, &prompt, PromptMode::Whole)?;
+        let chunked = direct_run(&fixture.walk, &prompt, PromptMode::Chunked)?;
+        if whole != chunked {
+            return Err(disagreement(
+                &format!("the {rows}-row prompt whole = chunked"),
+                &whole,
+                &chunked,
+                &fixture.source,
+            ));
+        }
+        if A::tick_engine() {
+            let engine = engine_run(A::fixture(1)?.walk, &prompt, CONFORMANCE_TOKENS)?;
+            if whole != engine {
+                return Err(disagreement(
+                    &format!("the tick engine = the {rows}-row prompt whole"),
+                    &whole,
+                    &engine,
+                    &fixture.source,
+                ));
+            }
+        }
+        println!("conformance: the {rows}-row prompt whole = chunked: {whole:?}");
     }
     println!(
         "conformance: whole prompt = chunked = token by token: {} tokens over {}",
@@ -599,23 +645,20 @@ fn alone_equals_four<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
 fn continued_equals_cold<A: ArmFixture>() -> Result<CheckOutcome, BackendError> {
     let fixture = A::fixture(1)?;
     let (cold, continued) = if A::tick_engine() {
-        let cold = engine_run(A::fixture(1)?.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
-        let mut engine = crate::TickEngine::new(A::fixture(1)?.walk, 1)?;
-        let prefix = CONFORMANCE_PROMPT[..4].to_vec();
-        let (id, _) = engine_turn(&mut engine, &prefix)?;
-        engine.finish(id);
-        let (id, first) = engine_turn(&mut engine, &CONFORMANCE_PROMPT)?;
-        if engine.history(id) != Some(CONFORMANCE_PROMPT.as_slice()) {
-            return Err(BackendError::new(
-                "conformance",
-                format!(
-                    "continued turn = cold: the tick engine kept {:?}, not the prompt",
-                    engine.history(id)
-                ),
-            ));
+        if let Some(rows) = fixture.long_prompt {
+            let prompt = long_prompt(rows);
+            let (cold, continued) = engine_continued::<A>(&prompt, rows / 2)?;
+            if cold != continued {
+                return Err(disagreement(
+                    &format!("the {rows}-row prompt continued at {} = cold", rows / 2),
+                    &cold,
+                    &continued,
+                    &fixture.source,
+                ));
+            }
+            println!("conformance: the {rows}-row prompt continued = cold: {cold:?}");
         }
-        let continued = engine_decode(&mut engine, id, first, CONFORMANCE_TOKENS)?;
-        (cold, continued)
+        engine_continued::<A>(&CONFORMANCE_PROMPT, 4)?
     } else {
         let runtime = Runtime::new(fixture.walk, 0)?;
         let cold = runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
@@ -649,6 +692,30 @@ fn continued_equals_cold<A: ArmFixture>() -> Result<CheckOutcome, BackendError> 
         fixture.source
     );
     Ok(CheckOutcome::Passed)
+}
+
+/// A cold run of `prompt` through the tick engine, and the same prompt as a turn that continues
+/// one of its first `prefix` ids.
+fn engine_continued<A: ArmFixture>(
+    prompt: &[u32],
+    prefix: usize,
+) -> Result<(Vec<Option<u32>>, Vec<Option<u32>>), BackendError> {
+    let cold = engine_run(A::fixture(1)?.walk, prompt, CONFORMANCE_TOKENS)?;
+    let mut engine = crate::TickEngine::new(A::fixture(1)?.walk, 1)?;
+    let (id, _) = engine_turn(&mut engine, &prompt[..prefix])?;
+    engine.finish(id);
+    let (id, first) = engine_turn(&mut engine, prompt)?;
+    if engine.history(id) != Some(prompt) {
+        return Err(BackendError::new(
+            "conformance",
+            format!(
+                "continued turn = cold: the tick engine kept {:?}, not the prompt",
+                engine.history(id)
+            ),
+        ));
+    }
+    let continued = engine_decode(&mut engine, id, first, CONFORMANCE_TOKENS)?;
+    Ok((cold, continued))
 }
 
 /// A rewound turn's tokens equal a cold turn's.
