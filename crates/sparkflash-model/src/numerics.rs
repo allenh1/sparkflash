@@ -203,6 +203,7 @@ pub const NEUTRAL_FIELDS: &[&str] = &[
     "drafter.seqs",
     "drafter.seed_split",
     "drafter.row_table",
+    "diagnostics.group_trace",
 ];
 
 /// The arithmetic switches an arm still reads directly, outside the profile table, until their

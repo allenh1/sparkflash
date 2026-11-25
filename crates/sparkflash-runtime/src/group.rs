@@ -171,6 +171,13 @@ impl GroupWire for TextWire {
         self.name
     }
 
+    fn trace(&self) -> bool {
+        sparkflash_model::active_profile()
+            .diagnostics
+            .group_trace
+            .unwrap_or(false)
+    }
+
     fn admit(&self, tokens: &[u32], images: &[VisionImage]) -> Result<(), BackendError> {
         if !images.is_empty() {
             return Err(BackendError::new(

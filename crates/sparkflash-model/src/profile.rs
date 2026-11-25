@@ -516,6 +516,8 @@ pub struct DiagnosticsProfile {
     pub generate: Option<bool>,
     /// Print the per-position argmax.
     pub print_argmax: Option<bool>,
+    /// Print every group control frame rank 0 sends and each worker replays (`TextWire`).
+    pub group_trace: Option<bool>,
     /// Use the L2 prefetch side stream.
     pub l2_prefetch: Option<bool>,
     /// Cache Engram reads.
@@ -756,6 +758,7 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_ROWS_DUMP", "diagnostics.rows_dump"),
     ("SPARKFLASH_GENERATE", "diagnostics.generate"),
     ("SPARKFLASH_PRINT_ARGMAX", "diagnostics.print_argmax"),
+    ("SPARKFLASH_GROUP_TRACE", "diagnostics.group_trace"),
     ("SPARKFLASH_L2_PREFETCH", "diagnostics.l2_prefetch"),
     ("SPARKFLASH_ENGRAM_CACHE", "diagnostics.engram_cache"),
     (
@@ -961,6 +964,9 @@ const BOOL_FIELDS: &[(&str, BoolField)] = &[
     ("diagnostics.generate", |p| &mut p.diagnostics.generate),
     ("diagnostics.print_argmax", |p| {
         &mut p.diagnostics.print_argmax
+    }),
+    ("diagnostics.group_trace", |p| {
+        &mut p.diagnostics.group_trace
     }),
     ("diagnostics.l2_prefetch", |p| {
         &mut p.diagnostics.l2_prefetch
