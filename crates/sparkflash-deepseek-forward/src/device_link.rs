@@ -266,38 +266,62 @@ pub enum WalkCommand {
     /// A lane for a new sequence at position 0; answers [`WalkAnswer::Opened`].
     Open,
     /// The sequence on `lane` ends and the lane's memory goes back.
-    Release { lane: usize },
+    Release {
+        /// The lane the sequence held.
+        lane: usize,
+    },
     /// The sequence on `lane` goes back to position `to`: its counters to the resume point at
     /// or below it (a recurrent block's saved point, or the start), and the rows after that point
     /// run again.
-    Rewind { lane: usize, to: usize },
+    Rewind {
+        /// The sequence's lane.
+        lane: usize,
+        /// The position it goes back to.
+        to: usize,
+    },
     /// Prompt rows on `lane` in one pass, the last row headed under `sampler`; answers one pick.
     /// `more` says more rows of the same prompt follow, so the next chunk continues this one's
     /// packed-key run; a chunk after one without it starts a run, as a placed prompt does.
     Chunk {
+        /// The sequence's lane.
         lane: usize,
+        /// The prompt's ids this pass walks.
         rows: Vec<u32>,
+        /// The sampler the last row is headed under.
         sampler: sparkflash_model::gumbel::GumbelSampler,
+        /// Whether more rows of the same prompt follow.
         more: bool,
     },
     /// One token row a lane, in one step, each headed under its own sampler; answers one pick a
     /// row, in order.
     Tokens {
+        /// Each row's lane, id and sampler.
         rows: Vec<(usize, u32, sparkflash_model::gumbel::GumbelSampler)>,
     },
     /// Whether the sequence on `lane` can be backed for `positions` positions.
-    Room { lane: usize, positions: usize },
+    Room {
+        /// The sequence's lane.
+        lane: usize,
+        /// The positions it would reach.
+        positions: usize,
+    },
     /// The draft block after `anchor` on `lane`, its rows' picks under `sampler`; answers
     /// [`WalkAnswer::Chain`]. The anchor is the sequence's next row, not yet walked.
     Draft {
+        /// The sequence's lane.
         lane: usize,
+        /// The sequence's next row, the block drafts after.
         anchor: u32,
+        /// The sampler the drafted rows' picks are taken under.
         sampler: sparkflash_model::gumbel::GumbelSampler,
     },
     /// One rows step verifying each member's lane and chunk (its drafted anchor, then the
     /// drafts kept for it), every member its own segment; each keeps its anchor and the drafts
     /// its picks agree with. Answers [`WalkAnswer::Verified`].
-    Verify { members: Vec<(usize, Vec<u32>)> },
+    Verify {
+        /// Each member's lane and chunk: its anchor, then the drafts kept for it.
+        members: Vec<(usize, Vec<u32>)>,
+    },
 }
 
 /// What the walk server knows about the epoch, for [`sparkflash_runtime::Limits`] and the rewind.
@@ -349,7 +373,9 @@ pub enum WalkAnswer {
     Room(bool),
     /// [`WalkCommand::Draft`]: the drafts, and the chance each leading run is accepted.
     Chain {
+        /// The drafted ids, in order.
         drafts: Vec<u32>,
+        /// The chance each leading run of the drafts is accepted.
         confidence: Vec<f64>,
     },
     /// [`WalkCommand::Verify`]: each member's picks for its anchor and the drafts it kept, the
