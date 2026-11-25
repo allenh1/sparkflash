@@ -65,6 +65,9 @@ struct Offsets {
     index_keys: usize,
     /// Each drafter stage's (codes, scales) ring.
     draft: Vec<(usize, usize)>,
+    /// Per layer, a grouped-query block's BF16 (keys, values) cache, position-addressed; `None`
+    /// at every other block.
+    grouped: Vec<Option<(usize, usize)>>,
 }
 
 /// One lane's device pointers, as the DeviceLayer fields hold them.
@@ -77,6 +80,7 @@ pub(super) struct LanePointers {
     pub(super) store_scales: u64,
     pub(super) index_keys: u64,
     pub(super) draft: Vec<(u64, u64)>,
+    pub(super) grouped: Vec<Option<(u64, u64)>>,
 }
 
 /// The host counters of a lane's device state, swapped in and out with its pointers.
@@ -145,6 +149,11 @@ impl Lanes<'_> {
                 .draft
                 .iter()
                 .map(|&(codes, scales)| (at(codes), at(scales)))
+                .collect(),
+            grouped: o
+                .grouped
+                .iter()
+                .map(|part| part.map(|(keys, values)| (at(keys), at(values))))
                 .collect(),
         }
     }
@@ -327,6 +336,22 @@ impl<'a> DeviceLayer<'a> {
             stage.1 = layout.reserve(draft_rows * latent / 32);
             layout.window(stage.1, draft_rows * latent / 32, latent / 32);
         }
+        // A grouped-query block's BF16 keys and values, one row of the rank's key/value heads a
+        // position, backed as far as the lane's positions reach.
+        let mut grouped = vec![None; layers];
+        if let Some(shape) = self.grouped_shape()? {
+            let row_bytes = shape.kv_width() * 2;
+            for &layer in &crate::plan::description().values().gqa_layers {
+                let slot = grouped.get_mut(layer).ok_or_else(|| {
+                    format!("lanes: grouped-query block {layer} of {layers} layers")
+                })?;
+                let bytes = self.max_positions * row_bytes;
+                *slot = Some((
+                    layout.part(bytes, row_bytes, 0),
+                    layout.part(bytes, row_bytes, 0),
+                ));
+            }
+        }
         let shape = layout.finish(granularity, ROW_QUANTUM);
         let stride = shape.stride;
         let offsets = Offsets {
@@ -337,6 +362,7 @@ impl<'a> DeviceLayer<'a> {
             store_scales,
             index_keys,
             draft,
+            grouped,
         };
 
         // The single sequence's state goes before the lanes take memory.

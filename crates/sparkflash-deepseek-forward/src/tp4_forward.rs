@@ -7980,19 +7980,24 @@ pub(crate) fn released_dense(format: sparkflash_model::format::StoredFormat) -> 
 }
 
 /// One layer's dense format routes: the attention projections (wq_a, wkv, wq_b, wo_a, wo_b), the
-/// indexer's wq_b and the shared expert, each `None` where the released bodies read it.
+/// indexer's wq_b and the shared expert, each `None` where the released bodies read it, and a
+/// grouped-query block's four projections (wq, wk, wv, wo), which only this route reads.
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct LayerDense {
     pub(crate) attention: Option<sparkflash_kernels::dense_format::DenseFormat>,
     pub(crate) indexer: Option<sparkflash_kernels::dense_format::DenseFormat>,
     pub(crate) shared: Option<sparkflash_kernels::dense_format::DenseFormat>,
+    pub(crate) grouped: Option<sparkflash_kernels::dense_format::DenseFormat>,
 }
 
 #[cfg(feature = "cuda")]
 impl LayerDense {
     fn any(&self) -> bool {
-        self.attention.is_some() || self.indexer.is_some() || self.shared.is_some()
+        self.attention.is_some()
+            || self.indexer.is_some()
+            || self.shared.is_some()
+            || self.grouped.is_some()
     }
 }
 
@@ -14271,8 +14276,9 @@ impl<'a> DeviceLayer<'a> {
     }
 
     /// Opens the dense format route for every layer whose attention, indexer or shared-expert
-    /// projections are stored in a class the released MXFP8 bodies do not read: the four row-form
-    /// entries the plan's catalogue claims for the class, loaded once here.
+    /// projections are stored in a class the released MXFP8 bodies do not read, and for every
+    /// grouped-query block: the four row-form entries the plan's catalogue claims for the class,
+    /// loaded once here.
     ///
     /// # Errors
     /// The staged directory lacks `dense_format_sm121.cubin`, or the plan claims no entry decoding
@@ -14314,10 +14320,24 @@ impl<'a> DeviceLayer<'a> {
                     .map(Some),
                     _ => Ok(None),
                 };
+            // A grouped-query block's projections have no released body: the route opens for
+            // whatever class they are stored in, and refuses by name one it has no entry for.
+            let grouped = match description.operand(Some(layer), Part::GqaAttention) {
+                Some(operand) => Some(open_dense_format(
+                    self.cuda,
+                    kernel_dir,
+                    Some(layer),
+                    Part::GqaAttention,
+                    operand.stored,
+                    &format!("layer {layer} {:?}", Part::GqaAttention),
+                )?),
+                None => None,
+            };
             routes.push(LayerDense {
                 attention: open(Part::MlaAttention, attention)?,
                 indexer: open(Part::SparseIndexer, indexer)?,
                 shared: open(mlp_part, mlp.map(|mlp| mlp.format))?,
+                grouped,
             });
         }
         if routes.iter().any(LayerDense::any) {
@@ -16524,7 +16544,11 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                     u32::try_from(layer).unwrap_or(u32::MAX),
                     u64::try_from(position).unwrap_or(0),
                 );
-                sparkflash_kernels::mxfp8_gemv_launch::launch(self.cuda, self.gemv.1, &wq_b_params)?;
+                sparkflash_kernels::mxfp8_gemv_launch::launch(
+                    self.cuda,
+                    self.gemv.1,
+                    &wq_b_params,
+                )?;
             }
             let pairs = usize::try_from(self.rope_pairs).unwrap_or(0);
             let table_bytes = self.max_positions * pairs * 4;

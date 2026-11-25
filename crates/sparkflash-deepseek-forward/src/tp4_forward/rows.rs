@@ -342,6 +342,87 @@ pub(super) struct RowsState {
     /// The head's per-row noise when one step's rows sample under several requests' samplers:
     /// `[R_MAX][4]` u32 for opt_rows_lm_head, then `[R_MAX][4]` for opt_rows_topc.
     pub(super) head_params: sparkflash_kernels::cuda_driver::HostMapped,
+    /// A stack with a grouped-query block: the shared body's kernels and rows (None without one).
+    pub(super) grouped: Option<GroupedRows>,
+}
+
+/// A grouped-query block's body on the rows path ([sparkflash_ops::roles::GqaLayer]): the shared
+/// attention's kernels, taking at most [R_MAX] rows a launch so the split partials stay
+/// [R_MAX] rows; the norm its heads take where a layer has q/k gains; this rank's shape; and the
+/// f32 rows the body works in, as many as the state's rows.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GroupedRows {
+    pub(super) attention: sparkflash_ops::roles::GqaAttention,
+    pub(super) norm: sparkflash_ops::roles::Norm,
+    pub(super) shape: sparkflash_ops::roles::GqaShape,
+    pub(super) rows: sparkflash_ops::roles::GqaRows,
+}
+
+impl GroupedRows {
+    /// Loads the shared grouped-query kernels from the images this build embeds and carves `rows`
+    /// rows of `shape` with `alloc`.
+    fn open(
+        cuda: &Cuda,
+        shape: sparkflash_ops::roles::GqaShape,
+        rows: usize,
+        alloc: &mut impl FnMut(usize) -> Result<u64, String>,
+    ) -> Result<Self, String> {
+        use sparkflash_ops::images::{Image, qwen4_attn_cubin, qwen4_exp_cubin};
+        use sparkflash_ops::plan::Precision;
+        use sparkflash_ops::roles::{Bound, GqaAttention, GqaRows, Norm};
+        let token = |symbol: &'static str| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Exp,
+                qwen4_exp_cubin(),
+                symbol,
+                Precision::Bf16,
+            )
+        };
+        let attention = |symbol: &'static str| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Attn,
+                qwen4_attn_cubin(),
+                symbol,
+                Precision::Bf16,
+            )
+        };
+        let what = |error: String| format!("rows grouped-query attention: {error}");
+        let body = GqaAttention::new(
+            [
+                token("q4e_deinterleave").map_err(what)?,
+                token("q4e_rope").map_err(what)?,
+                attention("q4e_cache_bf16").map_err(what)?,
+                attention("q4e_attn_full").map_err(what)?,
+                attention("q4e_attn_full_combine").map_err(what)?,
+            ],
+            Some(R_MAX),
+        )
+        .map_err(what)?;
+        let norm = Norm::new(token("q4e_rmsnorm").map_err(what)?, None).map_err(what)?;
+        let (query, kv) = (shape.query_width(), shape.kv_width());
+        let partials = sparkflash_ops::calls::FullAttention::partial_floats(
+            R_MAX,
+            shape.heads,
+            shape.head_dim,
+        );
+        let mut carve = |floats: usize| alloc(floats * 4).map(Deviceptr);
+        Ok(Self {
+            attention: body,
+            norm,
+            shape,
+            rows: GqaRows {
+                interleaved: Deviceptr(0),
+                query: carve(rows * query)?,
+                gate: Deviceptr(0),
+                key: carve(rows * kv)?,
+                value: carve(rows * kv)?,
+                partials: carve(partials)?,
+                attended: carve(rows * query)?,
+            },
+        })
+    }
 }
 
 impl RowsState {
@@ -692,12 +773,17 @@ impl RowsState {
             topc_gather: alloc(GATHER_WORLD * R_MAX * super::sample::TOPC_WORDS * 4)?,
             embed_gather: alloc(GATHER_WORLD * r * dim * 2)?,
         };
+        let grouped = match device.grouped_shape()? {
+            Some(shape) => Some(GroupedRows::open(cuda, shape, d, &mut alloc)?),
+            None => None,
+        };
         let head_params = cuda.alloc_host_mapped(R_MAX * 8 * 4, &mut 0)?;
         Ok(Self {
             kernels,
             b,
             allocations,
             head_params,
+            grouped,
             q_cols,
             lora_cols,
             kv_cols,
@@ -852,13 +938,14 @@ pub(super) struct RouteLinear {
 /// ([RouteLinear]).
 ///
 /// The base sums a part's partials itself, through its own reduce on the BF16 wire, so
-/// [sparkflash_ops::roles::DeviceCx::sum] refuses by name. The base carves no part state into a
-/// lane, so a pass has no segments: only a stateless body runs here, and the open path refuses
-/// a part with regions.
+/// [sparkflash_ops::roles::DeviceCx::sum] refuses by name. A pass's segments are the step's
+/// sequences with the part's regions in each one's lane ([LaneSegment]); a stateless body's pass
+/// has none.
 pub(super) struct RowsCx<'c> {
     cuda: &'c Cuda,
     rows: usize,
     share: Option<sparkflash_model::TpPlan>,
+    segments: &'c [LaneSegment],
 }
 
 impl<'c> RowsCx<'c> {
@@ -867,8 +954,27 @@ impl<'c> RowsCx<'c> {
         rows: usize,
         share: Option<sparkflash_model::TpPlan>,
     ) -> Self {
-        Self { cuda, rows, share }
+        Self {
+            cuda,
+            rows,
+            share,
+            segments: &[],
+        }
     }
+
+    /// The pass with `segments`: a stateful body's sequences and their regions.
+    pub(super) fn with_segments(self, segments: &'c [LaneSegment]) -> Self {
+        Self { segments, ..self }
+    }
+}
+
+/// One sequence of a rows pass for a body with state in the lanes: its rows (from `first`), its
+/// position before the pass, and the part's regions in its lane, in the part's order.
+pub(super) struct LaneSegment {
+    pub(super) first: usize,
+    pub(super) rows: usize,
+    pub(super) position: usize,
+    pub(super) regions: Vec<Deviceptr>,
 }
 
 impl sparkflash_ops::roles::Launcher for RowsCx<'_> {
@@ -893,7 +999,14 @@ impl sparkflash_ops::roles::DeviceCx for RowsCx<'_> {
     }
 
     fn segments(&self) -> impl Iterator<Item = sparkflash_ops::roles::SegmentRows<'_>> + '_ {
-        std::iter::empty()
+        self.segments
+            .iter()
+            .map(|segment| sparkflash_ops::roles::SegmentRows {
+                first: segment.first,
+                rows: segment.rows,
+                position: segment.position,
+                regions: &segment.regions,
+            })
     }
 
     fn share(&self) -> Option<sparkflash_model::TpPlan> {
@@ -1329,6 +1442,10 @@ impl DeviceLayer<'_> {
                     self.run_layer_attn(rows, layer, p0, n)?;
                     attention_pending = true;
                 }
+                Part::GqaAttention if !attention_pending => {
+                    self.run_layer_grouped(rows, layer, p0, n)?;
+                    attention_pending = true;
+                }
                 Part::DenseMlp if attention_pending => {
                     self.run_dense_mlp(rows, layer, n)?;
                     attention_pending = false;
@@ -1356,6 +1473,156 @@ impl DeviceLayer<'_> {
             self.rows_post(rows, n, residual, b.attn_mix, b.reduced, b.stream)?;
         }
         Ok(())
+    }
+
+    /// This rank's grouped-query shape: the stack's grouped-query geometry with this rank's
+    /// query heads and key/value heads (a count under the world is shared), or `None` for a
+    /// stack with no grouped-query block.
+    ///
+    /// # Errors
+    /// A head count the group does not split.
+    pub(super) fn grouped_shape(&self) -> Result<Option<sparkflash_ops::roles::GqaShape>, String> {
+        let values = crate::plan::description().values();
+        if values.gqa_layers.is_empty() {
+            return Ok(None);
+        }
+        let geometry = values.gqa.ok_or(
+            "rows grouped-query attention: the stack has grouped-query blocks and no geometry",
+        )?;
+        let plan = sparkflash_model::TpPlan::new(self.routed_geometry.world, self.tp_rank)
+            .map_err(|error| error.to_string())?;
+        let split = |total: usize, axis: sparkflash_model::TpAxis| {
+            plan.split(total, axis, 1)
+                .map(|split| split.per_rank)
+                .map_err(|error| format!("rows grouped-query attention: {error}"))
+        };
+        Ok(Some(sparkflash_ops::roles::GqaShape {
+            heads: split(geometry.heads, sparkflash_model::TpAxis::Heads)?,
+            kv_heads: split(geometry.kv_heads, sparkflash_model::TpAxis::KvHeads)?,
+            head_dim: geometry.head_dim,
+            gated: false,
+            rotary: geometry.rotary,
+            theta: geometry.theta as f32,
+        }))
+    }
+
+    /// A grouped-query block's attention: the previous layer's post and the entry seam
+    /// ([Self::run_layer_attn_seam]), the shared grouped-query body
+    /// ([sparkflash_ops::roles::GqaLayer]) over the seam's f32 rows with its four projections on
+    /// the dense format route and each sequence's key/value cache in its lane, the output's BF16
+    /// rank partials, then the base's attention all-reduce. A split chunk is refused: the body
+    /// projects whole rows.
+    fn run_layer_grouped(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::dense_format::{DenseIo, DenseMatrix, RowForm};
+        if self.sp_rows(rows, n).is_some() {
+            return Err(format!(
+                "rows layer {layer}: a split chunk reached a grouped-query block; the body projects whole rows (enable_prefill_sp)"
+            ));
+        }
+        let grouped = rows.grouped.ok_or_else(|| {
+            format!("rows layer {layer}: the rows state carved no grouped-query rows")
+        })?;
+        let route = self.layer_dense(layer).grouped.ok_or_else(|| {
+            format!(
+                "rows layer {layer}: the grouped-query block has no dense format route (attach_dense_format)"
+            )
+        })?;
+        let lanes = self.lanes.as_ref().ok_or_else(|| {
+            format!(
+                "rows layer {layer}: a grouped-query block keeps its key/value cache in the lanes, and none are attached"
+            )
+        })?;
+        let segments = self
+            .step_segs(p0, n)
+            .iter()
+            .map(|seg| {
+                let lane = if seg.lane == NO_LANE {
+                    lanes.selected
+                } else {
+                    seg.lane
+                };
+                let (keys, values) = lanes
+                    .pointers(lane)
+                    .grouped
+                    .get(layer)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        format!("rows layer {layer}: lane {lane} holds no grouped-query cache")
+                    })?;
+                Ok(LaneSegment {
+                    first: seg.row0,
+                    rows: seg.n,
+                    position: seg.p0,
+                    regions: vec![Deviceptr(keys), Deviceptr(values)],
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let bind = self
+            .attention
+            .ok_or_else(|| format!("rows layer {layer}: no attention bind"))?;
+        let lookup = |tail: &str| -> Result<(Deviceptr, Deviceptr), String> {
+            let name = crate::plan::layer_claim(layer, tail);
+            bind.pointers
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("rows layer {layer}: the bind has no {name}"))
+        };
+        let dim = self.dim;
+        let shape = grouped.shape;
+        let (query, kv) = (shape.query_width(), shape.kv_width());
+        let linear = |tail: &str, (cols, inner): (usize, usize), output: RowForm| {
+            lookup(tail).map(|(weight, scales)| RouteLinear {
+                route,
+                matrix: DenseMatrix {
+                    weight: weight.0,
+                    scales: scales.0,
+                    cols,
+                    inner,
+                },
+                io: DenseIo::new(RowForm::F32, output),
+            })
+        };
+        let q = linear("attn.wq.weight", (query, dim), RowForm::F32)?;
+        let k = linear("attn.wk.weight", (kv, dim), RowForm::F32)?;
+        let v = linear("attn.wv.weight", (kv, dim), RowForm::F32)?;
+        let o = linear("attn.wo.weight", (dim, query), RowForm::Bf16)?;
+        self.run_layer_attn_seam(rows, layer, p0, n)?;
+        let b = rows.b;
+        let world = self.routed_geometry.world;
+        let share = (world > 1)
+            .then(|| sparkflash_model::TpPlan::new(world, self.tp_rank))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        sparkflash_ops::roles::GqaLayer {
+            q: &q,
+            k: &k,
+            v: &v,
+            o: &o,
+            norms: (None, None),
+        }
+        .run(
+            &RowsCx::new(self.cuda, n, share).with_segments(&segments),
+            (&grouped.attention, &grouped.norm),
+            shape,
+            &grouped.rows,
+            (Deviceptr(b.normed), Deviceptr(b.attn_out)),
+            (crate::plan::description().values().norm_eps as f32, false),
+        )
+        .map_err(|error| format!("rows layer {layer}: {error}"))?;
+        self.reduce_layer_rows(
+            rows,
+            "all_reduce",
+            span(b.attn_out, n * dim * 2),
+            span(b.reduced, n * dim * 2),
+            n,
+        )
     }
 
     /// A dense-FFN block's MLP: the attention's post and the FFN seam (the fused block's
