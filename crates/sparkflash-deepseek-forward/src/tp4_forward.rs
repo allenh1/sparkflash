@@ -3533,6 +3533,12 @@ impl AttentionBody {
             store_zero: std::cell::Cell::new(true),
         };
         for layer in 0..config.n_layers {
+            // A block without the MLA part (a grouped-query one) has no sink row; its slot stays
+            // empty and the MLA body never runs it.
+            if !crate::plan::block_has_part(layer, sparkflash_model::Part::MlaAttention) {
+                body.sinks.push(Vec::new());
+                continue;
+            }
             let sink = read_arena_bytes(
                 cuda,
                 arena,
@@ -12849,7 +12855,9 @@ impl<'a> DeviceLayer<'a> {
         )
         .map_err(|error| format!("layer device: attention output geometry: {error}"))?;
         if let Some(plan) = plan {
-            for layer in 0..config.n_layers {
+            for layer in (0..config.n_layers).filter(|&layer| {
+                crate::plan::block_has_part(layer, sparkflash_model::Part::MlaAttention)
+            }) {
                 for (name, want) in [
                     (
                         crate::plan::layer_claim(layer, "attn.wo_a.weight"),
@@ -12893,6 +12901,11 @@ impl<'a> DeviceLayer<'a> {
             .ok_or_else(|| "layer device: the sink pool width overflows".to_owned())?;
         let mut sink_bytes = Vec::with_capacity(sink_pool_bytes);
         for layer in 0..config.n_layers {
+            // A block without the MLA part keeps a zero row: the pool is indexed by layer.
+            if !crate::plan::block_has_part(layer, sparkflash_model::Part::MlaAttention) {
+                sink_bytes.resize(sink_bytes.len() + sink_stride, 0);
+                continue;
+            }
             let sink = read_arena_bytes(
                 cuda,
                 arena,
@@ -15521,6 +15534,12 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         let has_attention =
             crate::plan::block_has_part(layer, sparkflash_model::Part::MlaAttention);
         let has_ffn = crate::plan::block_has_part(layer, sparkflash_model::Part::Moe);
+        // The one-token loop has no grouped-query stage: such a block runs on the rows path.
+        if crate::plan::block_has_part(layer, sparkflash_model::Part::GqaAttention) {
+            return Err(format!(
+                "layer device: layer {layer} is a grouped-query attention block, which the one-token stage loop has no stage for; it runs on the rows path"
+            ));
+        }
         // The one-token loop has no dense MLP stage: a dense-FFN block runs on the rows path.
         if crate::plan::block_has_part(layer, sparkflash_model::Part::DenseMlp) {
             return Err(format!(
