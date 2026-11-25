@@ -3549,7 +3549,7 @@ impl AttentionBody {
         for layer in 0..config.n_layers {
             // A block without the MLA part (a grouped-query one) has no sink row; its slot stays
             // empty and the MLA body never runs it.
-            if !crate::plan::block_has_part(layer, sparkflash_model::Part::MlaAttention) {
+            if !crate::plan::release_mla(layer) {
                 body.sinks.push(Vec::new());
                 continue;
             }
@@ -12886,9 +12886,7 @@ impl<'a> DeviceLayer<'a> {
         )
         .map_err(|error| format!("layer device: attention output geometry: {error}"))?;
         if let Some(plan) = plan {
-            for layer in (0..config.n_layers).filter(|&layer| {
-                crate::plan::block_has_part(layer, sparkflash_model::Part::MlaAttention)
-            }) {
+            for layer in (0..config.n_layers).filter(|&layer| crate::plan::release_mla(layer)) {
                 for (name, want) in [
                     (
                         crate::plan::layer_claim(layer, "attn.wo_a.weight"),
@@ -12933,7 +12931,7 @@ impl<'a> DeviceLayer<'a> {
         let mut sink_bytes = Vec::with_capacity(sink_pool_bytes);
         for layer in 0..config.n_layers {
             // A block without the MLA part keeps a zero row: the pool is indexed by layer.
-            if !crate::plan::block_has_part(layer, sparkflash_model::Part::MlaAttention) {
+            if !crate::plan::release_mla(layer) {
                 sink_bytes.resize(sink_bytes.len() + sink_stride, 0);
                 continue;
             }

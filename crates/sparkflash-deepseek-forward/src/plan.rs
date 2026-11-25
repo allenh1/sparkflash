@@ -1324,6 +1324,22 @@ pub fn block_has_part(layer: usize, part: Part) -> bool {
     language_block(layer).is_some_and(|block| block.parts.iter().any(|p| p.part == part))
 }
 
+/// Whether the description states its producer's wiring beside the release's
+/// ([sparkflash_engine::config::StatedWiring]): every block of such a stack runs
+/// [BlockSteps::Stated].
+#[must_use]
+pub fn stated_stack() -> bool {
+    !description().config().stated().is_release()
+}
+
+/// Whether block `layer` runs the release's MLA (the V4 latent with its sink, window, compression
+/// and grouped output). A stated stack's MLA is the absorbed form ([StatedMixer::Absorbed]),
+/// which the stated walk runs and which claims none of those tensors.
+#[must_use]
+pub fn release_mla(layer: usize) -> bool {
+    block_has_part(layer, Part::MlaAttention) && !stated_stack()
+}
+
 /// One fact a language block's part instances carry.
 #[must_use]
 pub fn layer_fact(layer: usize, name: &str) -> Option<&'static FactValue> {
@@ -1487,10 +1503,11 @@ pub struct StatedBlock {
     pub ffn: StatedFfn,
 }
 
-/// The parts a [BlockSteps::Stated] block may carry: the manifold mix and its norms, one token
-/// mixer (KDA, or the MLA with its indexer) and one FFN.
-const STATED_PARTS: [Part; 7] = [
+/// The parts a [BlockSteps::Stated] block may carry: the manifold mix (its tensors and its
+/// stated facts) and its norms, one token mixer (KDA, or the MLA with its indexer) and one FFN.
+const STATED_PARTS: [Part; 8] = [
     Part::RmsNorm,
+    Part::HyperConnection,
     Part::ManifoldHyperConnection,
     Part::KdaScan,
     Part::MlaAttention,
