@@ -50,6 +50,7 @@ pub mod layer_zero;
 pub mod mhc;
 pub mod moe;
 pub mod mtp;
+pub mod recurrent;
 mod weight_view;
 
 use crate::config::ModelConfig;
@@ -72,6 +73,8 @@ pub struct SequenceState {
     attention: Vec<attention::AttnState>,
     /// Every backbone block's grouped-query cache; empty at an MLA block.
     grouped: Vec<grouped::GroupedCache>,
+    /// Every backbone block's Gated DeltaNet state; empty at an attention block.
+    recurrent: Vec<recurrent::RecurrentState>,
 }
 
 impl SequenceState {
@@ -84,6 +87,7 @@ impl SequenceState {
                 .map(|_| attention::AttnState::for_config(config))
                 .collect(),
             grouped: vec![grouped::GroupedCache::default(); config.n_layers],
+            recurrent: vec![recurrent::RecurrentState::default(); config.n_layers],
         }
     }
 
@@ -1674,7 +1678,27 @@ impl InferenceEngine {
             u64_bytes(wide),
             "reference attention arithmetic over the window KV",
         );
-        if config.gqa_layers.contains(&layer) {
+        if config.gdn_layers.contains(&layer) {
+            // A Gated DeltaNet block computes its mixer whole on every rank, as a grouped-query
+            // block does: the host path has no recurrent shard.
+            if attention.is_some() {
+                return Err(EngineError::Shape {
+                    what: format!("layer {layer} attention"),
+                    detail: "a Gated DeltaNet block runs on the host; a device projection backend is MLA's and cannot run it".to_owned(),
+                });
+            }
+            recurrent::recurrent_attention_forward(
+                config,
+                layer,
+                &prefix,
+                &scratch.attn_in,
+                start_pos,
+                &mut state.recurrent[layer],
+                source,
+                &mut scratch.attn_out,
+                self.limit,
+            )?;
+        } else if config.gqa_layers.contains(&layer) {
             // A grouped-query block computes its attention whole on every rank: the host path
             // has no grouped-query shard, and a device projection backend is MLA's.
             if attention.is_some() {

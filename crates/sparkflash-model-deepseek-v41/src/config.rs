@@ -887,6 +887,10 @@ mod released {
         /// The conv's taps.
         #[serde(default)]
         linear_conv_kernel_dim: Option<usize>,
+        /// The Gated DeltaNet's output gate; SiLU, the Qwen3-Next default, is the only one a
+        /// DeepSeek-shaped stack runs.
+        #[serde(default)]
+        output_gate_type: Option<String>,
         /// Backbone blocks.
         num_hidden_layers: usize,
         /// DSpark stages; the runtime name is `n_mtp_layers`.
@@ -1292,6 +1296,18 @@ mod released {
             text.linear_value_head_dim,
             text.linear_conv_kernel_dim,
         ];
+        if let Some(gate) = text
+            .output_gate_type
+            .as_deref()
+            .filter(|gate| *gate != "silu")
+        {
+            return Err(ConfigError::Invalid {
+                field: "text_config.output_gate_type",
+                detail: format!(
+                    "the Gated DeltaNet output gate is {gate:?}; this stack's recurrent blocks take silu"
+                ),
+            });
+        }
         let gdn = match (linear, gdn_layers.is_empty()) {
             (
                 [

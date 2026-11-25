@@ -1475,7 +1475,7 @@ fn layer_index(cfg: &ModelConfig, prefix: &str) -> Result<usize, EngineError> {
 }
 
 /// `F.softplus(x)` with `beta = 1` and PyTorch's threshold of 20 (model.py:816-817).
-fn softplus(x: f32) -> f32 {
+pub(crate) fn softplus(x: f32) -> f32 {
     if x > SOFTPLUS_THRESHOLD {
         x
     } else {
