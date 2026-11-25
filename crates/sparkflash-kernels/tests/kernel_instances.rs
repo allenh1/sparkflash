@@ -826,7 +826,9 @@ fn the_second_shape_loads_a_build_of_its_own_at_every_world() {
                 .unwrap_or_else(|| panic!("world {world}: {stem} has no second-shape build"));
             let cubin = line.split('\t').nth(1).expect("stem<TAB>cubin");
             assert!(
-                suffixes.iter().any(|suffix| cubin == format!("{stem}{suffix}")),
+                suffixes
+                    .iter()
+                    .any(|suffix| cubin == format!("{stem}{suffix}")),
                 "world {world}: {stem} loads {cubin}"
             );
         }

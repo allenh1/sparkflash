@@ -73,13 +73,17 @@ __device__ __forceinline__ void df_project(const AT *__restrict__ a, const uint8
     }
 
 // The four row forms (f32 or BF16 in, f32 or BF16 out) of each stored class: FP8 on 128 x 128
-// tiles with an f32 or a BF16 inverse scale, and BF16 row-major.
-#define DF_CLASS(io, a_t, out_t)                                                               \
-    DF_ENTRY(dense_format_##io##_fp8_sm121, SPM_W_FP8, float, a_t, out_t)                       \
-    DF_ENTRY(dense_format_##io##_fp8_bf16_sm121, SPM_W_FP8, __nv_bfloat16, a_t, out_t)          \
-    DF_ENTRY(dense_format_##io##_bf16_sm121, SPM_W_BF16, float, a_t, out_t)
-
-DF_CLASS(f32a_f32o, float, float)
-DF_CLASS(f32a_bf16o, float, __nv_bfloat16)
-DF_CLASS(bf16a_f32o, __nv_bfloat16, float)
-DF_CLASS(bf16a_bf16o, __nv_bfloat16, __nv_bfloat16)
+// tiles with an f32 or a BF16 inverse scale, and BF16 row-major. Each name is spelled out:
+// instances.toml names them.
+DF_ENTRY(dense_format_f32a_f32o_fp8_sm121, SPM_W_FP8, float, float, float)
+DF_ENTRY(dense_format_f32a_f32o_fp8_bf16_sm121, SPM_W_FP8, __nv_bfloat16, float, float)
+DF_ENTRY(dense_format_f32a_f32o_bf16_sm121, SPM_W_BF16, float, float, float)
+DF_ENTRY(dense_format_f32a_bf16o_fp8_sm121, SPM_W_FP8, float, float, __nv_bfloat16)
+DF_ENTRY(dense_format_f32a_bf16o_fp8_bf16_sm121, SPM_W_FP8, __nv_bfloat16, float, __nv_bfloat16)
+DF_ENTRY(dense_format_f32a_bf16o_bf16_sm121, SPM_W_BF16, float, float, __nv_bfloat16)
+DF_ENTRY(dense_format_bf16a_f32o_fp8_sm121, SPM_W_FP8, float, __nv_bfloat16, float)
+DF_ENTRY(dense_format_bf16a_f32o_fp8_bf16_sm121, SPM_W_FP8, __nv_bfloat16, __nv_bfloat16, float)
+DF_ENTRY(dense_format_bf16a_f32o_bf16_sm121, SPM_W_BF16, float, __nv_bfloat16, float)
+DF_ENTRY(dense_format_bf16a_bf16o_fp8_sm121, SPM_W_FP8, float, __nv_bfloat16, __nv_bfloat16)
+DF_ENTRY(dense_format_bf16a_bf16o_fp8_bf16_sm121, SPM_W_FP8, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16)
+DF_ENTRY(dense_format_bf16a_bf16o_bf16_sm121, SPM_W_BF16, float, __nv_bfloat16, __nv_bfloat16)

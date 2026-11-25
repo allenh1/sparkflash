@@ -716,7 +716,9 @@ from the host's (relative L2, with the normed input equal to 4.6e-6), the FFN 2.
 stream 4.2%. So the world-1 PASS shows the ids agree where the margins hold, not that the two
 arms' bits agree, and an exact-id bar between them at W > 1 is a property of the fixture's
 margins, not of the implementation. Worlds 2 and 4 are recorded as **not passed, no fault
-found**; the bar they are held to is the open decision.
+found**.
+
+**Decision (2026-11-24, the owner): there is no exact-id bar at W > 1 on the synthetic fixture.** Its near-uniform logits flip on the split's BF16 reduce, which is the served layout's arithmetic and not a fault, and the released models serve correctly at four ranks on this branch (DeepSeek's greedy answers equal production's; Inkling, GLM and Qwen3.8 answer correctly). World 1 keeps the exact-id bar against the host arm; worlds 2 and 4 are proved by opening, binding and serving the fixture, and by the released models.
 
 **The stored-format sweep at world 1 (2026-11-24).** The eight non-released variants were written
 and run on the device arm at world 1 (`fp8-f32`, `fp8-bf16`, `bf16`, `packed-bf16`, `nvfp4-qwen`,
