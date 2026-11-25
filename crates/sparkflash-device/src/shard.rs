@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 
 use sparkflash_engine::WeightError;
 use sparkflash_engine::safetensors::SafeTensorsSource;
+use sparkflash_engine::weights::WeightSource;
 use sparkflash_model::TpPlan;
 
 /// The checkpoint axis a tensor shards along under tensor parallelism.
@@ -126,6 +127,149 @@ pub struct ShardPlan {
     tp_rank: usize,
     tp_world: usize,
     rules: BTreeMap<String, ShardRule>,
+}
+
+/// A packed BF16 weight as its logical rows: the stored `[rows, row_bytes]` U8 tensor and the
+/// escape list the checkpoint holds beside it as `<matrix>.escape`.
+///
+/// The packed word form is an arrangement of BF16 rows, not another arithmetic
+/// ([sparkflash_model::packed_bf16]). A rank's slice of it is a slice of the logical rows, so the
+/// plan reads the whole store with its escape list, unpacks it, and cuts the slice from the BF16
+/// rows; a Row (inner-axis) slice cannot be cut from the packed words at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedWeight {
+    /// The escape list's checkpoint name.
+    pub escape: String,
+    /// The logical rows.
+    pub rows: usize,
+    /// The logical BF16 columns.
+    pub columns: usize,
+}
+
+impl PackedWeight {
+    /// The escape list's name beside a packed weight's name.
+    #[must_use]
+    pub fn escape_name(weight: &str) -> Option<String> {
+        weight
+            .strip_suffix(".weight")
+            .map(|base| format!("{base}.escape"))
+    }
+
+    /// The packed store behind `name`, when the checkpoint holds its escape list beside it.
+    ///
+    /// # Errors
+    /// [ShardError::Plan] when an escape list sits beside a tensor that is not `[rows, stride]`
+    /// U8 with one of the packed form's strides.
+    pub fn of(
+        dtype: &str,
+        shape: &[usize],
+        name: &str,
+        has_escape: bool,
+    ) -> Result<Option<Self>, ShardError> {
+        let Some(escape) = Self::escape_name(name).filter(|_| has_escape) else {
+            return Ok(None);
+        };
+        let [rows, stride] = shape else {
+            return Err(ShardError::Plan(format!(
+                "{name}: a packed BF16 weight (its escape list {escape} beside it) is stored two-dimensional, not {shape:?}"
+            )));
+        };
+        if dtype != "U8" {
+            return Err(ShardError::Plan(format!(
+                "{name}: a packed BF16 weight (its escape list {escape} beside it) is stored as U8 bytes, not {dtype}"
+            )));
+        }
+        let columns = sparkflash_model::packed_bf16::columns_of_row_bytes(*stride).ok_or_else(|| {
+            ShardError::Plan(format!(
+                "{name}: a packed row of {stride} bytes is not one of the packed BF16 form's strides"
+            ))
+        })?;
+        Ok(Some(Self {
+            escape,
+            rows: *rows,
+            columns,
+        }))
+    }
+
+    /// The packed weight behind `name` in a checkpoint.
+    ///
+    /// # Errors
+    /// As [Self::of], and a header read failure.
+    pub fn in_source<S: WeightSource + ?Sized>(
+        source: &S,
+        name: &str,
+    ) -> Result<Option<Self>, ShardError> {
+        let has_escape = Self::escape_name(name).is_some_and(|escape| source.contains(&escape));
+        if !has_escape {
+            return Ok(None);
+        }
+        let spec = source.spec(name)?;
+        Self::of(spec.dtype.name(), &spec.shape, name, true)
+    }
+
+    /// The logical shape the rows stand for.
+    #[must_use]
+    pub fn shape(&self) -> Vec<usize> {
+        vec![self.rows, self.columns]
+    }
+
+    /// The logical BF16 bytes.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        (self.rows * self.columns * 2) as u64
+    }
+
+    /// Reads the store and its escape list and unpacks the whole matrix to BF16 rows.
+    ///
+    /// # Errors
+    /// A read failure, or a store and escape list that are not one matrix.
+    pub fn unpack<S: WeightSource + ?Sized>(
+        &self,
+        source: &S,
+        name: &str,
+    ) -> Result<Vec<u8>, ShardError> {
+        let packed = source.read(name)?;
+        let escapes = source.read(&self.escape)?;
+        if escapes.len() % 4 != 0 {
+            return Err(ShardError::Plan(format!(
+                "{}: an escape list of {} bytes is not whole u32 entries",
+                self.escape,
+                escapes.len()
+            )));
+        }
+        let entries: Vec<u32> = escapes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|entry| u32::from_le_bytes(*entry))
+            .collect();
+        sparkflash_model::packed_bf16::unpack(self.rows, self.columns, &packed, &entries)
+            .map_err(|error| ShardError::Plan(format!("{name}: {error}")))
+    }
+}
+
+/// The dtype, shape and byte length a planned tensor is sliced by: a packed weight's logical BF16
+/// rows, any other tensor's header.
+fn logical_header(
+    source: &SafeTensorsSource,
+    name: &str,
+) -> Result<(String, Vec<usize>, u64, Option<PackedWeight>), ShardError> {
+    if let Some(packed) = PackedWeight::in_source(source, name)? {
+        return Ok((
+            "BF16".to_owned(),
+            packed.shape(),
+            packed.bytes(),
+            Some(packed),
+        ));
+    }
+    let header = source.header(name)?;
+    let descriptor = header.tensor(name)?;
+    Ok((
+        descriptor.dtype.clone(),
+        descriptor.shape.clone(),
+        descriptor.byte_len(),
+        None,
+    ))
 }
 
 impl ShardPlan {
@@ -234,10 +378,9 @@ impl ShardPlan {
     pub fn verify(&self, source: &SafeTensorsSource) -> Result<Vec<VerifiedTensor>, ShardError> {
         let mut verified = Vec::with_capacity(self.rules.len());
         for (name, rule) in &self.rules {
-            let header = source.header(name)?;
-            let descriptor = header.tensor(name)?;
-            let geometry = self.geometry(name, *rule, &descriptor.shape, descriptor.byte_len())?;
-            let mut shard_shape = descriptor.shape.clone();
+            let (dtype, shape, bytes, _) = logical_header(source, name)?;
+            let geometry = self.geometry(name, *rule, &shape, bytes)?;
+            let mut shard_shape = shape.clone();
             match rule {
                 ShardRule::Replicated => {}
                 ShardRule::Column => shard_shape[0] /= self.tp_world,
@@ -246,8 +389,8 @@ impl ShardPlan {
             verified.push(VerifiedTensor {
                 name: name.clone(),
                 rule: *rule,
-                dtype: descriptor.dtype.clone(),
-                stored_shape: descriptor.shape.clone(),
+                dtype,
+                stored_shape: shape,
                 shard_shape,
                 shard_bytes: geometry.shard_bytes,
                 row_bytes: geometry.row_bytes,
@@ -283,9 +426,8 @@ impl ShardPlan {
         let rule = self
             .rule(name)
             .ok_or_else(|| ShardError::Plan(format!("the plan does not describe {name}")))?;
-        let header = source.header(name)?;
-        let descriptor = header.tensor(name)?;
-        let geometry = self.geometry(name, rule, &descriptor.shape, descriptor.byte_len())?;
+        let (dtype, shape, bytes, packed) = logical_header(source, name)?;
+        let geometry = self.geometry(name, rule, &shape, bytes)?;
         if dst.len() as u64 != geometry.shard_bytes {
             return Err(ShardError::Plan(format!(
                 "{name}: destination buffer is {} bytes, expected {} shard bytes",
@@ -293,9 +435,22 @@ impl ShardPlan {
                 geometry.shard_bytes
             )));
         }
-        let ranges = self.byte_ranges(rule, &descriptor.shape, geometry);
-        source.read_ranges_into(name, &ranges, dst)?;
-        let mut shard_shape = descriptor.shape.clone();
+        let ranges = self.byte_ranges(rule, &shape, geometry);
+        match packed {
+            // The slice is cut from the unpacked rows by the same ranges a stored BF16 tensor
+            // of the logical shape is read by.
+            Some(packed) => {
+                let rows = packed.unpack(source, name)?;
+                let mut at = 0usize;
+                for (offset, len) in &ranges {
+                    let offset = *offset as usize;
+                    dst[at..at + len].copy_from_slice(&rows[offset..offset + len]);
+                    at += len;
+                }
+            }
+            None => source.read_ranges_into(name, &ranges, dst)?,
+        }
+        let mut shard_shape = shape.clone();
         match rule {
             ShardRule::Replicated => {}
             ShardRule::Column => shard_shape[0] /= self.tp_world,
@@ -304,8 +459,8 @@ impl ShardPlan {
         Ok(VerifiedTensor {
             name: name.to_owned(),
             rule,
-            dtype: descriptor.dtype.clone(),
-            stored_shape: descriptor.shape.clone(),
+            dtype,
+            stored_shape: shape,
             shard_shape,
             shard_bytes: geometry.shard_bytes,
             row_bytes: geometry.row_bytes,
@@ -322,9 +477,8 @@ impl ShardPlan {
         let rule = self
             .rule(name)
             .ok_or_else(|| ShardError::Plan(format!("the plan does not describe {name}")))?;
-        let header = source.header(name)?;
-        let descriptor = header.tensor(name)?;
-        let geometry = self.geometry(name, rule, &descriptor.shape, descriptor.byte_len())?;
+        let (_, shape, bytes, _) = logical_header(source, name)?;
+        let geometry = self.geometry(name, rule, &shape, bytes)?;
         let len = usize::try_from(geometry.shard_bytes).map_err(|_| {
             ShardError::Plan(format!(
                 "{name}: shard bytes {} do not fit usize",
@@ -509,6 +663,72 @@ mod tests {
         plan.insert("t.row", ShardRule::Row);
         plan.insert("t.rep", ShardRule::Replicated);
         plan
+    }
+
+    /// A 4 x 512 BF16 matrix with words that escape, packed with its escape list beside it.
+    fn packed_fixture() -> (tempfile::TempDir, SafeTensorsSource, Vec<u8>) {
+        let (rows, columns) = (4usize, 512usize);
+        let mut logical = Vec::with_capacity(rows * columns * 2);
+        for index in 0..rows * columns {
+            // Every 37th word sits far under its step's largest, so the list is not empty.
+            let word: u16 = if index % 37 == 0 {
+                0x0001
+            } else {
+                0x3f80 ^ (index as u16 & 0x7f)
+            };
+            logical.extend_from_slice(&word.to_le_bytes());
+        }
+        let (packed, escapes) =
+            sparkflash_model::packed_bf16::pack(rows, columns, &logical).expect("pack");
+        let stride = sparkflash_model::packed_bf16::row_bytes(columns);
+        let escape_bytes: Vec<u8> = escapes
+            .iter()
+            .flat_map(|entry| entry.to_le_bytes())
+            .collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)> = vec![
+            ("m.weight", "U8", vec![rows, stride], packed),
+            (
+                "m.escape",
+                "U8",
+                vec![escape_bytes.len()],
+                escape_bytes.clone(),
+            ),
+        ];
+        let source = source(dir.path(), &tensors);
+        (dir, source, logical)
+    }
+
+    #[test]
+    fn a_packed_weight_is_read_as_the_slice_of_its_bf16_rows() {
+        let (_dir, source, logical) = packed_fixture();
+        let (rows, columns) = (4usize, 512usize);
+        for rank in 0..2 {
+            for rule in [ShardRule::Replicated, ShardRule::Column, ShardRule::Row] {
+                let mut plan = ShardPlan::new(rank, 2).expect("plan");
+                plan.insert("m.weight", rule);
+                let shard = plan
+                    .read(&source, "m.weight")
+                    .expect("the packed slice reads");
+                assert_eq!(shard.dtype, "BF16");
+                assert_eq!(shard.stored_shape, vec![rows, columns]);
+                let expected: Vec<u8> = match rule {
+                    ShardRule::Replicated => logical.clone(),
+                    ShardRule::Column => {
+                        logical[rank * 2 * columns * 2..(rank + 1) * 2 * columns * 2].to_vec()
+                    }
+                    ShardRule::Row => (0..rows)
+                        .flat_map(|row| {
+                            let at = (row * columns + rank * columns / 2) * 2;
+                            logical[at..at + columns].to_vec()
+                        })
+                        .collect(),
+                };
+                assert_eq!(shard.bytes, expected, "rank {rank} {rule:?}");
+                let verified = plan.verify(&source).expect("verify");
+                assert_eq!(verified[0].shard_bytes, expected.len() as u64);
+            }
+        }
     }
 
     #[test]

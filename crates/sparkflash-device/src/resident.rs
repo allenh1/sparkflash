@@ -357,6 +357,17 @@ pub fn classify(name: &str) -> Result<Option<Classification>, ShardError> {
             _ => Err(unknown()),
         };
     }
+    // A dense-FFN block's one gated MLP (first_k_dense_replace): the shared expert's split, the
+    // gate and up projections by their output rows and the down projection by its inner axis.
+    if let Some(rest) = tail.strip_prefix("ffn.") {
+        match rest {
+            "w1.weight" | "w1.scale" | "w3.weight" | "w3.scale" => {
+                return classified(Group::SharedColumn, ShardRule::Column);
+            }
+            "w2.weight" | "w2.scale" => return classified(Group::SharedRow, ShardRule::Row),
+            _ => {}
+        }
+    }
     if let Some(rest) = tail.strip_prefix("ffn.gate.") {
         return match rest {
             "weight" | "bias" | "bias_vl" => classified(Group::Router, ShardRule::Replicated),
@@ -580,8 +591,54 @@ impl ResidentPlan {
         tp: sparkflash_model::TpPlan,
         entries: impl IntoIterator<Item = HeaderEntry>,
     ) -> Result<Self, ShardError> {
+        let entries: Vec<HeaderEntry> = entries.into_iter().collect();
+        let names: std::collections::BTreeSet<&str> =
+            entries.iter().map(|entry| entry.name.as_str()).collect();
+        let mut packed_escapes = std::collections::BTreeSet::new();
+        let mut logical = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let has_escape = crate::shard::PackedWeight::escape_name(&entry.name)
+                .is_some_and(|escape| names.contains(escape.as_str()));
+            let Some(packed) = crate::shard::PackedWeight::of(
+                &entry.dtype,
+                &entry.shape,
+                &entry.name,
+                has_escape,
+            )?
+            else {
+                logical.push(entry.clone());
+                continue;
+            };
+            // A packed weight is planned as the BF16 rows it stands for: the slice a rank holds
+            // and the bytes it uploads are those rows', and its escape list is read with it.
+            if let Some(format) = entry.format
+                && format.layout() != sparkflash_model::format::FormatLayout::Packed
+            {
+                return Err(ShardError::Plan(format!(
+                    "{}: the checkpoint stores it packed (its escape list {} beside it), but the plan reads it as {}",
+                    entry.name,
+                    packed.escape,
+                    format.name()
+                )));
+            }
+            packed_escapes.insert(packed.escape.clone());
+            logical.push(HeaderEntry {
+                dtype: "BF16".to_owned(),
+                shape: packed.shape(),
+                ..entry.clone()
+            });
+        }
         let mut shards = Vec::new();
-        for entry in entries {
+        for entry in logical {
+            if packed_escapes.contains(&entry.name) {
+                continue;
+            }
+            if entry.name.ends_with(".escape") {
+                return Err(ShardError::Plan(format!(
+                    "{}: an escape list with no packed weight beside it",
+                    entry.name
+                )));
+            }
             let Some(classification) = classify(&entry.name)? else {
                 continue;
             };
@@ -867,6 +924,43 @@ mod tests {
 
     fn entry(name: &str, dtype: &str, shape: &[usize]) -> HeaderEntry {
         HeaderEntry::new(name, dtype, shape.to_vec())
+    }
+
+    #[test]
+    fn a_packed_weight_is_planned_as_its_bf16_rows_and_carries_its_escape_list() {
+        let stride = sparkflash_model::packed_bf16::row_bytes(512);
+        let plan = ResidentPlan::plan(
+            0,
+            2,
+            [
+                entry("layers.0.attn.wq_b.weight", "U8", &[64, stride]),
+                entry("layers.0.attn.wq_b.escape", "U8", &[260]),
+            ],
+        )
+        .expect("the packed weight plans");
+        let shards = plan.shards();
+        assert_eq!(shards.len(), 1, "the escape list is read with its weight");
+        assert_eq!(shards[0].dtype, "BF16");
+        assert_eq!(shards[0].stored_shape, vec![64, 512]);
+        assert_eq!(shards[0].shard_shape, vec![32, 512]);
+        assert_eq!(shards[0].shard_bytes, 32 * 512 * 2);
+        let orphan = ResidentPlan::plan(0, 2, [entry("layers.0.attn.wq_b.escape", "U8", &[260])])
+            .expect_err("an escape list alone is refused");
+        assert!(orphan.to_string().contains("no packed weight"), "{orphan}");
+    }
+
+    #[test]
+    fn a_dense_ffn_block_splits_like_the_shared_expert() {
+        for (leaf, rule) in [
+            ("w1.weight", ShardRule::Column),
+            ("w3.scale", ShardRule::Column),
+            ("w2.weight", ShardRule::Row),
+        ] {
+            let name = format!("layers.0.ffn.{leaf}");
+            let classification = classify(&name).expect("known").expect("resident");
+            assert_eq!(classification.rule, Some(rule), "{name}");
+        }
+        assert!(classify("layers.0.ffn.w4.weight").is_err());
     }
 
     #[test]

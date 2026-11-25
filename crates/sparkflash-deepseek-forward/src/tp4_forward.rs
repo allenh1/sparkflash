@@ -8145,9 +8145,28 @@ fn build_shared_expert_device(
                          inner: usize|
          -> Result<sparkflash_kernels::cuda_driver::Deviceptr, String> {
             let name = format!("{base}.{leaf}.weight");
-            let codes = source.read(&name).map_err(|error| {
-                format!("shared expert (device): layer {layer} {name}: {error}")
-            })?;
+            let what =
+                |error: String| format!("shared expert (device): layer {layer} {name}: {error}");
+            // A packed weight is the BF16 rows it stands for, unpacked once here with its escape
+            // list; the route reads those rows. The checkpoint and the plan must agree on it.
+            let packed = sparkflash_device::shard::PackedWeight::in_source(source, &name)
+                .map_err(|error| what(error.to_string()))?;
+            let stated = shared_format.layout() == sparkflash_model::format::FormatLayout::Packed;
+            if packed.is_some() != stated {
+                return Err(what(format!(
+                    "the plan reads it as {} but the checkpoint {} an escape list beside it",
+                    shared_format.describe(),
+                    if packed.is_some() { "stores" } else { "has no" }
+                )));
+            }
+            let codes = match packed {
+                Some(packed) => packed
+                    .unpack(source, &name)
+                    .map_err(|error| what(error.to_string()))?,
+                None => source
+                    .read(&name)
+                    .map_err(|error| what(error.to_string()))?,
+            };
             let tiled = if released {
                 sparkflash_device::arena::tile_b12x(&codes, cols, inner).map_err(|error| {
                     format!("shared expert (device): layer {layer} {name}: {error}")

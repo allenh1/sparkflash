@@ -3901,7 +3901,7 @@ impl DeviceLayer<'_> {
         ops: SharedExpertDeviceLayer,
         layer: usize,
         n: usize,
-        out: (Deviceptr, sparkflash_kernels::dense_format::RowForm),
+        out: (u64, sparkflash_kernels::dense_format::RowForm),
     ) -> Result<(), String> {
         use sparkflash_kernels::dense_format::{DenseIo, DenseMatrix, RowForm};
         let b = rows.b;
