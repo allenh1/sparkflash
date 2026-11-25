@@ -5208,7 +5208,8 @@ fn routed_slice_base(
     })?;
     let weight_name =
         crate::plan::layer_claim(layer, &format!("ffn.experts.{expert}.{leaf}.weight"));
-    let scale_name = crate::plan::layer_claim(layer, &format!("ffn.experts.{expert}.{leaf}.scale"));
+    let scale_name =
+        crate::plan::layer_scale_claim(layer, &format!("ffn.experts.{expert}.{leaf}.weight"));
     let slice_values = slice_shape[0] * slice_shape[1];
     let scale_slice = format.scale_count(values[0], values[1]);
     let weight_shape = plan_index

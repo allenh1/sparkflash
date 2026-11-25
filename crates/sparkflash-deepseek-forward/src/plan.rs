@@ -1138,6 +1138,33 @@ pub fn layer_claim_if(block: usize, tail: &str) -> Option<&'static str> {
     layer_claim_any(block, tail)
 }
 
+/// The scale plane of the weight the layer `block` claims under `weight_tail` (a `.weight`
+/// tail): the block's own `.scale` claim where its parts claim one, else the plan tensor beside
+/// the claimed weight under the base's `.scale` spelling. A layout claims a block-scaled weight
+/// alone and its checkpoint carries the inverse scale under that name
+/// (sparkflash_model::layout::checkpoint_names), so the scale is the weight's, never a guess.
+///
+/// # Panics
+/// The block claims no such weight, or the plan holds no scale beside it.
+#[must_use]
+pub fn layer_scale_claim(block: usize, weight_tail: &str) -> &'static str {
+    let stem = weight_tail
+        .strip_suffix(".weight")
+        .unwrap_or_else(|| panic!("forward open: .{weight_tail} is not a weight tail"));
+    if let Some(name) = layer_claim_any(block, &format!("{stem}.scale")) {
+        return name;
+    }
+    let weight = layer_claim(block, weight_tail);
+    let scale = format!("{}.scale", weight.strip_suffix(".weight").unwrap_or(weight));
+    description()
+        .tensors
+        .get_key_value(&scale)
+        .map(|(name, _)| name.as_str())
+        .unwrap_or_else(|| {
+            panic!("forward open: block {block} claims {weight} but the plan holds no {scale}")
+        })
+}
+
 fn layer_claim_any(block: usize, tail: &str) -> Option<&'static str> {
     let description = description();
     let suffix = format!(".{tail}");
