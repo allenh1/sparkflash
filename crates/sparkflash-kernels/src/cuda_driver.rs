@@ -5057,7 +5057,7 @@ impl Cuda {
                 note_sync(started.elapsed().as_nanos() as u64);
             }
             if r != 0 {
-                return Err(format!("cuCtxSynchronize failed: {r}"));
+                return Err(format!("cuCtxSynchronize failed: {r} after {}", kernel.name));
             }
             self.completed
                 .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
