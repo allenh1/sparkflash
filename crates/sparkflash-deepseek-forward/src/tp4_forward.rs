@@ -18453,14 +18453,15 @@ fn run_forward_loop(
             let format_dir = request.kernel_cubin_dir.ok_or_else(|| {
                 "layer device: the routed format route needs the staged cubin directory".to_owned()
             })?;
-            // A stated stack runs its experts on the stated walk's own route (the block-scaled
-            // expert GEMV at the stated holds), never the released routed device, whose launches
-            // are compiled per released shape.
+            // A stated stack runs every linear on the stated walk's tiled projection (BF16 rows
+            // and block-scaled E4M3, its experts on the block-scaled expert GEMV), never the
+            // released routed device, whose launches are compiled per released shape, nor the
+            // dense format route.
             if !crate::plan::stated_stack() {
                 device.attach_moe_routed()?;
                 device.attach_routed_format(bind, format_dir)?;
+                device.attach_dense_format(format_dir)?;
             }
-            device.attach_dense_format(format_dir)?;
             device.attach_seam_ring()?;
             if let Some(seam) = seam_wq_b.as_ref() {
                 device.set_seam_kernels(seam.hostw_symbols());
