@@ -41,6 +41,8 @@ use sparkflash_engine::weights::WeightSource;
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
 use sparkflash_model::format::StoredFormat;
+use sparkflash_model_deepseek_v41::config::Mixer;
+use sparkflash_model_deepseek_v41::tensor::{self, scale_of};
 /// Host seams are row-major BF16 weights with no scale grid and no device kernel; they are
 /// computed on the host (CompressorCache / IndexerWeights) and must never enter the device bind.
 fn is_host_seam_weight(name: &str) -> bool {
@@ -105,7 +107,7 @@ impl ResidentAttention {
                     .map_err(|error| format!("{name}: {error}"))?;
                 let tiled =
                     tile_b12x(&raw, cols, inner).map_err(|error| format!("{name}: {error}"))?;
-                let scale_name = format!("{}.scale", name.trim_end_matches(".weight"));
+                let scale_name = scale_of(&name);
                 let scales = source
                     .read(&scale_name)
                     .map_err(|error| format!("{scale_name}: {error}"))?;
@@ -184,7 +186,7 @@ impl ResidentAttention {
                 slice.bytes
             ));
         }
-        let scale_name = format!("{}.scale", name.trim_end_matches(".weight"));
+        let scale_name = scale_of(&name);
         let expected_scales = cols.div_ceil(32) * inner.div_ceil(32);
         let Some(scale) = self.arena.slice(&scale_name) else {
             return Err(format!("{name}: resident weight without its scale grid"));
@@ -235,6 +237,7 @@ pub fn rank_attention_geometry(
         ));
     }
     let wide = config.n_heads * config.head_dim;
+    let dim = config.dim;
     let split = |value: usize, axis: &str, name: &str| -> Result<usize, String> {
         if !value.is_multiple_of(world) {
             return Err(format!(
@@ -245,43 +248,45 @@ pub fn rank_attention_geometry(
     };
     let mut map = BTreeMap::new();
     for layer in 0..config.n_layers {
-        // A grouped-query block: wq/wk/wv split their output rows (the rank's heads), wo its
-        // inner axis, as the resident plan shards them.
-        if config.gqa_layers.contains(&layer) {
-            let gqa = config.gqa.ok_or_else(|| {
-                format!("rank_attention_geometry: block {layer} is grouped-query and the stack has no geometry")
-            })?;
-            let query = split(gqa.heads * gqa.head_dim, "cols", "wq")?;
-            let kv = split(gqa.kv_heads * gqa.head_dim, "cols", "wk/wv")?;
-            for (tail, shape) in [
-                ("attn.wq.weight", (query, config.dim)),
-                ("attn.wk.weight", (kv, config.dim)),
-                ("attn.wv.weight", (kv, config.dim)),
-                ("attn.wo.weight", (config.dim, query)),
-            ] {
-                map.insert(crate::plan::layer_claim(layer, tail).to_owned(), shape);
+        let mixer = config
+            .mixer(layer)
+            .map_err(|error| format!("rank_attention_geometry: {error}"))?;
+        let stacked: Vec<(&str, (usize, usize))> = match mixer {
+            // A grouped-query block: wq/wk/wv split their output rows (the rank's heads), wo
+            // its inner axis, as the resident plan shards them.
+            Mixer::Gqa(gqa) => {
+                let query = split(gqa.heads * gqa.head_dim, "cols", "wq")?;
+                let kv = split(gqa.kv_heads * gqa.head_dim, "cols", "wk/wv")?;
+                let names = tensor::GQA_TENSORS;
+                vec![
+                    (names.q, (query, dim)),
+                    (names.k, (kv, dim)),
+                    (names.v, (kv, dim)),
+                    (names.o, (dim, query)),
+                ]
             }
-            continue;
-        }
-        // A Gated DeltaNet block: every projection whole on every rank, as the resident plan
-        // keeps it, and the conv, decay vectors and gated norm its body reads beside them (BF16,
-        // bound by their stored bytes).
-        if config.gdn_layers.contains(&layer) {
-            let gdn = config.gdn.ok_or_else(|| {
-                format!("rank_attention_geometry: block {layer} is a Gated DeltaNet and the stack has no geometry")
-            })?;
-            let (key, value) = (gdn.key_heads * gdn.key_dim, gdn.value_heads * gdn.value_dim);
-            for (tail, shape) in [
-                ("attn.in_proj_qkv.weight", (2 * key + value, config.dim)),
-                ("attn.in_proj_z.weight", (value, config.dim)),
-                ("attn.in_proj_b.weight", (gdn.value_heads, config.dim)),
-                ("attn.in_proj_a.weight", (gdn.value_heads, config.dim)),
-                ("attn.out_proj.weight", (config.dim, value)),
-                ("attn.conv1d.weight", (2 * key + value, gdn.conv)),
-                ("attn.A_log", (gdn.value_heads, 1)),
-                ("attn.dt_bias", (gdn.value_heads, 1)),
-                ("attn.norm.weight", (gdn.value_dim, 1)),
-            ] {
+            // A Gated DeltaNet block: every projection whole on every rank, as the resident plan
+            // keeps it, and the conv, decay vectors and gated norm its body reads beside them (BF16,
+            // bound by their stored bytes).
+            Mixer::Gdn(gdn) => {
+                let (key, value) = (gdn.key_heads * gdn.key_dim, gdn.value_heads * gdn.value_dim);
+                let names = tensor::GDN_TENSORS;
+                vec![
+                    (names.qkv, (2 * key + value, dim)),
+                    (names.z, (value, dim)),
+                    (names.b, (gdn.value_heads, dim)),
+                    (names.a, (gdn.value_heads, dim)),
+                    (names.out, (dim, value)),
+                    (names.conv, (2 * key + value, gdn.conv)),
+                    (names.a_log, (gdn.value_heads, 1)),
+                    (names.dt_bias, (gdn.value_heads, 1)),
+                    (names.norm, (gdn.value_dim, 1)),
+                ]
+            }
+            Mixer::Mla => Vec::new(),
+        };
+        if !stacked.is_empty() {
+            for (tail, shape) in stacked {
                 map.insert(crate::plan::layer_claim(layer, tail).to_owned(), shape);
             }
             continue;
@@ -289,11 +294,11 @@ pub fn rank_attention_geometry(
         // Replicated: the whole projection on every rank.
         map.insert(
             crate::plan::layer_claim(layer, "attn.wq_a.weight").to_owned(),
-            (config.q_lora_rank, config.dim),
+            (config.q_lora_rank, dim),
         );
         map.insert(
             crate::plan::layer_claim(layer, "attn.wkv.weight").to_owned(),
-            (config.head_dim, config.dim),
+            (config.head_dim, dim),
         );
         // Column: split cols (the kernel's output rows) across ranks.
         map.insert(
@@ -311,7 +316,7 @@ pub fn rank_attention_geometry(
         map.insert(
             crate::plan::layer_claim(layer, "attn.wo_b.weight").to_owned(),
             (
-                config.dim,
+                dim,
                 split(config.o_groups * config.o_lora_rank, "inner", "wo_b")?,
             ),
         );
@@ -970,7 +975,7 @@ pub fn bind_rank_attention(
                         shard.name, weight.bytes
                     ));
                 }
-                let scale_name = format!("{}.scale", shard.name.trim_end_matches(".weight"));
+                let scale_name = scale_of(&shard.name);
                 let expected_scale = usize::try_from(scale_bytes).unwrap_or(usize::MAX);
                 let scales = arena.slice(&scale_name).ok_or_else(|| {
                     format!("{scale_name}: no arena slice for the weight's scale grid")
@@ -999,7 +1004,7 @@ pub fn bind_rank_attention(
                 // stored path by dtype and never read the second field.
                 let scaled = shard.format.is_some_and(|format| !format.is_unscaled());
                 let scales = if scaled {
-                    let scale_name = format!("{}.scale", shard.name.trim_end_matches(".weight"));
+                    let scale_name = scale_of(&shard.name);
                     let plane = arena.slice(&scale_name).ok_or_else(|| {
                         format!(
                             "{scale_name}: no arena slice for the stored scale plane of the scaled class {}",
@@ -1369,7 +1374,7 @@ fn bind_plan_pair(
             shard.name, weight.bytes
         ));
     }
-    let scale_name = format!("{}.scale", shard.name.trim_end_matches(".weight"));
+    let scale_name = scale_of(&shard.name);
     let scales = match by_name.get(scale_name.as_str()) {
         Some(scale_shard) => {
             let slice = arena
@@ -1442,13 +1447,13 @@ pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
                 )
                 .to_owned();
                 gate_up.insert(base.clone());
-                gate_up.insert(format!("{}.scale", base.trim_end_matches(".weight")));
+                gate_up.insert(scale_of(&base));
                 gate_up.extend(wide_leaf_names(&base, wide));
             }
             let base = crate::plan::layer_claim(layer, &format!("ffn.experts.{expert}.w2.weight"))
                 .to_owned();
             down.insert(base.clone());
-            down.insert(format!("{}.scale", base.trim_end_matches(".weight")));
+            down.insert(scale_of(&base));
             down.extend(wide_leaf_names(&base, wide));
         }
         for matrix in [Matrix::Gate, Matrix::Up, Matrix::Down] {
@@ -1458,7 +1463,7 @@ pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
             )
             .to_owned();
             shared.insert(base.clone());
-            shared.insert(format!("{}.scale", base.trim_end_matches(".weight")));
+            shared.insert(scale_of(&base));
         }
         for part in [RouterPart::Weight, RouterPart::Bias, RouterPart::BiasVl] {
             router.insert(
@@ -1476,7 +1481,7 @@ pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
 
 /// The factor leaves an NVFP4 convention stores beside the weight `base` (`<matrix>.weight`).
 fn wide_leaf_names(base: &str, wide: sparkflash_model::format::NvFp4Wide) -> Vec<String> {
-    let matrix = base.trim_end_matches(".weight");
+    let matrix = tensor::matrix(base);
     wide.leaves()
         .into_iter()
         .flatten()
@@ -1562,7 +1567,7 @@ pub fn bind_rank_moe(
                 };
                 let bind = bind_plan_pair(arena, shard, &by_name)?;
                 routed.insert((layer, expert, matrix), bind);
-                let scale = format!("{}.scale", shard.name.trim_end_matches(".weight"));
+                let scale = scale_of(&shard.name);
                 let set = match matrix {
                     Matrix::Down => &mut routed_down,
                     Matrix::Gate | Matrix::Up => &mut routed_gate_up,
@@ -1582,7 +1587,7 @@ pub fn bind_rank_moe(
                 let bind = bind_plan_pair(arena, shard, &by_name)?;
                 shared.insert((layer, matrix), bind);
                 shared_names.insert(shard.name.clone());
-                shared_names.insert(format!("{}.scale", shard.name.trim_end_matches(".weight")));
+                shared_names.insert(scale_of(&shard.name));
             }
             PlanClass::Router => {
                 let layer = plan_layer(&shard.name)

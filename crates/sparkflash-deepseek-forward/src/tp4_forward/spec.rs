@@ -1703,8 +1703,8 @@ impl DeviceLayer<'_> {
                     let name = format!("L{layer:02}");
                     let mut buffers = vec![
                         ("attn_normed", b.normed, n * dim * 4),
-                        ("attn_out_bf16", b.attn_out, n * dim * 2),
-                        ("attn_reduced_bf16", b.reduced, n * dim * 2),
+                        ("attn_out", b.attn_out, n * dim * 2),
+                        ("attn_reduced", b.reduced, n * dim * 2),
                         ("stream", b.stream, n * hc * dim * 4),
                     ];
                     if let Some(grouped) = rows.grouped.as_ref() {
@@ -1746,8 +1746,8 @@ impl DeviceLayer<'_> {
                 &[
                     ("attn_normed", b.normed, n * dim * 4),
                     ("attn_mix", b.attn_mix, n * super::rows::MIX_ROWS * 4),
-                    ("attn_out_bf16", b.attn_out, n * dim * 2),
-                    ("attn_reduced_bf16", b.reduced, n * dim * 2),
+                    ("attn_out", b.attn_out, n * dim * 2),
+                    ("attn_reduced", b.reduced, n * dim * 2),
                 ],
                 p0,
                 n,
@@ -1758,8 +1758,8 @@ impl DeviceLayer<'_> {
                 &name,
                 &[
                     ("ffn_mix", b.ffn_mix, n * super::rows::MIX_ROWS * 4),
-                    ("ffn_x_bf16", b.ffn_x, n * dim * 2),
-                    ("moe_reduced_bf16", b.moe_reduced, n * dim * 2),
+                    ("ffn_x", b.ffn_x, n * dim * 2),
+                    ("moe_reduced", b.moe_reduced, n * dim * 2),
                     ("stream", b.stream, n * hc * dim * 4),
                 ],
                 p0,
@@ -1770,7 +1770,8 @@ impl DeviceLayer<'_> {
         Ok(())
     }
 
-    /// Each `(suffix, buffer, bytes)` of the rows as `<dir>/<name>-<suffix>.bin`, after the device
+    /// Each `(suffix, buffer, bytes)` of the rows as `<dir>/<name>-<suffix>.bin` (a suffix names its
+    /// workspace span, whose dtype the span documents; the BF16 spans are half the f32 width), after the device
     /// has finished every launch queued so far. A diagnostic: it stalls the step at each call.
     fn rows_dump(
         &self,

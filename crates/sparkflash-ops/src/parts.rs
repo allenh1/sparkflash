@@ -1582,7 +1582,7 @@ pub const CATALOGUE: &[PartKernel] = &[
             deepseek_sym("routed_format_down_mxfp8_row_sm121", &[Precision::MxFp8]),
             // A split chunk's gathered BF16 rows widened to f32 for the combine.
             deepseek_sym(
-                "routed_format_widen_sm121",
+                sparkflash_kernels::routed_format::WIDEN,
                 &[Precision::Bf16, Precision::F32],
             ),
         ],
@@ -2243,7 +2243,7 @@ pub const CATALOGUE: &[PartKernel] = &[
             deepseek_sym("routed_format_down_mxfp8_row_sm121", &[Precision::MxFp8]),
             // A split chunk's gathered BF16 rows widened to f32 for the combine.
             deepseek_sym(
-                "routed_format_widen_sm121",
+                sparkflash_kernels::routed_format::WIDEN,
                 &[Precision::Bf16, Precision::F32],
             ),
         ],

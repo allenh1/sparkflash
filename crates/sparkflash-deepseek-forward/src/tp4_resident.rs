@@ -1410,15 +1410,9 @@ fn routed_expert_format(
     plan: &sparkflash_ops::engine_plan::EnginePlan,
     name: &str,
 ) -> Option<sparkflash_model::format::StoredFormat> {
-    if !name.contains(".ffn.experts.") || !name.ends_with(".weight") {
-        return None;
-    }
     // A decoder block's experts take that block's format (a joint declaration states it per
     // range); a draft stage's are no decoder block and take the part's own aggregate.
-    let block = name
-        .strip_prefix("layers.")
-        .and_then(|rest| rest.split('.').next())
-        .and_then(|block| block.parse::<usize>().ok());
+    let block = sparkflash_model_deepseek_v41::tensor::routed_weight(name)?.block;
     plan.stored_format(sparkflash_model::Part::Moe, block)
 }
 /// Reads the headers the plan needs, from whichever source was given.

@@ -77,6 +77,7 @@ impl Batch<'_, '_, '_> {
                 1
             },
             context: self.room,
+            prompt_rows: super::super::prefill_chunk(),
             resume_step: self.device.resume_step(),
             exchange: self.exchange.is_some(),
             slack: super::super::lanes::SLIDE_KEEP

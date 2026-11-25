@@ -309,6 +309,8 @@ pub struct WalkDescription {
     pub members: usize,
     /// The most positions a sequence may reach.
     pub context: usize,
+    /// The widest prompt pass the walk takes: the epoch's bulk chunk ([crate::tp4_forward::prefill_chunk]).
+    pub prompt_rows: usize,
     /// The resume boundaries' step: a sequence goes back only to a multiple of it.
     pub resume_step: usize,
     /// Whether the rows' embeddings and samples are exchanged on the device.

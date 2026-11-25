@@ -1962,7 +1962,7 @@ mod tests {
 #[cfg(all(test, feature = "cuda"))]
 mod base_conformance {
     use super::{DeviceServeOptions, Tp4ServeOptions, chain_args, epoch_env};
-    use sparkflash_deepseek_forward::base_walk::{BaseWalk, CODE, PROMPT_ROWS, layout};
+    use sparkflash_deepseek_forward::base_walk::{BaseWalk, CODE, layout};
     use sparkflash_deepseek_forward::device_link::{WalkRequest, install_walk, take_walk};
     use sparkflash_deepseek_forward::tp4_forward::{VERIFY_ROWS, step_wall};
     use sparkflash_model::TpPlan;
@@ -2114,7 +2114,11 @@ mod base_conformance {
     /// at the profile's band model, and the chunks a 5,000-row prompt runs in. The profile's
     /// checks read the layout's kind, so its bytes a row are a placeholder for the epoch's.
     fn stated() -> ArmProfile {
-        let limits = Limits::new(PROMPT_ROWS, 1_048_576).with_members(32);
+        let limits = Limits::new(
+            sparkflash_deepseek_forward::tp4_forward::prefill_chunk(),
+            1_048_576,
+        )
+        .with_members(32);
         ArmProfile::new("DeepSeek", layout(1, 0), limits)
             .with_code(CODE)
             .drafting(5, DraftBudget::OnePass(VERIFY_ROWS))

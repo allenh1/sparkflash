@@ -53,7 +53,7 @@ pub mod mtp;
 pub mod recurrent;
 mod weight_view;
 
-use crate::config::ModelConfig;
+use crate::config::{Mixer, ModelConfig};
 use crate::dtype::DType;
 use crate::forward::boundary::{BoundaryTable, LayerBoundary};
 use crate::forward::layer_zero::{LayerZeroEntry, LayerZeroEntrySource, StageEvent};
@@ -1678,7 +1678,11 @@ impl InferenceEngine {
             u64_bytes(wide),
             "reference attention arithmetic over the window KV",
         );
-        if config.gdn_layers.contains(&layer) {
+        let mixer = config.mixer(layer).map_err(|detail| EngineError::Shape {
+            what: format!("layer {layer} attention"),
+            detail,
+        })?;
+        if matches!(mixer, Mixer::Gdn(_)) {
             // A Gated DeltaNet block computes its mixer whole on every rank, as a grouped-query
             // block does: the host path has no recurrent shard.
             if attention.is_some() {
@@ -1698,7 +1702,7 @@ impl InferenceEngine {
                 &mut scratch.attn_out,
                 self.limit,
             )?;
-        } else if config.gqa_layers.contains(&layer) {
+        } else if matches!(mixer, Mixer::Gqa(_)) {
             // A grouped-query block computes its attention whole on every rank: the host path
             // has no grouped-query shard, and a device projection backend is MLA's.
             if attention.is_some() {

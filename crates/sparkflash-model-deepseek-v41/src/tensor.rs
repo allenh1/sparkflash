@@ -45,7 +45,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::ModelConfig;
+use crate::config::{Mixer, ModelConfig};
 use crate::dtype::DType;
 use sparkflash_model::format::{FormatValues, ScaleKind, ScaleValues, StoredFormat};
 
@@ -86,6 +86,139 @@ pub struct TensorPlan {
     /// (an embedding, a norm, a router) is not one of them, and the Engram table keeps its own
     /// grid rather than the dense class's.
     scaled_weights: BTreeMap<String, StoredFormat>,
+}
+
+/// A grouped-query block's projections, named below its `layers.N.` prefix: every one a matrix in
+/// the dense class (its `.weight` and the scale grid beside it). The plan lists them, the resident
+/// load shards them and the rows path binds them by these names alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GqaTensors {
+    /// The query projection, `heads * head_dim` rows.
+    pub q: &'static str,
+    /// The key projection, `kv_heads * head_dim` rows.
+    pub k: &'static str,
+    /// The value projection, `kv_heads * head_dim` rows.
+    pub v: &'static str,
+    /// The output projection, `dim` rows over the query width.
+    pub o: &'static str,
+}
+
+/// The grouped-query block's tensor names.
+pub const GQA_TENSORS: GqaTensors = GqaTensors {
+    q: "attn.wq.weight",
+    k: "attn.wk.weight",
+    v: "attn.wv.weight",
+    o: "attn.wo.weight",
+};
+
+/// A Gated DeltaNet block's tensors, named below its `layers.N.` prefix: five projections in the
+/// dense class, then the conv, the two decay vectors and the gated norm, stored BF16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GdnTensors {
+    /// The mixed query/key/value projection, `2 * key + value` rows.
+    pub qkv: &'static str,
+    /// The output gate's projection, the value width.
+    pub z: &'static str,
+    /// The write strength's projection, one row a value head.
+    pub b: &'static str,
+    /// The decay's projection, one row a value head.
+    pub a: &'static str,
+    /// The output projection, `dim` rows over the value width.
+    pub out: &'static str,
+    /// The causal conv over the mixed rows.
+    pub conv: &'static str,
+    /// The decay's log scale, one a value head.
+    pub a_log: &'static str,
+    /// The decay's step bias, one a value head.
+    pub dt_bias: &'static str,
+    /// The gated norm's weight, the value head width.
+    pub norm: &'static str,
+}
+
+/// The Gated DeltaNet block's tensor names.
+pub const GDN_TENSORS: GdnTensors = GdnTensors {
+    qkv: "attn.in_proj_qkv.weight",
+    z: "attn.in_proj_z.weight",
+    b: "attn.in_proj_b.weight",
+    a: "attn.in_proj_a.weight",
+    out: "attn.out_proj.weight",
+    conv: "attn.conv1d.weight",
+    a_log: "attn.A_log",
+    dt_bias: "attn.dt_bias",
+    norm: "attn.norm.weight",
+};
+
+/// A routed expert's three matrices, by the leaf name the plan gives each under
+/// `ffn.experts.N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertLeaf {
+    /// The gate projection, `w1`.
+    Gate,
+    /// The down projection, `w2`.
+    Down,
+    /// The up projection, `w3`.
+    Up,
+}
+
+impl ExpertLeaf {
+    /// The leaf's name in the plan.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Gate => "w1",
+            Self::Down => "w2",
+            Self::Up => "w3",
+        }
+    }
+}
+
+/// A routed expert's matrix in the block at `prefix` (`layers.N` or `mtp.N`), without its
+/// `.weight`/`.scale` ending: the one spelling the plan writes and the forward looks up.
+#[must_use]
+pub fn routed_matrix(prefix: &str, expert: usize, leaf: ExpertLeaf) -> String {
+    format!("{prefix}.ffn.experts.{expert}.{}", leaf.name())
+}
+
+/// A routed expert's weight, as [routed_weight] reads one from a plan name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutedWeight {
+    /// The language-stack block it belongs to; `None` for a draft stage's (`mtp.N`) expert,
+    /// which is no decoder block.
+    pub block: Option<usize>,
+}
+
+/// The routed expert weight `name` spells, or `None` for any other tensor (its scale plane, the
+/// shared expert, a dense projection): the inverse of [routed_matrix] with the weight ending.
+#[must_use]
+pub fn routed_weight(name: &str) -> Option<RoutedWeight> {
+    let (stack, rest) = name.split_once('.')?;
+    let (index, rest) = rest.split_once('.')?;
+    let index = index.parse::<usize>().ok()?;
+    let (expert, leaf) = rest.strip_prefix("ffn.experts.")?.split_once('.')?;
+    expert.parse::<usize>().ok()?;
+    let leaf = leaf.strip_suffix(".weight")?;
+    [ExpertLeaf::Gate, ExpertLeaf::Down, ExpertLeaf::Up]
+        .iter()
+        .any(|candidate| candidate.name() == leaf)
+        .then_some(())?;
+    match stack {
+        "layers" => Some(RoutedWeight { block: Some(index) }),
+        "mtp" => Some(RoutedWeight { block: None }),
+        _ => None,
+    }
+}
+
+/// A matrix's name without its `.weight` ending (the name itself when it has none): the stem the
+/// plan's scaled entries take and its scale plane and tensor-wide factors are named from.
+#[must_use]
+pub fn matrix(name: &str) -> &str {
+    name.strip_suffix(".weight").unwrap_or(name)
+}
+
+/// The scale plane the plan names beside the weight `name`.
+#[must_use]
+pub fn scale_of(name: &str) -> String {
+    format!("{}.scale", matrix(name))
 }
 
 impl TensorPlan {
@@ -245,44 +378,57 @@ impl TensorPlan {
         };
         let _ = n_activated;
 
-        if let (false, true, Some(gqa)) =
-            (mtp, config.gqa_layers.contains(&layer), config.gqa.as_ref())
-        {
+        // A draft stage is MLA; a backbone block listed without its geometry is refused by the
+        // parser and plans as MLA here, where the index check names what it lacks.
+        let mixer = if mtp {
+            Mixer::Mla
+        } else {
+            config.mixer(layer).unwrap_or(Mixer::Mla)
+        };
+        if let Mixer::Gqa(gqa) = mixer {
             // A grouped-query block: its four projections in the dense class, and none of MLA's
             // low-rank query, latent, grouped output, sink or norms.
             let query = gqa.heads * gqa.head_dim;
             let kv = gqa.kv_heads * gqa.head_dim;
-            self.dense(&format!("{prefix}.attn.wq"), query, dim);
-            self.dense(&format!("{prefix}.attn.wk"), kv, dim);
-            self.dense(&format!("{prefix}.attn.wv"), kv, dim);
-            self.dense(&format!("{prefix}.attn.wo"), dim, query);
-        } else if let (false, true, Some(gdn)) =
-            (mtp, config.gdn_layers.contains(&layer), config.gdn.as_ref())
-        {
+            let names = GQA_TENSORS;
+            for (name, out, r#in) in [
+                (names.q, query, dim),
+                (names.k, kv, dim),
+                (names.v, kv, dim),
+                (names.o, dim, query),
+            ] {
+                self.dense(&format!("{prefix}.{}", matrix(name)), out, r#in);
+            }
+        } else if let Mixer::Gdn(gdn) = mixer {
             // A Gated DeltaNet block: its five projections in the dense class, the conv, the
             // decay vectors and the gated norm BF16, and none of MLA's tensors.
             let key = gdn.key_heads * gdn.key_dim;
             let value = gdn.value_heads * gdn.value_dim;
             let mixed = 2 * key + value;
-            self.dense(&format!("{prefix}.attn.in_proj_qkv"), mixed, dim);
-            self.dense(&format!("{prefix}.attn.in_proj_z"), value, dim);
-            self.dense(&format!("{prefix}.attn.in_proj_b"), gdn.value_heads, dim);
-            self.dense(&format!("{prefix}.attn.in_proj_a"), gdn.value_heads, dim);
-            self.dense(&format!("{prefix}.attn.out_proj"), dim, value);
+            let names = GDN_TENSORS;
+            for (name, out, r#in) in [
+                (names.qkv, mixed, dim),
+                (names.z, value, dim),
+                (names.b, gdn.value_heads, dim),
+                (names.a, gdn.value_heads, dim),
+                (names.out, dim, value),
+            ] {
+                self.dense(&format!("{prefix}.{}", matrix(name)), out, r#in);
+            }
             self.plain(
-                &format!("{prefix}.attn.conv1d.weight"),
+                &format!("{prefix}.{}", names.conv),
                 DType::BF16,
                 vec![mixed, 1, gdn.conv],
             );
-            for vector in ["A_log", "dt_bias"] {
+            for vector in [names.a_log, names.dt_bias] {
                 self.plain(
-                    &format!("{prefix}.attn.{vector}"),
+                    &format!("{prefix}.{vector}"),
                     DType::BF16,
                     vec![gdn.value_heads],
                 );
             }
             self.plain(
-                &format!("{prefix}.attn.norm.weight"),
+                &format!("{prefix}.{}", names.norm),
                 DType::BF16,
                 vec![gdn.value_dim],
             );
@@ -383,23 +529,22 @@ impl TensorPlan {
         self.dense(&format!("{prefix}.ffn.shared_experts.w3"), inter, dim);
 
         for expert in 0..n_routed {
-            let base = format!("{prefix}.ffn.experts.{expert}");
             self.expert(
-                &format!("{base}.w1"),
+                &routed_matrix(prefix, expert, ExpertLeaf::Gate),
                 inter_for_expert(config),
                 dim,
                 mtp,
                 layer,
             );
             self.expert(
-                &format!("{base}.w2"),
+                &routed_matrix(prefix, expert, ExpertLeaf::Down),
                 dim,
                 inter_for_expert(config),
                 mtp,
                 layer,
             );
             self.expert(
-                &format!("{base}.w3"),
+                &routed_matrix(prefix, expert, ExpertLeaf::Up),
                 inter_for_expert(config),
                 dim,
                 mtp,
@@ -646,5 +791,22 @@ mod tests {
             !plan.contains("layers.4.ffn.experts.0.w1.input_scale"),
             "the row-scaled layers do not"
         );
+    }
+}
+
+#[cfg(test)]
+mod routed_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_routed_weight_reads_back_the_name_the_plan_spells() {
+        let name = format!("{}.weight", routed_matrix("layers.7", 3, ExpertLeaf::Down));
+        assert_eq!(routed_weight(&name), Some(RoutedWeight { block: Some(7) }));
+        let draft = format!("{}.weight", routed_matrix("mtp.0", 0, ExpertLeaf::Gate));
+        assert_eq!(routed_weight(&draft), Some(RoutedWeight { block: None }));
+        let scale = format!("{}.scale", routed_matrix("layers.7", 3, ExpertLeaf::Up));
+        assert_eq!(routed_weight(&scale), None);
+        assert_eq!(routed_weight("layers.7.ffn.shared_experts.w2.weight"), None);
+        assert_eq!(routed_weight("layers.7.attn.wq_a.weight"), None);
     }
 }

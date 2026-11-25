@@ -41,9 +41,6 @@ use crate::device_link::{WalkAnswer, WalkCommand, WalkDescription, WalkRequest};
 /// The code the walk's refusals carry.
 pub const CODE: &str = "deepseek_base";
 
-/// The widest prompt pass the walk takes: the scheduler's idle bulk tick, a chunk-policy size.
-pub const PROMPT_ROWS: usize = 4096;
-
 /// The end of the walk server's channel.
 #[derive(Clone)]
 struct Link(Sender<WalkRequest>);
@@ -237,7 +234,8 @@ impl Walk for BaseWalk {
     }
 
     fn limits(&self) -> Limits {
-        Limits::new(PROMPT_ROWS, self.description.context).with_members(self.description.members)
+        Limits::new(self.description.prompt_rows, self.description.context)
+            .with_members(self.description.members)
     }
 
     fn drafter(&self) -> &BaseDrafter {

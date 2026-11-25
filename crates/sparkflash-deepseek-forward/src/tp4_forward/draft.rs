@@ -663,10 +663,13 @@ fn open_routed_format(
     };
     let entries = FormatEntries {
         gate_up: load(
-            "routed_format_sm121.cubin",
+            sparkflash_kernels::routed_format::CUBIN,
             entry("routed_format_gate_up_")?,
         )?,
-        down: load("routed_format_sm121.cubin", entry("routed_format_down_")?)?,
+        down: load(
+            sparkflash_kernels::routed_format::CUBIN,
+            entry("routed_format_down_")?,
+        )?,
     };
     let plan_image = sparkflash_kernels::images::moe_plan_cubin();
     if plan_image.is_empty() {
@@ -682,7 +685,10 @@ fn open_routed_format(
         plan_threads: sparkflash_model::active_profile().plan.block_threads(),
         swiglu: load("opt_rows_sm121.cubin", "opt_rows_shared_swiglu")?,
         combine: load("opt_moe_sm121.cubin", crate::plan::handles().mtp_combine)?,
-        widen: load("routed_format_sm121.cubin", "routed_format_widen_sm121")?,
+        widen: load(
+            sparkflash_kernels::routed_format::CUBIN,
+            sparkflash_kernels::routed_format::WIDEN,
+        )?,
     };
     let ptr = |name: &str| -> Result<Deviceptr, String> {
         arena

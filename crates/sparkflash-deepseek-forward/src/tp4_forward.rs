@@ -8073,16 +8073,18 @@ pub(crate) fn open_dense_format(
     })
 }
 
-/// Stages the shared expert on the device for every layer: B12x repack, upload, budget admission.
-///
-/// Warmup only. The repack is permutation-only ([sparkflash_device::arena::tile_b12x]) and the
-/// scale grids are uploaded as stored, so this function never touches the values. It admits its
-/// own memory through [sparkflash_device::budget::BudgetAdmission] before the first allocation and
-/// refuses by name when the projection does not fit, rather than discovering it mid-repack.
-///
-/// # Errors
-/// A missing plan tensor or dtype, a repack geometry mismatch, a budget refusal, or a driver
-/// allocation/copy failure.
+/// The rows one bulk prefill chunk takes, SPARKFLASH_PREFILL_CHUNK (8 or less keeps every prompt
+/// on the exact rows step). 4096 by sweep: a 32K prompt takes 15.2 s at 2048, 13.6 s at 4096 (the
+/// MoE weights read once for twice the rows) and 13.8 s at 8192. A scheduling default chosen by
+/// that sweep, not model geometry.
+#[must_use]
+pub fn prefill_chunk() -> usize {
+    sparkflash_model::active_profile()
+        .prefill
+        .chunk
+        .unwrap_or(4096)
+}
+
 #[cfg(feature = "cuda")]
 /// A row-major `[rows][cols]` grid of `unit`-byte values laid out rank-major: rank r's
 /// `[rows][cols / world]` column slice, then rank r + 1's.
@@ -8098,6 +8100,17 @@ fn rank_major(bytes: &[u8], rows: usize, cols: usize, world: usize, unit: usize)
     out
 }
 
+/// Stages the shared expert on the device for every layer: B12x repack, upload, budget admission.
+///
+/// Warmup only. The repack is permutation-only ([sparkflash_device::arena::tile_b12x]) and the
+/// scale grids are uploaded as stored, so this function never touches the values. It admits its
+/// own memory through [sparkflash_device::budget::BudgetAdmission] before the first allocation and
+/// refuses by name when the projection does not fit, rather than discovering it mid-repack.
+///
+/// # Errors
+/// A missing plan tensor or dtype, a repack geometry mismatch, a budget refusal, or a driver
+/// allocation/copy failure.
+#[cfg(feature = "cuda")]
 fn build_shared_expert_device(
     cuda: &sparkflash_kernels::cuda_driver::Cuda,
     request: &TokenStageRequest<'_>,
@@ -8224,8 +8237,9 @@ fn build_shared_expert_device(
         let w2 = stage("w2", dim, inter)?;
         // The dense format route reads whole weight rows: the down's reduction is split over
         // the ranks, so its stored [dim][inter] goes up rank-major ([world][dim][inter/world],
-        // its scale grid alike), each rank's slice one contiguous matrix.
-        let s2 = if s2.is_empty() || released || request.world == 1 {
+        // its scale grid alike), each rank's slice one contiguous matrix (the identity at one
+        // rank).
+        let s2 = if s2.is_empty() || released {
             s2
         } else {
             let block = shared_format.block().max(1);
@@ -14426,13 +14440,15 @@ impl<'a> DeviceLayer<'a> {
             .iter()
             .position(|format| !released(format))
             .unwrap_or(0);
-        let (cubin, _sha) =
-            cached_cubin(&kernel_dir.join("routed_format_sm121.cubin")).map_err(|error| {
-                format!(
-                    "{}, which only the format route reads: {error}",
-                    what(first)
-                )
-            })?;
+        let (cubin, _sha) = cached_cubin(
+            &kernel_dir.join(sparkflash_kernels::routed_format::CUBIN),
+        )
+        .map_err(|error| {
+            format!(
+                "{}, which only the format route reads: {error}",
+                what(first)
+            )
+        })?;
         let load = |name: &'static str| -> Result<sparkflash_kernels::cuda_driver::Kernel, String> {
             // The modules stay loaded for the process, as every by-name load here does.
             self.cuda
@@ -14485,7 +14501,7 @@ impl<'a> DeviceLayer<'a> {
             plan_threads: sparkflash_model::active_profile().plan.block_threads(),
             swiglu,
             combine: opt.dedup[2].1,
-            widen: load("routed_format_widen_sm121")?,
+            widen: load(sparkflash_kernels::routed_format::WIDEN)?,
         };
         // The table: every layer's rows, the released layers' too (the route never reads them),
         // so a layer's base is its index times the layer stride.
@@ -18581,14 +18597,8 @@ fn run_forward_loop(
         let drafter = draft::DraftState::open(device, arena, dir, noise)?;
         let (tap_kernel, sink) = drafter.tap_sink();
         rows.taps = Some((tap_kernel, sink, config.dspark_target_layer_ids.clone()));
-        // The bulk prefill's rows state, SPARKFLASH_PREFILL_CHUNK rows per chunk (8 or less keeps
-        // every prompt on the exact rows step). 4096 by sweep: a 32K prompt takes 15.2 s at 2048,
-        // 13.6 s at 4096 (the MoE weights read once for twice the rows) and 13.8 s at 8192.
-        // Rows per bulk chunk: a scheduling default chosen by the sweep above, not model geometry.
-        let chunk: usize = sparkflash_model::active_profile()
-            .prefill
-            .chunk
-            .unwrap_or(4096);
+        // The bulk prefill's rows state, [prefill_chunk] rows per chunk.
+        let chunk = prefill_chunk();
         // `sparkflash serve --tp4-device` installs a link before the epoch: serve its requests
         // instead of the one-shot generation.
         let link = crate::device_link::take();
@@ -18596,7 +18606,7 @@ fn run_forward_loop(
         // thread. Its sequences are this process's, so a group (whose workers would need every
         // command mirrored) and a serving link beside it are refused by name.
         let walk = crate::device_link::take_walk();
-        if walk.is_some() && (link.is_some() || request.world != 1) {
+        if walk.is_some() && (link.is_some() || request.world > 1) {
             return Err(format!(
                 "the walk server runs one rank with no serving link (world {}, link {})",
                 request.world,

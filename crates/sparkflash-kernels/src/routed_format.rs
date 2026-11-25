@@ -45,6 +45,10 @@ pub const TABLE_STRIDE: usize = 9;
 pub const MATRIX_WORDS: usize = 3;
 /// The slots one plan item holds (GLM_MOE_ROWS): the tile's row count.
 pub const ITEM_ROWS: usize = 128;
+/// The image every format block's kernels live in.
+pub const CUBIN: &str = "routed_format_sm121.cubin";
+/// The entry that widens a split chunk's gathered BF16 rows into f32 rows ([SharedKernels::widen]).
+pub const WIDEN: &str = "routed_format_widen_sm121";
 /// The output columns one tile block computes (GLM_BN).
 const TILE_COLS: usize = 128;
 /// The block the tile entries run (OM_THREADS).

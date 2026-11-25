@@ -232,6 +232,17 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+/// A backbone block's token mixer, as [ModelConfig::mixer] answers it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Mixer {
+    /// The released multi-head latent attention.
+    Mla,
+    /// Grouped-query attention, with the stack's geometry.
+    Gqa(GqaGeometry),
+    /// A Gated DeltaNet, with the stack's geometry.
+    Gdn(GdnGeometry),
+}
+
 /// The hyperparameters of one DeepSeek-V4.1-Flash-shaped model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -759,6 +770,27 @@ impl ModelConfig {
     /// vision-disabled checkpoint cannot contain.
     pub fn vision_enabled(&self) -> bool {
         self.vision_n_layers.is_some_and(|layers| layers > 0)
+    }
+
+    /// The token mixer of backbone block `layer`: grouped-query attention or a Gated DeltaNet
+    /// where [Self::gqa_layers] or [Self::gdn_layers] lists it, with the stack's geometry, and MLA
+    /// otherwise. Every reader of a block's mixer asks here, so a stacked block has one answer.
+    ///
+    /// # Errors
+    /// A block listed without its stack's geometry: the document parser refuses that, so only a
+    /// configuration put together by hand reaches it.
+    pub fn mixer(&self, layer: usize) -> Result<Mixer, String> {
+        if self.gdn_layers.contains(&layer) {
+            return self.gdn.map(Mixer::Gdn).ok_or_else(|| {
+                format!("block {layer} is a Gated DeltaNet and the stack has no geometry")
+            });
+        }
+        if self.gqa_layers.contains(&layer) {
+            return self.gqa.map(Mixer::Gqa).ok_or_else(|| {
+                format!("block {layer} is grouped-query attention and the stack has no geometry")
+            });
+        }
+        Ok(Mixer::Mla)
     }
 
     /// Whether a layer index addresses an MTP stage rather than a backbone block.

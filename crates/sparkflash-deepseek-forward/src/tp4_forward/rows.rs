@@ -1784,10 +1784,11 @@ impl DeviceLayer<'_> {
                 io: DenseIo::new(RowForm::F32, output),
             })
         };
-        let q = linear("attn.wq.weight", (query, dim), RowForm::F32)?;
-        let k = linear("attn.wk.weight", (kv, dim), RowForm::F32)?;
-        let v = linear("attn.wv.weight", (kv, dim), RowForm::F32)?;
-        let o = linear("attn.wo.weight", (dim, query), RowForm::Bf16)?;
+        let names = sparkflash_model_deepseek_v41::tensor::GQA_TENSORS;
+        let q = linear(names.q, (query, dim), RowForm::F32)?;
+        let k = linear(names.k, (kv, dim), RowForm::F32)?;
+        let v = linear(names.v, (kv, dim), RowForm::F32)?;
+        let o = linear(names.o, (dim, query), RowForm::Bf16)?;
         self.run_layer_attn_seam(rows, layer, p0, n)?;
         let b = rows.b;
         let world = self.routed_geometry.world;
@@ -1825,8 +1826,7 @@ impl DeviceLayer<'_> {
     /// over the seam's f32 rows with its five projections on the dense format route and each
     /// sequence's conv history and state in its lane, then the block's BF16 rows as the attention's
     /// sum: the projections are whole on every rank, so every rank runs every head and one rank's
-    /// rows are the sum (world 1 takes the base's reduce, which copies them; a wider group copies
-    /// them itself). A verify pass (`keep_recurrent`) leaves each region's state after
+    /// rows are the sum, copied into the reduced rows at every world. A verify pass (`keep_recurrent`) leaves each region's state after
     /// each row in the snapshot slab, for the kept row's commit ([Self::commit_recurrent]). A
     /// split chunk is refused: the body projects whole rows.
     fn run_layer_gdn(
@@ -1930,11 +1930,12 @@ impl DeviceLayer<'_> {
                 io: DenseIo::new(RowForm::F32, output),
             })
         };
-        let qkv = linear("attn.in_proj_qkv.weight", (conv, dim), RowForm::F32)?;
-        let z = linear("attn.in_proj_z.weight", (value, dim), RowForm::F32)?;
-        let beta = linear("attn.in_proj_b.weight", (heads, dim), RowForm::F32)?;
-        let decay = linear("attn.in_proj_a.weight", (heads, dim), RowForm::F32)?;
-        let out = linear("attn.out_proj.weight", (dim, value), RowForm::Bf16)?;
+        let names = sparkflash_model_deepseek_v41::tensor::GDN_TENSORS;
+        let qkv = linear(names.qkv, (conv, dim), RowForm::F32)?;
+        let z = linear(names.z, (value, dim), RowForm::F32)?;
+        let beta = linear(names.b, (heads, dim), RowForm::F32)?;
+        let decay = linear(names.a, (heads, dim), RowForm::F32)?;
+        let out = linear(names.out, (dim, value), RowForm::Bf16)?;
         let vector = |tail: &str| lookup(tail).map(|(weight, _)| weight);
         let body = sparkflash_ops::roles::GdnLayer {
             qkv: &qkv,
@@ -1942,9 +1943,9 @@ impl DeviceLayer<'_> {
             b: &beta,
             a: &decay,
             out: &out,
-            conv: vector("attn.conv1d.weight")?,
-            decay: (vector("attn.A_log")?, vector("attn.dt_bias")?),
-            norm: vector("attn.norm.weight")?,
+            conv: vector(names.conv)?,
+            decay: (vector(names.a_log)?, vector(names.dt_bias)?),
+            norm: vector(names.norm)?,
         };
         self.run_layer_attn_seam(rows, layer, p0, n)?;
         let b = rows.b;
@@ -1957,13 +1958,8 @@ impl DeviceLayer<'_> {
             (crate::plan::description().values().norm_eps as f32, false),
         )
         .map_err(|error| format!("rows layer {layer}: {error}"))?;
-        let (input, output) = (span(b.attn_out, n * dim * 2), span(b.reduced, n * dim * 2));
-        if self.routed_geometry.world == 1 {
-            self.reduce_layer_rows(rows, "all_reduce", input, output, n)
-        } else {
-            self.cuda
-                .copy_dtod_async(&Deviceptr(b.reduced), &Deviceptr(b.attn_out), n * dim * 2)
-        }
+        self.cuda
+            .copy_dtod_async(&Deviceptr(b.reduced), &Deviceptr(b.attn_out), n * dim * 2)
     }
 
     /// A dense-FFN block's MLP: the attention's post and the FFN seam (the fused block's
