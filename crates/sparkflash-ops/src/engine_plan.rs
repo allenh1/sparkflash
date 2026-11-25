@@ -990,11 +990,13 @@ fn plan_tensors(architecture: &Architecture, tp: &TpPlan, stacks: &[Stack]) -> V
     out
 }
 
-/// The DeepSeek image's symbols for each part instance the plan executes, grouped by part.
+/// The base image's symbols for each part instance the plan executes, grouped by part.
+///
+/// The base forward is the engine every description runs on (docs/engine/05-runtime-models.md),
+/// so its symbols are planned for any family: a description that states its own arithmetic
+/// launches the base's engine kernels (the norm, the head, the routed staging) beside its own
+/// part kinds, and an arm that still runs its own crate reads none of them.
 fn part_symbols(architecture: &Architecture) -> Vec<PartSymbols> {
-    if !architecture.family.starts_with("deepseek") {
-        return Vec::new();
-    }
     crate::parts::CATALOGUE
         .iter()
         .filter(|entry| {
