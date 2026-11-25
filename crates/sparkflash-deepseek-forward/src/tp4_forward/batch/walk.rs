@@ -63,9 +63,7 @@ impl Batch<'_, '_, '_> {
                 anchor,
                 sampler,
             } => self.walk_draft(lane, anchor, sampler),
-            WalkCommand::Verify { members } => {
-                self.walk_verify(&members).map(WalkAnswer::Verified)
-            }
+            WalkCommand::Verify { members } => self.walk_verify(&members).map(WalkAnswer::Verified),
         }
     }
 

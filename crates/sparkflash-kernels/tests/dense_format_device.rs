@@ -120,7 +120,9 @@ fn stored(class: Class, groups: usize, cols: usize, inner: usize, salt: u64) -> 
         };
         match class {
             Class::Bf16 => {}
-            Class::Fp8F32 => plane.iter().for_each(|s| scales.extend_from_slice(&s.to_le_bytes())),
+            Class::Fp8F32 => plane
+                .iter()
+                .for_each(|s| scales.extend_from_slice(&s.to_le_bytes())),
             Class::Fp8Bf16 => plane
                 .iter()
                 .for_each(|&s| scales.extend_from_slice(&bf16_bits(s).to_le_bytes())),
@@ -204,9 +206,10 @@ fn the_dense_format_entries_are_the_host_sum_within_the_split() {
                     .collect();
                 let a = match io.input {
                     RowForm::F32 => upload(&cuda, &x),
-                    RowForm::Bf16 => {
-                        upload(&cuda, &x.iter().map(|&v| bf16_bits(v)).collect::<Vec<u16>>())
-                    }
+                    RowForm::Bf16 => upload(
+                        &cuda,
+                        &x.iter().map(|&v| bf16_bits(v)).collect::<Vec<u16>>(),
+                    ),
                 };
                 let out_stride = groups * cols + 64;
                 let out_bytes = match io.output {

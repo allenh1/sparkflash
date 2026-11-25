@@ -2953,7 +2953,8 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         self.seqs[index].pos = pos + m + 1;
         // The recurrent state ran every verify row; it keeps the last accepted row's.
         if m + 1 < seg.n {
-            self.device.commit_recurrent(self.rows, seg.lane, seg.row0 + m)?;
+            self.device
+                .commit_recurrent(self.rows, seg.lane, seg.row0 + m)?;
         }
         self.enter(seg.lane)?;
         self.device.rewind_rows(pos + m + 1);

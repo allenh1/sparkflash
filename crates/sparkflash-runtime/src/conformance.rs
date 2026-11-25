@@ -694,12 +694,15 @@ fn continued_equals_cold<A: ArmFixture>() -> Result<CheckOutcome, BackendError> 
     Ok(CheckOutcome::Passed)
 }
 
+/// One run's generated ids, a step each (None where a step gave no token).
+type Steps = Vec<Option<u32>>;
+
 /// A cold run of `prompt` through the tick engine, and the same prompt as a turn that continues
 /// one of its first `prefix` ids.
 fn engine_continued<A: ArmFixture>(
     prompt: &[u32],
     prefix: usize,
-) -> Result<(Vec<Option<u32>>, Vec<Option<u32>>), BackendError> {
+) -> Result<(Steps, Steps), BackendError> {
     let cold = engine_run(A::fixture(1)?.walk, prompt, CONFORMANCE_TOKENS)?;
     let mut engine = crate::TickEngine::new(A::fixture(1)?.walk, 1)?;
     let (id, _) = engine_turn(&mut engine, &prompt[..prefix])?;

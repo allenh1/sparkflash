@@ -31,9 +31,9 @@ use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput}
 use sparkflash_model::gumbel::GumbelSampler;
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
-    ComputeDeclaration, Draft, DraftBudget, Drafter, HeadRow, LaneState, Limits,
-    NoVision, Pass, PassKind, PassMask, Region, Residual, Segment, Segments, StateKind, StateLayout,
-    StepWall, Walk, WalkCapabilities, check_checkpoint, check_rewind,
+    ComputeDeclaration, Draft, DraftBudget, Drafter, HeadRow, LaneState, Limits, NoVision, Pass,
+    PassKind, PassMask, Region, Residual, Segment, Segments, StateKind, StateLayout, StepWall,
+    Walk, WalkCapabilities, check_checkpoint, check_rewind,
 };
 
 use crate::device_link::{WalkAnswer, WalkCommand, WalkDescription, WalkRequest};
@@ -470,7 +470,11 @@ impl Drafter<BaseWalk> for BaseDrafter {
             ));
         };
         seq.pos += kept + 1;
-        seq.held = chunk[1..=kept].iter().copied().zip(rows[1..].iter().copied()).collect();
+        seq.held = chunk[1..=kept]
+            .iter()
+            .copied()
+            .zip(rows[1..].iter().copied())
+            .collect();
         if chunk.len() > 1 {
             seq.speculation.verify_steps += 1;
             seq.speculation.drafts_proposed += chunk.len() - 1;

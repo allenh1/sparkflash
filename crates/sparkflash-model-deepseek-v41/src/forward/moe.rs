@@ -305,8 +305,7 @@ impl MoeScratch {
             }
             ExpertBody::Dense => {
                 self.base.clear();
-                write!(self.base, "{prefix}.ffn")
-                    .expect("a String cannot fail to be written to");
+                write!(self.base, "{prefix}.ffn").expect("a String cannot fail to be written to");
                 (
                     local_inter.unwrap_or(cfg.dense_inter_dim),
                     cfg.dense_grid().unwrap_or(ScaleGrid::Block32),

@@ -346,7 +346,10 @@ pub enum WalkAnswer {
     /// [`WalkCommand::Room`].
     Room(bool),
     /// [`WalkCommand::Draft`]: the drafts, and the chance each leading run is accepted.
-    Chain { drafts: Vec<u32>, confidence: Vec<f64> },
+    Chain {
+        drafts: Vec<u32>,
+        confidence: Vec<f64>,
+    },
     /// [`WalkCommand::Verify`]: each member's picks for its anchor and the drafts it kept, the
     /// last one the model's own next token.
     Verified(Vec<Vec<u32>>),

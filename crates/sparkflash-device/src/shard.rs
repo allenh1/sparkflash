@@ -265,7 +265,11 @@ impl PackedWeight {
             return Err(ShardError::Plan(format!(
                 "{name}: the plan reads it {} but the checkpoint {} beside it",
                 if stated_packed { "packed" } else { "as stored" },
-                if packed.is_some() { "stores an escape list" } else { "has no escape list" }
+                if packed.is_some() {
+                    "stores an escape list"
+                } else {
+                    "has no escape list"
+                }
             )));
         }
         match packed {

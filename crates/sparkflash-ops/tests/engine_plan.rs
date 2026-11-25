@@ -1218,7 +1218,12 @@ fn a_gated_deltanet_block_in_an_mla_stack_scans_every_head_at_any_world() {
                 .expect("the GDN block's scan");
             let geometry = scan.geometry;
             assert_eq!(
-                (geometry.heads, geometry.head_offset, geometry.kv_heads, geometry.kv_head_offset),
+                (
+                    geometry.heads,
+                    geometry.head_offset,
+                    geometry.kv_heads,
+                    geometry.kv_head_offset
+                ),
                 (4, 0, 8, 0),
                 "TP{world}/{rank}"
             );

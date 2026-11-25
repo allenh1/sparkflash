@@ -176,10 +176,16 @@ fn the_row_scaled_mxfp8_entries_are_the_host_sum_within_the_split() {
     for tokens in TOKENS {
         let x = activations(tokens, dim, 0x900d + tokens as u64);
         let act = activations(tokens, inter, 0xacdc + tokens as u64);
-        let route: Vec<f32> = (0..tokens).map(|token| 0.25 + token as f32 * 0.125).collect();
+        let route: Vec<f32> = (0..tokens)
+            .map(|token| 0.25 + token as f32 * 0.125)
+            .collect();
         let sorted: Vec<i32> = (0..tokens as i32).collect();
         let items: Vec<i32> = vec![0, 0, tokens as i32, 0];
-        let (x_d, act_d, route_d) = (upload(&cuda, &x), upload(&cuda, &act), upload(&cuda, &route));
+        let (x_d, act_d, route_d) = (
+            upload(&cuda, &x),
+            upload(&cuda, &act),
+            upload(&cuda, &route),
+        );
         let (sorted_d, items_d) = (upload(&cuda, &sorted), upload(&cuda, &items));
         let gate_out = upload(&cuda, &vec![0f32; tokens * inter]);
         let down_out = upload(&cuda, &vec![0f32; tokens * dim]);

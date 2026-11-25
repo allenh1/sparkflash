@@ -306,12 +306,10 @@ pub fn classify(name: &str) -> Result<Option<Classification>, ShardError> {
             // A Gated DeltaNet block (`linear_attention`) runs whole on every rank: its fused
             // q/k/v rows split as three runs and its conv by the same channels, which no single
             // shard rule states.
-            "in_proj_qkv.weight" | "in_proj_qkv.scale" | "in_proj_z.weight"
-            | "in_proj_z.scale" | "in_proj_b.weight" | "in_proj_b.scale" | "in_proj_a.weight"
-            | "in_proj_a.scale" | "out_proj.weight" | "out_proj.scale" | "conv1d.weight"
-            | "A_log" | "dt_bias" | "norm.weight" => {
-                classified(Group::AttentionReplicated, ShardRule::Replicated)
-            }
+            "in_proj_qkv.weight" | "in_proj_qkv.scale" | "in_proj_z.weight" | "in_proj_z.scale"
+            | "in_proj_b.weight" | "in_proj_b.scale" | "in_proj_a.weight" | "in_proj_a.scale"
+            | "out_proj.weight" | "out_proj.scale" | "conv1d.weight" | "A_log" | "dt_bias"
+            | "norm.weight" => classified(Group::AttentionReplicated, ShardRule::Replicated),
             "attn_sink" => classified(Group::AttentionSink, ShardRule::Column),
             other if other.starts_with("indexer.") || other.starts_with("compressor.") => {
                 classified(Group::AttentionAux, ShardRule::Replicated)
@@ -1006,7 +1004,10 @@ mod tests {
             let classification = classify(&name).expect("known").expect("resident");
             assert_eq!(
                 (classification.group, classification.rule),
-                (ResidentGroup::AttentionReplicated, Some(ShardRule::Replicated)),
+                (
+                    ResidentGroup::AttentionReplicated,
+                    Some(ShardRule::Replicated)
+                ),
                 "{name}"
             );
         }
