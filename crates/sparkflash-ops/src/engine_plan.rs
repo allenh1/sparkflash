@@ -934,7 +934,17 @@ fn plan_tensors(architecture: &Architecture, tp: &TpPlan, stacks: &[Stack]) -> V
     for index in 0..plan.len() {
         let spec = plan.spec_at(index);
         let rank = plan.rank_spec_at(index);
-        let slot = claims.get(&spec.name).and_then(|claim| claim.3.clone());
+        // A block-scaled weight's inverse scale is claimed with its weight: it takes the
+        // weight's slot under the base's `.scale` spelling, the name the checkpoint opener reads
+        // it by (sparkflash_model::layout::checkpoint_names).
+        let slot = claims
+            .get(&spec.name)
+            .and_then(|claim| claim.3.clone())
+            .or_else(|| {
+                let stem = spec.name.strip_suffix(".weight_scale_inv")?;
+                let weight = claims.get(&format!("{stem}.weight"))?.3.as_deref()?;
+                Some(format!("{}.scale", weight.strip_suffix(".weight")?))
+            });
         let base = slot.as_deref().unwrap_or(&spec.name);
         let global = match base {
             "embed.weight" => Some(Part::Embedding),
