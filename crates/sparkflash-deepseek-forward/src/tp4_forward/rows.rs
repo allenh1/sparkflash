@@ -1542,7 +1542,7 @@ impl DeviceLayer<'_> {
             .step_segs(p0, n)
             .iter()
             .map(|seg| {
-                let lane = if seg.lane == NO_LANE {
+                let lane = if seg.lane == super::lanes::NO_LANE {
                     lanes.selected
                 } else {
                     seg.lane
