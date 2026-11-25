@@ -876,6 +876,7 @@ fn the_bulk_index_scores_are_the_decode_kernels_bit_for_bit() {
                 u64::from(score_scale.to_bits()),
                 u64::from(head_scale.to_bits()),
                 score_stride as u64,
+                0,
             ],
         );
         launch(
@@ -898,6 +899,7 @@ fn the_bulk_index_scores_are_the_decode_kernels_bit_for_bit() {
                 u64::from(head_scale.to_bits()),
                 score_stride as u64,
                 rows as u64,
+                0,
             ],
         );
         let expected = download::<f32>(&cuda, &decode, rows * score_stride);

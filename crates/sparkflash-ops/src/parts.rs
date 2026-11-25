@@ -2032,6 +2032,8 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             sym("q4e_mhc_in", &[Precision::Bf16, Precision::Fp8E4M3]),
             sym("q4e_mhc_post", &[Precision::Bf16, Precision::Fp8E4M3]),
+            // The head's fold, and the stated RMSNorm of one stream (an MLA latent's norm).
+            sym("q4e_mhc_head", &[Precision::Bf16, Precision::Fp8E4M3]),
         ],
         true,
     ),

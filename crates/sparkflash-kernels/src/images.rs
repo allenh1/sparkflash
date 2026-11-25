@@ -389,6 +389,7 @@ impl Image {
                 "q4e_glm_pick",
                 "q4e_glm_pool",
                 "q4e_layer_norm",
+                "q4e_mhc_head",
                 "q4e_mhc_in",
                 "q4e_mhc_post",
                 "q4e_noaux_router",

@@ -784,12 +784,19 @@ __device__ __forceinline__ float q4e_indexer_key(const CacheT value) {
 // RMS-normed by k_weight and rotated at the pool's first position. kGated=true is GLM's k-pool:
 // a softmax over the pool's tokens of gate + ape, weighting their f32 keys in token order.
 // `keys` is already at the pool's first token; `destination` at the pool's row.
+//
+// With `stated` (GLM's producer types, modeling_glm5_next.py) the gated form reads its keys and
+// gates as the BF16 values their modules return, casts each weight to BF16, rounds each product,
+// and rounds the f32 sum once.
 template <typename CacheT, bool kGated>
 __device__ __forceinline__ void q4e_indexer_pool_body(
     const CacheT* __restrict__ keys, const float* __restrict__ gates,
     const __nv_bfloat16* __restrict__ ape, const __nv_bfloat16* __restrict__ k_weight,
     float* __restrict__ destination, int dim, int pool, int rotary, float theta, float eps,
-    int first) {
+    int first, bool stated = false) {
+    const auto narrow = [stated](float value) {
+        return stated ? __bfloat162float(__float2bfloat16_rn(value)) : value;
+    };
     __shared__ float pooled[128];
     __shared__ float scratch[128];
     constexpr int kGatedMax = 16;
@@ -839,7 +846,7 @@ __device__ __forceinline__ void q4e_indexer_pool_body(
     for (int offset = 0; offset < kGatedMax; ++offset) {
         if (offset < pool) {
             weight[offset] = __fadd_rn(
-                gates[(unsigned long long)offset * dim + channel],
+                narrow(gates[(unsigned long long)offset * dim + channel]),
                 __bfloat162float(ape[offset * dim + channel]));
             maximum = fmaxf(maximum, weight[offset]);
         }
@@ -861,11 +868,12 @@ __device__ __forceinline__ void q4e_indexer_pool_body(
                                                   : weight[offset];
             accumulated = __fadd_rn(
                 accumulated,
-                __fmul_rn(share, q4e_indexer_key(
-                                     keys[(unsigned long long)offset * dim + channel])));
+                narrow(__fmul_rn(narrow(share),
+                                 narrow(q4e_indexer_key(
+                                     keys[(unsigned long long)offset * dim + channel])))));
         }
     }
-    destination[channel] = accumulated;
+    destination[channel] = narrow(accumulated);
 }
 
 // One pool's indexer score for one lane's warp. kWeightedRelu=false is Qwen's: the sum over

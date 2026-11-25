@@ -384,11 +384,16 @@ __device__ __forceinline__ constexpr int gpi_leaf(int j) {
 // threads. Row y of the run is at `position` + y; its query heads are GPI_HEADS x GPI_DIM floats
 // at query + y * GPI_HEADS * GPI_DIM, its head weights GPI_HEADS floats at
 // head_weights + y * GPI_HEADS, and its scores at scores + y * score_stride, one a whole pool,
-// the layout q4e_glm_pick reads. Every pool a row has is written; none past it.
+// the layout q4e_glm_pick reads. Every pool a row has is written; none past it. With `stated`
+// the query heads and the head weights are read as the BF16 values their projections return, as
+// q4e_glm_index_scores reads them.
 extern "C" __global__ __launch_bounds__(GPI_THREADS, 2) void glm_prefill_index_scores(
     const float *__restrict__ query, const float *__restrict__ head_weights,
     const float *__restrict__ pooled, float *__restrict__ scores, int position, int pool,
-    float score_scale, float head_scale, int score_stride, int rows) {
+    float score_scale, float head_scale, int score_stride, int rows, int stated) {
+    const auto narrow = [stated](float value) {
+        return stated ? __bfloat162float(__float2bfloat16_rn(value)) : value;
+    };
     constexpr int kWarpPools = 16;
     constexpr int kStaged = GPI_HEADS * 32 / GPI_THREADS;
     static_assert(GPI_POOLS == (GPI_THREADS / 32) * kWarpPools, "a warp scores 16 pools");
@@ -419,7 +424,8 @@ extern "C" __global__ __launch_bounds__(GPI_THREADS, 2) void glm_prefill_index_s
         for (int e = 0; e < kStaged; ++e) {
             const int entry = threadIdx.x + e * GPI_THREADS;
             const float *at = source + (entry >> 5) * GPI_DIM + (entry & 31);
-            staged[e] = make_float4(at[0], at[32], at[64], at[96]);
+            staged[e] =
+                make_float4(narrow(at[0]), narrow(at[32]), narrow(at[64]), narrow(at[96]));
         }
     };
     load_row(row_begin);
@@ -441,7 +447,7 @@ extern "C" __global__ __launch_bounds__(GPI_THREADS, 2) void glm_prefill_index_s
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             weight[i] = __fmul_rn(
-                __fmul_rn(head_weights[(unsigned long long)row * GPI_HEADS + 4 * hl + i],
+                __fmul_rn(narrow(head_weights[(unsigned long long)row * GPI_HEADS + 4 * hl + i]),
                           head_scale),
                 1.0f);
         }

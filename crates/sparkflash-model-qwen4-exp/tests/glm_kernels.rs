@@ -877,6 +877,7 @@ fn the_split_latent_attention_keeps_the_attend_kernels_bits() {
                     MLA_LATENT as u64,
                     MLA_STRIDE as u64,
                     quantise,
+                    0,
                 ],
             ),
             (
@@ -893,6 +894,7 @@ fn the_split_latent_attention_keeps_the_attend_kernels_bits() {
                     MLA_NOPE as u64,
                     MLA_VALUE as u64,
                     MLA_LATENT as u64,
+                    0,
                 ],
             ),
         ];

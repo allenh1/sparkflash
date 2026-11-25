@@ -58,6 +58,12 @@
 #include "shared_prefill_mma_sm121.cuh"
 #include "bf16_packed_sm121.cuh"
 
+// A value narrowed to BF16 round-to-nearest-even and widened back: the producer's BF16 module
+// output, held in an f32 register (quant::bf16_round).
+__device__ __forceinline__ float q4e_bf16r(float value) {
+    return __bfloat162float(__float2bfloat16_rn(value));
+}
+
 #define Q4E_BLOCK 256
 #define Q4E_MAX_SELECTED 2304
 #define Q4E_MAX_EXPERTS 512
@@ -201,11 +207,12 @@ __device__ __forceinline__ float q4e_glm_mla_at(const float* __restrict__ latent
 // The query half of the absorption: q_abs[row][head][c] = sum_j q[row][head][j] * kv_b[h][j][c],
 // kv_b's key rows, [nope][latent] a head. grid (heads, rows, latent / blockDim.x rounded up):
 // thread threadIdx.x of z-block z owns latent column z * blockDim.x + threadIdx.x, so a warp's
-// reads of the weight are consecutive words and its reads of the query one broadcast.
+// reads of the weight are consecutive words and its reads of the query one broadcast. With
+// `stated` the query is read as the producer's BF16 q_b output.
 extern "C" __global__ void q4e_glm_mla_absorb(const float* __restrict__ q,
                                               const float* __restrict__ kv_b,
                                               float* __restrict__ q_abs, int base, int nope,
-                                              int value, int latent) {
+                                              int value, int latent, int stated) {
     OPT_PDL_ENTRY();
     const int head = blockIdx.x;
     const int row = base + blockIdx.y;
@@ -225,11 +232,11 @@ extern "C" __global__ void q4e_glm_mla_absorb(const float* __restrict__ q,
         }
 #pragma unroll
         for (int k = 0; k < Q4E_GLM_MLA_AHEAD; ++k) {
-            acc = fmaf(w[k], qh[j + k], acc);
+            acc = fmaf(w[k], stated ? q4e_bf16r(qh[j + k]) : qh[j + k], acc);
         }
     }
     for (; j < nope; ++j) {
-        acc = fmaf(wc[(unsigned long long)j * latent], qh[j], acc);
+        acc = fmaf(wc[(unsigned long long)j * latent], stated ? q4e_bf16r(qh[j]) : qh[j], acc);
     }
     q_abs[((unsigned long long)row * gridDim.x + head) * latent + c] = acc;
 }
@@ -531,7 +538,9 @@ extern "C" __global__ void q4e_glm_mla_softmax(float* __restrict__ logits,
 // The weighted latent sum over the selection, in its order, over the softmax's sum: grid
 // (latent / 32, heads / Q4E_GLM_MLA_MIX_HEADS, rows), 32 * Q4E_GLM_MLA_MIX_HEADS threads. A tile
 // of positions' 32 columns and its weights load into registers while the block folds the tile
-// before it, so a warp is never waiting on one position's gather.
+// before it, so a warp is never waiting on one position's gather. With `stated` each weight is
+// the producer's BF16 probability, its share of the total rounded before it multiplies, and the
+// sum is not divided again.
 extern "C" __global__ void q4e_glm_mla_mix(const float* __restrict__ latent_cache,
                                            const unsigned char* __restrict__ codes,
                                            const float* __restrict__ scales,
@@ -540,7 +549,8 @@ extern "C" __global__ void q4e_glm_mla_mix(const float* __restrict__ latent_cach
                                            const float* __restrict__ weights,
                                            const float* __restrict__ total,
                                            float* __restrict__ mixed, int base, int heads,
-                                           int latent, int select_stride, int quantise) {
+                                           int latent, int select_stride, int quantise,
+                                           int stated) {
     OPT_PDL_ENTRY();
     constexpr int TILE = Q4E_GLM_MLA_MIX_TILE;
     constexpr int WARPS = Q4E_GLM_MLA_MIX_HEADS;
@@ -567,6 +577,7 @@ extern "C" __global__ void q4e_glm_mla_mix(const float* __restrict__ latent_cach
     }
     __syncthreads();
     const float* wh = weights + ((unsigned long long)row * heads + head) * Q4E_MAX_SELECTED;
+    const float share = head < heads ? total[(unsigned long long)row * heads + head] : 1.0f;
     unsigned int word[TILE / WARPS];
     float block[TILE / WARPS];
     float w[TILE / 32];
@@ -580,7 +591,8 @@ extern "C" __global__ void q4e_glm_mla_mix(const float* __restrict__ latent_cach
         }
 #pragma unroll
         for (int i = 0; i < TILE / 32; ++i) {
-            w[i] = head < heads ? wh[min(first + lane + 32 * i, nsel - 1)] : 0.0f;
+            const float weight = head < heads ? wh[min(first + lane + 32 * i, nsel - 1)] : 0.0f;
+            w[i] = stated ? q4e_bf16r(__fdiv_rn(weight, share)) : weight;
         }
     };
     fetch(0);
@@ -613,19 +625,19 @@ extern "C" __global__ void q4e_glm_mla_mix(const float* __restrict__ latent_cach
     }
     if (column < latent && head < heads) {
         mixed[((unsigned long long)row * heads + head) * latent + column] =
-            accumulator / total[(unsigned long long)row * heads + head];
+            stated ? accumulator : accumulator / share;
     }
 }
 
 // The value projection, kv_b's value rows ([latent][value] a head, after its key rows) over the
 // mixed latent: grid (heads, value / blockDim.x rounded up), rows base .. base + rows at once, so
 // the weights are read once a run. A row with nothing selected is zero, as the attend kernel
-// leaves it.
+// leaves it. With `stated` a head's output is the producer's BF16 value.
 extern "C" __global__ void q4e_glm_mla_project(const float* __restrict__ mixed,
                                                const float* __restrict__ kv_b,
                                                const int* __restrict__ selected_count,
                                                float* __restrict__ out, int base, int rows,
-                                               int nope, int value, int latent) {
+                                               int nope, int value, int latent, int stated) {
     OPT_PDL_ENTRY();
     constexpr int ROWS = Q4E_GLM_MLA_PROJECT_ROWS;
     constexpr int AHEAD = Q4E_GLM_MLA_PROJECT_AHEAD;
@@ -686,8 +698,9 @@ extern "C" __global__ void q4e_glm_mla_project(const float* __restrict__ mixed,
             if (r < count) {
                 const int nsel = selected_count[at];
                 if (nsel <= Q4E_MAX_SELECTED) {
+                    const float held = stated ? q4e_bf16r(accumulator[r]) : accumulator[r];
                     out[((unsigned long long)at * heads + head) * value + j] =
-                        nsel > 0 ? accumulator[r] : 0.0f;
+                        nsel > 0 ? held : 0.0f;
                 }
             }
         }
@@ -962,6 +975,10 @@ __device__ __forceinline__ void q4e_mhc_warp_mixes(const Q4eMhcLane& in, float s
 //
 // The fn projection is `raw`, or with `partials` the split partials the q4e_mhc_post before it
 // left there ([batch][hc hidden / Q4E_BLOCK][(2 + hc) hc]); `raw` is then unread.
+//
+// With `stated` the values take the producer's BF16 types (modeling_glm5_next.py 295 and 74-79):
+// the collapse is narrowed to BF16, and the norm rounds the normalised row to BF16 before the
+// weight and the product again.
 extern "C" __global__ void q4e_mhc_in(const float* __restrict__ raw,
                                       const float* __restrict__ streams,
                                       const float* __restrict__ scale,
@@ -969,7 +986,7 @@ extern "C" __global__ void q4e_mhc_in(const float* __restrict__ raw,
                                       const __nv_bfloat16* __restrict__ weight,
                                       float* __restrict__ out, int hidden, int hc, int iters,
                                       float hc_eps, float norm_eps, float eps,
-                                      const float* __restrict__ partials) {
+                                      const float* __restrict__ partials, int stated) {
     OPT_PDL_LAUNCH();
     __shared__ float scratch[Q4E_BLOCK];
     __shared__ float pre[Q4E_MHC_MAX_HC];
@@ -1041,9 +1058,9 @@ extern "C" __global__ void q4e_mhc_in(const float* __restrict__ raw,
                 accumulated = __fadd_rn(accumulated, __fmul_rn(p[copy], held[copy][k]));
             }
         }
-        mixed[k] = accumulated;
+        mixed[k] = stated ? q4e_bf16r(accumulated) : accumulated;
         if (k < columns) {
-            squares = __fadd_rn(squares, __fmul_rn(accumulated, accumulated));
+            squares = __fadd_rn(squares, __fmul_rn(mixed[k], mixed[k]));
         }
     }
     const float total = q4e_block_sum(squares, scratch);
@@ -1056,8 +1073,10 @@ extern "C" __global__ void q4e_mhc_in(const float* __restrict__ raw,
 #pragma unroll
     for (int k = 0; k < Q4E_MHC_COLUMNS; ++k) {
         if (k < columns) {
+            const float gain = __bfloat162float(norm[k]);
             y[threadIdx.x + k * blockDim.x] =
-                __fmul_rn(__fmul_rn(mixed[k], inverse), __bfloat162float(norm[k]));
+                stated ? q4e_bf16r(__fmul_rn(gain, q4e_bf16r(__fmul_rn(mixed[k], inverse))))
+                       : __fmul_rn(__fmul_rn(mixed[k], inverse), gain);
         }
     }
 }
@@ -1079,6 +1098,11 @@ extern "C" __global__ void q4e_mhc_in(const float* __restrict__ raw,
 // split order from 0.0, as the GEMV's last block adds its own, so the projection is the GEMV's to
 // the bit and the GEMV does not run. A warp takes the (copy, row) pairs warp + 8 i, whose weights
 // it loads before the wait.
+//
+// With `stated` the update is the producer's BF16 expression (modeling_glm5_next.py 1317-1328):
+// the branch's sum narrowed to BF16 as its module returns it, post and comb cast to BF16, the post
+// term one BF16 product, the comb term summed in f32 over the source copies and rounded once, and
+// their sum rounded (stated::hc_post).
 #define Q4E_MHC_PAIRS 12
 static_assert(Q4E_BLOCK == Q4E_TG_THREADS && Q4E_BLOCK == 32 * 8,
               "a mixer block's columns of a copy are one round of the tiled BF16 GEMV");
@@ -1087,7 +1111,8 @@ extern "C" __global__ void q4e_mhc_post(float* __restrict__ streams,
                                         const float* __restrict__ coeffs, int hidden, int hc,
                                         const float* __restrict__ slots, int rank, int world,
                                         const __nv_bfloat16* __restrict__ next_fn,
-                                        float* __restrict__ next_partials, int mixes) {
+                                        float* __restrict__ next_partials, int mixes,
+                                        int stated) {
     OPT_PDL_LAUNCH();
     __shared__ __align__(16) float staged[Q4E_MHC_MAX_HC][Q4E_BLOCK];
     const int t = blockIdx.y;
@@ -1131,6 +1156,9 @@ extern "C" __global__ void q4e_mhc_post(float* __restrict__ streams,
         }
         y = sum;
     }
+    if (stated) {
+        y = q4e_bf16r(y);
+    }
     float residual[Q4E_MHC_MAX_HC];
 #pragma unroll
     for (int source = 0; source < Q4E_MHC_MAX_HC; ++source) {
@@ -1139,12 +1167,26 @@ extern "C" __global__ void q4e_mhc_post(float* __restrict__ streams,
 #pragma unroll
     for (int copy = 0; copy < Q4E_MHC_MAX_HC; ++copy) {
         if (copy < hc) {
-            float accumulated = __fmul_rn(post[copy], y);
+            float accumulated;
+            if (stated) {
+                float mixed = 0.0f;
 #pragma unroll
-            for (int source = 0; source < Q4E_MHC_MAX_HC; ++source) {
-                if (source < hc) {
-                    accumulated =
-                        __fadd_rn(accumulated, __fmul_rn(comb[source * hc + copy], residual[source]));
+                for (int source = 0; source < Q4E_MHC_MAX_HC; ++source) {
+                    if (source < hc) {
+                        mixed = __fadd_rn(
+                            mixed, __fmul_rn(q4e_bf16r(comb[source * hc + copy]), residual[source]));
+                    }
+                }
+                accumulated = q4e_bf16r(__fadd_rn(q4e_bf16r(__fmul_rn(q4e_bf16r(post[copy]), y)),
+                                                  q4e_bf16r(mixed)));
+            } else {
+                accumulated = __fmul_rn(post[copy], y);
+#pragma unroll
+                for (int source = 0; source < Q4E_MHC_MAX_HC; ++source) {
+                    if (source < hc) {
+                        accumulated = __fadd_rn(accumulated,
+                                                __fmul_rn(comb[source * hc + copy], residual[source]));
+                    }
                 }
             }
             x[(unsigned long long)copy * hidden + j] = accumulated;
@@ -1169,6 +1211,62 @@ extern "C" __global__ void q4e_mhc_post(float* __restrict__ streams,
                 out[(unsigned long long)(copy * (hidden / Q4E_BLOCK) + blockIdx.x) * mixes + row] =
                     sum;
             }
+        }
+    }
+}
+
+// The head's fold of the streams and the final norm, one block a token: the mean of the hc copies
+// summed in f32 in copy order (modeling_glm5_next.py 332-336), then RMSNorm with the BF16 weight.
+// With `stated` the fold is narrowed to BF16 and the norm takes the producer's two rounds, as
+// q4e_mhc_in's input does. grid (batch), Q4E_BLOCK threads.
+extern "C" __global__ void q4e_mhc_head(const float* __restrict__ streams,
+                                        const __nv_bfloat16* __restrict__ weight,
+                                        float* __restrict__ out, int hidden, int hc, float eps,
+                                        int stated) {
+    OPT_PDL_LAUNCH();
+    __shared__ float scratch[Q4E_BLOCK];
+    const int columns = hidden / (int)blockDim.x;
+    if (hc <= 0 || hc > Q4E_MHC_MAX_HC || columns * (int)blockDim.x != hidden ||
+        columns > Q4E_MHC_COLUMNS) {
+        return;
+    }
+    __nv_bfloat16 norm[Q4E_MHC_COLUMNS];
+#pragma unroll
+    for (int k = 0; k < Q4E_MHC_COLUMNS; ++k) {
+        norm[k] = k < columns ? weight[threadIdx.x + k * blockDim.x] : __float2bfloat16(0.0f);
+    }
+    OPT_PDL_WAIT();
+    const float* x = streams + (unsigned long long)blockIdx.x * hc * hidden;
+    float folded[Q4E_MHC_COLUMNS];
+    float squares = 0.0f;
+#pragma unroll
+    for (int k = 0; k < Q4E_MHC_COLUMNS; ++k) {
+        folded[k] = 0.0f;
+        if (k < columns) {
+            const int column = threadIdx.x + k * blockDim.x;
+            float sum = 0.0f;
+            for (int copy = 0; copy < hc; ++copy) {
+                sum = __fadd_rn(sum, x[(unsigned long long)copy * hidden + column]);
+            }
+            const float mean = __fdiv_rn(sum, (float)hc);
+            folded[k] = stated ? q4e_bf16r(mean) : mean;
+            squares = __fadd_rn(squares, __fmul_rn(folded[k], folded[k]));
+        }
+    }
+    const float total = q4e_block_sum(squares, scratch);
+    bool exact = true;
+    float inverse = q4e_mhc_rms_scale<true>(total, (float)hidden, eps, exact);
+    if (__any_sync(0xFFFFFFFFu, !exact)) {
+        inverse = q4e_mhc_rms_scale<false>(total, (float)hidden, eps, exact);
+    }
+    float* y = out + (unsigned long long)blockIdx.x * hidden;
+#pragma unroll
+    for (int k = 0; k < Q4E_MHC_COLUMNS; ++k) {
+        if (k < columns) {
+            const float gain = __bfloat162float(norm[k]);
+            y[threadIdx.x + k * blockDim.x] =
+                stated ? q4e_bf16r(__fmul_rn(gain, q4e_bf16r(__fmul_rn(folded[k], inverse))))
+                       : __fmul_rn(__fmul_rn(folded[k], inverse), gain);
         }
     }
 }
@@ -1211,28 +1309,33 @@ extern "C" __global__ void q4e_noaux_router(const float* __restrict__ logits,
 extern "C" __global__ void q4e_layer_norm(const float* __restrict__ x,
                                           const __nv_bfloat16* __restrict__ weight,
                                           const __nv_bfloat16* __restrict__ bias,
-                                          float* __restrict__ out, int columns, float eps) {
+                                          float* __restrict__ out, int columns, float eps,
+                                          int stated) {
     OPT_PDL_ENTRY();
     __shared__ float scratch[Q4E_BLOCK];
     const float* source = x + (unsigned long long)blockIdx.x * columns;
     float* destination = out + (unsigned long long)blockIdx.x * columns;
+    // With `stated` the input is the producer's BF16 module output and the norm's output is held
+    // the same way: read rounded, written rounded.
+    const auto read = [&](int index) { return stated ? q4e_bf16r(source[index]) : source[index]; };
     float sum = 0.0f;
     for (int index = threadIdx.x; index < columns; index += blockDim.x) {
-        sum = __fadd_rn(sum, source[index]);
+        sum = __fadd_rn(sum, read(index));
     }
     const float mean = q4e_block_sum(sum, scratch) / (float)columns;
     float squares = 0.0f;
     for (int index = threadIdx.x; index < columns; index += blockDim.x) {
-        const float delta = __fadd_rn(source[index], -mean);
+        const float delta = __fadd_rn(read(index), -mean);
         squares = __fadd_rn(squares, __fmul_rn(delta, delta));
     }
     const float variance = q4e_block_sum(squares, scratch) / (float)columns;
     const float scale = 1.0f / sqrtf(__fadd_rn(variance, eps));
     for (int index = threadIdx.x; index < columns; index += blockDim.x) {
-        const float delta = __fadd_rn(source[index], -mean);
-        destination[index] = __fadd_rn(
+        const float delta = __fadd_rn(read(index), -mean);
+        const float normed = __fadd_rn(
             __fmul_rn(__fmul_rn(delta, scale), __bfloat162float(weight[index])),
             __bfloat162float(bias[index]));
+        destination[index] = stated ? q4e_bf16r(normed) : normed;
     }
 }
 
@@ -1246,11 +1349,12 @@ extern "C" __global__ void q4e_layer_norm(const float* __restrict__ x,
 // (position + 1) / pool - 1 of `pooled`. A token that completes no pool is a no-op, so a step
 // launches this whatever its position. grid (positions): block b pools for `position` + b, threads
 // over the channels; a pool reads only cached keys and gates, so a run's pools are one launch.
+// With `stated` the pool takes the producer's BF16 types (q4e_indexer_pool_body).
 extern "C" __global__ void q4e_glm_pool(const float* __restrict__ keys,
                                         const float* __restrict__ gates,
                                         const __nv_bfloat16* __restrict__ ape,
                                         float* __restrict__ pooled, int dim, int pool,
-                                        int position) {
+                                        int position, int stated) {
     OPT_PDL_ENTRY();
     position += blockIdx.x;
     if (pool <= 0 || pool > Q4E_GLM_MAX_POOL || (position + 1) % pool != 0) {
@@ -1260,7 +1364,8 @@ extern "C" __global__ void q4e_glm_pool(const float* __restrict__ keys,
     float* destination = pooled + (unsigned long long)((position + 1) / pool - 1) * dim;
     q4e_indexer_pool_body<float, true>(keys + (unsigned long long)first * dim,
                                        gates + (unsigned long long)first * dim, ape, nullptr,
-                                       destination, dim, pool, 0, 0.0f, 0.0f, first);
+                                       destination, dim, pool, 0, 0.0f, 0.0f, first,
+                                       stated != 0);
 }
 
 
@@ -1274,13 +1379,14 @@ extern "C" __global__ void q4e_glm_pool(const float* __restrict__ keys,
 #define Q4E_QSA_TILE 64
 // grid (ceil(pools / Q4E_QSA_TILE) of the last row, rows), Q4E_BLOCK threads: blockIdx.y is the
 // row at `position` + y, its query heads and head weights the y-th of the run's and its scores
-// `score_stride` floats on from the previous row's.
+// `score_stride` floats on from the previous row's. With `stated` the query heads and the head
+// weights are read as the BF16 values their projections return.
 extern "C" __global__ void q4e_glm_index_scores(const float* __restrict__ query,
                                                 const float* __restrict__ head_weights,
                                                 const float* __restrict__ pooled,
                                                 float* __restrict__ scores, int position,
                                                 int heads, int dim, int pool, float score_scale,
-                                                float head_scale, int score_stride) {
+                                                float head_scale, int score_stride, int stated) {
     OPT_PDL_ENTRY();
     __shared__ float staged[Q4E_GLM_MAX_INDEX_HEADS * Q4E_GLM_MAX_INDEX_DIM];
     __shared__ float weight[Q4E_GLM_MAX_INDEX_HEADS];
@@ -1295,10 +1401,11 @@ extern "C" __global__ void q4e_glm_index_scores(const float* __restrict__ query,
         return;
     }
     for (int index = threadIdx.x; index < heads * dim; index += blockDim.x) {
-        staged[index] = query[index];
+        staged[index] = stated ? q4e_bf16r(query[index]) : query[index];
     }
     for (int head = threadIdx.x; head < heads; head += blockDim.x) {
-        weight[head] = __fmul_rn(head_weights[head], head_scale);
+        const float raw = stated ? q4e_bf16r(head_weights[head]) : head_weights[head];
+        weight[head] = __fmul_rn(raw, head_scale);
     }
     __syncthreads();
     const int lane = threadIdx.x & 31;

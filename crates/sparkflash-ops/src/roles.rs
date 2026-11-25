@@ -21,12 +21,12 @@
 //! argument the host passes. An arm calls a body through a small adapter, so the launches, their
 //! order and their arguments stay the arm's.
 //!
-//! The bodies here are the shared shapes of three roles: [StreamMixer] (the residual's
+//! The bodies here include the shared shapes of three roles: [ManifoldMixer] (the residual's
 //! hyper-connection streams, a frame around each branch), [PooledIndexer] (the selection a token
 //! mixer holds) and [EngramSide] (a lookup that lands on the layer input). Each carries its
-//! geometry, the bounds of the kernels it launches and its kernel table. Their passes refuse by
-//! name until an arm's body moves in: GLM's manifold mix, GLM's pooled indexer and DeepSeek's
-//! Engram gate and write.
+//! geometry, the bounds of the kernels it launches and its kernel table. The mix and the indexer
+//! are GLM's passes, moved in with a `stated` switch that takes the producer's BF16 types; the
+//! Engram side refuses by name until DeepSeek's gate and write move in.
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::Image;
@@ -540,7 +540,8 @@ impl LayerNorm {
     }
 
     /// `rows` rows of `width` floats from `input`, normed by `(gains, biases)` (BF16) at `eps`
-    /// into `output`, one launch.
+    /// into `output`, one launch. With `stated` the input is read and the output written as the
+    /// producer's BF16 values.
     ///
     /// # Errors
     /// The driver's refusal.
@@ -552,7 +553,7 @@ impl LayerNorm {
         (gains, biases): (Deviceptr, Deviceptr),
         output: Deviceptr,
         width: usize,
-        eps: f32,
+        (eps, stated): (f32, bool),
         rows: usize,
     ) -> Result<(), BackendError> {
         cx.launch(
@@ -565,6 +566,7 @@ impl LayerNorm {
                 output.0,
                 width as u64,
                 u64::from(eps.to_bits()),
+                u64::from(stated),
             ],
         )
     }
@@ -1914,78 +1916,56 @@ impl<L: ?Sized> KdaLayer<'_, L> {
     }
 }
 
-/// How a branch's rows reach the streams when the mix leaves the branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SumPath {
-    /// The branch's rows are whole: summed over the group before the mix, or one rank's.
-    Summed,
-    /// Every rank's partial rows sit in `slots`, `[world][rows][hidden]`, and the mix folds
-    /// them in rank order from zero.
-    FusedSlots {
-        /// The gathered partials.
-        slots: Deviceptr,
-        /// This rank.
-        rank: usize,
-        /// The ranks.
-        world: usize,
-    },
+/// A manifold mix's weights: the `fn` projection of a row's flattened streams, `[(2 + hc) hc]`
+/// outputs over `hc hidden` inputs in the arm's projection format, and the mix's f32 scale (three
+/// floats: pre, post, comb) and base (`(2 + hc) hc` floats).
+#[derive(Debug, Clone, Copy)]
+pub struct ManifoldWeights<'a, L: ?Sized> {
+    /// The `fn` projection.
+    pub projection: &'a L,
+    /// The mix's scale.
+    pub scale: Deviceptr,
+    /// The mix's base.
+    pub base: Deviceptr,
 }
 
-/// The residual's hyper-connection streams, as frames around each branch.
+/// A mix's rows: the projection's `[rows][(2 + hc) hc]` f32 outputs, and the coefficients the
+/// mix works out from them in the same width (pre, post, comb a row), which the branch's
+/// [ManifoldMixer::leave] reads.
+#[derive(Debug, Clone, Copy)]
+pub struct ManifoldRows {
+    /// The projection's outputs.
+    pub raw: Deviceptr,
+    /// The coefficients.
+    pub coeffs: Deviceptr,
+}
+
+/// The manifold-constrained mix (mHC) around each branch of a widened residual, its streams f32
+/// `[rows][hc][hidden]`: `q4e_mhc_in` before a branch (the coefficients from the streams, and the
+/// branch's normed input collapsed through the mix's own pre coefficients), `q4e_mhc_post` after
+/// it (the branch's rows mixed back into the streams), and `q4e_mhc_head` at the head (the mean of
+/// the streams, normed). A mixer is replicated: every rank mixes the same rows.
 ///
-/// The streams are f32 `[rows][streams][hidden]`. A mixer is stateless and replicated: every rank
-/// mixes the same streams.
-pub trait StreamMixer<C: DeviceCx> {
-    /// Mixes `streams` into the branch's normed input at `out`, under the norm gains at `norm`.
-    /// With `fused` the previous [Self::leave] already projected the streams for this mix.
-    ///
-    /// # Errors
-    /// The driver's refusal, or a body that does not run yet.
-    fn enter(
-        &self,
-        cx: &C,
-        streams: Deviceptr,
-        norm: Deviceptr,
-        out: Deviceptr,
-        fused: bool,
-    ) -> Result<(), BackendError>;
-
-    /// Lands the branch's rows at `branch` back on `streams` along `path`, and, when the host
-    /// passes the next branch's mixer as `next`, projects the new streams for it. Returns whether
-    /// it did, which the next [Self::enter] is told.
-    ///
-    /// # Errors
-    /// The driver's refusal, or a body that does not run yet.
-    fn leave(
-        &self,
-        cx: &C,
-        branch: Deviceptr,
-        streams: Deviceptr,
-        next: Option<&Self>,
-        path: SumPath,
-    ) -> Result<bool, BackendError>;
-
-    /// Folds the streams to one row each at `out`, f32 `[rows][hidden]`, for the head.
-    ///
-    /// # Errors
-    /// The driver's refusal, or a body that does not run yet.
-    fn fold(&self, cx: &C, streams: Deviceptr, out: Deviceptr) -> Result<(), BackendError>;
-}
-
-/// The manifold-constrained mix (mHC): `q4e_mhc_in` before a branch, `q4e_mhc_post` after it.
+/// With `stated` each body takes its producer's BF16 types (GLM-5.3-Flash's
+/// `modeling_glm5_next.py`): the collapse and the fold narrowed to BF16, the norm's two rounds,
+/// and the stream update's BF16 expression. Without it the values stay f32.
 #[derive(Debug, Clone, Copy)]
 pub struct ManifoldMixer {
     geometry: HcGeometry,
-    kernels: [Bound; 2],
+    kernels: [Bound; 3],
 }
 
 impl ManifoldMixer {
     /// The mix's kernels at the host's `precision`.
     #[must_use]
-    pub const fn table(precision: Precision) -> KernelTable<2> {
+    pub const fn table(precision: Precision) -> KernelTable<3> {
         KernelTable {
             image: Image::DECODE,
-            symbols: [("q4e_mhc_in", precision), ("q4e_mhc_post", precision)],
+            symbols: [
+                ("q4e_mhc_in", precision),
+                ("q4e_mhc_post", precision),
+                ("q4e_mhc_head", precision),
+            ],
         }
     }
 
@@ -2063,10 +2043,122 @@ impl ManifoldMixer {
         self.geometry
     }
 
-    /// The loaded `q4e_mhc_in` and `q4e_mhc_post`.
+    /// The loaded `q4e_mhc_in`, `q4e_mhc_post` and `q4e_mhc_head`.
     #[must_use]
-    pub const fn kernels(&self) -> [Bound; 2] {
+    pub const fn kernels(&self) -> [Bound; 3] {
         self.kernels
+    }
+
+    /// The `(2 + hc) hc` floats a row's coefficients take.
+    #[must_use]
+    pub const fn mixes(&self) -> usize {
+        (2 + self.geometry.hc_mult) * self.geometry.hc_mult
+    }
+
+    /// Before a branch: the `fn` projection of the pass's `streams` into `rows.raw`, then each
+    /// row's coefficients into `rows.coeffs` and its normed input into `out`, f32
+    /// `[rows][hidden]`, under the BF16 gains at `norm` and the branch norm's `eps`.
+    ///
+    /// # Errors
+    /// A projection the arm does not run, or the driver's refusal.
+    pub fn enter<C: DeviceCx>(
+        &self,
+        cx: &C,
+        weights: &ManifoldWeights<'_, C::Linear>,
+        rows: ManifoldRows,
+        (streams, norm, out): (Deviceptr, Deviceptr, Deviceptr),
+        (eps, stated): (f32, bool),
+    ) -> Result<(), BackendError> {
+        let count = cx.rows();
+        let geometry = self.geometry;
+        cx.project(weights.projection, streams, rows.raw, count)?;
+        cx.launch(
+            self.kernels[0],
+            ((2, count as u32, 1), (BLOCK, 1, 1)),
+            &[
+                rows.raw.0,
+                streams.0,
+                weights.scale.0,
+                weights.base.0,
+                rows.coeffs.0,
+                norm.0,
+                out.0,
+                geometry.dim as u64,
+                geometry.hc_mult as u64,
+                geometry.hc_sinkhorn_iters as u64,
+                u64::from(geometry.hc_eps.to_bits()),
+                u64::from(geometry.norm_eps.to_bits()),
+                u64::from(eps.to_bits()),
+                0,
+                u64::from(stated),
+            ],
+        )
+    }
+
+    /// After a branch: each row's `branch` rows (whole, summed over the group) mixed into its
+    /// `streams` in place by the coefficients [Self::enter] left at `coeffs`.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn leave<C: DeviceCx>(
+        &self,
+        cx: &C,
+        (streams, branch, coeffs): (Deviceptr, Deviceptr, Deviceptr),
+        stated: bool,
+    ) -> Result<(), BackendError> {
+        let geometry = self.geometry;
+        cx.launch(
+            self.kernels[1],
+            (
+                (
+                    geometry.dim.div_ceil(BLOCK as usize) as u32,
+                    cx.rows() as u32,
+                    1,
+                ),
+                (BLOCK, 1, 1),
+            ),
+            &[
+                streams.0,
+                branch.0,
+                coeffs.0,
+                geometry.dim as u64,
+                geometry.hc_mult as u64,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                u64::from(stated),
+            ],
+        )
+    }
+
+    /// At the head: each row's streams folded to their mean and normed into `out`, f32
+    /// `[rows][hidden]`, under the BF16 gains at `norm` and the final norm's `eps`.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn head<C: DeviceCx>(
+        &self,
+        cx: &C,
+        (streams, norm, out): (Deviceptr, Deviceptr, Deviceptr),
+        (eps, stated): (f32, bool),
+    ) -> Result<(), BackendError> {
+        let geometry = self.geometry;
+        cx.launch(
+            self.kernels[2],
+            ((cx.rows() as u32, 1, 1), (BLOCK, 1, 1)),
+            &[
+                streams.0,
+                norm.0,
+                out.0,
+                geometry.dim as u64,
+                geometry.hc_mult as u64,
+                u64::from(eps.to_bits()),
+                u64::from(stated),
+            ],
+        )
     }
 }
 
@@ -2078,40 +2170,51 @@ fn not_moved(body: &str, from: &str) -> BackendError {
     )
 }
 
-impl<C: DeviceCx> StreamMixer<C> for ManifoldMixer {
-    fn enter(
-        &self,
-        _cx: &C,
-        _streams: Deviceptr,
-        _norm: Deviceptr,
-        _out: Deviceptr,
-        _fused: bool,
-    ) -> Result<(), BackendError> {
-        Err(not_moved("manifold mix", "GLM's mix_in"))
-    }
-
-    fn leave(
-        &self,
-        _cx: &C,
-        _branch: Deviceptr,
-        _streams: Deviceptr,
-        _next: Option<&Self>,
-        _path: SumPath,
-    ) -> Result<bool, BackendError> {
-        Err(not_moved("manifold mix", "GLM's mix_out"))
-    }
-
-    fn fold(&self, _cx: &C, _streams: Deviceptr, _out: Deviceptr) -> Result<(), BackendError> {
-        Err(not_moved("manifold mix", "GLM's head fold"))
-    }
-}
-
 /// The pooled indexer a token mixer holds: keys pooled `pool` to one by a learned gate, scored by
 /// the indexer heads, and the best positions picked into the selection the mixer attends over.
 #[derive(Debug, Clone, Copy)]
 pub struct PooledIndexer {
     geometry: PooledGeometry,
     kernels: [Bound; 3],
+    /// `q4e_layer_norm` (the keys' norm), `glm_prefill_index_scores` (a long run's scores) and
+    /// `q4e_copy_flat` (the gates into their cache).
+    helpers: [Bound; 3],
+}
+
+/// The linears and tensors one pooled indexer reads, the host's own projections among them.
+#[derive(Debug, Clone, Copy)]
+pub struct PooledWeights<'a, L: ?Sized> {
+    /// `wk`: the hidden into a key a position.
+    pub keys: &'a L,
+    /// The pool gate: the hidden into a gate a key channel.
+    pub gates: &'a L,
+    /// `weights_proj`: the hidden into a weight a head.
+    pub head_weights: &'a L,
+    /// `wq_b`: the query latent into the heads' queries.
+    pub queries: &'a L,
+    /// The keys' LayerNorm gains and biases, BF16.
+    pub key_norm: (Deviceptr, Deviceptr),
+    /// The pool's position table, BF16 `[pool][head_dim]`.
+    pub ape: Deviceptr,
+}
+
+/// The pass's indexer scratch, f32 row-major a pass row each.
+#[derive(Debug, Clone, Copy)]
+pub struct PooledRows {
+    /// The projected keys, `head_dim` a row.
+    pub keys: Deviceptr,
+    /// The projected gates, `head_dim` a row.
+    pub gates: Deviceptr,
+    /// The heads' weights, `heads` a row.
+    pub head_weights: Deviceptr,
+    /// The heads' queries, `heads x head_dim` a row.
+    pub queries: Deviceptr,
+    /// Each row's pool scores, [PooledIndexer::score_stride] a row.
+    pub scores: Deviceptr,
+    /// Each row's picked positions, [MAX_SELECTED_TOKENS] a row (i32).
+    pub selected: Deviceptr,
+    /// Each row's picked count (i32).
+    pub count: Deviceptr,
 }
 
 /// The shape of a [PooledIndexer].
@@ -2164,6 +2267,13 @@ impl PooledIndexer {
         if indexer.candidate_pool.is_some() {
             return Err("a hierarchical candidate pool is not the pooled indexer's".to_owned());
         }
+        if !indexer.always_select_tail {
+            return Err(
+                "an indexer that drops the incomplete pool is not the pooled indexer's: \
+                 q4e_glm_pick always keeps it"
+                    .to_owned(),
+            );
+        }
         let checks = |checks: &[(&str, usize, usize)]| {
             checks.iter().try_for_each(|&(what, value, bound)| {
                 if value == 0 || value > bound {
@@ -2211,10 +2321,32 @@ impl PooledIndexer {
         geometry: PooledGeometry,
         precision: Precision,
     ) -> Result<Self, String> {
+        let [norm] = LayerNorm::TABLE.load(cuda)?;
+        let [run_scores] = Self::RUN_SCORES.load(cuda)?;
+        let [copy] = Self::COPY.load(cuda)?;
         Ok(Self {
             geometry,
             kernels: Self::table(precision).load(cuda)?,
+            helpers: [norm, run_scores, copy],
         })
+    }
+
+    /// The long run's score body, which keeps a tile of pooled keys while it walks the rows.
+    pub const RUN_SCORES: KernelTable<1> = KernelTable {
+        image: Image::GlmAttention,
+        symbols: [("glm_prefill_index_scores", Precision::F32)],
+    };
+
+    /// The copy of a pass's gates into each sequence's cache.
+    pub const COPY: KernelTable<1> = KernelTable {
+        image: Image::Qwen4Exp,
+        symbols: [("q4e_copy_flat", Precision::F32)],
+    };
+
+    /// The floats a row's pool scores take at a window of `positions`: one a pool.
+    #[must_use]
+    pub const fn score_stride(&self, positions: usize) -> usize {
+        positions / self.geometry.pool
     }
 
     /// The indexer's geometry.
@@ -2229,27 +2361,559 @@ impl PooledIndexer {
         self.kernels
     }
 
-    /// Appends the pass's pooled keys to each segment's index cache, its `regions`.
+    /// The caching half: the pass's keys and gates projected from `input` (the layer's normed
+    /// hidden, f32 `[rows][hidden]`) into `rows`, each segment's normed keys and gates appended
+    /// to its caches, and every pool a row completes pooled. A segment's regions are its keys,
+    /// its gates and its pooled keys, `head_dim` floats a position or a pool. The heads' weights
+    /// are projected here too and wait in `rows` for [Self::pick]. With `stated` the norm, the
+    /// pool and the scores take the producer's BF16 values, else the f32 ones.
+    ///
+    /// A pool reads only cached keys and gates, and a row scores only pools at or before its own,
+    /// so every pool a row scores is in by [Self::pick].
     ///
     /// # Errors
-    /// The driver's refusal, or a body that does not run yet.
-    pub fn cache<C: DeviceCx>(&self, _cx: &C, _regions: &[Deviceptr]) -> Result<(), BackendError> {
-        Err(not_moved("pooled indexer", "GLM's index_cache"))
+    /// A segment whose regions are not three, a projection the arm does not run, or the driver's
+    /// refusal.
+    pub fn cache<C: DeviceCx>(
+        &self,
+        cx: &C,
+        weights: &PooledWeights<'_, C::Linear>,
+        rows: &PooledRows,
+        input: Deviceptr,
+        (key_eps, stated): (f32, bool),
+    ) -> Result<(), BackendError> {
+        let count = cx.rows();
+        let PooledGeometry { head_dim, pool, .. } = self.geometry;
+        let floats = |values: usize| values * 4;
+        cx.project(weights.keys, input, rows.keys, count)?;
+        cx.project(weights.gates, input, rows.gates, count)?;
+        cx.project(weights.head_weights, input, rows.head_weights, count)?;
+        let [norm, _, copy] = self.helpers;
+        for segment in cx.segments() {
+            let &[keys, gates, pooled] = segment.regions else {
+                return Err(pooled_regions(segment.regions.len()));
+            };
+            let cached = floats(segment.position * head_dim);
+            let at = floats(segment.first * head_dim);
+            cx.launch(
+                norm,
+                ((segment.rows as u32, 1, 1), (BLOCK, 1, 1)),
+                &[
+                    rows.keys.offset(at).0,
+                    weights.key_norm.0.0,
+                    weights.key_norm.1.0,
+                    keys.offset(cached).0,
+                    head_dim as u64,
+                    u64::from(key_eps.to_bits()),
+                    u64::from(stated),
+                ],
+            )?;
+            cx.call(
+                copy,
+                calls::copy(
+                    gates.offset(cached).0,
+                    rows.gates.offset(at).0,
+                    segment.rows * head_dim,
+                ),
+            )?;
+            let pass = crate::indexer::IndexerPass::new(segment.position, segment.rows, pool);
+            cx.launch(
+                self.kernels[0],
+                pass.per_row(),
+                &[
+                    keys.0,
+                    gates.0,
+                    weights.ape.0,
+                    pooled.0,
+                    head_dim as u64,
+                    pool as u64,
+                    segment.position as u64,
+                    u64::from(stated),
+                ],
+            )?;
+        }
+        Ok(())
     }
 
-    /// Scores the cached keys against the queries at `query` and writes each row's picked
-    /// positions to `selection`.
+    /// The picking half: the heads' queries projected from `query` (the normed query latent,
+    /// f32 `[rows][q_lora]`), each row's scores over every whole pool it sees, and the picks it
+    /// attends over into `rows.selected` and `rows.count`. A run longer than `token_rows` (the
+    /// host's token-path rows) takes the run body, which computes the tiled body's floats. The
+    /// scores are `rows.scores`, `score_stride` floats a row ([Self::score_stride]).
     ///
     /// # Errors
-    /// The driver's refusal, or a body that does not run yet.
+    /// A segment whose regions are not three, a projection the arm does not run, or the driver's
+    /// refusal.
     pub fn pick<C: DeviceCx>(
         &self,
-        _cx: &C,
-        _query: Deviceptr,
-        _selection: Deviceptr,
+        cx: &C,
+        weights: &PooledWeights<'_, C::Linear>,
+        rows: &PooledRows,
+        query: Deviceptr,
+        (score_stride, token_rows, stated): (usize, usize, bool),
     ) -> Result<(), BackendError> {
-        Err(not_moved("pooled indexer", "GLM's index_pick"))
+        let count = cx.rows();
+        let PooledGeometry {
+            heads,
+            head_dim,
+            pool,
+            topk,
+            ..
+        } = self.geometry;
+        let floats = |values: usize| values * 4;
+        let float = |value: f32| u64::from(value.to_bits());
+        let inverse_sqrt = |value: usize| (1.0 / (value as f64).sqrt()) as f32;
+        cx.project(weights.queries, query, rows.queries, count)?;
+        let [_, run_scores, _] = self.helpers;
+        for segment in cx.segments() {
+            let &[_, _, pooled] = segment.regions else {
+                return Err(pooled_regions(segment.regions.len()));
+            };
+            let (row, position) = (segment.first, segment.position);
+            let pass = crate::indexer::IndexerPass::new(position, segment.rows, pool);
+            let queries = rows.queries.offset(floats(row * heads * head_dim)).0;
+            let head_weights = rows.head_weights.offset(floats(row * heads)).0;
+            let scores = rows.scores.offset(floats(row * score_stride)).0;
+            if let Some(launch) = pass.run_scores(heads, head_dim, token_rows) {
+                cx.launch(
+                    run_scores,
+                    launch,
+                    &[
+                        queries,
+                        head_weights,
+                        pooled.0,
+                        scores,
+                        position as u64,
+                        pool as u64,
+                        float(inverse_sqrt(head_dim)),
+                        float(inverse_sqrt(heads)),
+                        score_stride as u64,
+                        segment.rows as u64,
+                        u64::from(stated),
+                    ],
+                )?;
+            } else {
+                cx.launch(
+                    self.kernels[1],
+                    pass.scores(),
+                    &[
+                        queries,
+                        head_weights,
+                        pooled.0,
+                        scores,
+                        position as u64,
+                        heads as u64,
+                        head_dim as u64,
+                        pool as u64,
+                        float(inverse_sqrt(head_dim)),
+                        float(inverse_sqrt(heads)),
+                        score_stride as u64,
+                        u64::from(stated),
+                    ],
+                )?;
+            }
+            cx.launch(
+                self.kernels[2],
+                pass.per_row(),
+                &[
+                    scores,
+                    rows.selected.offset(floats(row * MAX_SELECTED_TOKENS)).0,
+                    rows.count.offset(floats(row)).0,
+                    position as u64,
+                    pool as u64,
+                    (topk / pool) as u64,
+                    score_stride as u64,
+                    MAX_SELECTED_TOKENS as u64,
+                ],
+            )?;
+        }
+        Ok(())
     }
+}
+
+/// The refusal of a segment whose indexer regions are not its keys, gates and pooled keys.
+fn pooled_regions(count: usize) -> BackendError {
+    BackendError::new(
+        ROLE,
+        format!(
+            "a pooled indexer's segment holds {count} regions, not its keys, gates and pooled keys"
+        ),
+    )
+}
+
+/// Q4E_GLM_MAX_LATENT: the widest latent the absorbed attention's kernels read.
+pub const MAX_LATENT: usize = 512;
+/// Q4E_GLM_MLA_HEADS: the heads one block of `q4e_glm_mla_scores` stages.
+const MLA_HEADS: usize = 16;
+/// Q4E_GLM_MLA_SCORE_SLOTS: the selected positions a `q4e_glm_mla_scores` block scores.
+const MLA_SCORE_SLOTS: usize = 64;
+/// Q4E_GLM_MLA_MIX_HEADS: the heads (a warp each) of a `q4e_glm_mla_mix` block.
+const MLA_MIX_HEADS: usize = 8;
+/// The threads of a `q4e_glm_mla_project` block: a value column each.
+const MLA_PROJECT_THREADS: u32 = 64;
+/// Q4E_FP8_BLOCK: the columns one E4M3 latent scale covers.
+const LATENT_BLOCK: usize = 128;
+
+/// The absorbed (V3-form) MLA a token mixer runs over its cached latents: one normed key/value
+/// latent a position, the query read into the latent space through `kv_b`'s key rows, the
+/// attention over the positions the indexer picked, and the mixed latent out through `kv_b`'s
+/// value rows. The expanded keys and values are never built (DeepSeek-V2's absorption,
+/// arXiv:2405.04434, in the NoPE form GLM-5.3-Flash releases).
+///
+/// The bodies are GLM's own (`q4e_glm_mla_*`). With `stated` they take the producer's types:
+/// the projections and norms BF16, the absorbed query, the logits, the softmax and the mixed
+/// latent f32, the probabilities and the head outputs BF16.
+#[derive(Debug, Clone, Copy)]
+pub struct AbsorbedMla {
+    geometry: AbsorbedGeometry,
+    kernels: [Bound; 8],
+}
+
+/// The shape of an [AbsorbedMla] on one rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbsorbedGeometry {
+    /// The rank's query heads.
+    pub heads: usize,
+    /// A head's key width, all of it unrotated.
+    pub nope: usize,
+    /// A head's value width.
+    pub value: usize,
+    /// The cached latent's width (`kv_lora_rank`).
+    pub latent: usize,
+    /// The query latent's width (`q_lora_rank`).
+    pub q_lora: usize,
+}
+
+/// The linears and tensors one absorbed layer reads, the host's own projections among them.
+#[derive(Debug, Clone, Copy)]
+pub struct AbsorbedWeights<'a, L: ?Sized> {
+    /// `q_a`: the hidden into the query latent.
+    pub q_a: &'a L,
+    /// `kv_a`: the hidden into the key/value latent.
+    pub kv_a: &'a L,
+    /// `q_b`: the query latent into the rank's heads.
+    pub q_b: &'a L,
+    /// `o_proj`: the rank's head outputs into the hidden (a partial the host sums).
+    pub out: &'a L,
+    /// The query and latent norms' BF16 gains.
+    pub norms: (Deviceptr, Deviceptr),
+    /// The rank's `kv_b` rows widened to f32, `[heads][nope + value][latent]`, the value rows
+    /// transposed to `[latent][value]` after a head's key rows.
+    pub kv_b: Deviceptr,
+}
+
+/// The pass's attention scratch, f32 row-major a pass row each.
+#[derive(Debug, Clone, Copy)]
+pub struct AbsorbedRows {
+    /// The normed query latent, `q_lora` a row (the indexer's query input too).
+    pub q_latent: Deviceptr,
+    /// The normed key/value latent, `latent` a row.
+    pub latent: Deviceptr,
+    /// The heads' queries, `heads x nope` a row.
+    pub query: Deviceptr,
+    /// The absorbed queries, `heads x latent` a row.
+    pub absorbed: Deviceptr,
+    /// The logits, then the unnormalised weights, `heads x MAX_SELECTED_TOKENS` a row.
+    pub logits: Deviceptr,
+    /// The weights' sums, `heads` a row.
+    pub total: Deviceptr,
+    /// The mixed latents, `heads x latent` a row.
+    pub mixed: Deviceptr,
+    /// The head outputs, `heads x value` a row.
+    pub heads: Deviceptr,
+}
+
+impl AbsorbedMla {
+    /// The attention's kernels at the host's `precision`.
+    #[must_use]
+    pub const fn table(precision: Precision) -> KernelTable<8> {
+        KernelTable {
+            image: Image::DECODE,
+            symbols: [
+                ("q4e_glm_mla_cache", precision),
+                ("q4e_glm_mla_cache_fp8", Precision::Fp8E4M3),
+                ("q4e_glm_mla_absorb", precision),
+                ("q4e_glm_mla_scores", precision),
+                ("q4e_glm_mla_softmax", precision),
+                ("q4e_glm_mla_mix", precision),
+                ("q4e_glm_mla_project", precision),
+                ("q4e_mhc_head", precision),
+            ],
+        }
+    }
+
+    /// The geometry, checked against the kernels' bounds.
+    ///
+    /// # Errors
+    /// A latent wider than the kernels read or not whole E4M3 blocks, or no head, by name.
+    pub fn geometry(geometry: AbsorbedGeometry) -> Result<AbsorbedGeometry, String> {
+        let AbsorbedGeometry {
+            heads,
+            nope,
+            value,
+            latent,
+            q_lora,
+        } = geometry;
+        if heads == 0 || nope == 0 || value == 0 || q_lora == 0 {
+            return Err(format!(
+                "an absorbed MLA of {heads} heads, {nope} key and {value} value columns and a \
+                 {q_lora}-wide query latent has nothing to attend with"
+            ));
+        }
+        if latent == 0 || latent > MAX_LATENT || !latent.is_multiple_of(LATENT_BLOCK) {
+            return Err(format!(
+                "a {latent}-wide latent is outside the absorbed attention's whole \
+                 {LATENT_BLOCK}-column blocks up to {MAX_LATENT}"
+            ));
+        }
+        for (what, width) in [("query latent", q_lora), ("latent", latent)] {
+            norm_threads(width).ok_or_else(|| {
+                format!("the {width}-wide {what} is not a width the stated norm takes")
+            })?;
+        }
+        Ok(geometry)
+    }
+
+    /// Opens the attention over `geometry`, its kernels loaded at `precision`.
+    ///
+    /// # Errors
+    /// As [Self::geometry] and [KernelTable::load].
+    pub fn open(
+        cuda: &Cuda,
+        geometry: AbsorbedGeometry,
+        precision: Precision,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            geometry: Self::geometry(geometry)?,
+            kernels: Self::table(precision).load(cuda)?,
+        })
+    }
+
+    /// The attention's geometry.
+    #[must_use]
+    pub const fn geometry_of(&self) -> AbsorbedGeometry {
+        self.geometry
+    }
+
+    /// The caching half: the query and key/value latents projected from `input` (the layer's
+    /// normed hidden, f32 `[rows][hidden]`) and normed in place at `eps`, and each segment's
+    /// latents written to its cache. A segment's first two regions are the latent cache (E4M3
+    /// codes when `quantise`, else f32) and its block scales. The normed query latent waits in
+    /// `rows.q_latent` for [Self::attend] and the indexer.
+    ///
+    /// # Errors
+    /// A segment with fewer than two regions, a projection the arm does not run, or the
+    /// driver's refusal.
+    pub fn cache<C: DeviceCx>(
+        &self,
+        cx: &C,
+        weights: &AbsorbedWeights<'_, C::Linear>,
+        rows: &AbsorbedRows,
+        input: Deviceptr,
+        (eps, quantise, stated): (f32, bool, bool),
+    ) -> Result<(), BackendError> {
+        let count = cx.rows();
+        let AbsorbedGeometry { latent, q_lora, .. } = self.geometry;
+        cx.project(weights.q_a, input, rows.q_latent, count)?;
+        cx.project(weights.kv_a, input, rows.latent, count)?;
+        for (at, gains, width) in [
+            (rows.q_latent, weights.norms.0, q_lora),
+            (rows.latent, weights.norms.1, latent),
+        ] {
+            // A row of one stream is its own mean: the head fold's norm at one copy is the
+            // stated RMSNorm, in place (a thread reads its columns before it writes them).
+            let threads = norm_threads(width).unwrap_or(BLOCK);
+            cx.launch(
+                self.kernels[7],
+                ((count as u32, 1, 1), (threads, 1, 1)),
+                &[
+                    at.0,
+                    gains.0,
+                    at.0,
+                    width as u64,
+                    1,
+                    u64::from(eps.to_bits()),
+                    u64::from(stated),
+                ],
+            )?;
+        }
+        for segment in cx.segments() {
+            let [cache, scales, ..] = *segment.regions else {
+                return Err(absorbed_regions(segment.regions.len()));
+            };
+            let source = rows.latent.offset(segment.first * latent * 4).0;
+            let launch = ((segment.rows as u32, 1, 1), (BLOCK, 1, 1));
+            let (position, len) = (segment.position as u64, segment.rows as u64);
+            if quantise {
+                cx.launch(
+                    self.kernels[1],
+                    launch,
+                    &[source, cache.0, scales.0, position, len, latent as u64],
+                )?;
+            } else {
+                cx.launch(
+                    self.kernels[0],
+                    launch,
+                    &[source, cache.0, position, len, latent as u64],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The attending half: the heads' queries from `rows.q_latent`, each row's attention over
+    /// the positions at `selection` (`selected`, [MAX_SELECTED_TOKENS] i32 a row, and `count`,
+    /// one a row), and the head outputs through `o_proj` into `output` (the rank's partial).
+    /// Every position a row reads is in its cache by then ([Self::cache]).
+    ///
+    /// # Errors
+    /// A segment with fewer than two regions, a projection the arm does not run, or the
+    /// driver's refusal.
+    pub fn attend<C: DeviceCx>(
+        &self,
+        cx: &C,
+        weights: &AbsorbedWeights<'_, C::Linear>,
+        rows: &AbsorbedRows,
+        (selected, count): (Deviceptr, Deviceptr),
+        output: Deviceptr,
+        (quantise, stated): (bool, bool),
+    ) -> Result<(), BackendError> {
+        let AbsorbedGeometry {
+            heads,
+            nope,
+            value,
+            latent,
+            ..
+        } = self.geometry;
+        cx.project(weights.q_b, rows.q_latent, rows.query, cx.rows())?;
+        for segment in cx.segments() {
+            let [cache, scales, ..] = *segment.regions else {
+                return Err(absorbed_regions(segment.regions.len()));
+            };
+            let (first, len) = (segment.first as u64, segment.rows as u32);
+            cx.launch(
+                self.kernels[2],
+                (
+                    (heads as u32, len, latent.div_ceil(BLOCK as usize) as u32),
+                    (BLOCK, 1, 1),
+                ),
+                &[
+                    rows.query.0,
+                    weights.kv_b.0,
+                    rows.absorbed.0,
+                    first,
+                    nope as u64,
+                    value as u64,
+                    latent as u64,
+                    u64::from(stated),
+                ],
+            )?;
+            let cache = [cache.0, cache.0, scales.0];
+            let selection = [selected.0, count.0];
+            cx.launch(
+                self.kernels[3],
+                (
+                    (
+                        (MAX_SELECTED_TOKENS / MLA_SCORE_SLOTS) as u32,
+                        len,
+                        heads.div_ceil(MLA_HEADS) as u32,
+                    ),
+                    (BLOCK, 1, 1),
+                ),
+                &[
+                    &[rows.absorbed.0][..],
+                    &cache,
+                    &selection,
+                    &[
+                        rows.logits.0,
+                        first,
+                        heads as u64,
+                        nope as u64,
+                        latent as u64,
+                        MAX_SELECTED_TOKENS as u64,
+                        u64::from(quantise),
+                    ],
+                ]
+                .concat(),
+            )?;
+            cx.launch(
+                self.kernels[4],
+                ((heads as u32, len, 1), (BLOCK, 1, 1)),
+                &[rows.logits.0, count.0, rows.total.0, first],
+            )?;
+            cx.launch(
+                self.kernels[5],
+                (
+                    (
+                        latent.div_ceil(32) as u32,
+                        heads.div_ceil(MLA_MIX_HEADS) as u32,
+                        len,
+                    ),
+                    ((32 * MLA_MIX_HEADS) as u32, 1, 1),
+                ),
+                &[
+                    &cache[..],
+                    &selection,
+                    &[
+                        rows.logits.0,
+                        rows.total.0,
+                        rows.mixed.0,
+                        first,
+                        heads as u64,
+                        latent as u64,
+                        MAX_SELECTED_TOKENS as u64,
+                        u64::from(quantise),
+                        u64::from(stated),
+                    ],
+                ]
+                .concat(),
+            )?;
+            cx.launch(
+                self.kernels[6],
+                (
+                    (
+                        heads as u32,
+                        (value as u32).div_ceil(MLA_PROJECT_THREADS),
+                        1,
+                    ),
+                    (MLA_PROJECT_THREADS, 1, 1),
+                ),
+                &[
+                    rows.mixed.0,
+                    weights.kv_b.0,
+                    count.0,
+                    rows.heads.0,
+                    first,
+                    u64::from(len),
+                    nope as u64,
+                    value as u64,
+                    latent as u64,
+                    u64::from(stated),
+                ],
+            )?;
+        }
+        cx.project(weights.out, rows.heads, output, cx.rows())
+    }
+}
+
+/// The threads `q4e_mhc_head` normalises a `width`-wide row with: whole warps, each thread at
+/// most [MIX_COLUMNS] columns, `None` for a width it does not take.
+fn norm_threads(width: usize) -> Option<u32> {
+    (1..=MIX_COLUMNS).find_map(|columns| {
+        let threads = width / columns;
+        (threads * columns == width && threads.is_multiple_of(32) && threads <= BLOCK as usize)
+            .then_some(threads as u32)
+    })
+}
+
+/// The refusal of a segment whose regions do not start with its latent cache and scales.
+fn absorbed_regions(count: usize) -> BackendError {
+    BackendError::new(
+        ROLE,
+        format!(
+            "an absorbed MLA's segment holds {count} regions, not its latent cache and scales first"
+        ),
+    )
 }
 
 /// An Engram lookup that lands on the layer input: hashed n-gram rows gathered, projected, gated
@@ -2396,6 +3060,14 @@ mod tests {
                 .expect("the indexer");
             EngramSide::table(precision).check().expect("the lookup");
         }
+        LayerNorm::TABLE.check().expect("the keys' norm");
+        for precision in [Precision::Bf16, Precision::Fp8E4M3] {
+            AbsorbedMla::table(precision)
+                .check()
+                .expect("the absorbed MLA");
+        }
+        PooledIndexer::RUN_SCORES.check().expect("the run scores");
+        PooledIndexer::COPY.check().expect("the gates' copy");
         EngramSide::table(Precision::MxFp8)
             .check()
             .expect("DeepSeek's MXFP8 lookup");
@@ -2538,7 +3210,5 @@ mod tests {
         };
         let error = EngramSide::new(empty, Precision::Bf16).expect_err("no tables");
         assert!(error.contains("no tables"), "{error}");
-        let error = not_moved("manifold mix", "GLM's mix_in").to_string();
-        assert!(error.contains("GLM's mix_in"), "{error}");
     }
 }

@@ -4338,6 +4338,8 @@ impl DeviceRank {
                 } else {
                     0
                 },
+                // The crate's version-3 arithmetic: f32 streams.
+                0,
             ],
         )?;
         match share {
@@ -4523,6 +4525,7 @@ impl DeviceRank {
                 next.map_or(0, |linear| linear.weight.data().0),
                 if next.is_some() { s.mix_parts.0 } else { 0 },
                 next.map_or(0, |linear| linear.rows as u64),
+                0,
             ],
         )
     }
@@ -4987,6 +4990,7 @@ impl DeviceRank {
                     nope as u64,
                     value as u64,
                     latent as u64,
+                    0,
                 ],
             )?;
             let cache = [cache.0, cache.0, scales.0];
@@ -5042,6 +5046,7 @@ impl DeviceRank {
                         latent as u64,
                         MAX_SELECTED_TOKENS as u64,
                         quantise,
+                        0,
                     ],
                 ]
                 .concat(),
@@ -5064,6 +5069,7 @@ impl DeviceRank {
                     nope as u64,
                     value as u64,
                     latent as u64,
+                    0,
                 ],
             )?;
         }
@@ -5129,6 +5135,7 @@ impl DeviceRank {
                     nope as u64,
                     value as u64,
                     latent as u64,
+                    0,
                 ],
             )?,
         }
@@ -5240,7 +5247,7 @@ impl DeviceRank {
                 (indexer.k_norm_weight, indexer.k_norm_bias),
                 index_keys.offset(cached),
                 dim,
-                INDEX_KEY_NORM_EPS,
+                (INDEX_KEY_NORM_EPS, false),
                 run.len,
             )?;
             self.launch(
@@ -5266,6 +5273,7 @@ impl DeviceRank {
                     dim as u64,
                     pool as u64,
                     run.position as u64,
+                    0,
                 ],
             )?;
         }
@@ -5328,6 +5336,7 @@ impl DeviceRank {
                         float(inverse_sqrt(heads)),
                         score_stride as u64,
                         run.len as u64,
+                        0,
                     ],
                 )?;
             } else {
@@ -5348,6 +5357,7 @@ impl DeviceRank {
                         float(inverse_sqrt(dim)),
                         float(inverse_sqrt(heads)),
                         score_stride as u64,
+                        0,
                     ],
                 )?;
             }
