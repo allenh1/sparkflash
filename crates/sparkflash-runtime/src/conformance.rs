@@ -1224,18 +1224,23 @@ fn engine_decode<W: Walk>(
             break;
         };
         engine.feed(id, fed)?;
-        let mut step = None;
+        // A decode answers a run: the fed token's step, then the answers the arm already held
+        // for the tokens it chose, each the next token in order.
+        let mut steps = None;
         loop {
             for event in engine.tick()? {
                 match event {
-                    crate::TickEvent::Decode { id: got, steps } if got == id => {
-                        step = steps.into_iter().next();
+                    crate::TickEvent::Decode {
+                        id: got,
+                        steps: answered,
+                    } if got == id => {
+                        steps = Some(answered);
                     }
                     crate::TickEvent::Failed { id: got, error } if got == id => return Err(error),
                     _ => {}
                 }
             }
-            if step.is_some() {
+            if steps.is_some() {
                 break;
             }
             if !engine.busy() {
@@ -1245,9 +1250,19 @@ fn engine_decode<W: Walk>(
                 ));
             }
         }
-        token = step.and_then(|step| step.next_token);
-        run.push(token);
+        let steps = steps.unwrap_or_default();
+        if steps.is_empty() {
+            return Err(BackendError::new(
+                "conformance",
+                "the tick engine answered a decode with no step",
+            ));
+        }
+        for step in steps {
+            token = step.next_token;
+            run.push(token);
+        }
     }
+    run.truncate(tokens);
     Ok(run)
 }
 
@@ -1291,18 +1306,22 @@ fn engine_four<W: Walk>(
     for (index, step) in first.iter().enumerate() {
         runs[index].push(step.as_ref().and_then(|step| step.next_token));
     }
-    for _ in 1..tokens {
+    // A member whose run already holds `tokens` waits; the others are fed their last token.
+    let wants =
+        |run: &Vec<Option<u32>>| run.len() < tokens && run.last().is_some_and(Option::is_some);
+    while runs.iter().any(wants) {
+        let mut expected = 0;
         for (index, id) in ids.iter().enumerate() {
+            if !wants(&runs[index]) {
+                continue;
+            }
             let Some(token) = runs[index].last().copied().flatten() else {
                 continue;
             };
             engine.feed(*id, token)?;
+            expected += 1;
         }
         let mut answered = 0;
-        let expected = runs
-            .iter()
-            .filter(|run| run.last().is_some_and(Option::is_some))
-            .count();
         while answered < expected {
             for event in engine.tick()? {
                 match event {
@@ -1310,7 +1329,9 @@ fn engine_four<W: Walk>(
                         let index = ids.iter().position(|other| *other == id).ok_or_else(|| {
                             BackendError::new("conformance", "an unknown decode answered")
                         })?;
-                        runs[index].push(steps.last().and_then(|step| step.next_token));
+                        // The run's every step is the next token in order (the held answers
+                        // after the fed token's).
+                        runs[index].extend(steps.iter().map(|step| step.next_token));
                         answered += 1;
                     }
                     crate::TickEvent::Failed { error, .. } => return Err(error),
@@ -1324,6 +1345,9 @@ fn engine_four<W: Walk>(
                 ));
             }
         }
+    }
+    for run in &mut runs {
+        run.truncate(tokens);
     }
     Ok(runs)
 }
