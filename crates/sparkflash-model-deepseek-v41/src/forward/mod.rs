@@ -40,6 +40,7 @@
 //! entry points delegate to the same `run` with a table instead of `None`, so the default path is
 //! the same code and keeps its determinism; [boundary] documents what is recorded and in what order.
 
+pub mod absorbed;
 pub mod attention;
 pub mod attention_case;
 pub mod batch;
@@ -51,6 +52,7 @@ pub mod mhc;
 pub mod moe;
 pub mod mtp;
 pub mod recurrent;
+pub(crate) mod stated;
 mod weight_view;
 
 use crate::config::{Mixer, ModelConfig};
@@ -75,6 +77,8 @@ pub struct SequenceState {
     grouped: Vec<grouped::GroupedCache>,
     /// Every backbone block's Gated DeltaNet state; empty at an attention block.
     recurrent: Vec<recurrent::RecurrentState>,
+    /// Every backbone block's absorbed-latent caches; empty at any other block.
+    absorbed: Vec<absorbed::AbsorbedCache>,
 }
 
 impl SequenceState {
@@ -88,6 +92,7 @@ impl SequenceState {
                 .collect(),
             grouped: vec![grouped::GroupedCache::default(); config.n_layers],
             recurrent: vec![recurrent::RecurrentState::default(); config.n_layers],
+            absorbed: vec![absorbed::AbsorbedCache::default(); config.n_layers],
         }
     }
 
@@ -345,7 +350,13 @@ impl InferenceEngine {
         limit: usize,
     ) -> Result<Self, EngineError> {
         config.validate()?;
-        let plan = TensorPlan::language_model(&config);
+        // The hand plan holds the release's blocks; a stack in the absorbed form is planned by
+        // its layout (`sparkflash_model::layout`), whose names the source already serves.
+        let plan = if config.absorbed_latent.is_some() {
+            TensorPlan::default()
+        } else {
+            TensorPlan::language_model(&config)
+        };
         Ok(Self {
             config,
             plan,
@@ -822,6 +833,9 @@ struct Scratch {
     ffn_out: Vec<f32>,
     residual: Vec<f32>,
     moe: moe::MoeScratch,
+    /// The selection an absorbed block with its own indexer left for the next block, which
+    /// reads it when it shares that indexer.
+    selection: Option<absorbed::Selection>,
 }
 
 impl Scratch {
@@ -836,6 +850,7 @@ impl Scratch {
             ffn_out: vec![0.0; width],
             residual: vec![0.0; positions * config.hc_width()],
             moe: moe::MoeScratch::for_config(config),
+            selection: None,
         }
     }
 }
@@ -1392,7 +1407,7 @@ impl InferenceEngine {
         // Collapse the copies with the LAST block's FFN coefficient, then the final norm and the LM
         // head (model.py:1268-1269).
         let mut collapsed = vec![0.0f32; seqlen * dim];
-        mhc::hc_pre(config, &pre_mix, &hidden, &mut collapsed)?;
+        stated::head_fold(config, &pre_mix, &hidden, &mut collapsed)?;
         let norm = linalg::decode_by_name(source, "norm.weight", self.limit)?;
         // The selected positions read the same collapse, final norm and head that produce the
         // tail below: the per-layer pass is shared and no prefix is re-forwarded.
@@ -1406,7 +1421,7 @@ impl InferenceEngine {
                     selected.extend_from_slice(&collapsed[position * dim..][..dim]);
                 }
                 for row in selected.chunks_mut(dim) {
-                    linalg::rms_norm(row, &norm, dim, config.norm_eps as f32)?;
+                    stated::rms_norm(config, row, &norm, config.norm_eps as f32)?;
                 }
                 let selected_logits = self.head_logits(source, &selected, positions.len())?;
                 selected_logits
@@ -1416,7 +1431,7 @@ impl InferenceEngine {
             }
         };
         let mut tail = collapsed[(seqlen - 1) * dim..].to_vec();
-        linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
+        stated::rms_norm(config, &mut tail, &norm, config.norm_eps as f32)?;
         let head_input = tail.clone();
         let logits = self.head_logits(source, &tail, 1)?;
 
@@ -1506,6 +1521,22 @@ impl InferenceEngine {
                     .to_owned(),
             });
         }
+        // A description's stated wiring runs on the whole-model host path only: the sharded
+        // block, the device handoffs and the deferred epilogue are the release's arithmetic.
+        if !config.stated().is_release()
+            && (self.tp.is_some()
+                || self.gather.is_some()
+                || entry.is_some()
+                || post.is_some()
+                || attention.is_some()
+                || moe.is_some()
+                || deferred.is_some())
+        {
+            return Err(EngineError::Shape {
+                what: format!("layer {layer} host block"),
+                detail: "the stack states its own wiring (own-mix collapse, BF16 stream, pooled indexer), which the host runs on its whole-model path only; the sharded and device seams run the release's".to_owned(),
+            });
+        }
 
         // The entry boundaries: the residual stream this block received and the input mix it will
         // consume (docs/archive/build/phase1-boundary-table.md section 2).
@@ -1589,13 +1620,24 @@ impl InferenceEngine {
                     scratch.attn_mixes.comb.clone(),
                 )?;
             }
-            mhc::hc_pre(config, pre_mix, hidden, &mut scratch.attn_in)?;
+            // The release collapses with the mix the previous sublayer computed; a stack whose
+            // layout states `own_mix` collapses each sublayer with its own.
+            if config.stated().own_mix {
+                stated::hc_pre(
+                    config,
+                    &scratch.attn_mixes.pre,
+                    hidden,
+                    &mut scratch.attn_in,
+                )?;
+            } else {
+                stated::hc_pre(config, pre_mix, hidden, &mut scratch.attn_in)?;
+            }
             let attn_norm =
                 linalg::decode_by_name(source, &format!("{prefix}.attn_norm.weight"), self.limit)?;
-            linalg::rms_norm(
+            stated::rms_norm(
+                config,
                 &mut scratch.attn_in,
                 &attn_norm,
-                config.dim,
                 config.norm_eps as f32,
             )?;
             record_stage(
@@ -1682,7 +1724,28 @@ impl InferenceEngine {
             what: format!("layer {layer} attention"),
             detail,
         })?;
-        if matches!(mixer, Mixer::Kda(_)) {
+        // A selection reaches only the block right after the one that made it.
+        let carry = scratch.selection.take();
+        if matches!(mixer, Mixer::Mla) && config.absorbed_latent.is_some() {
+            if attention.is_some() || self.gather.is_some() {
+                return Err(EngineError::Shape {
+                    what: format!("layer {layer} attention"),
+                    detail: "an absorbed-latent block runs whole on the host; it has no device projection backend or attention shard".to_owned(),
+                });
+            }
+            scratch.selection = absorbed::absorbed_attention_forward(
+                config,
+                layer,
+                &prefix,
+                &scratch.attn_in,
+                start_pos,
+                &mut state.absorbed[layer],
+                carry,
+                source,
+                &mut scratch.attn_out,
+                self.limit,
+            )?;
+        } else if matches!(mixer, Mixer::Kda(_)) {
             // A Kimi Delta Attention block runs every head on the host, as a Gated DeltaNet
             // block does.
             if attention.is_some() {
@@ -1865,7 +1928,7 @@ impl InferenceEngine {
             );
         } else {
             scratch.residual.copy_from_slice(hidden);
-            mhc::hc_post(
+            stated::hc_post(
                 config,
                 &scratch.attn_out,
                 &scratch.residual,
@@ -1911,13 +1974,17 @@ impl InferenceEngine {
                     scratch.ffn_mixes.comb.clone(),
                 )?;
             }
-            mhc::hc_pre(config, &scratch.attn_mixes.pre, hidden, &mut scratch.ffn_in)?;
+            if config.stated().own_mix {
+                stated::hc_pre(config, &scratch.ffn_mixes.pre, hidden, &mut scratch.ffn_in)?;
+            } else {
+                stated::hc_pre(config, &scratch.attn_mixes.pre, hidden, &mut scratch.ffn_in)?;
+            }
             let ffn_norm =
                 linalg::decode_by_name(source, &format!("{prefix}.ffn_norm.weight"), self.limit)?;
-            linalg::rms_norm(
+            stated::rms_norm(
+                config,
                 &mut scratch.ffn_in,
                 &ffn_norm,
-                config.dim,
                 config.norm_eps as f32,
             )?;
             if let Some(row) = boundary.as_deref_mut() {
@@ -2149,7 +2216,7 @@ impl InferenceEngine {
             );
         } else {
             scratch.residual.copy_from_slice(hidden);
-            mhc::hc_post(
+            stated::hc_post(
                 config,
                 &scratch.ffn_out,
                 &scratch.residual,

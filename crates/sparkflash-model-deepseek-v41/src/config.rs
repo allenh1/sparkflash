@@ -251,10 +251,52 @@ pub struct AbsorbedLatent {
     pub v_head_dim: usize,
 }
 
+/// The wiring a description states beside the release's, each from a layout fact cited to the
+/// producer's line (`models/layouts/*.toml`). The release states its own schedule (the previous
+/// sublayer's mix, the last pre-mix at the head, f32 values, no pooled keys) and carries `None`,
+/// so its open manifest records no field for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StatedWiring {
+    /// Each sublayer collapses the copies with the pre-mix its own connection computed
+    /// (`manifold_hyper_connection.collapse = own_mix`), not the sublayer's before it.
+    pub own_mix: bool,
+    /// The head folds the copies by their unweighted mean (`head_fold = mean`), not through the
+    /// last pre-mix.
+    pub mean_fold: bool,
+    /// The producer's type map (`manifold_hyper_connection.stream_update = bfloat16`): the
+    /// streams, every module output and every norm's output are BF16, and the values stay f32
+    /// only where the producer casts them (the norms' mean square, the mix coefficients and
+    /// Sinkhorn, the router, the indexer's scores and pool softmax, the attention's softmax and
+    /// the KDA decay, recurrence and state).
+    pub bf16_stream: bool,
+    /// An FP8 linear's input is quantised at run time on tiles this wide, E4M3 codes at
+    /// `amax / 448` in f32 (`quantization_config.activation_scheme = dynamic`); zero when the
+    /// stored format reads its input unquantised.
+    pub activation_tile: usize,
+    /// The indexer's keys are pooled by this many positions (`index_kpool` under
+    /// `indexer.pool_compress`); zero for an indexer over single keys.
+    pub index_pool: usize,
+    /// The selection appends the incomplete pool's visible positions
+    /// (`index_kpool_always_select_tail`).
+    pub index_tail: bool,
+}
+
+impl StatedWiring {
+    /// Whether every field is the release's, so a description states nothing beside it.
+    #[must_use]
+    pub fn is_release(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Whether a width is zero: a stack without the block it sizes, whose field the open manifest
 /// leaves out so the released configuration records the fields it always has.
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+fn is_unset(value: &f64) -> bool {
+    *value == 0.0
 }
 
 /// A backbone block's token mixer, as [ModelConfig::mixer] answers it.
@@ -311,6 +353,13 @@ pub struct ModelConfig {
     /// single-latent form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absorbed_latent: Option<AbsorbedLatent>,
+    /// The pooled indexer's key LayerNorm epsilon (`sparse_indexer.key_norm_eps`), zero for a
+    /// stack whose indexer has no key norm of its own.
+    #[serde(default, skip_serializing_if = "is_unset")]
+    pub index_key_norm_eps: f64,
+    /// The wiring the description states beside the release's; `None` for the release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wiring: Option<StatedWiring>,
     /// Backbone blocks.
     pub n_layers: usize,
     /// DSpark MTP stages, which the checkpoint names `mtp.{0..n_mtp_layers-1}`.
@@ -567,6 +616,8 @@ impl ModelConfig {
             kda_layers: Vec::new(),
             kda: None,
             absorbed_latent: None,
+            index_key_norm_eps: 0.0,
+            wiring: None,
             n_layers: 2,
             n_mtp_layers: 1,
             dspark_block_size: 2,
@@ -664,7 +715,11 @@ impl ModelConfig {
                 "RoPE rotates pairs, so this must be even".into(),
             );
         }
-        if self.o_groups == 0 || self.o_lora_rank == 0 || self.q_lora_rank == 0 {
+        // The absorbed form leaves through `wo` whole; only the grouped output has groups.
+        let grouped_output = self.absorbed_latent.is_none();
+        if (grouped_output && (self.o_groups == 0 || self.o_lora_rank == 0))
+            || self.q_lora_rank == 0
+        {
             return bad(
                 "o_groups",
                 "the attention projections must be non-zero".into(),
@@ -685,8 +740,12 @@ impl ModelConfig {
                 "top-k must be in 1..=n_routed_experts".into(),
             );
         }
-        if self.dspark_n_activated_experts == 0
-            || self.dspark_n_activated_experts > self.dspark_n_routed_experts
+        // A stack whose draft taps no target layers runs no DSpark stage, so it routes no
+        // draft experts.
+        let drafts = !self.dspark_target_layer_ids.is_empty();
+        if drafts
+            && (self.dspark_n_activated_experts == 0
+                || self.dspark_n_activated_experts > self.dspark_n_routed_experts)
         {
             return bad(
                 "dspark_n_activated_experts",
@@ -759,13 +818,15 @@ impl ModelConfig {
                 format!("layer {id} is not a backbone layer"),
             );
         }
-        if self.engram_n_heads == 0 || self.engram_head_dim == 0 {
+        if !self.engram_layer_ids.is_empty()
+            && (self.engram_n_heads == 0 || self.engram_head_dim == 0)
+        {
             return bad(
                 "engram_head_dim",
                 "the Engram heads must be non-zero".into(),
             );
         }
-        if self.dspark_target_layer_ids.len() != self.n_mtp_layers {
+        if drafts && self.dspark_target_layer_ids.len() != self.n_mtp_layers {
             return bad(
                 "dspark_target_layer_ids",
                 format!(
@@ -790,7 +851,11 @@ impl ModelConfig {
                 );
             }
         }
-        if self.window_size == 0 || self.hc_mult == 0 || self.hc_sinkhorn_iters == 0 {
+        // The window is the single-latent MLA's ring; the absorbed form keeps every position.
+        if (grouped_output && self.window_size == 0)
+            || self.hc_mult == 0
+            || self.hc_sinkhorn_iters == 0
+        {
             return bad(
                 "window_size",
                 "the attention and mHC widths must be non-zero".into(),
@@ -811,6 +876,12 @@ impl ModelConfig {
     /// vision-disabled checkpoint cannot contain.
     pub fn vision_enabled(&self) -> bool {
         self.vision_n_layers.is_some_and(|layers| layers > 0)
+    }
+
+    /// The wiring the description states beside the release's (the release's own when none).
+    #[must_use]
+    pub fn stated(&self) -> StatedWiring {
+        self.wiring.unwrap_or_default()
     }
 
     /// The token mixer of backbone block `layer`: grouped-query attention, a Gated DeltaNet or
@@ -1563,6 +1634,8 @@ mod released {
             kda_layers,
             kda,
             absorbed_latent: None,
+            index_key_norm_eps: 0.0,
+            wiring: None,
             n_layers: text.num_hidden_layers,
             n_mtp_layers: text.num_nextn_predict_layers,
             dspark_block_size: text.dspark_block_size,

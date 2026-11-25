@@ -185,9 +185,13 @@ value = "f32"
 # weightless norm (215, at rms_norm_eps) and mixed by the BF16 weight widened to f32, with no
 # activation quantiser on the input; 304-324: the coefficients and the Sinkhorn stay f32;
 # 1336-1346: post and comb are cast to the stream dtype before the stream update; 336 and
-# 1510: the head folds the streams by their unweighted mean.
+# 1510: the head folds the streams by their unweighted mean; 295, 1297 and 1324: each sublayer
+# collapses the streams with the pre-mix its own connection just computed.
 [[stacks.language.parts]]
 part = "manifold_hyper_connection"
+[[stacks.language.parts.facts]]
+name = "collapse"
+value = "own_mix"
 [[stacks.language.parts.facts]]
 name = "mix_input"
 value = "f32"
@@ -217,7 +221,8 @@ name = "probabilities"
 value = "query"
 
 # modeling_glm5_next.py:862 and 866: the pooled scores and the head weights are f32; 999: the
-# pool's gate-plus-position logits take their softmax in f32.
+# pool's gate-plus-position logits take their softmax in f32; 800: the index keys' LayerNorm
+# (weight and bias) is built at eps 1e-6, which no config key states.
 [[stacks.language.parts]]
 part = "sparse_indexer"
 [[stacks.language.parts.facts]]
@@ -226,6 +231,9 @@ value = "f32"
 [[stacks.language.parts.facts]]
 name = "pool_softmax"
 value = "f32"
+[[stacks.language.parts.facts]]
+name = "key_norm_eps"
+value = 1e-6
 
 # modeling_glm5_next.py:357-358: the forget gate and decay are f32; 476 and 533: the chunked
 # and recurrent forms run in f32; 763: the recurrent state is stored f32; 385-391: the gated

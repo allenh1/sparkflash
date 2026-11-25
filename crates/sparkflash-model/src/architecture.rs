@@ -1987,6 +1987,29 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
     let local_layers = usize_list(read_key(text, "local_layer_ids"))?;
     let ratios = usize_list(read_key(text, "compress_ratios"))?;
     let indexer_types = string_list(read_key(text, "indexer_types"))?;
+    // A shared layer reuses the selection its predecessor hands it, and only a layer that ran its
+    // own indexer hands one on; every other layer hands on none (modeling_glm5_next.py 1105-1107,
+    // 1209-1211, 1236, 1497-1506). A shared layer after any other refuses here rather than reading
+    // an older layer's selection.
+    for (index, kind) in indexer_types.iter().enumerate() {
+        if kind != "shared" {
+            continue;
+        }
+        let previous_runs = index
+            .checked_sub(1)
+            .is_some_and(|previous| indexer_types[previous] == "full")
+            && match (layer_types.get(index - 1), layer_types.get(index)) {
+                (Some(previous), Some(this)) => previous == this,
+                _ => true,
+            };
+        if !previous_runs {
+            return Err(ConfigError::Invalid(format!(
+                "indexer_types: layer {index} shares an indexer, but the layer before it does not \
+                 run one of the same attention kind, and a shared layer reads only its \
+                 predecessor's selection"
+            )));
+        }
+    }
     if layer_types.is_empty() && !local_layers.is_empty() {
         // Inkling names the sliding-layer set rather than a full_attention_interval. Every
         // unlisted layer is full attention; the local set is the sliding window.
@@ -4908,20 +4931,23 @@ mod tests {
         // pin (0xcf23_f963_2748_5934, 0xd96e_8b8c_c35c_0cd0, 0xf412_f70b_154f_43b3,
         // 0xbd42_c066_93ef_621a, 0xaa4c_55d5_0a90_dc5e, 0xf1eb_7c37_44b7_d05a,
         // 0x9440_176c_7d30_7627), so no other field moved.
+        // DeepSeek's and GLM's moved again (2026-11-25) by their layouts' stated collapse
+        // (`manifold_hyper_connection.collapse`, previous_mix and own_mix) and GLM's index key
+        // norm epsilon (`sparse_indexer.key_norm_eps`): new carried facts, nothing else.
         let pinned = [
             // DeepSeek's layout resolves the Engram, compressor, indexer, target, scale-grid,
             // draft-noise and vision-token arrays into layout_vars, so its parse carries those
             // entries; the joint declaration adds the per-block expert formats, which is the one
             // field that moved this digest from 0x4632_a934_d263_eaa1 (measured 2026-11-24, and
             // the only difference in the {:#?} text).
-            0x4604_1c34_ec88_4dd1,
+            0xff0c_d1e8_c473_a2ac,
             // Dory's layout supplies layout_vars (the attention and MLP widths), so its
             // parse carries those four facts and does not hash at the field's default. Its
             // digest moved with the DeepSeek one, by the same joint expert-format field.
             0x7946_daf1_9c6c_9d3a,
             // GLM, Inkling and the two Qwen releases carry the same joint expert-format field, so
             // all four digests moved with DeepSeek's on the same measurement.
-            0xd11a_54dd_0552_163b,
+            0x25a3_8b8d_51cf_6d38,
             // Inkling's layout learns the tower's rotary-plus-grid position, LayerNorm and
             // erf-GELU wiring, its relative-attention switches, and its [vars] resolve the MTP
             // and convolution shape facts.
@@ -4930,6 +4956,7 @@ mod tests {
             0x810f_439c_45e8_588c,
             0xb762_2ecd_8b42_6c89,
         ];
+        let mut moved = Vec::new();
         for ((name, text), pin) in RELEASED.iter().zip(pinned) {
             let architecture = Architecture::from_json(text).expect("the released document parses");
             assert_eq!(
@@ -4938,7 +4965,41 @@ mod tests {
                 "{name} turns a switch on"
             );
             let digest = fnv1a(format!("{architecture:#?}").as_bytes());
-            assert_eq!(digest, pin, "{name}'s parse moved: {digest:#018x}");
+            if digest != pin {
+                moved.push(format!("{name}: {digest:#018x}"));
+            }
+        }
+        assert!(moved.is_empty(), "parses moved: {}", moved.join(", "));
+    }
+
+    /// A shared indexer reads its predecessor's selection, so a shared layer after a layer that ran
+    /// none (a linear layer, or another shared one) is refused by name, and one right after a full
+    /// layer of its own kind parses with no indexer of its own.
+    #[test]
+    fn a_shared_indexer_needs_a_full_predecessor_of_its_kind() {
+        let text = |layer_types: &str, indexer_types: &str| {
+            format!(
+                r#"{{
+                "model_type": "made_up_mla", "hidden_size": 256, "intermediate_size": 512,
+                "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 4,
+                "head_dim": 64, "kv_lora_rank": 64, "q_lora_rank": 128, "qk_nope_head_dim": 32,
+                "qk_rope_head_dim": 32, "v_head_dim": 64, "vocab_size": 512,
+                "layer_types": {layer_types}, "indexer_types": {indexer_types},
+                "index_n_heads": 4, "index_head_dim": 32, "index_topk": 64
+            }}"#
+            )
+        };
+        let sparse = r#"["deepseek_sparse_attention", "deepseek_sparse_attention", "deepseek_sparse_attention"]"#;
+        let architecture = Architecture::from_json(&text(sparse, r#"["full", "shared", "full"]"#))
+            .expect("a shared layer after a full one parses");
+        assert!(architecture.layers[1].attention.indexer.is_none());
+        for indexer_types in [
+            r#"["shared", "full", "full"]"#,
+            r#"["full", "shared", "shared"]"#,
+        ] {
+            let error = Architecture::from_json(&text(sparse, indexer_types))
+                .expect_err("a shared layer with no full predecessor");
+            assert!(error.to_string().contains("shares an indexer"), "{error}");
         }
     }
 

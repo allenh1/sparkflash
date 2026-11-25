@@ -55,6 +55,7 @@ use sparkflash_model::format::StoredFormat;
 
 use crate::config::{ConfigError, ModelConfig};
 use crate::dtype::DType;
+use crate::forward::stated;
 use crate::forward::weight_view::WeightView;
 use crate::linalg::{self, EngineError, ScaleGrid};
 use crate::parallel::{enter_worker, reference_threads};
@@ -1052,6 +1053,9 @@ pub fn moe_forward(
     scratch: &mut MoeScratch,
     out: &mut [f32],
 ) -> Result<(), EngineError> {
+    if cfg.stated().bf16_stream {
+        return stated_ffn_forward(cfg, prefix, x, src, limit, scratch, out, ExpertBody::Shared);
+    }
     routed_forward(cfg, prefix, x, src, limit, scratch, out)?;
     add_shared_expert(cfg, prefix, x, src, limit, scratch, out)
 }
@@ -1084,6 +1088,15 @@ pub fn dense_mlp_forward(
             ),
         ));
     }
+    if cfg.stated().bf16_stream {
+        if local_inter.is_some() {
+            return Err(shape_error(
+                "the dense MLP",
+                "a stated BF16 stream runs the whole MLP on one host; a rank's slice is the release's".to_owned(),
+            ));
+        }
+        return stated_ffn_forward(cfg, prefix, x, src, limit, scratch, out, ExpertBody::Dense);
+    }
     let dense = scratch.read_expert(cfg, src, prefix, ExpertBody::Dense, limit, local_inter)?;
     for (row, input) in out.chunks_exact_mut(dim).zip(x.chunks_exact(dim)) {
         expert_body(
@@ -1096,6 +1109,194 @@ pub fn dense_mlp_forward(
             &mut scratch.expert_out,
         )?;
         row.copy_from_slice(&scratch.expert_out);
+    }
+    Ok(())
+}
+
+/// One expert body in the producer's types (a stated BF16 stream, [stated]): each projection
+/// quantises its input on the stated activation tiles and returns BF16, the clamped gate's SiLU
+/// and its product with the up branch are BF16, and a routed choice's output is multiplied by its
+/// BF16 weight after the down projection, as the release's FP8 experts do
+/// (`finegrained_fp8.py`, `fp8_grouped_mm_experts_forward`). `base` names the body's weights.
+#[allow(clippy::too_many_arguments)] // one body's operands, as [expert_body] takes them
+fn stated_expert_body(
+    cfg: &ModelConfig,
+    src: &dyn WeightSource,
+    base: &str,
+    row: &[f32],
+    expert: &ExpertWeights,
+    weight: Option<f32>,
+    (gate_branch, up_branch): (&mut [f32], &mut [f32]),
+    out: &mut [f32],
+) -> Result<(), EngineError> {
+    let (dim, inter) = (cfg.dim, expert.inter);
+    let bf16 = crate::quant::bf16_round;
+    let (gate, up) = (&mut gate_branch[..inter], &mut up_branch[..inter]);
+    stated::project_view(
+        cfg,
+        src,
+        &expert.w1,
+        &format!("{base}.w1.weight"),
+        (inter, dim),
+        row,
+        gate,
+    )?;
+    stated::project_view(
+        cfg,
+        src,
+        &expert.w3,
+        &format!("{base}.w3.weight"),
+        (inter, dim),
+        row,
+        up,
+    )?;
+    let limit = cfg.swiglu_limit as f32;
+    for (gate, up) in gate.iter_mut().zip(up.iter()) {
+        let (clamped_gate, clamped_up) = if limit > 0.0 {
+            (gate.min(limit), up.clamp(-limit, limit))
+        } else {
+            (*gate, *up)
+        };
+        *gate = bf16(bf16(linalg::silu(clamped_gate)) * clamped_up);
+    }
+    stated::project_view(
+        cfg,
+        src,
+        &expert.w2,
+        &format!("{base}.w2.weight"),
+        (dim, inter),
+        gate,
+        &mut out[..dim],
+    )?;
+    if let Some(weight) = weight {
+        let weight = bf16(weight);
+        for value in &mut out[..dim] {
+            *value = bf16(*value * weight);
+        }
+    }
+    Ok(())
+}
+
+/// The FFN block in the producer's types: a dense block's one MLP ([ExpertBody::Dense]), or the
+/// routed experts and the shared one ([ExpertBody::Shared]). The router is the release's (f32
+/// scores, `noaux_tc`); each choice's weighted output is BF16, the choices of a token are summed
+/// in f32 and rounded once, and the shared expert's BF16 output is added in BF16.
+#[allow(clippy::too_many_arguments)] // the FFN's operands, as [moe_forward] takes them
+fn stated_ffn_forward(
+    cfg: &ModelConfig,
+    prefix: &str,
+    x: &[f32],
+    src: &dyn WeightSource,
+    limit: usize,
+    scratch: &mut MoeScratch,
+    out: &mut [f32],
+    body: ExpertBody,
+) -> Result<(), EngineError> {
+    let dim = cfg.dim;
+    if dim == 0 || !x.len().is_multiple_of(dim) || out.len() != x.len() {
+        return Err(shape_error(
+            "the stated FFN",
+            format!(
+                "dim {dim}, {} input values and {} output values do not describe whole tokens",
+                x.len(),
+                out.len()
+            ),
+        ));
+    }
+    let tokens = x.len() / dim;
+    let bf16 = crate::quant::bf16_round;
+    let mut expert_out = vec![0.0f32; dim];
+    if matches!(body, ExpertBody::Dense) {
+        let dense = scratch.read_expert(cfg, src, prefix, ExpertBody::Dense, limit, None)?;
+        let base = scratch.base.clone();
+        for (row, input) in out.chunks_exact_mut(dim).zip(x.chunks_exact(dim)) {
+            stated_expert_body(
+                cfg,
+                src,
+                &base,
+                input,
+                &dense,
+                None,
+                (&mut scratch.gate_branch, &mut scratch.up_branch),
+                row,
+            )?;
+        }
+        return Ok(());
+    }
+    let (n_routed, _) = counts(cfg, prefix)?;
+    scratch.name.clear();
+    write!(scratch.name, "{prefix}.ffn.gate.weight")
+        .expect("a String cannot fail to be written to");
+    let gate = WeightView::read_plain(src, &scratch.name, n_routed, dim, limit)?;
+    scratch.name.clear();
+    write!(scratch.name, "{prefix}.ffn.gate.bias").expect("a String cannot fail to be written to");
+    let bias = linalg::decode_by_name(src, &scratch.name, limit)?;
+    if bias.len() != n_routed || scratch.scores.len() < n_routed {
+        return Err(shape_error(
+            &scratch.name,
+            format!(
+                "{n_routed} experts need {n_routed} biases and scores, got {} and {}",
+                bias.len(),
+                scratch.scores.len()
+            ),
+        ));
+    }
+    scratch.choices.clear();
+    {
+        let mut routing = Routing {
+            scores: &mut scratch.scores[..n_routed],
+            selected: &mut scratch.selected,
+        };
+        for token in 0..tokens {
+            routing.run_with_gate(cfg, prefix, &x[token * dim..][..dim], &gate, &bias, None)?;
+            for &(expert, weight) in routing.selected.iter() {
+                scratch.choices.push((token, expert, weight));
+            }
+        }
+    }
+    scratch
+        .choices
+        .sort_unstable_by_key(|(token, expert, _)| (*expert, *token));
+    let mut routed = vec![0.0f32; tokens * dim];
+    let choices = std::mem::take(&mut scratch.choices);
+    for (expert, start, end) in expert_groups(&choices) {
+        let weights =
+            scratch.read_expert(cfg, src, prefix, ExpertBody::Routed(expert), limit, None)?;
+        let base = scratch.base.clone();
+        for &(token, _, weight) in &choices[start..end] {
+            stated_expert_body(
+                cfg,
+                src,
+                &base,
+                &x[token * dim..][..dim],
+                &weights,
+                Some(weight),
+                (&mut scratch.gate_branch, &mut scratch.up_branch),
+                &mut expert_out,
+            )?;
+            for (sum, value) in routed[token * dim..][..dim].iter_mut().zip(&expert_out) {
+                *sum += value;
+            }
+        }
+    }
+    scratch.choices = choices;
+    let shared = scratch.read_expert(cfg, src, prefix, ExpertBody::Shared, limit, None)?;
+    let base = scratch.base.clone();
+    for token in 0..tokens {
+        stated_expert_body(
+            cfg,
+            src,
+            &base,
+            &x[token * dim..][..dim],
+            &shared,
+            None,
+            (&mut scratch.gate_branch, &mut scratch.up_branch),
+            &mut expert_out,
+        )?;
+        let row = &mut out[token * dim..][..dim];
+        for ((slot, sum), value) in row.iter_mut().zip(&routed[token * dim..]).zip(&expert_out) {
+            *slot = bf16(bf16(*sum) + value);
+        }
     }
     Ok(())
 }

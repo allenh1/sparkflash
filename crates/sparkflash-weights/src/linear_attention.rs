@@ -468,6 +468,9 @@ pub struct KdaActivations<'a> {
     pub conv: &'a dyn Fn(f32) -> f32,
     /// `sigmoid`.
     pub sigmoid: &'a dyn Fn(f32) -> f32,
+    /// The type `beta` and the delta rule's output are held in before the gated norm: the
+    /// identity for an f32 body, a BF16 round where the producer returns BF16 there.
+    pub narrow: &'a dyn Fn(f32) -> f32,
 }
 
 /// One token through a Kimi Delta Attention layer after its projections (GLM-5.3-Flash's linear
@@ -558,10 +561,13 @@ pub fn kda_token(
             Decay::Channel(&decay),
             &key,
             &convolved[2][channels.clone()],
-            (activations.sigmoid)(write[head]),
+            (activations.narrow)((activations.sigmoid)(write[head])),
             &query,
             &mut out[channels],
         );
+    }
+    for value in &mut out {
+        *value = (activations.narrow)(*value);
     }
     Ok(out
         .chunks(head_dim)

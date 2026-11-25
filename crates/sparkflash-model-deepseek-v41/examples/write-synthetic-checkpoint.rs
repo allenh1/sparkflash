@@ -15,11 +15,15 @@
 //! Writes a synthetic checkpoint from a configuration document.
 //!
 //! `write-synthetic-checkpoint CONFIG.json OUT_DIR [SEED] [SHARDS]` writes every tensor the
-//! DeepSeek text plan names for that configuration, in the released storage formats.
+//! DeepSeek text plan names for that configuration, in the released storage formats. A
+//! description that stores its tensors under its own spelling (a layout slot named apart from its
+//! stored name) is written in that spelling instead, every tensor its layout plans.
 
 use std::path::Path;
 
-use sparkflash_model_deepseek_v41::checkpoint::write_synthetic_checkpoint;
+use sparkflash_model_deepseek_v41::checkpoint::{
+    write_described_checkpoint, write_synthetic_checkpoint,
+};
 use sparkflash_model_deepseek_v41::config::ModelConfig;
 
 fn main() -> Result<(), String> {
@@ -41,13 +45,29 @@ fn main() -> Result<(), String> {
     let config_path = Path::new(&config).to_path_buf();
     let text =
         std::fs::read_to_string(&config_path).map_err(|error| format!("{config}: {error}"))?;
-    let config = ModelConfig::from_json(&text).map_err(|error| format!("config: {error}"))?;
+    let architecture = sparkflash_model::Architecture::from_json(&text)
+        .map_err(|error| format!("config: {error}"))?;
+    let own_spelling = sparkflash_model::layout::described_tensors(&architecture)
+        .map_err(|error| format!("layout: {error}"))?
+        .is_some_and(|tensors| {
+            tensors.iter().any(|tensor| {
+                tensor
+                    .slot
+                    .as_ref()
+                    .is_some_and(|slot| *slot != tensor.name)
+            })
+        });
     std::fs::create_dir_all(&out).map_err(|error| format!("{out}: {error}"))?;
     // The writer does not write config.json (the checkpoint's own document); copy it beside the
     // weights so the loader reads the same document the tensors were planned from.
     std::fs::copy(&config_path, Path::new(&out).join("config.json"))
         .map_err(|error| format!("config.json: {error}"))?;
-    write_synthetic_checkpoint(Path::new(&out), &config, seed, shards)?;
+    if own_spelling {
+        write_described_checkpoint(Path::new(&out), &architecture, seed, shards)?;
+    } else {
+        let config = ModelConfig::from_json(&text).map_err(|error| format!("config: {error}"))?;
+        write_synthetic_checkpoint(Path::new(&out), &config, seed, shards)?;
+    }
     println!("{out}: synthetic checkpoint written");
     Ok(())
 }

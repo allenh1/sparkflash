@@ -611,6 +611,7 @@ impl Kda {
             linear_attention::KdaActivations {
                 conv: &linalg::silu,
                 sigmoid: &linalg::sigmoid,
+                narrow: &|value| value,
             },
         )
         .map_err(|detail| EngineError::Shape {

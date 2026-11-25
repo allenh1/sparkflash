@@ -155,6 +155,8 @@ pub fn tiny_values() -> ModelConfig {
         kda_layers: Vec::new(),
         kda: None,
         absorbed_latent: None,
+        index_key_norm_eps: 0.0,
+        wiring: None,
         n_layers: 2,
         n_mtp_layers: 1,
         dspark_block_size: 2,

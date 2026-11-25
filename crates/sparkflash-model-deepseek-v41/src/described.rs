@@ -83,7 +83,10 @@ fn boolean(facts: &BTreeMap<String, FactValue>, name: &str, default: bool) -> bo
 /// The wiring facts a layout states that are not part sizes: how a part computes (its form, the
 /// type a value is held in, the fold at the head). An arm that runs none of a stated value must
 /// refuse the description by that name, never run its own arithmetic in the model's place.
-const WIRING_FLAGS: [&str; 2] = ["language.indexer.pool_compress", "language.draft.indexer_shared"];
+const WIRING_FLAGS: [&str; 2] = [
+    "language.indexer.pool_compress",
+    "language.draft.indexer_shared",
+];
 
 fn wiring_value(value: &FactValue) -> String {
     match value {
@@ -93,17 +96,59 @@ fn wiring_value(value: &FactValue) -> String {
     }
 }
 
-/// The wiring the base runs today, on the host and on the device: the single-latent MLA, the
-/// head fold through the last pre-mix, the shared f32 KDA body, f32 norm and router sums.
-pub const BASE_RUNS: [(&str, &str); 8] = [
+/// The wiring the base runs today, on the host and on the device: the single-latent MLA, each
+/// sublayer's collapse through the previous sublayer's mix and the head fold through the last
+/// pre-mix, the shared f32 KDA body, f32 norm and router sums.
+pub const BASE_RUNS: [(&str, &str); 9] = [
     ("language.mla_attention.form", "latent"),
-    ("language.manifold_hyper_connection.head_fold", "last_pre_mix"),
+    (
+        "language.manifold_hyper_connection.collapse",
+        "previous_mix",
+    ),
+    (
+        "language.manifold_hyper_connection.head_fold",
+        "last_pre_mix",
+    ),
     ("language.kda_scan.decay", "f32"),
     ("language.kda_scan.recurrence", "f32"),
     ("language.kda_scan.state", "f32"),
     ("language.kda_scan.output_norm", "f32"),
     ("language.rms_norm.accumulate", "f32"),
     ("language.moe.router_dtype", "float32"),
+];
+
+/// The wiring the host's whole-model forward runs: the base's, and the described forms it has
+/// built beside them ([crate::forward]'s `stated` and `absorbed` modules). Each sublayer's
+/// own-mix collapse, the mean head fold, the BF16 stream (every module output, norm and stream
+/// update in BF16, f32 where the producer casts), f32 mix inputs and coefficients, the absorbed
+/// MLA with its f32 softmax and query-typed probabilities, and the pooled indexer with f32
+/// scores and pool softmax. `draft.indexer_shared` is the draft's selection; the host drafts
+/// only through DSpark target layers, and a stack without them drafts nothing here.
+pub const HOST_RUNS: [(&str, &str); 21] = [
+    BASE_RUNS[0],
+    BASE_RUNS[1],
+    BASE_RUNS[2],
+    BASE_RUNS[3],
+    BASE_RUNS[4],
+    BASE_RUNS[5],
+    BASE_RUNS[6],
+    BASE_RUNS[7],
+    BASE_RUNS[8],
+    ("language.mla_attention.form", "absorbed"),
+    ("language.mla_attention.probabilities", "query"),
+    ("language.mla_attention.softmax", "f32"),
+    ("language.manifold_hyper_connection.collapse", "own_mix"),
+    ("language.manifold_hyper_connection.head_fold", "mean"),
+    ("language.manifold_hyper_connection.coefficients", "f32"),
+    ("language.manifold_hyper_connection.mix_input", "f32"),
+    (
+        "language.manifold_hyper_connection.stream_update",
+        "bfloat16",
+    ),
+    ("language.sparse_indexer.scores", "f32"),
+    ("language.sparse_indexer.pool_softmax", "f32"),
+    ("language.indexer.pool_compress", "true"),
+    ("language.draft.indexer_shared", "true"),
 ];
 
 /// Refuse every stated wiring fact whose value is not in `runs` (`(fact, value)` pairs): a
@@ -125,7 +170,14 @@ pub fn refuse_unrun_wiring(
                 .strip_prefix("language.")
                 .and_then(|rest| rest.split_once('.'))
                 .is_some_and(|(part, _)| sparkflash_model::Part::parse(part).is_some());
-        if !wiring || matches!(value, FactValue::Bool(false)) {
+        // A number is a part's parameter, read through the value table by the arm that runs
+        // the part; only how a part computes is wiring.
+        if !wiring
+            || matches!(
+                value,
+                FactValue::Bool(false) | FactValue::Integer(_) | FactValue::Float(_)
+            )
+        {
             continue;
         }
         let value = wiring_value(value);
@@ -205,6 +257,7 @@ pub fn from_facts(
             ));
         }
     };
+    let wiring = stated_wiring(facts, architecture)?;
     let n_layers = int(facts, "n_layers")?;
     let n_mtp_layers = opt_int(facts, "n_mtp_layers").unwrap_or(0);
     if compress_ratios.len() != n_layers + n_mtp_layers {
@@ -250,6 +303,8 @@ pub fn from_facts(
             None => None,
         },
         absorbed_latent,
+        index_key_norm_eps: opt_float(facts, "language.sparse_indexer.key_norm_eps").unwrap_or(0.0),
+        wiring: (!wiring.is_release()).then_some(wiring),
         gdn_layers: match facts.get("gdn_layers") {
             Some(_) => integers(facts, "gdn_layers")?,
             None => Vec::new(),
@@ -341,6 +396,97 @@ pub fn from_facts(
     })
 }
 
+/// The wiring the facts state beside the release's ([crate::config::StatedWiring]): the mHC
+/// schedule, the head fold, the stream's type map, the dynamic activation tile and the pooled
+/// indexer. A value outside the ones the base knows is refused by name.
+fn stated_wiring(
+    facts: &BTreeMap<String, FactValue>,
+    architecture: &Architecture,
+) -> Result<crate::config::StatedWiring, ConfigError> {
+    use sparkflash_model::architecture::WeightFormat;
+    let fact = |name: &str| facts.get(name).and_then(FactValue::as_text);
+    let choose = |name: &str, release: &str, other: &str| -> Result<bool, ConfigError> {
+        match fact(name) {
+            None => Ok(false),
+            Some(value) if value == release => Ok(false),
+            Some(value) if value == other => Ok(true),
+            Some(value) => Err(format!(
+                "the layout states {name} = {value}; the base knows {release} and {other}"
+            )),
+        }
+    };
+    let own_mix = choose(
+        "language.manifold_hyper_connection.collapse",
+        "previous_mix",
+        "own_mix",
+    )?;
+    let mean_fold = choose(
+        "language.manifold_hyper_connection.head_fold",
+        "last_pre_mix",
+        "mean",
+    )?;
+    let bf16_stream = match fact("language.manifold_hyper_connection.stream_update") {
+        None => false,
+        Some("bfloat16" | "bf16") => true,
+        Some(other) => {
+            return Err(format!(
+                "the layout states the mHC stream update in {other}; the base runs a BF16 stream"
+            ));
+        }
+    };
+    // The dynamic recipe is part of the producer's type map: a description that states its
+    // stream type runs its FP8 linears on the quantised input. The release's f32 reference path,
+    // and the synthetic variants on it, keep their own activation handling.
+    let activation_tile = match architecture.quantization.dense_format {
+        WeightFormat::Fp8Tile {
+            block_n,
+            dynamic_activations: true,
+            ..
+        } if bf16_stream => block_n,
+        _ => 0,
+    };
+    let pooled = matches!(
+        facts.get("language.indexer.pool_compress"),
+        Some(FactValue::Bool(true))
+    );
+    let mut pools = architecture
+        .layers
+        .iter()
+        .filter_map(|layer| layer.attention.indexer.as_ref())
+        .map(|indexer| (indexer.pool, indexer.always_select_tail));
+    let (index_pool, index_tail) = match (pooled, pools.next()) {
+        (true, Some(first)) => {
+            if let Some(other) = pools.find(|other| *other != first) {
+                return Err(format!(
+                    "the pooled indexers disagree: a pool of {} (tail {}) and one of {} (tail {})",
+                    first.0, first.1, other.0, other.1
+                ));
+            }
+            if first.0 < 2 {
+                return Err(format!(
+                    "the layout states pooled indexer keys and a pool of {}",
+                    first.0
+                ));
+            }
+            first
+        }
+        (true, None) => {
+            return Err(
+                "the layout states pooled indexer keys and no layer runs an indexer".to_owned(),
+            );
+        }
+        (false, _) => (0, false),
+    };
+    Ok(crate::config::StatedWiring {
+        own_mix,
+        mean_fold,
+        bf16_stream,
+        activation_tile,
+        index_pool,
+        index_tail,
+    })
+}
+
 /// A described checkpoint's values from its `config.json` text alone: the architecture, its
 /// facts, and the dense class it states. The host reference opens through this ([host_config]), and the device
 /// forward reads the same facts through its plan (the plan's per-part formats agree with the
@@ -362,12 +508,12 @@ pub fn from_config(text: &str) -> Result<ModelConfig, ConfigError> {
 }
 
 /// The host forward's open: [from_config], refused first for every wiring fact the host does not
-/// run ([refuse_unrun_wiring] at [BASE_RUNS]).
+/// run ([refuse_unrun_wiring] at [HOST_RUNS]).
 ///
 /// # Errors
 /// As [from_config], and the wiring the host has not built, by name.
 pub fn host_config(text: &str) -> Result<ModelConfig, ConfigError> {
     let architecture = Architecture::from_json(text).map_err(|error| error.to_string())?;
-    refuse_unrun_wiring(&architecture.model_facts(), "the host forward", &BASE_RUNS)?;
+    refuse_unrun_wiring(&architecture.model_facts(), "the host forward", &HOST_RUNS)?;
     from_config(text)
 }

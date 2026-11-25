@@ -243,21 +243,25 @@ pub(crate) fn kda_attention_forward(
     };
     let width = heads.width();
     let low = geometry.head_dim;
-    // The view reads `<base>.weight` (and a scale beside it, when the class has one).
+    // The view reads `<base>.weight` (and a scale beside it, when the class has one); a stated
+    // stream type holds each projection in it ([super::stated::project]).
+    let grid = if config.stated().is_release() {
+        ScaleGrid::Block32
+    } else {
+        config.dense_grid().unwrap_or(ScaleGrid::Block32)
+    };
     let project = |name: &str, outputs: usize, inputs: usize, input: &[f32]| {
         let base = name.strip_suffix(".weight").unwrap_or(name);
-        let view = WeightView::read_optional_scale(
+        super::stated::project(
+            config,
             source,
             &format!("{prefix}.{base}"),
             outputs,
             inputs,
-            ScaleGrid::Block32,
+            input,
+            grid,
             limit,
-        )?;
-        let count = input.len() / inputs;
-        let mut projected = vec![0.0f32; count * outputs];
-        view.matmul(&mut projected, input, outputs, inputs, count)?;
-        Ok::<_, EngineError>(projected)
+        )
     };
     let names = KDA_TENSORS;
     let qkv = [
@@ -291,9 +295,23 @@ pub(crate) fn kda_attention_forward(
         dt_bias: &dt_bias,
         norm: &norm,
     };
-    let activations = KdaActivations {
-        conv: &linalg::silu,
-        sigmoid: &linalg::sigmoid,
+    // On a BF16 stream the conv's SiLU, beta and the delta rule's output are BF16, as the
+    // producer returns them (`modeling_glm5_next.py` 357-391); the decay and the state stay f32.
+    let narrow_silu = |value: f32| quant::bf16_round(linalg::silu(value));
+    let narrow = |value: f32| quant::bf16_round(value);
+    let identity = |value: f32| value;
+    let activations = if config.stated().bf16_stream {
+        KdaActivations {
+            conv: &narrow_silu,
+            sigmoid: &linalg::sigmoid,
+            narrow: &narrow,
+        }
+    } else {
+        KdaActivations {
+            conv: &linalg::silu,
+            sigmoid: &linalg::sigmoid,
+            narrow: &identity,
+        }
     };
     let mut attended = Vec::with_capacity(rows * width);
     for row in 0..rows {
@@ -317,6 +335,7 @@ pub(crate) fn kda_attention_forward(
         )
         .map_err(|detail| shape(&what, detail))?;
         attended.extend_from_slice(&normed);
+        super::stated::hold(config, &mut attended[row * width..]);
         state.consumed += 1;
     }
     let projected = project(names.out, dim, width, &attended)?;

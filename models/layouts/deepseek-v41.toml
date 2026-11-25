@@ -211,7 +211,9 @@ value = "unfold"
 
 # The language stack's wiring that no config key states. inference/model.py:644 and 706: the
 # attention keeps one latent, kv_norm(wkv(x)), which every head reads as its key and value;
-# 1268: the head folds the streams through the last block's pre-mix, layer.hc_pre(h, pre_mix).
+# 1268: the head folds the streams through the last block's pre-mix, layer.hc_pre(h, pre_mix);
+# 981-994: each sublayer collapses the streams with the pre-mix the sublayer before it computed
+# (the attention with the caller's, the FFN with the attention's), seeded one-hot at 1159-1163.
 [[stacks.language.parts]]
 part = "mla_attention"
 [[stacks.language.parts.facts]]
@@ -220,6 +222,9 @@ value = "latent"
 
 [[stacks.language.parts]]
 part = "manifold_hyper_connection"
+[[stacks.language.parts.facts]]
+name = "collapse"
+value = "previous_mix"
 [[stacks.language.parts.facts]]
 name = "head_fold"
 value = "last_pre_mix"

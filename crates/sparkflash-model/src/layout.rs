@@ -2965,6 +2965,20 @@ pub fn matching(architecture: &Architecture) -> Result<Option<Layout>, LayoutErr
     Ok(set.select(architecture)?.cloned())
 }
 
+/// Every tensor a described checkpoint stores, as its layout plans them for `architecture`;
+/// `None` when no layout describes it.
+///
+/// # Errors
+/// As [Layout::tensors].
+pub fn described_tensors(
+    architecture: &Architecture,
+) -> Result<Option<Vec<LayoutTensor>>, LayoutError> {
+    let Some(layout) = matching(architecture)? else {
+        return Ok(None);
+    };
+    layout.tensors(architecture).map(Some)
+}
+
 /// The names the base forward reads a checkpoint's tensors by, where the layout gives a slot:
 /// stored name -> slot. Empty for a layout whose names are already the base's (DeepSeek's).
 ///
@@ -3003,7 +3017,10 @@ pub fn checkpoint_names(
                 slot.strip_suffix(".weight"),
             )
         {
-            names.insert(format!("{stored}.weight_scale_inv"), format!("{base}.scale"));
+            names.insert(
+                format!("{stored}.weight_scale_inv"),
+                format!("{base}.scale"),
+            );
         }
     }
     if let Some(tensor) = tensors

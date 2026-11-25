@@ -121,6 +121,8 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
                 .unwrap_or_else(|| "bf16".to_owned()),
         ),
     );
+    // A release that states one quantisation method and no expert format of its own (GLM's
+    // `quant_method: fp8`) stores its experts in that method, as it stores its dense linears.
     put(
         "expert_dtype",
         FactValue::Text(
@@ -128,6 +130,7 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
                 .quantization
                 .expert
                 .clone()
+                .or_else(|| architecture.quantization.method.clone())
                 .unwrap_or_else(|| "bf16".to_owned()),
         ),
     );

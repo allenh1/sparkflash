@@ -213,6 +213,173 @@ pub fn write_synthetic_checkpoint(
     write_checkpoint(directory, &tensors, shards).map_err(|error| error.to_string())
 }
 
+/// One FP8 tile class as written: its E4M3 codes, its scale grid `[rows, columns]` in tiles,
+/// and one inverse scale a tile.
+type Fp8Tiles = (Vec<u8>, Vec<usize>, Vec<f32>);
+
+/// The bytes of one FP8 tile class: E4M3 codes over the format's whole range and one inverse
+/// scale a `block_m x block_n` tile, so a decoded weight is about `signed / sqrt(columns)`.
+fn fp8_tile_bytes(
+    name: &str,
+    shape: &[usize],
+    (block_m, block_n): (usize, usize),
+    seed: u64,
+) -> Result<Fp8Tiles, String> {
+    let (rows, columns) = match shape {
+        [rows, columns] => (*rows, *columns),
+        other => {
+            return Err(format!(
+                "{name}: an FP8 tile class is a matrix, not {other:?}"
+            ));
+        }
+    };
+    let mut rng = TensorRng::new(seed, name);
+    let codes = (0..rows * columns)
+        .map(|_| quant::e4m3_encode(rng.signed() * 448.0))
+        .collect();
+    let grid = vec![rows.div_ceil(block_m), columns.div_ceil(block_n)];
+    let mut scales_rng = TensorRng::new(seed, &format!("{name}.weight_scale_inv"));
+    let scales = (0..grid[0] * grid[1])
+        .map(|_| matrix_width(columns) / 448.0 * (0.5 + scales_rng.unit()))
+        .collect();
+    Ok((codes, grid, scales))
+}
+
+/// Write a synthetic checkpoint in a description's own stored spelling: every tensor its layout
+/// plans (`sparkflash_model::layout::described_tensors`), each class in the architecture's
+/// stored format, the values from [write_synthetic_checkpoint]'s recipe read by the tensor's base
+/// name (its slot). An FP8 tile class writes its codes and its `weight_scale_inv` sibling.
+///
+/// # Errors
+/// No layout describes the architecture, a class whose stored format this writer has no recipe
+/// for (named), or a checkpoint that cannot be written.
+pub fn write_described_checkpoint(
+    directory: &Path,
+    architecture: &sparkflash_model::Architecture,
+    seed: u64,
+    shards: usize,
+) -> Result<(), String> {
+    use sparkflash_model::architecture::{ScaleDType, WeightFormat};
+    use sparkflash_model::layout::LayoutDtype;
+    let planned = sparkflash_model::layout::described_tensors(architecture)
+        .map_err(|error| error.to_string())?
+        .ok_or("no layout describes this architecture")?;
+    let quantization = &architecture.quantization;
+    let mut tensors: Vec<(TensorSpec, Vec<u8>)> = Vec::with_capacity(planned.len());
+    for tensor in &planned {
+        let format = match tensor.dtype {
+            LayoutDtype::Bf16 => WeightFormat::Bf16,
+            LayoutDtype::F32 => WeightFormat::F32,
+            LayoutDtype::Dense => quantization.dense_format,
+            LayoutDtype::Expert => match tensor.stack {
+                sparkflash_model::StackKind::Draft => quantization
+                    .mtp_expert_format
+                    .unwrap_or(quantization.expert_format),
+                _ => quantization.expert_format,
+            },
+            other => {
+                return Err(format!(
+                    "{}: the described writer has no recipe for the {other:?} class",
+                    tensor.name
+                ));
+            }
+        };
+        // The recipe reads the base name, so a described tensor takes the value its slot takes
+        // in the base's own spelling; the routing bias keeps its stored name, which the recipe
+        // knows.
+        let base = match &tensor.slot {
+            Some(_) if tensor.name.contains("e_score_correction_bias") => tensor.name.clone(),
+            Some(slot) => slot.clone(),
+            None => tensor.name.clone(),
+        };
+        match format {
+            WeightFormat::Bf16 | WeightFormat::F32 => {
+                let dtype = if format == WeightFormat::Bf16 {
+                    DType::BF16
+                } else {
+                    DType::F32
+                };
+                let recipe = TensorSpec {
+                    name: if base.ends_with(".bias") && base.contains("norm") {
+                        // A LayerNorm's bias sits near zero, as the weight sits near one.
+                        base.replace("norm", "nrm")
+                    } else {
+                        base.clone()
+                    },
+                    dtype,
+                    shape: tensor.shape.clone(),
+                };
+                let bytes = synthetic_bytes(&recipe, seed)?;
+                tensors.push((
+                    TensorSpec {
+                        name: tensor.name.clone(),
+                        dtype,
+                        shape: tensor.shape.clone(),
+                    },
+                    bytes,
+                ));
+            }
+            WeightFormat::Fp8Tile {
+                block_m,
+                block_n,
+                scale_dtype,
+                ..
+            } => {
+                let (codes, grid, scales) =
+                    fp8_tile_bytes(&base, &tensor.shape, (block_m, block_n), seed)?;
+                tensors.push((
+                    TensorSpec {
+                        name: tensor.name.clone(),
+                        dtype: DType::F8E4M3,
+                        shape: tensor.shape.clone(),
+                    },
+                    codes,
+                ));
+                let stem = tensor.name.strip_suffix(".weight").ok_or_else(|| {
+                    format!("{}: an FP8 tile class names a .weight tensor", tensor.name)
+                })?;
+                let (dtype, bytes) = match scale_dtype {
+                    ScaleDType::F32 => (
+                        DType::F32,
+                        scales
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect(),
+                    ),
+                    ScaleDType::Bf16 => (
+                        DType::BF16,
+                        scales
+                            .iter()
+                            .flat_map(|value| quant::f32_to_bf16_bits(*value).to_le_bytes())
+                            .collect(),
+                    ),
+                    other => {
+                        return Err(format!(
+                            "{}: the described writer has no recipe for {other:?} tile scales",
+                            tensor.name
+                        ));
+                    }
+                };
+                tensors.push((
+                    TensorSpec {
+                        name: format!("{stem}.weight_scale_inv"),
+                        dtype,
+                        shape: grid,
+                    },
+                    bytes,
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "{}: the described writer has no recipe for the stored format {other:?}",
+                    tensor.name
+                ));
+            }
+        }
+    }
+    write_checkpoint(directory, &tensors, shards).map_err(|error| error.to_string())
+}
+
 /// The summary of one written twin fixture.
 #[derive(Debug, Clone)]
 pub struct FixtureSummary {
