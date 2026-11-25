@@ -556,6 +556,235 @@ impl GdnChunk {
     }
 }
 
+/// `q4e_kda_decay`: Kimi Delta Attention's per-channel decay over `rows` rows of the forget
+/// logits `forget` (`[rows][heads * key_dim]` f32, after `f_b`), `exp(lower_bound *
+/// sigmoid(exp(a_log[head]) * (forget + dt_bias[channel])))` into `decay`, `a_log` (a head's) and
+/// `dt_bias` (a channel's) f32. A flat grid over every channel of every row.
+#[must_use]
+pub fn kda_decay(
+    (forget, a_log, dt_bias, decay): (u64, u64, u64, u64),
+    (heads, key_dim): (usize, usize),
+    lower_bound: f32,
+    rows: usize,
+) -> Call<8> {
+    Call {
+        grid: (flat_blocks(rows * heads * key_dim), 1, 1),
+        block: (BLOCK, 1, 1),
+        args: [
+            forget,
+            a_log,
+            dt_bias,
+            decay,
+            heads as u64,
+            key_dim as u64,
+            u64::from(lower_bound.to_bits()),
+            rows as u64,
+        ],
+    }
+}
+
+impl GdnGeometry {
+    /// A Kimi Delta Attention block's geometry: a value head a key head, both `head_dim` wide,
+    /// `heads` of them (the rank's share), the conv over q, k and v `taps` wide.
+    #[must_use]
+    pub const fn kda(heads: usize, head_dim: usize, taps: usize) -> Self {
+        Self {
+            key_heads: heads,
+            heads,
+            key_dim: head_dim,
+            value_dim: head_dim,
+            taps,
+        }
+    }
+
+    /// `q4p_kda_prep` over `rows` convolved rows of `mixed` and their beta logits `b`: the
+    /// normalised q (times `1 / sqrt(key_dim)`) and k into `qk`, and each row's (1, beta) per head
+    /// into `decay_beta` (the decay is a channel's, [kda_decay]). Grid (heads, rows), a thread a
+    /// key.
+    #[must_use]
+    pub const fn kda_prep(
+        &self,
+        (mixed, b): (u64, u64),
+        (qk, decay_beta): (u64, u64),
+        rows: usize,
+    ) -> Call<9> {
+        Call {
+            grid: (self.key_heads as u32, rows as u32, 1),
+            block: (self.key_dim as u32, 1, 1),
+            args: [
+                mixed,
+                b,
+                qk,
+                decay_beta,
+                self.key_width() as u64,
+                self.key_heads as u64,
+                self.heads as u64,
+                self.value_dim as u64,
+                self.groups() as u64,
+            ],
+        }
+    }
+
+    /// `q4p_kda_scan`'s arguments over `rows` prepared rows (launched on the
+    /// [crate::scan::ScanPlan]'s grid): the state in `state` stepped in place by each channel's
+    /// factor in `channel` ([kda_decay]), the raw head outputs into `out`, a verify's `snapshot`
+    /// kept as [Self::scan_args] keeps it.
+    #[must_use]
+    pub const fn kda_scan_args(
+        &self,
+        (qk, decay_beta, channel, mixed): (u64, u64, u64, u64),
+        state: u64,
+        out: u64,
+        rows: usize,
+        (snapshot, snapshot_rows, region_stride): (u64, usize, u64),
+    ) -> [u64; 15] {
+        [
+            qk,
+            decay_beta,
+            channel,
+            mixed,
+            state,
+            out,
+            self.key_width() as u64,
+            self.key_heads as u64,
+            self.heads as u64,
+            self.value_dim as u64,
+            self.groups() as u64,
+            rows as u64,
+            snapshot,
+            snapshot_rows as u64,
+            region_stride,
+        ]
+    }
+}
+
+/// The scan image's Kimi Delta Attention scans a [crate::scan::ScanPlan] names, by head widths.
+pub const KDA_SCANS: [&str; 3] = ["q4p_kda_scan", "q4p_kda_scan_64_64", "q4p_kda_scan_128_256"];
+
+/// A Kimi Delta Attention layer's chunk path after its projections, in its step order: the conv
+/// over q, k and v ([ChunkConv]); the per-channel decay of the forget logits ([Self::decay]); the
+/// prep over the convolved rows ([Self::prep]); the scan with the state in registers on the plan's
+/// kernel and grid, each key channel decayed by its own factor ([Self::scan]); and the gated norm
+/// with a sigmoid gate ([GatedNorm]). GLM-5.3-Flash's linear-attention blocks
+/// (`modeling_glm5_next.py` 357-391 and 476-533 at the layout's revision): the decay, the
+/// recurrence and the gated norm in f32, the state kept f32.
+#[derive(Clone, Copy, Debug)]
+pub struct KdaChunk {
+    /// The conv and the history advanced past it.
+    pub conv: ChunkConv,
+    decay: Bound,
+    prep: Bound,
+    /// The gated norm after the scan.
+    pub gate: GatedNorm,
+}
+
+impl KdaChunk {
+    /// The decay's kernel, in the token image.
+    pub const DECAY: &'static str = "q4e_kda_decay";
+    /// The prep's kernel, in the scan image.
+    pub const PREP: &'static str = "q4p_kda_prep";
+
+    /// The steps, `decay` the loaded [Self::DECAY] and `prep` the loaded [Self::PREP].
+    ///
+    /// # Errors
+    /// Another decay or prep kernel, by name.
+    pub fn new(
+        conv: ChunkConv,
+        decay: Bound,
+        prep: Bound,
+        gate: GatedNorm,
+    ) -> Result<Self, String> {
+        runs(decay, Self::DECAY, "the KDA decay").map_err(|error| error.to_string())?;
+        runs(prep, Self::PREP, "the KDA prep").map_err(|error| error.to_string())?;
+        Ok(Self {
+            conv,
+            decay,
+            prep,
+            gate,
+        })
+    }
+
+    /// [kda_decay] over `rows` rows of forget logits into `decay`.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn decay<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        geometry: &GdnGeometry,
+        (forget, a_log, dt_bias): (Deviceptr, Deviceptr, Deviceptr),
+        decay: Deviceptr,
+        lower_bound: f32,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        cx.call(
+            self.decay,
+            kda_decay(
+                (forget.0, a_log.0, dt_bias.0, decay.0),
+                (geometry.heads, geometry.key_dim),
+                lower_bound,
+                rows,
+            ),
+        )
+    }
+
+    /// [GdnGeometry::kda_prep] over `rows` convolved rows and their beta logits.
+    ///
+    /// # Errors
+    /// The driver's refusal.
+    pub fn prep<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        geometry: &GdnGeometry,
+        (mixed, b): (Deviceptr, Deviceptr),
+        (qk, decay_beta): (Deviceptr, Deviceptr),
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        cx.call(
+            self.prep,
+            geometry.kda_prep((mixed.0, b.0), (qk.0, decay_beta.0), rows),
+        )
+    }
+
+    /// The scan over `rows` prepared rows ([GdnGeometry::kda_scan_args]) on `scan`, one of
+    /// [KDA_SCANS], at the plan's `launch`.
+    ///
+    /// # Errors
+    /// Another scan kernel, by name, or the driver's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan<L: Launcher + ?Sized>(
+        &self,
+        cx: &L,
+        (scan, launch): (Bound, Launch),
+        geometry: &GdnGeometry,
+        staged: (Deviceptr, Deviceptr, Deviceptr, Deviceptr),
+        state: Deviceptr,
+        out: Deviceptr,
+        rows: usize,
+        snapshot: (u64, usize, u64),
+    ) -> Result<(), BackendError> {
+        let name = scan.kernel().name();
+        if !KDA_SCANS.contains(&name) {
+            return Err(BackendError::new(
+                "role",
+                format!("the KDA scan runs one of {KDA_SCANS:?}, not {name}"),
+            ));
+        }
+        let (qk, decay_beta, channel, mixed) = staged;
+        cx.launch(
+            scan,
+            launch,
+            &geometry.kda_scan_args(
+                (qk.0, decay_beta.0, channel.0, mixed.0),
+                state.0,
+                out.0,
+                rows,
+                snapshot,
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +826,38 @@ mod tests {
         assert_eq!(
             gate.args,
             [1, 2, 3, 1, 4, 128, u64::from(1e-6f32.to_bits()), 1]
+        );
+    }
+
+    /// The KDA calls keep the argument order GLM-5.3's host spelled (its `kda`, `scan` and
+    /// `recur`, `sparkflash-model-glm5-next/src/device.rs`): 16 heads of 128 at a rank of four.
+    #[test]
+    fn the_kda_calls_keep_the_kernels_argument_order() {
+        let geometry = GdnGeometry::kda(16, 128, 4);
+        let width = 16 * 128;
+        assert_eq!(geometry.conv_width(), 3 * width);
+        assert_eq!(geometry.groups(), 1);
+        assert_eq!(geometry.conv_bytes(), 3 * 3 * width * 4);
+        assert_eq!(geometry.state_bytes(), 16 * 128 * 128 * 4);
+        let decay = kda_decay((1, 2, 3, 4), (16, 128), -5.0, 9);
+        assert_eq!(
+            (decay.grid, decay.block),
+            ((flat_blocks(9 * width), 1, 1), (256, 1, 1))
+        );
+        assert_eq!(
+            decay.args,
+            [1, 2, 3, 4, 16, 128, u64::from((-5.0f32).to_bits()), 9]
+        );
+        let prep = geometry.kda_prep((1, 2), (3, 4), 9);
+        assert_eq!((prep.grid, prep.block), ((16, 9, 1), (128, 1, 1)));
+        assert_eq!(prep.args, [1, 2, 3, 4, width as u64, 16, 16, 128, 1]);
+        assert_eq!(
+            geometry.kda_scan_args((1, 2, 3, 4), 5, 6, 9, (0, 0, 0)),
+            [1, 2, 3, 4, 5, 6, width as u64, 16, 16, 128, 1, 9, 0, 0, 0]
+        );
+        assert_eq!(
+            geometry.kda_scan_args((1, 2, 3, 4), 5, 6, 9, (7, 3, 8)),
+            [1, 2, 3, 4, 5, 6, width as u64, 16, 16, 128, 1, 9, 7, 3, 8]
         );
     }
 

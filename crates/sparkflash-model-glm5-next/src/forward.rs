@@ -51,7 +51,7 @@
 //! bit.
 
 use sparkflash_weights::linalg::{self, EngineError, ScaleGrid};
-use sparkflash_weights::linear_attention::{self, Decay};
+use sparkflash_weights::linear_attention;
 use sparkflash_weights::mhc::{self, HcGeometry, Mixes};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
 use sparkflash_weights::{DType, WeightSource, quant, topk};
@@ -281,14 +281,8 @@ pub enum LayerState {
     Sparse(DsaState),
 }
 
-/// The state of one KDA layer.
-#[derive(Debug, Clone, PartialEq)]
-pub struct KdaState {
-    /// The last `kernel - 1` pre-convolution rows of the query, key and value projections.
-    pub conv: [Vec<Vec<f32>>; 3],
-    /// Each head's `[head_dim][head_dim]` memory, row-major by key channel.
-    pub recurrent: Vec<Vec<f32>>,
-}
+/// The state of one KDA layer: the shared host state ([linear_attention::KdaState]).
+pub use sparkflash_weights::linear_attention::KdaState;
 
 /// The caches of one DSA layer, one row per position.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -580,8 +574,8 @@ impl<S: WeightSource + ?Sized> Loader<'_, S> {
 }
 
 impl Kda {
-    /// One token through the layer: the convolved projections, the delta rule, the gated norm and
-    /// the output projection.
+    /// One token through the layer: the projections, the shared host KDA step
+    /// ([linear_attention::kda_token]) and the output projection.
     fn step(
         &self,
         config: &Glm5NextConfig,
@@ -591,74 +585,38 @@ impl Kda {
         // This rank's heads' channels.
         let width = self.o.columns;
         let head_dim = config.linear_head_dim;
-        let taps = config.linear_conv_kernel_dim;
-        let mut convolved: Vec<Vec<f32>> = Vec::with_capacity(3);
-        for ((projection, kernel), history) in self.qkv.iter().zip(&self.conv).zip(&mut state.conv)
-        {
-            let row = projection.apply(input)?;
-            let mut out = linear_attention::causal_conv(
-                std::slice::from_ref(&row),
-                history,
-                kernel,
-                width,
-                taps,
-                linalg::silu,
-            );
-            linear_attention::advance_conv_history(history, vec![row], taps);
-            convolved.push(out.swap_remove(0));
-        }
+        let qkv = [
+            self.qkv[0].apply(input)?,
+            self.qkv[1].apply(input)?,
+            self.qkv[2].apply(input)?,
+        ];
         let forget = self.f_b.apply(&self.f_a.apply(input)?)?;
         let write = self.b.apply(input)?;
         let gate = self.g_b.apply(&self.g_a.apply(input)?)?;
-        let lower_bound = config.linear_lower_bound as f32;
-        let query_scale = inverse_sqrt(head_dim);
-        let mut out = vec![0.0f32; width];
-        let mut query = vec![0.0f32; head_dim];
-        let mut key = vec![0.0f32; head_dim];
-        for (head, memory) in state.recurrent.iter_mut().enumerate() {
-            let channels = head * head_dim..(head + 1) * head_dim;
-            linear_attention::l2_normalise(
-                &convolved[0][channels.clone()],
-                query_scale,
-                &mut query,
-            );
-            linear_attention::l2_normalise(&convolved[1][channels.clone()], 1.0, &mut key);
-            let rate = self.a_log[head].exp();
-            let decay: Vec<f32> = channels
-                .clone()
-                .map(|channel| {
-                    linear_attention::kda_channel_decay(
-                        lower_bound,
-                        rate,
-                        forget[channel],
-                        self.dt_bias[channel],
-                        linalg::sigmoid,
-                    )
-                })
-                .collect();
-            linear_attention::delta_rule_step(
-                memory,
-                Decay::Channel(&decay),
-                &key,
-                &convolved[2][channels.clone()],
-                linalg::sigmoid(write[head]),
-                &query,
-                &mut out[channels],
-            );
-        }
-        let normed: Vec<f32> = out
-            .chunks(head_dim)
-            .zip(gate.chunks(head_dim))
-            .flat_map(|(head, gate)| {
-                linear_attention::rms_norm_gated(
-                    head,
-                    &self.o_norm,
-                    gate,
-                    config.rms_norm_eps as f32,
-                    linalg::sigmoid,
-                )
-            })
-            .collect();
+        let normed = linear_attention::kda_token(
+            linear_attention::KdaHeads {
+                heads: width / head_dim,
+                head_dim,
+                taps: config.linear_conv_kernel_dim,
+            },
+            linear_attention::KdaTensors {
+                conv: [&self.conv[0], &self.conv[1], &self.conv[2]],
+                a_log: &self.a_log,
+                dt_bias: &self.dt_bias,
+                norm: &self.o_norm,
+            },
+            (qkv, &forget, &write, &gate),
+            state,
+            (config.rms_norm_eps as f32, config.linear_lower_bound as f32),
+            linear_attention::KdaActivations {
+                conv: &linalg::silu,
+                sigmoid: &linalg::sigmoid,
+            },
+        )
+        .map_err(|detail| EngineError::Shape {
+            what: "a KDA layer".to_owned(),
+            detail,
+        })?;
         self.o.apply(&normed)
     }
 }

@@ -414,6 +414,164 @@ pub fn gdn_token(
     Ok(normed)
 }
 
+/// One Kimi Delta Attention layer's recurrent state on the host: the raw q, k and v rows before
+/// the next (oldest first, at most `taps - 1` each, the [causal_conv] histories) and each head's
+/// `[head_dim][head_dim]` memory, row-major by key channel (empty before the first token).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KdaState {
+    /// The q, k and v conv histories.
+    pub conv: [Vec<Vec<f32>>; 3],
+    /// Each head's memory.
+    pub recurrent: Vec<Vec<f32>>,
+}
+
+/// A Kimi Delta Attention layer's heads on the host: `heads` heads (a rank's share, or all of
+/// them) of `head_dim` keys and values each, and the conv's taps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdaHeads {
+    /// The heads.
+    pub heads: usize,
+    /// A head's key and value width.
+    pub head_dim: usize,
+    /// The conv's taps.
+    pub taps: usize,
+}
+
+impl KdaHeads {
+    /// The q, k or v row's floats, and the gates' and the output's.
+    #[must_use]
+    pub const fn width(&self) -> usize {
+        self.heads * self.head_dim
+    }
+}
+
+/// A Kimi Delta Attention layer's weights past its projections, as f32: the q, k and v convs
+/// (`[width][taps]` each), `A_log` a head's, `dt_bias` a channel's and the gated norm's gains (a
+/// head's width).
+#[derive(Debug, Clone, Copy)]
+pub struct KdaTensors<'a> {
+    /// The q, k and v convs.
+    pub conv: [&'a [f32]; 3],
+    /// `A_log`.
+    pub a_log: &'a [f32],
+    /// `dt_bias`.
+    pub dt_bias: &'a [f32],
+    /// The gated norm's gains.
+    pub norm: &'a [f32],
+}
+
+/// The activations a pack's Kimi Delta Attention takes, its own numerics: the conv's (SiLU) and
+/// the sigmoid of the decay, of beta and of the output gate.
+#[derive(Clone, Copy)]
+pub struct KdaActivations<'a> {
+    /// After the conv.
+    pub conv: &'a dyn Fn(f32) -> f32,
+    /// `sigmoid`.
+    pub sigmoid: &'a dyn Fn(f32) -> f32,
+}
+
+/// One token through a Kimi Delta Attention layer after its projections (GLM-5.3-Flash's linear
+/// attention, `modeling_glm5_next.py` 357-391 and 533): q, k and v each convolved over its own
+/// history (then appended to it), each head's q and k L2-normalised (q scaled by `1 /
+/// sqrt(head_dim)`), each key channel's decay [kda_channel_decay] from the low-rank forget
+/// projection `forget` at `lower_bound`, `beta = sigmoid(write)`, the delta-rule step on each
+/// head's memory, and each head's gated RMSNorm by the output gate `gate` with a sigmoid at
+/// `epsilon`. Returns the normed heads, `[width]`, which `o_proj` takes.
+///
+/// # Errors
+/// A projection or a tensor whose length is not the heads', by name.
+pub fn kda_token(
+    heads: KdaHeads,
+    tensors: KdaTensors<'_>,
+    (qkv, forget, write, gate): ([Vec<f32>; 3], &[f32], &[f32], &[f32]),
+    state: &mut KdaState,
+    (epsilon, lower_bound): (f32, f32),
+    activations: KdaActivations<'_>,
+) -> Result<Vec<f32>, String> {
+    let KdaHeads {
+        heads: count,
+        head_dim,
+        taps,
+    } = heads;
+    let width = heads.width();
+    let lengths = [
+        ("q_proj", qkv[0].len(), width),
+        ("k_proj", qkv[1].len(), width),
+        ("v_proj", qkv[2].len(), width),
+        ("the forget gate's projection", forget.len(), width),
+        ("b_proj", write.len(), count),
+        ("the output gate's projection", gate.len(), width),
+        ("q_conv1d", tensors.conv[0].len(), width * taps),
+        ("k_conv1d", tensors.conv[1].len(), width * taps),
+        ("v_conv1d", tensors.conv[2].len(), width * taps),
+        ("A_log", tensors.a_log.len(), count),
+        ("dt_bias", tensors.dt_bias.len(), width),
+        ("the gated norm", tensors.norm.len(), head_dim),
+    ];
+    for (name, got, want) in lengths {
+        if got != want {
+            return Err(format!(
+                "the KDA layer's {name} holds {got} floats, expected {want}"
+            ));
+        }
+    }
+    let mut convolved: Vec<Vec<f32>> = Vec::with_capacity(3);
+    for ((row, kernel), history) in qkv.into_iter().zip(tensors.conv).zip(&mut state.conv) {
+        let mut out = causal_conv(
+            std::slice::from_ref(&row),
+            history,
+            kernel,
+            width,
+            taps,
+            activations.conv,
+        );
+        advance_conv_history(history, vec![row], taps);
+        convolved.push(out.swap_remove(0));
+    }
+    if state.recurrent.is_empty() {
+        state.recurrent = vec![vec![0.0f32; head_dim * head_dim]; count];
+    }
+    // `1 / sqrt(head_dim)` taken in f64 and rounded once, as GLM's host reference took it.
+    let query_scale = (1.0 / (head_dim as f64).sqrt()) as f32;
+    let mut out = vec![0.0f32; width];
+    let mut query = vec![0.0f32; head_dim];
+    let mut key = vec![0.0f32; head_dim];
+    for (head, memory) in state.recurrent.iter_mut().enumerate() {
+        let channels = head * head_dim..(head + 1) * head_dim;
+        l2_normalise(&convolved[0][channels.clone()], query_scale, &mut query);
+        l2_normalise(&convolved[1][channels.clone()], 1.0, &mut key);
+        let rate = tensors.a_log[head].exp();
+        let decay: Vec<f32> = channels
+            .clone()
+            .map(|channel| {
+                kda_channel_decay(
+                    lower_bound,
+                    rate,
+                    forget[channel],
+                    tensors.dt_bias[channel],
+                    activations.sigmoid,
+                )
+            })
+            .collect();
+        delta_rule_step(
+            memory,
+            Decay::Channel(&decay),
+            &key,
+            &convolved[2][channels.clone()],
+            (activations.sigmoid)(write[head]),
+            &query,
+            &mut out[channels],
+        );
+    }
+    Ok(out
+        .chunks(head_dim)
+        .zip(gate.chunks(head_dim))
+        .flat_map(|(head, gate)| {
+            rms_norm_gated(head, tensors.norm, gate, epsilon, activations.sigmoid)
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
