@@ -615,6 +615,13 @@ fn mhc_seam_bound_shards<'a>(
                 continue;
             };
             if let Some(shard) = by_name.get(name) {
+                // A stated stack's mix weight is the type its layout states (the producer's: BF16
+                // or F32, unscaled), which its stated walk reads as it is.
+                let stated_mix = crate::plan::stated_stack() && suffix.ends_with("_fn");
+                let format = match shard.format {
+                    Some(stated @ (StoredFormat::BF16 | StoredFormat::F32)) if stated_mix => stated,
+                    _ => format,
+                };
                 selected.push((*shard, format));
             }
         }
