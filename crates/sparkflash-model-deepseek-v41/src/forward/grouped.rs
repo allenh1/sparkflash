@@ -17,8 +17,8 @@
 //! The block's mHC entry, norms and FFN are the stack's; only its token mixer differs: the
 //! `gqa_attn_config` heads project the normalised rows through `attn.wq`/`wk`/`wv`, turn query
 //! and key by the stack's unscaled `rope_theta` over every float of a head, attend causally over
-//! the block's own BF16 key/value cache and project back through `attn.wo`. No output gate and
-//! no query/key norms: the grouped-query geometry states neither.
+//! the block's own BF16 key/value cache and project back through `attn.wo` into BF16 rows. No
+//! output gate and no query/key norms: the grouped-query geometry states neither.
 
 use super::weight_view::WeightView;
 use crate::config::{GqaGeometry, ModelConfig};
@@ -170,8 +170,10 @@ pub(crate) fn grouped_attention_forward(
         attended[row * query_width..(row + 1) * query_width].copy_from_slice(&heads_out);
     }
     let projected = project("wo", dim, query_width, &attended)?;
+    // The output narrows to BF16 once, as the device's output projection writes it for the
+    // attention all-reduce's BF16 wire.
     out.clear();
-    out.extend_from_slice(&projected);
+    out.extend(projected.iter().map(|value| quant::bf16_round(*value)));
     Ok(())
 }
 
