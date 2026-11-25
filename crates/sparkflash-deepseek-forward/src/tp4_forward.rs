@@ -15513,6 +15513,13 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                 "layer device: layer {layer} is a dense-FFN block, which the one-token stage loop has no stage for; it runs on the rows path"
             ));
         }
+        // Its projection stages read only the released forms; a dense class those bodies do not
+        // read runs the dense format route, which only the rows path takes.
+        if self.layer_dense(layer).any() {
+            return Err(format!(
+                "layer device: layer {layer} holds a dense class the released bodies do not read, which the one-token stage loop has no route for; it runs on the rows path"
+            ));
+        }
         let outcome = (|| {
             if has_engram {
                 run_stage!("engram_write", self.engram_write(layer, position));
@@ -16442,35 +16449,50 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
 
             // 2. Indexer query: quantise q_normed -> indexer.wq_b -> forward RoPE across 32 heads -> FP4 round-trip.
             let q_lora_cols = self.projections[0].cols;
-            {
-                use sparkflash_kernels::layer_seams_launch as seams;
-                let row = self.buffers.workspace.q_normed;
-                let params = seams::PrologueBf16Params {
-                    normed: Deviceptr(row.device),
-                    codes: Deviceptr(self.buffers.workspace.act_codes.device),
-                    scales: Deviceptr(self.buffers.workspace.act_scales.device),
-                    cols: q_lora_cols,
-                    rows: 1,
-                    trace_ring: self.seam_trace_ring(),
-                    layer_id: u32::try_from(layer).unwrap_or(u32::MAX),
-                    step_seq: u64::try_from(position).unwrap_or(0),
-                };
-                seams::launch_prologue_bf16(self.cuda, self.kernels.prologue_bf16, &params)?;
+            if let Some(route) = self.layer_dense(layer).indexer {
+                // A dense class the released GEMV does not read: the same route the rows path
+                // takes, from the unquantised q_normed row.
+                self.index_query_dense(
+                    route,
+                    wq_b_weight,
+                    wq_b_scales,
+                    self.buffers.workspace.q_normed.device,
+                    self.buffers.workspace.index_query.device,
+                    q_index_cols,
+                    q_lora_cols as usize,
+                    1,
+                )?;
+            } else {
+                {
+                    use sparkflash_kernels::layer_seams_launch as seams;
+                    let row = self.buffers.workspace.q_normed;
+                    let params = seams::PrologueBf16Params {
+                        normed: Deviceptr(row.device),
+                        codes: Deviceptr(self.buffers.workspace.act_codes.device),
+                        scales: Deviceptr(self.buffers.workspace.act_scales.device),
+                        cols: q_lora_cols,
+                        rows: 1,
+                        trace_ring: self.seam_trace_ring(),
+                        layer_id: u32::try_from(layer).unwrap_or(u32::MAX),
+                        step_seq: u64::try_from(position).unwrap_or(0),
+                    };
+                    seams::launch_prologue_bf16(self.cuda, self.kernels.prologue_bf16, &params)?;
+                }
+                let wq_b_params = sparkflash_kernels::mxfp8_dense_launch::Mxfp8DenseParams::new(
+                    Deviceptr(self.buffers.workspace.act_codes.device),
+                    Deviceptr(self.buffers.workspace.act_scales.device),
+                    wq_b_weight,
+                    wq_b_scales,
+                    Deviceptr(self.buffers.workspace.index_query.device),
+                    1,
+                    u32::try_from(q_index_cols).unwrap_or(u32::MAX),
+                    q_lora_cols,
+                    self.seam_trace_ring(),
+                    u32::try_from(layer).unwrap_or(u32::MAX),
+                    u64::try_from(position).unwrap_or(0),
+                );
+                sparkflash_kernels::mxfp8_gemv_launch::launch(self.cuda, self.gemv.1, &wq_b_params)?;
             }
-            let wq_b_params = sparkflash_kernels::mxfp8_dense_launch::Mxfp8DenseParams::new(
-                Deviceptr(self.buffers.workspace.act_codes.device),
-                Deviceptr(self.buffers.workspace.act_scales.device),
-                wq_b_weight,
-                wq_b_scales,
-                Deviceptr(self.buffers.workspace.index_query.device),
-                1,
-                u32::try_from(q_index_cols).unwrap_or(u32::MAX),
-                q_lora_cols,
-                self.seam_trace_ring(),
-                u32::try_from(layer).unwrap_or(u32::MAX),
-                u64::try_from(position).unwrap_or(0),
-            );
-            sparkflash_kernels::mxfp8_gemv_launch::launch(self.cuda, self.gemv.1, &wq_b_params)?;
             let pairs = usize::try_from(self.rope_pairs).unwrap_or(0);
             let table_bytes = self.max_positions * pairs * 4;
             let rope_offset = position * pairs * 4;
