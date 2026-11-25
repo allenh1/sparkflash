@@ -1834,8 +1834,8 @@ fn checkpoint_config(directory: &std::path::Path) -> Result<ModelConfig, String>
     let path = directory.join("config.json");
     let text =
         std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let config =
-        ModelConfig::from_json(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let (config, _) = sparkflash_engine::described::checkpoint_config(&text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
     config
         .validate()
         .map_err(|error| format!("config: {error}"))?;
