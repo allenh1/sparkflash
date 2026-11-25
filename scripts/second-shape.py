@@ -355,8 +355,15 @@ def variant_config(name: str, out: Path) -> Path:
     """Write the fixture's configuration with the variant's stored format, and return its path."""
     declared = STORED_FORMATS[name]
     if declared is not None and declared.get("fixture") == "glm":
+        # The base's own kernels a stated stack still runs (the rows embedding, the head, the
+        # sampler) are compiled at the second shape's width and vocabulary, so the GLM stack is
+        # written at those two; every other width stays the fixture's.
+        document = json.loads(GLM_FIXTURE.read_text())
+        shape = json.loads(FIXTURE.read_text())["text_config"]
+        for key in ("hidden_size", "vocab_size"):
+            document["text_config"][key] = shape[key]
         path = out / f"config-{name}.json"
-        path.write_text(GLM_FIXTURE.read_text())
+        path.write_text(json.dumps(document, indent=2) + "\n")
         return path
     document = json.loads(FIXTURE.read_text())
     if declared is not None:
