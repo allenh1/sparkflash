@@ -390,6 +390,18 @@ impl Batch<'_, '_, '_> {
             let seq = &mut self.seqs[index];
             seq.steps += 1;
             seq.accepted += m;
+            if self.print {
+                println!(
+                    "walk verify {}: lane {} pos {} chunk {chunk:?} verify {:?} accepted {m}",
+                    seq.steps,
+                    seg.lane,
+                    seq.pos,
+                    picks[seg.row0..seg.row0 + seg.n]
+                        .iter()
+                        .map(|pick| pick.0)
+                        .collect::<Vec<_>>()
+                );
+            }
             seq.tokens.truncate(seq.pos + 1 + m);
             self.keep_verified(index, seg, m)?;
             answers.push(
