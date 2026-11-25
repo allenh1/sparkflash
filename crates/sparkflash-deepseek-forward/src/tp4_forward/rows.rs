@@ -1489,7 +1489,16 @@ impl DeviceLayer<'_> {
         let geometry = values.gqa.ok_or(
             "rows grouped-query attention: the stack has grouped-query blocks and no geometry",
         )?;
-        let plan = sparkflash_model::TpPlan::new(self.routed_geometry.world, self.tp_rank)
+        let world = self.routed_geometry.world;
+        // The shard plan splits the key and value projections' rows evenly (ShardRule::Column),
+        // so a rank holds whole heads only where the world divides them.
+        if geometry.kv_heads % world != 0 {
+            return Err(format!(
+                "rows grouped-query attention: {} key/value heads over {world} ranks; the shard plan holds no shared key/value head",
+                geometry.kv_heads
+            ));
+        }
+        let plan = sparkflash_model::TpPlan::new(world, self.tp_rank)
             .map_err(|error| error.to_string())?;
         let split = |total: usize, axis: sparkflash_model::TpAxis| {
             plan.split(total, axis, 1)
