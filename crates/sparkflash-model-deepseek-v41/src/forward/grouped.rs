@@ -17,16 +17,17 @@
 //! The block's mHC entry, norms and FFN are the stack's; only its token mixer differs: the
 //! `gqa_attn_config` heads project the normalised rows through `attn.wq`/`wk`/`wv`, turn query
 //! and key by the stack's unscaled `rope_theta` over every float of a head, attend causally over
-//! the block's own key/value cache and project back through `attn.wo`. No output gate and no
-//! query/key norms: the grouped-query geometry states neither.
+//! the block's own BF16 key/value cache and project back through `attn.wo`. No output gate and
+//! no query/key norms: the grouped-query geometry states neither.
 
 use super::weight_view::WeightView;
 use crate::config::{GqaGeometry, ModelConfig};
 use crate::linalg::{EngineError, ScaleGrid};
+use crate::quant;
 use crate::weights::WeightSource;
 
-/// One grouped-query block's cache: every consumed position's turned key and its value,
-/// `[positions][kv_heads * head_dim]` each.
+/// One grouped-query block's cache: every consumed position's turned key and its value, each
+/// narrowed to BF16, `[positions][kv_heads * head_dim]` each.
 #[derive(Debug, Clone, Default)]
 pub struct GroupedCache {
     keys: Vec<f32>,
@@ -151,10 +152,16 @@ pub(crate) fn grouped_attention_forward(
             (theta, 1.0),
             position,
         );
-        cache.keys.extend_from_slice(key);
+        // The cache holds BF16 keys and values, as the device's does (and a BF16 reference's
+        // cache): the turned key and the value narrow once on the way in.
         cache
-            .values
-            .extend_from_slice(&values[row * kv_width..(row + 1) * kv_width]);
+            .keys
+            .extend(key.iter().map(|value| quant::bf16_round(*value)));
+        cache.values.extend(
+            values[row * kv_width..(row + 1) * kv_width]
+                .iter()
+                .map(|value| quant::bf16_round(*value)),
+        );
         let heads_out = sparkflash_weights::gqa::attend(
             query,
             (&cache.keys, &cache.values),
