@@ -14453,7 +14453,7 @@ impl<'a> DeviceLayer<'a> {
             };
             layers.push(Some(
                 FormatEntries::load(
-                    &self.cuda,
+                    self.cuda,
                     &cubin,
                     entry("routed_format_gate_up_")?,
                     entry("routed_format_down_")?,
@@ -14471,7 +14471,7 @@ impl<'a> DeviceLayer<'a> {
             cached_cubin(&kernel_dir.join(sparkflash_kernels::routed_format::SWIGLU_CUBIN))
                 .map_err(|error| format!("layer device routed format: {error}"))?;
         let shared = SharedKernels::load(
-            &self.cuda,
+            self.cuda,
             &cubin,
             &rows_cubin,
             opt.dedup[2].1,

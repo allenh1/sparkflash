@@ -186,7 +186,7 @@ impl ResidentAttention {
                 slice.bytes
             ));
         }
-        let scale_name = scale_of(&name);
+        let scale_name = scale_of(name);
         let expected_scales = cols.div_ceil(32) * inner.div_ceil(32);
         let Some(scale) = self.arena.slice(&scale_name) else {
             return Err(format!("{name}: resident weight without its scale grid"));

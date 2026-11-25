@@ -427,6 +427,9 @@ impl GroupedRows {
     }
 }
 
+/// A recurrent scan's launch: its grid and its block.
+pub(super) type ScanDims = ((u32, u32, u32), (u32, u32, u32));
+
 /// A Gated DeltaNet block's body on the rows path ([sparkflash_ops::roles::GdnLayer]): the scan
 /// image's chunk kernels and the scan the rank's plan resolves; the block's geometry, whole (its
 /// projections are whole on every rank, so every rank runs every head and no sum follows); the f32
@@ -436,10 +439,7 @@ impl GroupedRows {
 #[derive(Debug, Clone)]
 pub(super) struct RecurrentRows {
     pub(super) chunk: sparkflash_ops::gdn::GdnChunk,
-    pub(super) scan: (
-        sparkflash_ops::roles::Bound,
-        ((u32, u32, u32), (u32, u32, u32)),
-    ),
+    pub(super) scan: (sparkflash_ops::roles::Bound, ScanDims),
     pub(super) geometry: sparkflash_ops::gdn::GdnGeometry,
     pub(super) rows: sparkflash_ops::roles::GdnRows,
     pub(super) snapshots: Option<sparkflash_kernels::checkpoint::VerifySnapshots>,
@@ -627,10 +627,11 @@ impl RowsState {
         if device.dim != crate::plan::hidden() || device.hc_mult != crate::plan::hc_mult() {
             return refuse("the row kernels hold the plan dim and hc only");
         }
-        if device.dim % 128 != 0
-            || device.routed_geometry.experts
-                % sparkflash_kernels::moe_routed_device::OPT_ROUTER_EXPERTS_PER_BLOCK
-                != 0
+        if !device.dim.is_multiple_of(128)
+            || !device
+                .routed_geometry
+                .experts
+                .is_multiple_of(sparkflash_kernels::moe_routed_device::OPT_ROUTER_EXPERTS_PER_BLOCK)
         {
             return Err(format!(
                 "rows: hidden {} is not whole 128-column blocks or {} experts are not whole \

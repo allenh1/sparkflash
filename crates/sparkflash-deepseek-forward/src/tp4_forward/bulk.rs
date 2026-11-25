@@ -1573,7 +1573,7 @@ impl DeviceLayer<'_> {
         // The body's column tiles are 128 wide and it bounds a partial tile at 32 columns
         // (opt_mma_bf16_body's col_tiles), so a count under 128 (the second shape's 64) is one
         // tile, not none.
-        if experts % 32 != 0 {
+        if !experts.is_multiple_of(32) {
             return Err(format!(
                 "bulk router: {experts} experts are not whole 32-column tiles"
             ));

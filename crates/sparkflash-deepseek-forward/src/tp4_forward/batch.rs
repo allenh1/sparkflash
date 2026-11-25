@@ -78,6 +78,12 @@ use sparkflash_vision::IMAGE_TOKEN_ID;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// A drafted block: its draft ids and the drafter's probability of each.
+type Drafted = (Vec<u32>, Vec<f32>);
+
+/// A verify step's rows, its segments and each row's pick with its probability.
+type Verified = (usize, Vec<Seg>, Vec<(u32, f32)>);
+
 mod walk;
 
 /// A tick's call to rank 0's link with the next tick's room and hold, made once the decode
@@ -2818,11 +2824,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     /// Each sequence of `group`'s draft block from its anchor `tokens[pos]`, `depth` deep, in
     /// passes of up to [DraftState::pass_seqs] blocks ([DeviceLayer::draft_blocks]): the drafts
     /// and the drafter's probability of each.
-    fn draft_group(
-        &mut self,
-        group: &[usize],
-        depth: usize,
-    ) -> Result<Vec<(Vec<u32>, Vec<f32>)>, String> {
+    fn draft_group(&mut self, group: &[usize], depth: usize) -> Result<Vec<Drafted>, String> {
         let (rows, inputs, draft) = (self.rows, self.inputs, self.draft);
         let blocks = group
             .iter()
@@ -2859,7 +2861,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         group: &[usize],
         depths: &[usize],
         ahead: Ahead<'_>,
-    ) -> Result<(usize, Vec<Seg>, Vec<(u32, f32)>), String> {
+    ) -> Result<Verified, String> {
         let (rows, inputs, draft) = (self.rows, self.inputs, self.draft);
         let exchange = self
             .exchange
