@@ -216,6 +216,13 @@ pub struct GdnGeometry {
     pub conv: usize,
 }
 
+/// Whether a width is zero: a stack without the block it sizes, whose field the open manifest
+/// leaves out so the released configuration records the fields it always has.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 /// The hyperparameters of one DeepSeek-V4.1-Flash-shaped model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -227,24 +234,24 @@ pub struct ModelConfig {
     pub moe_inter_dim: usize,
     /// The backbone blocks whose FFN is one dense gated MLP instead of the MoE block
     /// (`first_k_dense_replace`), ascending. The released stack has none.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dense_ffn_layers: Vec<usize>,
     /// The dense gated MLP's intermediate width (`intermediate_size`); zero without one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub dense_inter_dim: usize,
     /// The backbone blocks whose token mixer is grouped-query attention instead of MLA
     /// (`layer_types` naming `gqa_attention`), ascending. The released stack has none.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gqa_layers: Vec<usize>,
     /// The grouped-query layers' geometry (`gqa_attn_config`); `None` without one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gqa: Option<GqaGeometry>,
     /// The backbone blocks whose token mixer is a Gated DeltaNet instead of MLA (`layer_types`
     /// naming `linear_attention`), ascending. The released stack has none.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gdn_layers: Vec<usize>,
     /// The Gated DeltaNet layers' geometry; `None` without one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gdn: Option<GdnGeometry>,
     /// Backbone blocks.
     pub n_layers: usize,
