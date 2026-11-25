@@ -185,6 +185,17 @@ pub const V41_FLASH_RUNTIME_CONFIG: &str =
 
 pub use sparkflash_weights::ConfigError;
 
+/// A grouped-query layer's geometry in a DeepSeek-shaped stack (`gqa_attn_config`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GqaGeometry {
+    /// Query heads.
+    pub heads: usize,
+    /// Key/value heads.
+    pub kv_heads: usize,
+    /// One head's width.
+    pub head_dim: usize,
+}
+
 /// The hyperparameters of one DeepSeek-V4.1-Flash-shaped model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -201,6 +212,13 @@ pub struct ModelConfig {
     /// The dense gated MLP's intermediate width (`intermediate_size`); zero without one.
     #[serde(default)]
     pub dense_inter_dim: usize,
+    /// The backbone blocks whose token mixer is grouped-query attention instead of MLA
+    /// (`layer_types` naming `gqa_attention`), ascending. The released stack has none.
+    #[serde(default)]
+    pub gqa_layers: Vec<usize>,
+    /// The grouped-query layers' geometry (`gqa_attn_config`); `None` without one.
+    #[serde(default)]
+    pub gqa: Option<GqaGeometry>,
     /// Backbone blocks.
     pub n_layers: usize,
     /// DSpark MTP stages, which the checkpoint names `mtp.{0..n_mtp_layers-1}`.
@@ -444,6 +462,8 @@ impl ModelConfig {
             moe_inter_dim: 32,
             dense_ffn_layers: Vec::new(),
             dense_inter_dim: 0,
+            gqa_layers: Vec::new(),
+            gqa: None,
             n_layers: 2,
             n_mtp_layers: 1,
             dspark_block_size: 2,
@@ -743,7 +763,7 @@ impl ModelConfig {
 mod released {
     use serde::Deserialize;
 
-    use super::{ConfigError, ModelConfig, default_gate_temp};
+    use super::{ConfigError, GqaGeometry, ModelConfig, default_gate_temp};
 
     /// The released document's top-level object.
     #[derive(Deserialize)]
@@ -813,6 +833,13 @@ mod released {
         /// The dense gated MLP's intermediate width; read only beside `first_k_dense_replace`.
         #[serde(default)]
         intermediate_size: Option<usize>,
+        /// Each block's token mixer: `compressed_attention` (MLA) or `gqa_attention`; absent in
+        /// the release, where every block is MLA.
+        #[serde(default)]
+        layer_types: Option<Vec<String>>,
+        /// The `gqa_attention` blocks' geometry; required beside one.
+        #[serde(default)]
+        gqa_attn_config: Option<GqaAttnConfig>,
         /// Backbone blocks.
         num_hidden_layers: usize,
         /// DSpark stages; the runtime name is `n_mtp_layers`.
@@ -930,6 +957,15 @@ mod released {
         topk_method: String,
         /// RoPE scaling.
         rope_scaling: Scaling,
+    }
+
+    /// `text_config.gqa_attn_config`.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GqaAttnConfig {
+        num_attention_heads: usize,
+        num_key_value_heads: usize,
+        head_dim: usize,
     }
 
     /// `vision_config`: the tower the released checkpoint carries.
@@ -1146,6 +1182,56 @@ mod released {
             });
         }
 
+        let mut gqa_layers = Vec::new();
+        if let Some(types) = text.layer_types.as_ref() {
+            if types.len() != text.num_hidden_layers {
+                return Err(ConfigError::Invalid {
+                    field: "text_config.layer_types",
+                    detail: format!(
+                        "names {} blocks and the document has {}",
+                        types.len(),
+                        text.num_hidden_layers
+                    ),
+                });
+            }
+            for (layer, kind) in types.iter().enumerate() {
+                match kind.as_str() {
+                    "compressed_attention" => {}
+                    sparkflash_model::architecture::GQA_LAYER_TYPE => gqa_layers.push(layer),
+                    other => {
+                        return Err(ConfigError::Invalid {
+                            field: "text_config.layer_types",
+                            detail: format!(
+                                "block {layer} is {other:?}; a block is compressed_attention or {:?}",
+                                sparkflash_model::architecture::GQA_LAYER_TYPE
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        let gqa = match (&text.gqa_attn_config, gqa_layers.is_empty()) {
+            (Some(nested), false) => Some(GqaGeometry {
+                heads: nested.num_attention_heads,
+                kv_heads: nested.num_key_value_heads,
+                head_dim: nested.head_dim,
+            }),
+            (None, false) => {
+                return Err(ConfigError::Invalid {
+                    field: "text_config.gqa_attn_config",
+                    detail: format!(
+                        "blocks {gqa_layers:?} are grouped-query attention and the document states no geometry for them"
+                    ),
+                });
+            }
+            (Some(_), true) => {
+                return Err(ConfigError::Invalid {
+                    field: "text_config.gqa_attn_config",
+                    detail: "the document states grouped-query geometry and no block is gqa_attention".to_owned(),
+                });
+            }
+            (None, true) => None,
+        };
         Ok(ModelConfig {
             vocab_size: text.vocab_size,
             dim: text.hidden_size,
@@ -1164,6 +1250,8 @@ mod released {
                 }
                 _ => 0,
             },
+            gqa_layers: gqa_layers.clone(),
+            gqa,
             n_layers: text.num_hidden_layers,
             n_mtp_layers: text.num_nextn_predict_layers,
             dspark_block_size: text.dspark_block_size,

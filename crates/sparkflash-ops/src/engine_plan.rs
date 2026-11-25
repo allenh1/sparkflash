@@ -862,7 +862,17 @@ fn winning_format(entries: Vec<(StoredFormat, usize)>) -> Option<StoredFormat> {
 /// reads at open is carried here once, on the plan, so a backend never re-parses the checkpoint.
 fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
     let mut facts = BTreeMap::new();
-    let first = architecture.layers.first();
+    use sparkflash_model::architecture::AttentionKind;
+    // A grouped-query layer inside an MLA stack carries its own geometry (the `gqa_*` facts
+    // below); the stack-wide attention facts are the MLA layers'. No other stack mixes the two.
+    let mla_stack = architecture
+        .layers
+        .iter()
+        .any(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }));
+    let foreign_gqa = |layer: &sparkflash_model::architecture::Layer| {
+        mla_stack && matches!(layer.attention.kind, AttentionKind::Gqa { .. })
+    };
+    let first = architecture.layers.iter().find(|layer| !foreign_gqa(layer));
     let first_moe = architecture
         .layers
         .iter()
@@ -988,6 +998,21 @@ fn model_facts(architecture: &Architecture) -> BTreeMap<String, FactValue> {
             "dense_inter_dim",
             FactValue::Integer(dense.intermediate as i64),
         );
+    }
+    // The grouped-query layers of an MLA stack, and their one geometry.
+    let gqa_layers: Vec<&sparkflash_model::architecture::Layer> = architecture
+        .layers
+        .iter()
+        .filter(|layer| foreign_gqa(layer))
+        .collect();
+    if let Some(gqa) = gqa_layers.first() {
+        let indices = gqa_layers.iter().map(|layer| layer.index as i64).collect();
+        put("gqa_layers", FactValue::Integers(indices));
+        put("gqa_heads", FactValue::Integer(gqa.attention.heads as i64));
+        if let AttentionKind::Gqa { kv_heads, .. } = gqa.attention.kind {
+            put("gqa_kv_heads", FactValue::Integer(kv_heads as i64));
+        }
+        put("gqa_head_dim", FactValue::Integer(gqa.attention.head_dim as i64));
     }
     if let Some(moe) = first_moe {
         put("moe_inter_dim", FactValue::Integer(moe.intermediate as i64));

@@ -105,7 +105,29 @@ impl ModelConfig {
             .iter()
             .filter(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }))
             .count();
-        check("MLA layers", self.n_layers, mla)?;
+        check(
+            "MLA layers",
+            self.n_layers - self.gqa_layers.len().min(self.n_layers),
+            mla,
+        )?;
+        // A block is grouped-query attention where the typed configuration names it one, with
+        // the typed geometry.
+        for (index, layer) in architecture.layers.iter().enumerate() {
+            let gqa = matches!(layer.attention.kind, AttentionKind::Gqa { .. });
+            check_flag(
+                "grouped-query layer",
+                index,
+                gqa,
+                self.gqa_layers.contains(&index),
+            )?;
+            if let (true, Some(geometry), AttentionKind::Gqa { kv_heads, .. }) =
+                (gqa, self.gqa, &layer.attention.kind)
+            {
+                check("grouped-query heads", geometry.heads, layer.attention.heads)?;
+                check("grouped-query key/value heads", geometry.kv_heads, *kv_heads)?;
+                check("grouped-query head width", geometry.head_dim, layer.attention.head_dim)?;
+            }
+        }
         // A block is a dense gated MLP where the typed configuration names it one
         // (`first_k_dense_replace`), and MoE everywhere else.
         for (index, layer) in architecture.layers.iter().enumerate() {

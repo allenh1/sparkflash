@@ -119,6 +119,18 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
             None => Vec::new(),
         },
         dense_inter_dim: opt_int(facts, "dense_inter_dim").unwrap_or(0),
+        gqa_layers: match facts.get("gqa_layers") {
+            Some(_) => integers(facts, "gqa_layers")?,
+            None => Vec::new(),
+        },
+        gqa: match facts.get("gqa_layers") {
+            Some(_) => Some(sparkflash_model_deepseek_v41::config::GqaGeometry {
+                heads: int(facts, "gqa_heads")?,
+                kv_heads: int(facts, "gqa_kv_heads")?,
+                head_dim: int(facts, "gqa_head_dim")?,
+            }),
+            None => None,
+        },
         n_layers,
         n_mtp_layers,
         dspark_block_size: opt_int(facts, "dspark_block_size").unwrap_or(0),
@@ -296,6 +308,8 @@ pub fn tiny_values() -> ModelConfig {
         moe_inter_dim: 32,
         dense_ffn_layers: Vec::new(),
         dense_inter_dim: 0,
+        gqa_layers: Vec::new(),
+        gqa: None,
         n_layers: 2,
         n_mtp_layers: 1,
         dspark_block_size: 2,

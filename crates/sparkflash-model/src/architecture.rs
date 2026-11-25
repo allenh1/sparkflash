@@ -2261,6 +2261,72 @@ struct Schedule<'a> {
     candidate_pool: Option<CandidatePool>,
 }
 
+/// The layer type that names a grouped-query attention inside a stack whose other layers are
+/// another attention (a DeepSeek-shaped MLA stack): its geometry is `gqa_attn_config`'s.
+pub const GQA_LAYER_TYPE: &str = "gqa_attention";
+
+/// The keys a stack spells for its own attention (MLA, its compressor and its indexer) that a
+/// `gqa_attention` layer does not inherit: its geometry is the nested object's alone.
+const STACK_ATTENTION_KEYS: [&str; 26] = [
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "q_lora_rank",
+    "kv_lora_rank",
+    "qk_nope_head_dim",
+    "qk_rope_head_dim",
+    "v_head_dim",
+    "o_groups",
+    "o_lora_rank",
+    "compress_ratios",
+    "gated_mla",
+    "gating_type",
+    "learnable_sink",
+    "qk_norm",
+    "index_n_heads",
+    "indexer_n_heads",
+    "index_head_dim",
+    "indexer_head_dim",
+    "indexer_compress_ratio",
+    "index_kpool",
+    "index_topk",
+    "indexer_budget",
+    "index_source_layer_ids",
+    "sliding_window",
+    "partial_rotary_factor",
+];
+
+/// The text config a `gqa_attention` layer reads: the stack's keys without its own attention's
+/// (`STACK_ATTENTION_KEYS`), under `gqa_attn_config`'s. The nested object states the heads, the
+/// key/value heads and the head width; a missing one is refused, never inherited.
+fn gqa_layer_text(text: &Value, index: usize) -> Result<Value, ConfigError> {
+    let nested = object(text, "gqa_attn_config").ok_or_else(|| {
+        invalid(format!(
+            "layer {index} is {GQA_LAYER_TYPE:?} and the config has no gqa_attn_config object"
+        ))
+    })?;
+    for key in ["num_attention_heads", "num_key_value_heads", "head_dim"] {
+        if read_key(nested, key).is_none() {
+            return Err(invalid(format!(
+                "layer {index} is {GQA_LAYER_TYPE:?} and gqa_attn_config does not state {key}"
+            )));
+        }
+    }
+    let mut view = text
+        .as_object()
+        .cloned()
+        .ok_or_else(|| invalid("the text config is not an object"))?;
+    for key in STACK_ATTENTION_KEYS {
+        view.remove(key);
+    }
+    if let Some(entries) = nested.as_object() {
+        for (key, value) in entries {
+            view.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Value::Object(view))
+}
+
 fn attention(
     text: &Value,
     index: usize,
@@ -2268,6 +2334,28 @@ fn attention(
     ratio: usize,
     schedule: &Schedule<'_>,
 ) -> Result<Attention, ConfigError> {
+    if layer_type == GQA_LAYER_TYPE {
+        // A grouped-query layer in another attention's stack owns no compressed cache and is
+        // no layer's index or key source: it attends over its own whole keys.
+        if ratio > 0 {
+            return Err(invalid(format!(
+                "layer {index} is {GQA_LAYER_TYPE:?} with compress ratio {ratio}; a grouped-query layer compresses nothing"
+            )));
+        }
+        if schedule.index_sources.contains(&index) || schedule.kv_sources.contains(&index) {
+            return Err(invalid(format!(
+                "layer {index} is {GQA_LAYER_TYPE:?} and is named an index or key source; a grouped-query layer is neither"
+            )));
+        }
+        let view = gqa_layer_text(text, index)?;
+        let plain = Schedule {
+            kv_sources: &[],
+            index_sources: &[],
+            indexer_types: &[],
+            candidate_pool: None,
+        };
+        return attention(&view, index, "full_attention", 0, &plain);
+    }
     let heads = required_usize(text, "num_attention_heads", "text_config")?;
     if heads == 0 {
         return Err(invalid(format!("layer {index} has zero query heads")));
@@ -4271,6 +4359,39 @@ mod tests {
         assert!(!names_the_producer("fp8"));
         assert!(!names_the_producer("nvfp4"));
         assert!(!names_the_producer(""));
+    }
+
+    /// A DeepSeek-shaped stack with one grouped-query layer: layer 0 is `gqa_attention`, read
+    /// from `gqa_attn_config` alone, and every other layer keeps the stack's MLA.
+    fn deepseek_with_gqa_layer(nested: serde_json::Value, ratio: usize) -> Result<Architecture, ConfigError> {
+        let mut root: Value = serde_json::from_str(DEEPSEEK).expect("DeepSeek config");
+        let text = root["text_config"].as_object_mut().expect("text_config");
+        let layers = text["num_hidden_layers"].as_u64().expect("layers") as usize;
+        let mut types = vec![Value::from("compressed_attention"); layers];
+        types[0] = Value::from(GQA_LAYER_TYPE);
+        text.insert("layer_types".into(), Value::from(types));
+        text.insert("gqa_attn_config".into(), nested);
+        text["compress_ratios"][0] = Value::from(ratio);
+        Architecture::from_json(&root.to_string())
+    }
+
+    #[test]
+    fn a_gqa_layer_in_an_mla_stack_reads_its_own_geometry() {
+        let nested = serde_json::json!({"num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128});
+        let architecture = deepseek_with_gqa_layer(nested.clone(), 0).expect("one GQA layer");
+        let first = &architecture.layers[0].attention;
+        assert!(matches!(first.kind, AttentionKind::Gqa { kv_heads: 8, .. }), "{:?}", first.kind);
+        assert_eq!((first.heads, first.head_dim), (32, 128));
+        assert!(first.compression.is_none() && first.indexer.is_none());
+        assert!(matches!(architecture.layers[1].attention.kind, AttentionKind::Mla { .. }));
+        assert_eq!(architecture.layers[1].attention.head_dim, 512);
+        // A compressing grouped-query layer and a nested object that leaves a width out are
+        // refused by name.
+        let compressing = deepseek_with_gqa_layer(nested, 4).expect_err("ratio 4");
+        assert!(compressing.to_string().contains("compresses nothing"), "{compressing}");
+        let short = serde_json::json!({"num_attention_heads": 32, "head_dim": 128});
+        let missing = deepseek_with_gqa_layer(short, 0).expect_err("no kv heads");
+        assert!(missing.to_string().contains("num_key_value_heads"), "{missing}");
     }
 
     #[test]
