@@ -289,6 +289,13 @@ fn the_runtime_document_carries_the_fields_the_struct_serialises() {
     // spell them out.
     serialised.remove("gate_temp");
     serialised.remove("norm_topk_prob");
+    // The struct leaves the released grid's block and scale out at their defaults (the open
+    // manifest never carried them), and the runtime file states the grid it derives formats from.
+    serialised.insert("weight_block".to_owned(), Value::from(config.weight_block));
+    serialised.insert(
+        "weight_scale".to_owned(),
+        Value::from(config.weight_scale.clone()),
+    );
     assert_eq!(
         file.keys().collect::<Vec<_>>(),
         serialised.keys().collect::<Vec<_>>()

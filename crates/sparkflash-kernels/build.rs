@@ -600,7 +600,7 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 }
 "#;
 
-/// The fifty device kernel sources the crate probes and pins, with the stem used for their PTX
+/// The fifty-two device kernel sources the crate probes and pins, with the stem used for their PTX
 /// output.
 ///
 /// Six of them are the Milestone 4 kernels of specification 6.2, the set m4_abi's frozen KERNELS
@@ -630,10 +630,10 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 /// M=1 and multi-row decode path, the bulk-prefill MMA and the D59 vision tower, loaded by name
 /// from their own cubins, one pin each). They are
 /// device sources this crate ships, the clang/nvcc probes compile them like the others, and
-/// baseline/kernel_baseline.txt records their cubins. Every one of the fifty is probed on every
+/// baseline/kernel_baseline.txt records their cubins. Every one of the fifty-two is probed on every
 /// build: a kernel that is only ever compiled by hand on a GPU host is a kernel nobody has
 /// type-checked, and the CI cuda-tests job runs exactly this probe.
-const PROBED_KERNELS: [(&str, &str); 50] = [
+const PROBED_KERNELS: [(&str, &str); 52] = [
     ("mega_mhc_sm121.cu", "mega_mhc_sm121"),
     ("b12x_mxfp8_dense_sm121.cu", "b12x_mxfp8_dense_sm121"),
     ("b12x_mxfp8_dense_m1_sm121.cu", "b12x_mxfp8_dense_m1_sm121"),
@@ -709,6 +709,12 @@ const PROBED_KERNELS: [(&str, &str); 50] = [
     // wrappers take their geometry as launch words. The combined translation unit therefore
     // skips it; each of its instance groups is still probed on its own below.
     ("nvfp4_prefill_sm121.cu", "nvfp4_prefill_sm121"),
+    // DeepSeek's format routes for a stored class the released bodies do not read: routed
+    // experts and dense projections on the shared prefill tile. Like the NVFP4 wrappers, their
+    // cubins are the second shape's builds, so the combined unit skips them and each instance
+    // group is probed on its own.
+    ("routed_format_sm121.cu", "routed_format_sm121"),
+    ("dense_format_sm121.cu", "dense_format_sm121"),
 ];
 
 /// The shared header every one of those kernels includes for its model constants, the MX codecs
@@ -1240,7 +1246,7 @@ fn report_clang_probe(clang: &Path, arch: &str, groups: &[(String, String, Vec<S
                 println!(
                     "cargo:warning=sparkflash-kernels: nvcc not found; clang's CUDA frontend parsed \
                  kernels/rocenante_oneshot_sm121.cu, the RoCEnante ABI probe (trace macros \
-                 enabled, signature redeclared, slot static_asserts), {checked} of the fifty \
+                 enabled, signature redeclared, slot static_asserts), {checked} of the fifty-two \
                  probed kernels (the six Milestone 4 ABI kernels, the M7 SwiGLU quantiser \
                  epilogue and its weighted routed variant, the task-37 device router, the \
                  task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified head's \
@@ -1273,7 +1279,7 @@ fn report_clang_probe(clang: &Path, arch: &str, groups: &[(String, String, Vec<S
     }
 }
 
-/// Parses the fifty probed kernels and the combined probe with clang. Returns how many kernels were
+/// Parses the fifty-two probed kernels and the combined probe with clang. Returns how many kernels were
 /// found and how many were missing, so the warning can say which evidence was gathered.
 fn check_probed_kernels_syntax(
     clang: &Path,
@@ -1291,7 +1297,7 @@ fn check_probed_kernels_syntax(
         let path = kernels.join(file);
         if instanced.contains(file) {
             // Probe every group for this source, including a second-shape instance in its own
-            // cubin. The source is one of the fifty; the groups are its shapes.
+            // cubin. The source is one of the fifty-two; the groups are its shapes.
             let mut found = false;
             for (source, _, defines) in groups {
                 if source.strip_prefix("kernels/").unwrap_or(source) == file {
