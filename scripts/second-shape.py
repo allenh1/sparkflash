@@ -225,7 +225,7 @@ STORED_FORMATS = {
     # ratio 0 (a recurrent block compresses nothing) and the fixture's MoE; the stack below it is
     # the fixture's.
     # GLM-5.3-Flash's own fixture, as its release stores it (GLM_FIXTURE).
-    "glm": {"fixture": "glm"},
+    "glm": {"fixture": "glm", "host": "whole"},
     "gdn-decoder": {
         "quant_method": "bf16",
         "scale_fmt": "ue8m0",
@@ -878,7 +878,22 @@ def run_world(
     tops_file = Path(str(expected_file) + ".tops.json")
     plan_file = Path(str(expected_file) + ".plan")
     plan = reference_plan(config, world, variant_prompts(args.stored_format), args.max_tokens)
-    if reference_reusable(expected_file, plan_file, plan) and tops_file.is_file():
+    # A stack that states its own wiring runs on the host's whole-model path only: the served
+    # host arm's sharded seams are the release's arithmetic and refuse it. Its every world is
+    # held to the whole-model reference, the unsplit sum the producer computes.
+    whole_only = (STORED_FORMATS.get(args.stored_format) or {}).get("host") == "whole"
+    if whole_only:
+        if not args.device:
+            raise WorldFailure(
+                f"{args.stored_format} states its own wiring, which the host runs whole only; "
+                "its arms are the device's (--device)"
+            )
+        print(
+            f"second-shape: {args.stored_format} is held to the whole-model reference at "
+            f"world {world}; the host has no sharded arm for a stated stack"
+        )
+        expected_file = global_file
+    elif reference_reusable(expected_file, plan_file, plan) and tops_file.is_file():
         print(
             f"second-shape: reusing {expected_file.name}; "
             "the plan covers the same checkpoint, world, prompts and max-tokens"
@@ -910,9 +925,11 @@ def run_world(
         if result.returncode != 0:
             raise WorldFailure(f"the {world}-rank host arm could not write its reference")
         write_plan(plan_file, plan)
-    expected = json.loads(expected_file.read_text())
-    tops = json.loads(tops_file.read_text())
-    differing = report_world(world, expected_file, expected, global_ids, tops)
+    differing = []
+    if not whole_only:
+        expected = json.loads(expected_file.read_text())
+        tops = json.loads(tops_file.read_text())
+        differing = report_world(world, expected_file, expected, global_ids, tops)
     if world == 1 and differing:
         prompts = ", ".join(str(index) for index in differing)
         raise WorldFailure(
