@@ -8150,15 +8150,12 @@ fn build_shared_expert_device(
             let name = format!("{base}.{leaf}.weight");
             let what =
                 |error: String| format!("shared expert (device): layer {layer} {name}: {error}");
-            // A packed weight is the BF16 rows it stands for, unpacked once here with its escape
-            // list; the route reads those rows. The checkpoint and the plan must agree on it.
-            let codes = sparkflash_device::shard::PackedWeight::read_stated(
-                source,
-                &name,
-                shared_format.layout() == sparkflash_model::format::FormatLayout::Packed,
-            )
-            .map_err(|error| what(error.to_string()))?
-            .bytes;
+            // The gathered source is the arena's rows, which already hold a packed weight as the
+            // BF16 rows it stands for (the arena unpacks it with its escape list at load), and the
+            // gather checked each shard against the plan's dtype: the values are read as they are.
+            let codes = source
+                .read(&name)
+                .map_err(|error| what(error.to_string()))?;
             let tiled = if released {
                 sparkflash_device::arena::tile_b12x(&codes, cols, inner).map_err(|error| {
                     format!("shared expert (device): layer {layer} {name}: {error}")
