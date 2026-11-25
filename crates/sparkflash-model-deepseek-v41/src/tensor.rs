@@ -256,6 +256,36 @@ impl TensorPlan {
             self.dense(&format!("{prefix}.attn.wk"), kv, dim);
             self.dense(&format!("{prefix}.attn.wv"), kv, dim);
             self.dense(&format!("{prefix}.attn.wo"), dim, query);
+        } else if let (false, true, Some(gdn)) =
+            (mtp, config.gdn_layers.contains(&layer), config.gdn.as_ref())
+        {
+            // A Gated DeltaNet block: its five projections in the dense class, the conv, the
+            // decay vectors and the gated norm BF16, and none of MLA's tensors.
+            let key = gdn.key_heads * gdn.key_dim;
+            let value = gdn.value_heads * gdn.value_dim;
+            let mixed = 2 * key + value;
+            self.dense(&format!("{prefix}.attn.in_proj_qkv"), mixed, dim);
+            self.dense(&format!("{prefix}.attn.in_proj_z"), value, dim);
+            self.dense(&format!("{prefix}.attn.in_proj_b"), gdn.value_heads, dim);
+            self.dense(&format!("{prefix}.attn.in_proj_a"), gdn.value_heads, dim);
+            self.dense(&format!("{prefix}.attn.out_proj"), dim, value);
+            self.plain(
+                &format!("{prefix}.attn.conv1d.weight"),
+                DType::BF16,
+                vec![mixed, 1, gdn.conv],
+            );
+            for vector in ["A_log", "dt_bias"] {
+                self.plain(
+                    &format!("{prefix}.attn.{vector}"),
+                    DType::BF16,
+                    vec![gdn.value_heads],
+                );
+            }
+            self.plain(
+                &format!("{prefix}.attn.norm.weight"),
+                DType::BF16,
+                vec![gdn.value_dim],
+            );
         } else {
             self.dense(&format!("{prefix}.attn.wq_a"), config.q_lora_rank, dim);
             self.dense(&format!("{prefix}.attn.wq_b"), heads, config.q_lora_rank);

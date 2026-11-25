@@ -139,6 +139,7 @@ order = [
   "engram",
   "mla_attention",
   "gqa_attention",
+  "gdn_scan",
   "csa2_compression",
   "sparse_indexer",
   "moe",
@@ -515,6 +516,151 @@ shape = ["(hidden) / quant_block[0]", "(heads * head_dim) / quant_block[0]"]
 split = "columns"
 repeat = "layers"
 when = { attention = "gqa" }
+
+# A Gated DeltaNet layer inside the MLA stack (text_config.layer_types names it linear_attention,
+# and the Qwen3-Next linear_* keys hold its heads, widths and conv taps): the five projections in
+# the dense class (the fused q/k/v rows, the output gate z, the beta and decay logits b and a,
+# and the output), and the conv, the decay vectors and the gated norm BF16 as the Qwen3-Next
+# release stores them. No cache, no sink and no compression: the layer keeps one recurrent state.
+[[tensor]]
+name = "layers.{layer}.attn.in_proj_qkv.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "dense"
+shape = ["2 * gdn_key_width + gdn_value_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.in_proj_qkv.scale"
+part = "gdn_scan"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(2 * gdn_key_width + gdn_value_width) / quant_block[0]", "(hidden) / quant_block[0]"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.in_proj_z.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "dense"
+shape = ["gdn_value_width", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.in_proj_z.scale"
+part = "gdn_scan"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(gdn_value_width) / quant_block[0]", "(hidden) / quant_block[0]"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.in_proj_b.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "dense"
+shape = ["gdn_value_heads", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.in_proj_b.scale"
+part = "gdn_scan"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(gdn_value_heads) / quant_block[0]", "(hidden) / quant_block[0]"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.in_proj_a.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "dense"
+shape = ["gdn_value_heads", "hidden"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.in_proj_a.scale"
+part = "gdn_scan"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(gdn_value_heads) / quant_block[0]", "(hidden) / quant_block[0]"]
+split = "rows"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.out_proj.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "dense"
+shape = ["hidden", "gdn_value_width"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.out_proj.scale"
+part = "gdn_scan"
+role = "attention"
+dtype = "f8e8m0"
+shape = ["(hidden) / quant_block[0]", "(gdn_value_width) / quant_block[0]"]
+split = "columns"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.conv1d.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["2 * gdn_key_width + gdn_value_width", 1, "gdn_conv"]
+split = "conv"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.A_log"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_heads"]
+split = "vector"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.dt_bias"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_heads"]
+split = "vector"
+repeat = "layers"
+when = { attention = "gdn" }
+
+[[tensor]]
+name = "layers.{layer}.attn.norm.weight"
+part = "gdn_scan"
+role = "attention"
+dtype = "bf16"
+shape = ["gdn_value_dim"]
+split = "whole"
+repeat = "layers"
+when = { attention = "gdn" }
 
 # model.py:798-809: the router matrix is BF16 (the index has no ffn.gate.scale) and its two
 # f32 biases are [routed]; bias_vl exists because the checkpoint has a vision tower.
