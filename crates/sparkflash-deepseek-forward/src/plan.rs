@@ -124,7 +124,7 @@ pub fn values_from_plan(plan: &EnginePlan) -> Result<ModelConfig, ConfigError> {
             None => Vec::new(),
         },
         gqa: match facts.get("gqa_layers") {
-            Some(_) => Some(sparkflash_model_deepseek_v41::config::GqaGeometry {
+            Some(_) => Some(sparkflash_engine::config::GqaGeometry {
                 heads: int(facts, "gqa_heads")?,
                 kv_heads: int(facts, "gqa_kv_heads")?,
                 head_dim: int(facts, "gqa_head_dim")?,
