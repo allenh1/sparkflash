@@ -40,6 +40,7 @@ pub mod defaults;
 pub mod descriptor;
 pub mod dflash2;
 pub mod engine;
+pub mod facts;
 pub mod format;
 pub mod gumbel;
 pub mod layout;

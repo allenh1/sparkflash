@@ -310,6 +310,13 @@ pub fn classify(name: &str) -> Result<Option<Classification>, ShardError> {
             | "in_proj_b.weight" | "in_proj_b.scale" | "in_proj_a.weight" | "in_proj_a.scale"
             | "out_proj.weight" | "out_proj.scale" | "conv1d.weight" | "A_log" | "dt_bias"
             | "norm.weight" => classified(Group::AttentionReplicated, ShardRule::Replicated),
+            // A Kimi Delta Attention block (`kda_scan`) runs whole on every rank too: its three
+            // short convolutions, low-rank forget and gate pairs, beta, decay and output norm.
+            "q_proj.weight" | "q_proj.scale" | "k_proj.weight" | "k_proj.scale"
+            | "v_proj.weight" | "v_proj.scale" | "q_conv1d.weight" | "k_conv1d.weight"
+            | "v_conv1d.weight" | "f_a_proj.weight" | "f_b_proj.weight" | "g_a_proj.weight"
+            | "g_b_proj.weight" | "b_proj.weight" | "o_norm.weight" | "o_proj.weight"
+            | "o_proj.scale" => classified(Group::AttentionReplicated, ShardRule::Replicated),
             "attn_sink" => classified(Group::AttentionSink, ShardRule::Column),
             other if other.starts_with("indexer.") || other.starts_with("compressor.") => {
                 classified(Group::AttentionAux, ShardRule::Replicated)
@@ -1001,6 +1008,35 @@ mod tests {
             "norm.weight",
         ] {
             let name = format!("layers.7.attn.{leaf}");
+            let classification = classify(&name).expect("known").expect("resident");
+            assert_eq!(
+                (classification.group, classification.rule),
+                (
+                    ResidentGroup::AttentionReplicated,
+                    Some(ShardRule::Replicated)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kimi_delta_attention_block_is_whole_on_every_rank() {
+        for leaf in [
+            "q_proj.weight",
+            "k_proj.scale",
+            "v_proj.weight",
+            "q_conv1d.weight",
+            "v_conv1d.weight",
+            "f_a_proj.weight",
+            "g_b_proj.weight",
+            "b_proj.weight",
+            "A_log",
+            "dt_bias",
+            "o_norm.weight",
+            "o_proj.weight",
+        ] {
+            let name = format!("layers.3.attn.{leaf}");
             let classification = classify(&name).expect("known").expect("resident");
             assert_eq!(
                 (classification.group, classification.rule),

@@ -93,7 +93,7 @@ impl CachedCheckpointSource {
         index_path: &Path,
     ) -> Result<Self, WeightError> {
         Ok(Self {
-            inner: SafeTensorsSource::open(dir, index_path)?,
+            inner: sparkflash_model::layout::open_checkpoint(dir, index_path)?,
             cache: Mutex::new(HashMap::new()),
         })
     }

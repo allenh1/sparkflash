@@ -287,10 +287,10 @@ fn load_entries(
         .as_ref()
         .ok_or_else(|| "one of --tensor-index or --checkpoint is required".to_string())?;
     let index_path = dir.join("model.safetensors.index.json");
-    let index = CheckpointIndex::load(&index_path)
-        .map_err(|error| format!("read the checkpoint index: {error}"))?;
-    let source = SafeTensorsSource::open(dir.clone(), &index_path)
+    let source = sparkflash_model::layout::open_checkpoint(dir.clone(), &index_path)
         .map_err(|error| format!("open the checkpoint {}: {error}", dir.display()))?;
+    // The source's index, not the file's: it answers to the layout's slots.
+    let index = source.index();
     let mut entries = Vec::with_capacity(index.weight_map.len());
     for name in index.names() {
         let header = source

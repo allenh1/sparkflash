@@ -101,6 +101,17 @@ pub struct TensorClaim {
     pub split: String,
     /// The tile width a `tiles` or `tile_rows` split cuts on.
     pub tile: Option<usize>,
+    /// The base forward's name for the tensor, when the checkpoint spells it otherwise (the
+    /// layout's `slot`).
+    pub slot: Option<String>,
+}
+
+impl TensorClaim {
+    /// The name the base forward reads this tensor by: its slot, else its stored name.
+    #[must_use]
+    pub fn base_name(&self) -> &str {
+        self.slot.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// Which stack of a model description a block belongs to.

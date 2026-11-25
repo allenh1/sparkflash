@@ -1322,3 +1322,73 @@ fn glm_kda_blocks_scan_their_ranks_share_of_the_heads() {
         }
     }
 }
+
+/// The base forward reads a checkpoint by its own spelling: GLM's layout gives every tensor a
+/// slot in DeepSeek's names, so the forward reads it with no GLM name in its code, and the plan
+/// claims each by that slot. DeepSeek's names are the base's, so its layout gives none.
+#[test]
+fn the_glm_layout_names_every_tensor_by_a_base_slot() {
+    let glm = Architecture::from_json(GLM).expect("GLM");
+    let names = sparkflash_model::layout::checkpoint_names(&glm).expect("the GLM names");
+    let layout = sparkflash_model::layout::matching(&glm)
+        .expect("layouts")
+        .expect("the GLM layout");
+    let tensors = layout.tensors(&glm).expect("the GLM tensors");
+    let missing: Vec<&str> = tensors
+        .iter()
+        .filter(|tensor| tensor.slot.is_none())
+        .map(|tensor| tensor.name.as_str())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "GLM tensors without a slot: {missing:?}"
+    );
+    assert_eq!(names.len(), tensors.len());
+    let mtp = glm.layers.len();
+    for (stored, base) in [
+        ("lm_head.weight".to_owned(), "head.weight".to_owned()),
+        (
+            "model.language_model.layers.3.self_attn.kv_b_proj.weight".to_owned(),
+            "layers.3.attn.wkv_b.weight".to_owned(),
+        ),
+        (
+            "model.language_model.layers.3.mlp.experts.7.down_proj.weight".to_owned(),
+            "layers.3.ffn.experts.7.w2.weight".to_owned(),
+        ),
+        (
+            format!("model.language_model.layers.{mtp}.self_attn.q_a_proj.weight"),
+            "mtp.0.attn.wq_a.weight".to_owned(),
+        ),
+        (
+            format!("model.language_model.layers.{mtp}.eh_proj.weight"),
+            "mtp.0.eh_proj.weight".to_owned(),
+        ),
+    ] {
+        assert_eq!(names.get(&stored), Some(&base), "{stored}");
+    }
+
+    let plan = EnginePlan::from_json(GLM, Target::Sm121, 4, 0).expect("GLM TP4 rank 0");
+    {
+        for stack in plan.stacks() {
+            for block in &stack.blocks {
+                for instance in &block.parts {
+                    for claim in &instance.claims {
+                        assert_eq!(
+                            Some(claim.base_name()),
+                            names.get(&claim.name).map(String::as_str),
+                            "{}",
+                            claim.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let deepseek = Architecture::from_json(DEEPSEEK).expect("DeepSeek");
+    assert!(
+        sparkflash_model::layout::checkpoint_names(&deepseek)
+            .expect("the DeepSeek names")
+            .is_empty()
+    );
+}

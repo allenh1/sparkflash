@@ -23,9 +23,9 @@
 
 pub use sparkflash_model_deepseek_v41::{
     AttentionGeometry, CompressionKind, DType, LayerMode, LayerPlan, LayerSpec, ModelConfig,
-    PlanError, TensorPlan, TensorSpec, TensorView, WeightError, WeightSource, config, dtype,
-    encoding, forward, layer_plan, linalg, loader, parallel, parallel_tp, prompt_ranks, quant,
-    report, safetensors, sequence_fixture, synthetic, tensor, weights,
+    PlanError, TensorPlan, TensorSpec, TensorView, WeightError, WeightSource, config, described,
+    dtype, encoding, forward, layer_plan, linalg, loader, parallel, parallel_tp, prompt_ranks,
+    quant, report, safetensors, sequence_fixture, synthetic, tensor, weights,
 };
 
 pub use sparkflash_model_deepseek_v41::sequence_fixture::{

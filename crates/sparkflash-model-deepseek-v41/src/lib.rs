@@ -28,6 +28,7 @@
 pub mod architecture;
 pub mod checkpoint;
 pub mod config;
+pub mod described;
 pub mod dtype;
 pub mod encoding;
 pub mod forward;

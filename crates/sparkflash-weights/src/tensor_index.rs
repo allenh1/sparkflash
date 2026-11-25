@@ -640,6 +640,68 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_source_answers_to_the_base_names_and_reads_the_stored_bytes() {
+        use crate::safetensors::open_checkpoint;
+        use crate::weights::WeightSource;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tensors = vec![
+            (
+                spec("model.norm.weight", DType::F32, &[2]),
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+            (
+                spec("model.embed_tokens.weight", DType::F32, &[1]),
+                vec![9, 9, 9, 9],
+            ),
+        ];
+        write_checkpoint(dir.path(), &tensors, 2).expect("the fixture writes");
+        let names = BTreeMap::from([("model.norm.weight".to_owned(), "norm.weight".to_owned())]);
+        let source = open_checkpoint(dir.path())
+            .expect("open")
+            .with_names(names)
+            .expect("rename");
+        assert_eq!(
+            source.names(),
+            vec![
+                "model.embed_tokens.weight".to_owned(),
+                "norm.weight".to_owned()
+            ]
+        );
+        assert_eq!(
+            source.read("norm.weight").expect("read"),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert!(source.read("model.norm.weight").is_err());
+        assert_eq!(
+            source
+                .header("norm.weight")
+                .expect("header")
+                .tensor("norm.weight")
+                .expect("entry")
+                .shape,
+            vec![2]
+        );
+        // One name cannot mean two tensors.
+        let clash = BTreeMap::from([(
+            "model.norm.weight".to_owned(),
+            "model.embed_tokens.weight".to_owned(),
+        )]);
+        assert!(
+            open_checkpoint(dir.path())
+                .expect("open")
+                .with_names(clash)
+                .is_err()
+        );
+        let absent = BTreeMap::from([("model.head.weight".to_owned(), "head.weight".to_owned())]);
+        assert!(
+            open_checkpoint(dir.path())
+                .expect("open")
+                .with_names(absent)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn a_sharded_directory_reads_its_headers_and_ignores_the_index() {
         let dir = tempfile::tempdir().expect("tempdir");
         let specs = checkpoint(dir.path(), 2);

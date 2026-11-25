@@ -613,6 +613,9 @@ pub struct SafeTensorsSource {
     index: CheckpointIndex,
     limit: u128,
     refused: BTreeSet<String>,
+    /// Stored name -> the name this source answers to, for a layout whose checkpoint spells a
+    /// tensor otherwise than the forward reads it ([SafeTensorsSource::with_names]).
+    names: BTreeMap<String, String>,
     headers: Mutex<BTreeMap<String, Arc<SafeTensorsHeader>>>,
     files: Mutex<BTreeMap<String, Arc<File>>>,
 }
@@ -625,6 +628,7 @@ impl SafeTensorsSource {
             index,
             limit: DEFAULT_LIMIT,
             refused: BTreeSet::new(),
+            names: BTreeMap::new(),
             headers: Mutex::new(BTreeMap::new()),
             files: Mutex::new(BTreeMap::new()),
         }
@@ -664,6 +668,39 @@ impl SafeTensorsSource {
     {
         self.refused.extend(names.into_iter().map(Into::into));
         self
+    }
+
+    /// Answers to other names: each `stored -> name` pair makes the index and every shard header
+    /// this source parses name the tensor `name`, so a reader asks for it by the name its forward
+    /// uses and the bytes still come from the stored entry. The spelling is all that changes: the
+    /// dtype, shape and byte range are the stored tensor's.
+    ///
+    /// # Errors
+    /// [WeightError::Malformed] when a stored name is not in the index, or when a new name is
+    /// already a stored tensor's or another pair's, since one name would then mean two tensors.
+    pub fn with_names(mut self, names: BTreeMap<String, String>) -> Result<Self, WeightError> {
+        let mut weight_map = BTreeMap::new();
+        for (stored, shard) in std::mem::take(&mut self.index.weight_map) {
+            let name = names.get(&stored).cloned().unwrap_or(stored);
+            if weight_map.insert(name.clone(), shard).is_some() {
+                return Err(WeightError::Malformed {
+                    name,
+                    detail: "two stored tensors would answer to this one name".to_string(),
+                });
+            }
+        }
+        for (stored, name) in &names {
+            if !weight_map.contains_key(name) {
+                return Err(WeightError::Malformed {
+                    name: stored.clone(),
+                    detail: format!("the index names no tensor {stored} to answer to {name}"),
+                });
+            }
+        }
+        self.index.weight_map = weight_map;
+        self.names = names;
+        self.headers().clear();
+        Ok(self)
     }
 
     /// The largest tensor this source will read.
@@ -727,7 +764,16 @@ impl SafeTensorsSource {
                 ),
             });
         }
-        let header = Arc::new(SafeTensorsHeader::read(&self.shard_path(shard))?);
+        let mut header = SafeTensorsHeader::read(&self.shard_path(shard))?;
+        if !self.names.is_empty() {
+            header.tensors = std::mem::take(&mut header.tensors)
+                .into_iter()
+                .map(|(stored, tensor)| {
+                    (self.names.get(&stored).cloned().unwrap_or(stored), tensor)
+                })
+                .collect();
+        }
+        let header = Arc::new(header);
         self.headers()
             .insert(shard.to_string(), Arc::clone(&header));
         Ok(header)

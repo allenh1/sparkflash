@@ -34,7 +34,6 @@ use std::path::Path;
 use sparkflash_model_deepseek_v41::config::ModelConfig;
 use sparkflash_model_deepseek_v41::forward::boundary::BoundaryData;
 use sparkflash_model_deepseek_v41::forward::{InferenceEngine, SequenceState};
-use sparkflash_weights::safetensors::SafeTensorsSource;
 
 /// The largest single tensor the reference will materialise.
 const TENSOR_LIMIT: usize = 512 * 1024 * 1024;
@@ -71,8 +70,9 @@ fn main() -> Result<(), String> {
     let text = std::fs::read_to_string(dir.join("config.json"))
         .map_err(|error| format!("{}: {error}", dir.join("config.json").display()))?;
     let config = ModelConfig::from_json(&text).map_err(|error| format!("config: {error}"))?;
-    let source = SafeTensorsSource::open(dir, &dir.join("model.safetensors.index.json"))
-        .map_err(|error| format!("checkpoint: {error}"))?;
+    let source =
+        sparkflash_model::layout::open_checkpoint(dir, &dir.join("model.safetensors.index.json"))
+            .map_err(|error| format!("checkpoint: {error}"))?;
     let mut engine = InferenceEngine::new(config.clone(), Box::new(source), TENSOR_LIMIT)
         .map_err(|error| format!("engine: {error}"))?;
     match (tokenizer, ids_compressed) {

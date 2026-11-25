@@ -36,7 +36,7 @@
 //! that names both, never a silent precedence rule.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -172,6 +172,10 @@ pub struct TensorDecl {
     pub stack: Option<String>,
     /// When the tensor is stored but never loaded, why.
     pub unloaded: Option<String>,
+    /// The name template the base forward reads this tensor by, when the checkpoint names it
+    /// otherwise: the base's operand in its own spelling, so one forward reads every layout's
+    /// tensors without a name of any model's in its code.
+    pub slot: Option<String>,
 }
 
 /// Where one expanded tensor sits in the description.
@@ -253,6 +257,9 @@ pub struct LayoutTensor {
     pub tile: Option<usize>,
     /// Why the tensor is stored but never loaded, when it is.
     pub unloaded: Option<String>,
+    /// The base forward's name for the tensor, when the checkpoint's differs
+    /// ([TensorDecl::slot], expanded).
+    pub slot: Option<String>,
 }
 
 /// The stored element class a layout declares.
@@ -493,6 +500,8 @@ struct RawTensor {
     stack: Option<String>,
     #[serde(default)]
     unloaded: Option<String>,
+    #[serde(default)]
+    slot: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -816,6 +825,7 @@ impl Layout {
                 when,
                 stack: tensor.stack,
                 unloaded: tensor.unloaded,
+                slot: tensor.slot,
             });
         }
         let vars = raw
@@ -1901,6 +1911,11 @@ impl Layout {
             vars.insert("shard".to_owned(), shard as i64);
         }
         let name = expand_name(&declaration.name, &vars, &self.id)?;
+        let slot = declaration
+            .slot
+            .as_ref()
+            .map(|slot| expand_name(slot, &vars, &self.id))
+            .transpose()?;
         let shape = declaration
             .shape
             .iter()
@@ -1956,6 +1971,7 @@ impl Layout {
             block,
             tile: declaration.tile,
             unloaded: declaration.unloaded.clone(),
+            slot,
         });
         Ok(())
     }
@@ -2407,6 +2423,7 @@ fn attach_tensors(block: &mut Block, tensors: &[LayoutTensor], stack: StackKind)
                 .to_owned(),
                 split: split_name(tensor.split).to_owned(),
                 tile: tensor.tile,
+                slot: tensor.slot.clone(),
             })
             .collect();
     }
@@ -2946,6 +2963,79 @@ impl LayoutSet {
 pub fn matching(architecture: &Architecture) -> Result<Option<Layout>, LayoutError> {
     let set = LayoutSet::load()?;
     Ok(set.select(architecture)?.cloned())
+}
+
+/// The names the base forward reads a checkpoint's tensors by, where the layout gives a slot:
+/// stored name -> slot. Empty for a layout whose names are already the base's (DeepSeek's).
+///
+/// # Errors
+/// The layout does not expand, or two tensors take one slot, or a slot is another tensor's stored
+/// name: either would make one name mean two tensors.
+pub fn checkpoint_names(
+    architecture: &Architecture,
+) -> Result<BTreeMap<String, String>, LayoutError> {
+    let Some(layout) = matching(architecture)? else {
+        return Ok(BTreeMap::new());
+    };
+    let tensors = layout.tensors(architecture)?;
+    let mut names = BTreeMap::new();
+    let mut slots = BTreeMap::new();
+    for tensor in &tensors {
+        let Some(slot) = &tensor.slot else {
+            continue;
+        };
+        if let Some(other) = slots.insert(slot.clone(), tensor.name.clone()) {
+            return Err(LayoutError::invalid(
+                &layout.id,
+                format!(
+                    "tensors {other} and {} both take the slot {slot}",
+                    tensor.name
+                ),
+            ));
+        }
+        names.insert(tensor.name.clone(), slot.clone());
+    }
+    if let Some(tensor) = tensors
+        .iter()
+        .find(|tensor| tensor.slot.is_none() && slots.contains_key(&tensor.name))
+    {
+        return Err(LayoutError::invalid(
+            &layout.id,
+            format!("the slot {} is also a stored tensor's name", tensor.name),
+        ));
+    }
+    Ok(names)
+}
+
+/// Opens a checkpoint directory under the names the base forward reads it by: the layout's
+/// slots (see [checkpoint_names]), read from the directory's own `config.json`. A drop-in for
+/// [sparkflash_weights::safetensors::SafeTensorsSource::open]: a directory without a config, or
+/// whose layout gives no slot, opens exactly as that does.
+///
+/// # Errors
+/// As the plain open; [WeightError::Malformed] when the config does not parse, the layout does
+/// not expand, or the index refuses the names.
+pub fn open_checkpoint(
+    directory: impl Into<PathBuf>,
+    index_path: &Path,
+) -> Result<sparkflash_weights::safetensors::SafeTensorsSource, sparkflash_weights::WeightError> {
+    let directory = directory.into();
+    let config = directory.join("config.json");
+    let source = sparkflash_weights::safetensors::SafeTensorsSource::open(directory, index_path)?;
+    if !config.is_file() {
+        return Ok(source);
+    }
+    let malformed = |detail: String| sparkflash_weights::WeightError::Malformed {
+        name: config.display().to_string(),
+        detail,
+    };
+    let architecture =
+        Architecture::from_path(&config).map_err(|error| malformed(error.to_string()))?;
+    let names = checkpoint_names(&architecture).map_err(|error| malformed(error.to_string()))?;
+    if names.is_empty() {
+        return Ok(source);
+    }
+    source.with_names(names)
 }
 
 /// The cache directory, expanded against this node's home.

@@ -985,7 +985,7 @@ impl Tp4Rank {
         };
         let index_path = input.source_dir.join("model.safetensors.index.json");
         let source = Arc::new(
-            SafeTensorsSource::open(&input.source_dir, &index_path)
+            sparkflash_model::layout::open_checkpoint(&input.source_dir, &index_path)
                 .map_err(|error| Tp4Error::new(format!("open checkpoint: {error}")))?,
         );
         let attention_shard = attention_shard_enabled(&config, input.world);

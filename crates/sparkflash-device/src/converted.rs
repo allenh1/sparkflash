@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use sparkflash_engine::safetensors::{CheckpointIndex, SafeTensorsSource};
+use sparkflash_engine::safetensors::SafeTensorsSource;
 use sparkflash_kernels::cuda_driver::DirectReadReport;
 use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
 pub use sparkflash_weights::rank_file::{
@@ -282,13 +282,13 @@ pub fn load_checkpoint_headers_once(
     checkpoint_dir: &Path,
 ) -> Result<(SafeTensorsSource, Vec<HeaderEntry>), String> {
     let index_path = checkpoint_dir.join("model.safetensors.index.json");
-    let index = CheckpointIndex::load(&index_path)
-        .map_err(|error| format!("read {}: {error}", index_path.display()))?;
-    let source = SafeTensorsSource::open(checkpoint_dir, &index_path)
+    // The source answers to the layout's slots, so its own index is the one to walk.
+    let source = sparkflash_model::layout::open_checkpoint(checkpoint_dir, &index_path)
         .map_err(|error| format!("open checkpoint {}: {error}", checkpoint_dir.display()))?;
     source
         .preload_headers()
         .map_err(|error| format!("preload headers in {}: {error}", checkpoint_dir.display()))?;
+    let index = source.index();
     let mut entries = Vec::with_capacity(index.weight_map.len());
     for name in index.names() {
         let header = source
