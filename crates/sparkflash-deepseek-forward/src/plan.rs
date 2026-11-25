@@ -427,6 +427,7 @@ impl Description {
                     };
                     let claimed = symbols
                         .get(&(Some(block.index), instance.part))
+                        .or_else(|| symbols.get(&(None, instance.part)))
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
                     let operand = crate::operand::Operand {
@@ -553,10 +554,15 @@ impl Description {
     }
 
     /// The catalogue symbols of one part instance, in catalogue order.
+    ///
+    /// The plan groups the image's symbols by part, not by block: one entry serves every block
+    /// of that part. A block-keyed list, when the plan states one, answers for its block;
+    /// otherwise the part's list does.
     #[must_use]
     pub fn symbols(&self, block: Option<usize>, part: Part) -> &[&'static str] {
         self.symbols
             .get(&(block, part))
+            .or_else(|| self.symbols.get(&(None, part)))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }

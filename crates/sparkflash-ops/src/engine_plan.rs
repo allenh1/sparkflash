@@ -726,7 +726,19 @@ fn stored_formats(
                 .find(|range| range.covers(block))
                 .copied()
         });
-        let format = if tensor.part == Part::Moe {
+        // An MTP stage's routed experts are the same packed containers as the backbone's, so
+        // they take the same reading: a row-scaled E4M3 weight is MXFP8 row-32, not the 32-tile
+        // a dense E4M3 weight with a u8 scale grid would be. The stage's dense tensors keep the
+        // class reading below.
+        let draft_expert = tensor.part == Part::Mtp
+            && match tensor.dtype {
+                LayoutDtype::Expert | LayoutDtype::U8 | LayoutDtype::F4E2M1 => true,
+                LayoutDtype::F8E4M3 => layout_scale_name(&tensor.name)
+                    .and_then(|scale| scale_shapes.get(&scale))
+                    .is_some_and(|scale| is_row_scale(&tensor.shape, scale)),
+                _ => false,
+            };
+        let format = if tensor.part == Part::Moe || draft_expert {
             if let Some(range) = declared {
                 Some(range.format)
             } else {
