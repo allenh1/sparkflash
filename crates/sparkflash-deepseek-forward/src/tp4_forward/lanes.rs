@@ -72,8 +72,6 @@ struct Offsets {
     /// Per layer, a Gated DeltaNet block's (conv history, state), each touched whole; `None` at
     /// every other block.
     recurrent: Vec<Option<(usize, usize)>>,
-    /// The recurrent regions' checkpoint arena, when the stack has recurrent blocks.
-    checkpoint: Option<usize>,
 }
 
 /// One lane's device pointers, as the DeviceLayer fields hold them.
@@ -423,7 +421,6 @@ impl<'a> DeviceLayer<'a> {
             draft,
             grouped,
             recurrent,
-            checkpoint,
         };
 
         // The single sequence's state goes before the lanes take memory.
