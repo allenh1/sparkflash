@@ -18450,11 +18450,16 @@ fn run_forward_loop(
             // The routed data path needs both: `attach_routed` for the arena pointers and the
             // kernels for the launches. It allocates its 9.8 MiB staging state once, here, before
             // the first clock.
-            device.attach_moe_routed()?;
             let format_dir = request.kernel_cubin_dir.ok_or_else(|| {
                 "layer device: the routed format route needs the staged cubin directory".to_owned()
             })?;
-            device.attach_routed_format(bind, format_dir)?;
+            // A stated stack runs its experts on the stated walk's own route (the block-scaled
+            // expert GEMV at the stated holds), never the released routed device, whose launches
+            // are compiled per released shape.
+            if !crate::plan::stated_stack() {
+                device.attach_moe_routed()?;
+                device.attach_routed_format(bind, format_dir)?;
+            }
             device.attach_dense_format(format_dir)?;
             device.attach_seam_ring()?;
             if let Some(seam) = seam_wq_b.as_ref() {
