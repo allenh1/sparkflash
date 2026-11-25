@@ -1303,6 +1303,36 @@ stack.
   * **Under the tie band.** The owner approved the band for foreign-part variants on 2026-11-24.
     `gqa-dense` runs under it (bands and ties below, with S3).
   * **Not yet run:** a grouped-query block at world 2 or 4.
+* **S3** (`917ef5f5` .. `ab87fd5f`). `gdn-dense` makes block 0 a Gated DeltaNet block over a
+  dense MLP. `gdn-decoder` makes block 7, above the encoder layers, a Gated DeltaNet block over
+  the MoE. The base runs the block on the rows path through the dense arm's body,
+  `ops::roles::GdnLayer`. Its projections are whole on every rank, so every rank runs every head.
+  * **Lanes.** Each lane carves every recurrent block's conv history and state as whole regions,
+    plus one checkpoint arena. A stack with no recurrent block carves nothing, so its lane stride,
+    scratch and copies are unchanged.
+  * **The save point.** A prefill cuts its chunks at the last resume boundary before the
+    prompt's end (`tick::save_point`) and saves the state there. This is the base's "save at the
+    prompt's end" at its resume granularity. The rows resume only on a boundary, and the
+    prompt's last row always runs for the first token's logits.
+  * **Resume and adopt.** Place and adopt resume only at a lane's saved point. Otherwise they
+    start from 0 with the state zeroed. The replay and the live tick make the same decisions.
+  * **Verify.** A verify pass leaves each row's state in a snapshot slab. The kept row's copy
+    is committed before the rewind.
+  * **The decoder skip.** A recurrent block among the decoder layers turns the skip off, and
+    the ledger says so. A profile that asks for the skip is refused.
+  * **The MoE half.** A block whose attention is a foreign part runs its MoE as the fused
+    block's FFN half.
+  * **Refused by name:** a split prompt chunk and the one-token stage loop.
+  * **Results at world 1.** `gdn-decoder` gives exact ids, including the prompt that resumes at
+    the first prompt's saved point (298 cached rows).
+    * `gdn-dense` runs under the band. The band is 0.2: the reference shows zero drift (512
+      shared alternatives) and 0.2 is the largest measured band.
+    * Its one tie is prompt 3, position 7, gap 0.0022 nats. That prompt resumes from prompt 2's
+      saved point (4 cached rows).
+    * With prefix reuse off, the device gives the same ids, so resuming changes no bits.
+    * Layer 0's output agrees with the host on 8083 of 8192 BF16 values (max |diff| 2.0e-3,
+      rms 0.19). The normed rows agree to 9e-6.
+  * **Not yet run:** world 2 or 4; the laptop has one GPU.
 
 ## 5. Order
 
