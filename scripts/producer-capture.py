@@ -35,8 +35,10 @@ per-position distances, the verdict and the versions that produced it. Exit 0 on
 import argparse
 import json
 import math
+import os
 import statistics
 import sys
+import sysconfig
 from pathlib import Path
 
 
@@ -93,6 +95,25 @@ def log_softmax(row: list[float]) -> list[float]:
     return [value - math.log(total) for value in shifted]
 
 
+def python_headers_on_the_compile_path() -> None:
+    """Make this interpreter's headers findable by the C compiler.
+
+    The Hub's fine-grained FP8 kernel arrives as Triton source that is compiled on first use,
+    and the compile shells out to gcc with `-I<sysconfig include>`. On a host whose system
+    python ships no development headers (this cluster's `/usr/bin/python3.12`), gcc stops at
+    `Python.h: No such file or directory` and triton raises, which reads as a broken kernels
+    wheel and is a header path. The interpreter running this script does have its headers, so
+    the compiler's include path is pointed at them. Nothing is installed and nothing is
+    downloaded.
+    """
+    include = sysconfig.get_paths().get("include")
+    if not include or not (Path(include) / "Python.h").is_file():
+        return
+    for name in ("C_INCLUDE_PATH", "CPATH"):
+        parts = [p for p in os.environ.get(name, "").split(os.pathsep) if p]
+        if include not in parts:
+            os.environ[name] = os.pathsep.join([include, *parts])
+
 def stored_bf16_modules(checkpoint: Path) -> list[str]:
     """The modules this checkpoint stores without an FP8 scale, from its own index.
 
@@ -132,6 +153,7 @@ def producer_logits(checkpoint: Path, host: dict, dtype_name: str, device: str =
     import torch
     from transformers import AutoConfig, Glm5NextForConditionalGeneration
 
+    python_headers_on_the_compile_path()
     config = AutoConfig.from_pretrained(str(checkpoint), trust_remote_code=False)
     if getattr(config, "model_type", None) != "glm5_next":
         fail(f"{checkpoint} opens as {getattr(config, 'model_type', None)}, not the producer's glm5_next")
