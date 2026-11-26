@@ -139,6 +139,11 @@ impl GumbelSampler {
     /// The sample for `row` from every rank's exchanged `opt_rows_topc` slot: `slots` is
     /// `[world][rows][TOPC_WORDS]` u32, `position` the sequence index the row's token lands at.
     /// Every rank runs this on the same bytes and returns the same id.
+    ///
+    /// `None` when the slots hold no candidate at all: no rank's slice contributed a pair, so
+    /// there is nothing to cut or sample. `world` of zero is the shape that does it (a device
+    /// exchange that names no peer). The caller refuses by name; a panic on the empty list instead
+    /// takes down the walk server the caller runs in, and with it every later check of the run.
     #[must_use]
     pub fn pick_truncated(
         &self,
@@ -147,7 +152,7 @@ impl GumbelSampler {
         row: usize,
         world: usize,
         position: u32,
-    ) -> u32 {
+    ) -> Option<u32> {
         let inv_t = self.inv_t();
         let slot = |rank: usize| {
             let at = (rank * rows + row) * TOPC_WORDS;
@@ -179,7 +184,10 @@ impl GumbelSampler {
         }
         merged.retain(|&(logit, _)| logit >= floor);
         merged.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        self.cut(&mut merged, m, z, floor, false, position).0
+        if merged.is_empty() {
+            return None;
+        }
+        Some(self.cut(&mut merged, m, z, floor, false, position).0)
     }
 
     /// The truncated cut over `merged` (best first, ties to the lower id) and the sample from the
@@ -385,10 +393,24 @@ mod tests {
         for position in 0..32 {
             assert_eq!(
                 sampler.pick_truncated(&slots, 1, 0, 2, position),
-                best.0 as u32
+                Some(best.0 as u32)
             );
             assert_eq!(sampler.pick_row(&row, position), best.0 as u32);
         }
+    }
+
+    /// A run whose device exchange names no peer hands the sampler no slice at all. That used to
+    /// index an empty list (the panic took the walk server down and every later check with it); it
+    /// is now `None`, so the caller refuses with the world it was given.
+    #[test]
+    fn a_world_of_no_slices_has_no_candidate_to_pick() {
+        let sampler = GumbelSampler {
+            temperature: 0.8,
+            top_p: 0.95,
+            top_k: 40,
+            seed: 1234,
+        };
+        assert_eq!(sampler.pick_truncated(&[], 1, 0, 0, 0), None);
     }
 
     #[test]
@@ -408,7 +430,7 @@ mod tests {
         };
         let row: Vec<f32> = a.iter().chain(&b).copied().collect();
         for position in 0..64 {
-            assert_eq!(sampler.pick_truncated(&slots, 1, 0, 2, position), 17);
+            assert_eq!(sampler.pick_truncated(&slots, 1, 0, 2, position), Some(17));
             assert_eq!(sampler.pick_row(&row, position), 17);
         }
         // With the whole distribution kept, the other tokens are drawn too.
@@ -418,7 +440,7 @@ mod tests {
             ..sampler
         };
         let picks: std::collections::HashSet<u32> = (0..512)
-            .map(|p| wide.pick_truncated(&slots, 1, 0, 2, p))
+            .filter_map(|p| wide.pick_truncated(&slots, 1, 0, 2, p))
             .collect();
         assert!(picks.len() > 1);
     }

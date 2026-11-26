@@ -5936,8 +5936,19 @@ impl DeviceLayer<'_> {
                 .collect();
             for (row, (sampler, index)) in samplers.iter().enumerate() {
                 if truncated[row] {
-                    picked[row] =
-                        Some(sampler.pick_truncated(&slots, n, row, world, *index as u32));
+                    // A slot list with no candidate is a head that wrote nothing (or an exchange
+                    // over no peer): refuse with the shape, rather than sample from an empty list.
+                    picked[row] = Some(
+                        sampler
+                            .pick_truncated(&slots, n, row, world, *index as u32)
+                            .ok_or_else(|| {
+                                format!(
+                                    "rows head: the top-c slots hold no candidate for row {row} \
+                                     of {n} over {world} rank(s); the head wrote no {} word slot",
+                                    super::sample::TOPC_WORDS
+                                )
+                            })?,
+                    );
                 }
             }
             if truncated.iter().all(|&cut| cut) {
