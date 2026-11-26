@@ -1,6 +1,6 @@
 # Milestone 4: GLM runs on the base, and its crate is deleted
 
-Status: in progress, 2026-11-25 (`bc37795c`); see *Progress* below. It details milestone 4 of
+Status: in progress, 2026-11-26 (`c0793f36`); see *Progress* below. It details milestone 4 of
 [05-runtime-models.md](05-runtime-models.md) (section 5.2, "Then the models move"). After
 [milestone 3](07-base-ranks-formats-seam.md) the base runs at one, two and four ranks, takes FP8
 tiles, BF16, NVFP4 and row-scaled MXFP8, and runs a foreign part through the seam, all proved on
@@ -14,42 +14,49 @@ tower runs as a stack. Then `crates/sparkflash-model-glm5-next` is deleted.
 
 Line numbers are the tree's at `m3/finish` `bdeb563a`.
 
-## Progress (2026-11-25, `bc37795c`)
+## Progress (2026-11-26, `c0793f36`)
 
-GLM's text stack runs on the base from its description, on the device rows path, and the
-`glm-wiring` synthetic passes at worlds 1, 2 and 4 on four nodes (section 3: seam-gated, ids
-reported, a change from the approved split that awaits the owner's review). Nothing is served
-from the base yet, and the crate is not deleted. "Landed" below means it is in the tree and runs
-under that proof. A line's own measurements, where it asks for them, are not yet taken unless
-they are named.
+Items 1 to 9 of section 5 are in the tree and measured on four nodes: GLM's text stack runs on
+the base from its description, `glm-wiring` passes at worlds 1, 2 and 4 (section 3),
+`conformance!(DeepSeekBase)` passes on the `glm` variant (8 of 8), the converter writes GLM's
+ranks in the base's format, and the released DeepSeek is unchanged against the pre-milestone-4
+build (manifest, launch and tick identical on all four ranks). Nothing is served from the base
+yet, and the crate is not deleted: the work stopped where it agreed to (section 7). "Landed"
+below means it is in the tree and runs under that proof, and a line that asked for a measurement
+names the number it got.
 
 | Line | State | Where |
 |---|---|---|
 | V1 value table by part | landed | `43fa53db`, `36323243` |
 | V2 the split is data | landed | `83f22afe`, `f9782ba0` (resident plan) |
 | V3 facts leave the crate | in part: the base reads the description; the crate's own parse and `include_str!`s remain until S5 | `43fa53db` |
-| A1 absorbed MLA | landed on the stated walk; the measurement against GLM's four-launch split is not taken | `cca81db7`, `63e6c220`, `84a98d8d` |
-| A2 latent cache | in part: the stated lane region holds the E4M3 latent and block scales; the profile switch, prefix adoption, slide and 1M window are not proved | `stated.rs` |
+| A1 absorbed MLA | landed on the stated walk, and measured against the base's four-launch split: the base's split wins at every sequence, so it is kept (section 3) | `cca81db7`, `63e6c220`, `84a98d8d` |
+| A2 latent cache | landed: `attention.latent_cache` selects E4M3 or f32, a prefix is adopted, the ring slides, and the 1M window is proved in the stated code's own test | `99989c80` |
 | A3 pooled indexer | landed | `cca81db7`, `63e6c220` |
-| A4 bulk prefill attention | not started | |
+| A4 bulk prefill attention | landed and kept: GLM's body beats the base's four-launch split by 2.0x to 7.3x (section 3) | `562e0a5b` |
 | K1 one KDA body | landed | `03209028`, `83f22afe` |
 | K2 the split | landed | `83f22afe`, `f9782ba0` |
-| K3-K5 state, chunks, fusion | in part: prompts walk in 64-row chunks on the stated walk; kept-state turns and fusion across the boundary are not proved | `dbb94c78`, `63ed499c` |
+| K3-K5 state, chunks, fusion | landed: state survives kept turns, snapshots and rewind, interleaved chunks walk `whole = chunked`; K5 is measured and no fusion is built (section 3) | `c5591555` |
 | M1 mHC | landed | `cca81db7`, `9e079a17` |
 | M2-M4 dense, router, routed experts | landed on the stated FFN | `87190912`, `070d13b5`, `1cabde0b` |
 | M5 embedding and head | landed on the stated walk | `stated.rs` |
-| M6 the sum on the BF16 wire | landed; the RDMA exchange is not proved for GLM | `fb0ee21d` |
-| D1-D3 drafting | not started | |
+| M6 the sum on the BF16 wire | in part: the host check against the f32 sum rounded once passes; the live RDMA exchange is not proved for GLM (the launcher pins the reduce to NCCL whenever a cubin directory is staged) | `fb0ee21d`, section 3 |
+| D1-D3 drafting | landed: the MTP layer is the draft stack, DFlash 2 attaches, the draft head is E4M3, and `drafted = plain` passes on the synthetic | `8fba8f8e`, `2957348b` |
 | I1-I3 vision tower | not started | |
-| W1 converted ranks | not started (it needs the stated splits in `convert_rank_with_source`) | |
+| W1 converted ranks | landed: the converter writes GLM's ranks in the base's format from the stated splits, at TP 1, 2 and 4, weights verified (section 3) | `c38c217c` |
 | W2 synthetic writer | landed for the `glm` and `glm-wiring` variants | `45ec0a05`, `b716c1a3` |
 | S1-S5 serving, codec, kernels, numerics v4, deletion | not started | |
-| Proof: synthetic, worlds 1, 2, 4 | `glm-wiring` PASS (seams), `glm` reported | `69ce489d`, section 3 |
-| Proof: producer capture, real checkpoint, suite, tower, released DeepSeek | not started | |
+| Proof: synthetic, worlds 1, 2, 4 | `glm-wiring` PASS at all three worlds (largest seam median 1.63e-2, 2.77e-2, 2.65e-2 against the 7e-2 bar); `glm` reported | section 3 |
+| Proof: producer capture | landed on `glm-tiny`; two host fixes came out of it, and the pure-BF16 end-to-end capture misses the top-1 and mean-NLL bars on fixture ties (section 3) | `68074500` |
+| Proof: conformance on the `glm` variant | PASS, 8 of 8, under `--ignored` (the form `scripts/onboard-gate.sh` uses) | section 3 |
+| Proof: released DeepSeek unchanged | PASS: pre-milestone-4 `2f99fbe7` against HEAD, manifests, launch traces and tick identical on all four ranks | section 3 |
+| Proof: real checkpoint, tower, served gate | not started: the work stopped before the real-checkpoint window, as section 7 fixes | |
 
-Open fault: a forward refused at world above 1 is written only to the rank's evidence file
-(`tp4-token-r<rank>.json`), because the refusal is reported after the TCP collective walk, which
-waits on peers. The rank logs show a group that never becomes ready.
+Closed fault (`78d009c5`): a forward refused at world above 1 used to be written only to the
+rank's evidence file (`tp4-token-r<rank>.json`), because the refusal was reported after the TCP
+collective walk, which waits on peers, and the rank logs showed a group that never became
+ready. The rank now writes the refusal to its log and stops before the group walk, so a
+refused world says why on every rank it refused on.
 
 ## 1. What the tree says today
 
@@ -432,6 +439,106 @@ synthetic checkpoint, as in milestone 3.
   before the run. Then image chat on the served model, greedy and sampled.
 * **The released DeepSeek.** One rule-1 window at the end of each line that touches a shared
   body (A, M, D), and the end battery.
+* **Milestone 4's measurements (2026-11-26, four nodes).** Every number below is from one
+  window: `c0793f36`'s build on the head node's GB10, the released DeepSeek stopped, the
+  production server restored from `target/m3/release/sparkflash` (`269f7b99`) after each run.
+  The corpus is `crates/sparkflash-ops/examples/glm-stage-bench.rs`, run as
+  `SPARKFLASH_KERNEL_DIR=<cubins> glm-stage-bench`; the geometry is the release's at four ranks
+  (16 heads, NoPE 256, value 256, latent 512, q-LoRA 1,536, E4M3 latent cache).
+
+  **A1, the absorbed MLA body against the base's four-launch split.** GLM's own
+  `q4e_glm_mla_attend` is one launch; the base's `AbsorbedMla::attend` is scores, softmax, mix
+  and project. The ratio is the four-launch time over the one-launch time, so a value under 1
+  means the base's split is faster:
+
+  | rows | sequence | one launch | four launches | ratio |
+  |---|---|---|---|---|
+  | 1 | 256 | 140.8 us | 119.1 us | 0.85 |
+  | 4 | 256 | 569.7 us | 99.1 us | 0.17 |
+  | 1 | 512 | 271.3 us | 123.9 us | 0.46 |
+  | 4 | 512 | 1,080.6 us | 130.9 us | 0.12 |
+  | 1 | 2,048 | 1,034.4 us | 147.0 us | 0.14 |
+  | 4 | 2,048 | 4,108.6 us | 319.7 us | 0.08 |
+
+  The base's split is faster at every shape, by 1.2x at the smallest and 12.8x at the widest,
+  so A1 keeps the base's body and the stated walk does not call GLM's one-launch decoder. The
+  one-launch kernel is one block a head; the split's blocks fill the GPU at every sequence.
+
+  **A4, bulk prefill attention.** The same comparison over the prefill side, where GLM's body is
+  `glm_prefill_mla_attend` plus per-head BF16 MMA:
+
+  | rows | sequence | four launches | GLM's bulk | speedup |
+  |---|---|---|---|---|
+  | 32 | 256 | 280.9 us | 72.2 us | 3.89x |
+  | 64 | 256 | 542.8 us | 111.8 us | 4.86x |
+  | 128 | 256 | 1,065.1 us | 145.5 us | 7.32x |
+  | 32 | 512 | 322.8 us | 96.1 us | 3.36x |
+  | 64 | 512 | 588.5 us | 166.1 us | 3.54x |
+  | 128 | 512 | 1,139.6 us | 214.5 us | 5.31x |
+  | 32 | 2,048 | 500.5 us | 235.2 us | 2.13x |
+  | 64 | 2,048 | 875.8 us | 441.6 us | 1.98x |
+  | 128 | 2,048 | 1,691.6 us | 639.6 us | 2.64x |
+
+  GLM's body wins everywhere: 2.0x to 7.3x, the margin growing with the row count because the
+  split pays four launches a row group. A4 keeps it.
+
+  **K5, the KDA body.** `KdaLayer::run` over the release's geometry (16 heads of 128, four
+  taps), with the projections stubbed out so the number is the conv, the decay, the prep and the
+  scan alone: 35.9 us a layer at one row and 74.0 us at 64 rows, so 1.22 ms and 2.52 ms for the
+  release's 34 KDA layers. Against a decode step that is milliseconds already, the KDA body is
+  not the speed row's problem, so no fusion across the foreign boundary is built (K5's own rule:
+  build it only if the speed rows need it).
+
+  **Conformance.** `conformance!(DeepSeekBase)` on the `glm` variant, run the way
+  `scripts/onboard-gate.sh` runs it (`--ignored`, one thread), passes 8 of 8:
+  `alone_equals_four`, `bits_equal_the_record` (a SKIP: no record directory was named),
+  `continued_equals_cold`, `drafted_equals_plain`, `no_unrecorded_widening`,
+  `rewound_equals_cold`, `tp_one_two_four` and `whole_prompt_equals_chunked`. The arm boots the
+  synthetic `glm` checkpoint the second-shape writer produces, at world 1, through `BaseWalk`,
+  with the staged cubins beside it (`SPARKFLASH_CONFORMANCE_CHECKPOINT`,
+  `SPARKFLASH_CONFORMANCE_CUBINS`, and `LD_LIBRARY_PATH` pointing at the collective's library:
+  without that last one the walk server's rank 0 cannot open NCCL and every check fails with
+  `the walk server has ended`).
+
+  **W1, the converted ranks.** On the GLM second-shape checkpoint,
+  `SPARKFLASH_ON_BASE=1 sparkflash convert --tp-world-size W --ranks ...` writes
+  `rank-{r}-of-W.bin` at W = 1, 2 and 4 from the stated splits: 567 tensors a rank, no B12x and
+  no 640-padded MoE tile (GLM's dense and routed weights are already the producer's 128-wide FP8
+  tiles), and `convert --inspect --verify-weights` reports `weights_verified=true` on each. The
+  stated stack does not yet read those files: it streams the checkpoint, and reading a converted
+  rank is S-series work.
+
+  **The released DeepSeek is unchanged.** `scripts/open-manifest-ab.py ab` with the
+  pre-milestone-4 build (`2f99fbe7`, sha `cf91afd3`) against this one (sha `8333cc15`), both on
+  the same cubin directory, one repetition: the model manifest is identical on all four ranks
+  (93,386 records on ranks 0 to 2, 93,394 on rank 3), the launch traces are identical, the tick
+  trace is identical, decode and prefill speeds are inside the tolerance, drafting accepts 524
+  of 667 on both, and the harness reports `1 of 1 repetitions clean`. Prefill reads 7,147.8
+  tok/s against 6,354.4 tok/s, +12.5% from the shared bodies this milestone touched.
+
+  **Two faults the window itself found, both in the new code and both fixed (`c0793f36`).** The
+  stated draft stack resolved the whole embedding table from `device.embed_table`, which the
+  device fills only when the embedding replica is gathered — and the replica was gathered after
+  the drafter opened, so worlds 2 and 4 refused with `stated draft: full embed.weight table is
+  not resident on device`. The replica now gathers before the drafter opens, and the later
+  gather is skipped when it already ran. Separately, four kernels in the stated drafter's
+  catalogue were declared at a precision that catalogue does not carry
+  (`q4e_quantize_e4m3_rows` and `q4d_capture` as `Fp8E4M3`/`F32`, `q4e_argmax_prob_slices` as
+  `F32`), so world 1 refused with `the catalogue carries no q4e_quantize_e4m3_rows in
+  qwen4_exp_sm121 accepting e4m3`; they are now `Bf16`, `Bf16` and `Fp8E4M3`, which is what
+  `sparkflash-ops`' own part table states.
+
+  **Environment notes, for the next window.** `target/m3-cubins` is the released DeepSeek's
+  staging directory: 62 cubins, none of them GLM's or Qwen's, so a GLM window needs its own
+  `scripts/build-cubins.sh` output (153 cubins). The head node's name `spark0` does not resolve
+  from any of the four hosts; rank 0 runs locally through `SPARK_LOCAL_RANKS=0` and every ssh
+  goes to `sg1-carter.local`, `sg1-teilc.local` or `sg1-jackson.local`.
+
+  **Still open.** The live RDMA exchange is not proved for GLM: `scripts/serve-four-node.sh`
+  pins `SPARK_COMM_REDUCE=nccl` whenever a cubin directory is staged, and the device arm always
+  stages one, so the GLM group ran `requested="nccl" path=nccl` with no RoCE call. Proving it
+  needs a packed-arm launch with no cubin directory, which is the branch the launcher already
+  carries for a model that brings its own kernels. The host side of M6 is proved.
 
 ## 4. The work
 
