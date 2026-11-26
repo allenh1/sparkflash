@@ -1420,7 +1420,48 @@ fn clang_syntax_check(
 }
 
 fn which_nvcc() -> Option<PathBuf> {
-    which("SPARKFLASH_NVCC", "nvcc")
+    which("SPARKFLASH_NVCC", "nvcc").or_else(cuda_toolkit_nvcc)
+}
+
+/// `nvcc` from an installed CUDA toolkit that is not on `PATH`.
+///
+/// A non-interactive shell — an `ssh` command, a CI job, a build spawned by an editor — never
+/// reads the profile that puts `/usr/local/cuda/bin` on `PATH`. On such a host a complete
+/// toolkit used to build "CPU reference kernels only": every model image stayed empty and the
+/// runtime then refused each staged part as unloadable, which reads as a wiring fault and is a
+/// `PATH` fault (milestone 4's A.4). The search is the toolkit's own install layout, newest
+/// version first, so the newest installed toolkit wins and a bare `cuda` symlink (which points
+/// at one of the versioned directories) is only a fallback.
+fn cuda_toolkit_nvcc() -> Option<PathBuf> {
+    let mut roots: Vec<(usize, usize, PathBuf)> = Vec::new();
+    for base in ["/usr/local", "/opt"] {
+        let Ok(entries) = std::fs::read_dir(base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().into_owned();
+            let version = match name.strip_prefix("cuda") {
+                Some("") => (0, 0),
+                Some(rest) => match rest.strip_prefix('-') {
+                    Some(number) => {
+                        let mut parts = number.split('.');
+                        let major = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let minor = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        (major, minor)
+                    }
+                    None => continue,
+                },
+                None => continue,
+            };
+            roots.push((version.0, version.1, entry.path()));
+        }
+    }
+    roots.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+    roots
+        .into_iter()
+        .map(|(_, _, root)| root.join("bin").join("nvcc"))
+        .find(|candidate| candidate.is_file())
 }
 
 fn which_clang() -> Option<PathBuf> {
