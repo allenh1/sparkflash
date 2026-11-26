@@ -110,7 +110,10 @@ fn main() -> Result<(), String> {
     .load(&cuda)?;
 
     let max_rows = 128usize;
-    let max_pos = 2048usize;
+    // A7: the positions attention really sees at the release's largest window, so the latent
+    // cache is allocated for the whole 1,048,576-position window rather than a 2,048-token
+    // prompt.
+    let max_pos = 1_048_576usize;
     let max_sel = MAX_SELECTED_TOKENS;
     let mut allocs = Vec::new();
     let mut alloc = |bytes: usize| -> Result<Deviceptr, String> {
@@ -162,20 +165,27 @@ fn main() -> Result<(), String> {
     };
 
     println!("=== A1: Absorbed MLA decode (1-launch q4e_glm_mla_attend vs 4-launch split, E4M3 cache, H=16, D=256, L=512) ===");
-    for &seq in &[256usize, 512, 2048] {
-        let sel_ids: Vec<i32> = (0..seq as i32).collect();
+    // A7: the row counts and the positions the release serves - the smallest prompts, the
+    // attention's written window (2k), a long prompt (13k), a 100k document and the 1M window.
+    let positions = [256usize, 512, 2048, 13_312, 100_000, 1_048_576];
+    for &seq in &positions {
+        // The selection is top-2,048 over the raw positions and always holds the tail, so a
+        // window longer than the budget selects its last `max_sel` positions.
+        let chosen = seq.min(max_sel);
+        let first = seq - chosen;
+        let sel_ids: Vec<i32> = (first..seq).map(|id| id as i32).collect();
         let mut host_sel = Vec::with_capacity(max_rows * max_sel);
         for _ in 0..max_rows {
             host_sel.extend_from_slice(&sel_ids);
-            host_sel.resize(host_sel.len() + (max_sel - seq), 0);
+            host_sel.resize(host_sel.len() + (max_sel - chosen), 0);
         }
         let sel_bytes: Vec<u8> = host_sel.iter().flat_map(|v| v.to_le_bytes()).collect();
         cuda.copy_htod(&selected, &sel_bytes)?;
-        let cnts: Vec<i32> = vec![seq as i32; max_rows];
+        let cnts: Vec<i32> = vec![chosen as i32; max_rows];
         let cnt_bytes: Vec<u8> = cnts.iter().flat_map(|v| v.to_le_bytes()).collect();
         cuda.copy_htod(&selected_count, &cnt_bytes)?;
 
-        for &rows in &[1usize, 4] {
+        for &rows in &[1usize, 4, 8] {
             let one_us = time_us(&cuda, 10, 100, || {
                 for r in 0..rows {
                     cuda.launch(
@@ -218,6 +228,11 @@ fn main() -> Result<(), String> {
             println!("A1 rows={rows:<3} S={seq:<4}  1-launch={one_us:7.1} us   4-launch={four_us:7.1} us   ratio(4L/1L)={:.2}x", four_us / one_us);
         }
 
+        // A4 measures the prefill body, whose cost is rows x selected positions: the long
+        // windows belong to A1, because a decode step scores the selection and not the window.
+        if seq > 2048 {
+            continue;
+        }
         println!("--- A4: Bulk prefill attention (glm_prefill_mla_attend+BF16 MMA vs 4-launch, S={seq}) ---");
         for &rows in &[32usize, 64, 128] {
             let regs = [codes, scales];
