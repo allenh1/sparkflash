@@ -755,6 +755,7 @@ static ENCODER_LAYERS_VALUE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static MOE_INTER_DIM_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static DSPARK_BLOCK_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static STATED_DRAFT_BLOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static N_MTP_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static DSPARK_EXPERTS_VALUE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -785,6 +786,7 @@ fn publish_geometry(values: &ModelConfig) {
     ENCODER_LAYERS_VALUE.store(encoder_layers, Ordering::Relaxed);
     MOE_INTER_DIM_VALUE.store(values.moe_inter_dim, Ordering::Relaxed);
     DSPARK_BLOCK_VALUE.store(values.dspark_block_size, Ordering::Relaxed);
+    STATED_DRAFT_BLOCK.store(0, Ordering::Relaxed);
     N_MTP_VALUE.store(values.n_mtp_layers, Ordering::Relaxed);
     DSPARK_EXPERTS_VALUE.store(values.dspark_n_routed_experts, Ordering::Relaxed);
     DSPARK_TOP_K_VALUE.store(values.dspark_n_activated_experts, Ordering::Relaxed);
@@ -910,8 +912,38 @@ pub fn n_mtp_layers() -> usize {
 ///
 /// # Errors
 /// The stated depth is zero or deeper than the plan's block.
+/// Sets the active draft block size for a stated stack's drafter (GLM MTP or DFlash 2).
+/// Cleared to 0 whenever a new model description is opened.
+pub fn set_stated_draft_block(block: usize) {
+    STATED_DRAFT_BLOCK.store(block, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The active drafter's block size: the stated drafter's block when one is attached, else the
+/// plan's `dspark_block_size`.
+#[must_use]
+pub fn active_draft_block() -> usize {
+    let stated = STATED_DRAFT_BLOCK.load(std::sync::atomic::Ordering::Relaxed);
+    if stated > 0 {
+        stated
+    } else {
+        dspark_block_size()
+    }
+}
+
+/// Whether the open description declares a stated draft stack with an MTP bridge (`mtp.0.*`,
+/// such as GLM-5.3-Flash's next-token layer).
+#[must_use]
+pub fn has_stated_mtp() -> bool {
+    stated_stack()
+        && description()
+            .plan()
+            .tensors()
+            .iter()
+            .any(|tensor| tensor.slot.as_deref() == Some("mtp.0.enorm.weight"))
+}
+
 pub fn draft_depth(stated: Option<usize>) -> Result<usize, String> {
-    let block = dspark_block_size();
+    let block = active_draft_block();
     let depth = stated.unwrap_or(block);
     if depth == 0 || depth > block {
         return Err(format!("SPARKFLASH_DSPARK_K={depth}: needs 1..={block}"));

@@ -46,7 +46,7 @@ use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt};
 
 /// The draft block's row count, read at open from the plan's `dspark_block_size`.
 pub(super) fn draft_block() -> usize {
-    crate::plan::dspark_block_size()
+    crate::plan::active_draft_block()
 }
 /// The most sequences one draft pass serves (opt_draft's OD_MAX_SEQS).
 pub(super) const MAX_SEQS: usize = 16;
@@ -192,8 +192,8 @@ pub(super) struct DraftBlock {
     pub(super) sampler: super::sample::Sampler,
 }
 
-/// The drafter's run-scope state.
-pub(super) struct DraftState {
+/// The DSpark drafter's run-scope state.
+pub(super) struct DSparkState {
     kernels: DraftKernels,
     stages: Vec<Stage>,
     main_proj: (u64, u64),
@@ -253,7 +253,7 @@ pub(super) struct DraftState {
     dense: Option<sparkflash_kernels::dense_format::DenseFormat>,
 }
 
-impl DraftState {
+impl DSparkState {
     /// Resolves the three stages' operands from the arena, retiles main_proj for the GEMV, carves
     /// the drafter's buffers and the stage rings, and loads opt_draft / the top-3 router and MoE.
     ///
@@ -630,6 +630,81 @@ impl DraftState {
     }
 }
 
+/// Active run-scope drafter state: DeepSeek's DSpark stages or a stated stack's drafter
+/// (GLM's MTP layer or DFlash 2).
+pub(super) enum DraftState {
+    DSpark(Box<DSparkState>),
+    Stated(Box<super::stated_draft::StatedDraftState>),
+}
+
+impl DraftState {
+    pub(super) fn open(
+        device: &DeviceLayer<'_>,
+        arena: &sparkflash_device::arena::ResidentArena,
+        kernel_dir: &Path,
+        noise_row: Vec<f32>,
+    ) -> Result<Self, String> {
+        Ok(Self::DSpark(Box::new(DSparkState::open(
+            device,
+            arena,
+            kernel_dir,
+            noise_row,
+        )?)))
+    }
+
+    pub(super) fn open_stated(
+        device: &DeviceLayer<'_>,
+        arena: &sparkflash_device::arena::ResidentArena,
+        max_rows: usize,
+    ) -> Result<Self, String> {
+        Ok(Self::Stated(Box::new(
+            super::stated_draft::StatedDraftState::open(device, arena, max_rows)?,
+        )))
+    }
+
+    pub(super) fn pass_seqs(&self) -> usize {
+        match self {
+            Self::DSpark(d) => d.pass_seqs(),
+            Self::Stated(_) => MAX_SEQS,
+        }
+    }
+
+    pub(super) fn ring_rows(&self) -> usize {
+        match self {
+            Self::DSpark(d) => d.ring_rows(),
+            Self::Stated(_) => 0,
+        }
+    }
+
+    pub(super) fn ids(&self) -> u64 {
+        match self {
+            Self::DSpark(d) => d.ids(),
+            Self::Stated(s) => s.ids(),
+        }
+    }
+
+    pub(super) fn tap_sink(&self) -> Option<(Kernel, u64)> {
+        match self {
+            Self::DSpark(d) => Some(d.tap_sink()),
+            Self::Stated(_) => None,
+        }
+    }
+
+    pub(super) fn dflash_tap(&self) -> Option<(Kernel, Deviceptr, Vec<usize>, usize)> {
+        match self {
+            Self::DSpark(_) => None,
+            Self::Stated(s) => s.dflash_tap(),
+        }
+    }
+
+    pub(super) fn release(self, cuda: &Cuda) {
+        match self {
+            Self::DSpark(d) => d.release(cuda),
+            Self::Stated(s) => s.release(cuda),
+        }
+    }
+}
+
 /// Whether the drafter's stages store their experts as the released MXFP4, which the released
 /// bodies read (no format route).
 fn released_experts() -> bool {
@@ -857,6 +932,10 @@ impl DeviceLayer<'_> {
         // A release without a drafter seeds nothing.
         let Some(draft) = draft else {
             return Ok(());
+        };
+        let draft = match draft {
+            DraftState::DSpark(d) => &**d,
+            DraftState::Stated(s) => return s.seed(self, rows, p0, n),
         };
         let b = rows.b;
         let dim = self.dim;
@@ -1095,7 +1174,7 @@ impl DeviceLayer<'_> {
     fn draft_kv(
         &self,
         rows: &RowsState,
-        draft: &DraftState,
+        draft: &DSparkState,
         stage: &Stage,
         (ring_codes, ring_scales): (u64, u64),
         cos: u64,
@@ -1160,10 +1239,35 @@ impl DeviceLayer<'_> {
                 "draft: block at {d} with {k} drafts is outside the run"
             ));
         }
-        let verify = match anchor_row {
-            AnchorRow::Device { embed, .. } if verify > 0 => Some((embed, verify)),
+        let verify_pair = match anchor_row {
+            AnchorRow::Device { embed, exchange } if verify > 0 => Some((embed, verify, exchange)),
             _ => None,
         };
+        let draft = match draft {
+            DraftState::DSpark(d) => &**d,
+            DraftState::Stated(s) => {
+                let lane = self.lanes.as_ref().map_or(0, |l| l.selected);
+                let block = DraftBlock {
+                    lane,
+                    d,
+                    anchor,
+                    sampler: sampler.clone(),
+                };
+                let mut res = s.draft_blocks(self, rows, tail, transport, &[block], k)?;
+                let (ids, probs) = res.pop().ok_or("stated draft: empty block result")?;
+                if let Some((embed, v_rows, exchange)) = verify_pair {
+                    let mut verify_ids = Vec::with_capacity(k + 1);
+                    verify_ids.push(anchor);
+                    verify_ids.extend_from_slice(&ids);
+                    let bytes: Vec<u8> =
+                        verify_ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+                    self.cuda.copy_htod(&Deviceptr(s.ids()), &bytes)?;
+                    self.embed_rows_on_device(rows, embed, s.ids(), v_rows, v_rows, 0, exchange, false)?;
+                }
+                return Ok((ids, probs));
+            }
+        };
+        let verify = verify_pair.map(|(embed, v_rows, _)| (embed, v_rows));
         // The block's streams: [anchor, noise x 4], each copied over the hc axis; identity pre mix.
         match anchor_row {
             AnchorRow::Device { embed, exchange } => {
@@ -1234,15 +1338,29 @@ impl DeviceLayer<'_> {
     /// [MAX_SEQS], on the device exchange): block g is rows g * draft_block().., and each step of the Markov
     /// chain picks every block's draft. Every row's arithmetic is the one-block pass's, so each
     /// sequence's k drafts and probabilities are the ones it would draft alone.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draft_blocks(
         &self,
         rows: &RowsState,
         draft: &DraftState,
         tail: &crate::tp4_tail::TailStage,
+        transport: &dyn sparkflash_comm::transport::Transport,
         embed: u64,
         blocks: &[DraftBlock],
         k: usize,
     ) -> Result<Vec<Drafts>, String> {
+        let draft = match draft {
+            DraftState::DSpark(d) => &**d,
+            DraftState::Stated(s) => {
+                if blocks.is_empty() {
+                    return Ok(Vec::new());
+                }
+                if k == 0 || k > s.block_size() {
+                    return Err(format!("stated draft: k={k} outside 1..={}", s.block_size()));
+                }
+                return s.draft_blocks(self, rows, tail, transport, blocks, k);
+            }
+        };
         let b = rows.b;
         let dim = self.dim;
         let seqs = blocks.len();
@@ -1410,7 +1528,7 @@ impl DeviceLayer<'_> {
     /// row 0, whose stage rings all sit at the lane's offset from the first block's: each row's
     /// {lane offset, position} goes to `draft.row_tab`, which no launch still reads (the last pass
     /// that did was read back). None when the profile turns the table off.
-    fn draft_row_table(&self, draft: &DraftState, blocks: &[Seg]) -> Result<Option<u64>, String> {
+    fn draft_row_table(&self, draft: &DSparkState, blocks: &[Seg]) -> Result<Option<u64>, String> {
         let off = !sparkflash_model::active_profile().drafter.build_row_table();
         let (Some(lanes), Some(first)) = (self.lanes.as_ref(), blocks.first()) else {
             return Ok(None);
@@ -1455,7 +1573,7 @@ impl DeviceLayer<'_> {
     fn draft_stages(
         &self,
         rows: &RowsState,
-        draft: &DraftState,
+        draft: &DSparkState,
         blocks: &[Seg],
     ) -> Result<(), String> {
         let b = rows.b;
@@ -1710,7 +1828,7 @@ impl DeviceLayer<'_> {
     fn draft_output(
         &self,
         rows: &RowsState,
-        draft: &DraftState,
+        draft: &DSparkState,
         stage: &Stage,
         n: usize,
     ) -> Result<(), String> {
@@ -1799,7 +1917,7 @@ impl DeviceLayer<'_> {
     fn draft_moe(
         &self,
         rows: &RowsState,
-        draft: &DraftState,
+        draft: &DSparkState,
         stage: &Stage,
         n: usize,
     ) -> Result<(), String> {
@@ -2056,7 +2174,7 @@ impl DeviceLayer<'_> {
     fn draft_logits(
         &self,
         rows: &RowsState,
-        draft: &DraftState,
+        draft: &DSparkState,
         tail: &crate::tp4_tail::TailStage,
         (groups, k, stride): (usize, usize, usize),
     ) -> Result<(), String> {
@@ -2213,7 +2331,7 @@ impl DeviceLayer<'_> {
     fn draft_head(
         &self,
         rows: &RowsState,
-        draft: &DraftState,
+        draft: &DSparkState,
         tail: &crate::tp4_tail::TailStage,
         transport: &dyn sparkflash_comm::transport::Transport,
         anchor: u32,

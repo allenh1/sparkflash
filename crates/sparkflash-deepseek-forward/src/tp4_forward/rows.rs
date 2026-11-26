@@ -322,6 +322,8 @@ pub(super) struct RowsState {
     /// and the target layers in tap order. Before each target layer the rows' streams are
     /// hc-averaged into their tap slot.
     pub(super) taps: Option<(Kernel, u64, Vec<usize>)>,
+    /// DFlash 2 target-layer capture for a stated stack: `(q4d_capture, features, target_layers, feature_width)`.
+    pub(super) dflash_tap: Option<(Kernel, Deviceptr, Vec<usize>, usize)>,
     /// The side stream the all-reduce windows' L2 prefetches run on (SPARKFLASH_L2_PREFETCH=0: none).
     side: Option<sparkflash_kernels::cuda_driver::SideStream>,
     /// The most rows a step takes: R_MAX, or a bulk prefill chunk's capacity.
@@ -1061,6 +1063,7 @@ impl RowsState {
             row_tab_for: std::cell::RefCell::new(Vec::new()),
             group_ratios: Cell::new([0; GROUP_SLOTS]),
             taps: None,
+            dflash_tap: None,
             // A bulk chunk's stages read far more than the L2 holds, so it prefetches nothing.
             side: if sparkflash_model::active_profile()
                 .diagnostics

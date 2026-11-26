@@ -44,7 +44,7 @@ use sparkflash_ops::tiled::{TiledMatrix, TiledProjection, TiledScratch};
 const CHUNK: usize = 64;
 
 /// The tiles an FP8 linear's input is quantised on: the tiled body's E4M3 block.
-const ACTIVATION_TILE: usize = 128;
+pub(super) const ACTIVATION_TILE: usize = 128;
 
 /// The expert GEMV's tokens a launch: a token picks an expert once, so a launch of this many
 /// tokens gives no expert more pairs than the body batches (`Q4E_MAX_BATCH`).
@@ -81,27 +81,27 @@ struct KdaTensors {
 
 /// A pooled indexer's tensors.
 #[derive(Debug, Clone, Copy)]
-struct IndexerTensors {
-    keys: TiledMatrix,
-    gates: TiledMatrix,
-    head_weights: TiledMatrix,
-    queries: TiledMatrix,
-    key_norm: (Deviceptr, Deviceptr),
-    ape: Deviceptr,
+pub(super) struct IndexerTensors {
+    pub(super) keys: TiledMatrix,
+    pub(super) gates: TiledMatrix,
+    pub(super) head_weights: TiledMatrix,
+    pub(super) queries: TiledMatrix,
+    pub(super) key_norm: (Deviceptr, Deviceptr),
+    pub(super) ape: Deviceptr,
 }
 
 /// An absorbed MLA block's tensors, its own indexer's when it runs one.
 #[derive(Debug, Clone, Copy)]
-struct AbsorbedTensors {
-    q_a: TiledMatrix,
-    kv_a: TiledMatrix,
-    q_b: TiledMatrix,
-    out: TiledMatrix,
-    norms: (Deviceptr, Deviceptr),
-    kv_b: Deviceptr,
+pub(super) struct AbsorbedTensors {
+    pub(super) q_a: TiledMatrix,
+    pub(super) kv_a: TiledMatrix,
+    pub(super) q_b: TiledMatrix,
+    pub(super) out: TiledMatrix,
+    pub(super) norms: (Deviceptr, Deviceptr),
+    pub(super) kv_b: Deviceptr,
     /// Optional raw BF16 `kv_b` and transposed key rows for A4 bulk prefill MMA.
-    kv_b_bf16: Option<(Deviceptr, Deviceptr)>,
-    indexer: Option<IndexerTensors>,
+    pub(super) kv_b_bf16: Option<(Deviceptr, Deviceptr)>,
+    pub(super) indexer: Option<IndexerTensors>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,14 +112,14 @@ enum MixerTensors {
 
 /// One gated MLP: gate, up and down.
 #[derive(Debug, Clone, Copy)]
-struct Mlp {
-    gate: TiledMatrix,
-    up: TiledMatrix,
-    down: TiledMatrix,
+pub(super) struct Mlp {
+    pub(super) gate: TiledMatrix,
+    pub(super) up: TiledMatrix,
+    pub(super) down: TiledMatrix,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum FfnTensors {
+pub(super) enum FfnTensors {
     Dense(Mlp),
     Moe {
         router: TiledMatrix,
@@ -140,37 +140,37 @@ struct StatedLayer {
 
 /// The widths the rows a stated walk carves are sized by, on this rank.
 #[derive(Debug, Clone, Copy)]
-struct Widths {
+pub(super) struct Widths {
     /// The widest input a projection quantises.
-    columns: usize,
+    pub(super) columns: usize,
     /// A KDA projection's outputs (the stage its row copy places them from).
-    kda_part: usize,
-    experts: usize,
-    top_k: usize,
+    pub(super) kda_part: usize,
+    pub(super) experts: usize,
+    pub(super) top_k: usize,
     /// A routed expert's intermediate rows on this rank.
-    routed_inter: usize,
+    pub(super) routed_inter: usize,
     /// The widest MLP body that is not a routed expert's (dense or shared), on this rank.
-    mlp: usize,
+    pub(super) mlp: usize,
 }
 
 /// A stated stack's device state: the shared bodies, each block's tensors in the arena (with
 /// the few the bodies read in another type built here), and the widths its rows are carved by.
 pub(super) struct StatedDevice {
-    mixer: ManifoldMixer,
-    tiled: TiledProjection,
-    absorbed: Option<AbsorbedMla>,
-    indexer: Option<PooledIndexer>,
-    router: Router,
+    pub(super) mixer: ManifoldMixer,
+    pub(super) tiled: TiledProjection,
+    pub(super) absorbed: Option<AbsorbedMla>,
+    pub(super) indexer: Option<PooledIndexer>,
+    pub(super) router: Router,
     /// `q4e_expert_gemv_e4m3_block`.
-    expert: Bound,
+    pub(super) expert: Bound,
     /// `q4e_copy_rows`, `q4e_swiglu_held`, `q4e_combine_held` and `q4e_narrow_bf16`.
-    token: [Bound; 4],
+    pub(super) token: [Bound; 4],
     layers: Vec<StatedLayer>,
-    widths: Widths,
-    quantise: bool,
+    pub(super) widths: Widths,
+    pub(super) quantise: bool,
     /// Whether the absorbed MLA latent cache stores E4M3 codes with 128-wide f32 block scales
     /// (the serving default; `attention.latent_cache = "f32"` selects f32).
-    e4m3_latent: bool,
+    pub(super) e4m3_latent: bool,
     allocations: Vec<Deviceptr>,
 }
 
@@ -266,7 +266,7 @@ pub(super) fn absorbed_regions() -> Result<Vec<AbsorbedRegionPlan>, String> {
 }
 
 /// A tensor's arena slice by its claimed name.
-fn slice<'s>(
+pub(super) fn slice<'s>(
     arena: &'s sparkflash_device::arena::ResidentArena,
     name: &str,
 ) -> Result<&'s sparkflash_device::arena::ArenaSlice, String> {
@@ -277,7 +277,7 @@ fn slice<'s>(
 
 /// The rank's `[rows, columns]` matrix `name`: block-scaled E4M3 when the arena holds its
 /// `.scale` (f32, one a 128 x 128 block), else BF16.
-fn matrix(
+pub(super) fn matrix(
     arena: &sparkflash_device::arena::ResidentArena,
     name: &str,
     (rows, columns): (usize, usize),
@@ -322,7 +322,7 @@ impl DeviceLayer<'_> {
     /// A vector of `count` values in the type its body reads: the arena's own slice when it
     /// holds that type; a BF16 tensor a body reads as f32 widened exactly here (and kept).
     /// Narrowing would change a stored value, so an f32 tensor a body reads as BF16 is refused.
-    fn stated_vector(
+    pub(super) fn stated_vector(
         &self,
         arena: &sparkflash_device::arena::ResidentArena,
         name: &str,
@@ -353,7 +353,7 @@ impl DeviceLayer<'_> {
         ))
     }
 
-    fn stated_upload(
+    pub(super) fn stated_upload(
         &self,
         bytes: &[u8],
         allocations: &mut Vec<Deviceptr>,
@@ -367,7 +367,7 @@ impl DeviceLayer<'_> {
     /// The rank's `kv_b` (`[heads (nope + value), latent]`, BF16 or block-scaled E4M3) widened
     /// to f32 in the absorbed attention's layout: a head's key rows as stored, then its value
     /// rows transposed to `[latent][value]` ([AbsorbedWeights::kv_b]).
-    fn stated_kv_b(
+    pub(super) fn stated_kv_b(
         &self,
         arena: &sparkflash_device::arena::ResidentArena,
         name: &str,
@@ -799,24 +799,24 @@ impl DeviceLayer<'_> {
 /// routing, and a [CHUNK]'s attention and expert scratch.
 pub(super) struct StatedRows {
     mix: ManifoldRows,
-    scratch: TiledScratch,
+    pub(super) scratch: TiledScratch,
     /// The sublayer's f32 output before it narrows to the BF16 wire, `[rows][hidden]`.
-    branch: Deviceptr,
-    absorbed: Option<AbsorbedRows>,
-    pooled: Option<PooledRows>,
-    router: RouterRows,
+    pub(super) branch: Deviceptr,
+    pub(super) absorbed: Option<AbsorbedRows>,
+    pub(super) pooled: Option<PooledRows>,
+    pub(super) router: RouterRows,
     /// The bodies' gate, up and activation rows, a chunk's.
-    gate: Deviceptr,
-    up: Deviceptr,
-    act: Deviceptr,
+    pub(super) gate: Deviceptr,
+    pub(super) up: Deviceptr,
+    pub(super) act: Deviceptr,
     /// The routed experts' held outputs, a chunk's `[rows][top_k][hidden]`.
-    expert_out: Deviceptr,
+    pub(super) expert_out: Deviceptr,
     /// The shared expert's held output, `[rows][hidden]` (zero where a stack has none).
-    shared: Deviceptr,
+    pub(super) shared: Deviceptr,
     /// The stage a KDA projection's packed rows are placed from.
-    stage: Deviceptr,
+    pub(super) stage: Deviceptr,
     /// The head's folded and normed rows, f32.
-    head: Deviceptr,
+    pub(super) head: Deviceptr,
 }
 
 impl StatedRows {
@@ -934,7 +934,7 @@ fn chunk_segments(segments: &[LaneSegment], first: usize, rows: usize) -> Vec<La
 }
 
 impl DeviceLayer<'_> {
-    fn stated_share(&self) -> Result<Option<sparkflash_model::TpPlan>, String> {
+    pub(super) fn stated_share(&self) -> Result<Option<sparkflash_model::TpPlan>, String> {
         let world = self.routed_geometry.world;
         (world > 1)
             .then(|| sparkflash_model::TpPlan::new(world, self.tp_rank))
@@ -1100,6 +1100,23 @@ impl DeviceLayer<'_> {
                 )
                 .map_err(what)?;
         }
+        if let Some((kernel, features, ref targets, feature_width)) = rows.dflash_tap
+            && let Some(slot) = targets.iter().position(|&id| id == layer)
+        {
+            self.cuda.launch(
+                kernel,
+                (dim.div_ceil(256) as u32, n as u32, 1),
+                (256, 1, 1),
+                &[
+                    b.stream,
+                    features.0,
+                    dim as u64,
+                    self.hc_mult as u64,
+                    feature_width as u64,
+                    slot as u64,
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -1117,7 +1134,6 @@ impl DeviceLayer<'_> {
         };
         let share = self.stated_share()?;
         let b = rows.b;
-        let dim = self.dim;
         let eps = crate::plan::description().values().norm_eps as f32;
         let linear = |matrix: TiledMatrix| TiledLinear {
             body: &stated.tiled,
@@ -1189,99 +1205,16 @@ impl DeviceLayer<'_> {
                         "rows layer {layer}: the block's indexer and its attached tensors disagree"
                     ));
                 }
-                let body = stated
-                    .absorbed
-                    .ok_or_else(|| format!("rows layer {layer}: no absorbed attention was opened"))?;
-                let scratch = state
-                    .absorbed
-                    .ok_or_else(|| format!("rows layer {layer}: no absorbed rows were carved"))?;
-                let selection = state.pooled.ok_or_else(|| {
-                    format!("rows layer {layer}: an absorbed block with no indexer rows to select by")
-                })?;
                 let (attention, index) = self.absorbed_segments(layer, (p0, n))?;
-                let (q_a, kv_a, q_b, out) = (
-                    linear(absorbed.q_a),
-                    linear(absorbed.kv_a),
-                    linear(absorbed.q_b),
-                    linear(absorbed.out),
-                );
-                let weights = AbsorbedWeights {
-                    q_a: &q_a,
-                    kv_a: &kv_a,
-                    q_b: &q_b,
-                    out: &out,
-                    norms: absorbed.norms,
-                    kv_b: absorbed.kv_b,
-                    kv_b_bf16: absorbed.kv_b_bf16,
-                };
-                let indexer = absorbed
-                    .indexer
-                    .map(|tensors| {
-                        (
-                            linear(tensors.keys),
-                            linear(tensors.gates),
-                            linear(tensors.head_weights),
-                            linear(tensors.queries),
-                            tensors,
-                        )
-                    });
-                let key_eps = crate::plan::description().values().index_key_norm_eps as f32;
-                for first in (0..n).step_by(CHUNK) {
-                    let count = CHUNK.min(n - first);
-                    let input = normed.offset(first * dim * 4);
-                    let selected = selection.selected.offset(first * MAX_SELECTED_TOKENS * 4);
-                    let picked = selection.count.offset(first * 4);
-                    let attention = chunk_segments(&attention, first, count);
-                    let cx = RowsCx::new(self.cuda, count, share).with_segments(&attention);
-                    body.cache(&cx, &weights, &scratch, input, (eps, stated.e4m3_latent, true))
-                        .map_err(what)?;
-                    if let Some((keys, gates, head_weights, queries, tensors)) = indexer.as_ref() {
-                        let picker = stated.indexer.ok_or_else(|| {
-                            format!("rows layer {layer}: no pooled indexer was opened")
-                        })?;
-                        let index = chunk_segments(&index, first, count);
-                        let cx = RowsCx::new(self.cuda, count, share).with_segments(&index);
-                        let pooled_weights = PooledWeights {
-                            keys,
-                            gates,
-                            head_weights,
-                            queries,
-                            key_norm: tensors.key_norm,
-                            ape: tensors.ape,
-                        };
-                        let pooled_rows = PooledRows {
-                            selected,
-                            count: picked,
-                            ..selection
-                        };
-                        picker
-                            .cache(&cx, &pooled_weights, &pooled_rows, input, (key_eps, true))
-                            .map_err(what)?;
-                        picker
-                            .pick(
-                                &cx,
-                                &pooled_weights,
-                                &pooled_rows,
-                                scratch.q_latent,
-                                (
-                                    picker.score_stride(self.max_positions),
-                                    usize::MAX,
-                                    true,
-                                ),
-                            )
-                            .map_err(what)?;
-                    }
-                    body.attend(
-                        &cx,
-                        &weights,
-                        &scratch,
-                        (selected, picked),
-                        state.branch.offset(first * dim * 4),
-                        (stated.e4m3_latent, true),
-                    )
-                    .map_err(what)?;
-                }
-                Ok(())
+                self.stated_absorbed_exec(
+                    (stated, state),
+                    absorbed,
+                    (&attention, &index),
+                    normed,
+                    n,
+                    &format!("rows layer {layer}"),
+                    true,
+                )
             }
             (_, mixer) => Err(format!(
                 "rows layer {layer}: the walk was asked for {mixer:?} and attached another mixer's tensors"
@@ -1289,8 +1222,129 @@ impl DeviceLayer<'_> {
         }
     }
 
+    /// Runs absorbed MLA cache, optional pooled indexer cache+pick, and optional attend over
+    /// `normed` (`[n][dim]` f32), shared by backbone MLA layers and GLM's MTP draft stack.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stated_absorbed_exec(
+        &self,
+        (stated, state): (&StatedDevice, &StatedRows),
+        absorbed: &AbsorbedTensors,
+        (attention, index): (&[LaneSegment], &[LaneSegment]),
+        normed: Deviceptr,
+        n: usize,
+        label: &str,
+        attend: bool,
+    ) -> Result<(), String> {
+        let what = |error: sparkflash_model::backend::BackendError| format!("{label}: {error}");
+        let share = self.stated_share()?;
+        let dim = self.dim;
+        let eps = crate::plan::description().values().norm_eps as f32;
+        let linear = |matrix: TiledMatrix| TiledLinear {
+            body: &stated.tiled,
+            scratch: &state.scratch,
+            matrix,
+            exact: true,
+            held: true,
+            stage: None,
+        };
+        let body = stated
+            .absorbed
+            .ok_or_else(|| format!("{label}: no absorbed attention was opened"))?;
+        let scratch = state
+            .absorbed
+            .ok_or_else(|| format!("{label}: no absorbed rows were carved"))?;
+        let selection = state
+            .pooled
+            .ok_or_else(|| format!("{label}: an absorbed block with no indexer rows to select by"))?;
+        let (q_a, kv_a, q_b, out) = (
+            linear(absorbed.q_a),
+            linear(absorbed.kv_a),
+            linear(absorbed.q_b),
+            linear(absorbed.out),
+        );
+        let weights = AbsorbedWeights {
+            q_a: &q_a,
+            kv_a: &kv_a,
+            q_b: &q_b,
+            out: &out,
+            norms: absorbed.norms,
+            kv_b: absorbed.kv_b,
+            kv_b_bf16: absorbed.kv_b_bf16,
+        };
+        let indexer = absorbed.indexer.map(|tensors| {
+            (
+                linear(tensors.keys),
+                linear(tensors.gates),
+                linear(tensors.head_weights),
+                linear(tensors.queries),
+                tensors,
+            )
+        });
+        let key_eps = crate::plan::description().values().index_key_norm_eps as f32;
+        for first in (0..n).step_by(CHUNK) {
+            let count = CHUNK.min(n - first);
+            let input = normed.offset(first * dim * 4);
+            let selected = selection.selected.offset(first * MAX_SELECTED_TOKENS * 4);
+            let picked = selection.count.offset(first * 4);
+            let attention = chunk_segments(attention, first, count);
+            let cx = RowsCx::new(self.cuda, count, share).with_segments(&attention);
+            body.cache(&cx, &weights, &scratch, input, (eps, stated.e4m3_latent, true))
+                .map_err(what)?;
+            if let Some((keys, gates, head_weights, queries, tensors)) = indexer.as_ref() {
+                let picker = stated
+                    .indexer
+                    .ok_or_else(|| format!("{label}: no pooled indexer was opened"))?;
+                let index = chunk_segments(index, first, count);
+                let cx = RowsCx::new(self.cuda, count, share).with_segments(&index);
+                let pooled_weights = PooledWeights {
+                    keys,
+                    gates,
+                    head_weights,
+                    queries,
+                    key_norm: tensors.key_norm,
+                    ape: tensors.ape,
+                };
+                let pooled_rows = PooledRows {
+                    selected,
+                    count: picked,
+                    ..selection
+                };
+                picker
+                    .cache(&cx, &pooled_weights, &pooled_rows, input, (key_eps, true))
+                    .map_err(what)?;
+                if attend {
+                    picker
+                        .pick(
+                            &cx,
+                            &pooled_weights,
+                            &pooled_rows,
+                            scratch.q_latent,
+                            (
+                                picker.score_stride(self.max_positions),
+                                usize::MAX,
+                                true,
+                            ),
+                        )
+                        .map_err(what)?;
+                }
+            }
+            if attend {
+                body.attend(
+                    &cx,
+                    &weights,
+                    &scratch,
+                    (selected, picked),
+                    state.branch.offset(first * dim * 4),
+                    (stated.e4m3_latent, true),
+                )
+                .map_err(what)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The FFN over the normed rows into the BF16 rows the reduce sums (`attn_out`).
-    fn stated_ffn<'s>(
+    pub(super) fn stated_ffn<'s>(
         &self,
         (stated, state): (&'s StatedDevice, &'s StatedRows),
         ffn: &FfnTensors,

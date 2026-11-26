@@ -2871,6 +2871,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 rows,
                 draft,
                 inputs.tail,
+                inputs.transport,
                 inputs.embed.0,
                 pass,
                 depth,

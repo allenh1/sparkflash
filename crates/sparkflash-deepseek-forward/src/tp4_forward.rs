@@ -64,6 +64,7 @@ mod lanes;
 pub(crate) mod rows;
 #[cfg(feature = "cuda")]
 mod stated;
+mod stated_draft;
 
 /// The number of hidden streams the row kernels are built for (kernels/opt_rows_sm121.cu's
 /// `OR_S_HC`). A plan that states another count is refused before a row is written: the gather
@@ -18629,23 +18630,16 @@ fn run_forward_loop(
         // its own plan.
         // A release whose plan declares no draft block (GLM-5.3-Flash) serves with no drafter:
         // every decode step is plain, and a profile that asks for a draft depth is refused.
-        let drafting = crate::plan::dspark_block_size() > 0;
+        let chunk = prefill_chunk();
         let stated_k = sparkflash_model::active_profile().speculation.dspark_k;
-        let k = match (drafting, stated_k) {
-            (true, _) => crate::plan::draft_depth(stated_k)?,
-            (false, None) => 0,
-            (false, Some(asked)) => {
-                return Err(format!(
-                    "SPARKFLASH_DSPARK_K={asked}: this release declares no DSpark drafter"
-                ));
-            }
-        };
-        if k + 1 > rows::R_MAX {
-            return Err(format!(
-                "SPARKFLASH_DSPARK_K={k}: a pass holds {rows} rows",
-                rows = rows::R_MAX
-            ));
-        }
+        let stated_drafter = crate::plan::stated_stack()
+            && stated_k != Some(0)
+            && (sparkflash_model::active_profile()
+                .speculation
+                .drafter
+                .is_some()
+                || crate::plan::has_stated_mtp());
+        let dspark_drafter = crate::plan::dspark_block_size() > 0;
         let staged: Vec<Option<SeamStagedWeights>> = (0..n_layers)
             .map(|layer| seam_wq_b.as_ref().and_then(|seam| seam.staged_for(layer)))
             .collect();
@@ -18665,20 +18659,43 @@ fn run_forward_loop(
             bulk_more: &[],
         };
         let counter = Cell::new(0u64);
-        let drafter = if drafting {
+        let drafter = if dspark_drafter {
             let noise =
                 spec::gather_rows(&cuda, &inputs, &counter, &[config.dspark_noise_token_id])?;
             Some(draft::DraftState::open(device, arena, dir, noise)?)
+        } else if stated_drafter {
+            Some(draft::DraftState::open_stated(
+                device,
+                arena,
+                chunk.max(rows::R_MAX),
+            )?)
         } else {
             None
         };
-        let tap_kernel = drafter.as_ref().map(|drafter| {
-            let (tap_kernel, sink) = drafter.tap_sink();
+        let k = match (drafter.is_some(), stated_k) {
+            (true, _) => crate::plan::draft_depth(stated_k)?,
+            (false, None | Some(0)) => 0,
+            (false, Some(asked)) => {
+                return Err(format!(
+                    "SPARKFLASH_DSPARK_K={asked}: this release declares no drafter"
+                ));
+            }
+        };
+        if k + 1 > rows::R_MAX {
+            return Err(format!(
+                "SPARKFLASH_DSPARK_K={k}: a pass holds {rows} rows",
+                rows = rows::R_MAX
+            ));
+        }
+        let tap_kernel = drafter.as_ref().and_then(|drafter| {
+            let (tap_kernel, sink) = drafter.tap_sink()?;
             rows.taps = Some((tap_kernel, sink, config.dspark_target_layer_ids.clone()));
-            tap_kernel
+            Some(tap_kernel)
         });
-        // The bulk prefill's rows state, [prefill_chunk] rows per chunk.
-        let chunk = prefill_chunk();
+        let dflash_tap = drafter.as_ref().and_then(draft::DraftState::dflash_tap);
+        if let Some(ref tap) = dflash_tap {
+            rows.dflash_tap = Some(tap.clone());
+        }
         // `sparkflash serve --tp4-device` installs a link before the epoch: serve its requests
         // instead of the one-shot generation.
         let link = crate::device_link::take();
@@ -18768,11 +18785,13 @@ fn run_forward_loop(
             })?;
         }
         for state in bulk_rows.iter_mut().chain(more_rows.iter_mut()) {
-            let Some(tap_kernel) = tap_kernel else {
-                break;
-            };
-            let taps = state.bulk.as_ref().map_or(0, |bulk| bulk.taps);
-            state.taps = Some((tap_kernel, taps, config.dspark_target_layer_ids.clone()));
+            if let Some(tap_kernel) = tap_kernel {
+                let taps = state.bulk.as_ref().map_or(0, |bulk| bulk.taps);
+                state.taps = Some((tap_kernel, taps, config.dspark_target_layer_ids.clone()));
+            }
+            if let Some(ref tap) = dflash_tap {
+                state.dflash_tap = Some(tap.clone());
+            }
         }
         let inputs = spec::SpecInputs {
             bulk: bulk_rows.as_ref(),

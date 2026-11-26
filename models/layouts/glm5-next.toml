@@ -148,7 +148,13 @@ order = [
 ]
 
 [stacks.draft]
-order = ["mtp"]
+order = [
+  "rms_norm",
+  "mla_attention",
+  "sparse_indexer",
+  "moe",
+  "mtp",
+]
 
 [stacks.vision]
 order = [
@@ -545,7 +551,7 @@ when = { attention = "mla" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.q_a_proj.weight"
 slot = "mtp.{stage}.attn.wq_a.weight"
-part = "mtp"
+part = "mla_attention"
 role = "mtp"
 dtype = "dense"
 shape = ["q_lora", "hidden"]
@@ -567,7 +573,7 @@ when = { attention = "mla" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.q_a_layernorm.weight"
 slot = "mtp.{stage}.attn.q_norm.weight"
-part = "mtp"
+part = "mla_attention"
 role = "mtp"
 dtype = "bf16"
 shape = ["q_lora"]
@@ -589,7 +595,7 @@ when = { attention = "mla" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.q_b_proj.weight"
 slot = "mtp.{stage}.attn.wq_b.weight"
-part = "mtp"
+part = "mla_attention"
 role = "mtp"
 dtype = "dense"
 shape = ["heads * nope", "q_lora"]
@@ -611,7 +617,7 @@ when = { attention = "mla" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.kv_a_proj_with_mqa.weight"
 slot = "mtp.{stage}.attn.wkv.weight"
-part = "mtp"
+part = "mla_attention"
 role = "mtp"
 dtype = "dense"
 shape = ["kv_lora", "hidden"]
@@ -633,7 +639,7 @@ when = { attention = "mla" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.kv_a_layernorm.weight"
 slot = "mtp.{stage}.attn.kv_norm.weight"
-part = "mtp"
+part = "mla_attention"
 role = "mtp"
 dtype = "bf16"
 shape = ["kv_lora"]
@@ -655,7 +661,7 @@ when = { attention = "mla" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.kv_b_proj.weight"
 slot = "mtp.{stage}.attn.wkv_b.weight"
-part = "mtp"
+part = "mla_attention"
 role = "mtp"
 dtype = "bf16"
 shape = ["heads * (nope + v_head)", "kv_lora"]
@@ -678,7 +684,7 @@ when = { attention = "mla" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.o_proj.weight"
 slot = "mtp.{stage}.attn.wo.weight"
-part = "mtp"
+part = "mla_attention"
 role = "mtp"
 dtype = "dense"
 shape = ["hidden", "heads * v_head"]
@@ -701,7 +707,7 @@ when = { attention = "mla", indexer = true }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.wq_b.weight"
 slot = "mtp.{stage}.attn.indexer.wq_b.weight"
-part = "mtp"
+part = "sparse_indexer"
 role = "mtp"
 dtype = "bf16"
 shape = ["index_heads * index_dim", "q_lora"]
@@ -723,7 +729,7 @@ when = { attention = "mla", indexer = true }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.wk.weight"
 slot = "mtp.{stage}.attn.indexer.wk.weight"
-part = "mtp"
+part = "sparse_indexer"
 role = "mtp"
 dtype = "bf16"
 shape = ["index_dim", "hidden"]
@@ -745,7 +751,7 @@ when = { attention = "mla", indexer = true }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.k_norm.weight"
 slot = "mtp.{stage}.attn.indexer.k_norm.weight"
-part = "mtp"
+part = "sparse_indexer"
 role = "mtp"
 dtype = "bf16"
 shape = ["index_dim"]
@@ -767,7 +773,7 @@ when = { attention = "mla", indexer = true }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.k_norm.bias"
 slot = "mtp.{stage}.attn.indexer.k_norm.bias"
-part = "mtp"
+part = "sparse_indexer"
 role = "mtp"
 dtype = "bf16"
 shape = ["index_dim"]
@@ -789,7 +795,7 @@ when = { attention = "mla", indexer = true }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.weights_proj.weight"
 slot = "mtp.{stage}.attn.indexer.weights_proj.weight"
-part = "mtp"
+part = "sparse_indexer"
 role = "mtp"
 dtype = "bf16"
 shape = ["index_heads", "hidden"]
@@ -811,7 +817,7 @@ when = { attention = "mla", indexer = true }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.index_kpool_compress_gate"
 slot = "mtp.{stage}.attn.indexer.kpool_gate"
-part = "mtp"
+part = "sparse_indexer"
 role = "mtp"
 dtype = "bf16"
 shape = ["index_dim", "hidden"]
@@ -834,7 +840,7 @@ when = { attention = "mla", indexer = true }
 [[tensor]]
 name = "model.language_model.layers.{layer}.self_attn.indexer.index_kpool_compress_ape"
 slot = "mtp.{stage}.attn.indexer.kpool_ape"
-part = "mtp"
+part = "sparse_indexer"
 role = "mtp"
 dtype = "bf16"
 shape = ["index_pool", "index_dim"]
@@ -890,7 +896,7 @@ when = { ffn = "moe" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.mlp.gate.weight"
 slot = "mtp.{stage}.ffn.gate.weight"
-part = "mtp"
+part = "moe"
 role = "mtp"
 dtype = "bf16"
 shape = ["routed", "hidden"]
@@ -912,7 +918,7 @@ when = { ffn = "moe" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.mlp.gate.e_score_correction_bias"
 slot = "mtp.{stage}.ffn.gate.bias"
-part = "mtp"
+part = "moe"
 role = "mtp"
 dtype = "f32"
 shape = ["routed"]
@@ -934,7 +940,7 @@ when = { ffn = "moe" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.mlp.shared_experts.gate_proj.weight"
 slot = "mtp.{stage}.ffn.shared_experts.w1.weight"
-part = "mtp"
+part = "moe"
 role = "mtp"
 dtype = "dense"
 shape = ["shared_width", "hidden"]
@@ -956,7 +962,7 @@ when = { ffn = "moe" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.mlp.shared_experts.up_proj.weight"
 slot = "mtp.{stage}.ffn.shared_experts.w3.weight"
-part = "mtp"
+part = "moe"
 role = "mtp"
 dtype = "dense"
 shape = ["shared_width", "hidden"]
@@ -978,7 +984,7 @@ when = { ffn = "moe" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.mlp.shared_experts.down_proj.weight"
 slot = "mtp.{stage}.ffn.shared_experts.w2.weight"
-part = "mtp"
+part = "moe"
 role = "mtp"
 dtype = "dense"
 shape = ["hidden", "shared_width"]
@@ -1025,7 +1031,7 @@ when = { ffn = "moe" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight"
 slot = "mtp.{stage}.ffn.experts.{expert}.w1.weight"
-part = "mtp"
+part = "moe"
 role = "mtp"
 dtype = "expert"
 shape = ["moe_intermediate", "hidden"]
@@ -1036,7 +1042,7 @@ when = { ffn = "moe" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.mlp.experts.{expert}.up_proj.weight"
 slot = "mtp.{stage}.ffn.experts.{expert}.w3.weight"
-part = "mtp"
+part = "moe"
 role = "mtp"
 dtype = "expert"
 shape = ["moe_intermediate", "hidden"]
@@ -1047,7 +1053,7 @@ when = { ffn = "moe" }
 [[tensor]]
 name = "model.language_model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"
 slot = "mtp.{stage}.ffn.experts.{expert}.w2.weight"
-part = "mtp"
+part = "moe"
 role = "mtp"
 dtype = "expert"
 shape = ["hidden", "moe_intermediate"]
@@ -1099,7 +1105,7 @@ repeat = "mtp"
 [[tensor]]
 name = "model.language_model.layers.{layer}.input_layernorm.weight"
 slot = "mtp.{stage}.attn_norm.weight"
-part = "mtp"
+part = "rms_norm"
 role = "mtp"
 dtype = "bf16"
 shape = ["hidden"]
@@ -1109,7 +1115,7 @@ repeat = "mtp"
 [[tensor]]
 name = "model.language_model.layers.{layer}.post_attention_layernorm.weight"
 slot = "mtp.{stage}.ffn_norm.weight"
-part = "mtp"
+part = "rms_norm"
 role = "mtp"
 dtype = "bf16"
 shape = ["hidden"]
