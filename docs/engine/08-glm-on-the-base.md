@@ -30,7 +30,7 @@ names the number it got.
 | V1 value table by part | landed | `43fa53db`, `36323243` |
 | V2 the split is data | landed | `83f22afe`, `f9782ba0` (resident plan) |
 | V3 facts leave the crate | in part: the base reads the description; the crate's own parse and `include_str!`s remain until S5 | `43fa53db` |
-| A1 absorbed MLA | landed on the stated walk, and measured against the base's four-launch split: the base's split wins at every sequence, so it is kept (section 3) | `cca81db7`, `63e6c220`, `84a98d8d` |
+| A1 absorbed MLA | landed on the stated walk, and measured against the base's four-launch split: the base's split wins at every sequence, so it is kept (section 3). A7 extends it to 8 rows and to the release's own windows: at 13,312, 100,000 and 1,048,576 positions the split is 22x to 33x faster (section 3) | `cca81db7`, `63e6c220`, `84a98d8d`, `2744c47b` |
 | A2 latent cache | landed: `attention.latent_cache` selects E4M3 or f32, a prefix is adopted, the ring slides, and the 1M window is proved in the stated code's own test | `99989c80` |
 | A3 pooled indexer | landed | `cca81db7`, `63e6c220` |
 | A4 bulk prefill attention | landed and kept: GLM's body beats the base's four-launch split by 2.0x to 7.3x (section 3) | `562e0a5b` |
@@ -47,8 +47,8 @@ names the number it got.
 | W2 synthetic writer | landed for the `glm` and `glm-wiring` variants | `45ec0a05`, `b716c1a3` |
 | S1-S5 serving, codec, kernels, numerics v4, deletion | not started | |
 | Proof: synthetic, worlds 1, 2, 4 | `glm-wiring` PASS at all three worlds (largest seam median 1.63e-2, 2.77e-2, 2.65e-2 against the 7e-2 bar); `glm` reported | section 3 |
-| Proof: producer capture | PASS on decisive BF16 `glm-tiny` (both expanded and absorbed meet the unchanged 1e-2 / 20-of-20 / 0.02 bar); dynamic FP8 on GPU still owed (A.3) | `68074500`, `0f526464`, section 3 |
-| Proof: conformance on the `glm` variant | PASS, 8 of 8, under `--ignored` (the form `scripts/onboard-gate.sh` uses) | section 3 |
+| Proof: producer capture | PASS on decisive BF16 `glm-tiny` (both expanded and absorbed meet the unchanged 1e-2 / 20-of-20 / 0.02 bar); the GPU run over the release's dynamic FP8 scheme is still owed (A.3), and its two blockers are closed: the checkpoint now carries the tower the producer initialises (`glm-tiny-tower`, zero missing keys) and the capture's inputs follow the model's device | `68074500`, `0f526464`, `edccea24`, `89b08da4`, section 3 |
+| Proof: conformance on the `glm` variant | PASS, 8 of 8, under `--ignored` (the form `scripts/onboard-gate.sh` uses). The run that writes and then compares a bit record is still owed: the 2026-11-26 window ran the suite against a stale fixture checkpoint and all eight checks failed at boot (section 3) | section 3 |
 | Proof: released DeepSeek unchanged | PASS: pre-milestone-4 `2f99fbe7` against HEAD, manifests, launch traces and tick identical on all four ranks | section 3 |
 | Proof: real checkpoint, tower, served gate | not started: the work stopped before the real-checkpoint window, as section 7 fixes | |
 
@@ -535,6 +535,38 @@ synthetic checkpoint, as in milestone 3.
         (only the DeepSeek image is loadable from a cubin directory). The rebuild with
         `PATH=/usr/local/cuda/bin:$PATH` is the fix; the checks themselves never ran, so no
         record was written and nothing about GLM's bits was measured either way.
+  * **The third window (2026-11-26, `1def661c`): the build fault closed, and neither test reached its
+    arithmetic.** One four-node window, production DeepSeek stopped for 3 m 50 s and restored
+    (`269f7b99`, `/readyz` 200, 4/4 ranks, same model card).
+    * **The build now finds its toolkit.** With `nvcc` off `PATH` (the non-interactive shell the
+      launcher uses), `build.rs` fell back to the installed toolkit and found
+      `/usr/local/cuda-13.0/bin/nvcc`; all four cargo commands exited 0 and the build log carries
+      no warning line at all, where the two previous windows logged "CPU reference kernels only".
+      That is `0b43725d`, and it is the fault A.4 recorded, closed.
+    * **A.4 did not run.** The suite booted and every one of the eight checks failed:
+      `alone_equals_four` on a token mismatch, the rest with `the walk server has ended`, and one
+      walk-server thread panicked in `gumbel.rs` with `range end index 1 out of range for slice of
+      length 0`. The cause is the fixture, in two parts. The checkpoint the window named
+      (`glm-s2-ckpt`) was written before this tree's fixture, so the plan and the stored weights
+      disagree; and a checkpoint regenerated from the current fixture could not be opened at all,
+      because the fixture now carried the vision tower and the plan then asks for
+      `vision_patch_embed`, `vision_position`, `vision_norm`, `vision_attention`, `vision_mlp`,
+      `vision_downsample` and `vision_merger`, for which no kernel candidate exists until I1-I3.
+      The tower therefore moved to its own fixture (`glm-tiny-tower`, for the producer capture),
+      the text-only fixture is what the device arm opens, and the record-directory run stays owed.
+      The suite also reads `reference/tokenizer.json` from the repository root, so it must be run
+      from there.
+    * **A.3 measured nothing, and for a fault of ours.** The producer loaded the checkpoint and
+      then died in its first `index_select`: `Expected all tensors to be on the same device, but
+      got index is on cpu, different from other tensors on cuda:0`. The capture built its id
+      tensor on the CPU while `from_pretrained` had put the model on `cuda:0`. The ids, mask and
+      positions now follow the model's device (`89b08da4`); the run itself is owed.
+    * **A.7 is measured.** The absorbed MLA at 8 rows and at the release's windows, four-launch
+      against one-launch: at 13,312 positions 361.6 us against 9,195.3 us (0.04x), at 100,000
+      334.2 us against 9,196.5 us (0.04x), at 1,048,576 293.5 us against 9,217.9 us (0.03x). The
+      base's split wins by 22x to 33x there, and the margin grows with the window because the
+      one-launch body is one block a head whatever the sequence is.
+
   * On the real checkpoint, a producer-side stack that serves it (vLLM has, on these four nodes)
     is teacher-forced on the anchor's tokens once, before the move. That distance is recorded
     for the crate build. The base build must be no further from the producer than the crate
