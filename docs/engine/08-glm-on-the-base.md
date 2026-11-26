@@ -453,6 +453,13 @@ synthetic checkpoint, as in milestone 3.
         drawn 3x wider (`write_described_checkpoint`'s recipe; no rule, epsilon, width or
         clamp changes), the same unchanged bars give:
 
+        Status of the rest of the owner's list (2026-11-26): A.1 is done and below, A.2 is
+        partial (this table), and A.3 to A.8, B, C, D and E are not started in this tree.
+        A.3 (the release's dynamic scheme on a GPU host), A.4 (a record directory for
+        `bits_equal_the_record`), A.5 (the stated stack loading converted ranks), A.6 (the
+        residual's cost at the 34 foreign boundaries), A.7 (A1 at eight rows and the 1M
+        window's positions) and A.8 (a live RDMA exchange) each need the four-node window.
+
         | form | top-1 | mean abs NLL | largest position rel L2 |
         |---|---|---|---|
         | expanded (the producer's own order) | 20 of 20 (bar: all) | 5.007e-3 (bar 0.02) | 2.538e-1 (bar 1e-2) |
