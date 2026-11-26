@@ -176,11 +176,12 @@ Pick widths that make every split real at two and four ranks. A fixture too narr
 proves nothing there.
 
 The bar is the same token ids as the reference. When they differ, find out why before you
-relax anything. Dump each layer's output on both sides and look at the per-row distance:
+relax anything. Dump each layer's output on both sides and look at the per-row distance
+(`scripts/seam-diff.py layers HOST DEVICE`):
 
 * Every row drifts, starting early: the wiring is wrong. Fix it.
 * A few rows jump at a router or a selection layer, and the rest hold: a random fixture's
-  near-tie flipped under rounding. Recompute the margins to confirm.
+  near-tie flipped under rounding. Recompute the margins to confirm (`seam-diff.py router`).
 
 A tie band or a seam gate exists for the second case. Both are last resorts, both are
 measured, and both need the owner's sign-off.

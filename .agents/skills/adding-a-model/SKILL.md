@@ -398,6 +398,7 @@ runs and is wrong is the failure this stage exists to catch.
    A tie gate is a last resort. Try first to make the fixture's routers and selections decisive
    (larger margins) so exact ids hold.
 5. **When ids miss, diagnose before relaxing anything.**
+   `scripts/seam-diff.py` does steps 2 to 4 from the two dumps (`layers`, `rows`, `router`).
    1. Dump both sides' per-layer boundaries on the failing prompt.
    2. Compute each layer's per-row relative L2 distance: the median and the rows past ten times
       the median.
