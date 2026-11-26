@@ -205,6 +205,38 @@ synthetic checkpoint, as in milestone 3.
   `owed-cluster-window.sh`, `onboard-gate.sh`, `numerics.py`. The `qwen4-exp` tests exercise GLM
   kernels.
 
+### 1.4 The release's stored formats, module by module (2026-11-26, its own index)
+
+The layout's `dtype` is checked against 76,108 indexed tensors of revision
+`03eb5366286afd40d2221b1d9c63a6dd1ba4832e`, by asking which tensors carry a
+`weight_scale_inv` sibling. That sibling is what makes a tensor an FP8 tile class; without it
+the checkpoint stores the tensor unquantised.
+
+| module | stored |
+|---|---|
+| KDA `q_proj`, `k_proj`, `v_proj`, `q_conv1d`, `k_conv1d`, `v_conv1d`, `b_proj`, `f_a_proj`, `f_b_proj`, `g_a_proj`, `g_b_proj` | BF16 |
+| KDA `o_proj` | BF16 |
+| MLA `kv_a_proj_with_mqa`, `q_a_proj`, `q_b_proj`, `o_proj` | FP8 tiles |
+| MLA `kv_b_proj` | BF16 |
+| indexer `wk`, `wq_b`, `weights_proj` | BF16 |
+| dense and shared `gate_proj`, `up_proj`, `down_proj`, routed experts | FP8 tiles |
+| the whole vision tower (patch embed, qkv, proj, MLP, downsample, merger) | BF16 |
+| `embed_tokens`, `lm_head`, every norm, every bias | BF16 (and f32 for the mix tables) |
+
+The layout states exactly this, so rule 2's stored formats are right. What is not right is the
+producer: `transformers` decides which linears become FP8 modules from the quantization
+config's `modules_to_not_convert` list, and that list names only `attn_mha`, `attn_mqa`,
+`dt_bias`, `hyper_connection`, `lm_head` and `mapping_proj`. Every module the table above calls
+BF16 and the list omits - the KDA projections, `kv_b`, the indexer, the tower - is built as an
+FP8 module, finds no `weight_scale_inv` in the checkpoint, and carries a zero inverse scale, so
+every value derived from it is NaN. That is what the fourth window's A.3 run measured:
+`producer_quantized: true`, 0 of 20 positions agreeing, logits all NaN.
+
+`scripts/producer-capture.py` now reads the answer from the checkpoint's own index - a module
+with no `.weight_scale_inv` is unquantised - and passes that list through
+`modules_to_not_convert` before it builds the producer, recording `stored_unquantised_modules`
+in its report. The real checkpoint is read the same way, so the same list applies to it. The
+capture has not yet been run with it, so A.3 remains owed.
 ## 2. The rules
 
 1. **Nothing changes for the released DeepSeek** unless the change is declared under rule 3.
