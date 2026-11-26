@@ -2597,10 +2597,23 @@ const LATENT_BLOCK: usize = 128;
 /// The bodies are GLM's own (`q4e_glm_mla_*`). With `stated` they take the producer's types:
 /// the projections and norms BF16, the absorbed query, the logits, the softmax and the mixed
 /// latent f32, the probabilities and the head outputs BF16.
+/// GMA_HEADS / GMA_LATENT: `glm_prefill_mla_attend`'s head tile and required latent width.
+const BULK_MLA_HEADS: usize = 16;
+const BULK_MLA_LATENT: usize = 512;
+
+/// Optional bulk prefill attention kernels (`Image::GlmAttention`): fused tensor-core attention
+/// over E4M3 latents (`glm_prefill_mla_attend`) and per-head BF16 MMA (`glm_prefill_heads_bf16_mma`).
+#[derive(Debug, Clone, Copy)]
+struct BulkAbsorbed {
+    attend: Bound,
+    heads_bf16: Bound,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct AbsorbedMla {
     geometry: AbsorbedGeometry,
     kernels: [Bound; 8],
+    bulk: Option<BulkAbsorbed>,
 }
 
 /// The shape of an [AbsorbedMla] on one rank.
@@ -2634,6 +2647,9 @@ pub struct AbsorbedWeights<'a, L: ?Sized> {
     /// The rank's `kv_b` rows widened to f32, `[heads][nope + value][latent]`, the value rows
     /// transposed to `[latent][value]` after a head's key rows.
     pub kv_b: Deviceptr,
+    /// Optional raw BF16 `kv_b` (`[heads][nope + value][latent]`) and transposed key rows
+    /// (`[heads][latent][nope]`), used by `glm_prefill_heads_bf16_mma` during bulk prefill (A4).
+    pub kv_b_bf16: Option<(Deviceptr, Deviceptr)>,
 }
 
 /// The pass's attention scratch, f32 row-major a pass row each.
@@ -2712,14 +2728,37 @@ impl AbsorbedMla {
     ///
     /// # Errors
     /// As [Self::geometry] and [KernelTable::load].
+    /// The bulk prefill attention kernels from [Image::GlmAttention].
+    #[must_use]
+    pub const fn bulk_table() -> KernelTable<2> {
+        KernelTable {
+            image: Image::GlmAttention,
+            symbols: [
+                ("glm_prefill_mla_attend", Precision::Bf16),
+                ("glm_prefill_heads_bf16_mma", Precision::Bf16),
+            ],
+        }
+    }
+
     pub fn open(
         cuda: &Cuda,
         geometry: AbsorbedGeometry,
         precision: Precision,
     ) -> Result<Self, String> {
+        let geometry = Self::geometry(geometry)?;
+        let kernels = Self::table(precision).load(cuda)?;
+        let bulk = if geometry.latent == BULK_MLA_LATENT && geometry.value.is_multiple_of(128) {
+            Self::bulk_table()
+                .load(cuda)
+                .ok()
+                .map(|[attend, heads_bf16]| BulkAbsorbed { attend, heads_bf16 })
+        } else {
+            None
+        };
         Ok(Self {
-            geometry: Self::geometry(geometry)?,
-            kernels: Self::table(precision).load(cuda)?,
+            geometry,
+            kernels,
+            bulk,
         })
     }
 
@@ -2819,7 +2858,124 @@ impl AbsorbedMla {
             latent,
             ..
         } = self.geometry;
-        cx.project(weights.q_b, rows.q_latent, rows.query, cx.rows())?;
+        let total_rows = cx.rows();
+        cx.project(weights.q_b, rows.q_latent, rows.query, total_rows)?;
+        // A4: multi-row E4M3 prefill on the 512-wide latent uses glm_prefill_mla_attend (and
+        // glm_prefill_heads_bf16_mma when BF16 kv_b is present), unless disabled for A/B timing.
+        let use_bulk = quantise
+            && total_rows > 1
+            && self.bulk.is_some()
+            && !matches!(std::env::var("SPARKFLASH_ABSORBED_BULK").as_deref(), Ok("0"));
+        if let Some(bulk) = self.bulk.filter(|_| use_bulk) {
+            let row_tiles = total_rows.div_ceil(128) as u32;
+            match weights.kv_b_bf16 {
+                Some((_, key_t)) => cx.launch(
+                    bulk.heads_bf16,
+                    (((latent / 128) as u32, row_tiles, heads as u32), (BLOCK, 1, 1)),
+                    &[
+                        key_t.0,
+                        rows.query.0,
+                        rows.absorbed.0,
+                        latent as u64,
+                        nope as u64,
+                        total_rows as u64,
+                        (heads * nope) as u64,
+                        (heads * latent) as u64,
+                        nope as u64,
+                        latent as u64,
+                        (latent * nope * 2) as u64,
+                    ],
+                )?,
+                None => cx.launch(
+                    self.kernels[2],
+                    (
+                        (heads as u32, total_rows as u32, latent.div_ceil(BLOCK as usize) as u32),
+                        (BLOCK, 1, 1),
+                    ),
+                    &[
+                        rows.query.0,
+                        weights.kv_b.0,
+                        rows.absorbed.0,
+                        0,
+                        nope as u64,
+                        value as u64,
+                        latent as u64,
+                        u64::from(stated),
+                    ],
+                )?,
+            }
+            let score_div = u64::from((nope as f32).sqrt().to_bits());
+            for segment in cx.segments() {
+                let [cache, scales, ..] = *segment.regions else {
+                    return Err(absorbed_regions(segment.regions.len()));
+                };
+                cx.launch(
+                    bulk.attend,
+                    (
+                        (
+                            segment.rows as u32,
+                            1,
+                            heads.div_ceil(BULK_MLA_HEADS) as u32,
+                        ),
+                        (BLOCK, 1, 1),
+                    ),
+                    &[
+                        rows.absorbed.0,
+                        cache.0,
+                        scales.0,
+                        selected.0,
+                        count.0,
+                        segment.first as u64,
+                        MAX_SELECTED_TOKENS as u64,
+                        score_div,
+                        heads as u64,
+                    ],
+                )?;
+            }
+            match weights.kv_b_bf16 {
+                Some((raw_kv_b, _)) => {
+                    let per_head = nope + value;
+                    let value_weight = raw_kv_b.offset(nope * latent * 2);
+                    cx.launch(
+                        bulk.heads_bf16,
+                        (((value / 128) as u32, row_tiles, heads as u32), (BLOCK, 1, 1)),
+                        &[
+                            value_weight.0,
+                            rows.absorbed.0,
+                            rows.heads.0,
+                            value as u64,
+                            latent as u64,
+                            total_rows as u64,
+                            (heads * latent) as u64,
+                            (heads * value) as u64,
+                            latent as u64,
+                            value as u64,
+                            (per_head * latent * 2) as u64,
+                        ],
+                    )?;
+                }
+                None => cx.launch(
+                    self.kernels[6],
+                    (
+                        (heads as u32, (value as u32).div_ceil(MLA_PROJECT_THREADS), 1),
+                        (MLA_PROJECT_THREADS, 1, 1),
+                    ),
+                    &[
+                        rows.absorbed.0,
+                        weights.kv_b.0,
+                        count.0,
+                        rows.heads.0,
+                        0,
+                        total_rows as u64,
+                        nope as u64,
+                        value as u64,
+                        latent as u64,
+                        u64::from(stated),
+                    ],
+                )?,
+            }
+            return cx.project(weights.out, rows.heads, output, total_rows);
+        }
         for segment in cx.segments() {
             let [cache, scales, ..] = *segment.regions else {
                 return Err(absorbed_regions(segment.regions.len()));

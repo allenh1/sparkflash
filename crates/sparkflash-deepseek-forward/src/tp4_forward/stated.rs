@@ -99,6 +99,8 @@ struct AbsorbedTensors {
     out: TiledMatrix,
     norms: (Deviceptr, Deviceptr),
     kv_b: Deviceptr,
+    /// Optional raw BF16 `kv_b` and transposed key rows for A4 bulk prefill MMA.
+    kv_b_bf16: Option<(Deviceptr, Deviceptr)>,
     indexer: Option<IndexerTensors>,
 }
 
@@ -371,7 +373,7 @@ impl DeviceLayer<'_> {
         name: &str,
         geometry: AbsorbedGeometry,
         allocations: &mut Vec<Deviceptr>,
-    ) -> Result<Deviceptr, String> {
+    ) -> Result<(Deviceptr, Option<(Deviceptr, Deviceptr)>), String> {
         let AbsorbedGeometry {
             heads,
             nope,
@@ -381,10 +383,29 @@ impl DeviceLayer<'_> {
         } = geometry;
         let rows = heads * (nope + value);
         let stored = matrix(arena, name, (rows, latent))?;
+        let mut bf16_pair = None;
         let decoded: Vec<f32> = match stored.scales {
             None => {
                 let mut bits = vec![0u8; rows * latent * 2];
                 self.cuda.copy_dtoh(&mut bits, &stored.weight)?;
+                // A4: transpose each head's [nope][latent] BF16 key rows to [latent][nope] BF16
+                // for glm_prefill_heads_bf16_mma when latent == 512 and value is 128-aligned.
+                if latent == 512 && value.is_multiple_of(128) {
+                    let mut key_t = vec![0u8; heads * latent * nope * 2];
+                    for head in 0..heads {
+                        let first = head * (nope + value);
+                        for k in 0..nope {
+                            for col in 0..latent {
+                                let src = ((first + k) * latent + col) * 2;
+                                let dst = ((head * latent + col) * nope + k) * 2;
+                                key_t[dst] = bits[src];
+                                key_t[dst + 1] = bits[src + 1];
+                            }
+                        }
+                    }
+                    let key_t_dev = self.stated_upload(&key_t, allocations)?;
+                    bf16_pair = Some((stored.weight, key_t_dev));
+                }
                 bits.chunks_exact(2)
                     .map(|word| {
                         sparkflash_weights::quant::bf16_to_f32(u16::from_le_bytes([
@@ -429,7 +450,7 @@ impl DeviceLayer<'_> {
             }
         }
         let bytes: Vec<u8> = laid.iter().flat_map(|value| value.to_le_bytes()).collect();
-        self.stated_upload(&bytes, allocations)
+        Ok((self.stated_upload(&bytes, allocations)?, bf16_pair))
     }
 
     /// Opens a stated stack's device state from the arena: the shared bodies at the producer's
@@ -658,6 +679,14 @@ impl DeviceLayer<'_> {
                     } else {
                         None
                     };
+                    let (kv_b, kv_b_bf16) = self
+                        .stated_kv_b(
+                            arena,
+                            claim(layer, "attn.wkv_b.weight")?,
+                            geometry,
+                            &mut allocations,
+                        )
+                        .map_err(what)?;
                     MixerTensors::Absorbed(AbsorbedTensors {
                         q_a: m("attn.wq_a.weight", (q_lora, dim))?,
                         kv_a: m("attn.wkv.weight", (latent, dim))?,
@@ -669,9 +698,8 @@ impl DeviceLayer<'_> {
                             self.stated_vector(arena, claim(layer, "attn.kv_norm.weight")?, (latent, false), &mut allocations)
                                 .map_err(what)?,
                         ),
-                        kv_b: self
-                            .stated_kv_b(arena, claim(layer, "attn.wkv_b.weight")?, geometry, &mut allocations)
-                            .map_err(what)?,
+                        kv_b,
+                        kv_b_bf16,
                         indexer,
                     })
                 }
@@ -1184,6 +1212,7 @@ impl DeviceLayer<'_> {
                     out: &out,
                     norms: absorbed.norms,
                     kv_b: absorbed.kv_b,
+                    kv_b_bf16: absorbed.kv_b_bf16,
                 };
                 let indexer = absorbed
                     .indexer
