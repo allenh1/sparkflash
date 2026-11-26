@@ -5942,9 +5942,15 @@ impl DeviceLayer<'_> {
                         sampler
                             .pick_truncated(&slots, n, row, world, *index as u32)
                             .ok_or_else(|| {
+                                let at = row * words;
+                                let m = slots.get(at).copied().map(f32::from_bits);
+                                let z = slots.get(at + 1).copied().map(f32::from_bits);
+                                let first_l = slots.get(at + 2).copied().map(f32::from_bits);
+                                let first_id = slots.get(at + 3).copied();
                                 format!(
                                     "rows head: the top-c slots hold no candidate for row {row} \
-                                     of {n} over {world} rank(s); the head wrote no {} word slot",
+                                     of {n} over {world} rank(s); the head wrote no {} word slot \
+                                     (rank0 m={m:?} z={z:?} slot0=({first_l:?}, {first_id:?}))",
                                     super::sample::TOPC_WORDS
                                 )
                             })?,
