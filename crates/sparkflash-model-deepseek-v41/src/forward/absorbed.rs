@@ -205,6 +205,74 @@ pub(crate) fn absorbed_attention_forward(
     // The attention through the latent, per position and head.
     let scale = inverse_sqrt(head_dim + config.rope_head_dim);
     let mut mixed_heads = vec![0.0f32; positions * heads * value_dim];
+    if latent_form.expanded {
+        // The producer's own order (D125's parity mode): every cached position's latent is
+        // expanded through `wkv_b` once into per-head keys and values, and each lands in the
+        // producer's type, BF16, because `kv_b` is a module output. The absorbed form below is
+        // the same linear map evaluated in another order; it never makes these two roundings.
+        let total = cache.positions;
+        let mut keys = vec![0.0f32; total * heads * head_dim];
+        let mut values = vec![0.0f32; total * heads * value_dim];
+        for position in 0..total {
+            let cached = &cache.latent[position * rank..][..rank];
+            for head in 0..heads {
+                let rows = &expand[head * (head_dim + value_dim) * rank..][..head_dim * rank];
+                let key = &mut keys[(position * heads + head) * head_dim..][..head_dim];
+                for (slot, row) in key.iter_mut().zip(rows.chunks(rank)) {
+                    *slot = quant::bf16_round(row.iter().zip(cached).map(|(w, c)| w * c).sum());
+                }
+                let rows =
+                    &expand[(head * (head_dim + value_dim) + head_dim) * rank..][..value_dim * rank];
+                let value = &mut values[(position * heads + head) * value_dim..][..value_dim];
+                for (slot, row) in value.iter_mut().zip(rows.chunks(rank)) {
+                    *slot = quant::bf16_round(row.iter().zip(cached).map(|(w, c)| w * c).sum());
+                }
+            }
+        }
+        for (row, chosen) in selection.iter().enumerate() {
+            let mut logits = vec![0.0f32; chosen.len()];
+            for head in 0..heads {
+                let query = &queries[(row * heads + head) * head_dim..][..head_dim];
+                for (logit, &position) in logits.iter_mut().zip(chosen) {
+                    let key = &keys[(position * heads + head) * head_dim..][..head_dim];
+                    // The producer's own types (`modeling_glm5_next.py` 1089): a BF16 matmul
+                    // rounds its output, and the scale multiplies that BF16 value, so the
+                    // logit the softmax sees is `bf16(bf16(q.k) * scale)`.
+                    let dot = quant::bf16_round(
+                        query.iter().zip(key).map(|(q, k)| q * k).sum::<f32>(),
+                    );
+                    *logit = quant::bf16_round(dot * scale);
+                }
+                linalg::softmax(&mut logits);
+                let head_out = &mut mixed_heads[(row * heads + head) * value_dim..][..value_dim];
+                head_out.fill(0.0);
+                for (probability, &position) in logits.iter().zip(chosen) {
+                    let probability = if config.stated().bf16_stream {
+                        quant::bf16_round(*probability)
+                    } else {
+                        *probability
+                    };
+                    let value = &values[(position * heads + head) * value_dim..][..value_dim];
+                    for (slot, v) in head_out.iter_mut().zip(value) {
+                        *slot += probability * v;
+                    }
+                }
+            }
+        }
+        stated::hold(config, &mut mixed_heads);
+        let projected = stated::project(
+            config,
+            source,
+            &format!("{attn}.wo"),
+            dim,
+            heads * value_dim,
+            &mixed_heads,
+            grid,
+            limit,
+        )?;
+        out[..projected.len()].copy_from_slice(&projected);
+        return Ok(own.then_some(selection));
+    }
     let mut absorbed = vec![0.0f32; rank];
     let mut mixed = vec![0.0f32; rank];
     for (row, chosen) in selection.iter().enumerate() {

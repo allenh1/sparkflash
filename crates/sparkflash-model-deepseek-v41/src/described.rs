@@ -246,14 +246,17 @@ pub fn from_facts(
         .get("language.mla_attention.form")
         .and_then(FactValue::as_text)
     {
-        Some("absorbed") => Some(crate::config::AbsorbedLatent {
+        Some(form @ ("absorbed" | "expanded")) => Some(crate::config::AbsorbedLatent {
             kv_lora_rank: int(facts, "kv_lora_rank")?,
             v_head_dim: int(facts, "v_head_dim")?,
+            // `expanded` is the producer's order, for the host reference's parity check (D125);
+            // a rank serves the absorbed form.
+            expanded: form == "expanded",
         }),
         Some("latent") | None => None,
         Some(other) => {
             return Err(format!(
-                "the layout states the MLA form `{other}`; the base knows `latent` (one key/value latent every head reads) and `absorbed` (the V3 form through kv_b)"
+                "the layout states the MLA form `{other}`; the base knows `latent` (one key/value latent every head reads), `absorbed` (the V3 form through kv_b) and `expanded` (the producer's own order, for the host reference's parity check)"
             ));
         }
     };

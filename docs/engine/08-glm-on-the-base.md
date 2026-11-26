@@ -419,11 +419,34 @@ synthetic checkpoint, as in milestone 3.
       `4.34e-01`. Native FP8 producer comparison requires a CUDA/XPU host.
     **What the capture leaves owed.**
     * The absorbed block's 3.6e-3 to 3.9e-3 is declared a reorder (D125), on the condition that
-      the host reference's expanded mode meets the producer at zero or one ulp. That mode is not
-      written yet.
+      the host reference's expanded mode meets the producer at zero or one ulp. **Done
+      (2026-11-26).** The host reference runs the producer's own order through
+      `mla_attention.form = expanded` (a layout value; a rank serves `absorbed`), and
+      `dump-host-logits --mla-form expanded` selects it for a capture. On a genuine BF16
+      `glm-tiny` (seed 7, 20 tokens), each side given the other's own pre-attention hidden
+      state:
+
+      | layer | expanded vs producer, entries within 1 BF16 ulp | expanded vs producer, median | absorbed vs expanded, median | absorbed vs expanded, max |
+      |---|---|---|---|---|
+      | 3 (the first MLA block, identical inputs) | 100.0% | 0.000e+00 | 3.897e-3 | 5.287e-3 |
+
+      Expanded reproduces the producer's `kv_b` expansion, its BF16 keys and values and its
+      BF16 logits (`modeling_glm5_next.py` 1165, 1089) to the last ulp, so the wiring is
+      proved and the 3.9e-3 is the two intermediate BF16 roundings the absorbed form never
+      makes. Absorbed sits at 3.897e-3 median against the 1e-2 bar D125 set before this run.
+      The layers after 3 diverge in their *inputs* (the absorbed form's own rounding
+      propagates), so only layer 3 is a same-input comparison.
     * The end-to-end bar is not met and is not widened. Both misses are fixture ties, so the
       fixture is made decisive (no exact-zero pool scores at the selection's edge, router margins
       above the reorder) and the capture is run again against the same bar.
+      * **Measured on the BF16 fixture (2026-11-26).** The two misses are exactly the recorded
+        pair: `L6` position 11 is a pool tie where the host's pool score and the producer's are
+        both exactly `0.0` and the two `topk` implementations order them differently, and `L4`
+        position 13 is a router margin of `0.0022` between experts 0 and 7, under the absorbed
+        form's `3.897e-3`. Both are properties of a near-uniform random fixture, not of the
+        stack: the expanded mode, which reproduces the producer's arithmetic to the ulp, fails
+        at the same positions and the same sizes (`L6` max `1.003e+00`, `L7` max `1.060e+00`).
+        The decisive fixture is the next line of this section.
     * The pool tie itself: where several pools score exactly zero at the selection's edge, the
       producer's `topk` order is not specified and differs between its CPU and CUDA builds, so
       it is not a model fact. How often the real checkpoint's selection admits zero-score pools

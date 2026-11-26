@@ -35,6 +35,9 @@ const TOKENS: [u32; 20] = [
 fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1).peekable();
     let mut boundaries_dir: Option<PathBuf> = None;
+    // D125's parity mode: `expanded` runs the producer's own order in the host reference, so the
+    // absorbed form's distance from it is measured on the same inputs. A rank serves `absorbed`.
+    let mut mla_form: Option<bool> = None;
     while let Some(flag) = args.peek() {
         if flag == "--boundaries" {
             args.next();
@@ -42,16 +45,28 @@ fn main() -> Result<(), String> {
                 .next()
                 .ok_or("--boundaries needs a directory path")?;
             boundaries_dir = Some(PathBuf::from(dir));
+        } else if flag == "--mla-form" {
+            args.next();
+            let form = args.next().ok_or("--mla-form needs absorbed or expanded")?;
+            mla_form = Some(match form.as_str() {
+                "absorbed" => false,
+                "expanded" => true,
+                other => {
+                    return Err(format!(
+                        "--mla-form {other}: the host reference knows absorbed and expanded"
+                    ));
+                }
+            });
         } else {
             break;
         }
     }
     let checkpoint = args
         .next()
-        .ok_or("usage: dump-host-logits [--boundaries DIR] CHECKPOINT_DIR OUT.json [TOKEN ...]")?;
+        .ok_or("usage: dump-host-logits [--boundaries DIR] [--mla-form absorbed|expanded] CHECKPOINT_DIR OUT.json [TOKEN ...]")?;
     let out = args
         .next()
-        .ok_or("usage: dump-host-logits [--boundaries DIR] CHECKPOINT_DIR OUT.json [TOKEN ...]")?;
+        .ok_or("usage: dump-host-logits [--boundaries DIR] [--mla-form absorbed|expanded] CHECKPOINT_DIR OUT.json [TOKEN ...]")?;
     let tokens: Vec<u32> = args
         .map(|token| token.parse().map_err(|error| format!("token {token}: {error}")))
         .collect::<Result<_, _>>()?;
@@ -63,7 +78,13 @@ fn main() -> Result<(), String> {
     let directory = Path::new(&checkpoint);
     let text = std::fs::read_to_string(directory.join("config.json"))
         .map_err(|error| format!("{checkpoint}/config.json: {error}"))?;
-    let config = host_config(&text).map_err(|error| format!("the description: {error}"))?;
+    let mut config = host_config(&text).map_err(|error| format!("the description: {error}"))?;
+    if let Some(expanded) = mla_form {
+        let latent = config.absorbed_latent.as_mut().ok_or_else(|| {
+            format!("--mla-form: the description states no absorbed latent to run either way")
+        })?;
+        latent.expanded = expanded;
+    }
     let source = sparkflash_model::layout::open_checkpoint(
         directory,
         &directory.join("model.safetensors.index.json"),

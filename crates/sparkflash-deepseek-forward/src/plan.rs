@@ -2124,6 +2124,7 @@ mod tests {
                     Some(sparkflash_engine::config::AbsorbedLatent {
                         kv_lora_rank: 512,
                         v_head_dim: 256,
+                        expanded: false,
                     })
                 );
                 assert_eq!(values.rope_head_dim, 0);

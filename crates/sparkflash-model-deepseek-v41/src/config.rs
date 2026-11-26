@@ -249,6 +249,12 @@ pub struct AbsorbedLatent {
     pub kv_lora_rank: usize,
     /// One head's value width (`v_head_dim`).
     pub v_head_dim: usize,
+    /// The producer's own order, for parity checks (D125): expand every cached position through
+    /// `wkv_b` into per-head keys and values, round both to BF16 where the producer's module
+    /// output is, and score and mix them. The absorbed form (`false`) is the same linear map
+    /// evaluated in another order and is what a rank serves; this is the host reference's second
+    /// mode, so the absorbed form's distance from it can be measured on the same inputs.
+    pub expanded: bool,
 }
 
 /// The wiring a description states beside the release's, each from a layout fact cited to the
