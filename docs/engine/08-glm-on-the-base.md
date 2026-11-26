@@ -566,6 +566,35 @@ synthetic checkpoint, as in milestone 3.
       334.2 us against 9,196.5 us (0.04x), at 1,048,576 293.5 us against 9,217.9 us (0.03x). The
       base's split wins by 22x to 33x there, and the margin grows with the window because the
       one-launch body is one block a head whatever the sequence is.
+  * **The fourth window (2026-11-26, `04e585f5`): A.4 boots and A.3 reaches the kernel.** Another
+    four-node window, production DeepSeek stopped for 3 m 11 s and restored (`269f7b99`,
+    `/readyz` 200, 4/4 ranks, model card byte-identical).
+    * **The checkpoint now opens.** `scripts/second-shape.py run --stored-format glm` wrote the
+      variant from this tree's fixture (plan hash `1170f041`, `8 layers, 38 part instances, dense
+      Fp8E4M3, experts Fp8E4M3`) and the conformance arm booted it. The stale-fixture refusal is
+      gone; the tower-free text fixture is what the arm opens.
+    * **A.4 still fails, and now on a real fault, not a fixture.** All eight checks failed in both
+      runs (`exit 139`), deterministically. `alone_equals_four` returned different tokens from the
+      four-lane run (`[26264, 15026, 0, 2, 6]` against `[26264, 0, 5, 2, 4]`);
+      `bits_equal_the_record` panicked at `gumbel.rs:225` with `range end index 1 out of range for
+      slice of length 0`, i.e. the sampler was handed an empty candidate row; the walk server then
+      died and the remaining six checks reported `the walk server has ended`. The record directory
+      stayed empty, so no bit record was written. Until this window the record check always
+      SKIPped for want of a directory, so the sampled path had never run here: the panic is a
+      fault the record check exists to find, and it is ours to close before A.4 can pass.
+    * **A.3 reached the FP8 kernel and stopped on a missing wheel.** The producer loaded the
+      tower-carrying checkpoint, ran its own quantizer, and raised
+      `ImportError: finegrained-fp8 kernel unavailable: \`kernels\` is either not installed or uses
+      an incompatible version ... (0.18.2 <= version < 0.19.0)` on the first FP8 linear, so no
+      capture was written. `transformers` 5.x routes fine-grained FP8 through the Hub `kernels`
+      package, which the GPU venv did not have; `kernels 0.18.3` is now installed in
+      `~/.venvs/glm-producer-gpu2`. The init-time `normal_kernel_cuda` fault is gone, so the next
+      run is the one that measures.
+    * **A note for the launcher's environment.** The brief's rank order (rank 1 on
+      `sg1-jackson`, rank 3 on `sg1-carter`) does not match the live group (rank 1 on
+      `sg1-carter`, rank 3 on `sg1-jackson`). A stop that trusts the brief's order leaves ranks 1
+      and 3 serving; the launcher's own recorded command is the authority.
+
 
   * On the real checkpoint, a producer-side stack that serves it (vLLM has, on these four nodes)
     is teacher-forced on the anchor's tokens once, before the move. That distance is recorded
