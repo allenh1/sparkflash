@@ -582,6 +582,11 @@ synthetic checkpoint, as in milestone 3.
       stayed empty, so no bit record was written. Until this window the record check always
       SKIPped for want of a directory, so the sampled path had never run here: the panic is a
       fault the record check exists to find, and it is ours to close before A.4 can pass.
+      The sampler no longer indexes an empty list: `pick_truncated` returns `None` when no
+      rank's slice contributed a candidate (the shape a world of zero slices makes), the row
+      head refuses by name with the row, the row count and the world, and
+      `a_world_of_no_slices_has_no_candidate_to_pick` holds it. The next run therefore names
+      the world it was handed instead of taking the walk server down with it.
     * **A.3 reached the FP8 kernel and stopped on a missing wheel.** The producer loaded the
       tower-carrying checkpoint, ran its own quantizer, and raised
       `ImportError: finegrained-fp8 kernel unavailable: \`kernels\` is either not installed or uses
