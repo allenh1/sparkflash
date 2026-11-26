@@ -440,7 +440,7 @@ host; the report names the thirteen device targets a CUDA host should run rather
 they passed.
 ### The GLM capture, and what a four-rank boot needs
 
-The arm does boot at world 4 on the branch. Three windows on the cluster (head `sg1-oneill`, four
+The arm does boot at world 4 on the branch. Three windows on the cluster (head node0, four
 DGX Sparks, GLM-5.3-Flash over 1,048,576 tokens) established it, and the third measured it:
 
 * Window one failed in 8 s with `the bootstrap gather's plan digest differs by rank (rank 0 sent

@@ -514,7 +514,9 @@ synthetic checkpoint, as in milestone 3.
   (93,386 records on ranks 0 to 2, 93,394 on rank 3), the launch traces are identical, the tick
   trace is identical, decode and prefill speeds are inside the tolerance, drafting accepts 524
   of 667 on both, and the harness reports `1 of 1 repetitions clean`. Prefill reads 7,147.8
-  tok/s against 6,354.4 tok/s, +12.5% from the shared bodies this milestone touched.
+  tok/s against 6,354.4 tok/s. That 12.5% is one repetition's spread, not a gain: no kernel
+  source changed between the two builds, both ran the same cubins and their launch traces are
+  identical. The alternated repetitions rule 1 asks for are still owed.
 
   **Two faults the window itself found, both in the new code and both fixed (`c0793f36`).** The
   stated draft stack resolved the whole embedding table from `device.embed_table`, which the
@@ -530,9 +532,9 @@ synthetic checkpoint, as in milestone 3.
 
   **Environment notes, for the next window.** `target/m3-cubins` is the released DeepSeek's
   staging directory: 62 cubins, none of them GLM's or Qwen's, so a GLM window needs its own
-  `scripts/build-cubins.sh` output (153 cubins). The head node's name `spark0` does not resolve
-  from any of the four hosts; rank 0 runs locally through `SPARK_LOCAL_RANKS=0` and every ssh
-  goes to `sg1-carter.local`, `sg1-teilc.local` or `sg1-jackson.local`.
+  `scripts/build-cubins.sh` output (153 cubins). The launcher's default head name `spark0` does
+  not resolve from any of the four hosts; rank 0 runs locally through `SPARK_LOCAL_RANKS=0` and
+  every ssh goes to node1, node2 or node3 by its own name.
 
   **Still open.** The live RDMA exchange is not proved for GLM: `scripts/serve-four-node.sh`
   pins `SPARK_COMM_REDUCE=nccl` whenever a cubin directory is staged, and the device arm always
