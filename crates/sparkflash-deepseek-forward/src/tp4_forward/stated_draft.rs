@@ -249,7 +249,7 @@ impl DFlash2Draft {
         let [quantize_e4m3, embed_bound, add_bound] = KernelTable {
             image: Image::TOKEN,
             symbols: [
-                ("q4e_quantize_e4m3_rows", Precision::Fp8E4M3),
+                ("q4e_quantize_e4m3_rows", Precision::Bf16),
                 ("q4e_embed", Precision::Bf16),
                 ("q4e_add", Precision::F32),
             ],
@@ -272,7 +272,7 @@ impl DFlash2Draft {
             .map_err(|error| format!("stated dflash2: {error}"))?;
         let [capture_bound] = KernelTable {
             image: Image::Dflash2,
-            symbols: [("q4d_capture", Precision::F32)],
+            symbols: [("q4d_capture", Precision::Bf16)],
         }
         .load(cuda)?;
         let capture_kernel = capture_bound.kernel();
@@ -704,12 +704,12 @@ impl MtpDraft {
         let [q_b, g_b, e_b, r_b, a_b, p_b] = KernelTable {
             image: Image::TOKEN,
             symbols: [
-                ("q4e_quantize_e4m3_rows", Precision::Fp8E4M3),
+                ("q4e_quantize_e4m3_rows", Precision::Bf16),
                 ("q4e_gemv_tiled_e4m3", Precision::Fp8E4M3),
                 ("q4e_embed", Precision::Bf16),
                 ("q4e_rmsnorm", Precision::Bf16),
                 ("q4e_add", Precision::F32),
-                ("q4e_argmax_prob_slices", Precision::F32),
+                ("q4e_argmax_prob_slices", Precision::Fp8E4M3),
             ],
         }
         .load(cuda)?;

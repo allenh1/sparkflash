@@ -248,22 +248,20 @@ fn main() -> Result<(), String> {
         value_dim: 128,
         taps: 4,
     };
-    let [conv_rows, conv_hist, kda_prep, kda_scan] = KernelTable {
+    let [conv_rows, conv_hist, kda_prep, kda_scan, gated_norm] = KernelTable {
         image: Image::SCAN,
         symbols: [
-            ("q4p_conv_rows", Precision::Bf16),
-            ("q4p_conv_history", Precision::F32),
+            (ChunkConv::SYMBOLS[0], Precision::Bf16),
+            (ChunkConv::SYMBOLS[1], Precision::F32),
             (KdaChunk::PREP, Precision::F32),
             ("q4p_kda_scan", Precision::F32),
+            ("q4p_gdn_gate", Precision::Bf16),
         ],
     }
     .load(&cuda)?;
-    let [kda_decay, gated_norm] = KernelTable {
+    let [kda_decay] = KernelTable {
         image: Image::TOKEN,
-        symbols: [
-            (KdaChunk::DECAY, Precision::Bf16),
-            ("q4e_gated_norm", Precision::Bf16),
-        ],
+        symbols: [(KdaChunk::DECAY, Precision::Bf16)],
     }
     .load(&cuda)?;
     let chunk = KdaChunk::new(

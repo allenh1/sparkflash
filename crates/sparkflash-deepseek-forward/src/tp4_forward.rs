@@ -18665,6 +18665,7 @@ fn run_forward_loop(
                 spec::gather_rows(&cuda, &inputs, &counter, &[config.dspark_noise_token_id])?;
             Some(draft::DraftState::open(device, arena, dir, noise)?)
         } else if stated_drafter {
+            device.replicate_embedding(bind.tail.embed.0)?;
             Some(draft::DraftState::open_stated(
                 device,
                 arena,
@@ -18716,7 +18717,9 @@ fn run_forward_loop(
         if link.is_some() && crate::device_link::vision_enabled(dir) {
             device.open_vision(dir, request.weights, chunk.max(rows::R_MAX))?;
         }
-        device.replicate_embedding(bind.tail.embed.0)?;
+        if device.embed_table.is_none() {
+            device.replicate_embedding(bind.tail.embed.0)?;
+        }
         let lane_count = planned_lanes(link.is_some() || walk.is_some())?;
         if lane_count > 0 {
             device.attach_lanes(&lanes::LaneGeometry {
