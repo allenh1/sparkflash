@@ -18638,7 +18638,8 @@ fn run_forward_loop(
                 .speculation
                 .drafter
                 .is_some()
-                || crate::plan::has_stated_mtp());
+                || (crate::plan::has_stated_mtp()
+                    && arena.slice("mtp.0.enorm.weight").is_some()));
         let dspark_drafter = crate::plan::dspark_block_size() > 0;
         let staged: Vec<Option<SeamStagedWeights>> = (0..n_layers)
             .map(|layer| seam_wq_b.as_ref().and_then(|seam| seam.staged_for(layer)))

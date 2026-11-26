@@ -38,11 +38,11 @@ fn quantize_lm_head_e4m3(
     dim: usize,
     allocations: &mut Vec<Deviceptr>,
 ) -> Result<GpuMatE4m3, String> {
-    let lm_head = slice(arena, "lm_head.weight")?;
+    let lm_head = slice(arena, "head.weight")?;
     let expected = local_vocab * dim * 2;
     if lm_head.bytes != expected {
         return Err(format!(
-            "stated draft head: lm_head.weight holds {} bytes, not [{local_vocab}, {dim}] BF16",
+            "stated draft head: head.weight holds {} bytes, not [{local_vocab}, {dim}] BF16",
             lm_head.bytes
         ));
     }
@@ -499,6 +499,12 @@ impl DFlash2Draft {
 /// Per-lane caches for GLM's MTP layer (`mtp.0.*`).
 #[derive(Clone, Copy)]
 struct MtpLane {
+    /// `[R_MAX][dim]` f32: backbone normed hidden states for positions `recent_p0..recent_p0+recent_n`.
+    /// Holding the whole verify pass's hidden states lets MTP pick the exact accepted row
+    /// `block.d - 1` even when a verify step rejects some drafts.
+    recent_hiddens: Deviceptr,
+    recent_p0: usize,
+    recent_n: usize,
     last_hidden: Deviceptr,
     latent: Deviceptr,
     latent_scales: Deviceptr,
@@ -798,6 +804,10 @@ impl MtpDraft {
             extra.push(ptr);
             Ok(ptr)
         };
+        let recent_hiddens = alloc(super::rows::R_MAX * device.dim * 4)?;
+        device
+            .cuda
+            .memset_d8_async(recent_hiddens, 0, super::rows::R_MAX * device.dim * 4)?;
         let last_hidden = alloc(device.dim * 4)?;
         device.cuda.memset_d8_async(last_hidden, 0, device.dim * 4)?;
         let latent_row = if stated.e4m3_latent { latent } else { latent * 4 };
@@ -825,6 +835,9 @@ impl MtpDraft {
             (Deviceptr(0), Deviceptr(0), Deviceptr(0))
         };
         let entry = MtpLane {
+            recent_hiddens,
+            recent_p0: 0,
+            recent_n: 0,
             last_hidden,
             latent: latent_buf,
             latent_scales,
@@ -982,6 +995,16 @@ impl MtpDraft {
             }
             let last_h = state.head.offset((seg.row0 + seg.n - 1) * dim * 4);
             device.cuda.copy_dtod_async(&lane.last_hidden, &last_h, dim * 4)?;
+            let keep = seg.n.min(super::rows::R_MAX);
+            let skip = seg.n - keep;
+            let src = state.head.offset((seg.row0 + skip) * dim * 4);
+            device
+                .cuda
+                .copy_dtod_async(&lane.recent_hiddens, &src, keep * dim * 4)?;
+            if let Some(entry) = self.lanes.borrow_mut().get_mut(&lane_id) {
+                entry.recent_p0 = seg.p0 + skip;
+                entry.recent_n = keep;
+            }
         }
         Ok(())
     }
@@ -1012,7 +1035,17 @@ impl MtpDraft {
         let mut out = Vec::with_capacity(blocks.len());
         for block in blocks {
             let lane = self.ensure_lane(device, block.lane)?;
-            device.cuda.copy_dtod_async(&self.cur_hidden, &lane.last_hidden, dim * 4)?;
+            let target_pos = block.d.saturating_sub(1);
+            let src_hidden = if lane.recent_n > 0
+                && target_pos >= lane.recent_p0
+                && target_pos < lane.recent_p0 + lane.recent_n
+            {
+                lane.recent_hiddens
+                    .offset((target_pos - lane.recent_p0) * dim * 4)
+            } else {
+                lane.last_hidden
+            };
+            device.cuda.copy_dtod_async(&self.cur_hidden, &src_hidden, dim * 4)?;
             let mut cur_tok = block.anchor;
             let mut mtp_pos = block.d.saturating_sub(1);
             let mut ids = Vec::with_capacity(k);
