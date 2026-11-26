@@ -138,7 +138,7 @@ def stored_bf16_modules(checkpoint: Path) -> list[str]:
     # A norm, an embedding, the head and a bias are not linears a quantizer would take; naming
     # them would be noise in the report. Everything else the index stores without a scale is a
     # BF16 linear.
-    not_a_linear = ("norm", "embed_tokens", "lm_head", "ape", "bias")
+    not_a_linear = ("norm", "embed_tokens", "ape", "bias")
     bare = {
         name[: -len(".weight")]
         for name in weight_map
