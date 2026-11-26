@@ -936,6 +936,13 @@ impl Layout {
             facts.insert(fact.clone(), layout_value(value, self, fact)?);
         }
         for (stack_name, stack) in &self.stacks {
+            // A checkpoint without an optional stack (for instance a text-only or synthetic
+            // checkpoint with no vision_config) does not carry that stack's config keys, and
+            // apply_facts treats its facts as inert; skip reading them so a required key on an
+            // absent stack does not refuse the checkpoint.
+            if stack_name == "vision" && architecture.vision.is_none() {
+                continue;
+            }
             for part in &stack.parts {
                 for fact in &part.facts {
                     let (fact_path, value, key_path) =
@@ -3471,5 +3478,19 @@ split = "whole"
         let carried: Vec<&str> = coverage.carried_facts().collect();
         assert_eq!(carried, ["language.mlp_bias"]);
         assert!(architecture.embedding_tied_to_head);
+    }
+
+    #[test]
+    fn a_tower_free_checkpoint_skips_the_layouts_vision_stack_facts() {
+        let mut root: Value = serde_json::from_str(include_str!(
+            "../../../models/configs/glm53_flash.hf.json"
+        ))
+        .expect("released GLM config");
+        root.as_object_mut()
+            .expect("root object")
+            .remove("vision_config");
+        let architecture = Architecture::from_json(&root.to_string())
+            .expect("a tower-free GLM checkpoint opens without vision_config keys");
+        assert!(architecture.vision.is_none());
     }
 }

@@ -5008,9 +5008,10 @@ mod tests {
             // parse carries those four facts and does not hash at the field's default. Its
             // digest moved with the DeepSeek one, by the same joint expert-format field.
             0x7946_daf1_9c6c_9d3a,
-            // GLM, Inkling and the two Qwen releases carry the same joint expert-format field, so
-            // all four digests moved with DeepSeek's on the same measurement.
-            0x25a3_8b8d_51cf_6d38,
+            // GLM's layout states its vision tower's wiring (RMSNorm at rms_norm_eps, q/k norm,
+            // attention bias, SwiGLU MLP and merger, conv downsample; d9029a63), moving its digest
+            // from 0x25a3_8b8d_51cf_6d38.
+            0xb288_89c1_f3b4_1a15,
             // Inkling's layout learns the tower's rotary-plus-grid position, LayerNorm and
             // erf-GELU wiring, its relative-attention switches, and its [vars] resolve the MTP
             // and convolution shape facts.
