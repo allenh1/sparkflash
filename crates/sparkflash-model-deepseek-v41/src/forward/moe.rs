@@ -1169,9 +1169,18 @@ fn stated_expert_body(
         &mut out[..dim],
     )?;
     if let Some(weight) = weight {
-        let weight = bf16(weight);
-        for value in &mut out[..dim] {
-            *value = bf16(*value * weight);
+        // The FP8 grouped-mm body multiplies in BF16 (`finegrained_fp8.py:694`); the plain BF16
+        // grouped-mm body (`moe.py:523-535`) multiplies in f32 and sums in f32 before casting once
+        // to BF16.
+        if cfg.stated().activation_tile != 0 {
+            let weight = bf16(weight);
+            for value in &mut out[..dim] {
+                *value = bf16(*value * weight);
+            }
+        } else {
+            for value in &mut out[..dim] {
+                *value *= weight;
+            }
         }
     }
     Ok(())

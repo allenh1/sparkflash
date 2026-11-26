@@ -351,6 +351,59 @@ synthetic checkpoint, as in milestone 3.
     With the types aligned, that tolerance is a reorder's. This checks the wiring part by part:
     the mix and its epsilons, the pool and the tail, the router, the head fold, the activation
     recipe, and where each f32 cast sits.
+
+    **Tolerance, written before the run (2026-11-25, before the capture below has run).** Both
+    sides read the same checkpoint, the same 20-token prompt (five pools of four) and the same
+    config's BF16 type map; the only expected difference is the order of the f32 sums inside
+    BF16-owned modules (torch's matmul reduction order and kernels against ours). The host
+    reference must be inside, at every position:
+    * logit relative L2 distance, `||ours - producer|| / ||producer||` over the 512-wide row,
+      at most **1e-2** (half of rule 2's version-4 NLL ceiling, expressed on the row the head
+      emits);
+    * top-1 agreement **20 of 20** positions, and every position's argmax is the same token;
+    * mean absolute NLL delta, over the 20 positions, at most **0.02 nat** (rule 2's ceiling).
+
+    A miss is a changed function or a wrong type. It is found and fixed in the layout, the part
+    or the body; the tolerance is not widened after the run. The check is
+    `scripts/producer-capture.py`, which runs the producer and compares the two logit files.
+
+    **Results (2026-11-25, CPU BF16, `transformers` at `42efcfde46e668067a74bbd439d33f107b4a7c6c`).**
+    Running the capture found and fixed two real discrepancies:
+    1. `sparkflash-weights/src/safetensors.rs`: `write_checkpoint` padded tensor data to 8-byte
+       boundaries, leaving 4-byte holes after 12-byte F32 tensors (`hc_attn_scale`, `hc_ffn_scale`,
+       shape `[3]`), which `safetensors` 0.8.0 rejects with `InvalidOffset`. Writing contiguous
+       tensor bytes fixes checkpoint interoperability.
+    2. `sparkflash-model-deepseek-v41/src/forward/moe.rs` (`stated_expert_body`): on plain BF16
+       checkpoints (`activation_tile == 0`), `transformers`'s `grouped_mm_experts_forward`
+       (`transformers/integrations/moe.py:523-535`) multiplies each expert output by the f32
+       routing weight and accumulates in f32 before casting once to BF16, whereas the FP8 grouped
+       path (`finegrained_fp8.py:694`) multiplies in BF16. Matching that split dropped same-input
+       MoE distance on layers 3, 4 and 5 from `3.18e-3` to `0.0000e+00` across all 20 positions,
+       and end-to-end pos 0 logit distance from `9.31e-3` to `1.66e-3` (`0.0000e+00` before
+       `lm_head`'s BF16 output rounding).
+
+    Same-input sublayer check (`scripts/producer-capture.py --boundaries`, pure BF16 `glm-tiny`,
+    seed 7):
+
+    | sublayer | pos 0 rel L2 | median rel L2 | max rel L2 | cause of any non-zero |
+    |---|---|---|---|---|
+    | KDA (L0, L1, L2, L4, L5) | `0.0000e+00` | `0.0000e+00` | `1.54e-03` | 1-ULP BF16 half-way ties on 5/100 rows |
+    | Dense MLP (L0, L1, L2) | `0.0000e+00` | `0.0000e+00` | `2.03e-04` | 1-ULP sum order |
+    | MoE (L3, L4, L5, L6, L7) | `0.0000e+00` (L3-L6) | `0.0000e+00` | `1.10e-03` (L7) | 1-ULP sum order |
+    | Absorbed MLA + pooled/shared indexer (L3, L6, L7) | `0.0000e+00` | `3.64e-03`–`3.90e-03` | `5.29e-03` (L3); `9.99e-01` (L6 pos 11) | absorbed vs producer's expanded BF16 MLA (`~3.9e-3`); L6 pos 11 exact `0.0 == 0.0` pool tie on 2-head `ReLU` |
+    | Head fold + norm + `lm_head` (f32) | `0.0000e+00` | `0.0000e+00` | `1.21e-07` | bit-exact |
+
+    End-to-end logits against the unchanged pre-run bar on `glm-tiny` (seed 7, 20 tokens):
+    * **Pure BF16** (same arithmetic on CPU): 19/20 top-1 agree, mean `|NLL delta| = 1.285e-02`
+      (inside the `0.02` bar), pos 0 `1.66e-03`, median `1.04e-02`, max `3.49e-01` (**FAIL** on
+      the two synthetic tie positions: L6 pos 11 exact `0.0 == 0.0` pool tie broken to Pool 1 by
+      PyTorch CPU `topk` vs Pool 0 by `top_pools`; and L4 pos 13 router margin `0.0022` between
+      experts 0 and 7 flipped by the `3.9e-3` absorbed-vs-expanded BF16 reorder).
+    * **FP8 `glm-tiny/config.json` on CPU**: `transformers` falls back to dequantizing FP8 weights
+      to BF16 and disabling dynamic activation quantization on CPU (`Using FP8 quantized models
+      requires a GPU or XPU`), adding `~4.5e-3` weight truncation per FP8 projection; against host
+      `activation_scheme: dynamic` that gives 18/20 top-1, mean `|NLL delta| = 3.93e-02`, max
+      `4.34e-01`. Native FP8 producer comparison requires a CUDA/XPU host.
   * On the real checkpoint, a producer-side stack that serves it (vLLM has, on these four nodes)
     is teacher-forced on the anchor's tokens once, before the move. That distance is recorded
     for the crate build. The base build must be no further from the producer than the crate

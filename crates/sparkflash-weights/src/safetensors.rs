@@ -1387,9 +1387,10 @@ pub fn write_checkpoint(
                     ),
                 });
             }
-            while !data.len().is_multiple_of(8) {
-                data.push(0);
-            }
+            // The format requires each tensor's offsets to start exactly where the previous one
+            // ended (safetensors' own validate: an offset that is not the running start is
+            // InvalidOffset). Padding a tensor to an alignment writes a hole no reader accepts,
+            // so the data is contiguous: the producer's loader opens what this writer wrote.
             let mut shape = spec.shape.clone();
             let dtype = match spec.dtype {
                 DType::F4E2M1 => {
