@@ -447,6 +447,26 @@ synthetic checkpoint, as in milestone 3.
         stack: the expanded mode, which reproduces the producer's arithmetic to the ulp, fails
         at the same positions and the same sizes (`L6` max `1.003e+00`, `L7` max `1.060e+00`).
         The decisive fixture is the next line of this section.
+      * **The fixture's router is drawn three times wider (2026-11-26).** On the BF16 fixture
+        the router's top-2 margins sat under the absorbed form's 3.9e-3, so an expert flipped
+        and the capture measured the near-tie rather than the stack. With the router's logits
+        drawn 3x wider (`write_described_checkpoint`'s recipe; no rule, epsilon, width or
+        clamp changes), the same unchanged bars give:
+
+        | form | top-1 | mean abs NLL | largest position rel L2 |
+        |---|---|---|---|
+        | expanded (the producer's own order) | 20 of 20 (bar: all) | 5.007e-3 (bar 0.02) | 2.538e-1 (bar 1e-2) |
+        | absorbed | 19 of 20 | 5.817e-3 (bar 0.02) | 2.539e-1 (bar 1e-2) |
+
+        So the top-1 and NLL bars are met by the producer's own order, and the per-position
+        bar is not: position 11 still fails, identically in both forms (2.538e-1 against
+        2.539e-1), which is the pool tie and not the absorbed reorder. Two things were tried
+        and measured rather than assumed: drawing the indexer's queries and keys wider does
+        not help (scaling moves no sign, so an all-negative pool stays all-negative: the
+        distance stayed at 2.538e-1), and making every pool selectable (`index_topk` raised
+        past the pool count) makes it worse (3.616e-1). What remains is a seed or draw whose
+        pool scores are distinct at the selection's edge; that is the next attempt, and the
+        bar is not moved.
     * The pool tie itself: where several pools score exactly zero at the selection's edge, the
       producer's `topk` order is not specified and differs between its CPU and CUDA builds, so
       it is not a model fact. How often the real checkpoint's selection admits zero-score pools

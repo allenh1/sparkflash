@@ -64,7 +64,19 @@ fn value_at(spec: &TensorSpec, rng: &mut TensorRng) -> f32 {
     if name.contains("e_score_correction_bias") {
         return 0.05 * rng.signed();
     }
-    rng.signed() * matrix_width(spec.shape.last().copied().unwrap_or(1))
+    // The producer-capture fixture's own recipe (doc 08, "the fixture is made decisive"): on a
+    // near-uniform draw the router's top-2 margins sit under the absorbed form's 3.9e-3
+    // reorder, so an expert flips and the capture measures the fixture's near-tie instead of
+    // the stack. A trained model's router is not near-tied, so the router's logits are drawn
+    // three times wider here. No rule, epsilon, width or clamp changes: the fixture is better
+    // conditioned, not a different model. (The indexer's queries and keys are deliberately
+    // left alone: scaling them moves no sign, so it cannot break an all-negative pool.)
+    let spread = if name.contains("ffn.gate.weight") {
+        3.0
+    } else {
+        1.0
+    };
+    rng.signed() * matrix_width(spec.shape.last().copied().unwrap_or(1)) * spread
 }
 
 /// The bytes of one planned tensor.
