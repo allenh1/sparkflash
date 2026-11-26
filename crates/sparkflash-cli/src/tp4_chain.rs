@@ -828,6 +828,21 @@ fn resident_argv(args: &ChainArgs) -> Vec<String> {
     resident_args
 }
 
+/// The rank-log line a refused forward produces, or `None` for a run that executed. A refusal is
+/// the group's to stop on: it is reported before the blocking collective walk (never after it),
+/// so a world above 1 cannot hang with the reason only in `tp4-token-r<rank>.json`.
+fn refusal_before_walk(
+    rank: usize,
+    outcome: &crate::tp4_forward::TokenStageOutcome,
+) -> Option<String> {
+    outcome.is_refused().then(|| {
+        format!(
+            "forward refused on rank {rank}: {}",
+            outcome.error().unwrap_or("no reason recorded")
+        )
+    })
+}
+
 /// C1 of the device loop: per-rank plan setup, arena streaming and attention binding only.
 /// No forward pass, no token - the evidence says setup_only: true and must not be read as a step.
 fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
@@ -1172,6 +1187,18 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
     } else {
         false
     };
+    // A refused forward ends the rank HERE, before the group's collective walk. The walk is a
+    // blocking rendezvous: a rank that enters it after its own forward refused waits on peers
+    // that are waiting on it, so the group never becomes ready and the refusal exists only in
+    // this rank's tp4-token file. The refusal is already written as evidence above; the error
+    // reaches stderr (the rank log) and the process exits, which is what stops the group - the
+    // launcher sees the dead rank and tears the rest down.
+    if let Some(reason) = forward_outcome
+        .as_ref()
+        .and_then(|outcome| refusal_before_walk(args.rank, outcome))
+    {
+        return Err(reason);
+    }
     let (transport_evidence, walk_evidence) = if args.peers.is_empty() {
         (
             serde_json::json!({"opened": false, "note": "no --comm-peers: transport not opened"}),
@@ -1327,12 +1354,8 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
         if !forward_evidence_written {
             lines.extend(write_forward_evidence(args, &outcome)?);
         }
-        if outcome.is_refused() {
-            return Err(format!(
-                "forward refused on rank {}: {}",
-                args.rank,
-                outcome.error().unwrap_or("no reason recorded")
-            ));
+        if let Some(reason) = refusal_before_walk(args.rank, &outcome) {
+            return Err(reason);
         }
     }
     Ok(lines)
@@ -1939,5 +1962,22 @@ mod forward_args_tests {
         );
         let error = parse_with(&["--loop", "--forward", "--token-ids", ","]).expect_err("empty");
         assert!(error.contains("at least one token id"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_forward_is_reported_before_the_group_walk() {
+        let outcome = crate::tp4_forward::TokenStageOutcome::Refused(
+            crate::tp4_token::TokenEnvelope::refused(
+                2,
+                4,
+                "layer 3: the KDA body refused".to_string(),
+            ),
+        );
+        let reason = refusal_before_walk(2, &outcome).expect("a refusal is a stop");
+        assert_eq!(
+            reason,
+            "forward refused on rank 2: layer 3: the KDA body refused"
+        );
+        assert!(reason.contains("forward refused on rank"), "{reason}");
     }
 }
