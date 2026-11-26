@@ -1647,7 +1647,7 @@ pub const fn is_attention(part: Part) -> bool {
 /// until its body takes interleaved chunks, and the scan says so.
 #[must_use]
 pub const fn interleaves(part: Part) -> bool {
-    !matches!(part, Part::GqaAttention | Part::GdnScan | Part::KdaScan)
+    !matches!(part, Part::GqaAttention | Part::GdnScan)
 }
 
 /// The first language block part with no body for interleaved prompt chunks ([interleaves]), and

@@ -1650,4 +1650,27 @@ mod tests {
         assert!(latent_cache_fp8_for(Some(sparkflash_model::profile::LatentCacheMode::Fp8)));
         assert!(!latent_cache_fp8_for(Some(sparkflash_model::profile::LatentCacheMode::F32)));
     }
+
+    #[test]
+    fn k4_kda_interleaves_prompt_chunks_while_gdn_stays_refused() {
+        assert!(crate::plan::interleaves(sparkflash_model::Part::KdaScan));
+        assert!(!crate::plan::interleaves(sparkflash_model::Part::GdnScan));
+        assert!(!crate::plan::interleaves(sparkflash_model::Part::GqaAttention));
+
+        let description = glm_description(4);
+        let non_interleaving = description
+            .plan()
+            .stacks()
+            .iter()
+            .filter(|stack| stack.kind == sparkflash_model::StackKind::Language)
+            .flat_map(|stack| &stack.blocks)
+            .find_map(|block| {
+                block
+                    .parts
+                    .iter()
+                    .find(|instance| !crate::plan::interleaves(instance.part))
+                    .map(|instance| (block.index, instance.part))
+            });
+        assert_eq!(non_interleaving, None, "every GLM language block interleaves");
+    }
 }

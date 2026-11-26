@@ -153,7 +153,7 @@ fn prefill_decoder_skip() -> Result<bool, String> {
     match recurrent_decoder_block() {
         None => Ok(asked.unwrap_or(true)),
         Some(layer) if asked == Some(true) => Err(format!(
-            "prefill_decoder_skip: block {layer} is a Gated DeltaNet among the decoder layers, \
+            "prefill_decoder_skip: block {layer} is a recurrent block among the decoder layers, \
              whose state folds every prompt row, so prompt rows cannot stop after the encoder \
              (leave prefill_decoder_skip unset or false)"
         )),
@@ -1888,7 +1888,11 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         };
         let n = current.as_ref().map_or_else(|| chunk(p, 0), |next| next.n);
         let buffer = current.as_ref().map_or(0, |current| current.buffer);
-        let several = ways > 1 && n > R_MAX && p + n < target && chunk(p + n, 1) > R_MAX;
+        let several = ways > 1
+            && n > R_MAX
+            && p + n < target
+            && save != Some(p + n)
+            && chunk(p + n, 1) > R_MAX;
         let lane = self.seqs[index].lane.ok_or("prefill: no lane")?;
         if !several {
             self.traced(Decision::Prefill {
@@ -1964,11 +1968,12 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             return self.bulk_first(index, state, n, target).map(Some);
         }
         // The chunks this tick runs together: the first, then one on each further rows state while
-        // another chunk of more than R_MAX rows follows. A recurrent block runs alone (the plan
-        // gives it one prefill way), so it never comes here.
-        if self.device.has_recurrent() {
+        // another chunk of more than R_MAX rows follows. A Gated DeltaNet stack keeps one prefill
+        // way; a KDA stack interleaves chunks because its chunked scan resumes from the lane's
+        // recurrent region after each earlier chunk at the same layer (K4).
+        if !crate::plan::description().values().gdn_layers.is_empty() {
             return Err(
-                "prefill: a recurrent stack's prompt reached the interleaved bulk chunks"
+                "prefill: a Gated DeltaNet stack's prompt reached the interleaved bulk chunks"
                     .to_owned(),
             );
         }
@@ -1979,7 +1984,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let mut slots = vec![(state, p, n, current, staging, buffer)];
         let mut end = p + n;
         for (slot, state_i) in more.iter().enumerate() {
-            if end >= target || chunk(end, slot + 1) <= R_MAX {
+            if end >= target || save == Some(end) || chunk(end, slot + 1) <= R_MAX {
                 break;
             }
             let staging_i = bulk_staging(state_i, inputs);
@@ -2097,6 +2102,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             self.device.draft_seed(state, draft, p, n)?;
         }
         self.seqs[index].pos = after;
+        if save == Some(after) {
+            self.device.recurrent_save(lane, after)?;
+        }
         if after < target || self.seqs[index].emitted() > 0 {
             return Ok(None);
         }

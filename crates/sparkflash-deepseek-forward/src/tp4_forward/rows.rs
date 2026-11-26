@@ -1758,10 +1758,13 @@ impl DeviceLayer<'_> {
         fn gcd(a: usize, b: usize) -> usize {
             if b == 0 { a } else { gcd(b, a % b) }
         }
+        let pool = crate::plan::description().values().stated().index_pool;
         self.compress_ratio
             .iter()
-            .filter(|&&ratio| ratio > 0)
-            .fold(1, |step, &ratio| step / gcd(step, ratio) * ratio)
+            .copied()
+            .chain(std::iter::once(pool))
+            .filter(|&ratio| ratio > 0)
+            .fold(1, |step, ratio| step / gcd(step, ratio) * ratio)
     }
 
     /// One layer over rows p0..p0+n.
