@@ -242,6 +242,10 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
                     },
                 );
             }
+            Converter::Glm if std::env::var_os("SPARKFLASH_ON_BASE").is_some() => {
+                // W1: GLM's ranks in the base's converted format (stated splits + stored
+                // formats from the description), opened by load_converted_rank_arena.
+            }
             Converter::Glm => {
                 let config = Glm5NextConfig::from_json(&text)
                     .map_err(|error| unparsed(error.to_string()))?;

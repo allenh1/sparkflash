@@ -277,10 +277,60 @@ pub struct ConvertedLoadReport {
     pub weights_verified: bool,
 }
 
+/// The stated rank splits and stored formats from a checkpoint's description (`config.json` +
+/// layout), when `config.json` is present. A bare synthetic fixture without `config.json` gets
+/// empty maps and keeps its name rules.
+fn described_header_metadata(
+    checkpoint_dir: &Path,
+) -> Result<(
+    BTreeMap<String, crate::shard::ShardRule>,
+    Option<(sparkflash_model::format::StoredFormat, sparkflash_model::format::StoredFormat)>,
+), String> {
+    use sparkflash_model::architecture::WeightFormat;
+    use sparkflash_model::format::{FormatLayout, StoredFormat};
+    use sparkflash_model::layout::TensorSplit;
+
+    if !checkpoint_dir.join("config.json").is_file() {
+        return Ok((BTreeMap::new(), None));
+    }
+    let architecture = sparkflash_model::Architecture::from_checkpoint_dir(checkpoint_dir)
+        .map_err(|error| format!("architecture {}: {error}", checkpoint_dir.display()))?;
+    let arrange = |format: WeightFormat| -> StoredFormat {
+        let stored = format.stored_format();
+        if matches!(format, WeightFormat::MxFp8 { .. }) {
+            stored.with_layout(FormatLayout::Tile32)
+        } else {
+            stored
+        }
+    };
+    let dense_format = arrange(architecture.quantization.dense_format);
+    let expert_format = arrange(architecture.quantization.expert_format);
+    let mut splits = BTreeMap::new();
+    if let Some(tensors) = sparkflash_model::layout::described_tensors(&architecture)
+        .map_err(|error| format!("layout {}: {error}", checkpoint_dir.display()))?
+    {
+        for tensor in tensors {
+            let rule = match tensor.split {
+                TensorSplit::Whole => crate::shard::ShardRule::Replicated,
+                TensorSplit::Rows | TensorSplit::Conv | TensorSplit::Vector => {
+                    crate::shard::ShardRule::Column
+                }
+                TensorSplit::Columns => crate::shard::ShardRule::Row,
+                _ => continue,
+            };
+            let base_name = tensor.slot.as_deref().unwrap_or(&tensor.name);
+            splits.insert(base_name.to_owned(), rule);
+        }
+    }
+    Ok((splits, Some((dense_format, expert_format))))
+}
+
 /// Loads all safetensors headers once from `checkpoint_dir` and returns `(SafeTensorsSource, Vec<HeaderEntry>)`.
 pub fn load_checkpoint_headers_once(
     checkpoint_dir: &Path,
 ) -> Result<(SafeTensorsSource, Vec<HeaderEntry>), String> {
+    use sparkflash_model::format::StoredFormat;
+
     let index_path = checkpoint_dir.join("model.safetensors.index.json");
     // The source answers to the layout's slots, so its own index is the one to walk.
     let source = sparkflash_model::layout::open_checkpoint(checkpoint_dir, &index_path)
@@ -288,6 +338,7 @@ pub fn load_checkpoint_headers_once(
     source
         .preload_headers()
         .map_err(|error| format!("preload headers in {}: {error}", checkpoint_dir.display()))?;
+    let (splits, formats) = described_header_metadata(checkpoint_dir)?;
     let index = source.index();
     let mut entries = Vec::with_capacity(index.weight_map.len());
     for name in index.names() {
@@ -297,11 +348,25 @@ pub fn load_checkpoint_headers_once(
         let tensor = header
             .tensor(name)
             .map_err(|error| format!("{name}: {error}"))?;
-        entries.push(HeaderEntry::new(
-            name.to_string(),
-            tensor.dtype.clone(),
-            tensor.shape.clone(),
-        ));
+        let format = formats.and_then(|(dense, expert)| {
+            let is_routed = sparkflash_engine::tensor::routed_weight(name).is_some();
+            match tensor.dtype.as_str() {
+                "F8_E4M3" => Some(if is_routed { expert } else { dense }),
+                "F4_E2M1" | "I8" => Some(if is_routed { expert } else { StoredFormat::MXFP4_ROW_32 }),
+                "BF16" => Some(StoredFormat::BF16),
+                "F32" => Some(StoredFormat::F32),
+                _ => None,
+            }
+        });
+        entries.push(
+            HeaderEntry::new(
+                name.to_string(),
+                tensor.dtype.clone(),
+                tensor.shape.clone(),
+            )
+            .with_format(format)
+            .with_split(splits.get(name).copied()),
+        );
     }
     Ok((source, entries))
 }
@@ -1002,5 +1067,114 @@ mod tests {
                 .bytes,
             4 * 20
         );
+    }
+
+    #[test]
+    fn w1_glm_ranks_convert_into_base_format_and_load_into_arena() {
+        let ckpt_dir = tempfile::tempdir().expect("ckpt_dir");
+        let out_dir = tempfile::tempdir().expect("out_dir");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../sparkflash-model-deepseek-v41/tests/fixtures/glm-tiny/config.json");
+        let cfg_text = fs::read_to_string(&fixture).expect("read glm-tiny config");
+        fs::write(ckpt_dir.path().join("config.json"), &cfg_text).expect("write config.json");
+
+        // Write one safetensors shard carrying GLM KDA, absorbed MLA, MoE, and head tensors
+        // under GLM's HuggingFace checkpoint names so open_checkpoint + described_header_metadata
+        // maps every slot, split, and FP8_BLOCK_128 stored format.
+        let tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)> = vec![
+            ("model.language_model.embed_tokens.weight", "BF16", vec![256, 256], vec![1u8; 256 * 256 * 2]),
+            ("model.language_model.layers.0.self_attn.q_proj.weight", "BF16", vec![256, 256], vec![2u8; 256 * 256 * 2]),
+            ("model.language_model.layers.0.self_attn.o_proj.weight", "BF16", vec![256, 256], vec![4u8; 256 * 256 * 2]),
+            ("model.language_model.layers.0.self_attn.q_conv1d.weight", "BF16", vec![256, 1, 4], vec![6u8; 256 * 4 * 2]),
+            ("model.language_model.layers.0.self_attn.A_log", "F32", vec![4], vec![7u8; 4 * 4]),
+            ("model.language_model.layers.6.self_attn.q_a_proj.weight", "BF16", vec![128, 256], vec![8u8; 128 * 256 * 2]),
+            ("model.language_model.layers.6.self_attn.q_b_proj.weight", "F8_E4M3", vec![512, 128], vec![9u8; 512 * 128]),
+            ("model.language_model.layers.6.self_attn.q_b_proj.weight_scale_inv", "F32", vec![4, 1], vec![3u8; 4 * 4]),
+            ("model.language_model.layers.6.self_attn.o_proj.weight", "F8_E4M3", vec![256, 512], vec![10u8; 256 * 512]),
+            ("model.language_model.layers.6.self_attn.o_proj.weight_scale_inv", "F32", vec![2, 4], vec![5u8; 8 * 4]),
+            ("model.language_model.norm.weight", "BF16", vec![256], vec![11u8; 256 * 2]),
+            ("lm_head.weight", "BF16", vec![256, 256], vec![12u8; 256 * 256 * 2]),
+        ];
+        let shard_name = "model-00001-of-00001.safetensors";
+        let mut header = String::from("{");
+        let mut offset = 0u64;
+        for (idx, (name, dtype, shape, bytes)) in tensors.iter().enumerate() {
+            if idx > 0 {
+                header.push(',');
+            }
+            let begin = offset;
+            offset += bytes.len() as u64;
+            let shape_text = shape.iter().map(usize::to_string).collect::<Vec<_>>().join(",");
+            header.push_str(&format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{shape_text}],\"data_offsets\":[{begin},{offset}]}}"
+            ));
+        }
+        header.push('}');
+        let mut header_bytes = header.into_bytes();
+        while (8 + header_bytes.len()) % 8 != 0 {
+            header_bytes.push(b' ');
+        }
+        let mut file_bytes = Vec::new();
+        file_bytes.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        file_bytes.extend_from_slice(&header_bytes);
+        for (_, _, _, bytes) in &tensors {
+            file_bytes.extend_from_slice(bytes);
+        }
+        fs::write(ckpt_dir.path().join(shard_name), file_bytes).expect("write shard");
+        let mut weight_map = String::new();
+        for (idx, (name, _, _, _)) in tensors.iter().enumerate() {
+            if idx > 0 {
+                weight_map.push(',');
+            }
+            weight_map.push_str(&format!("\"{name}\":\"{shard_name}\""));
+        }
+        fs::write(
+            ckpt_dir.path().join("model.safetensors.index.json"),
+            format!("{{\"metadata\":{{}},\"weight_map\":{{{weight_map}}}}}"),
+        )
+        .expect("write index");
+
+        let mut options = ConvertOptions::new(ckpt_dir.path(), out_dir.path());
+        options.world_size = 4;
+        options.ranks = vec![0, 1, 2, 3];
+        options.verify = true;
+        let manifest = convert_checkpoint(&options).expect("convert glm ranks at world 4");
+        assert_eq!(manifest.ranks.len(), 4);
+        // FP8_BLOCK_128 weights must stay TensorLayout::Stored (never B12x-tiled).
+        assert_eq!(manifest.ranks[0].tiled_tensors, 0);
+        assert_eq!(manifest.ranks[0].padded_moe_tensors, 0);
+
+        let rank0_path = out_dir.path().join(rank_file_name(0, 4));
+        let (_, header) = inspect_converted_rank(&rank0_path).expect("inspect rank 0");
+        let kda_q = header.tensors.iter().find(|t| t.name == "layers.0.attn.q_proj.weight").expect("kda q_proj");
+        assert_eq!(kda_q.shard_shape, vec![64, 256], "kda q_proj splits rows across 4 ranks");
+        assert_eq!(kda_q.layout, TensorLayout::Stored);
+        let kda_o = header.tensors.iter().find(|t| t.name == "layers.0.attn.o_proj.weight").expect("kda o_proj");
+        assert_eq!(kda_o.shard_shape, vec![256, 64], "kda o_proj splits columns across 4 ranks");
+        let a_log = header.tensors.iter().find(|t| t.name == "layers.0.attn.A_log").expect("kda A_log");
+        assert_eq!(a_log.shard_shape, vec![1], "kda a_log splits 1-D vector across 4 ranks");
+        let conv = header.tensors.iter().find(|t| t.name == "layers.0.attn.q_conv1d.weight").expect("kda q_conv1d");
+        assert_eq!(conv.shard_shape, vec![64, 1, 4], "kda q_conv1d splits conv rows across 4 ranks");
+        let q_a = header.tensors.iter().find(|t| t.name == "layers.6.attn.wq_a.weight").expect("mla wq_a");
+        assert_eq!(q_a.shard_shape, vec![128, 256], "mla wq_a is replicated");
+
+        let mut allocator = TestAllocator::new();
+        let (arena, report) = load_converted_rank_arena(
+            &mut allocator,
+            &rank0_path,
+            0,
+            4,
+            ConvertedLoadOptions {
+                chunk_bytes: 4096,
+                concurrency: 2,
+                verify_weights: true,
+                ..ConvertedLoadOptions::default()
+            },
+        )
+        .expect("load converted GLM rank 0 arena");
+        assert!(report.weights_verified);
+        assert_eq!(arena.slice("layers.0.attn.q_proj.weight").expect("slice").bytes, 64 * 256 * 2);
+        assert_eq!(arena.slice("layers.0.attn.o_proj.weight").expect("slice").bytes, 256 * 64 * 2);
+        assert_eq!(arena.slice("layers.6.attn.wo.weight").expect("mla wo").bytes, 256 * 128);
     }
 }
