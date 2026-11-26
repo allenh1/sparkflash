@@ -295,9 +295,10 @@ pub(crate) fn kda_attention_forward(
         dt_bias: &dt_bias,
         norm: &norm,
     };
-    // On a BF16 stream the conv's SiLU, beta and the delta rule's output are BF16, as the
-    // producer returns them (`modeling_glm5_next.py` 357-391); the decay and the state stay f32.
-    let narrow_silu = |value: f32| quant::bf16_round(linalg::silu(value));
+    // On a BF16 stream F.conv1d returns BF16 before SiLU, and SiLU, beta and the delta rule's
+    // output are BF16, as the producer returns them (`modeling_glm5_next.py` 357-446); the decay
+    // and the state stay f32.
+    let narrow_silu = |value: f32| quant::bf16_round(linalg::silu(quant::bf16_round(value)));
     let narrow = |value: f32| quant::bf16_round(value);
     let identity = |value: f32| value;
     let activations = if config.stated().bf16_stream {
