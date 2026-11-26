@@ -47,7 +47,7 @@ names the number it got.
 | W2 synthetic writer | landed for the `glm` and `glm-wiring` variants | `45ec0a05`, `b716c1a3` |
 | S1-S5 serving, codec, kernels, numerics v4, deletion | not started | |
 | Proof: synthetic, worlds 1, 2, 4 | `glm-wiring` PASS at all three worlds (largest seam median 1.63e-2, 2.77e-2, 2.65e-2 against the 7e-2 bar); `glm` reported | section 3 |
-| Proof: producer capture | landed on `glm-tiny`; two host fixes came out of it, and the pure-BF16 end-to-end capture misses the top-1 and mean-NLL bars on fixture ties (section 3) | `68074500` |
+| Proof: producer capture | PASS on decisive BF16 `glm-tiny` (both expanded and absorbed meet the unchanged 1e-2 / 20-of-20 / 0.02 bar); dynamic FP8 on GPU still owed (A.3) | `68074500`, `0f526464`, section 3 |
 | Proof: conformance on the `glm` variant | PASS, 8 of 8, under `--ignored` (the form `scripts/onboard-gate.sh` uses) | section 3 |
 | Proof: released DeepSeek unchanged | PASS: pre-milestone-4 `2f99fbe7` against HEAD, manifests, launch traces and tick identical on all four ranks | section 3 |
 | Proof: real checkpoint, tower, served gate | not started: the work stopped before the real-checkpoint window, as section 7 fixes | |
@@ -453,13 +453,6 @@ synthetic checkpoint, as in milestone 3.
         drawn 3x wider (`write_described_checkpoint`'s recipe; no rule, epsilon, width or
         clamp changes), the same unchanged bars give:
 
-        Status of the rest of the owner's list (2026-11-26): A.1 is done and below, A.2 is
-        partial (this table), and A.3 to A.8, B, C, D and E are not started in this tree.
-        A.3 (the release's dynamic scheme on a GPU host), A.4 (a record directory for
-        `bits_equal_the_record`), A.5 (the stated stack loading converted ranks), A.6 (the
-        residual's cost at the 34 foreign boundaries), A.7 (A1 at eight rows and the 1M
-        window's positions) and A.8 (a live RDMA exchange) each need the four-node window.
-
         | form | top-1 | mean abs NLL | largest position rel L2 |
         |---|---|---|---|
         | expanded (the producer's own order) | 20 of 20 (bar: all) | 5.007e-3 (bar 0.02) | 2.538e-1 (bar 1e-2) |
@@ -471,9 +464,30 @@ synthetic checkpoint, as in milestone 3.
         and measured rather than assumed: drawing the indexer's queries and keys wider does
         not help (scaling moves no sign, so an all-negative pool stays all-negative: the
         distance stayed at 2.538e-1), and making every pool selectable (`index_topk` raised
-        past the pool count) makes it worse (3.616e-1). What remains is a seed or draw whose
-        pool scores are distinct at the selection's edge; that is the next attempt, and the
-        bar is not moved.
+        past the pool count) makes it worse (3.616e-1).
+      * **Done (2026-11-26): the decisive fixture recipe passes the unchanged bar.** Four
+        conditioning recipes in `write_described_checkpoint` (the DeepSeek writer
+        `write_synthetic_checkpoint` stays bit-for-bit unchanged; no arithmetic, epsilon, width
+        or clamp changes) remove the fixture's random near-ties while exercising every branch:
+        (1) `mirror_indexer_heads` mirrors `wq_b` heads in negated pairs with shared
+        `weights_proj` rows so `w_h * (relu(d) + relu(-d)) = w_h * |d|` gives zero exact-zero
+        pool scores (smallest selection-edge margin `5.295e-2`, 0 exact zeros);
+        (2) `EMBEDDING_SPREAD = 3.0` gives the residual stream a dominant common component so
+        1-ULP halfway ties in KDA do not compound past `1e-2` over eight random layers;
+        (3) `ROUTER_STEP = 1.2` on `e_score_correction_bias` keeps every router margin above
+        `2.498e-1`, clear of the absorbed form's `4.1e-3` reorder (unlike scaling logits, which
+        scales perturbation and margin together and still left a `3.30e-4` tie at L6 pos 5);
+        (4) `HEAD_WIDE = 8.0` on the first 8 rows of `head.weight` peaks the next-token
+        distribution so argmax is decided by a real margin instead of a 512-way `6.0e-4` tie.
+        On BF16 `glm-tiny` (seed 7, 20 tokens), same-input layer-3 expanded matches the
+        producer on 100.0% of entries at `0.0` ulp (absorbed vs expanded median `4.127e-3`,
+        max `5.150e-3`), and end-to-end `scripts/producer-capture.py` passes the unchanged bar
+        in **both** forms:
+
+        | form | top-1 (bar: 20/20) | mean abs NLL (bar: 0.02) | largest position rel L2 (bar: 1e-2) | verdict |
+        |---|---|---|---|---|
+        | expanded (the producer's own order) | 20 of 20 | 1.378e-2 | 7.838e-3 (pos 13) | **PASS** |
+        | absorbed (the served form) | 20 of 20 | 1.289e-2 | 8.206e-3 (pos 11) | **PASS** |
     * The pool tie itself: where several pools score exactly zero at the selection's edge, the
       producer's `topk` order is not specified and differs between its CPU and CUDA builds, so
       it is not a model fact. How often the real checkpoint's selection admits zero-score pools

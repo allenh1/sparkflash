@@ -40,9 +40,11 @@ const TOKENS: [u32; 20] = [
     3, 17, 42, 5, 63, 0, 28, 9, 11, 200, 7, 33, 21, 60, 14, 90, 2, 150, 77, 8,
 ];
 
-/// Every position's greedy token.
+/// Every position's greedy token, under the fixture's current recipes (doc 08, "the fixture is made
+/// decisive"): the head's first rows are drawn wider, so a handful of logits carry the row and the
+/// argmax is decided by a margin rather than by a 512-way near-tie.
 const PINNED: [usize; 20] = [
-    505, 499, 288, 219, 201, 311, 461, 326, 90, 461, 66, 340, 110, 346, 169, 398, 332, 56, 284, 326,
+    75, 5, 4, 5, 2, 3, 2, 1, 1, 318, 1, 4, 3, 3, 4, 3, 2, 2, 6, 1,
 ];
 
 struct Scratch(PathBuf);
