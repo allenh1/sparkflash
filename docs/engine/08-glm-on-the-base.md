@@ -507,6 +507,34 @@ synthetic checkpoint, as in milestone 3.
       tile's own amax, so a one-ulp difference in the tile's activation can move one code by one
       step, and the tables say how far that carries. If the end-to-end bar is missed, the miss is
       reported with its positions and is not repaired by widening the bar.
+    * **A.3 and A.4, two windows and what they measured (2026-11-26).** Both items were run twice
+      on the four nodes; neither passed, and both failures are about the host the run needs, not
+      about GLM's arithmetic.
+      * **A.3: the producer's fp8 path cannot run on this hardware yet.** The capture builds the
+        host reference and the fixture fine (`write-synthetic-checkpoint` and
+        `dump-host-logits` exit 0 in both MLA forms), and then the producer refuses before it
+        reads a token: torch 2.9.0+cu130 refuses the GB10 outright (`cuda capability 12.1 ...
+        Maximum ... supported ... is (8.0) - (12.0)`), and torch 2.14.1+cu130, which does report
+        capability `(12, 1)`, still raises `NotImplementedError: "normal_kernel_cuda" not
+        implemented for 'Float8_e4m3fn'` — inside `_initialize_missing_keys`, i.e. while it
+        random-initialises the **vision tower's** parameters, which the synthetic checkpoint does
+        not carry, as fp8 tensors. Two things follow: the checkpoint has to carry every tensor the
+        producer initialises (the tower, B. I1-I3), and the frontend has to be able to run an fp8
+        kernel on sm_121 (torch 2.14.1's compiled architecture list stops at `sm_120`). A.3
+        therefore runs after B, and its bar stands as written above.
+      * **A.4: the fixture refused the checkpoint because the build embedded no kernel image.**
+        The conformance arm booted, planned the checkpoint, and refused every part with
+        "not loadable under runtime availability" — including `glm_attention_sm121`,
+        `glm_decode_sm121`, `glm_moe_sm121` and `glm_prefill_sm121`, whose cubins were staged
+        in the directory that both `SPARKFLASH_CUBINS` and `SPARKFLASH_KERNEL_DIR` named.
+        The reason is the build, not the env: `sparkflash-kernels`' build script embeds a
+        cubin only when it finds `nvcc`, and the head node's `nvcc` lives at
+        `/usr/local/cuda/bin/nvcc`, which is not on a non-interactive `ssh` `PATH`. Without
+        it the script warns that the build has "CPU reference kernels only", the images are
+        empty, `Image::available()` is false, and `image_loadable` refuses every GLM image
+        (only the DeepSeek image is loadable from a cubin directory). The rebuild with
+        `PATH=/usr/local/cuda/bin:$PATH` is the fix; the checks themselves never ran, so no
+        record was written and nothing about GLM's bits was measured either way.
   * On the real checkpoint, a producer-side stack that serves it (vLLM has, on these four nodes)
     is teacher-forced on the anchor's tokens once, before the move. That distance is recorded
     for the crate build. The base build must be no further from the producer than the crate
