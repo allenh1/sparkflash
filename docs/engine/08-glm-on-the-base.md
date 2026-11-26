@@ -240,6 +240,12 @@ synthetic checkpoint, as in milestone 3.
      wire is f32 and the sum is rounded once.
    * **The order of f32 sums may change:** a different split-K, a tile, a fused launch, the rank
      fold.
+   * **A linear map may be reassociated** (D125, 2026-11-26). The absorbed MLA evaluates the
+     producer's `kv_b` expansion in another order and never rounds the per-head keys and values
+     to BF16. Nothing is narrowed and no part is substituted, so it is a reorder. It is held by
+     the host reference's expanded mode: expanded agrees with the producer at zero or one ulp on
+     the same inputs, and absorbed sits within 1e-2 median of expanded. A nonlinear step (the
+     softmax, a norm, a selection) is never moved under this rule.
    * **Version 4 is the reorder and the types together,** declared in the numerics registry with
      the owner's decision recorded in [DECISIONS.md](../DECISIONS.md). It is checked by:
      * coherent output on the served gate's prompts, greedy and sampled;
@@ -411,6 +417,19 @@ synthetic checkpoint, as in milestone 3.
       requires a GPU or XPU`), adding `~4.5e-3` weight truncation per FP8 projection; against host
       `activation_scheme: dynamic` that gives 18/20 top-1, mean `|NLL delta| = 3.93e-02`, max
       `4.34e-01`. Native FP8 producer comparison requires a CUDA/XPU host.
+    **What the capture leaves owed.**
+    * The absorbed block's 3.6e-3 to 3.9e-3 is declared a reorder (D125), on the condition that
+      the host reference's expanded mode meets the producer at zero or one ulp. That mode is not
+      written yet.
+    * The end-to-end bar is not met and is not widened. Both misses are fixture ties, so the
+      fixture is made decisive (no exact-zero pool scores at the selection's edge, router margins
+      above the reorder) and the capture is run again against the same bar.
+    * The pool tie itself: where several pools score exactly zero at the selection's edge, the
+      producer's `topk` order is not specified and differs between its CPU and CUDA builds, so
+      it is not a model fact. How often the real checkpoint's selection admits zero-score pools
+      is measured at the real capture.
+    * The release's dynamic FP8 scheme has no producer comparison yet: the producer refuses FP8
+      on a CPU. It is run on a GPU host.
   * On the real checkpoint, a producer-side stack that serves it (vLLM has, on these four nodes)
     is teacher-forced on the anchor's tokens once, before the move. That distance is recorded
     for the crate build. The base build must be no further from the producer than the crate
