@@ -20,7 +20,12 @@ reference ran; the two logit files are compared inside the tolerance the model d
 either ran. The tolerance is an argument here, never a constant the script can raise.
 
   scripts/producer-capture.py --checkpoint DIR --host host-logits.json \
-      --out DIR [--revision SHA] [--rel-l2 1e-2] [--nll 0.02]
+      --out DIR [--revision SHA] [--rel-l2 1e-2] [--nll 0.02] [--device cpu|cuda]
+
+  --device is the device the producer runs on. A checkpoint that declares the release's fp8
+  quantization is dequantized to bfloat16 when it loads on a CPU, so a capture of the release's
+  dynamic scheme must name cuda: on a CPU the comparison would be the host's quantized arithmetic
+  against an unquantized one, and the report says which the run actually got.
 
 The host file is `dump-host-logits`'s `sparkflash-host-logits/1` document. The producer file is
 written beside it as `producer-logits.json` with the same shape, and `capture.json` holds the
@@ -59,6 +64,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="optional dump-host-logits --boundaries directory for same-input per-sublayer checks",
     )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help=(
+            "where the producer runs (cpu or cuda). A checkpoint that declares the release's fp8 "
+            "quantization is dequantized to bfloat16 on a CPU, so a run of the release's dynamic "
+            "scheme needs cuda: it is the device that makes transformers keep the quantizer"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -79,7 +93,7 @@ def log_softmax(row: list[float]) -> list[float]:
     return [value - math.log(total) for value in shifted]
 
 
-def producer_logits(checkpoint: Path, host: dict, dtype_name: str):
+def producer_logits(checkpoint: Path, host: dict, dtype_name: str, device: str = "cpu"):
     """The producer's rows for the host's token prompt, from the checkpoint alone."""
     import torch
     from transformers import AutoConfig, Glm5NextForConditionalGeneration
@@ -88,6 +102,15 @@ def producer_logits(checkpoint: Path, host: dict, dtype_name: str):
     if getattr(config, "model_type", None) != "glm5_next":
         fail(f"{checkpoint} opens as {getattr(config, 'model_type', None)}, not the producer's glm5_next")
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[dtype_name]
+    quantized = False
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            fail("--device cuda was asked for and torch reports no CUDA device")
+        device_map = {"": "cuda"}
+    elif device == "cpu":
+        device_map = None
+    else:
+        fail(f"--device must be cpu or cuda, got {device!r}")
     model = Glm5NextForConditionalGeneration.from_pretrained(
         str(checkpoint),
         config=config,
@@ -95,7 +118,14 @@ def producer_logits(checkpoint: Path, host: dict, dtype_name: str):
         attn_implementation="eager",
         ignore_mismatched_sizes=True,
         low_cpu_mem_usage=True,
+        **({"device_map": device_map} if device_map else {}),
     )
+    quantized = bool(getattr(model, "is_quantized", False))
+    if device == "cuda" and getattr(config, "quantization_config", None) and not quantized:
+        fail(
+            "the checkpoint declares a quantization this producer loaded unquantized: the run "
+            "would compare the host's quantized arithmetic with an unquantized one"
+        )
     model.eval()
     tokens = host["tokens"]
     with torch.no_grad():
@@ -202,7 +232,7 @@ def main() -> int:
     config_text = (args.checkpoint / "config.json").read_text()
     config = json.loads(config_text)
     dtype_name = config.get("text_config", config).get("dtype", "bfloat16")
-    rows, loaded, model = producer_logits(args.checkpoint, host, dtype_name)
+    rows, loaded, model = producer_logits(args.checkpoint, host, dtype_name, args.device)
     sublayers = check_boundaries(model, host, args.boundaries) if args.boundaries else None
     (args.out / "producer-logits.json").write_text(
         json.dumps(
@@ -251,6 +281,8 @@ def main() -> int:
         "revision": args.revision,
         "config_model_type": loaded.model_type,
         "dtype": dtype_name,
+        "device": args.device,
+        "producer_quantized": bool(getattr(model, "is_quantized", False)),
         "positions": len(table),
         "top1_agreement": agreement,
         "top1_same": same,

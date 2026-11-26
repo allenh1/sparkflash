@@ -492,8 +492,21 @@ synthetic checkpoint, as in milestone 3.
       producer's `topk` order is not specified and differs between its CPU and CUDA builds, so
       it is not a model fact. How often the real checkpoint's selection admits zero-score pools
       is measured at the real capture.
-    * The release's dynamic FP8 scheme has no producer comparison yet: the producer refuses FP8
-      on a CPU. It is run on a GPU host.
+    * **A.3, the release's dynamic FP8 scheme. The tolerance is written here before the run
+      (2026-11-26).** The capture above runs the fixture as a BF16 model: `glm-tiny`'s
+      `text_config.dtype` is bfloat16, so both sides widen every weight and activate in BF16.
+      The release ships `quant_method: fp8`, `activation_scheme: dynamic` and
+      `weight_block_size [128, 128]`, and the writer honours it (567 tensors, 187 scale planes);
+      the same capture is run over that checkpoint on a host where the producer's quantiser can
+      run, because loading it on a CPU dequantises it (transformers reads the fp8 checkpoint as
+      bfloat16 with `is_quantized false`, so a CPU run would compare the host's FP8 arithmetic
+      with the producer's BF16 arithmetic and measure the wrong thing). The bars are the ones
+      above, **unchanged**: every position's top-1 the same, per-position relative L2 at or under
+      `1e-2`, mean |NLL delta| at or under `0.02`. The same-input layer tables are reported
+      beside them and set no bar of their own — a dynamic scheme scales a 128-column tile by that
+      tile's own amax, so a one-ulp difference in the tile's activation can move one code by one
+      step, and the tables say how far that carries. If the end-to-end bar is missed, the miss is
+      reported with its positions and is not repaired by widening the bar.
   * On the real checkpoint, a producer-side stack that serves it (vLLM has, on these four nodes)
     is teacher-forced on the anchor's tokens once, before the move. That distance is recorded
     for the crate build. The base build must be no further from the producer than the crate
