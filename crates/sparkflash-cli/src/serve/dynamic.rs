@@ -412,7 +412,11 @@ fn profile_with(
 pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     let checkpoint = resolve(options)?;
     let on_device = device_family(&checkpoint.architecture.family, &checkpoint.directory);
-    let unresolved = if checkpoint.architecture.family == "inkling2" {
+    let looped = checkpoint.architecture.family == "inkling2_loop";
+    let unresolved = if matches!(
+        checkpoint.architecture.family.as_str(),
+        "inkling2" | "inkling2_loop"
+    ) {
         // Its host backend runs the new relative/short-conv/block arithmetic itself; the CUDA
         // catalogue is a device-arm gate, not this path's capability list.
         Vec::new()
@@ -512,7 +516,7 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     // dense device arm); every other family keeps one request at a time here, as before.
     let family = checkpoint.plan.family();
     let typed = pack::typed_for_checkpoint(family, &checkpoint.directory);
-    let novel = typed.is_none() && !matches!(family, "inkling2" | "dory");
+    let novel = typed.is_none() && !matches!(family, "inkling2" | "inkling2_loop" | "dory");
     #[cfg(feature = "tp4-serve")]
     if options.tp4.is_some() && !novel {
         return Err(format!(
@@ -538,10 +542,10 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
         return (typed.serve_identity)(options, checkpoint.directory, descriptor, seam, context);
     }
     match checkpoint.plan.family() {
-        "inkling2" if options.group.is_some() => {
+        "inkling2" | "inkling2_loop" if options.group.is_some() => {
             serve_inkling_group(options, checkpoint, descriptor, seam, dialect, context)
         }
-        "inkling2" => serve_inkling_host(
+        "inkling2" | "inkling2_loop" => serve_inkling_host(
             checkpoint,
             descriptor,
             seam,
@@ -878,25 +882,62 @@ fn serve_inkling_host(
             checkpoint.directory.display().to_string(),
         ),
     };
-    let backend = sparkflash_model_inkling2::Inkling2HostBackend::open(
-        descriptor.clone(),
-        config,
-        source,
-        context,
-    )
-    .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+    // A looped release runs on the device arm when this build can open one: its message path and
+    // its per-pass caches are the arm's, and the f32 reference would take minutes a token. A host
+    // with no driver (or a build with no cubin) keeps the reference, which is the same arithmetic.
+    let (backend, engine): (Box<dyn sparkflash_model::ModelBackend>, &str) =
+        if config.loop_plan.is_some() {
+            match sparkflash_model_inkling2::device::InklingDeviceBackend::open(
+                descriptor.clone(),
+                config.clone(),
+                Arc::clone(&source),
+                context,
+            ) {
+                Ok(mut device) => {
+                    if config.vision.is_some() {
+                        device.load_vision(&*source).map_err(|error| {
+                            format!("--model {}: vision: {error}", checkpoint.model_id)
+                        })?;
+                    }
+                    if config.mtp.is_some() && device.wants_drafter() {
+                        device
+                            .load_drafter(&checkpoint.directory)
+                            .map_err(|error| {
+                                format!("--model {}: drafter: {error}", checkpoint.model_id)
+                            })?;
+                    }
+                    (Box::new(device), "device")
+                }
+                Err(error) => {
+                    eprintln!(
+                        "sparkflash serve: the device arm did not open ({error}); serving the f32 \
+                         host reference"
+                    );
+                    let backend = sparkflash_model_inkling2::Inkling2HostBackend::open(
+                        descriptor.clone(),
+                        config.clone(),
+                        source,
+                        context,
+                    )
+                    .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+                    (Box::new(backend), "f32 host reference")
+                }
+            }
+        } else {
+            let backend = sparkflash_model_inkling2::Inkling2HostBackend::open(
+                descriptor.clone(),
+                config,
+                source,
+                context,
+            )
+            .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+            (Box::new(backend), "f32 host reference")
+        };
     let banner = format!(
-        "{} ({}) at TP=1 on {where_from}, context {context}, Inkling f32 host reference",
+        "{} ({}) at TP=1 on {where_from}, context {context}, Inkling {engine}",
         descriptor.id, descriptor.weights_id
     );
-    serve_backend(
-        Box::new(backend),
-        descriptor,
-        seam,
-        dialect,
-        options,
-        &banner,
-    )
+    serve_backend(backend, descriptor, seam, dialect, options, &banner)
 }
 
 /// Serves an Inkling checkpoint through its four-rank device arm.

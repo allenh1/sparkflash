@@ -185,15 +185,22 @@ const QWEN_ROUTED_SHAPES: &[(usize, usize, usize)] = &[(2560, 512, 10), (2048, 2
 /// published list is the set the released arms resolve at.
 const GQA_GROUPS: &[usize] = &[1, 2, 3, 4, 6, 8, 12];
 
-/// The Inkling-2-Small text geometry every inkling_* entry is compiled for.
+/// The text widths the inkling_* entries serve: Inkling-2-Mini at 2,304 and Inkling-2-Small
+/// at 4,608.
 ///
-/// The released checkpoint is 4,608-wide with 48 query heads of 128 and 8 KV heads (group 6),
-/// a kernel-4 short convolution, a 2,304-wide routed expert and a 1,024-token sliding window.
-/// The window is per layer (1024 on a sliding layer, 0 on a full one), so it is documented
-/// here rather than pinned as an equality: a full layer legitimately carries no window.
+/// The bodies take the row width, the group count and the expert columns as launch words
+/// (`kernels/inkling_attn_sm121.cu:20-21`, `kernels/inkling_moe_sm121.cu:291-322`), so one
+/// image runs both releases. The catalogue states exactly the widths this tree has brought up
+/// rather than one release's constant: a rule pinned to 4,608 refused every Mini row (97 in the
+/// scan) even though the arm's device walk launches the same bodies at 2,304.
 const INKLING_HIDDEN: usize = 4608;
+const INKLING_TEXT_WIDTHS: &[usize] = &[2304, 4608];
 const INKLING_HEAD_DIM: usize = 128;
 const INKLING_INTERMEDIATE: usize = 2304;
+
+/// The output widths the Inkling tower's merger is released at: 4,096 for Mini and 4,608 for
+/// Small. The merger's row width (1,024) and GELU box (4,096) are shared.
+const INKLING_VISION_MERGER_WIDTHS: &[usize] = &[4096, 4608];
 
 /// The widest short-convolution kernel the body accepts.
 ///
@@ -335,7 +342,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // TP4 holds 96 of the 384 experts, and the same body runs either count. The columns are
         // a multiple of 16 (NVFP4's block scale, `:289`).
         (Part::Moe, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(4608)
+            .hidden_in(INKLING_TEXT_WIDTHS)
             .intermediate_multiple(16)
             .max_experts(4096)
             .max_top_k(64),
@@ -375,15 +382,24 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         // compile-time group. Pinning 6 refused the plan's own RelativeAttention geometry,
         // which names heads and head width but leaves kv_heads unset.
         (Part::RelativeAttention, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(INKLING_HIDDEN)
+            .hidden_in(INKLING_TEXT_WIDTHS)
             .head_dim_equals(INKLING_HEAD_DIM)
             .positions(0, 1 << 21),
         (Part::ShortConv, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(INKLING_HIDDEN)
+            .hidden_in(INKLING_TEXT_WIDTHS)
+            .window_between(1, INKLING_MAX_KERNEL),
+        (Part::DynamicShortConv, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_in(INKLING_TEXT_WIDTHS)
             .window_between(1, INKLING_MAX_KERNEL),
         (Part::BlockAttentionResidual, Image::Inkling) => ShapeConstraint::ANY
-            .hidden_equals(INKLING_HIDDEN)
+            .hidden_in(INKLING_TEXT_WIDTHS)
             .streams_between(1, 16),
+        (Part::LoopMessageGate, Image::Inkling) => {
+            ShapeConstraint::ANY.hidden_in(INKLING_TEXT_WIDTHS)
+        }
+        (Part::CrossPassAttention, Image::Inkling) => {
+            ShapeConstraint::ANY.hidden_in(INKLING_TEXT_WIDTHS)
+        }
         (Part::SoftcappedActivation, Image::Inkling) => ShapeConstraint::ANY
             .hidden_equals(INKLING_HIDDEN)
             .intermediate_equals(INKLING_INTERMEDIATE),
@@ -500,7 +516,7 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         }
         (Part::VisionMerger, Image::Inkling) => ShapeConstraint::ANY
             .hidden_equals(INKLING_VISION_DIM)
-            .out_hidden_equals(4608)
+            .out_hidden_in(INKLING_VISION_MERGER_WIDTHS)
             .merger_intermediate_equals(4096)
             .vision_activation(VisionActivation::GeluErf.code()),
         _ => ShapeConstraint::ANY,
@@ -1457,6 +1473,27 @@ pub const CATALOGUE: &[PartKernel] = &[
         ],
         true,
     ),
+    // The dynamic short convolution: the taps are `static_weight + weight_proj(input)` and the
+    // divisor is `sqrt(2k + 1)` (`kernels/inkling_conv_sm121.cu:204-265`). It shares the
+    // history moves with the static convolution because a layer swaps between the two bodies
+    // without changing its cache layout.
+    sm121(
+        Part::DynamicShortConv,
+        Image::Inkling,
+        &[
+            sym(
+                "inkling_short_conv_dynamic",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
+                "inkling_short_conv_dynamic_decode",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym("inkling_conv_history_copy", &[Precision::F32]),
+            sym("inkling_conv_history_restore", &[Precision::F32]),
+        ],
+        true,
+    ),
     sm121(
         Part::BlockAttentionResidual,
         Image::Inkling,
@@ -1481,6 +1518,27 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("inkling_join_pieces", &[Precision::F32]),
             sym("inkling_widen_f32", &[Precision::F32]),
         ],
+        true,
+    ),
+    // The loop message path: the two-tanh gate a stream and the cross-pass read a layer.
+    // Both read f32 arithmetic end to end (the producer builds those parameters in f32 and the
+    // checkpoint stores the gates BF16, which the arm widens at load; see the model note's type
+    // note), so the entries name f32 precision.
+    sm121(
+        Part::LoopMessageGate,
+        Image::Inkling,
+        &[sym(
+            "inkling_message_gate",
+            // The checkpoint stores the controllers BF16 and the loader widens them to the f32
+            // the body runs; the entry names both so the scan's stored format resolves.
+            &[Precision::Bf16, Precision::F32],
+        )],
+        true,
+    ),
+    sm121(
+        Part::CrossPassAttention,
+        Image::Inkling,
+        &[sym("inkling_cross_pass", &[Precision::F32])],
         true,
     ),
     sm121(
@@ -2797,8 +2855,11 @@ const fn part_bodies_ok(part: Part) -> bool {
         | Part::Rope
         | Part::RelativeAttention
         | Part::ShortConv
+        | Part::DynamicShortConv
         | Part::BlockAttentionResidual
         | Part::SoftcappedActivation
+        | Part::LoopMessageGate
+        | Part::CrossPassAttention
         | Part::Quantize
         | Part::LayerNorm
         | Part::MoeRouter
@@ -4242,7 +4303,43 @@ mod tests {
                 .find(|entry| entry.image == Image::Inkling)
                 .unwrap_or_else(|| panic!("{part} has no Inkling image entry"));
             assert!(entry.canonical, "{part}'s Inkling entry must be canonical");
-            assert_eq!(entry.shape.hidden_equals, Some(INKLING_HIDDEN));
+            // The three bodies whose row width the kernel takes at run time state the released
+            // set: Mini's 2,304 and Small's 4,608. The softcapped activation's intermediate is
+            // the expert width the same body was compiled for on Small, which Mini's experts do
+            // not reach, so it keeps its single-width rule and the loop skips it.
+            if part == Part::SoftcappedActivation {
+                assert_eq!(entry.shape.hidden_equals, Some(INKLING_HIDDEN));
+                continue;
+            }
+            assert_eq!(entry.shape.hidden_equals, None);
+            for hidden in INKLING_TEXT_WIDTHS {
+                if let Err(error) = entry.shape.accepts(&PartGeometry {
+                    hidden: *hidden,
+                    head_dim: INKLING_HEAD_DIM,
+                    intermediate: INKLING_INTERMEDIATE,
+                    window: 4,
+                    streams: 1,
+                    positions: 1024,
+                    ..PartGeometry::new()
+                }) {
+                    panic!("{part}'s Inkling entry refused the released width {hidden}: {error}");
+                }
+            }
+            assert!(
+                entry
+                    .shape
+                    .accepts(&PartGeometry {
+                        hidden: 4096,
+                        head_dim: INKLING_HEAD_DIM,
+                        intermediate: INKLING_INTERMEDIATE,
+                        window: 4,
+                        streams: 1,
+                        positions: 1024,
+                        ..PartGeometry::new()
+                    })
+                    .is_err(),
+                "{part}'s Inkling entry accepted a width no release names"
+            );
         }
 
         // The attention body takes the GQA group as a runtime argument, so the entry must not

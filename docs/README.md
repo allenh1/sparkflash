@@ -18,6 +18,8 @@
 | [models/dory1-4b-bf16.md](models/dory1-4b-bf16.md) | NVIDIA Nemotron Labs Dory1.0-4B (BF16): looped nGPT arithmetic, the 507-name tensor plan, the TP=1 device arm and the CPU host reference |
 | [models/qwen36-35b-a3b-fp8.md](models/qwen36-35b-a3b-fp8.md) | Qwen3.6-35B-A3B (FP8): the Qwen3.5-MoE hybrid on the generalised Qwen device arm at TP=1 (plain residual, full attention, FP8 dense), and what it still refuses |
 | [models/inkling2-small-tp4.md](models/inkling2-small-tp4.md) | Inkling 2 Small (NVFP4): the 594B/17B-active hybrid, four-Spark memory feasibility, and the parts, kernels and arm it needs |
+| [engine/09-inkling-mini-loop-device.md](engine/09-inkling-mini-loop-device.md) | Inkling 2 Mini on the device walk: applications, per-pass caches, the message ops, and the order of work |
+| [models/inkling-2-mini.md](models/inkling-2-mini.md) | Inkling 2 Mini (NVFP4/MXFP8): the looped 24-layer release, its shared core and cross-pass message path, the layout that claims all 1,244 tensors, and the scan's work list |
 | [models/hy4-flash-onboarding.md](models/hy4-flash-onboarding.md) | Tencent Hy4-Flash (FP8): the onboarding proof of concept; what `sparkflash onboard --emit` wrote, the four outside edits, and the roles the shared walk still refuses |
 | [../crates/sparkflash-model-inkling2/](../crates/sparkflash-model-inkling2/) | Inkling-2-Small: the typed config, exact 390 GB tensor plan and TP4 slices, the f32 host reference, the released prompt template, and the device kernel catalogue |
 | [../crates/sparkflash-model-glm5-next/](../crates/sparkflash-model-glm5-next/) | GLM-5.3-Flash: the pack's tensor plan, host reference, device arm and rank-file converter, documented in its crate root |

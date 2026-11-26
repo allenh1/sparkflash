@@ -983,6 +983,10 @@ pub(super) struct ChunkRun {
     /// Whether this layer's band already gathered its mix rows into `mixed` (run_band_halves),
     /// which is then what its ExpertDelta collective would have done.
     band_gathered: bool,
+    /// How many summary blocks the prelude left, on a looped release's first pass.
+    loop_blocks: Option<usize>,
+    /// The previous pass's summary rows, copied aside at a pass boundary.
+    loop_prev_count: usize,
 }
 
 impl ChunkRun {
@@ -1086,7 +1090,7 @@ impl ChunkRun {
                 .iter()
                 .zip(&offsets)
                 .filter_map(|(segment, &first)| {
-                    segment.taps.map(|sink| (sink, first, segment.rows))
+                    segment.taps.clone().map(|sink| (sink, first, segment.rows))
                 })
                 .collect(),
             _ => taps.map(|sink| (sink, 0, rows)).into_iter().collect(),
@@ -1112,6 +1116,8 @@ impl ChunkRun {
             cursor: 0,
             previous_conv: None,
             band_gathered: false,
+            loop_blocks: None,
+            loop_prev_count: 0,
         })
     }
 
@@ -1242,6 +1248,46 @@ impl ChunkRun {
             .get(index)
             .ok_or_else(|| device_error(format!("the chunk schedule has no layer {index}")))?;
         let to = to.min(layer.steps.len());
+        // A looped release restarts each pass after the first from the prelude's stream, exactly
+        // as the row walk does. A verify's rows carry one message each: the summaries and the
+        // gate are per row.
+        if from == 0
+            && let Some(loop_plan) = config.loop_plan
+            && layer.stored == loop_plan.core_start
+        {
+            let byte = hidden * std::mem::size_of::<f32>();
+            if layer.pass == 0 {
+                run(shared
+                    .cuda
+                    .copy_dtod(&scratch.loop_saved, &scratch.x, rows * byte)
+                    .map_err(|error| error.to_string()))?;
+                self.loop_blocks = Some(blocks);
+            } else {
+                let depth = self.loop_blocks.unwrap_or(0);
+                let start = depth + 1;
+                let count = blocks.saturating_sub(start).min(super::LOOP_PREV_MAX);
+                for block in 0..count {
+                    let source = chunk
+                        .summaries
+                        .offset((start + block) * summary_stride * std::mem::size_of::<f32>());
+                    let destination = scratch.loop_prev.offset(block * rows * byte);
+                    run(shared
+                        .cuda
+                        .copy_dtod(&destination, &source, rows * byte)
+                        .map_err(|error| error.to_string()))?;
+                }
+                self.loop_prev_count = count;
+                run(shared
+                    .cuda
+                    .copy_dtod(&scratch.loop_prev_hidden, &scratch.x, rows * byte)
+                    .map_err(|error| error.to_string()))?;
+                run(shared
+                    .cuda
+                    .copy_dtod(&scratch.x, &scratch.loop_saved, rows * byte)
+                    .map_err(|error| error.to_string()))?;
+                blocks = self.loop_blocks.unwrap_or(0);
+            }
+        }
         // A layer's per-row scale table: null for a layer that does not scale (its kernels take the
         // scalar `tau`, 1 at every position), otherwise the rule's factor at each row's position.
         // The full layers share one rule, so the table goes up once a walk: an upload from pageable
@@ -1263,14 +1309,14 @@ impl ChunkRun {
 
         if from == 0 {
             // The drafter's taps of this layer: every row's stream as the layer starts on it.
-            for &(sink, first, count) in sinks {
+            for (sink, first, count) in sinks {
                 if let Some(slot) = sink.slot(layer.index) {
                     sink.capture(
                         shared,
                         scratch
                             .x
-                            .offset(first * hidden * std::mem::size_of::<f32>()),
-                        count,
+                            .offset(*first * hidden * std::mem::size_of::<f32>()),
+                        *count,
                         slot,
                     )?;
                 }
@@ -1297,6 +1343,43 @@ impl ChunkRun {
                         0,
                         rows,
                     )?;
+                }
+                (Op::MessageRead, _) => {
+                    run(shared.cross_pass(
+                        scratch.loop_prev,
+                        scratch.loop_prev_hidden,
+                        scratch.loop_messages,
+                        rows,
+                        self.loop_prev_count.min(super::LOOP_PREV_MAX),
+                    ))?;
+                }
+                (Op::MessageGate(stream), _) => {
+                    let loop_plan = config.loop_plan.ok_or_else(|| {
+                        device_error(format!(
+                            "layer {index}: a message gate on a single-pass release"
+                        ))
+                    })?;
+                    let stored = layer.stored;
+                    let core = stored.saturating_sub(loop_plan.core_start);
+                    let shift = match stream {
+                        MessageStream::Mlp | MessageStream::Query => 0,
+                        MessageStream::Key => 1,
+                        MessageStream::Value => 2,
+                    };
+                    // A block residual writes one row a sublayer input on a full layer and one
+                    // row on a sliding layer; the rows are `nq * hidden` apart.
+                    let nq = if layer.sliding { 1 } else { 3 };
+                    run(shared.message_gate(
+                        scratch.rows,
+                        scratch.loop_messages,
+                        stored,
+                        stream,
+                        rows,
+                        nq * hidden,
+                        shift * hidden,
+                        loop_plan.core_len() * 4 * hidden,
+                        (core * 4 + stream.index()) * hidden,
+                    ))?;
                 }
                 (Op::RmsNorm, Target::Norm(role)) => {
                     let gain = weight(step.weights[0]);
@@ -2022,14 +2105,14 @@ impl ChunkRun {
                         answers,
                         hidden,
                     ))?;
-                    if let Some(&(sink, _, _)) = sinks.first() {
+                    if let Some((sink, _, _)) = sinks.first() {
                         if answers == rows {
-                            for &(sink, first, count) in sinks {
+                            for (sink, first, count) in sinks {
                                 sink.capture(
                                     shared,
-                                    scratch.final_row.offset(first * hidden * byte),
-                                    count,
-                                    FINAL_TAP,
+                                    scratch.final_row.offset(*first * hidden * byte),
+                                    *count,
+                                    sink.final_slot(),
                                 )?;
                             }
                         } else {
@@ -2053,7 +2136,7 @@ impl ChunkRun {
                                 rows,
                             )?;
                             run(shared.rmsnorm(scratch.q_in, gain, scratch.q_in, rows, hidden))?;
-                            sink.capture(shared, scratch.q_in, rows, FINAL_TAP)?;
+                            sink.capture(shared, scratch.q_in, rows, sink.final_slot())?;
                         }
                     }
                 }

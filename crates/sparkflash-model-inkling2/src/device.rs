@@ -68,8 +68,8 @@ use crate::collective::{Exchange, Solo};
 use crate::config::Inkling2Config;
 use crate::convert::RankFileSource;
 use crate::device_plan::{
-    BandOp, Collective, ConvSlot, ExpertBody, InklingDevicePlan, LayerSchedule, NormRole, Op, Pass,
-    Projection, ResidualInput, Step, Target,
+    BandOp, Collective, ConvSlot, ExpertBody, InklingDevicePlan, LayerSchedule, MessageStream,
+    NormRole, Op, Pass, Projection, ResidualInput, Step, Target,
 };
 use crate::forward::trace_on;
 use crate::host::choose;
@@ -87,7 +87,7 @@ pub use walk::{InklingDrafter, InklingHost, InklingLane, InklingSequence, Inklin
 
 use chunk::{BandOut, band_exchange, band_mix, device_error, exchange_gather, exchange_sum};
 pub use draft::DRAFT_FILE;
-use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
+use draft::{DraftModel, DraftState, TapSink};
 use packed::pack_dense;
 use sparkflash_ops::moe::Launch;
 use sparkflash_ops::packed::{Form as DenseForm, Layout, Packed, PackedSet, Tiled};
@@ -103,6 +103,13 @@ pub const DEVICE: &str = "inkling_device";
 const TOKEN_BLOCK: u32 = 256;
 /// The threads the Inkling elementwise bodies run.
 const ELEMENT_BLOCK: u32 = 256;
+/// The loop message path's block, the `inkling_message_gate`/`inkling_cross_pass` launch width
+/// (the kernels' `INKLING_MESSAGE_BLOCK`).
+const MESSAGE_BLOCK: u32 = 256;
+
+/// The most block summaries one loop pass appends: what the message read copies aside before a
+/// pass restarts. The released core crosses at most two boundaries a pass.
+const LOOP_PREV_MAX: usize = 8;
 /// The rows a block-attention residual reads at most: the summary stack (INKLING_MAX_BLOCKS)
 /// and the current stream.
 const RESIDUAL_ROWS: usize = 17;
@@ -894,6 +901,10 @@ struct Kernels {
     /// Every one of a verify's histories back to the decode layout from its kept rows, in one
     /// launch ([InklingDeviceSession::settle]).
     conv_restore: Bound,
+    /// The loop's cross-pass read: one block a (row, core layer, stream) query.
+    cross_pass: Bound,
+    /// The loop's two-tanh gate over one stream's residual row.
+    message_gate: Bound,
 }
 
 impl Kernels {
@@ -1265,6 +1276,18 @@ impl Kernels {
                 "inkling_conv_history_restore",
                 Precision::F32,
             )?,
+            cross_pass: load(
+                Image::Inkling,
+                inkling,
+                "inkling_cross_pass",
+                Precision::F32,
+            )?,
+            message_gate: load(
+                Image::Inkling,
+                inkling,
+                "inkling_message_gate",
+                Precision::F32,
+            )?,
         })
     }
 }
@@ -1390,6 +1413,9 @@ struct Shared {
     dense: PackedSet,
     clip: Vec<ClipScales>,
     clip_arena: Deviceptr,
+    /// The loop's controllers and query banks, resident on the device for the walk's message
+    /// path; `None` on a single-pass release.
+    loop_device: Option<LoopDevice>,
     experts: Vec<Option<ExpertScale>>,
     /// Each layer's grouped-MMA table: the NVFP4 layers', and the MXFP8 layers' under
     /// [Mxfp8Walk::Mma].
@@ -1864,6 +1890,102 @@ impl Shared {
                 hidden as u64,
                 queries_count as u64,
                 summary_stride as u64,
+            ],
+        )
+    }
+
+    /// The loop's cross-pass read: the four messages of every core layer for `rows` rows, from
+    /// the previous pass's summary rows and final hidden row
+    /// (`modeling_inkling2_loop.py`:147-176).
+    fn cross_pass(
+        &self,
+        prev: Deviceptr,
+        prev_hidden: Deviceptr,
+        out: Deviceptr,
+        rows: usize,
+        count: usize,
+    ) -> Result<(), String> {
+        let plan = self
+            .config
+            .loop_plan
+            .ok_or_else(|| "a message read on a single-pass release".to_owned())?;
+        let device = self
+            .loop_device
+            .as_ref()
+            .ok_or_else(|| "the loop controllers are not resident".to_owned())?;
+        let core = plan.core_len();
+        let hidden = self.hidden();
+        let eps = bits(self.config.architecture.norm_epsilon as f32);
+        self.launch(
+            self.kernels.cross_pass,
+            ((core * 4) as u32, rows as u32, 1),
+            (MESSAGE_BLOCK, 1, 1),
+            &[
+                prev.0,
+                prev_hidden.0,
+                device.queries.0,
+                device.kv.0,
+                out.0,
+                rows as u64,
+                count as u64,
+                core as u64,
+                hidden as u64,
+                eps,
+            ],
+        )
+    }
+
+    /// One stream's loop gate over `rows` residual rows, in place.
+    ///
+    /// `values` is the walk's residual arena: row `r`'s hidden slice starts at
+    /// `r * value_stride + value_shift`. `message` is the [Scratch::loop_messages] arena: row
+    /// `r`'s slice starts at `r * message_stride + message_shift`.
+    #[allow(clippy::too_many_arguments)]
+    fn message_gate(
+        &self,
+        values: Deviceptr,
+        message: Deviceptr,
+        stored: usize,
+        stream: MessageStream,
+        rows: usize,
+        value_stride: usize,
+        value_shift: usize,
+        message_stride: usize,
+        message_shift: usize,
+    ) -> Result<(), String> {
+        let plan = self
+            .config
+            .loop_plan
+            .ok_or_else(|| "a message gate on a single-pass release".to_owned())?;
+        let device = self
+            .loop_device
+            .as_ref()
+            .ok_or_else(|| "the loop controllers are not resident".to_owned())?;
+        let gates = device
+            .gates
+            .get(stored)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("layer {stored} has no loop controllers"))?;
+        let hidden = self.hidden();
+        let eps = bits(self.config.architecture.norm_epsilon as f32);
+        let (down, forget, gain) = gates[stream.index()];
+        self.launch(
+            self.kernels.message_gate,
+            (rows as u32, 1, 1),
+            (MESSAGE_BLOCK, 1, 1),
+            &[
+                values.0,
+                message.0,
+                down.0,
+                forget.0,
+                gain.0,
+                hidden as u64,
+                plan.gate_rank as u64,
+                eps,
+                value_stride as u64,
+                value_shift as u64,
+                message_stride as u64,
+                message_shift as u64,
             ],
         )
     }
@@ -3125,7 +3247,18 @@ impl InklingDeviceBackend {
                 tp.world()
             ));
         }
-        let prefill_walk = PrefillWalk::from_env()?;
+        // A looped release's prefill runs one position at a time until the message path has a
+        // chunked form: the gates read and write each row's stream, and the chunk walks are
+        // built for rows that share a launch. The row walk is the same arithmetic a decode step
+        // runs, so this is a speed choice, not a numerics one.
+        let mut prefill_walk = PrefillWalk::from_env()?;
+        if config.loop_plan.is_some() && prefill_walk != PrefillWalk::Rows {
+            eprintln!(
+                "[inkling] the looped release prefills through the row walk until the message \
+                 path has a chunked form ({PREFILL_ENV}=rows)"
+            );
+            prefill_walk = PrefillWalk::Rows;
+        }
         let mxfp8_walk = Mxfp8Walk::from_env(prefill_walk)?;
         let planes = ActivationPlanes::from_env(prefill_walk)?;
         let dense_form = DenseForm::from_env()?;
@@ -3237,6 +3370,7 @@ impl InklingDeviceBackend {
             arena: expert_arena,
             route_ones,
         } = expert_scales(&cuda, &plan, &weights, mxfp8_walk)?;
+        let loop_device = loop_weights(&cuda, &plan, &weights)?;
         let exchange_slots = if exchange.has_device_leg() {
             let widest = (prefill_chunk * config.hidden_size).max(plan.rank_vocab());
             let mut total = 0usize;
@@ -3297,6 +3431,7 @@ impl InklingDeviceBackend {
                 dense,
                 clip,
                 clip_arena,
+                loop_device,
                 experts,
                 mma,
                 mxfp8_walk,
@@ -3815,7 +3950,7 @@ fn widen_clips(
     cuda.synchronize()?;
     let mut clip = Vec::with_capacity(plan.layers().len());
     for layer in plan.layers() {
-        let prefix = format!("model.llm.layers.{}.attn", layer.index);
+        let prefix = format!("model.llm.layers.{}.attn", layer.stored);
         let query_name = format!("{prefix}.q_l2_clip.scale");
         let relative_name = format!("{prefix}.rel_l2_clip.scale");
         let query_index = plan
@@ -3844,6 +3979,118 @@ fn widen_clips(
     }
     cuda.synchronize()?;
     Ok((clip, arena))
+}
+
+/// The loop's controller and query tensors once resident on the device.
+///
+/// The message path runs entirely on the device: \`inkling_cross_pass\` reads the previous pass's
+/// summaries and \`inkling_message_gate\` mixes a message into the running residual, so a pass
+/// boundary and a gate are launches rather than host copies of every row.
+struct LoopDevice {
+    /// The query and MLP streams' bank: \`[2 * core_len][hidden]\`.
+    queries: Deviceptr,
+    /// The key and value streams' bank: \`[2 * core_len][hidden]\`.
+    kv: Deviceptr,
+    /// One entry a stored layer (\`Some\` on a core layer): the four streams' (down, forget,
+    /// gain).
+    gates: Vec<Option<[(Deviceptr, Deviceptr, Deviceptr); 4]>>,
+}
+
+/// Read the loop's controller and query tensors off the device and keep them resident.
+///
+/// The checkpoint stores the controllers BF16 where the producer builds them f32; the read widens
+/// each value once, which is the cast the producer's forward makes on every call. The banks are
+/// already f32. A release with no loop plan has nothing to load and answers \`None\`.
+fn loop_weights(
+    cuda: &Cuda,
+    plan: &InklingDevicePlan,
+    weights: &Weights,
+) -> Result<Option<LoopDevice>, String> {
+    let config = plan.config();
+    let Some(loop_plan) = config.loop_plan else {
+        return Ok(None);
+    };
+    let hidden = config.hidden_size;
+    let rank = loop_plan.gate_rank;
+    let read = |name: &str, f32_tensor: bool| -> Result<Vec<f32>, String> {
+        let index = plan
+            .served()
+            .index_of(name)
+            .ok_or_else(|| format!("{name} is not a served tensor"))?;
+        let slot = weights.get(index);
+        let mut bytes = vec![0u8; slot.bytes];
+        cuda.copy_dtoh(&mut bytes, &slot.pointer)
+            .map_err(|error| format!("{name}: {error}"))?;
+        Ok(if f32_tensor {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word))
+                .collect()
+        } else {
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|word| f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16))
+                .collect()
+        })
+    };
+    // One arena holds every upload: a pointer is an offset into it, the same shape
+    // [expert_scales] uses.
+    let mut cursor = 0usize;
+    let mut upload = |values: &[f32]| -> Result<Deviceptr, String> {
+        let pointer = cuda.alloc(values.len().max(1) * 4, &mut cursor)?;
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        cuda.copy_htod(&pointer, &bytes)
+            .map_err(|error| format!("a loop controller upload: {error}"))?;
+        Ok(pointer)
+    };
+    let queries = read("model.llm.middle_cycle_cross_pass_queries", true)?;
+    let kv_queries = read("model.llm.middle_cycle_cross_pass_kv_queries", true)?;
+    if queries.len() != 2 * loop_plan.core_len() * hidden
+        || kv_queries.len() != 2 * loop_plan.core_len() * hidden
+    {
+        return Err(format!(
+            "the cross-pass banks are not {} rows of {hidden}",
+            2 * loop_plan.core_len()
+        ));
+    }
+    let queries = upload(&queries)?;
+    let kv = upload(&kv_queries)?;
+    let mut gates: Vec<Option<[(Deviceptr, Deviceptr, Deviceptr); 4]>> =
+        vec![None; config.num_hidden_layers];
+    for layer in loop_plan.core_start..loop_plan.core_end {
+        let mut pointers = Vec::with_capacity(4);
+        for stream in ["attn", "k", "v", "mlp"] {
+            let prefix = format!("model.llm.layers.{layer}.controllers.{stream}");
+            let down = read(&format!("{prefix}.down_weight"), false)?;
+            let forget = read(&format!("{prefix}.forget_weight"), false)?;
+            let gain = read(&format!("{prefix}.gain_weight"), false)?;
+            if down.len() != rank * 2 * hidden
+                || forget.len() != hidden * rank
+                || gain.len() != hidden * rank
+            {
+                return Err(format!(
+                    "layer {layer} stream {stream}: the controller shapes are not the {rank} x \
+                     {} down and {hidden} x {rank} gates the schedule plans",
+                    2 * hidden
+                ));
+            }
+            pointers.push((upload(&down)?, upload(&forget)?, upload(&gain)?));
+        }
+        gates[layer] = Some(
+            pointers
+                .try_into()
+                .map_err(|_| "four loop streams".to_owned())?,
+        );
+    }
+    cuda.synchronize()?;
+    Ok(Some(LoopDevice { queries, kv, gates }))
 }
 
 /// What [expert_scales] lays out: the NVFP4 layers' scales, every grouped-MMA table, the arena
@@ -3878,7 +4125,7 @@ fn expert_scales(
             table.push(None);
             continue;
         }
-        let prefix = format!("model.llm.layers.{}.mlp.experts", layer.index);
+        let prefix = format!("model.llm.layers.{}.mlp.experts", layer.stored);
         let read = |suffix: &str| -> Result<Vec<f32>, String> {
             let name = format!("{prefix}.{suffix}");
             let index = plan
@@ -4329,7 +4576,7 @@ impl State {
             .iter()
             .filter(|layer| {
                 layer
-                    .index
+                    .stored
                     .is_multiple_of(shared.config.n_layers_per_attn_res_block.max(1))
             })
             .count()
@@ -4442,6 +4689,16 @@ impl State {
 #[derive(Clone)]
 struct Scratch {
     x: Deviceptr,
+    /// The prelude's hidden rows, kept across the loop's passes: every pass after the first
+    /// restarts from them (\`modeling_inkling2_loop.py\`:1415-1417). Unused by a single-pass
+    /// release.
+    loop_saved: Deviceptr,
+    /// The previous pass's summary rows the message reads, up to [LOOP_PREV_MAX] blocks.
+    loop_prev: Deviceptr,
+    /// The previous pass's final hidden rows the message reads.
+    loop_prev_hidden: Deviceptr,
+    /// The four messages of every core layer, \`[core_len][4][hidden]\`, a row at a time.
+    loop_messages: Deviceptr,
     /// The block-attention residual's output: `[rows][nq][hidden]`, three rows a row on a full
     /// layer.
     rows: Deviceptr,
@@ -4586,6 +4843,18 @@ impl Scratch {
             at
         };
         let x = take(rows * hidden, 4);
+        let loop_saved = take(rows * hidden, 4);
+        let loop_prev = if config.loop_plan.is_some() {
+            take(LOOP_PREV_MAX * rows * hidden, 4)
+        } else {
+            take(rows * hidden, 4)
+        };
+        let loop_prev_hidden = take(rows * hidden, 4);
+        let loop_messages = if let Some(plan) = config.loop_plan {
+            take(rows * plan.core_len() * 4 * hidden, 4)
+        } else {
+            take(rows * hidden, 4)
+        };
         let block_inputs = take(rows * 3 * hidden, 4);
         let residual_stats = take(rows * RESIDUAL_STATS_ROW, 4);
         let normed = take(3 * hidden, 4);
@@ -4689,6 +4958,10 @@ impl Scratch {
         let at = |offset: usize| arena.offset(offset);
         Ok(Self {
             x: at(x),
+            loop_saved: at(loop_saved),
+            loop_prev: at(loop_prev),
+            loop_prev_hidden: at(loop_prev_hidden),
+            loop_messages: at(loop_messages),
             rows: at(block_inputs),
             residual_stats: at(residual_stats),
             normed: at(normed),
@@ -5636,6 +5909,12 @@ struct RowRun {
     blocks: usize,
     /// The layer step the walk runs next.
     cursor: usize,
+    /// How many summary blocks the prelude left, when the release loops. Every pass after the
+    /// first resets the stack to this length, which is the producer's `block_states` rewind.
+    loop_blocks: Option<usize>,
+    /// The previous pass's summary rows, copied aside at a pass boundary for the message read.
+    loop_prev_count: usize,
+
     /// The convolution the layer ran last, whose output the next residual add reads.
     previous_conv: Option<ConvSlot>,
 }
@@ -5662,6 +5941,8 @@ impl RowRun {
             taps,
             blocks: 0,
             cursor: 0,
+            loop_blocks: None,
+            loop_prev_count: 0,
             previous_conv: None,
         })
     }
@@ -5733,6 +6014,20 @@ impl RowRun {
     /// Steps `from..to` of layer `index`'s row schedule, the layer's drafter tap first when
     /// `from` is its first step. The layer's own cursor carries between the calls, so a step that
     /// went on past `to` is not run again by the next call.
+    /// The four messages of every core layer for this row, from the previous pass's summaries
+    /// and its final hidden (`modeling_inkling2_loop.py`:147-176). The read runs on the device
+    /// (`inkling_cross_pass`), so the row walk keeps no message copy on the host.
+    fn loop_messages(&mut self, shared: &Arc<Shared>) -> Result<(), String> {
+        let count = self.loop_prev_count.min(LOOP_PREV_MAX);
+        shared.cross_pass(
+            self.state.scratch.loop_prev,
+            self.state.scratch.loop_prev_hidden,
+            self.state.scratch.loop_messages,
+            1,
+            count,
+        )
+    }
+
     fn steps(&mut self, index: usize, from: usize, to: usize) -> Result<(), BackendError> {
         let (mut cursor, mut previous_conv) = if from == 0 {
             (0, None)
@@ -5749,15 +6044,66 @@ impl RowRun {
         let heads = shared.heads();
         let head_dim = config.head_dim;
         let groups = heads / plan.rank_kv_heads().max(1);
-        let taps = self.taps;
+        let taps = self.taps.clone();
         let schedule = plan
             .layers()
             .get(index)
             .ok_or_else(|| device_error(format!("the row schedule has no layer {index}")))?;
         let to = to.min(schedule.steps.len());
         let layer = schedule.index;
+        // A looped release restarts each pass after the first from the prelude's stream. The
+        // first core application of pass zero saves it; the first core application of every
+        // later pass puts it back and rewinds the summary stack to the depth the prelude left
+        // (`modeling_inkling2_loop.py`:1415-1423). Caches are per application already, so the
+        // keys, values and convolution histories need no copy.
         if from == 0
-            && let Some((sink, slot)) = taps.and_then(|sink| Some((sink, sink.slot(layer)?)))
+            && let Some(plan) = config.loop_plan
+            && schedule.stored == plan.core_start
+        {
+            let bytes = hidden * std::mem::size_of::<f32>();
+            if schedule.pass == 0 {
+                run(shared
+                    .cuda
+                    .copy_dtod(&self.state.scratch.loop_saved, &self.state.scratch.x, bytes)
+                    .map_err(|error| error.to_string()))?;
+                self.loop_blocks = Some(self.blocks);
+            } else {
+                // The message reads the previous pass's summaries and its final hidden. Take
+                // them aside before the rewind overwrites the stream; the producer's slice is
+                // `block_states[num_pre_loop_blocks + 1:]` (`:1419`), which drops the
+                // prelude's own summary and the pass's first append.
+                let depth = self.loop_blocks.unwrap_or(0);
+                let start = depth + 1;
+                let count = self.blocks.saturating_sub(start).min(LOOP_PREV_MAX);
+                for block in 0..count {
+                    let source = self.state.summaries.offset((start + block) * bytes);
+                    let destination = self.state.scratch.loop_prev.offset(block * bytes);
+                    run(shared
+                        .cuda
+                        .copy_dtod(&destination, &source, bytes)
+                        .map_err(|error| error.to_string()))?;
+                }
+                self.loop_prev_count = count;
+                run(shared
+                    .cuda
+                    .copy_dtod(
+                        &self.state.scratch.loop_prev_hidden,
+                        &self.state.scratch.x,
+                        bytes,
+                    )
+                    .map_err(|error| error.to_string()))?;
+                let saved = self.state.scratch.loop_saved;
+                run(shared
+                    .cuda
+                    .copy_dtod(&self.state.scratch.x, &saved, bytes)
+                    .map_err(|error| error.to_string()))?;
+                self.blocks = self.loop_blocks.unwrap_or(0);
+            }
+        }
+        if from == 0
+            && let Some((sink, slot)) = taps
+                .as_ref()
+                .and_then(|sink| sink.slot(layer).map(|slot| (sink.clone(), slot)))
         {
             sink.capture(&shared, self.state.scratch.x, 1, slot)?;
         }
@@ -6134,6 +6480,36 @@ impl RowRun {
                         0,
                     ))?;
                 }
+                (Op::MessageRead, _) => {
+                    self.loop_messages(&shared).map_err(device_error)?;
+                }
+                (Op::MessageGate(stream), _) => {
+                    let loop_plan = config.loop_plan.ok_or_else(|| {
+                        device_error(format!(
+                            "layer {layer}: a message gate on a single-pass release"
+                        ))
+                    })?;
+                    // The controller tensors and the query row are the stored layer's, not the
+                    // application's: a later pass reuses them.
+                    let stored = schedule.stored;
+                    let core = stored.saturating_sub(loop_plan.core_start);
+                    let shift = match stream {
+                        MessageStream::Mlp | MessageStream::Query => 0,
+                        MessageStream::Key => hidden,
+                        MessageStream::Value => 2 * hidden,
+                    };
+                    run(shared.message_gate(
+                        self.state.scratch.rows,
+                        self.state.scratch.loop_messages,
+                        stored,
+                        stream,
+                        1,
+                        hidden,
+                        shift,
+                        hidden,
+                        (core * 4 + stream.index()) * hidden,
+                    ))?;
+                }
                 (Op::Router, _) => {
                     let bias = self.weight(step.weights[0]);
                     if trace_on() && layer == 0 {
@@ -6246,8 +6622,8 @@ impl RowRun {
                         1,
                         hidden,
                     ))?;
-                    if let Some(sink) = self.taps {
-                        sink.capture(&shared, self.state.scratch.final_row, 1, FINAL_TAP)?;
+                    if let Some(sink) = self.taps.clone() {
+                        sink.capture(&shared, self.state.scratch.final_row, 1, sink.final_slot())?;
                     }
                 }
                 (Op::Gemv, Target::Project(Projection::Head)) => {

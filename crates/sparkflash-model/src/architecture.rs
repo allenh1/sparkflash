@@ -113,6 +113,8 @@ pub struct Inkling {
     pub unpadded_vocab_size: usize,
     /// One stored expert format per decoder layer.
     pub layer_expert_formats: Vec<WeightFormat>,
+    /// The looped core schedule, when the release runs its middle layers more than once.
+    pub loop_plan: Option<InklingLoop>,
 }
 
 /// The log scaling full-attention layers apply to queries and relative states.
@@ -146,6 +148,37 @@ pub struct BlockAttentionResidual {
     pub mlp_queries: usize,
     /// Whether the summary stack is normalized before the query attention.
     pub normalize: bool,
+}
+
+/// The looped schedule Inkling-2-Mini applies to its core layers.
+///
+/// The checkpoint stores one copy of the core. The forward runs the prelude once, the core
+/// `passes` times and the coda once, and every pass after the first starts from the prelude's
+/// hidden state and block summaries while receiving a message from the previous pass
+/// (`modeling_inkling2_loop.py`:1390-1470). The count is a schedule fact, not a second set of
+/// weights: the stored layer indices are `0..num_hidden_layers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InklingLoop {
+    /// The first shared core layer (0-based, from `loop_config.core_start`).
+    pub core_start: usize,
+    /// One past the last shared core layer (`loop_config.core_end`).
+    pub core_end: usize,
+    /// How many times the core runs, first pass included (`loop_config.num_passes`).
+    pub passes: usize,
+    /// The rank of the message gates' down projection (`loop_config.gate_rank`).
+    pub gate_rank: usize,
+    /// The sublayer inputs a message feeds: query, key, value and MLP. The producer's query
+    /// bank is shaped `(core layers, 4, hidden)`, so the four are a stored fact
+    /// (`modeling_inkling2_loop.py:155-158`), not a schedule option.
+    pub streams: usize,
+}
+
+impl InklingLoop {
+    /// The layers in the shared core.
+    #[must_use]
+    pub const fn core_len(&self) -> usize {
+        self.core_end - self.core_start
+    }
 }
 
 /// The special-token ids a checkpoint names.
@@ -1871,6 +1904,17 @@ impl Architecture {
         )
     }
 
+    /// The looped core schedule, when the checkpoint runs its middle layers more than once.
+    ///
+    /// This is the one accessor the description reads: [crate::stack] builds the message parts
+    /// from it without naming a family, and a caller that has no loop gets `None`.
+    #[must_use]
+    pub fn loop_plan(&self) -> Option<InklingLoop> {
+        self.inkling
+            .as_ref()
+            .and_then(|geometry| geometry.loop_plan)
+    }
+
     /// The parts a run of this architecture needs.
     #[must_use]
     pub fn parts(&self) -> PartSet {
@@ -1896,6 +1940,12 @@ impl Architecture {
             inkling.softcaps.gate.is_finite() || inkling.softcaps.up.is_finite()
         }) {
             parts.insert(Part::SoftcappedActivation);
+        }
+        if self.loop_plan().is_some() {
+            // The loop's message path: one pooled cross-pass attention and one gate per core
+            // layer. They are model-wide parts of the description, not per-layer geometry.
+            parts.insert(Part::CrossPassAttention);
+            parts.insert(Part::LoopMessageGate);
         }
         for layer in &self.layers {
             match &layer.attention.kind {
@@ -2986,7 +3036,10 @@ fn inkling(text: &Value, root: &Value, vocab_size: usize) -> Result<Option<Inkli
     let Some(d_rel) = optional_usize(text, "d_rel")? else {
         return Ok(None);
     };
-    if family != "inkling2" {
+    // The looped release is the same text stack with a shared middle: `inkling2_loop` adds the
+    // `loop_config` schedule and the message path, and keeps every other Inkling fact. A family
+    // that declares neither spelling is refused rather than parsed as Inkling.
+    if family != "inkling2" && family != "inkling2_loop" {
         return Err(invalid(format!(
             "d_rel is declared by {family:?}, not an inkling2 document"
         )));
@@ -3017,6 +3070,44 @@ fn inkling(text: &Value, root: &Value, vocab_size: usize) -> Result<Option<Inkli
         }),
         None => None,
     };
+    // `loop_config` is the looped release's schedule (configuration_inkling2_loop.py:134-145).
+    // The producer defaults are its own; a document that names the block with different values is
+    // read, and a variable-length loop is refused because the pass count is then token-dependent.
+    let loop_plan = match object(text, "loop_config").or_else(|| object(root, "loop_config")) {
+        Some(loop_config) => {
+            if family != "inkling2_loop" {
+                return Err(invalid(format!(
+                    "loop_config is declared by {family:?}, and only the inkling2_loop release \
+                     runs a shared core"
+                )));
+            }
+            if optional_bool(loop_config, "is_varloop")?.unwrap_or(false) {
+                return Err(invalid(
+                    "loop_config.is_varloop is true: the pass count is token-dependent, and this \
+                     description plans a fixed schedule",
+                ));
+            }
+            let core_start = optional_usize(loop_config, "core_start")?.unwrap_or(6);
+            let core_end = optional_usize(loop_config, "core_end")?.unwrap_or(layers);
+            let passes = optional_usize(loop_config, "num_passes")?.unwrap_or(3);
+            if core_start >= core_end || core_end > layers {
+                return Err(invalid(format!(
+                    "loop_config names core [{core_start}, {core_end}) outside 0..{layers}"
+                )));
+            }
+            if passes < 1 {
+                return Err(invalid("loop_config.num_passes must be positive"));
+            }
+            Some(InklingLoop {
+                core_start,
+                core_end,
+                passes,
+                gate_rank: optional_usize(loop_config, "gate_rank")?.unwrap_or(64),
+                streams: 4,
+            })
+        }
+        None => None,
+    };
     let quantization = quantization(root)?;
     Ok(Some(Inkling {
         d_rel,
@@ -3034,6 +3125,7 @@ fn inkling(text: &Value, root: &Value, vocab_size: usize) -> Result<Option<Inkli
         final_logit_softcap: optional_f64(text, "final_logit_softcapping")?,
         unpadded_vocab_size: optional_usize(text, "unpadded_vocab_size")?.unwrap_or(vocab_size),
         layer_expert_formats: vec![quantization.expert_format; layers],
+        loop_plan,
     }))
 }
 
@@ -5014,8 +5106,10 @@ mod tests {
             0xb288_89c1_f3b4_1a15,
             // Inkling's layout learns the tower's rotary-plus-grid position, LayerNorm and
             // erf-GELU wiring, its relative-attention switches, and its [vars] resolve the MTP
-            // and convolution shape facts.
-            0x58a5_5123_bdf0_554c,
+            // and convolution shape facts. The digest moved once more (2026-11-26) when
+            // `Inkling` gained `loop_plan`, which prints as `None` for this release: only that
+            // field differs in the {:#?} text (previous 0x58a5_5123_bdf0_554c).
+            0x78b0_fe77_3bcd_73d6,
             0xe125_71f7_d485_a808,
             0x810f_439c_45e8_588c,
             0xb762_2ecd_8b42_6c89,

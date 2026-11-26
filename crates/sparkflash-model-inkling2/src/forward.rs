@@ -362,18 +362,67 @@ impl Inkling2Weights {
         // tokens would grow it a block group a token and feed the next token's sublayers an
         // older token's stream, which is not a residual the released model has.
         state.block_states.clear();
-        for layer in 0..config.num_hidden_layers {
-            let start = std::time::Instant::now();
-            x = self.layer(layer, position, x, state)?;
-            if trace_on() {
-                let rms =
-                    (x.iter().map(|value| value * value).sum::<f32>() / x.len() as f32).sqrt();
-                eprintln!(
-                    "[inkling] host   layer {layer} x0={:.5} x1={:.5} rms={rms:.5}",
-                    x[0], x[1]
-                );
+        // A looped release runs its core more than once. The schedule below is the producer's
+        // (modeling_inkling2_loop.py:1390-1470): the prelude once, the core `passes` times and
+        // the coda once. Every pass after the first restarts from the prelude's hidden state and
+        // block stack, and receives a message from the pass before it.
+        if let Some(plan) = config.loop_plan {
+            let schedule = config.applications();
+            let mut prelude_hidden: Option<Vec<f32>> = None;
+            let mut prelude_blocks: Vec<Vec<f32>> = Vec::new();
+            let mut previous: Option<(Vec<Vec<f32>>, Vec<f32>)> = None;
+            let mut running_pass = 0usize;
+            for (layer, pass) in schedule {
+                if pass > running_pass {
+                    // The pass just finished: take the summary the message reads, then rewind to
+                    // the prelude. The producer drops the prelude's blocks and the first block
+                    // the pass appended (`:1419`), and keeps the rest with the pass's output.
+                    let skip = prelude_blocks.len() + 1;
+                    let blocks = state.block_states.get(skip..).unwrap_or_default().to_vec();
+                    previous = Some((blocks, x.clone()));
+                    x = prelude_hidden
+                        .clone()
+                        .expect("the prelude ran before the core");
+                    state.block_states = prelude_blocks.clone();
+                    running_pass = pass;
+                }
+                let messages = match (&previous, pass) {
+                    (Some((blocks, hidden)), p) if p > 0 => {
+                        Some(self.cross_pass(layer - plan.core_start, blocks, hidden)?)
+                    }
+                    _ => None,
+                };
+                let start = std::time::Instant::now();
+                let cache = config.cache_slot(layer, pass);
+                x = self.layer(cache, layer, position, x, state, messages.as_ref())?;
+                if trace_on() {
+                    let rms =
+                        (x.iter().map(|value| value * value).sum::<f32>() / x.len() as f32).sqrt();
+                    eprintln!(
+                        "[inkling] host   layer {layer} pass {pass} x0={:.5} x1={:.5} rms={rms:.5}",
+                        x[0], x[1]
+                    );
+                }
+                trace_timing!(format!("token={token} layer={layer} pass={pass}"), start);
+                if pass == 0 && layer + 1 == plan.core_start {
+                    prelude_hidden = Some(x.clone());
+                    prelude_blocks = state.block_states.clone();
+                }
             }
-            trace_timing!(format!("token={token} layer={layer}"), start);
+        } else {
+            for layer in 0..config.num_hidden_layers {
+                let start = std::time::Instant::now();
+                x = self.layer(layer, layer, position, x, state, None)?;
+                if trace_on() {
+                    let rms =
+                        (x.iter().map(|value| value * value).sum::<f32>() / x.len() as f32).sqrt();
+                    eprintln!(
+                        "[inkling] host   layer {layer} x0={:.5} x1={:.5} rms={rms:.5}",
+                        x[0], x[1]
+                    );
+                }
+                trace_timing!(format!("token={token} layer={layer}"), start);
+            }
         }
         let head = std::time::Instant::now();
         let final_input = block_residual(
@@ -441,12 +490,111 @@ impl Inkling2Weights {
         Ok(logits)
     }
 
+    /// The four messages a core layer consumes on a pass after the first.
+    ///
+    /// `modeling_inkling2_loop.py:147-176`: the previous pass's block summaries and its final
+    /// hidden state are stacked, unweighted-RMS normed, and read by four learned queries (one
+    /// a stream) with a `hidden**-0.5` scale. There is no mask: the read is over a handful of
+    /// summaries, not over positions.
+    fn cross_pass(
+        &self,
+        loop_index: usize,
+        blocks: &[Vec<f32>],
+        hidden: &[f32],
+    ) -> Result<LoopMessages, String> {
+        let config = &self.config;
+        let epsilon = config.architecture.norm_epsilon;
+        let mut states: Vec<Vec<f32>> = blocks.to_vec();
+        states.push(hidden.to_vec());
+        for state in &mut states {
+            *state = unweighted_rms(state, epsilon);
+        }
+        let scale = 1.0 / (config.hidden_size as f32).sqrt();
+        let attend = |query: Vec<f32>| -> Result<Vec<f32>, String> {
+            let mut scores: Vec<f32> = states
+                .iter()
+                .map(|state| {
+                    query
+                        .iter()
+                        .zip(state)
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>()
+                        * scale
+                })
+                .collect();
+            let largest = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut total = 0.0f32;
+            for score in &mut scores {
+                *score = (*score - largest).exp();
+                total += *score;
+            }
+            let mut out = vec![0.0f32; config.hidden_size];
+            for (weight, state) in scores.iter().zip(&states) {
+                let weight = weight / total;
+                for (out, value) in out.iter_mut().zip(state) {
+                    *out += weight * value;
+                }
+            }
+            Ok(out)
+        };
+        // The producer's bank is `(core layers, 4, hidden)` in query, key, value, MLP order. The
+        // checkpoint splits it into two 24-row tensors; which two streams each holds is a
+        // conversion fact the layout records, and this is the split it states: the query and
+        // MLP streams in `middle_cycle_cross_pass_queries`, the key and value streams in
+        // `middle_cycle_cross_pass_kv_queries`.
+        let row = |bank: &str, sub: usize| self.row(bank, loop_index * 2 + sub, config.hidden_size);
+        let q = attend(row("model.llm.middle_cycle_cross_pass_queries", 0)?)?;
+        let mlp = attend(row("model.llm.middle_cycle_cross_pass_queries", 1)?)?;
+        let k = attend(row("model.llm.middle_cycle_cross_pass_kv_queries", 0)?)?;
+        let v = attend(row("model.llm.middle_cycle_cross_pass_kv_queries", 1)?)?;
+        Ok(LoopMessages { q, k, v, mlp })
+    }
+
+    /// One stream's message gate: `(1 - tanh(forget)) * source + tanh(gain) * message`.
+    ///
+    /// `modeling_inkling2_loop.py:81-99`: the gates are projected from an unweighted-RMSNorm of
+    /// the concatenated source and message through a rank-bottlenecked down projection. The
+    /// producer builds the gate parameters in f32 and casts at the boundary; the checkpoint
+    /// stores them BF16, which is the type the layout states and the loader decodes.
+    fn message_gate(
+        &self,
+        layer: usize,
+        stream: &str,
+        source: &[f32],
+        message: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        let config = &self.config;
+        let epsilon = config.architecture.norm_epsilon;
+        let hidden = config.hidden_size;
+        let rank = config.loop_plan.map_or(0, |plan| plan.gate_rank);
+        let prefix = format!("model.llm.layers.{layer}.controllers.{stream}");
+        let down = self.matrix(&format!("{prefix}.down_weight"), rank, 2 * hidden)?;
+        let forget = self.matrix(&format!("{prefix}.forget_weight"), hidden, rank)?;
+        let gain = self.matrix(&format!("{prefix}.gain_weight"), hidden, rank)?;
+        let mut joined = unweighted_rms(source, epsilon);
+        joined.extend(unweighted_rms(message, epsilon));
+        let bottleneck = matvec(&down, &joined, rank, 2 * hidden);
+        let forget = matvec(&forget, &bottleneck, hidden, rank);
+        let gain = matvec(&gain, &bottleneck, hidden, rank);
+        Ok(source
+            .iter()
+            .zip(&forget)
+            .zip(&gain)
+            .zip(message)
+            .map(|(((source, forget), gain), message)| {
+                (1.0 - forget.tanh()) * source + gain.tanh() * message
+            })
+            .collect())
+    }
+
     fn layer(
         &self,
+        cache: usize,
         layer: usize,
         position: usize,
         hidden: Vec<f32>,
         state: &mut Inkling2State,
+        messages: Option<&LoopMessages>,
     ) -> Result<Vec<f32>, String> {
         let config = &self.config;
         let prefix = format!("model.llm.layers.{layer}");
@@ -474,43 +622,46 @@ impl Inkling2Weights {
             )?
         };
 
+        // A later pass folds the previous pass's message into each sublayer input before the
+        // input norm (modeling_inkling2_loop.py:1001-1012, 1152-1160). The gate is per stream:
+        // the query path, the key path, the value path and the MLP.
+        let gated = |stream: &str, source: &[f32], message: Option<&Vec<f32>>| match message {
+            Some(message) => self.message_gate(layer, stream, source, message),
+            None => Ok(source.to_vec()),
+        };
         let (q_input, k_input, v_input) = if sliding {
             let norm = self.vector(&format!("{prefix}.attn_norm.weight"))?;
             // The block-attention residual is read on a sliding layer too: `attention_input` is the
             // softmax mix over the summary stack, and it is the layer's attention input, not the
             // raw stream. At layer 0 the two coincide because there is no stack yet.
-            let x = rms_norm(
-                &attention_input[0],
-                Some(&norm),
-                config.architecture.norm_epsilon,
-            );
+            let source = gated("attn", &attention_input[0], messages.map(|held| &held.q))?;
+            let x = rms_norm(&source, Some(&norm), config.architecture.norm_epsilon);
             (x.clone(), x.clone(), x)
         } else {
             let qn = self.vector(&format!("{prefix}.q_input_norm.weight"))?;
             let kn = self.vector(&format!("{prefix}.k_input_norm.weight"))?;
             let vn = self.vector(&format!("{prefix}.v_input_norm.weight"))?;
+            let q_source = gated("attn", &attention_input[0], messages.map(|held| &held.q))?;
+            let k_source = gated(
+                "k",
+                attention_input.get(1).unwrap_or(&attention_input[0]),
+                messages.map(|held| &held.k),
+            )?;
+            let v_source = gated(
+                "v",
+                attention_input.get(2).unwrap_or(&attention_input[0]),
+                messages.map(|held| &held.v),
+            )?;
             (
-                rms_norm(
-                    &attention_input[0],
-                    Some(&qn),
-                    config.architecture.norm_epsilon,
-                ),
-                rms_norm(
-                    attention_input.get(1).unwrap_or(&attention_input[0]),
-                    Some(&kn),
-                    config.architecture.norm_epsilon,
-                ),
-                rms_norm(
-                    attention_input.get(2).unwrap_or(&attention_input[0]),
-                    Some(&vn),
-                    config.architecture.norm_epsilon,
-                ),
+                rms_norm(&q_source, Some(&qn), config.architecture.norm_epsilon),
+                rms_norm(&k_source, Some(&kn), config.architecture.norm_epsilon),
+                rms_norm(&v_source, Some(&vn), config.architecture.norm_epsilon),
             )
         };
 
         let stage = std::time::Instant::now();
         let attn = self.attention(
-            layer, position, sliding, &q_input, &k_input, &v_input, state,
+            cache, layer, position, sliding, &q_input, &k_input, &v_input, state,
         )?;
         if trace_on() {
             let rms =
@@ -527,7 +678,7 @@ impl Inkling2Weights {
             &format!("{prefix}.attn_sconv.weight"),
             &attn,
             state,
-            layer,
+            cache,
             2,
         )?;
         let residual = if layer.is_multiple_of(config.n_layers_per_attn_res_block) {
@@ -547,17 +698,19 @@ impl Inkling2Weights {
             config.architecture.norm_epsilon,
         )?;
         let norm = self.vector(&format!("{prefix}.mlp_norm.weight"))?;
-        let mlp_in = rms_norm(&mlp_input[0], Some(&norm), config.architecture.norm_epsilon);
+        let mlp_source = gated("mlp", &mlp_input[0], messages.map(|held| &held.mlp))?;
+        let mlp_in = rms_norm(&mlp_source, Some(&norm), config.architecture.norm_epsilon);
         let stage = std::time::Instant::now();
         let mlp = self.moe(layer, &mlp_in)?;
         trace_timing!(format!("layer={layer} moe"), stage);
-        let mlp = self.conv(&format!("{prefix}.mlp_sconv.weight"), &mlp, state, layer, 3)?;
+        let mlp = self.conv(&format!("{prefix}.mlp_sconv.weight"), &mlp, state, cache, 3)?;
         Ok(add(&residual, &mlp))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
+        cache: usize,
         layer: usize,
         position: usize,
         sliding: bool,
@@ -601,11 +754,11 @@ impl Inkling2Weights {
         )?;
 
         if sliding {
-            k = self.conv(&format!("{prefix}.k_sconv.weight"), &k, state, layer, 0)?;
-            v = self.conv(&format!("{prefix}.v_sconv.weight"), &v, state, layer, 1)?;
+            k = self.conv(&format!("{prefix}.k_sconv.weight"), &k, state, cache, 0)?;
+            v = self.conv(&format!("{prefix}.v_sconv.weight"), &v, state, cache, 1)?;
         } else {
-            k = self.conv_dynamic(&format!("{prefix}.k_sconv"), &k, k_input, state, layer, 0)?;
-            v = self.conv_dynamic(&format!("{prefix}.v_sconv"), &v, v_input, state, layer, 1)?;
+            k = self.conv_dynamic(&format!("{prefix}.k_sconv"), &k, k_input, state, cache, 0)?;
+            v = self.conv_dynamic(&format!("{prefix}.v_sconv"), &v, v_input, state, cache, 1)?;
         }
 
         let q_scale = self.vector(&format!("{prefix}.q_l2_clip.scale"))?;
@@ -639,11 +792,14 @@ impl Inkling2Weights {
                 );
             }
         }
-        let cache = &mut state.layers[layer];
-        cache.k.push(k);
-        cache.v.push(v);
+        let layer_state = &mut state.layers[cache];
+        layer_state.k.push(k);
+        layer_state.v.push(v);
         let start = if sliding {
-            cache.k.len().saturating_sub(config.sliding_window_size)
+            layer_state
+                .k
+                .len()
+                .saturating_sub(config.sliding_window_size)
         } else {
             0
         };
@@ -658,8 +814,8 @@ impl Inkling2Weights {
         let output = crate::reference::attention(
             &q,
             &gate,
-            &cache.k[start..],
-            &cache.v[start..],
+            &layer_state.k[start..],
+            &layer_state.v[start..],
             &rel,
             &rel_bank,
             &sink,
@@ -707,13 +863,13 @@ impl Inkling2Weights {
         weight_name: &str,
         input: &[f32],
         state: &mut Inkling2State,
-        layer: usize,
+        cache: usize,
         slot: usize,
     ) -> Result<Vec<f32>, String> {
         let width = input.len();
         let kernel = self.config.sconv_kernel_size;
         let weights = self.matrix(weight_name, width, kernel)?;
-        let history = &mut state.layers[layer].conv[slot];
+        let history = &mut state.layers[cache].conv[slot];
         Ok(crate::reference::short_conv_decode(
             input, &weights, history, width, kernel,
         ))
@@ -726,7 +882,7 @@ impl Inkling2Weights {
         input: &[f32],
         dynamic: &[f32],
         state: &mut Inkling2State,
-        layer: usize,
+        cache: usize,
         slot: usize,
     ) -> Result<Vec<f32>, String> {
         let config = &self.config;
@@ -739,7 +895,7 @@ impl Inkling2Weights {
             config.num_key_value_heads * kernel,
             config.hidden_size,
         )?;
-        let history = &mut state.layers[layer].conv[slot];
+        let history = &mut state.layers[cache].conv[slot];
         Ok(crate::reference::short_conv_dynamic_decode(
             input,
             &static_w,
@@ -823,6 +979,22 @@ impl Inkling2Weights {
     }
 }
 
+/// The four sublayer inputs one loop pass hands the next.
+#[derive(Debug, Clone)]
+struct LoopMessages {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    mlp: Vec<f32>,
+}
+
+/// An unweighted RMSNorm in f32, as the loop's message path applies it.
+fn unweighted_rms(input: &[f32], epsilon: f64) -> Vec<f32> {
+    let mean = input.iter().map(|value| value * value).sum::<f32>() / input.len() as f32;
+    let scale = (mean + epsilon as f32).sqrt().recip();
+    input.iter().map(|value| value * scale).collect()
+}
+
 /// One session's growing state.
 #[derive(Debug, Clone)]
 pub struct Inkling2State {
@@ -850,7 +1022,7 @@ impl Inkling2State {
         Self {
             position: 0,
             block_states: Vec::new(),
-            layers: (0..config.num_hidden_layers)
+            layers: (0..config.cache_slots())
                 .map(|_| LayerState {
                     k: Vec::new(),
                     v: Vec::new(),

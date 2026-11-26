@@ -67,12 +67,10 @@ fn full_window(value: Option<&str>) -> Result<Option<usize>, String> {
     }
 }
 
-/// The taps a committed row carries: seven pre-layer partials, then the post-final-norm hidden.
-pub(super) const TAPS: usize = 8;
-/// The tap slot of the post-final-norm hidden.
-pub(super) const FINAL_TAP: usize = TAPS - 1;
-/// The fusion rows: one a draft layer, then the Markov head's.
-const FUSION_ROWS: usize = 6;
+// The taps and fusion rows are the checkpoint's: `mtp_config.target_layer_ids` names one tap a
+// pre-layer partial plus the post-final-norm hidden, and `fuse_weight` carries one fusion row a
+// draft layer plus the Markov head's. Inkling-2-Small has eight taps and six rows; Inkling-2-Mini
+// has four and four, and the kernels take the count at run time.
 /// The context rows one injection pass mixes and projects at once.
 const INJECT_ROWS: usize = 1024;
 /// The drafter's head width, which the attention and the rotary assume.
@@ -269,7 +267,7 @@ struct DraftLayer {
 pub(super) struct DraftModel {
     kernels: DraftKernels,
     layers: Vec<DraftLayer>,
-    /// `bf16(softmax(fuse_weight))`, [FUSION_ROWS][TAPS].
+    /// `bf16(softmax(fuse_weight))`, [fusion_rows][taps].
     alpha: Deviceptr,
     mask: Deviceptr,
     norm: Deviceptr,
@@ -282,8 +280,12 @@ pub(super) struct DraftModel {
     fold_weight: Deviceptr,
     fold_bias: Deviceptr,
     markov_norm: Deviceptr,
-    /// The target layers whose pre-layer partials are taps 0..FINAL_TAP.
-    tap_layers: [usize; FINAL_TAP],
+    /// The target layers whose pre-layer partials are taps 0..taps-1.
+    tap_layers: Vec<usize>,
+    /// The taps a committed row carries, the post-final hidden included.
+    taps: usize,
+    /// The fusion rows: one a draft layer, then the Markov head's.
+    fusion_rows: usize,
     /// The target's embedding table, embedding norm and head (this rank's slices).
     embed_table: Deviceptr,
     embed_norm: Deviceptr,
@@ -305,13 +307,15 @@ pub(super) struct DraftModel {
     bytes: usize,
 }
 
-/// A walk's sink for the drafter's taps: the tap buffer, `[rows][TAPS][hidden]` BF16, and the
+/// A walk's sink for the drafter's taps: the tap buffer, `[rows][taps][hidden]` BF16, and the
 /// target layers whose pre-layer partials it keeps.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct TapSink {
     capture: Bound,
     taps: Deviceptr,
-    layers: [usize; FINAL_TAP],
+    layers: Vec<usize>,
+    /// The taps a row carries, the post-final hidden included.
+    per_row: usize,
     /// The rows the buffer holds.
     rows: usize,
 }
@@ -323,6 +327,11 @@ unsafe impl Send for TapSink {}
 unsafe impl Sync for TapSink {}
 
 impl TapSink {
+    /// The tap slot of the post-final-norm hidden.
+    pub(super) fn final_slot(&self) -> usize {
+        self.per_row - 1
+    }
+
     /// The slot of the tap taken before target layer `layer`, if any.
     pub(super) fn slot(&self, layer: usize) -> Option<usize> {
         self.layers.iter().position(|tap| *tap == layer)
@@ -353,7 +362,7 @@ impl TapSink {
                     self.taps.0,
                     hidden as u64,
                     hidden as u64,
-                    TAPS as u64,
+                    self.per_row as u64,
                     slot as u64,
                 ],
             )
@@ -460,16 +469,21 @@ impl DraftModel {
         if markov == 0 {
             return Err("the drafter has no Markov head (markov_rank 0)".to_owned());
         }
-        let layers_total = config.num_hidden_layers;
+        // The taps count the `applications` a token runs, not the stored layers: a looped
+        // release's last tap is the hidden after its last application, so the count is the
+        // schedule's length and the pre-layer taps are application indices.
+        let applications = config.applications().len();
         let ids = &mtp.target_layer_ids;
-        if ids.len() != TAPS || ids.last() != Some(&layers_total) {
+        let taps = ids.len();
+        let fusion_rows = mtp.num_hidden_layers + 1;
+        if taps < 2 || ids.last() != Some(&applications) {
             return Err(format!(
-                "the drafter taps {ids:?}: this arm takes {FINAL_TAP} pre-layer partials and \
-                 the post-final-norm hidden ({layers_total})"
+                "the drafter taps {ids:?}: the list names the pre-layer taps and then the \
+                 post-final hidden ({applications})"
             ));
         }
-        let mut tap_layers = [0usize; FINAL_TAP];
-        for (slot, layer) in ids[..FINAL_TAP].iter().enumerate() {
+        let mut tap_layers = Vec::with_capacity(taps - 1);
+        for layer in &ids[..taps - 1] {
             if !shared
                 .plan
                 .layers()
@@ -478,7 +492,7 @@ impl DraftModel {
             {
                 return Err(format!("tap layer {layer} is not a layer of this schedule"));
             }
-            tap_layers[slot] = *layer;
+            tap_layers.push(*layer);
         }
         if mtp
             .local_layer_ids
@@ -616,15 +630,15 @@ impl DraftModel {
         }
         // The fusion rows' softmax over the taps, in fp32 and rounded to BF16 as the reference
         // keeps them.
-        let fuse = up.read("fuse_weight", FUSION_ROWS * TAPS * 2)?;
+        let fuse = up.read("fuse_weight", fusion_rows * taps * 2)?;
         let fuse: Vec<f32> = fuse
             .as_chunks::<2>()
             .0
             .iter()
             .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair)))
             .collect();
-        let mut alpha = Vec::with_capacity(FUSION_ROWS * TAPS * 2);
-        for row in fuse.chunks(TAPS) {
+        let mut alpha = Vec::with_capacity(fusion_rows * taps * 2);
+        for row in fuse.chunks(taps) {
             let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = row.iter().map(|value| (value - top).exp()).collect();
             let total: f32 = exps.iter().sum();
@@ -668,6 +682,8 @@ impl DraftModel {
             fold_bias,
             markov_norm,
             tap_layers,
+            taps,
+            fusion_rows,
             embed_table: shared.weights.get(embed_table).pointer,
             embed_norm: shared.weights.get(embed_norm).pointer,
             head,
@@ -895,7 +911,7 @@ impl DraftState {
                 )
             })
             .collect();
-        let taps = layout.take(tap_rows * TAPS * hidden * 2);
+        let taps = layout.take(tap_rows * model.taps * hidden * 2);
         let fused = layout.take(INJECT_ROWS * hidden * f);
         let context_keys = layout.take(INJECT_ROWS * kv_width * f);
         let context_values = layout.take(INJECT_ROWS * kv_width * f);
@@ -947,7 +963,8 @@ impl DraftState {
             sink: TapSink {
                 capture: model.kernels.capture,
                 taps: at(taps),
-                layers: model.tap_layers,
+                layers: model.tap_layers.clone(),
+                per_row: model.taps,
                 rows: tap_rows,
             },
             fused: at(fused),
@@ -989,7 +1006,7 @@ impl DraftState {
 
     /// Where the walks leave this sequence's taps.
     pub(super) fn sink(&self) -> TapSink {
-        self.sink
+        self.sink.clone()
     }
 
     /// Forget the context: the next prompt injects from position zero. The rings keep their
@@ -1056,7 +1073,7 @@ impl DraftState {
         }
         let hidden = model.hidden;
         let kv_width = model.kv_heads * HEAD_DIM;
-        let tap_row = TAPS * hidden * 2;
+        let tap_row = model.taps * hidden * 2;
         let kernels = &model.kernels;
         let run = |result: Result<(), String>| result.map_err(device_error);
         for (index, layer) in model.layers.iter().enumerate() {
@@ -1071,11 +1088,11 @@ impl DraftState {
                     (BLOCK, 1, 1),
                     &[
                         self.sink.taps.offset(at * tap_row).0,
-                        model.alpha.offset(index * TAPS * 2).0,
+                        model.alpha.offset(index * model.taps * 2).0,
                         layer.fusion_norm.0,
                         self.fused.0,
                         hidden as u64,
-                        TAPS as u64,
+                        model.taps as u64,
                         bits(model.eps),
                     ],
                 ))?;
@@ -1130,11 +1147,14 @@ impl DraftState {
             (BLOCK, 1, 1),
             &[
                 self.sink.taps.offset((rows - 1) * tap_row).0,
-                model.alpha.offset((FUSION_ROWS - 1) * TAPS * 2).0,
+                model
+                    .alpha
+                    .offset((model.fusion_rows - 1) * model.taps * 2)
+                    .0,
                 model.markov_norm.0,
                 self.feature.0,
                 hidden as u64,
-                TAPS as u64,
+                model.taps as u64,
                 bits(model.eps),
             ],
         ))?;

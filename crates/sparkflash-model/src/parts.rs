@@ -88,10 +88,20 @@ pub enum Part {
     RelativeAttention,
     /// A depthwise causal short convolution with decode history.
     ShortConv,
+    /// A short convolution whose taps are a fixed table plus a per-token projection of the
+    /// layer input, and whose residual is scaled by `sqrt(2k + 1)` (Inkling-2-Mini's
+    /// full-attention key and value convolutions).
+    DynamicShortConv,
     /// A block-attention residual over a stack of block summaries.
     BlockAttentionResidual,
     /// A softcapped gated activation (Inkling's SwiGLU).
     SoftcappedActivation,
+    /// A loop's gated message mix: a rank-bottlenecked pair of tanh gates that fold the
+    /// previous pass's message into a sublayer's input (Inkling-2-Mini's message gate).
+    LoopMessageGate,
+    /// A pooled cross-pass attention that reads a whole pass's block summaries with learned
+    /// queries and emits the message a later pass consumes.
+    CrossPassAttention,
     /// An on-the-fly quantization epilogue.
     Quantize,
     /// Layer normalization, distinct from RMSNorm.
@@ -139,8 +149,11 @@ impl Part {
         Self::Rope,
         Self::RelativeAttention,
         Self::ShortConv,
+        Self::DynamicShortConv,
         Self::BlockAttentionResidual,
         Self::SoftcappedActivation,
+        Self::LoopMessageGate,
+        Self::CrossPassAttention,
         Self::Quantize,
         Self::LayerNorm,
         Self::MoeRouter,
@@ -183,8 +196,11 @@ impl Part {
             Self::Rope => "rope",
             Self::RelativeAttention => "relative_attention",
             Self::ShortConv => "short_conv",
+            Self::DynamicShortConv => "dynamic_short_conv",
             Self::BlockAttentionResidual => "block_attention_residual",
             Self::SoftcappedActivation => "softcapped_activation",
+            Self::LoopMessageGate => "loop_message_gate",
+            Self::CrossPassAttention => "cross_pass_attention",
             Self::Quantize => "quantize",
             Self::LayerNorm => "layer_norm",
             Self::MoeRouter => "moe_router",

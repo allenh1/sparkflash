@@ -110,3 +110,77 @@ fn the_part_set_names_every_new_inkling_mechanism() {
         assert!(parts.contains(part), "{part} is missing");
     }
 }
+
+const MINI: &str = include_str!("data/inkling2_mini_config.json");
+const MINI_QUANT: &str = include_str!("data/inkling2_mini_quant.json");
+
+#[test]
+fn the_looped_document_parses_its_core_and_its_message_parts() {
+    let mut architecture = Architecture::from_json(MINI).expect("the looped document parses");
+    let quant: serde_json::Value =
+        serde_json::from_str(MINI_QUANT).expect("the quant fixture parses");
+    architecture
+        .apply_quant_config(&quant)
+        .expect("the quant document applies");
+    assert_eq!(architecture.family, "inkling2_loop");
+    assert_eq!(architecture.hidden_size, 2304);
+    assert_eq!(architecture.layers.len(), 24);
+    let inkling = architecture.inkling.as_ref().expect("Inkling geometry");
+    let plan = inkling.loop_plan.expect("the loop schedule");
+    assert_eq!(plan.core_start, 6);
+    assert_eq!(plan.core_end, 18);
+    assert_eq!(plan.passes, 3);
+    assert_eq!(plan.gate_rank, 64);
+    assert_eq!(plan.streams, 4);
+    // The released document's expert split: NVFP4 through layer 19, MXFP8 from 20.
+    assert_eq!(
+        inkling.layer_expert_formats[19],
+        WeightFormat::NvFp4 {
+            group_size: 16,
+            wide: sparkflash_model::format::NvFp4Wide::Inkling
+        }
+    );
+    assert_eq!(
+        inkling.layer_expert_formats[20],
+        WeightFormat::MxFp8Row { block: 32 }
+    );
+    let sliding: Vec<usize> = architecture
+        .layers
+        .iter()
+        .filter(|layer| layer.attention.window == Some(1024))
+        .map(|layer| layer.index)
+        .collect();
+    assert_eq!(sliding.len(), 20);
+    assert!(sliding.contains(&0));
+    assert!(!sliding.contains(&5));
+    // The message path is present exactly on the twelve core layers, ahead of the attention.
+    for step in architecture.steps() {
+        let in_core = (6..18).contains(&step.index);
+        assert_eq!(step.message.contains(&Part::CrossPassAttention), in_core);
+        assert_eq!(step.message.contains(&Part::LoopMessageGate), in_core);
+        if in_core {
+            let part = Part::LoopMessageGate;
+            let gate = architecture
+                .stacks()
+                .into_iter()
+                .flat_map(|stack| stack.blocks)
+                .find(|block| block.index == step.index)
+                .and_then(|block| {
+                    block
+                        .parts
+                        .into_iter()
+                        .find(|instance| instance.part == part)
+                })
+                .expect("the core layer's message gate");
+            assert_eq!(
+                gate.facts.get("loop_streams"),
+                Some(&sparkflash_model::stack::FactValue::Integer(4))
+            );
+        }
+    }
+    // The layout applied: the forward walk sees the inherited block geometry and the loop facts.
+    let block = inkling
+        .block_residual
+        .expect("the block-attention residual");
+    assert_eq!(block.layers_per_block, 6);
+}

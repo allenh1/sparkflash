@@ -189,6 +189,45 @@ pub fn tiny_source(config: &Inkling2Config) -> TinySource {
         .collect();
     source.f32("model.llm.attn_res.output_query", vec![hidden], &values);
 
+    // The loop's message path, when the release has one.
+    if let Some(plan) = config.loop_plan {
+        for layer in plan.core_start..plan.core_end {
+            for stream in ["attn", "k", "v", "mlp"] {
+                let prefix = format!("model.llm.layers.{layer}.controllers.{stream}");
+                matrix(
+                    &mut source,
+                    &format!("{prefix}.down_weight"),
+                    plan.gate_rank,
+                    2 * hidden,
+                    0.08,
+                );
+                matrix(
+                    &mut source,
+                    &format!("{prefix}.forget_weight"),
+                    hidden,
+                    plan.gate_rank,
+                    0.08,
+                );
+                matrix(
+                    &mut source,
+                    &format!("{prefix}.gain_weight"),
+                    hidden,
+                    plan.gate_rank,
+                    0.08,
+                );
+            }
+        }
+        for bank in [
+            "model.llm.middle_cycle_cross_pass_queries",
+            "model.llm.middle_cycle_cross_pass_kv_queries",
+        ] {
+            let values: Vec<f32> = (0..2 * plan.core_len() * hidden)
+                .map(|index| seeded(bank, index, 0.05))
+                .collect();
+            source.f32(bank, vec![2 * plan.core_len(), hidden], &values);
+        }
+    }
+
     for layer in 0..config.num_hidden_layers {
         let prefix = format!("model.llm.layers.{layer}");
         let attn = format!("{prefix}.attn");

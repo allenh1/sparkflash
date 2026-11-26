@@ -376,3 +376,58 @@ fn four_converted_ranks_answer_like_one_rank() {
         compare(&format!("tp4/rank{rank}"), &reference.logits, logits);
     }
 }
+
+#[test]
+fn the_looped_fixture_walks_every_application_without_a_refusal() {
+    if !backend_available() {
+        return;
+    }
+    // The looped release's device walk against the f32 host reference on the same fixture: the
+    // applications, the per-pass caches, the prelude rewind and the message path.
+    let config = Inkling2Config::tiny_looped();
+    let source = Arc::new(tiny_source(&config));
+    let host = Inkling2HostBackend::open(
+        sparkflash_model_inkling2::descriptor(),
+        config.clone(),
+        Arc::clone(&source) as Arc<dyn sparkflash_weights::WeightSource>,
+        16,
+    )
+    .expect("the looped host reference opens");
+    let device = InklingDeviceBackend::open(
+        sparkflash_model_inkling2::descriptor(),
+        config.clone(),
+        source as Arc<dyn sparkflash_weights::WeightSource>,
+        16,
+    )
+    .expect("the looped device arm opens");
+    let mut session = device.open_session().expect("a device session");
+    session.set_sampling(greedy());
+    let first = session
+        .prefill(&[3, 7, 11])
+        .expect("the looped device prompt");
+    assert_eq!(first.logits.len(), config.unpadded_vocab_size);
+    assert!(first.logits.iter().all(|value| value.is_finite()));
+    let next = first.next_token.expect("a next token");
+    let second = session.decode(next).expect("the looped device decode");
+    assert!(second.logits.iter().all(|value| value.is_finite()));
+
+    let mut host_session = host.open_session().expect("a host session");
+    host_session.set_sampling(greedy());
+    let host_first = host_session.prefill(&[3, 7, 11]).expect("the host prompt");
+    let scale = |row: &[f32]| {
+        row.iter()
+            .fold(0.0f32, |largest, value| largest.max(value.abs()))
+    };
+    let largest = scale(&host_first.logits).max(scale(&first.logits));
+    for (device, host) in first.logits.iter().zip(&host_first.logits) {
+        let difference = (device - host).abs();
+        assert!(
+            difference <= RELATIVE_TOLERANCE * largest,
+            "looped device vs host: {difference} of {largest}"
+        );
+    }
+    assert_eq!(
+        first.next_token, host_first.next_token,
+        "the looped walks rank the vocabulary differently"
+    );
+}

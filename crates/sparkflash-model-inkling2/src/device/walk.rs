@@ -511,11 +511,14 @@ impl InklingHost {
         let walked = segments
             .iter()
             .zip(&shapes)
-            .map(|((seq, _), &(depth, tails, taps))| Segment {
-                state: seq.lane.session.state.view(),
-                tails,
-                rows: depth + 1,
-                taps,
+            .map(|((seq, _), held)| {
+                let (depth, tails, taps) = held.clone();
+                Segment {
+                    state: seq.lane.session.state.view(),
+                    tails,
+                    rows: depth + 1,
+                    taps,
+                }
             })
             .collect();
         ChunkRun::begin(

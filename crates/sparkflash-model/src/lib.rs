@@ -64,7 +64,7 @@ pub mod tp_plan;
 pub mod vision;
 pub mod vision_geometry;
 
-pub use architecture::{Architecture, LoopSchedule, names_the_producer};
+pub use architecture::{Architecture, InklingLoop, LoopSchedule, names_the_producer};
 pub use arm::{
     Admission, AdmissionRefusal, KvPlan, MEMORY_FLOOR_BYTES, NODE_MEMORY_BUDGET_BYTES,
     PackIdentity, gib, kv_budget_bytes,

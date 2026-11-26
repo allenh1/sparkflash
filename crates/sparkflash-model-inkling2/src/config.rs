@@ -95,6 +95,9 @@ pub struct Inkling2Config {
     /// How the rank files divide the routed experts. Not a released field: the converter sets
     /// it and a rank file's load takes it from the file.
     pub expert_split: ExpertSplit,
+    /// The looped core schedule, when the release runs its middle layers more than once.
+    /// `None` is every single-pass release.
+    pub loop_plan: Option<sparkflash_model::InklingLoop>,
 }
 
 /// The vision tower's released geometry.
@@ -265,6 +268,7 @@ impl Inkling2Config {
         let quant_config = parse_quant(quant, &inkling.layer_expert_formats, num_hidden_layers)?;
         let vision = parse_vision(root, hidden_size)?;
         let mtp = parse_mtp(root)?;
+        let loop_plan = architecture.loop_plan();
         Ok(Self {
             architecture,
             hidden_size,
@@ -297,7 +301,70 @@ impl Inkling2Config {
             mtp,
             quant: quant_config,
             expert_split: ExpertSplit::default(),
+            loop_plan,
         })
+    }
+
+    /// The number of per-layer caches a served sequence keeps.
+    ///
+    /// A single-pass release keeps one a stored layer. A looped release runs its core more than
+    /// once, and each pass owns its keys, values and convolution history, so the core's caches
+    /// are appended after the stack: `num_hidden_layers + (passes - 1) * core_layers`.
+    #[must_use]
+    pub fn cache_slots(&self) -> usize {
+        match self.loop_plan {
+            Some(plan) => {
+                self.num_hidden_layers + (plan.passes.saturating_sub(1)) * plan.core_len()
+            }
+            None => self.num_hidden_layers,
+        }
+    }
+
+    /// The layers one token applies, in order, as `(stored layer, pass)`.
+    ///
+    /// A single-pass release is its stored stack once. A looped release is the prelude once,
+    /// the core `passes` times and the coda once, which is the producer's schedule
+    /// (`modeling_inkling2_loop.py:1390-1470`). The device walk and the host reference both
+    /// read this list, so the two cannot disagree about the order or the pass a layer is in.
+    #[must_use]
+    pub fn applications(&self) -> Vec<(usize, usize)> {
+        match self.loop_plan {
+            None => (0..self.num_hidden_layers)
+                .map(|layer| (layer, 0))
+                .collect(),
+            Some(plan) => {
+                let mut schedule = Vec::with_capacity(
+                    self.num_hidden_layers + (plan.passes - 1) * plan.core_len(),
+                );
+                for layer in 0..plan.core_start {
+                    schedule.push((layer, 0));
+                }
+                for pass in 0..plan.passes {
+                    for layer in plan.core_start..plan.core_end {
+                        schedule.push((layer, pass));
+                    }
+                }
+                for layer in plan.core_end..self.num_hidden_layers {
+                    schedule.push((layer, 0));
+                }
+                schedule
+            }
+        }
+    }
+
+    /// The cache slot stored layer `layer` uses on pass `pass`.
+    ///
+    /// Pass 0 is the stored cache. Later passes read the copies the checkpoint's converter
+    /// appends after the stack, in pass then layer order, which is the order the producer's
+    /// `cache.layers += copy.deepcopy(loop_layers)` builds.
+    #[must_use]
+    pub fn cache_slot(&self, layer: usize, pass: usize) -> usize {
+        match self.loop_plan {
+            Some(plan) if pass > 0 && (plan.core_start..plan.core_end).contains(&layer) => {
+                self.num_hidden_layers + (pass - 1) * plan.core_len() + (layer - plan.core_start)
+            }
+            _ => layer,
+        }
     }
 
     /// Refuse a shape the arithmetic cannot run.
@@ -402,6 +469,37 @@ impl Inkling2Config {
           }
         }"#;
         Self::from_json(TINY, None).expect("the tiny Inkling config is valid")
+    }
+
+    /// A six-layer synthetic release with a shared core, for the loop's parity tests.
+    ///
+    /// The core is layers 2..4, run twice; the prelude is 0..2 and the coda 4..6. Block size 2
+    /// makes layer 2 a block boundary, which is where the producer appends the summary the
+    /// message path reads.
+    ///
+    /// # Panics
+    /// Only if the carried JSON stops parsing, which is a crate bug.
+    #[must_use]
+    pub fn tiny_looped() -> Self {
+        const TINY: &str = r#"{
+          "model_type":"inkling2_loop",
+          "architectures":["Inkling2LoopForConditionalGeneration"],
+          "text_config":{
+            "hidden_size":32,"num_hidden_layers":6,"vocab_size":256,"max_position_embeddings":64,
+            "num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
+            "d_rel":4,"rel_extent":8,"qk_l2_clip_threshold":22.627416997969522,
+            "rel_l2_clip_threshold":8.0,"log_scaling_n_floor":16,"log_scaling_alpha":0.1,
+            "rms_norm_eps":1e-06,"use_value_norm_no_gamma":true,
+            "local_layer_ids":[0,1,3,4],"sconv_kernel_size":4,"unpadded_vocab_size":250,
+            "final_logit_softcapping":30.0,"sliding_window_size":8,
+            "n_layers_per_attn_res_block":2,"attn_res_normalize_values":true,
+            "n_routed_experts":2,"num_experts_per_tok":1,"n_shared_experts":0,
+            "intermediate_size":16,"mlp_gate_softcap":4.0,"mlp_up_softcap":25.0,
+            "route_scale":8.0,"use_gate_bias":true,
+            "loop_config":{"core_start":2,"core_end":4,"num_passes":2,"gate_rank":8,"is_varloop":false}
+          }
+        }"#;
+        Self::from_json(TINY, None).expect("the tiny looped config is valid")
     }
 
     /// A four-expert variant of [Self::tiny], for the tensor-parallel tests.

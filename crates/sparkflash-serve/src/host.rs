@@ -328,6 +328,14 @@ impl InferenceEngine for HostDriver {
             );
         }
         let prompt_tokens = request.prompt_tokens.len();
+        // The visual positions the caller's images occupy in the prompt. The API expands each
+        // prepared image's span before the request reaches this driver, so the spans are the
+        // usage field's count rather than a second guess at the tower's placeholder arithmetic.
+        let image_tokens = request
+            .vision
+            .iter()
+            .map(|image| image.span.len())
+            .sum::<usize>();
         let max_tokens = request.max_tokens.min(self.max_tokens);
         // The serve cap would otherwise cut a forced sequence short and answer a prefix of it.
         if !request.forced_tokens.is_empty() && request.forced_tokens.len() != max_tokens {
@@ -388,6 +396,7 @@ impl InferenceEngine for HostDriver {
             AnswerState {
                 answers,
                 prompt_tokens,
+                image_tokens,
                 done: false,
                 fabric,
             },
@@ -411,7 +420,12 @@ impl InferenceEngine for HostDriver {
                         state.done = true;
                         let fabric = state.fabric.clone();
                         Some((
-                            finished_event(state.prompt_tokens, *summary, &fabric),
+                            finished_event(
+                                state.prompt_tokens,
+                                state.image_tokens,
+                                *summary,
+                                &fabric,
+                            ),
                             state,
                         ))
                     }
@@ -459,6 +473,8 @@ impl InferenceEngine for HostDriver {
 struct AnswerState {
     answers: mpsc::Receiver<Reply>,
     prompt_tokens: usize,
+    /// The visual positions the request's prepared images occupy in the prompt.
+    image_tokens: usize,
     done: bool,
     /// The fabric this driver's backend declared, carried to the finish event's transport block.
     fabric: String,
@@ -1430,7 +1446,12 @@ fn top_k(logprobs: &[f32], count: usize) -> Vec<usize> {
     order
 }
 
-fn finished_event(prompt_tokens: usize, summary: HostSummary, fabric: &str) -> EngineEvent {
+fn finished_event(
+    prompt_tokens: usize,
+    image_tokens: usize,
+    summary: HostSummary,
+    fabric: &str,
+) -> EngineEvent {
     let completion_tokens = summary.completion_tokens;
     let speculation = summary.speculation;
     let cached = summary.cached_tokens.min(prompt_tokens);
@@ -1479,7 +1500,7 @@ fn finished_event(prompt_tokens: usize, summary: HostSummary, fabric: &str) -> E
                 cached_tokens: cached,
                 uma_cached_tokens: cached,
                 nvme_cached_tokens: 0,
-                image_tokens: 0,
+                image_tokens: image_tokens.min(prompt_tokens),
             },
             completion_tokens_details: CompletionTokensDetails {
                 reasoning_tokens: 0,
