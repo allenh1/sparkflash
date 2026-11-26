@@ -16,11 +16,12 @@ limitations under the License.
 
 # Arm reference
 
-The reference behind [adding-a-model.md](adding-a-model.md): the kernel stack, the typed ops and
-execution plan, the serving contract and what an arm inherits from it, the profile and its
-switches, the parity harness, the shared homes, and the dynamic Hugging Face path. A new family
-reads [adding-a-model.md](adding-a-model.md) first; it needs this page only for a part of its
-own or a released arm's internals.
+The internals of the released arms: the kernel stack, the typed ops and execution plan, the
+serving contract and what an arm inherits from it, the profile and its switches, the parity
+harness, the shared homes, and the dynamic Hugging Face path. A new model is added from its
+checkpoint, without an arm: read [adding-a-model.md](adding-a-model.md). This page is for a
+released arm's internals while the arms are being retired
+([engine/05-runtime-models.md](engine/05-runtime-models.md)).
 
 ## 1. The one stack
 

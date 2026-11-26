@@ -14,118 +14,236 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Adding a model arm
+# Adding a model
 
-A new family is its released `config.json`, the arithmetic of the parts no other model has, and
-one registration. The walk, the sequence and its lane memory, the rewind point, the sampler, the
-head, lanes, prompt chunks, prefix reuse and the tensor-parallel group are the runtime's
-(`sparkflash_runtime::PlanWalk` on the shared dense host); a family writes none of them. The
-kernel stack, the typed ops, the serving contract and the shared homes are described in
-[arm-reference.md](arm-reference.md); a family reads it only for a part of its own.
+You don't write a crate to add a model. You point SparkFlash at a checkpoint, and it tells you
+what it needs. Usually that is a layout file and a few kernel shapes. Sometimes it is one new
+shared part. It is never a serving path, a converter, or a branch on the model's name.
 
-## 1. Run `onboard` first
+This page describes the process at the end of [plan 05](engine/05-runtime-models.md). Some of
+it isn't built yet; [the last section](#what-works-today) says what is. The step-by-step
+procedure, with every gate and a checklist, is the skill at
+[`.agents/skills/adding-a-model/SKILL.md`](../.agents/skills/adding-a-model/SKILL.md). Read
+this page to understand the work, and follow the skill to do it.
+
+## The short version
+
+1. Write down what you're adding: the Hub revision, the license, and the producer's modelling
+   code.
+2. Scan the checkpoint. Read every row.
+3. If the scan doesn't know the wiring, write a layout file.
+4. If a kernel isn't built at your shape, add it to the build list.
+5. If the model has an operation nobody has had, add one shared part.
+6. Prove the wiring on a tiny random checkpoint at one, two and four ranks.
+7. Check your reading against the producer's own code.
+8. Convert, serve, register the numerics, measure.
+
+Most models stop needing new work at step 4.
+
+## Three things to hold onto
+
+**Serve the model its producer built.** Compute what the producer computes, in the types it
+computes in. If the producer runs in BF16 and casts to f32 inside its norms, so do we: BF16
+outside, f32 inside, nothing wider "to be safe" and nothing narrower. Don't give a model a part
+it wasn't trained with because the base happens to have one. CSA2 belongs to DeepSeek V4.1 and
+no one else. When the base's body computes a slightly different function, the model gets its
+own instance or its own part. The model's facts never bend to fit a body.
+
+**Keep the model's facts out of the code.** A width, an epsilon, a router rule, a split: each
+lives in the checkpoint or in the layout file. If you're typing a model's name or one of its
+numbers into Rust or CUDA, stop. It wants to be a layout fact or a template argument.
+
+**Leave DeepSeek alone.** It is the base everything runs on. If you touch a shared body, prove
+the released model's bits, traces and speed didn't move
+(`scripts/open-manifest-ab.py ab`). If it got slower, revert and say so.
+
+## 1. Scan
 
 ```sh
-sparkflash onboard ORG/REPO [--config FILE] [--emit DIR]
+sparkflash onboard ORG/REPO
 ```
 
-Before any code is written it prints:
+The web console prints the same report when you paste the Hub id. It reads the config, the
+tokenizer files and the safetensors headers. No weights are downloaded.
 
-- the one `ScanReport` per target and TP: every part the stack names, whether a kernel resolves
-  for both passes, and every unread config key or unclaimed tensor with its fix;
-- which matrix-product parts have only a row body or no tensor-core body for a pass, and whether
-  a `WAIVERS` line covers the gap, so a `PartExec` or a waiver is the next edit;
-- the stored format of each weight class, read from `quantization_config` at the top level or
-  under `text_config`;
-- the config switches the parser does not model yet (`Architecture::unmodelled_features`), which
-  must be taught to `Architecture` before a part is written for them;
-- the fit at TP 1, 2 and 4, and the stored bytes-per-token floor.
+Each row is a part of the model with one status. The status tells you what to do:
 
-`--config FILE` reads the document from disk; otherwise it uses the hub cache and only then the
-Hub. The tensor check reads safetensors headers (local, or ranged Hub reads) without weights; when
-no header is available the report says `tensors not checked` and is not clean. `--emit DIR` adds
-the last step:
+| Status | What it means | What you do |
+| --- | --- | --- |
+| `resolved` | a kernel is chosen for prompts and for tokens | nothing |
+| `unknown layout` | the config doesn't say how the blocks are wired | write the layout (step 2) |
+| `unknown key` | a config key nothing read | read it or ignore it, in the layout |
+| `unclaimed tensor` | a tensor no part took | add the stack or tensor to the layout |
+| `not built` | the kernel exists, not at this shape or format | add a build line (step 3) |
+| `no kernel on this target` | this GPU has no body for the part | port it |
+| `no part kind` | an operation the library doesn't have | add a part (step 4) |
 
-- a family whose every part the dense host registers (`Dense::catalogue()`) needs no crate: it
-  prints the `sparkflash serve --checkpoint DIR` command and succeeds;
-- any other family gets a crate skeleton in `DIR`: `Cargo.toml`, the config under `config/`,
-  `architecture()`, `parts()` registering one `PartExec` stub per part of its own (each body
-  refuses by name), and `tests/conformance.rs` whose fixture refuses by name until it is written.
-  It then prints the edits outside the crate and what the shared host cannot run yet.
+Turn the rows into a work list in the model's page under `docs/models/`. Then do one check
+the scan can't do for you: for each `resolved` part, open the producer's code and confirm it
+is the same function. Same norm, same activation, same router rule. A part that resolves to a
+near neighbour is a missing layout fact, and it will serve wrong answers that look fine.
 
-It writes nothing outside `DIR` and refuses a `DIR` that exists.
+## 2. Write the layout
 
-## 2. What you supply
+A config gives sizes and switches. It doesn't say whether a block norms before or after its
+branch, where a cast to f32 sits, or how the head folds its streams. That lives in the
+producer's Python, and the layout is where you write it down as data. The format is in
+[models/layouts/README.md](../models/layouts/README.md), and the shipped files beside it are
+worked examples.
 
-Only what this family alone has:
+First check whether a shipped layout already matches. Most new releases reuse one.
 
-1. **Its config mapping.** `sparkflash_model::Architecture` reads `layer_types`,
-   `mlp_layer_types`, `first_k_dense_replace`, `indexer_types`, `hidden_act`, `scoring_func`,
-   `compress_ratios`, `hc_mult`, `engram_layer_ids` and the rest into typed parts; a field it does
-   not model is named by `onboard`. Teach the parser the field, not a module of the family.
-2. **The arithmetic of each part of its own.** `impl PartExec<Dense> for ItsPart` with four
-   methods and no defaults: `state` (the lane regions it adds, positional or recurrent), `split`
-   (`RankSplit::Summed` when a rank leaves a partial the group sums, `Replicated` otherwise),
-   `rows` (the prompt body) and `token` (the token body; `self.rows(pass)` when they are the
-   same). A body reads the normed rows at `pass.input()` and leaves the branch's rows at
-   `pass.output()`.
-3. **Its registration.** One line on the catalogue registry:
+If not, read the producer's modelling file from top to bottom before you write anything. Note
+the order of operations in a block, every epsilon and clamp, every `.float()` and
+`.to(dtype)`, and keep the line number for each. Then write the file:
 
-   ```rust
-   let mut parts = Dense::catalogue();
-   parts.replace(Part::DenseMlp, |open: &mut OpenCx<'_>| ItsPart::open(open))?;
-   ```
+* **`[match]`**: the producer's class and `model_type`. This is the one place in the tree
+  that compares a family name.
+* **`[[keys]]`**: every config key, either read into a fact or ignored with a reason. "Not
+  needed" is not a reason. "Training only: dropout is off at inference" is.
+* **`[stacks.*]`**: the language stack, and the draft head and vision or audio towers if the
+  checkpoint has them. A tower is a stack of ordinary parts, not one opaque box.
+* **Part facts**: the function (which attention form, which pool rule, which fold) and the
+  types (each f32 cast is its own fact). State how each recurrent block splits across ranks.
+* **`[[tensor]]`**: a name template, dtype, shape and split for every tensor. Shapes are
+  expressions over facts, never a repeated number.
 
-   `register` adds a kind the registry does not hold and refuses one it does; `replace` takes a
-   kind over. The constructor uploads the rank's share through `OpenCx` (`source`, `plan`, `keep`,
-   `record`, `pack`, `scratch`, and the catalogue constructors, which a part may wrap).
-4. **Its kernel**, if the part needs one: a source under `kernels/`, loaded through
-   `open.cuda()` and launched with `pass.launch` on the walk's stream.
-5. **A tiny fixture and a stated profile** for `sparkflash_runtime::conformance!`: a written
-   checkpoint at the config's shapes and the prompt and token limits the walk takes.
-6. **Weight names, tokenizer and chat template**, only where they leave the shared spelling
-   (`sparkflash_ops::naming`) and the `tokenizer.json` markers.
+Put a comment on every fact saying where it came from: a producer line, a config path, or the
+tensor that proves it. If you can't source a fact, leave it out and let the scan keep saying
+`unknown layout`. A guess here is the most expensive kind of bug.
 
-## 3. The worked examples
+You're done when the scan has no `unknown layout`, `unknown key` or `unclaimed tensor` rows,
+and the layout's tensor plan matches the checkpoint's index at one, two and four ranks
+(`crates/sparkflash-ops/tests/layout_equality.rs`).
 
-- `crates/sparkflash-model-dense/tests/onboard_example.rs` is a whole family in one file (325
-  lines): a made-up sandwich-normed decoder's config, its one `PartExec`, its registration, a
-  written tiny checkpoint and `conformance!` with a stated profile. It writes no walk.
-- `crates/sparkflash-model-dense/tests/part_plugin.rs` registers a part defined outside the crate
-  and checks its logits against the catalogue part's, bit for bit.
-- `scripts/dense-synthetic-checkpoint.py` writes a random checkpoint of a family no pack names,
-  and `scripts/onboard-gate.sh <arm>` runs the served gate (`scripts/served-gate.py all`) on it
-  and writes the first numerics reference through `scripts/numerics.py`.
+A layout you're still working on can live in `~/.cache/sparkflash/layouts/`. A finished one
+ships in `models/layouts/`.
 
-## 4. What holds the rest
+## 3. Build the missing shapes
 
-Each item the old checklist named is now refused by the compiler, a test or the boot:
+Kernels are templates, and a shape is a template argument. The shapes that get built are
+listed in one file, `kernels/instances.toml`, and the catalogue is generated from it, so
+nothing can claim a shape that wasn't compiled.
 
-| rule | held by |
-| --- | --- |
-| no `.cu`/`.cuh` and no kernel build script in a model crate | `sparkflash-ops/tests/one_stack.rs` `no_model_crate_owns_cuda_or_a_kernel_build_script` |
-| no model crate depends on another (the shared host `sparkflash-model-dense` excepted) | `one_stack.rs` `no_model_crate_depends_on_another_model_crate` |
-| a GEMM-class part has a tensor-core body or a `WAIVERS` line naming the gap | the const assertion over `Part::ALL` in `sparkflash_ops::parts` |
-| a step whose part has no registered executor | refused by the part's name when the arm opens, before a tensor is read |
-| a layer role the walk does not run (compression, indexer, residual mixer, side lookup) | `sparkflash_runtime::plan_layer`, by name, for the roles its host does not frame |
-| the crate is a workspace member | cargo refuses to build a crate outside the workspace's `members` |
-| the crate is named in both CI files | `sparkflash-model/tests/arms.rs` `every_model_crate_is_named_in_both_ci_files` |
-| every model crate is some `ARMS` entry's crate | `every_model_crate_is_an_arms_crate` |
-| every `MODELS` descriptor has an `ARMS` entry, every weights selector resolves | `every_registered_model_has_an_arm`, `every_weights_selector_resolves_in_the_registry` |
-| a ledger states every strategy once; its weights are the `ARMS` entries naming it | `ledger.rs` `every_arm_states_every_strategy_once`, `ArmLedger::weights` (derived, not listed) |
-| a `Route::Pack` arm has a `TYPED_PACKS` row, and only those do | `serve/pack.rs` `every_pack_route_arm_has_a_typed_pack_row` |
-| a carried profile parses and keeps its registry identity | `every_carried_profile_parses_and_keeps_its_registry_identity` |
-| a profile departs from DeepSeek's defaults only with `measured = "docs/…"` | the profile parser (`defaults.rs`, `an_override_without_a_measured_key_is_refused_by_name`) |
-| a new switch is one typed field with one environment alias | `profile.rs` `every_override_settles_on_one_typed_field`, `every_override_moves_its_field` |
-| the walk's compute rows, tick configuration, prompt chunks and rounds | the checks `conformance!` generates for the crate |
-| lanes, sampled lanes, interleaved prompts and kept turns, served | `scripts/served-gate.py`, through `scripts/onboard-gate.sh` |
-| an option the arm does not apply | refused at parse time (`Pack::unapplied`) |
+For each `not built` row, add an `[instance]` with the shapes one rank sees, then:
 
-## 5. What the shared host does not run yet
+```sh
+scripts/instances.py --check
+scripts/build-cubins.sh
+```
 
-The dense host runs a layer's attention and feed-forward roles. A family whose config names a
-compression, an indexer, a residual mixer (hyper-connections) or a side lookup (Engram, PLE)
-gets its skeleton from `--emit`, and `onboard` names those roles as unhosted; such a family is
-served today only by a released arm that owns its own walk (DeepSeek, GLM, Qwen, Inkling, Dory).
-Their move onto the shared walk is tracked in
-[engine/04-onboarding-review.md](engine/04-onboarding-review.md).
+Scan again. When an operation has more than one body (a row body and a tensor-core body, say),
+measure your new instance at the row counts the model serves, so the resolver's speed table
+has a real number to choose by.
+
+## 4. Add a part (rarely)
+
+First make sure it's really new. Read the producer's code next to the nearest part we have:
+
+* Same function, different sizes: that's an instance. Go back to step 3.
+* Same function with a variant (a bias, a different epsilon, a gate): add an argument to the
+  existing body.
+* A different function: a new part.
+
+For a new part:
+
+1. Name it for what it does (`kda_scan`, not the model).
+2. Write the host body first, in `sparkflash-weights`, following the producer line by line
+   in the producer's types. Everything else is checked against it.
+3. Write the device body as a `PartExec`: the lane state it keeps, how it splits across
+   ranks, a prompt body and a token body. It sees normed rows in and leaves its branch's rows
+   out. It knows nothing about the engine.
+4. Put the kernel under `kernels/`, named by operation, with every size a template argument.
+5. Refuse by name whatever it can't handle: a rank count that doesn't divide its heads, a
+   format it doesn't decode.
+6. Test the device body against the host body, alone, at one, two and four ranks.
+
+If your part overlaps one that exists, measure both. The faster one becomes the shared body
+and the other is deleted.
+
+## 5. Prove it on a tiny checkpoint
+
+A clean scan means every piece has a kernel. It doesn't mean the pieces are wired correctly.
+So build a tiny random checkpoint with the model's structure (add a variant to
+`scripts/second-shape.py`), run it through the host reference, and run it on the device at one,
+two and four ranks:
+
+```sh
+scripts/second-shape.py run --device ... --world 1,2,4
+```
+
+Pick widths that make every split real at two and four ranks. A fixture too narrow to split
+proves nothing there.
+
+The bar is the same token ids as the reference. When they differ, find out why before you
+relax anything. Dump each layer's output on both sides and look at the per-row distance:
+
+* Every row drifts, starting early: the wiring is wrong. Fix it.
+* A few rows jump at a router or a selection layer, and the rest hold: a random fixture's
+  near-tie flipped under rounding. Recompute the margins to confirm.
+
+A tie band or a seam gate exists for the second case. Both are last resorts, both are
+measured, and both need the owner's sign-off.
+
+Then run the conformance suite on the same checkpoint: a whole prompt equals a chunked one, a
+continued turn equals a cold one, drafted equals plain, one lane equals four, and one rank
+equals two equals four.
+
+## 6. Check against the producer
+
+Step 5 compares us with our own reading of the producer. This step checks the reading.
+
+Write down the tolerance you expect before you run anything. Then run the producer's own
+classes (transformers at the revision your layout cites) on the tiny checkpoint and compare
+logits. If a producer-side stack can serve the real checkpoint, teacher-force it on the anchor
+prompts and record the distance. Do the same for a vision tower with a fixed set of images.
+
+If you miss the tolerance, something computes a different function or sits in the wrong type.
+Find it. Don't widen the number after the fact.
+
+## 7. Serve the real thing
+
+1. Download the weights and convert. The shards are computed from the description; there is
+   no converter to write.
+2. Check memory on every node, then serve at each rank count that fits.
+3. Capture the reference and register it as numerics version 1
+   (`scripts/numerics.py capture`, `numerics/registry.toml`, a short report under
+   `docs/numerics/<model>/`).
+4. Run the served gate (`scripts/served-gate.py all PORT --long FILE`).
+5. Measure: alone and four at once, greedy and sampled, short and long prompts, first token
+   at the largest window, draft acceptance.
+
+The prompt format comes from the checkpoint's chat template, sampling defaults from its
+`generation_config.json`, and image preprocessing from its `preprocessor_config.json`. Any
+default that departs from DeepSeek's needs a measurement behind it.
+
+## 8. Land it
+
+Sign off your commits. Update the model's page, its numerics report, `docs/DECISIONS.md` for
+anything the owner decided, and `NOTICE` for anything adapted from elsewhere. Test what you
+changed as you go, and run the full battery once at the end.
+
+## When to stop and ask
+
+Bring the measurement to the owner when:
+
+* a step can't be made free for the released DeepSeek;
+* the only way forward changes what the model computes, or narrows a value below the
+  producer's type;
+* a gate only passes if you loosen it;
+* the wiring needs a fact you can't source;
+* the model is slower on a shared body and you can't get it back.
+
+Stopping is fine. Shipping a slower or less faithful model is not.
+
+## What works today
+
+As of 2026-11-25 the scan, the layouts, the instance list, the synthetic proof and the
+conformance suite all run. GLM is the first model moving onto the base
+([08-glm-on-the-base.md](engine/08-glm-on-the-base.md)).
+
+Not built yet: the producer-capture script (step 6), converting and serving straight from the
+description, and the chat-template engine (step 7). Until those land, the released models still
+serve through their own crates. `sparkflash onboard --emit DIR` can still write a crate
+skeleton, and [arm-reference.md](arm-reference.md) describes those internals, but that route
+is being retired. Ask the owner before adding a crate.

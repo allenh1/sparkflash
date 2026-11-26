@@ -25,9 +25,10 @@ limitations under the License.
 This skill is the process once plan 05 ([docs/engine/05-runtime-models.md](../../../docs/engine/05-runtime-models.md))
 is complete: no model crates, no arms, one engine (DeepSeek's forward, "the base") that walks a
 description built at load from the checkpoint. Section 17 says which stages run in the tree
-today. Follow the stages in order. Each one has an entry condition, numbered steps and an exit
-gate. Do not start a stage until the previous gate is met, and do not mark a gate met without
-the evidence it names.
+today, and [docs/adding-a-model.md](../../../docs/adding-a-model.md) is the short guide to the
+same process. Follow the stages in order. Each one has an entry condition, numbered steps and
+an exit gate. Do not start a stage until the previous gate is met, and do not mark a gate met
+without the evidence it names.
 
 ## 0. What adding a model is
 
@@ -595,6 +596,6 @@ The stages above describe the end of plan 05. Today:
 | 9 template engine and parser registry | not yet (milestone 6) |
 
 Until milestone 6 lands, a released model still serves through its crate, and a new model that
-must serve before then is the owner's decision. The crate-era process is in
-[docs/adding-a-model.md](../../../docs/adding-a-model.md); do not use it to add a crate without
-that decision.
+must serve before then is the owner's decision. `sparkflash onboard --emit DIR` still writes a
+crate skeleton and [docs/arm-reference.md](../../../docs/arm-reference.md) describes those
+internals; do not add a crate without that decision.
