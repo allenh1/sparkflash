@@ -174,6 +174,47 @@ part = "vision_position"
 [[stacks.vision.parts.facts]]
 name = "position"
 value = "rotary"
+# The tower's wiring, each from the producer reference. modeling_glm5_next.py:1568-1583 is an
+# RMSNorm (mean square in f32, the normalised value cast back before the weight) at the vision
+# config's rms_norm_eps; 1698-1725 are the blocks, whose qkv and proj carry biases and whose
+# attention normalises q and k per head (1623-1624); 1525-1542 is the gated MLP at the config's
+# swiglu_limit; 1832-1837 is a stride-2 2 x 2 convolution from the ViT width to the output width,
+# and 1545-1565 the merger: proj, a LayerNorm, GELU, then a clamped gated SwiGLU.
+[[stacks.vision.parts]]
+part = "vision_norm"
+[[stacks.vision.parts.facts]]
+name = "norm"
+value = "rms"
+[[stacks.vision.parts.facts]]
+name = "norm_epsilon"
+value = { key = "vision_config.rms_norm_eps" }
+
+[[stacks.vision.parts]]
+part = "vision_attention"
+[[stacks.vision.parts.facts]]
+name = "attention_bias"
+value = true
+[[stacks.vision.parts.facts]]
+name = "qk_norm"
+value = true
+
+[[stacks.vision.parts]]
+part = "vision_mlp"
+[[stacks.vision.parts.facts]]
+name = "activation"
+value = "swiglu"
+
+[[stacks.vision.parts]]
+part = "vision_merger"
+[[stacks.vision.parts.facts]]
+name = "downsample"
+value = "conv"
+[[stacks.vision.parts.facts]]
+name = "merger_activation"
+value = "swiglu"
+[[stacks.vision.parts.facts]]
+name = "merger_final_norm"
+value = false
 
 # The language stack's wiring that no config key states, each from the producer reference.
 # The stream and every module output take the config's dtype; the producer casts to f32 only
