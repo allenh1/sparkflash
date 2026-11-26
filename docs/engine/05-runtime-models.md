@@ -202,13 +202,16 @@ parts come across through the seam; the model's crate is deleted.
 * **Qwen**: recurrent state (GDN), PLE, the hyper mix, TP 1.
 * **Inkling**: relative attention, short convolution, its drafter, its vision tower.
 * **Dense**: the default for any model with only standard parts. Small once the above are done.
-* **Dory last**: its recurrence ring is a second schedule, not a lane walk.
+* **Dory stays in its own crate for now** (decision 6). Its recurrence ring is a second schedule,
+  not a lane walk, and it is a toy model with an architecture of its own. It keeps
+  `sparkflash-runtime`'s walk until it moves, so what the runtime gives Dory is not retired.
 
 If a step cannot be made free for DeepSeek, stop, record the measurement, and bring it to the
 owner. Aborting a step is acceptable; a slower DeepSeek is not.
 
 What happens to `sparkflash-runtime`: its strategies that DeepSeek's engine already has better
-are retired as models leave them. What only it has (the part contract, the description walk,
+are retired as models leave them. Dory still runs on it (decision 6), so nothing Dory uses is
+retired. What only it has (the part contract, the description walk,
 rewind points for recurrent state) moves into the base.
 
 ### 5.3 One serving path (M)
@@ -294,7 +297,8 @@ pass, target.
 4. **GLM runs on the base and its crate is deleted.** Its one bit change, checked as in 3.3. Its
    vision tower runs as a stack here. The work is broken down in
    [08-glm-on-the-base.md](08-glm-on-the-base.md).
-5. **Qwen, Inkling, dense, Dory**, one at a time, each with its own bit change and A/B.
+5. **Qwen, Inkling, dense**, one at a time, each with its own bit change and A/B. Dory is not
+   part of this milestone (decision 6).
 6. **Serving and weights have no model dispatch.** 5.3 and 5.4. Can run beside 4 and 5.
 7. **Demonstration:** a model the owner picks, onboarded with zero Rust unless it has a new part
    kind.
@@ -329,3 +333,6 @@ relax one.
 4. **DeepSeek.** Its forward is the base. Other models move onto it. Abort a step if it shows a
    problem.
 5. **Reference runs.** Any machine that holds the weights may run the producer's Python.
+6. **Dory (2026-11-26).** Dory stays in its own crate for now. It is a toy model with its own
+   architecture, and no model's move may change another model. Its crate stays on the
+   `one_stack` allow-list, and the base's scheduler takes no second schedule for it.
