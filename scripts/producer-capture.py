@@ -93,6 +93,40 @@ def log_softmax(row: list[float]) -> list[float]:
     return [value - math.log(total) for value in shifted]
 
 
+def stored_bf16_modules(checkpoint: Path) -> list[str]:
+    """The modules this checkpoint stores without an FP8 scale, from its own index.
+
+    `transformers` builds a fine-grained FP8 model from the quantization config's
+    `modules_to_not_convert` list alone: it decides which linears become FP8 modules by name, and
+    never reads the checkpoint's stored dtypes. This release stores its KDA projections, `kv_b`,
+    the sparse indexer and the whole vision tower in BF16, with no `weight_scale_inv` beside them,
+    and its config names none of them. Built as FP8 modules those weights carry a zero inverse
+    scale, so every value the producer computes from them is NaN, and the capture measures
+    nothing at all.
+
+    The index is the authority, and this reads it rather than a hand-written list: a module whose
+    `.weight_scale_inv` is absent is stored unquantised, and its name goes to
+    `modules_to_not_convert`. The same reading applies to the real checkpoint, which stores the
+    same modules the same way.
+    """
+    index = checkpoint / "model.safetensors.index.json"
+    if not index.is_file():
+        return []
+    weight_map = json.loads(index.read_text())["weight_map"]
+    scales = {name for name in weight_map if name.endswith(".weight_scale_inv")}
+    # A norm, an embedding, the head and a bias are not linears a quantizer would take; naming
+    # them would be noise in the report. Everything else the index stores without a scale is a
+    # BF16 linear.
+    not_a_linear = ("norm", "embed_tokens", "lm_head", "ape", "bias")
+    bare = {
+        name[: -len(".weight")]
+        for name in weight_map
+        if name.endswith(".weight")
+        and name[: -len(".weight")] + ".weight_scale_inv" not in scales
+        and not any(part in name for part in not_a_linear)
+    }
+    return sorted(bare)
+
 def producer_logits(checkpoint: Path, host: dict, dtype_name: str, device: str = "cpu"):
     """The producer's rows for the host's token prompt, from the checkpoint alone."""
     import torch
@@ -102,6 +136,9 @@ def producer_logits(checkpoint: Path, host: dict, dtype_name: str, device: str =
     if getattr(config, "model_type", None) != "glm5_next":
         fail(f"{checkpoint} opens as {getattr(config, 'model_type', None)}, not the producer's glm5_next")
     dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}[dtype_name]
+    # The modules the checkpoint stores unquantised, told to the quantizer by name: without them
+    # its FP8 modules carry a zero inverse scale and every value derived from them is NaN.
+    stored_bf16 = stored_bf16_modules(checkpoint)
     quantized = False
     if device == "cuda":
         if not torch.cuda.is_available():
@@ -111,6 +148,14 @@ def producer_logits(checkpoint: Path, host: dict, dtype_name: str, device: str =
         device_map = None
     else:
         fail(f"--device must be cpu or cuda, got {device!r}")
+    if stored_bf16:
+        quantization = getattr(config, "quantization_config", None)
+        if isinstance(quantization, dict):
+            named = list(quantization.get("modules_to_not_convert") or [])
+            quantization["modules_to_not_convert"] = sorted(set(named) | set(stored_bf16))
+        elif quantization is not None:
+            named = list(getattr(quantization, "modules_to_not_convert", None) or [])
+            quantization.modules_to_not_convert = sorted(set(named) | set(stored_bf16))
     model = Glm5NextForConditionalGeneration.from_pretrained(
         str(checkpoint),
         config=config,
@@ -288,6 +333,7 @@ def main() -> int:
         "dtype": dtype_name,
         "device": args.device,
         "producer_quantized": bool(getattr(model, "is_quantized", False)),
+        "stored_unquantised_modules": len(stored_bf16_modules(args.checkpoint)),
         "positions": len(table),
         "top1_agreement": agreement,
         "top1_same": same,
