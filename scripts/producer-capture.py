@@ -228,7 +228,7 @@ def check_boundaries(model, host: dict, boundaries: Path) -> list[dict]:
             ):
                 x = torch.from_numpy(
                     np.fromfile(boundaries / in_key, dtype="<f4").reshape(1, *shapes[in_key])
-                ).to(torch.bfloat16)
+                ).to(device=where, dtype=torch.bfloat16)
                 host_out = np.fromfile(boundaries / out_key, dtype="<f4").reshape(shapes[out_key])
                 if kind == "attn":
                     if hasattr(layer.self_attn, "conv1d"):
@@ -275,7 +275,7 @@ def check_boundaries(model, host: dict, boundaries: Path) -> list[dict]:
         r_key = f"L{last}-residual_out.f32"
         r_last = torch.from_numpy(
             np.fromfile(boundaries / r_key, dtype="<f4").reshape(1, *shapes[r_key])
-        ).to(torch.bfloat16)
+        ).to(device=where, dtype=torch.bfloat16)
         h = model.model.language_model.norm(model.model.language_model.hc_head(r_last))
         prod_f32_logits = (h.float() @ model.lm_head.weight.float().T)[0].cpu().numpy()
         host_logits = np.array(host["logits"], dtype=np.float32)
