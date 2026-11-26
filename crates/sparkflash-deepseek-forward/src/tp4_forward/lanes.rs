@@ -55,6 +55,39 @@ pub(super) fn slide_floor(pos: usize) -> usize {
     pos.saturating_sub(SLIDE_KEEP) / SLIDE_STEP * SLIDE_STEP
 }
 
+/// Reserves one absorbed MLA block's lane regions in [ABSORBED_REGIONS]'s order:
+/// `[latent, scales, index_keys, index_gates, pooled_keys]`.
+pub(super) fn plan_absorbed_regions(
+    layout: &mut Layout,
+    max_positions: usize,
+    plan: super::stated::AbsorbedRegionPlan,
+) -> [Option<usize>; ABSORBED_REGIONS] {
+    let latent = Some(layout.part(
+        max_positions * plan.latent_row_bytes,
+        plan.latent_row_bytes,
+        0,
+    ));
+    let scales = plan
+        .scale_row_bytes
+        .map(|row| layout.part(max_positions * row, row, 0));
+    let [keys, gates, pooled] = match plan.indexer {
+        Some((key_row, pool)) => {
+            let keys_off = layout.reserve(max_positions * key_row);
+            layout.window(keys_off, max_positions * key_row, key_row);
+            let gates_off = layout.reserve(max_positions * key_row);
+            layout.window(gates_off, max_positions * key_row, key_row);
+            let pooled_off = layout.part(
+                max_positions.div_ceil(pool) * key_row,
+                key_row.div_ceil(pool),
+                0,
+            );
+            [Some(keys_off), Some(gates_off), Some(pooled_off)]
+        }
+        None => [None, None, None],
+    };
+    [latent, scales, keys, gates, pooled]
+}
+
 /// Where each part of a lane starts, relative to the lane's base.
 #[derive(Clone, Debug)]
 struct Offsets {
@@ -73,8 +106,9 @@ struct Offsets {
     /// every other block.
     recurrent: Vec<Option<(usize, usize)>>,
     /// Per layer, a stated absorbed MLA block's regions ([ABSORBED_REGIONS]), position-addressed;
-    /// `None` at every other block.
-    absorbed: Vec<Option<[usize; ABSORBED_REGIONS]>>,
+    /// `None` at every other block, and `None` inside the array for regions a mode or shared
+    /// indexer does not carry (E4M3 scales in f32 mode; indexer caches on shared-indexer layers).
+    absorbed: Vec<Option<[Option<usize>; ABSORBED_REGIONS]>>,
 }
 
 /// A stated absorbed MLA block's lane regions, in the bodies' order: the latent cache and its
@@ -182,7 +216,7 @@ impl Lanes<'_> {
             absorbed: o
                 .absorbed
                 .iter()
-                .map(|part| part.map(|regions| regions.map(at)))
+                .map(|part| part.map(|regions| regions.map(|offset| offset.map_or(0, at))))
                 .collect(),
         }
     }
@@ -409,18 +443,17 @@ impl<'a> DeviceLayer<'a> {
                 ));
             }
         }
-        // A stated absorbed MLA block's latent cache (f32 a latent column) and its E4M3 block
-        // scales, then its pooled indexer's keys, gates and pooled keys (f32 a key column), each
-        // a row a position and backed as far as the lane's positions reach.
+        // A stated absorbed MLA block's latent cache (E4M3 codes + f32 block scales by default, or
+        // f32 latent when attention.latent_cache = "f32"), plus the pooled indexer's caches on
+        // layers that own an indexer. The raw indexer keys and gates are only read while pooling
+        // the incomplete tail of kpool tokens, so they slide behind SLIDE_KEEP; pooled keys hold
+        // one row per kpool positions.
         let mut absorbed = vec![None; layers];
-        for (layer, widths) in super::stated::absorbed_regions()? {
+        for plan in super::stated::absorbed_regions()? {
             let slot = absorbed
-                .get_mut(layer)
-                .ok_or_else(|| format!("lanes: absorbed block {layer} of {layers} layers"))?;
-            *slot = Some(widths.map(|width| {
-                let row_bytes = (width * 4).max(4);
-                layout.part(self.max_positions * row_bytes, row_bytes, 0)
-            }));
+                .get_mut(plan.layer)
+                .ok_or_else(|| format!("lanes: absorbed block {} of {layers} layers", plan.layer))?;
+            *slot = Some(plan_absorbed_regions(&mut layout, self.max_positions, plan));
         }
         // A Gated DeltaNet block's conv history and state, each a sequence's whole, then one
         // checkpoint arena for them all: nothing at all for a stack with no recurrent block.

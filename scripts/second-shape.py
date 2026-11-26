@@ -880,6 +880,9 @@ def env_for_world(
         # Every variant is the base's: a family that still has its own typed pack (GLM's) is
         # served by the base from its description, which is what the variant proves.
         "SPARKFLASH_ON_BASE": "1",
+        # Parity against the host reference compares f32 latents; an operator may override this
+        # to fp8 to exercise the serving default (E4M3 latent cache).
+        "SPARKFLASH_GLM_LATENT_CACHE": os.environ.get("SPARKFLASH_GLM_LATENT_CACHE", "f32"),
         # The second shape's cubins are built from the instance list, not pinned in the
         # released baseline; the open manifest records their hashes.
         "SPARKFLASH_UNPINNED_SECOND_SHAPE": "1",

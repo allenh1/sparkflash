@@ -166,6 +166,9 @@ pub(super) struct StatedDevice {
     layers: Vec<StatedLayer>,
     widths: Widths,
     quantise: bool,
+    /// Whether the absorbed MLA latent cache stores E4M3 codes with 128-wide f32 block scales
+    /// (the serving default; `attention.latent_cache = "f32"` selects f32).
+    e4m3_latent: bool,
     allocations: Vec<Deviceptr>,
 }
 
@@ -177,26 +180,54 @@ impl StatedDevice {
     }
 }
 
-/// The lane regions of every absorbed MLA block, in [super::lanes::ABSORBED_REGIONS]'s order,
-/// as floats a position: the latent cache and its E4M3 block scales, then the pooled indexer's
-/// keys, gates and pooled keys. Empty for a stack that states no absorbed block.
+/// Whether the stated absorbed MLA latent cache stores E4M3 codes with f32 block scales
+/// (`true`, the serving default) or unquantised f32 (`false`, the parity form). Chosen by the
+/// profile's `attention.latent_cache` (`fp8` / `auto` / unset => E4M3; `f32` => f32), never as a
+/// model fact in the layout.
+pub(super) fn latent_cache_fp8_for(
+    mode: Option<sparkflash_model::profile::LatentCacheMode>,
+) -> bool {
+    !matches!(mode, Some(sparkflash_model::profile::LatentCacheMode::F32))
+}
+
+pub(super) fn latent_cache_fp8() -> bool {
+    latent_cache_fp8_for(sparkflash_model::active_profile().attention.latent_cache)
+}
+
+/// One absorbed MLA block's lane region geometry, in bytes per position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AbsorbedRegionPlan {
+    pub(super) layer: usize,
+    /// Bytes a position for the latent cache (`kv_lora_rank` for E4M3, `kv_lora_rank * 4` for f32).
+    pub(super) latent_row_bytes: usize,
+    /// Bytes a position for the E4M3 block scales, or `None` when the latent cache is f32.
+    pub(super) scale_row_bytes: Option<usize>,
+    /// `(key_row_bytes, pool)` when the layer owns a pooled indexer; `None` for a shared-indexer
+    /// layer, which holds no keys, gates or pooled keys of its own.
+    pub(super) indexer: Option<(usize, usize)>,
+}
+
+/// The lane region geometry of every absorbed MLA block in `description`, for E4M3 (`e4m3_latent`)
+/// or f32 latent caching. Empty for a stack that states no absorbed block.
 ///
 /// # Errors
 /// A block that cannot say how it runs, or a stated stack with no absorbed latent.
-pub(super) fn absorbed_regions()
--> Result<Vec<(usize, [usize; super::lanes::ABSORBED_REGIONS])>, String> {
-    if !crate::plan::stated_stack() {
+pub(super) fn absorbed_regions_for(
+    description: &crate::plan::Description,
+    e4m3_latent: bool,
+) -> Result<Vec<AbsorbedRegionPlan>, String> {
+    if !description.values().stated().bf16_stream {
         return Ok(Vec::new());
     }
-    let description = crate::plan::description();
     let values = description.values();
+    let pool = values.stated().index_pool.max(1);
     let mut out = Vec::new();
     for layer in 0..values.n_layers {
         let steps = description
             .block_steps(layer)
             .map_err(|error| format!("lanes: {error}"))?;
         let crate::plan::BlockSteps::Stated(StatedBlock {
-            mixer: StatedMixer::Absorbed { .. },
+            mixer: StatedMixer::Absorbed { own_indexer },
             ..
         }) = steps
         else {
@@ -208,13 +239,28 @@ pub(super) fn absorbed_regions()
                 format!("lanes: absorbed block {layer} in a stack that states no absorbed latent")
             })?
             .kv_lora_rank;
-        let keys = values.index_head_dim;
-        out.push((
+        let latent_row_bytes = if e4m3_latent { latent } else { latent * 4 };
+        let scale_row_bytes = e4m3_latent.then(|| latent.div_ceil(ACTIVATION_TILE) * 4);
+        let indexer = own_indexer.then(|| (values.index_head_dim * 4, pool));
+        out.push(AbsorbedRegionPlan {
             layer,
-            [latent, latent.div_ceil(ACTIVATION_TILE), keys, keys, keys],
-        ));
+            latent_row_bytes,
+            scale_row_bytes,
+            indexer,
+        });
     }
     Ok(out)
+}
+
+/// The active stack's absorbed MLA lane regions for the active profile's `attention.latent_cache`.
+///
+/// # Errors
+/// As [absorbed_regions_for].
+pub(super) fn absorbed_regions() -> Result<Vec<AbsorbedRegionPlan>, String> {
+    if !crate::plan::stated_stack() {
+        return Ok(Vec::new());
+    }
+    absorbed_regions_for(crate::plan::description(), latent_cache_fp8())
 }
 
 /// A tensor's arena slice by its claimed name.
@@ -714,6 +760,7 @@ impl DeviceLayer<'_> {
                 mlp: shared_inter.max(dense_inter),
             },
             quantise,
+            e4m3_latent: latent_cache_fp8(),
             allocations,
         });
         Ok(())
@@ -1157,7 +1204,7 @@ impl DeviceLayer<'_> {
                     let picked = selection.count.offset(first * 4);
                     let attention = chunk_segments(&attention, first, count);
                     let cx = RowsCx::new(self.cuda, count, share).with_segments(&attention);
-                    body.cache(&cx, &weights, &scratch, input, (eps, false, true))
+                    body.cache(&cx, &weights, &scratch, input, (eps, stated.e4m3_latent, true))
                         .map_err(what)?;
                     if let Some((keys, gates, head_weights, queries, tensors)) = indexer.as_ref() {
                         let picker = stated.indexer.ok_or_else(|| {
@@ -1201,7 +1248,7 @@ impl DeviceLayer<'_> {
                         &scratch,
                         (selected, picked),
                         state.branch.offset(first * dim * 4),
-                        (false, true),
+                        (stated.e4m3_latent, true),
                     )
                     .map_err(what)?;
                 }
@@ -1388,5 +1435,219 @@ impl DeviceLayer<'_> {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparkflash_kernels::checkpoint::Checkpoint;
+    use sparkflash_kernels::lane_memory::{ChunkDevice, ChunkPool, LaneSpan, Layout};
+    use std::cell::RefCell;
+
+    const GLM_CONFIG: &str = include_str!("../../../../models/configs/glm53_flash.hf.json");
+    const GRANULARITY: usize = 2 << 20;
+    const ROW_QUANTUM: usize = 2048;
+    const ONE_MILLION: usize = 1_048_576;
+    const DEFAULT_LANE_BUDGET: usize = 24 << 30;
+
+    #[derive(Default)]
+    struct MockDevice {
+        next: RefCell<u64>,
+        copies: RefCell<Vec<(u64, u64, usize)>>,
+        unmaps: RefCell<Vec<u64>>,
+    }
+
+    impl ChunkDevice for MockDevice {
+        fn create(&self, _bytes: usize) -> Result<u64, String> {
+            let mut next = self.next.borrow_mut();
+            *next += 1;
+            Ok(*next)
+        }
+        fn release(&self, _handle: u64) {}
+        fn map(&self, _at: u64, _bytes: usize, _handle: u64) -> Result<(), String> {
+            Ok(())
+        }
+        fn unmap(&self, at: u64, _bytes: usize) -> Result<(), String> {
+            self.unmaps.borrow_mut().push(at);
+            Ok(())
+        }
+        fn zero(&self, _at: u64, _bytes: usize) -> Result<(), String> {
+            Ok(())
+        }
+        fn copy(&self, dst: u64, src: u64, bytes: usize) -> Result<(), String> {
+            self.copies.borrow_mut().push((dst, src, bytes));
+            Ok(())
+        }
+    }
+
+    fn glm_description(world: usize) -> crate::plan::Description {
+        let plan = sparkflash_ops::engine_plan::EnginePlan::from_json(
+            GLM_CONFIG,
+            sparkflash_model::Target::Sm121,
+            world,
+            0,
+        )
+        .expect("the real GLM-5.3-Flash plan builds");
+        crate::plan::Description::new(plan).expect("the real GLM-5.3-Flash description builds")
+    }
+
+    fn build_glm_lane_shape(
+        description: &crate::plan::Description,
+        max_positions: usize,
+        e4m3_latent: bool,
+        world: usize,
+    ) -> (
+        sparkflash_kernels::lane_memory::LaneShape,
+        Vec<(usize, [Option<usize>; super::super::lanes::ABSORBED_REGIONS])>,
+        usize,
+    ) {
+        let mut layout = Layout::default();
+        let plans = absorbed_regions_for(description, e4m3_latent).expect("absorbed regions");
+        let mut offsets = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let reg = super::super::lanes::plan_absorbed_regions(&mut layout, max_positions, plan);
+            offsets.push((plan.layer, reg));
+        }
+        let values = description.values();
+        let kda_layers = values.kda_layers.len();
+        let kda = values.kda.expect("GLM states KDA geometry");
+        let heads = kda.heads / world;
+        let conv_width = heads * kda.head_dim * 3;
+        let history_bytes = conv_width * kda.conv.saturating_sub(1) * 4;
+        let state_bytes = heads * kda.head_dim * kda.head_dim * 4;
+        let mut recurrent_sizes = Vec::with_capacity(kda_layers * 2);
+        for _ in 0..kda_layers {
+            recurrent_sizes.push(history_bytes);
+            recurrent_sizes.push(state_bytes);
+            layout.state(history_bytes);
+            layout.state(state_bytes);
+        }
+        let checkpoint_bytes = Checkpoint::arena_bytes(&recurrent_sizes);
+        layout.state(checkpoint_bytes);
+        let recurrent_total = recurrent_sizes.iter().sum::<usize>() + checkpoint_bytes;
+        (
+            layout.finish(GRANULARITY, ROW_QUANTUM),
+            offsets,
+            recurrent_total,
+        )
+    }
+
+    #[test]
+    fn a2_e4m3_latent_cache_fits_1m_window_with_slide_and_prefix_adoption() {
+        let description = glm_description(4);
+        let plans_fp8 = absorbed_regions_for(&description, true).expect("fp8 plans");
+        let plans_f32 = absorbed_regions_for(&description, false).expect("f32 plans");
+        assert_eq!(plans_fp8.len(), 11, "GLM-5.3-Flash has 11 sparse MLA layers");
+        assert_eq!(
+            plans_fp8.iter().filter(|p| p.indexer.is_some()).count(),
+            11,
+            "all 11 sparse language layers in GLM-5.3-Flash own a pooled indexer (MTP shares the last)"
+        );
+        for (fp8, f32_plan) in plans_fp8.iter().zip(&plans_f32) {
+            assert_eq!(fp8.latent_row_bytes, 512);
+            assert_eq!(fp8.scale_row_bytes, Some(16));
+            assert_eq!(f32_plan.latent_row_bytes, 2048);
+            assert_eq!(f32_plan.scale_row_bytes, None);
+        }
+
+        let (shape_fp8, offsets, recurrent_bytes) =
+            build_glm_lane_shape(&description, ONE_MILLION, true, 4);
+        let (shape_f32, _, _) = build_glm_lane_shape(&description, ONE_MILLION, false, 4);
+
+        let floor_1m = super::super::lanes::slide_floor(ONE_MILLION);
+        let fp8_1m_bytes = shape_fp8.chunks_for(ONE_MILLION, floor_1m) * GRANULARITY;
+        let f32_1m_bytes = shape_f32.chunks_for(ONE_MILLION, floor_1m) * GRANULARITY;
+        eprintln!(
+            "GLM-5.3-Flash TP4 lane @ 1M (floor {floor_1m}): E4M3={:.2} GiB, F32={:.2} GiB, 34-KDA state+ckpt={:.2} MiB, stride_fp8={:.2} GiB",
+            fp8_1m_bytes as f64 / (1u64 << 30) as f64,
+            f32_1m_bytes as f64 / (1u64 << 30) as f64,
+            recurrent_bytes as f64 / (1u64 << 20) as f64,
+            shape_fp8.stride as f64 / (1u64 << 30) as f64,
+        );
+        assert!(
+            fp8_1m_bytes < 8 << 30,
+            "1M E4M3 window should stay under 8 GiB, got {} MiB (recurrent {} MiB)",
+            fp8_1m_bytes >> 20,
+            recurrent_bytes >> 20,
+        );
+        assert!(fp8_1m_bytes < DEFAULT_LANE_BUDGET / 3);
+        assert!(
+            f32_1m_bytes > fp8_1m_bytes * 3,
+            "f32 latent should be >3x E4M3 ({} MiB vs {} MiB)",
+            f32_1m_bytes >> 20,
+            fp8_1m_bytes >> 20,
+        );
+
+        let device = MockDevice::default();
+        let mut pool = ChunkPool::new(GRANULARITY, DEFAULT_LANE_BUDGET);
+        let mut lane0 = LaneSpan::new(0x1000_0000, &shape_fp8);
+        let mut lane1 = LaneSpan::new(0x2000_0000, &shape_fp8);
+
+        let rows = 65_536;
+        assert!(lane0.ensure(&device, &shape_fp8, &mut pool, rows).expect("grow"));
+        let mapped_before = lane0.mapped();
+        let floor = super::super::lanes::slide_floor(rows);
+        assert!(floor > 0);
+        let reclaimed = lane0
+            .slide(&device, &shape_fp8, &mut pool, floor)
+            .expect("slide");
+        assert!(
+            reclaimed > 0 && lane0.mapped() < mapped_before,
+            "sliding raw indexer keys/gates must reclaim physical chunks (reclaimed {reclaimed})"
+        );
+        assert_eq!(device.unmaps.borrow().len(), reclaimed);
+
+        device.copies.borrow_mut().clear();
+        assert!(
+            lane1
+                .copy_prefix(&device, &shape_fp8, &mut pool, &lane0, rows, floor)
+                .expect("copy_prefix")
+        );
+        let copies = device.copies.borrow();
+        let first_layer_regions = offsets[0].1;
+        let latent_off = first_layer_regions[0].expect("latent");
+        let scales_off = first_layer_regions[1].expect("scales");
+        assert!(
+            copies
+                .iter()
+                .any(|&(dst, _, len)| dst == lane1.base() + latent_off as u64 && len == rows * 512),
+            "prefix adoption must copy the E4M3 latent codes"
+        );
+        assert!(
+            copies
+                .iter()
+                .any(|&(dst, _, len)| dst == lane1.base() + scales_off as u64 && len == rows * 16),
+            "prefix adoption must copy the E4M3 block scales"
+        );
+        assert_eq!(copies.len(), 11 * 2 + 11 * 3);
+        lane0.release(&device, &shape_fp8, &mut pool).expect("release 0");
+        lane1.release(&device, &shape_fp8, &mut pool).expect("release 1");
+    }
+
+    #[test]
+    fn a2_shared_indexer_layer_allocates_no_indexer_regions() {
+        const TINY: &str = include_str!("../../../sparkflash-model-deepseek-v41/tests/fixtures/glm-tiny/config.json");
+        let plan = sparkflash_ops::engine_plan::EnginePlan::from_json(
+            TINY,
+            sparkflash_model::Target::Sm121,
+            1,
+            0,
+        )
+        .expect("glm-tiny plan");
+        let description = crate::plan::Description::new(plan).expect("glm-tiny description");
+        let plans = absorbed_regions_for(&description, true).expect("tiny absorbed plans");
+        assert_eq!(plans.len(), 3);
+        assert!(plans[0].indexer.is_some(), "L3 owns an indexer");
+        assert!(plans[1].indexer.is_some(), "L6 owns an indexer");
+        assert!(plans[2].indexer.is_none(), "L7 shares L6's selection");
+    }
+
+    #[test]
+    fn a2_profile_switch_selects_e4m3_by_default_and_f32_when_asked() {
+        assert!(latent_cache_fp8_for(None));
+        assert!(latent_cache_fp8_for(Some(sparkflash_model::profile::LatentCacheMode::Auto)));
+        assert!(latent_cache_fp8_for(Some(sparkflash_model::profile::LatentCacheMode::Fp8)));
+        assert!(!latent_cache_fp8_for(Some(sparkflash_model::profile::LatentCacheMode::F32)));
     }
 }
