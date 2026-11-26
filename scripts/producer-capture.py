@@ -127,9 +127,13 @@ def producer_logits(checkpoint: Path, host: dict, dtype_name: str, device: str =
             "would compare the host's quantized arithmetic with an unquantized one"
         )
     model.eval()
+    # The model's own device, which is the GPU under --device cuda: a CPU id tensor against a
+    # CUDA model fails inside the first index_select with `Expected all tensors to be on the same
+    # device`, which reads as a producer fault and is the caller's.
+    where = next(model.parameters()).device
     tokens = host["tokens"]
     with torch.no_grad():
-        ids = torch.tensor([tokens], dtype=torch.long)
+        ids = torch.tensor([tokens], dtype=torch.long, device=where)
         out = model(input_ids=ids, use_cache=False).logits
     rows = out[0].to(torch.float32).tolist()
     if len(rows) != len(tokens):
@@ -144,8 +148,9 @@ def check_boundaries(model, host: dict, boundaries: Path) -> list[dict]:
 
     shapes = json.loads((boundaries / "shapes.json").read_text())
     seq_len = len(host["tokens"])
-    mask = torch.ones((1, seq_len), dtype=torch.bool)
-    pos = torch.arange(seq_len).unsqueeze(0)
+    where = next(model.parameters()).device
+    mask = torch.ones((1, seq_len), dtype=torch.bool, device=where)
+    pos = torch.arange(seq_len, device=where).unsqueeze(0)
     results = []
     shared_topk = None
     with torch.no_grad():
