@@ -278,19 +278,15 @@ impl InklingStreamParser {
     }
 
     /// Flushes the held-back tail at end of stream.
+    ///
+    /// An invocation body that arrived whole is a call even when the closing `<|end_message|>`
+    /// never reached this layer: the stream can end on the sampling stop right after the JSON.
+    /// A body that does not parse stays visible, exactly as it does before a closing marker.
     pub fn finish(&mut self) -> Vec<InklingEvent> {
         let mut events = Vec::new();
         let pending = std::mem::take(&mut self.buffer);
         self.text(&pending, &mut events);
-        if self.section == Section::Invoke {
-            // An invocation the stream cut off (a length stop) is not a call.
-            let body = std::mem::take(&mut self.invoke);
-            push(
-                &mut events,
-                InklingEvent::Content(format!("{}{CONTENT_INVOKE_JSON}{body}", self.header)),
-            );
-            self.section = Section::Outside;
-        }
+        self.close_invoke(&mut events);
         events
     }
 }
@@ -490,6 +486,23 @@ mod tests {
                 0,
                 "lookup".to_owned(),
                 r#"{"city":"Paris","n":2}"#.to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_invocation_complete_at_stream_end_is_still_a_call() {
+        let (_, content, calls) = parse_all(&[
+            "Noting the call first. run_code<|content_invoke_tool_json|>",
+            r#"{"name":"run_code","args":{"code":"inspect(1)"}}"#,
+        ]);
+        assert_eq!(content, "Noting the call first. run_code");
+        assert_eq!(
+            calls,
+            [(
+                0,
+                "run_code".to_owned(),
+                r#"{"code":"inspect(1)"}"#.to_owned()
             )]
         );
     }
