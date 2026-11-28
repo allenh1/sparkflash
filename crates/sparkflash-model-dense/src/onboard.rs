@@ -105,7 +105,11 @@ pub fn survey(architecture: &Architecture, unmodelled: Vec<String>) -> Survey {
         StepRole::Attention | StepRole::Ffn => {
             survey.own.insert(part);
         }
-        StepRole::Compression | StepRole::Indexer | StepRole::Residual | StepRole::Side => {
+        StepRole::Compression
+        | StepRole::Indexer
+        | StepRole::Residual
+        | StepRole::Side
+        | StepRole::Message => {
             survey.unhosted.insert((role, part));
         }
     });

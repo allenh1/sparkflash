@@ -163,8 +163,54 @@ pub enum Op {
     ResidualAdd,
     /// The final logit softcap and the unpadded slice.
     LogitSoftcap,
+    /// The loop's cross-pass read: the four learned queries over the previous pass's summaries
+    /// and final hidden, into the per-application message buffer.
+    MessageRead,
+    /// One stream's loop message gate, applied to that stream's input before its norm.
+    MessageGate(MessageStream),
     /// A collective.
     Collective(Collective),
+}
+
+/// The four sublayer inputs a loop pass hands the next, in the producer's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MessageStream {
+    /// The query input.
+    Query,
+    /// The key input.
+    Key,
+    /// The value input.
+    Value,
+    /// The MLP input.
+    Mlp,
+}
+
+impl MessageStream {
+    /// The sublayer inputs, in the producer's `(query, key, value, MLP)` order.
+    pub const ALL: &'static [Self] = &[Self::Query, Self::Key, Self::Value, Self::Mlp];
+
+    /// The stream's index in the message buffer.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Query => 0,
+            Self::Key => 1,
+            Self::Value => 2,
+            Self::Mlp => 3,
+        }
+    }
+
+    /// The checkpoint's spelling of the stream's controller tensors. The producer calls the
+    /// query stream query; the released checkpoint stores it as `attn`.
+    #[must_use]
+    pub const fn controller(self) -> &'static str {
+        match self {
+            Self::Query => "attn",
+            Self::Key => "k",
+            Self::Value => "v",
+            Self::Mlp => "mlp",
+        }
+    }
 }
 
 impl Op {
@@ -189,6 +235,13 @@ impl Op {
             Self::ExpertMix => "expert_mix",
             Self::ResidualAdd => "residual_add",
             Self::LogitSoftcap => "logit_softcap",
+            Self::MessageRead => "message_read",
+            Self::MessageGate(stream) => match stream {
+                MessageStream::Query => "message_gate_query",
+                MessageStream::Key => "message_gate_key",
+                MessageStream::Value => "message_gate_value",
+                MessageStream::Mlp => "message_gate_mlp",
+            },
             Self::Collective(collective) => collective.name(),
         }
     }
@@ -448,8 +501,15 @@ impl Step {
 /// One decoder layer's schedule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerSchedule {
-    /// The checkpoint layer index.
+    /// This application's position in the plan: the index every per-application buffer,
+    /// cache and table uses.
     pub index: usize,
+    /// The checkpoint layer whose weights this application reads. A looped release applies its
+    /// core more than once, so several applications share one stored layer.
+    pub stored: usize,
+    /// The loop pass this application runs. 0 for every layer of a single-pass release and for
+    /// the prelude and coda of a looped one.
+    pub pass: usize,
     /// Whether the layer is a sliding-window layer.
     pub sliding: bool,
     /// How many learned queries the block-attention residual reads (1 or 3).
@@ -608,8 +668,11 @@ impl InklingDevicePlan {
         let (prologue, epilogue) = plan.global_steps()?;
         plan.prologue = prologue;
         plan.epilogue = epilogue;
-        for layer in 0..config.num_hidden_layers {
-            plan.layers.push(plan.layer_schedule(layer)?);
+        // One schedule an application, in the producer's order: the prelude once, the core
+        // `passes` times and the coda once (`Inkling2Config::applications`). A single-pass
+        // release is its stored stack once, so this is the same list it always built.
+        for (stored, pass) in config.applications() {
+            plan.layers.push(plan.layer_schedule(stored, pass)?);
         }
         plan.buffers = plan.buffer_plan();
         Ok(plan)
@@ -1084,7 +1147,7 @@ impl InklingDevicePlan {
         Ok((prologue, steps))
     }
 
-    fn layer_schedule(&self, layer: usize) -> Result<LayerSchedule, String> {
+    fn layer_schedule(&self, layer: usize, pass: usize) -> Result<LayerSchedule, String> {
         let config = &self.config;
         let hidden = config.hidden_size;
         let heads = self.rank_heads();
@@ -1125,33 +1188,97 @@ impl InklingDevicePlan {
         let mut steps = Vec::with_capacity(32);
         steps.extend(bank_step);
 
-        // The attention input norm: one shared norm on a sliding layer, three on a full one.
+        // A pass after the first reads the previous pass's message once at the first core layer:
+        // four learned queries per core layer over the summaries that pass appended and its final
+        // hidden (`modeling_inkling2_loop.py`:147-176, 1398-1407). Every later layer of the pass
+        // reads its four messages from the scratch populated here.
+        if pass > 0 && config.loop_plan.is_some_and(|lp| layer == lp.core_start) {
+            steps.push(self.step(
+                Op::MessageRead,
+                None,
+                None,
+                None,
+                &[
+                    "model.llm.middle_cycle_cross_pass_queries",
+                    "model.llm.middle_cycle_cross_pass_kv_queries",
+                ],
+                rows,
+                hidden,
+            )?);
+        }
+        // One gate a sublayer input, applied to the block residual's output before the input
+        // norm: `(1 - tanh(forget)) * source + tanh(gain) * message`.
+        let gate = |plan: &Self, stream: MessageStream| -> Result<Step, String> {
+            let controllers = format!("{prefix}.controllers.{}", stream.controller());
+            plan.step(
+                Op::MessageGate(stream),
+                None,
+                None,
+                None,
+                &[
+                    &format!("{controllers}.down_weight"),
+                    &format!("{controllers}.forget_weight"),
+                    &format!("{controllers}.gain_weight"),
+                ],
+                rows,
+                hidden,
+            )
+        };
+
+        // The attention input norm: one shared norm on a sliding layer on pass 0; three separate
+        // gated streams normed with `attn_norm` on a sliding loop layer for pass > 0
+        // (`modeling_inkling2_loop.py`:961-967); and three distinct norms on a full layer.
         if sliding {
-            steps.push(
-                self.step(
-                    Op::RmsNorm,
-                    Some(Part::RmsNorm),
-                    Some(Image::TOKEN),
-                    Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
-                    &[&format!("{prefix}.attn_norm.weight")],
-                    rows,
-                    hidden,
-                )?
-                .at(Target::Norm(if layer == 0 {
-                    NormRole::Stream
-                } else {
-                    NormRole::Attention
-                })),
-            );
+            if pass > 0 {
+                for (role, stream) in [
+                    (NormRole::Query, MessageStream::Query),
+                    (NormRole::Key, MessageStream::Key),
+                    (NormRole::Value, MessageStream::Value),
+                ] {
+                    steps.push(gate(self, stream)?);
+                    steps.push(
+                        self.step(
+                            Op::RmsNorm,
+                            Some(Part::RmsNorm),
+                            Some(Image::TOKEN),
+                            Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
+                            &[&format!("{prefix}.attn_norm.weight")],
+                            rows,
+                            hidden,
+                        )?
+                        .at(Target::Norm(role)),
+                    );
+                }
+            } else {
+                steps.push(
+                    self.step(
+                        Op::RmsNorm,
+                        Some(Part::RmsNorm),
+                        Some(Image::TOKEN),
+                        Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
+                        &[&format!("{prefix}.attn_norm.weight")],
+                        rows,
+                        hidden,
+                    )?
+                    .at(Target::Norm(if layer == 0 {
+                        NormRole::Stream
+                    } else {
+                        NormRole::Attention
+                    })),
+                );
+            }
         } else {
-            for (name, role) in [
-                ("q_input_norm", NormRole::Query),
-                ("k_input_norm", NormRole::Key),
-                ("v_input_norm", NormRole::Value),
+            for (name, role, stream) in [
+                ("q_input_norm", NormRole::Query, MessageStream::Query),
+                ("k_input_norm", NormRole::Key, MessageStream::Key),
+                ("v_input_norm", NormRole::Value, MessageStream::Value),
             ] {
                 // Layer 0 has no bank, so all three inputs are the stream (the host's one-row
                 // attention input, read three times).
                 let role = if layer == 0 { NormRole::Stream } else { role };
+                if pass > 0 {
+                    steps.push(gate(self, stream)?);
+                }
                 steps.push(
                     self.step(
                         Op::RmsNorm,
@@ -1321,6 +1448,9 @@ impl InklingDevicePlan {
             )?
             .at(Target::Input(ResidualInput::Mlp)),
         );
+        if pass > 0 {
+            steps.push(gate(self, MessageStream::Mlp)?);
+        }
         steps.push(
             self.step(
                 Op::RmsNorm,
@@ -1502,7 +1632,9 @@ impl InklingDevicePlan {
 
         let kv_rows = self.cache_rows(layer);
         Ok(LayerSchedule {
-            index: layer,
+            index: self.layers.len(),
+            stored: layer,
+            pass,
             sliding,
             block_queries: if full { 3 } else { 1 },
             taps,
@@ -1539,17 +1671,16 @@ impl InklingDevicePlan {
         let rows = self.rows;
         let activation = self.expert_intermediate();
         let history = config.conv_history();
-        let mut blocks = 0usize;
+        let blocks = config
+            .num_hidden_layers
+            .div_ceil(config.n_layers_per_attn_res_block.max(1));
         let mut kv_cache = 0usize;
-        for layer in 0..config.num_hidden_layers {
-            if layer.is_multiple_of(config.n_layers_per_attn_res_block.max(1)) {
-                blocks += 1;
-            }
-            let cache_rows = self.cache_rows(layer);
-            // Two caches (key and value) of BF16 rows.
-            kv_cache = kv_cache.saturating_add(cache_rows * kv_heads * head_dim * 2 * 2);
+        for layer in &self.layers {
+            // Two caches (key and value) of BF16 rows, one per application (so a looped core's
+            // passes each account for their own cache slot).
+            kv_cache = kv_cache.saturating_add(layer.kv_rows * kv_heads * head_dim * 2 * 2);
         }
-        let conv_state = config.num_hidden_layers
+        let conv_state = self.layers.len()
             * (2 * kv_heads * head_dim + 2 * hidden)
             * history
             * std::mem::size_of::<f32>();
@@ -1958,5 +2089,55 @@ mod tests {
             assert!(names[1].ends_with("q_l2_clip.scale"));
             assert!(names[2].ends_with("rel_l2_clip.scale"));
         }
+    }
+
+    #[test]
+    fn every_mini_looped_served_weight_is_read_and_buffers_count_applications() {
+        let config = Inkling2Config::from_json(
+            include_str!("../../sparkflash-model/tests/data/inkling2_mini_config.json"),
+            Some(include_str!(
+                "../../sparkflash-model/tests/data/inkling2_mini_quant.json"
+            )),
+        )
+        .expect("the mini config parses");
+        let tp = TpPlan::new(1, 0).expect("TP1");
+        let plan = InklingDevicePlan::build(&config, tp, Pass::Decode, 1, 4096)
+            .expect("the mini schedule builds");
+        assert_eq!(plan.layers().len(), 48);
+        let served = plan.served();
+        let mut reads = vec![0usize; served.plan().len()];
+        let mut message_reads = 0usize;
+        for step in plan.steps() {
+            if step.op == Op::MessageRead {
+                message_reads += 1;
+            }
+            for index in &step.weights {
+                reads[*index] += 1;
+            }
+        }
+        // MessageRead runs once per pass after pass 0 (3 passes -> 2 reads, not 24).
+        assert_eq!(message_reads, 2);
+        for (index, count) in reads.iter().enumerate() {
+            let name = &served.plan().specs()[index].name;
+            assert!(
+                *count >= 1,
+                "Mini TP1: served tensor {name} is never read by any scheduled step"
+            );
+        }
+        // Buffer accounting must cover all 48 applications (not just 24 stored layers).
+        let buffers = plan.buffers();
+        let kv_heads = plan.rank_kv_heads();
+        let head_dim = config.head_dim;
+        let expected_kv: usize = plan
+            .layers()
+            .iter()
+            .map(|layer| layer.kv_rows * kv_heads * head_dim * 2 * 2)
+            .sum();
+        assert_eq!(buffers.kv_cache, expected_kv);
+        let expected_conv = 48
+            * (2 * kv_heads * head_dim + 2 * config.hidden_size)
+            * config.conv_history()
+            * std::mem::size_of::<f32>();
+        assert_eq!(buffers.conv_state, expected_conv);
     }
 }

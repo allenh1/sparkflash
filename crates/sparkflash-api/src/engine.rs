@@ -21,8 +21,9 @@
 //! produce in Milestone 1; EngineEvent is the normalized decode stream both the SSE and
 //! the buffered response encoders consume.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,31 @@ pub const MAX_SEQ_LEN_ENV: &str = "SPARK_MAX_SEQ_LEN";
 /// or one wider than the model's), rather than second-guessing an operator who really
 /// wants a deliberately tiny window.
 pub const MIN_SEQ_LEN: usize = 1;
+
+/// Monotonic counter behind every adapter-generated tool-call id.
+static TOOL_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Per-process nonce mixed into tool-call ids so ids from two server runs cannot collide.
+static TOOL_CALL_NONCE: OnceLock<u64> = OnceLock::new();
+
+/// A tool-call id unique across every response this server process serves.
+///
+/// The model dialects number their calls from zero in each answer, so a literal `call_0`
+/// repeats on every turn. A client that persists tool calls (the harness records the id on
+/// each nested call) needs the id to identify one call for the life of the session. The
+/// nonce keeps ids distinct across server restarts; the counter keeps them distinct within
+/// one process.
+#[must_use]
+pub(crate) fn next_tool_call_id() -> String {
+    let nonce = *TOOL_CALL_NONCE.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        nanos ^ (u64::from(std::process::id()) << 32)
+    });
+    let sequence = TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("call_{nonce:016x}{sequence:08x}")
+}
 
 /// Parses a SPARK_MAX_SEQ_LEN value against the V4.1 window.
 ///

@@ -500,6 +500,668 @@ extern "C" __global__ void q4d_attn_span_chunk(const float* __restrict__ queries
     }
 }
 
+// Same as q4d_attn_span_chunk, reading BF16 context rings (`key_ring`, `value_ring`) via
+// double-buffered 16-byte cp.async.cg staging (read once per block across all warps, then widened
+// back to float4 — bit-identical to FP32 rings storing BF16-rounded values, at half the DRAM
+// traffic).
+#define Q4D_BF16_TILE_KEYS 16
+
+extern "C" __global__ void q4d_attn_span_chunk_bf16(const float* __restrict__ queries,
+                                                    const __nv_bfloat16* __restrict__ key_ring,
+                                                    const __nv_bfloat16* __restrict__ value_ring,
+                                                    const float* __restrict__ block_keys,
+                                                    const float* __restrict__ block_values,
+                                                    float* __restrict__ part, int heads,
+                                                    int kv_heads, int head_dim, int base,
+                                                    int lowest, int ring, int block_rows,
+                                                    float scale) {
+    static_assert(Q4D_SPAN_QUERIES * Q4D_SPAN_KEYS == 32, "one (query, key) pair a lane");
+    if (head_dim != Q4D_HEAD_DIM || heads % kv_heads != 0) {
+        return;
+    }
+    __shared__ __align__(16) uint4 s_k[2][Q4D_BF16_TILE_KEYS][Q4D_HEAD_DIM / 8];
+    __shared__ __align__(16) uint4 s_v[2][Q4D_BF16_TILE_KEYS][Q4D_HEAD_DIM / 8];
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nthreads = blockDim.x;
+    const int group = heads / kv_heads;
+    const int queries_total = group * block_rows;
+    const int key_head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int chunks = gridDim.y;
+    const int context = max(0, base - lowest);
+    const int total = context + block_rows;
+    const int per = (total + chunks - 1) / chunks;
+    const int first = min(total, chunk * per);
+    const int last = min(total, first + per);
+    const int kv_width = kv_heads * head_dim;
+    const int offset = key_head * head_dim + lane * 4;
+    const int own_query = lane / Q4D_SPAN_KEYS;
+    const int own_key = lane % Q4D_SPAN_KEYS;
+    float4 query[Q4D_SPAN_QUERIES];
+    float running_max[Q4D_SPAN_QUERIES];
+    float running_sum[Q4D_SPAN_QUERIES];
+    float acc[Q4D_SPAN_QUERIES][4];
+#pragma unroll
+    for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+        const int index = min(warp * Q4D_SPAN_QUERIES + i, queries_total - 1);
+        const int row = index / group;
+        const int head = key_head * group + index % group;
+        query[i] = *reinterpret_cast<const float4*>(
+            queries + (unsigned long long)row * heads * head_dim + head * head_dim + lane * 4);
+        running_max[i] = -CUDART_INF_F;
+        running_sum[i] = 0.0f;
+        acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+    }
+
+    const int ring_last = min(last, context);
+    const int ring_tiles_end = first + ((max(0, ring_last - first)) & ~(Q4D_BF16_TILE_KEYS - 1));
+    auto issue_tile = [&](int buf, int tile_first) {
+        for (int c = threadIdx.x; c < Q4D_BF16_TILE_KEYS * 16; c += nthreads) {
+            const int r = c >> 4;
+            const int ch = c & 15;
+            const int slot = (lowest + tile_first + r) % ring;
+            const unsigned long long at =
+                (unsigned long long)slot * kv_width + key_head * head_dim + ch * 8;
+            const uint32_t dk = (uint32_t)__cvta_generic_to_shared(&s_k[buf][r][ch]);
+            const uint32_t dv = (uint32_t)__cvta_generic_to_shared(&s_v[buf][r][ch]);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dk), "l"(key_ring + at));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dv),
+                         "l"(value_ring + at));
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+
+    int buf = 0;
+    if (first < ring_tiles_end) {
+        issue_tile(0, first);
+    }
+    for (int tile_key = first; tile_key < ring_tiles_end; tile_key += Q4D_BF16_TILE_KEYS) {
+        const int next_tile = tile_key + Q4D_BF16_TILE_KEYS;
+        if (next_tile < ring_tiles_end) {
+            issue_tile(buf ^ 1, next_tile);
+            asm volatile("cp.async.wait_group 1;" ::: "memory");
+        } else {
+            asm volatile("cp.async.wait_all;" ::: "memory");
+        }
+        __syncthreads();
+        const uint2* kb_base = reinterpret_cast<const uint2*>(&s_k[buf][0][0]);
+        const uint2* vb_base = reinterpret_cast<const uint2*>(&s_v[buf][0][0]);
+        for (int sub = 0; sub < Q4D_BF16_TILE_KEYS; sub += Q4D_SPAN_KEYS) {
+            float4 k[Q4D_SPAN_KEYS];
+            float4 v[Q4D_SPAN_KEYS];
+#pragma unroll
+            for (int j = 0; j < Q4D_SPAN_KEYS; ++j) {
+                const uint2 rk = kb_base[(sub + j) * 32 + lane];
+                const uint2 rv = vb_base[(sub + j) * 32 + lane];
+                const float2 k01 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rk.x));
+                const float2 k23 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rk.y));
+                const float2 v01 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rv.x));
+                const float2 v23 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rv.y));
+                k[j] = make_float4(k01.x, k01.y, k23.x, k23.y);
+                v[j] = make_float4(v01.x, v01.y, v23.x, v23.y);
+            }
+            float dot[32];
+#pragma unroll
+            for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+#pragma unroll
+                for (int j = 0; j < Q4D_SPAN_KEYS; ++j) {
+                    dot[i * Q4D_SPAN_KEYS + j] = q4d_attn_dot(query[i], k[j]);
+                }
+            }
+#pragma unroll
+            for (int width = 16; width >= 1; width >>= 1) {
+                const bool upper = (lane & width) != 0;
+#pragma unroll
+                for (int t = 0; t < width; ++t) {
+                    const float send = upper ? dot[t] : dot[t + width];
+                    const float keep = upper ? dot[t + width] : dot[t];
+                    dot[t] = __fadd_rn(keep, __shfl_xor_sync(0xFFFFFFFFu, send, width));
+                }
+            }
+            const float scaled = __fmul_rn(dot[0], scale);
+            float batch_max = scaled;
+#pragma unroll
+            for (int width = Q4D_SPAN_KEYS / 2; width >= 1; width >>= 1) {
+                batch_max = fmaxf(batch_max, __shfl_xor_sync(0xFFFFFFFFu, batch_max, width));
+            }
+            float own_max = 0.0f;
+#pragma unroll
+            for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+                const float next_max =
+                    fmaxf(running_max[i], __shfl_sync(0xFFFFFFFFu, batch_max, i * Q4D_SPAN_KEYS));
+                const float correction = __expf(running_max[i] - next_max);
+                running_sum[i] = __fmul_rn(running_sum[i], correction);
+#pragma unroll
+                for (int d = 0; d < 4; ++d) {
+                    acc[i][d] = __fmul_rn(acc[i][d], correction);
+                }
+                running_max[i] = next_max;
+                own_max = own_query == i ? next_max : own_max;
+            }
+            const float own_weight = __expf(scaled - own_max);
+#pragma unroll
+            for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+#pragma unroll
+                for (int j = 0; j < Q4D_SPAN_KEYS; ++j) {
+                    const float weight =
+                        __shfl_sync(0xFFFFFFFFu, own_weight, i * Q4D_SPAN_KEYS + j);
+                    running_sum[i] = __fadd_rn(running_sum[i], weight);
+                    acc[i][0] = __fmaf_rn(weight, v[j].x, acc[i][0]);
+                    acc[i][1] = __fmaf_rn(weight, v[j].y, acc[i][1]);
+                    acc[i][2] = __fmaf_rn(weight, v[j].z, acc[i][2]);
+                    acc[i][3] = __fmaf_rn(weight, v[j].w, acc[i][3]);
+                }
+            }
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    for (int base_key = ring_tiles_end; base_key < last; base_key += Q4D_SPAN_KEYS) {
+        float4 k[Q4D_SPAN_KEYS];
+        float4 v[Q4D_SPAN_KEYS];
+#pragma unroll
+        for (int j = 0; j < Q4D_SPAN_KEYS; ++j) {
+            const int key = base_key + j < last ? base_key + j : base_key;
+            const bool in_ring = key < context;
+            const int slot = in_ring ? (lowest + key) % ring : key - context;
+            const unsigned long long at = (unsigned long long)slot * kv_width + offset;
+            if (in_ring) {
+                const uint2 rk = *reinterpret_cast<const uint2*>(key_ring + at);
+                const uint2 rv = *reinterpret_cast<const uint2*>(value_ring + at);
+                const float2 k01 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rk.x));
+                const float2 k23 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rk.y));
+                const float2 v01 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rv.x));
+                const float2 v23 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rv.y));
+                k[j] = make_float4(k01.x, k01.y, k23.x, k23.y);
+                v[j] = make_float4(v01.x, v01.y, v23.x, v23.y);
+            } else {
+                k[j] = *reinterpret_cast<const float4*>(block_keys + at);
+                v[j] = *reinterpret_cast<const float4*>(block_values + at);
+            }
+        }
+        float dot[32];
+#pragma unroll
+        for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+#pragma unroll
+            for (int j = 0; j < Q4D_SPAN_KEYS; ++j) {
+                dot[i * Q4D_SPAN_KEYS + j] = q4d_attn_dot(query[i], k[j]);
+            }
+        }
+#pragma unroll
+        for (int width = 16; width >= 1; width >>= 1) {
+            const bool upper = (lane & width) != 0;
+#pragma unroll
+            for (int t = 0; t < width; ++t) {
+                const float send = upper ? dot[t] : dot[t + width];
+                const float keep = upper ? dot[t + width] : dot[t];
+                dot[t] = __fadd_rn(keep, __shfl_xor_sync(0xFFFFFFFFu, send, width));
+            }
+        }
+        const float scaled =
+            base_key + own_key < last ? __fmul_rn(dot[0], scale) : -CUDART_INF_F;
+        float batch_max = scaled;
+#pragma unroll
+        for (int width = Q4D_SPAN_KEYS / 2; width >= 1; width >>= 1) {
+            batch_max = fmaxf(batch_max, __shfl_xor_sync(0xFFFFFFFFu, batch_max, width));
+        }
+        float own_max = 0.0f;
+#pragma unroll
+        for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+            const float next_max =
+                fmaxf(running_max[i], __shfl_sync(0xFFFFFFFFu, batch_max, i * Q4D_SPAN_KEYS));
+            const float correction = __expf(running_max[i] - next_max);
+            running_sum[i] = __fmul_rn(running_sum[i], correction);
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                acc[i][d] = __fmul_rn(acc[i][d], correction);
+            }
+            running_max[i] = next_max;
+            own_max = own_query == i ? next_max : own_max;
+        }
+        const float own_weight = __expf(scaled - own_max);
+#pragma unroll
+        for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+#pragma unroll
+            for (int j = 0; j < Q4D_SPAN_KEYS; ++j) {
+                const float weight =
+                    __shfl_sync(0xFFFFFFFFu, own_weight, i * Q4D_SPAN_KEYS + j);
+                running_sum[i] = __fadd_rn(running_sum[i], weight);
+                acc[i][0] = __fmaf_rn(weight, v[j].x, acc[i][0]);
+                acc[i][1] = __fmaf_rn(weight, v[j].y, acc[i][1]);
+                acc[i][2] = __fmaf_rn(weight, v[j].z, acc[i][2]);
+                acc[i][3] = __fmaf_rn(weight, v[j].w, acc[i][3]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+        const int index = warp * Q4D_SPAN_QUERIES + i;
+        if (index >= queries_total) {
+            break;
+        }
+        const int row = index / group;
+        const int head = key_head * group + index % group;
+        float* at =
+            part + ((unsigned long long)(row * heads + head) * chunks + chunk) * Q4D_ATTN_PART;
+        *reinterpret_cast<float4*>(at + lane * 4) =
+            make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        if (lane == 0) {
+            at[Q4D_HEAD_DIM] = running_max[i];
+            at[Q4D_HEAD_DIM + 1] = running_sum[i];
+        }
+    }
+}
+
+// Tensor-core 2-plane BF16 MMA twin of q4d_attn_span_chunk_bf16 for group * block_rows <= 24,
+// head_dim == 128 (Inkling-2-Mini drafter: 3 heads/kv_head * 8 block_rows = 24 queries).
+// Double-buffers 64-key BF16 tiles via cp.async.cg and uses m16n8k16 MMA so long-context drafter
+// full attention saturates DRAM bandwidth (~235 GB/s vs ~145 GB/s scalar).
+// 49,408 B dynamic SMEM -> 2 blocks/SM on sm_121a. Writes the exact same Q4D_ATTN_PART layout so
+// q4d_attn_span_merge runs unchanged.
+#define Q4D_TC_KEYS 64
+#define Q4D_TC_WARPS 8
+#define Q4D_TC_THREADS 256
+#define Q4D_TC_MAX_Q 24
+
+struct Q4dTcShared {
+    alignas(16) uint4 kv[2][Q4D_TC_KEYS][16];
+    alignas(16) uint4 q_hi[Q4D_TC_MAX_Q][16];
+    alignas(16) uint4 q_lo[Q4D_TC_MAX_Q][16];
+    union {
+        alignas(16) float s_f32[16][Q4D_TC_KEYS];
+        struct {
+            alignas(16) __nv_bfloat16 p_hi[16][Q4D_TC_KEYS];
+            alignas(16) __nv_bfloat16 p_lo[16][Q4D_TC_KEYS];
+        };
+    };
+    alignas(16) float m_state[Q4D_TC_MAX_Q];
+    alignas(16) float l_state[Q4D_TC_MAX_Q];
+    alignas(16) float rescale[16];
+};
+
+static_assert(sizeof(Q4dTcShared) == 49408, "Q4D_TC_SHARED in draft.rs");
+
+__device__ __forceinline__ int q4d_tc_swz(int r, int c) { return c ^ (r & 7); }
+
+__device__ __forceinline__ void q4d_tc_mma(
+    float (&d)[4], unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
+    unsigned int b0, unsigned int b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+extern "C" __global__ void __launch_bounds__(Q4D_TC_THREADS, 2) q4d_attn_span_chunk_bf16_tc(
+    const float* __restrict__ queries,
+    const __nv_bfloat16* __restrict__ key_ring,
+    const __nv_bfloat16* __restrict__ value_ring,
+    const float* __restrict__ block_keys,
+    const float* __restrict__ block_values,
+    float* __restrict__ part,
+    int heads,
+    int kv_heads,
+    int head_dim,
+    int base,
+    int lowest,
+    int ring,
+    int block_rows,
+    float scale) {
+    extern __shared__ __align__(16) unsigned char raw_smem[];
+    Q4dTcShared& sm = *reinterpret_cast<Q4dTcShared*>(raw_smem);
+
+    if (head_dim != Q4D_HEAD_DIM || heads % kv_heads != 0) {
+        return;
+    }
+    const int group = heads / kv_heads;
+    const int Q = group * block_rows;
+    if (Q <= 0 || Q > Q4D_TC_MAX_Q) {
+        return;
+    }
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int grp = lane >> 2;
+    const int t4 = lane & 3;
+    const int key_head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int chunks = gridDim.y;
+    const int context = max(0, base - lowest);
+    const int total = context + block_rows;
+    const int per = (total + chunks - 1) / chunks;
+    const int first = min(total, chunk * per);
+    const int last = min(total, first + per);
+    const int span_n = last - first;
+    const int kv_width = kv_heads * Q4D_HEAD_DIM;
+    const int kv_offset = key_head * Q4D_HEAD_DIM;
+
+    if (span_n <= 0) {
+        for (int qi = warp; qi < Q; qi += Q4D_TC_WARPS) {
+            const int row = qi / group;
+            const int head = key_head * group + (qi - row * group);
+            float* at =
+                part + ((unsigned long long)(row * heads + head) * chunks + chunk) * Q4D_ATTN_PART;
+            *reinterpret_cast<float4*>(at + lane * 4) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (lane == 0) {
+                at[Q4D_HEAD_DIM] = -CUDART_INF_F;
+                at[Q4D_HEAD_DIM + 1] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    auto issue_ring_tile = [&](int buf, const __nv_bfloat16* ring_ptr, const float* blk_ptr,
+                               int k0, int tile_n) {
+        const bool all_ring = (first + k0 + tile_n) <= context;
+        if (all_ring) {
+#pragma unroll
+            for (int it = 0; it < 4; ++it) {
+                const int idx = tid + it * Q4D_TC_THREADS;
+                const int r = idx >> 4;
+                const int c = idx & 15;
+                const unsigned int dst =
+                    (unsigned int)__cvta_generic_to_shared(&sm.kv[buf][r][q4d_tc_swz(r, c)]);
+                if (r < tile_n) {
+                    const int slot = (lowest + first + k0 + r) % ring;
+                    const __nv_bfloat16* src =
+                        ring_ptr + (unsigned long long)slot * kv_width + kv_offset + c * 8;
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
+                } else {
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 0;" ::"r"(dst),
+                                 "l"(ring_ptr));
+                }
+            }
+            asm volatile("cp.async.commit_group;");
+        } else {
+            // Tail tile straddling context -> block_keys/block_values (FP32 -> BF16).
+            asm volatile("cp.async.commit_group;");
+#pragma unroll
+            for (int it = 0; it < 4; ++it) {
+                const int idx = tid + it * Q4D_TC_THREADS;
+                const int r = idx >> 4;
+                const int c = idx & 15;
+                __nv_bfloat16* dst =
+                    reinterpret_cast<__nv_bfloat16*>(&sm.kv[buf][r][q4d_tc_swz(r, c)]);
+                if (r < tile_n) {
+                    const int key = first + k0 + r;
+                    if (key < context) {
+                        const int slot = (lowest + key) % ring;
+                        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(
+                            ring_ptr + (unsigned long long)slot * kv_width + kv_offset + c * 8);
+                    } else {
+                        const float* src = blk_ptr +
+                                           (unsigned long long)(key - context) * kv_width +
+                                           kv_offset + c * 8;
+                        const float4 v0 = *reinterpret_cast<const float4*>(src);
+                        const float4 v1 = *reinterpret_cast<const float4*>(src + 4);
+                        *reinterpret_cast<__nv_bfloat162*>(dst + 0) =
+                            __floats2bfloat162_rn(v0.x, v0.y);
+                        *reinterpret_cast<__nv_bfloat162*>(dst + 2) =
+                            __floats2bfloat162_rn(v0.z, v0.w);
+                        *reinterpret_cast<__nv_bfloat162*>(dst + 4) =
+                            __floats2bfloat162_rn(v1.x, v1.y);
+                        *reinterpret_cast<__nv_bfloat162*>(dst + 6) =
+                            __floats2bfloat162_rn(v1.z, v1.w);
+                    }
+                } else {
+                    *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+                }
+            }
+        }
+    };
+
+    const int num_tiles = (span_n + Q4D_TC_KEYS - 1) / Q4D_TC_KEYS;
+    issue_ring_tile(0, key_ring, block_keys, 0, min(Q4D_TC_KEYS, span_n));
+
+    for (int qi = warp; qi < Q; qi += Q4D_TC_WARPS) {
+        const int row = qi / group;
+        const int head = key_head * group + (qi - row * group);
+        const float* qp = queries + (unsigned long long)(row * heads + head) * Q4D_HEAD_DIM;
+        __nv_bfloat16* dst_hi = reinterpret_cast<__nv_bfloat16*>(&sm.q_hi[qi][0]);
+        __nv_bfloat16* dst_lo = reinterpret_cast<__nv_bfloat16*>(&sm.q_lo[qi][0]);
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const int d = lane + s * 32;
+            const float qv = qp[d];
+            const __nv_bfloat16 hi = __float2bfloat16_rn(qv);
+            const __nv_bfloat16 lo = __float2bfloat16_rn(qv - __bfloat162float(hi));
+            dst_hi[q4d_tc_swz(qi, d >> 3) * 8 + (d & 7)] = hi;
+            dst_lo[q4d_tc_swz(qi, d >> 3) * 8 + (d & 7)] = lo;
+        }
+    }
+    if (tid < Q4D_TC_MAX_Q) {
+        sm.m_state[tid] = -CUDART_INF_F;
+        sm.l_state[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    float O0[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+    float O1[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+    const int n_mtiles = (Q > 16) ? 2 : 1;
+
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        const int k0 = tile * Q4D_TC_KEYS;
+        const int tile_n = min(Q4D_TC_KEYS, span_n - k0);
+        issue_ring_tile(1, value_ring, block_values, k0, tile_n);
+        asm volatile("cp.async.wait_group 1;" ::: "memory");
+        __syncthreads();
+
+        for (int mt = 0; mt < n_mtiles; ++mt) {
+            const int q0 = mt * 16;
+            const int q_cnt = min(16, Q - q0);
+
+            float s_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float s_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const int k_row = warp * 8 + (lane & 7);
+            const int q_r = q0 + (lane & 15);
+            const int q_r_safe = q_r < Q ? q_r : 0;
+
+#pragma unroll
+            for (int kk = 0; kk < 128; kk += 16) {
+                const int cv = (kk >> 3) + ((lane >> 4) & 1);
+                unsigned int a_hi[4], a_lo[4], b_k[2];
+                const unsigned int addr_hi = (unsigned int)__cvta_generic_to_shared(
+                    &sm.q_hi[q_r_safe][q4d_tc_swz(q_r_safe, cv)]);
+                const unsigned int addr_lo = (unsigned int)__cvta_generic_to_shared(
+                    &sm.q_lo[q_r_safe][q4d_tc_swz(q_r_safe, cv)]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a_hi[0]), "=r"(a_hi[1]), "=r"(a_hi[2]), "=r"(a_hi[3])
+                             : "r"(addr_hi));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a_lo[0]), "=r"(a_lo[1]), "=r"(a_lo[2]), "=r"(a_lo[3])
+                             : "r"(addr_lo));
+                const int k_cv = (kk >> 3) + ((lane >> 3) & 1);
+                const unsigned int addr_k = (unsigned int)__cvta_generic_to_shared(
+                    &sm.kv[0][k_row][q4d_tc_swz(k_row, k_cv)]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(b_k[0]), "=r"(b_k[1])
+                             : "r"(addr_k));
+                q4d_tc_mma(s_hi, a_hi[0], a_hi[1], a_hi[2], a_hi[3], b_k[0], b_k[1]);
+                q4d_tc_mma(s_lo, a_lo[0], a_lo[1], a_lo[2], a_lo[3], b_k[0], b_k[1]);
+            }
+
+            const int kc0 = warp * 8 + 2 * t4;
+            const int kc1 = kc0 + 1;
+            if (grp < q_cnt) {
+                sm.s_f32[grp][kc0] = (s_hi[0] + s_lo[0]) * scale;
+                sm.s_f32[grp][kc1] = (s_hi[1] + s_lo[1]) * scale;
+            }
+            if (grp + 8 < q_cnt) {
+                sm.s_f32[grp + 8][kc0] = (s_hi[2] + s_lo[2]) * scale;
+                sm.s_f32[grp + 8][kc1] = (s_hi[3] + s_lo[3]) * scale;
+            }
+            __syncthreads();
+
+            if (mt == n_mtiles - 1 && tile + 1 < num_tiles) {
+                issue_ring_tile(0, key_ring, block_keys, (tile + 1) * Q4D_TC_KEYS,
+                                min(Q4D_TC_KEYS, span_n - (tile + 1) * Q4D_TC_KEYS));
+            }
+
+            const int i0 = lane;
+            const int i1 = lane + 32;
+            const bool ok0 = i0 < tile_n;
+            const bool ok1 = i1 < tile_n;
+            float wp0[2] = {0.0f, 0.0f};
+            float wp1[2] = {0.0f, 0.0f};
+#pragma unroll
+            for (int it = 0; it < 2; ++it) {
+                const int qr = warp + it * Q4D_TC_WARPS;
+                if (qr < q_cnt) {
+                    const int qi = q0 + qr;
+                    const float v0 = ok0 ? sm.s_f32[qr][i0] : -CUDART_INF_F;
+                    const float v1 = ok1 ? sm.s_f32[qr][i1] : -CUDART_INF_F;
+                    float tmax = fmaxf(v0, v1);
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
+                        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, off));
+                    }
+                    const float m_old = sm.m_state[qi];
+                    const float m_new = fmaxf(m_old, tmax);
+                    const float alpha = (m_old == -CUDART_INF_F)
+                                            ? 0.0f
+                                            : (m_new == m_old ? 1.0f : __expf(m_old - m_new));
+                    const float p0 = (ok0 && m_new != -CUDART_INF_F) ? __expf(v0 - m_new) : 0.0f;
+                    const float p1 = (ok1 && m_new != -CUDART_INF_F) ? __expf(v1 - m_new) : 0.0f;
+                    float psum = p0 + p1;
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
+                        psum += __shfl_xor_sync(0xffffffffu, psum, off);
+                    }
+                    if (lane == 0) {
+                        sm.m_state[qi] = m_new;
+                        sm.l_state[qi] = sm.l_state[qi] * alpha + psum;
+                        sm.rescale[qr] = alpha;
+                    }
+                    wp0[it] = p0;
+                    wp1[it] = p1;
+                }
+            }
+
+            if (mt == 0) {
+                if (n_mtiles == 1 && tile + 1 < num_tiles) {
+                    asm volatile("cp.async.wait_group 1;" ::: "memory");
+                } else {
+                    asm volatile("cp.async.wait_all;" ::: "memory");
+                }
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int it = 0; it < 2; ++it) {
+                const int qr = warp + it * Q4D_TC_WARPS;
+                if (qr < q_cnt) {
+                    const __nv_bfloat16 h0 = __float2bfloat16_rn(wp0[it]);
+                    const __nv_bfloat16 h1 = __float2bfloat16_rn(wp1[it]);
+                    sm.p_hi[qr][i0] = h0;
+                    sm.p_hi[qr][i1] = h1;
+                    sm.p_lo[qr][i0] = __float2bfloat16_rn(wp0[it] - __bfloat162float(h0));
+                    sm.p_lo[qr][i1] = __float2bfloat16_rn(wp1[it] - __bfloat162float(h1));
+                }
+            }
+            __syncthreads();
+
+            float (&O)[2][4] = (mt == 0) ? O0 : O1;
+            const float a_top = grp < q_cnt ? sm.rescale[grp] : 0.0f;
+            const float a_bot = (grp + 8) < q_cnt ? sm.rescale[grp + 8] : 0.0f;
+            if (a_top != 1.0f) {
+                O[0][0] *= a_top;
+                O[0][1] *= a_top;
+                O[1][0] *= a_top;
+                O[1][1] *= a_top;
+            }
+            if (a_bot != 1.0f) {
+                O[0][2] *= a_bot;
+                O[0][3] *= a_bot;
+                O[1][2] *= a_bot;
+                O[1][3] *= a_bot;
+            }
+
+#pragma unroll
+            for (int kk = 0; kk < Q4D_TC_KEYS; kk += 16) {
+                const int pr = lane & 15;
+                const int pc = kk + ((lane >> 4) & 1) * 8;
+                unsigned int a_hi[4], a_lo[4];
+                const unsigned int addr_hi = (unsigned int)__cvta_generic_to_shared(&sm.p_hi[pr][pc]);
+                const unsigned int addr_lo = (unsigned int)__cvta_generic_to_shared(&sm.p_lo[pr][pc]);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a_hi[0]), "=r"(a_hi[1]), "=r"(a_hi[2]), "=r"(a_hi[3])
+                             : "r"(addr_hi));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a_lo[0]), "=r"(a_lo[1]), "=r"(a_lo[2]), "=r"(a_lo[3])
+                             : "r"(addr_lo));
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const int vr = kk + (lane & 15);
+                    const int vcv = 2 * warp + nt;
+                    unsigned int b_v[2];
+                    const unsigned int addr_v = (unsigned int)__cvta_generic_to_shared(
+                        &sm.kv[1][vr][q4d_tc_swz(vr, vcv)]);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                                 : "=r"(b_v[0]), "=r"(b_v[1])
+                                 : "r"(addr_v));
+                    q4d_tc_mma(O[nt], a_hi[0], a_hi[1], a_hi[2], a_hi[3], b_v[0], b_v[1]);
+                    q4d_tc_mma(O[nt], a_lo[0], a_lo[1], a_lo[2], a_lo[3], b_v[0], b_v[1]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    auto store_tile = [&](int mt, const float (&O)[2][4]) {
+        const int q0 = mt * 16;
+        const int q_cnt = min(16, Q - q0);
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int c0 = warp * 16 + nt * 8 + 2 * t4;
+            if (grp < q_cnt) {
+                const int qi = q0 + grp;
+                const int row = qi / group;
+                const int head = key_head * group + (qi - row * group);
+                float* at = part +
+                            ((unsigned long long)(row * heads + head) * chunks + chunk) *
+                                Q4D_ATTN_PART;
+                at[c0] = O[nt][0];
+                at[c0 + 1] = O[nt][1];
+                if (warp == 0 && nt == 0 && t4 == 0) {
+                    at[Q4D_HEAD_DIM] = sm.m_state[qi];
+                    at[Q4D_HEAD_DIM + 1] = sm.l_state[qi];
+                }
+            }
+            if (grp + 8 < q_cnt) {
+                const int qi = q0 + grp + 8;
+                const int row = qi / group;
+                const int head = key_head * group + (qi - row * group);
+                float* at = part +
+                            ((unsigned long long)(row * heads + head) * chunks + chunk) *
+                                Q4D_ATTN_PART;
+                at[c0] = O[nt][2];
+                at[c0 + 1] = O[nt][3];
+                if (warp == 0 && nt == 0 && t4 == 0) {
+                    at[Q4D_HEAD_DIM] = sm.m_state[qi];
+                    at[Q4D_HEAD_DIM + 1] = sm.l_state[qi];
+                }
+            }
+        }
+    };
+    store_tile(0, O0);
+    if (n_mtiles > 1) {
+        store_tile(1, O1);
+    }
+}
+
 // Stage two: query (row, head)'s `chunks` parts merged, in chunk order, into its output. Grid
 // (heads, block_rows), one warp.
 extern "C" __global__ void q4d_attn_span_merge(const float* __restrict__ part,

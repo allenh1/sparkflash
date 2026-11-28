@@ -633,7 +633,7 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 /// baseline/kernel_baseline.txt records their cubins. Every one of the fifty-two is probed on every
 /// build: a kernel that is only ever compiled by hand on a GPU host is a kernel nobody has
 /// type-checked, and the CI cuda-tests job runs exactly this probe.
-const PROBED_KERNELS: [(&str, &str); 52] = [
+const PROBED_KERNELS: [(&str, &str); 53] = [
     ("mega_mhc_sm121.cu", "mega_mhc_sm121"),
     ("b12x_mxfp8_dense_sm121.cu", "b12x_mxfp8_dense_sm121"),
     ("b12x_mxfp8_dense_m1_sm121.cu", "b12x_mxfp8_dense_m1_sm121"),
@@ -703,6 +703,7 @@ const PROBED_KERNELS: [(&str, &str); 52] = [
     ("inkling_moe_sm121.cu", "inkling_moe_sm121"),
     ("inkling_vision_sm121.cu", "inkling_vision_sm121"),
     ("inkling_draft_sm121.cu", "inkling_draft_sm121"),
+    ("inkling_message_sm121.cu", "inkling_message_sm121"),
     // NVFP4 routed-expert wrappers over the shared prefill tile. The source has no stem-cubin
     // instance: its cubins are the released expert geometries and the synthetic per-world
     // shapes (`nvfp4_prefill_sm121_qwen`, `_inkling`, `_i512`, `_i256`, `_i128`), and the
@@ -1457,7 +1458,11 @@ fn cuda_toolkit_nvcc() -> Option<PathBuf> {
             roots.push((version.0, version.1, entry.path()));
         }
     }
-    roots.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| a.2.cmp(&b.2)));
+    roots.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
     roots
         .into_iter()
         .map(|(_, _, root)| root.join("bin").join("nvcc"))

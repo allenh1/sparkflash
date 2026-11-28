@@ -151,6 +151,94 @@ extern "C" __global__ void moe_plan(
         return;
     }
 
+    // Fast parallel small-batch path (decode / speculative verify: rows <= 64, buckets <= 128,
+    // no segments/run_bounds/zero_rows, one item per expert). Replaces the serial tid==0 128-iter
+    // prefix loop with a 4-warp Blelloch/shuffle scan; bit-exact identical plan.
+    if (rows <= 64 && buckets <= 128 && span >= 128 && yield == 0 && run_bounds == nullptr &&
+        zero_rows == nullptr && item_rows == 0 && items != nullptr) {
+        if (tid < buckets) s_count[tid] = 0;
+        __syncthreads();
+        if (tid < rows) {
+            const int bucket = bucket_of(tid);
+            if (bucket >= 0) atomicAdd(&s_count[bucket], 1);
+        }
+        __syncthreads();
+        __shared__ int w_tot_c[4];
+        __shared__ int w_tot_a[4];
+        if (tid < 128) {
+            const int warp = tid >> 5;
+            const int lane = tid & 31;
+            const int c = tid < buckets ? s_count[tid] : 0;
+            const int act = c > 0 ? 1 : 0;
+            int sc = c;
+            int sa = act;
+#pragma unroll
+            for (int off = 1; off < 32; off <<= 1) {
+                const int pc = __shfl_up_sync(0xFFFFFFFFu, sc, off);
+                const int pa = __shfl_up_sync(0xFFFFFFFFu, sa, off);
+                if (lane >= off) {
+                    sc += pc;
+                    sa += pa;
+                }
+            }
+            if (lane == 31) {
+                w_tot_c[warp] = sc;
+                w_tot_a[warp] = sa;
+            }
+            __syncthreads();
+            int off_c = 0;
+            int off_a = 0;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                if (w < warp) {
+                    off_c += w_tot_c[w];
+                    off_a += w_tot_a[w];
+                }
+            }
+            const int base = off_c + sc - c;
+            const int item_idx = off_a + sa - act;
+            if (tid < buckets) {
+                s_base[tid] = base;
+                if (c > 0 && item_idx < max_items) {
+                    items[4 * item_idx] = tid - shift;
+                    items[4 * item_idx + 1] = base;
+                    items[4 * item_idx + 2] = c;
+                    items[4 * item_idx + 3] = item_idx;
+                }
+            }
+            if (tid == 127) {
+                const int total_items = off_a + sa;
+                s_used = total_items < max_items ? total_items : max_items;
+                if (item_count != nullptr) *item_count = s_used;
+            }
+        } else {
+            __syncthreads();
+        }
+        __syncthreads();
+        for (int item = s_used + tid; item < max_items; item += span) {
+            items[4 * item] = 0;
+            items[4 * item + 1] = 0;
+            items[4 * item + 2] = 0;
+            items[4 * item + 3] = item;
+        }
+        if (tid < 32) {
+            const unsigned int below = (1u << tid) - 1u;
+            for (int first = 0; first < rows; first += 32) {
+                const int rank = first + tid;
+                const int bucket = rank < rows ? bucket_of(rank) : -1;
+                const unsigned int same = __match_any_sync(0xFFFFFFFFu, bucket);
+                const int at = bucket >= 0 ? s_base[bucket] + __popc(same & below) : 0;
+                __syncwarp();
+                if (bucket >= 0) {
+                    if ((same & below) == 0u) s_base[bucket] = at + __popc(same);
+                    sorted[at] = rank;
+                }
+                __syncwarp();
+            }
+        }
+        return;
+    }
+
     for (int bucket = tid; bucket < buckets; bucket += span) s_count[bucket] = 0;
     // A run bound is written at sorted positions, so clear the table first: a position no run
     // covers (a rank the caller drops) then reads as an empty run rather than stale memory.
@@ -232,12 +320,62 @@ extern "C" __global__ void moe_plan(
         }
     }
 
-    // The stable half: warp 0 walks the ranks 32 at a time in ascending order. The lanes of a
-    // bucket rank among themselves by lane (__match_any_sync), take their positions from the
-    // bucket's cursor, and the lowest of them moves the cursor past them, so every bucket's
-    // positions hold its ranks in ascending order. s_base is that cursor from here on: nothing
-    // after this reads it. One thread a bucket walking every rank, as this did, ran a 4,096-token
-    // GLM chunk's 32,768 slots in ~2.5 ms, a launch a layer on a prefill chunk's critical path.
+    // The stable half: for large chunks with <= 129 buckets and >= 256 threads (8 or 16 warps),
+    // partition the rank range into contiguous slices (one per warp), count per-warp histograms
+    // in SMEM, prefix-sum across warps, and scatter all warps in parallel — producing the exact
+    // same deterministic order as the single-warp fallback below.
+    if (buckets <= 129 && span >= 256 && rows >= 1024 && yield == 0) {
+        __shared__ int s_wbase[16][129];
+        const int nwarps = span >= 512 ? 16 : 8;
+        const int warp = tid >> 5;
+        const int lane = tid & 31;
+        const unsigned int below = (1u << lane) - 1u;
+        const int per_warp = ((rows + nwarps - 1) / nwarps + 31) & ~31;
+        const int w_start = warp * per_warp;
+        const int w_end = w_start + per_warp < rows ? w_start + per_warp : rows;
+        if (warp < nwarps) {
+            for (int b = lane; b < buckets; b += 32) {
+                s_wbase[warp][b] = 0;
+            }
+            __syncwarp();
+            for (int first = w_start; first < w_end; first += 32) {
+                const int rank = first + lane;
+                const int bucket = rank < w_end ? bucket_of(rank) : -1;
+                const unsigned int same = __match_any_sync(0xFFFFFFFFu, bucket);
+                if (bucket >= 0 && (same & below) == 0u) {
+                    s_wbase[warp][bucket] += __popc(same);
+                }
+                __syncwarp();
+            }
+        }
+        __syncthreads();
+        if (tid < buckets) {
+            int cur = s_base[tid];
+            for (int w = 0; w < nwarps; ++w) {
+                const int c = s_wbase[w][tid];
+                s_wbase[w][tid] = cur;
+                cur += c;
+            }
+        }
+        __syncthreads();
+        if (warp < nwarps) {
+            for (int first = w_start; first < w_end; first += 32) {
+                const int rank = first + lane;
+                const int bucket = rank < w_end ? bucket_of(rank) : -1;
+                const unsigned int same = __match_any_sync(0xFFFFFFFFu, bucket);
+                const int at = bucket >= 0 ? s_wbase[warp][bucket] + __popc(same & below) : 0;
+                __syncwarp();
+                if (bucket >= 0) {
+                    if ((same & below) == 0u) s_wbase[warp][bucket] = at + __popc(same);
+                    sorted[at] = rank;
+                }
+                __syncwarp();
+            }
+        }
+        return;
+    }
+
+    // Fallback: warp 0 walks the ranks 32 at a time in ascending order.
     if (tid < 32) {
         const unsigned int below = (1u << tid) - 1u;
         for (int first = 0; first < rows; first += 32) {

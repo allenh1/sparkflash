@@ -54,6 +54,9 @@ pub struct LayerStep {
     pub indexer: Option<Part>,
     /// The feed-forward part.
     pub ffn: Part,
+    /// The loop's message parts, when the layer is inside a shared core: the pooled cross-pass
+    /// attention and the gate that mixes its result into the layer input.
+    pub message: Vec<Part>,
     /// The residual mixer, when the layer has more than a plain additive path.
     pub residual: Option<Part>,
     /// Lookups that land on the layer's input, in declaration order.
@@ -123,7 +126,24 @@ impl LayerStep {
             ffn,
             residual,
             sides,
+            message: Vec::new(),
         }
+    }
+
+    /// Build a step that also carries the model-wide loop schedule.
+    ///
+    /// A core layer of a looped release runs the message retrieval and its gate before the
+    /// attention. The schedule is one fact of the architecture, so the step reads it here rather
+    /// than from a second per-layer field.
+    #[must_use]
+    pub fn from_architecture(architecture: &Architecture, layer: &Layer) -> Self {
+        let mut step = Self::from_layer(layer);
+        if let Some(plan) = architecture.loop_plan()
+            && (plan.core_start..plan.core_end).contains(&layer.index)
+        {
+            step.message = vec![Part::CrossPassAttention, Part::LoopMessageGate];
+        }
+        step
     }
 }
 
@@ -142,6 +162,8 @@ pub enum StepRole {
     Residual,
     /// A lookup on the layer input, such as Engram or the n-gram PLE.
     Side,
+    /// A loop's message path, between the layer input and its residual mix.
+    Message,
 }
 
 impl StepRole {
@@ -169,6 +191,7 @@ impl StepRole {
                 + usize::from(step.indexer.is_some()),
         );
         roles.extend(step.sides.iter().map(|part| (Self::Side, *part)));
+        roles.extend(step.message.iter().map(|part| (Self::Message, *part)));
         if let Some(part) = step.residual {
             roles.push((Self::Residual, part));
         }
@@ -188,7 +211,10 @@ impl Architecture {
     /// The decoder layers as ordered steps, in ascending index order.
     #[must_use]
     pub fn steps(&self) -> Vec<LayerStep> {
-        self.layers.iter().map(LayerStep::from_layer).collect()
+        self.layers
+            .iter()
+            .map(|layer| LayerStep::from_architecture(self, layer))
+            .collect()
     }
 
     /// Visit every layer once, in ascending index order.

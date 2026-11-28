@@ -163,6 +163,47 @@ impl DepthPolicy {
         self.cost
     }
 
+    /// Updates the modelled step cost (for example as KV-cache reads grow with sequence position).
+    /// Calibration counts and observed token rate are preserved.
+    pub fn set_cost(&mut self, cost: StepCost) {
+        self.cost = cost;
+    }
+
+    /// Whether drafting another token past `probs` can still improve [Self::depth].
+    ///
+    /// Because every calibrated bin probability is at most 1, the chain probability is
+    /// monotonically non-increasing; once it falls to or below `rate * row_ms` (and both
+    /// `min_depth` and initial exploration are satisfied), no deeper draft can strictly increase
+    /// the objective, so a sequential head (such as DSpark's Markov loop) can stop early with
+    /// bit-identical depth decisions.
+    #[must_use]
+    pub fn should_continue(&self, probs: &[f32]) -> bool {
+        if !self.adaptive {
+            return probs.len() < self.k;
+        }
+        if probs.len() >= self.k {
+            return false;
+        }
+        if probs.len() < self.min_depth {
+            return true;
+        }
+        if probs.is_empty() && self.seen.iter().sum::<f64>() < EXPLORATION_STEPS {
+            return true;
+        }
+        let rate = if self.ms > 0.0 {
+            self.tokens / self.ms
+        } else {
+            self.cost.prior_tokens_per_ms
+        };
+        let mut chain = 1.0f64;
+        for &p in probs {
+            let b = Self::bin(p);
+            chain *= (self.accepted[b] + CALIBRATION_PRIOR * f64::from(p))
+                / (self.seen[b] + CALIBRATION_PRIOR);
+        }
+        chain > rate * self.cost.row_ms
+    }
+
     fn bin(p: f32) -> usize {
         CALIBRATION_EDGES
             .iter()
@@ -327,5 +368,36 @@ mod tests {
         assert_eq!(policy.depth(&[0.01; 5]), 3);
         let policy = DepthPolicy::adaptive(5, COST).with_min_depth(9);
         assert_eq!(policy.depth(&[0.01; 5]), 5);
+    }
+
+    #[test]
+    fn should_continue_early_stop_matches_full_depth() {
+        let cases: &[&[f32]] = &[
+            &[0.01, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99],
+            &[0.95, 0.90, 0.20, 0.99, 0.99, 0.99, 0.99],
+            &[0.80, 0.70, 0.60, 0.50, 0.40, 0.30, 0.20],
+            &[0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99],
+            &[0.40, 0.40, 0.40, 0.40, 0.40, 0.40, 0.40],
+        ];
+        for min_d in [0, 2] {
+            let mut policy = DepthPolicy::adaptive(7, COST).with_min_depth(min_d);
+            for round in 0..12 {
+                for &full in cases {
+                    let mut prefix = Vec::new();
+                    for &p in full {
+                        prefix.push(p);
+                        if !policy.should_continue(&prefix) {
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        policy.depth(&prefix),
+                        policy.depth(full),
+                        "early stop diverged at round={round} min_d={min_d} prefix={prefix:?}"
+                    );
+                }
+                policy.observe(cases[round % cases.len()], 3, round % 3);
+            }
+        }
     }
 }

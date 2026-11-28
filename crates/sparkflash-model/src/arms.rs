@@ -30,9 +30,9 @@
 use crate::descriptor::{
     DEFAULT_WEIGHTS_ID, DORY1_0_4B_BF16_WEIGHTS_ID, DORY1_0_4B_CONTEXT_TOKENS,
     GLM53_CONTEXT_TOKENS, GLM53_FLASH_WEIGHTS_ID, INKLING2_CONTEXT_TOKENS,
-    INKLING2_SMALL_WEIGHTS_ID, QWEN36_CONTEXT_TOKENS, QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
-    QWEN38_CONTEXT_TOKENS, QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID, QWEN38_FLASH_NEXT_WEIGHTS_ID,
-    V41_CONTEXT_TOKENS,
+    INKLING2_MINI_WEIGHTS_ID, INKLING2_SMALL_WEIGHTS_ID, QWEN36_CONTEXT_TOKENS,
+    QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID, QWEN38_CONTEXT_TOKENS, QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
+    QWEN38_FLASH_NEXT_WEIGHTS_ID, V41_CONTEXT_TOKENS,
 };
 use crate::ledger::{ArmLedger, ledger_for_arm};
 
@@ -695,10 +695,12 @@ impl Arm for Inkling {
         crate::descriptor::INKLING2_SMALL_ID
     }
     fn weights(&self) -> &'static [&'static str] {
-        &[INKLING2_SMALL_WEIGHTS_ID]
+        &[INKLING2_SMALL_WEIGHTS_ID, INKLING2_MINI_WEIGHTS_ID]
     }
     fn families(&self) -> &'static [&'static str] {
-        &["inkling2"]
+        // The looped release shares this arm's stack and converter; its schedule is read from
+        // the checkpoint's `loop_config`, not from the family string.
+        &["inkling2", "inkling2_loop"]
     }
     fn profile_toml(&self) -> Option<&'static str> {
         Some(include_str!(

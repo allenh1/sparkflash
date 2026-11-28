@@ -43,8 +43,8 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use crate::engine::{
-    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, InferenceEngine,
-    MissingCapability,
+    next_tool_call_id, Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest,
+    FinishReason, InferenceEngine, MissingCapability,
 };
 use crate::telemetry_types::{DeepSeekSparkRequestStats, OpenAiUsageWithCache};
 
@@ -278,19 +278,15 @@ impl InklingStreamParser {
     }
 
     /// Flushes the held-back tail at end of stream.
+    ///
+    /// An invocation body that arrived whole is a call even when the closing `<|end_message|>`
+    /// never reached this layer: the stream can end on the sampling stop right after the JSON.
+    /// A body that does not parse stays visible, exactly as it does before a closing marker.
     pub fn finish(&mut self) -> Vec<InklingEvent> {
         let mut events = Vec::new();
         let pending = std::mem::take(&mut self.buffer);
         self.text(&pending, &mut events);
-        if self.section == Section::Invoke {
-            // An invocation the stream cut off (a length stop) is not a call.
-            let body = std::mem::take(&mut self.invoke);
-            push(
-                &mut events,
-                InklingEvent::Content(format!("{}{CONTENT_INVOKE_JSON}{body}", self.header)),
-            );
-            self.section = Section::Outside;
-        }
+        self.close_invoke(&mut events);
         events
     }
 }
@@ -414,7 +410,7 @@ fn inkling_engine_event(event: InklingEvent) -> EngineEvent {
             arguments,
         } => EngineEvent::ToolCallDelta {
             index,
-            id: Some(format!("call_{index}")),
+            id: Some(next_tool_call_id()),
             name: Some(name),
             arguments_delta: arguments,
         },
@@ -490,6 +486,23 @@ mod tests {
                 0,
                 "lookup".to_owned(),
                 r#"{"city":"Paris","n":2}"#.to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_invocation_complete_at_stream_end_is_still_a_call() {
+        let (_, content, calls) = parse_all(&[
+            "Noting the call first. run_code<|content_invoke_tool_json|>",
+            r#"{"name":"run_code","args":{"code":"inspect(1)"}}"#,
+        ]);
+        assert_eq!(content, "Noting the call first. run_code");
+        assert_eq!(
+            calls,
+            [(
+                0,
+                "run_code".to_owned(),
+                r#"{"code":"inspect(1)"}"#.to_owned()
             )]
         );
     }
@@ -574,5 +587,40 @@ mod tests {
             })
             .collect();
         assert_eq!(raw, pieces.concat());
+    }
+
+    #[test]
+    fn every_response_gets_a_fresh_tool_call_id() {
+        use crate::engine::MockEngine;
+
+        let pieces = [
+            "<|message_model|>read<|content_invoke_tool_json|>",
+            r#"{"name":"read","args":{"path":"src/lib.rs"}}<|end_message|>"#,
+        ];
+        let id = || {
+            let engine = MockEngine::new("inkling")
+                .content(&pieces)
+                .with_finish_reason(FinishReason::Stop);
+            let engine = InklingResponseEngine::new(Arc::new(engine));
+            let request = crate::engine::test_request("inkling", true);
+            let events = futures::executor::block_on(engine.generate(request).collect::<Vec<_>>());
+            events
+                .into_iter()
+                .find_map(|event| match event {
+                    EngineEvent::ToolCallDelta { id, .. } => id,
+                    _ => None,
+                })
+                .expect("the adapter names its tool call")
+        };
+        let first = id();
+        let second = id();
+        assert!(
+            first.starts_with("call_"),
+            "ids keep the OpenAI prefix: {first}"
+        );
+        assert_ne!(
+            first, second,
+            "a later response must not reuse an earlier call id"
+        );
     }
 }

@@ -53,6 +53,38 @@ pub const DRAFT_FILE: &str = "mtp.safetensors";
 /// token. Anything else is refused.
 pub(crate) const DRAFT_WINDOW_ENV: &str = "SPARKFLASH_INKLING_DRAFT_WINDOW";
 
+/// Drafter weight quantization: unset or `nvfp4` (the default) quantizes the drafter's BF16
+/// projections, LM head slice, and Markov fold to per-row NVFP4 at load time; `bf16` or `off`
+/// keeps them in BF16. Because the drafter only proposes tokens and the target verifies every
+/// token with exact weights, this moves draft speed and acceptance, never emitted tokens.
+const DRAFT_QUANT_ENV: &str = "SPARKFLASH_INKLING_DRAFT_QUANT";
+
+fn draft_quant_nvfp4(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("" | "nvfp4" | "on" | "1") => Ok(true),
+        Some("bf16" | "off" | "0") => Ok(false),
+        Some(text) => Err(format!(
+            "{DRAFT_QUANT_ENV}={text} is not a drafter quantization mode: use nvfp4 (default) or bf16"
+        )),
+    }
+}
+
+/// Pre-swizzled MMA-tiled per-row NVFP4 matrix for `inkling_draft_nvfp4_gemv(3)`.
+#[derive(Clone, Copy)]
+struct Nvfp4Tiled {
+    codes: Deviceptr,
+    scales: Deviceptr,
+    row_scale: Deviceptr,
+}
+
+/// Row-major per-row NVFP4 matrix for `inkling_draft_nvfp4_markov_logits`.
+#[derive(Clone, Copy)]
+struct Nvfp4Row {
+    codes: Deviceptr,
+    scales: Deviceptr,
+    row_scale: Deviceptr,
+}
+
 /// The full layers' window [DRAFT_WINDOW_ENV] names; `None` reads the whole context.
 fn full_window(value: Option<&str>) -> Result<Option<usize>, String> {
     match value {
@@ -67,12 +99,10 @@ fn full_window(value: Option<&str>) -> Result<Option<usize>, String> {
     }
 }
 
-/// The taps a committed row carries: seven pre-layer partials, then the post-final-norm hidden.
-pub(super) const TAPS: usize = 8;
-/// The tap slot of the post-final-norm hidden.
-pub(super) const FINAL_TAP: usize = TAPS - 1;
-/// The fusion rows: one a draft layer, then the Markov head's.
-const FUSION_ROWS: usize = 6;
+// The taps and fusion rows are the checkpoint's: `mtp_config.target_layer_ids` names one tap a
+// pre-layer partial plus the post-final-norm hidden, and `fuse_weight` carries one fusion row a
+// draft layer plus the Markov head's. Inkling-2-Small has eight taps and six rows; Inkling-2-Mini
+// has four and four, and the kernels take the count at run time.
 /// The context rows one injection pass mixes and projects at once.
 const INJECT_ROWS: usize = 1024;
 /// The drafter's head width, which the attention and the rotary assume.
@@ -110,9 +140,15 @@ struct DraftKernels {
     markov_logits: Bound,
     markov_local: Bound,
     markov_last: Bound,
+    quantize_nvfp4_tiled: Bound,
+    quantize_nvfp4_row: Bound,
+    nvfp4_gemv: Bound,
+    nvfp4_gemv3: Bound,
+    nvfp4_markov_logits: Bound,
     /// DFlash 2's block attention over one span of the rings: every query's walks, and their
     /// merge.
     attention_part: Bound,
+    attention_part_tc: Bound,
     attention_merge: Bound,
 }
 
@@ -192,7 +228,7 @@ impl DraftKernels {
             context: load(
                 Image::Inkling,
                 inkling,
-                "inkling_draft_context",
+                "inkling_draft_context_bf16",
                 Precision::F32,
             )?,
             markov_input: load(
@@ -225,11 +261,49 @@ impl DraftKernels {
                 "inkling_draft_markov_last",
                 Precision::F32,
             )?,
+            quantize_nvfp4_tiled: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_quantize_nvfp4_tiled",
+                Precision::NvFp4,
+            )?,
+            quantize_nvfp4_row: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_quantize_nvfp4_row",
+                Precision::NvFp4,
+            )?,
+            nvfp4_gemv: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_nvfp4_gemv",
+                Precision::NvFp4,
+            )?,
+            nvfp4_gemv3: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_nvfp4_gemv3",
+                Precision::NvFp4,
+            )?,
+            nvfp4_markov_logits: load(
+                Image::Inkling,
+                inkling,
+                "inkling_draft_nvfp4_markov_logits",
+                Precision::NvFp4,
+            )?,
             attention_part: load(
                 Image::Dflash2,
                 dflash,
-                "q4d_attn_span_chunk",
+                "q4d_attn_span_chunk_bf16",
                 Precision::Bf16,
+            )?,
+            attention_part_tc: Bound::shared(
+                cuda,
+                Image::Dflash2,
+                dflash,
+                "q4d_attn_span_chunk_bf16_tc",
+                Precision::Bf16,
+                49_408,
             )?,
             attention_merge: load(
                 Image::Dflash2,
@@ -259,6 +333,13 @@ struct DraftLayer {
     gate: Deviceptr,
     up: Deviceptr,
     down: Deviceptr,
+    query_q: Option<Nvfp4Tiled>,
+    key_q: Option<Nvfp4Tiled>,
+    value_q: Option<Nvfp4Tiled>,
+    out_q: Option<Nvfp4Tiled>,
+    gate_q: Option<Nvfp4Tiled>,
+    up_q: Option<Nvfp4Tiled>,
+    down_q: Option<Nvfp4Tiled>,
     /// A local layer's window, or a full layer's under [DRAFT_WINDOW_ENV]; `None` for a full
     /// layer that reads the whole context.
     window: Option<usize>,
@@ -269,25 +350,32 @@ struct DraftLayer {
 pub(super) struct DraftModel {
     kernels: DraftKernels,
     layers: Vec<DraftLayer>,
-    /// `bf16(softmax(fuse_weight))`, [FUSION_ROWS][TAPS].
+    /// `bf16(softmax(fuse_weight))`, [fusion_rows][taps].
     alpha: Deviceptr,
     mask: Deviceptr,
     norm: Deviceptr,
     /// The Markov head's token table `markov_w1`, [vocabulary][rank], whole on every rank.
     markov_embed: Deviceptr,
     rnn_weight: Deviceptr,
+    rnn_q: Option<Nvfp4Tiled>,
     rnn_bias: Deviceptr,
     /// The fold against this rank's head slice: `bf16(W_lm W_ho)` [rank_vocab][rank] and
     /// `bf16(W_lm b_ho)` [rank_vocab].
     fold_weight: Deviceptr,
+    fold_q: Option<Nvfp4Row>,
     fold_bias: Deviceptr,
     markov_norm: Deviceptr,
-    /// The target layers whose pre-layer partials are taps 0..FINAL_TAP.
-    tap_layers: [usize; FINAL_TAP],
+    /// The target layers whose pre-layer partials are taps 0..taps-1.
+    tap_layers: Vec<usize>,
+    /// The taps a committed row carries, the post-final hidden included.
+    taps: usize,
+    /// The fusion rows: one a draft layer, then the Markov head's.
+    fusion_rows: usize,
     /// The target's embedding table, embedding norm and head (this rank's slices).
     embed_table: Deviceptr,
     embed_norm: Deviceptr,
     head: Deviceptr,
+    head_q: Option<Nvfp4Tiled>,
     block: usize,
     hidden: usize,
     heads: usize,
@@ -305,13 +393,15 @@ pub(super) struct DraftModel {
     bytes: usize,
 }
 
-/// A walk's sink for the drafter's taps: the tap buffer, `[rows][TAPS][hidden]` BF16, and the
+/// A walk's sink for the drafter's taps: the tap buffer, `[rows][taps][hidden]` BF16, and the
 /// target layers whose pre-layer partials it keeps.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct TapSink {
     capture: Bound,
     taps: Deviceptr,
-    layers: [usize; FINAL_TAP],
+    layers: Vec<usize>,
+    /// The taps a row carries, the post-final hidden included.
+    per_row: usize,
     /// The rows the buffer holds.
     rows: usize,
 }
@@ -323,6 +413,11 @@ unsafe impl Send for TapSink {}
 unsafe impl Sync for TapSink {}
 
 impl TapSink {
+    /// The tap slot of the post-final-norm hidden.
+    pub(super) fn final_slot(&self) -> usize {
+        self.per_row - 1
+    }
+
     /// The slot of the tap taken before target layer `layer`, if any.
     pub(super) fn slot(&self, layer: usize) -> Option<usize> {
         self.layers.iter().position(|tap| *tap == layer)
@@ -353,7 +448,7 @@ impl TapSink {
                     self.taps.0,
                     hidden as u64,
                     hidden as u64,
-                    TAPS as u64,
+                    self.per_row as u64,
                     slot as u64,
                 ],
             )
@@ -380,9 +475,9 @@ impl DraftModel {
             .collect()
     }
 
-    /// The bytes one position adds to a layer's key ring (and as many to its value ring).
+    /// The bytes one position adds to a layer's key ring (and as many to its value ring): BF16.
     pub(super) fn ring_row_bytes(&self) -> usize {
-        self.kv_heads * HEAD_DIM * std::mem::size_of::<f32>()
+        self.kv_heads * HEAD_DIM * 2
     }
 
     /// The bytes the Markov feature holds: what a prompt-boundary checkpoint copies of the
@@ -460,16 +555,21 @@ impl DraftModel {
         if markov == 0 {
             return Err("the drafter has no Markov head (markov_rank 0)".to_owned());
         }
-        let layers_total = config.num_hidden_layers;
+        // The taps count the `applications` a token runs, not the stored layers: a looped
+        // release's last tap is the hidden after its last application, so the count is the
+        // schedule's length and the pre-layer taps are application indices.
+        let applications = config.applications().len();
         let ids = &mtp.target_layer_ids;
-        if ids.len() != TAPS || ids.last() != Some(&layers_total) {
+        let taps = ids.len();
+        let fusion_rows = mtp.num_hidden_layers + 1;
+        if taps < 2 || ids.last() != Some(&applications) {
             return Err(format!(
-                "the drafter taps {ids:?}: this arm takes {FINAL_TAP} pre-layer partials and \
-                 the post-final-norm hidden ({layers_total})"
+                "the drafter taps {ids:?}: the list names the pre-layer taps and then the \
+                 post-final hidden ({applications})"
             ));
         }
-        let mut tap_layers = [0usize; FINAL_TAP];
-        for (slot, layer) in ids[..FINAL_TAP].iter().enumerate() {
+        let mut tap_layers = Vec::with_capacity(taps - 1);
+        for layer in &ids[..taps - 1] {
             if !shared
                 .plan
                 .layers()
@@ -478,7 +578,7 @@ impl DraftModel {
             {
                 return Err(format!("tap layer {layer} is not a layer of this schedule"));
             }
-            tap_layers[slot] = *layer;
+            tap_layers.push(*layer);
         }
         if mtp
             .local_layer_ids
@@ -494,6 +594,7 @@ impl DraftModel {
             return Err("the drafter's local layers have no window".to_owned());
         }
         let full_window = full_window(std::env::var(DRAFT_WINDOW_ENV).ok().as_deref())?;
+        let use_nvfp4 = draft_quant_nvfp4(std::env::var(DRAFT_QUANT_ENV).ok().as_deref())?;
         let prologue = shared.plan.prologue();
         let embed_table =
             step_weight(prologue, Op::Embed, None).ok_or("the schedule embeds no token")?;
@@ -518,11 +619,82 @@ impl DraftModel {
         let up = DraftUploader::new(cuda, &source);
         let mut dense = Vec::new();
         let mut allocations = Vec::new();
+        let mut temp_bf16 = Vec::new();
         let mut bytes = 0usize;
-        let mut keep = |pointer: Deviceptr, size: usize| -> Deviceptr {
-            allocations.push(pointer);
-            bytes += size;
-            pointer
+        let mut quant_bytes = 0usize;
+        let quantize_tiled = |bf16_ptr: Deviceptr,
+                              rows: usize,
+                              cols: usize,
+                              allocations: &mut Vec<Deviceptr>,
+                              bytes: &mut usize,
+                              quant_bytes: &mut usize|
+         -> Result<Nvfp4Tiled, String> {
+            let row_tiles = rows.div_ceil(16);
+            let k_tiles = cols / 64;
+            let codes_bytes = row_tiles * k_tiles * 32 * 16;
+            let scales_bytes = row_tiles * k_tiles * 16 * 4;
+            let rs_bytes = rows * 4;
+            let mut tmp = 0usize;
+            let codes = cuda.alloc(codes_bytes, &mut tmp)?;
+            let scales = cuda.alloc(scales_bytes, &mut tmp)?;
+            let row_scale = cuda.alloc(rs_bytes, &mut tmp)?;
+            allocations.extend([codes, scales, row_scale]);
+            *bytes += codes_bytes + scales_bytes + rs_bytes;
+            *quant_bytes += codes_bytes + scales_bytes + rs_bytes;
+            shared.launch(
+                kernels.quantize_nvfp4_tiled,
+                (row_tiles as u32, 1, 1),
+                (BLOCK, 1, 1),
+                &[
+                    bf16_ptr.0,
+                    codes.0,
+                    scales.0,
+                    row_scale.0,
+                    rows as u64,
+                    cols as u64,
+                ],
+            )?;
+            Ok(Nvfp4Tiled {
+                codes,
+                scales,
+                row_scale,
+            })
+        };
+        let quantize_row = |bf16_ptr: Deviceptr,
+                            rows: usize,
+                            cols: usize,
+                            allocations: &mut Vec<Deviceptr>,
+                            bytes: &mut usize,
+                            quant_bytes: &mut usize|
+         -> Result<Nvfp4Row, String> {
+            let codes_bytes = rows * (cols / 2);
+            let scales_bytes = rows * (cols / 16);
+            let rs_bytes = rows * 4;
+            let mut tmp = 0usize;
+            let codes = cuda.alloc(codes_bytes, &mut tmp)?;
+            let scales = cuda.alloc(scales_bytes, &mut tmp)?;
+            let row_scale = cuda.alloc(rs_bytes, &mut tmp)?;
+            allocations.extend([codes, scales, row_scale]);
+            *bytes += codes_bytes + scales_bytes + rs_bytes;
+            *quant_bytes += codes_bytes + scales_bytes + rs_bytes;
+            shared.launch(
+                kernels.quantize_nvfp4_row,
+                (rows as u32, 1, 1),
+                (BLOCK, 1, 1),
+                &[
+                    bf16_ptr.0,
+                    codes.0,
+                    scales.0,
+                    row_scale.0,
+                    rows as u64,
+                    cols as u64,
+                ],
+            )?;
+            Ok(Nvfp4Row {
+                codes,
+                scales,
+                row_scale,
+            })
         };
         let q_width = heads * HEAD_DIM;
         let kv_width = kv_heads * HEAD_DIM;
@@ -532,7 +704,10 @@ impl DraftModel {
         for layer in 0..mtp.num_hidden_layers {
             let name = |tail: &str| format!("layers.{layer}.{tail}");
             let mut vector = |tail: &str, elements: usize| -> Result<Deviceptr, String> {
-                Ok(keep(up.vector(&name(tail), elements)?, elements * 2))
+                let ptr = up.vector(&name(tail), elements)?;
+                allocations.push(ptr);
+                bytes += elements * 2;
+                Ok(ptr)
             };
             let input_norm = vector("input_layernorm.weight", hidden)?;
             let post_norm = vector("post_attention_layernorm.weight", hidden)?;
@@ -540,121 +715,218 @@ impl DraftModel {
             let query_norm = vector("self_attn.q_norm.weight", HEAD_DIM)?;
             let key_norm = vector("self_attn.k_norm.weight", HEAD_DIM)?;
             let context_key_norm = vector("self_attn.k_norm_ctx.weight", HEAD_DIM)?;
-            let mut part = |tail: &str, shape: (usize, usize), part: Part| {
-                up.mat_part(&name(tail), shape, part)
-                    .map(|matrix| keep(matrix.pointer, matrix.rows * matrix.columns * 2))
-            };
             let rows = |count: usize| Part::Rows(rank * count, count);
             let columns = |count: usize| Part::Columns(rank * count, count);
+            let mut load_part =
+                |tail: &str,
+                 shape: (usize, usize),
+                 part: Part,
+                 allow_quant: bool|
+                 -> Result<(Deviceptr, Option<Nvfp4Tiled>), String> {
+                    let matrix = up.mat_part(&name(tail), shape, part)?;
+                    if allow_quant && use_nvfp4 && matrix.columns.is_multiple_of(64) {
+                        let q = quantize_tiled(
+                            matrix.pointer,
+                            matrix.rows,
+                            matrix.columns,
+                            &mut allocations,
+                            &mut bytes,
+                            &mut quant_bytes,
+                        )?;
+                        temp_bf16.push(matrix.pointer);
+                        Ok((Deviceptr(0), Some(q)))
+                    } else {
+                        allocations.push(matrix.pointer);
+                        bytes += matrix.rows * matrix.columns * 2;
+                        dense.push((matrix.pointer, matrix.rows, matrix.columns));
+                        Ok((matrix.pointer, None))
+                    }
+                };
+            let (query, query_q) = load_part(
+                "self_attn.q_proj.weight",
+                (q_total, hidden),
+                rows(q_width),
+                true,
+            )?;
+            let (key, key_q) = load_part(
+                "self_attn.k_proj.weight",
+                (kv_total, hidden),
+                rows(kv_width),
+                true,
+            )?;
+            let (value, value_q) = load_part(
+                "self_attn.v_proj.weight",
+                (kv_total, hidden),
+                rows(kv_width),
+                true,
+            )?;
+            let (context_key, _) = load_part(
+                "self_attn.k_proj_ctx.weight",
+                (kv_total, hidden),
+                rows(kv_width),
+                false,
+            )?;
+            let (context_value, _) = load_part(
+                "self_attn.v_proj_ctx.weight",
+                (kv_total, hidden),
+                rows(kv_width),
+                false,
+            )?;
+            let (out, out_q) = load_part(
+                "self_attn.o_proj.weight",
+                (hidden, q_total),
+                columns(q_width),
+                true,
+            )?;
+            let (gate, gate_q) = load_part(
+                "mlp.gate_proj.weight",
+                (mtp.intermediate_size, hidden),
+                rows(intermediate),
+                true,
+            )?;
+            let (up_w, up_q) = load_part(
+                "mlp.up_proj.weight",
+                (mtp.intermediate_size, hidden),
+                rows(intermediate),
+                true,
+            )?;
+            let (down, down_q) = load_part(
+                "mlp.down_proj.weight",
+                (hidden, mtp.intermediate_size),
+                columns(intermediate),
+                true,
+            )?;
             layers.push(DraftLayer {
                 input_norm,
                 post_norm,
                 fusion_norm,
-                query: part("self_attn.q_proj.weight", (q_total, hidden), rows(q_width))?,
-                key: part(
-                    "self_attn.k_proj.weight",
-                    (kv_total, hidden),
-                    rows(kv_width),
-                )?,
-                value: part(
-                    "self_attn.v_proj.weight",
-                    (kv_total, hidden),
-                    rows(kv_width),
-                )?,
-                context_key: part(
-                    "self_attn.k_proj_ctx.weight",
-                    (kv_total, hidden),
-                    rows(kv_width),
-                )?,
-                context_value: part(
-                    "self_attn.v_proj_ctx.weight",
-                    (kv_total, hidden),
-                    rows(kv_width),
-                )?,
-                out: part(
-                    "self_attn.o_proj.weight",
-                    (hidden, q_total),
-                    columns(q_width),
-                )?,
+                query,
+                key,
+                value,
+                context_key,
+                context_value,
+                out,
                 query_norm,
                 key_norm,
                 context_key_norm,
-                gate: part(
-                    "mlp.gate_proj.weight",
-                    (mtp.intermediate_size, hidden),
-                    rows(intermediate),
-                )?,
-                up: part(
-                    "mlp.up_proj.weight",
-                    (mtp.intermediate_size, hidden),
-                    rows(intermediate),
-                )?,
-                down: part(
-                    "mlp.down_proj.weight",
-                    (hidden, mtp.intermediate_size),
-                    columns(intermediate),
-                )?,
+                gate,
+                up: up_w,
+                down,
+                query_q,
+                key_q,
+                value_q,
+                out_q,
+                gate_q,
+                up_q,
+                down_q,
                 window: if mtp.local_layer_ids.contains(&layer) {
                     Some(mtp.sliding_window_size)
                 } else {
                     full_window
                 },
             });
-            // The block's key and value stay BF16: at the block's 8 rows their 256-row packed walk
-            // measured slower (26.5 us against 19.5), where every other projection, the context
-            // pair at a round's few fed rows included, measured as fast or faster packed.
-            let layer = layers.last().expect("the layer was just pushed");
-            dense.extend([
-                (layer.query, q_width, hidden),
-                (layer.context_key, kv_width, hidden),
-                (layer.context_value, kv_width, hidden),
-                (layer.out, hidden, q_width),
-                (layer.gate, intermediate, hidden),
-                (layer.up, intermediate, hidden),
-                (layer.down, hidden, intermediate),
-            ]);
         }
         // The fusion rows' softmax over the taps, in fp32 and rounded to BF16 as the reference
         // keeps them.
-        let fuse = up.read("fuse_weight", FUSION_ROWS * TAPS * 2)?;
+        let fuse = up.read("fuse_weight", fusion_rows * taps * 2)?;
         let fuse: Vec<f32> = fuse
             .as_chunks::<2>()
             .0
             .iter()
             .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair)))
             .collect();
-        let mut alpha = Vec::with_capacity(FUSION_ROWS * TAPS * 2);
-        for row in fuse.chunks(TAPS) {
+        let mut alpha_buf = Vec::with_capacity(fusion_rows * taps * 2);
+        for row in fuse.chunks(taps) {
             let top = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = row.iter().map(|value| (value - top).exp()).collect();
             let total: f32 = exps.iter().sum();
             for value in exps {
-                alpha.extend_from_slice(&f32_to_bf16_bits(value / total).to_le_bytes());
+                alpha_buf.extend_from_slice(&f32_to_bf16_bits(value / total).to_le_bytes());
             }
         }
-        let alpha = keep(up.bytes(&alpha)?, alpha.len());
-        let mask = keep(up.vector("mask_embed", hidden)?, hidden * 2);
-        let norm = keep(up.vector("norm.weight", hidden)?, hidden * 2);
-        let markov_norm = keep(
-            up.vector("markov_head.dflare_norm.weight", hidden)?,
-            hidden * 2,
-        );
+        let alpha = up.bytes(&alpha_buf)?;
+        allocations.push(alpha);
+        bytes += alpha_buf.len();
+        let mask = up.vector("mask_embed", hidden)?;
+        allocations.push(mask);
+        bytes += hidden * 2;
+        let norm = up.vector("norm.weight", hidden)?;
+        allocations.push(norm);
+        bytes += hidden * 2;
+        let markov_norm = up.vector("markov_head.dflare_norm.weight", hidden)?;
+        allocations.push(markov_norm);
+        bytes += hidden * 2;
         let vocabulary = config.vocab_size;
-        let markov_embed = up.mat("markov_head.markov_w1.weight", vocabulary, markov)?;
-        let markov_embed = keep(markov_embed.pointer, vocabulary * markov * 2);
+        let markov_embed = up.mat("markov_head.markov_w1.weight", vocabulary, markov)?.pointer;
+        allocations.push(markov_embed);
+        bytes += vocabulary * markov * 2;
         let z_width = 2 * markov + 2 * hidden;
         let rnn = up.mat("markov_head.rnn_proj.weight", 3 * markov, z_width)?;
-        let rnn_weight = keep(rnn.pointer, 3 * markov * z_width * 2);
-        dense.push((rnn_weight, 3 * markov, z_width));
-        let rnn_bias = keep(
-            up.vector("markov_head.rnn_proj.bias", 3 * markov)?,
-            6 * markov,
-        );
-        let (fold_weight, fold_bias) = fold(shared, &up, head, hidden, markov)?;
+        let (rnn_weight, rnn_q) = if use_nvfp4 && z_width.is_multiple_of(64) {
+            let q = quantize_tiled(
+                rnn.pointer,
+                3 * markov,
+                z_width,
+                &mut allocations,
+                &mut bytes,
+                &mut quant_bytes,
+            )?;
+            temp_bf16.push(rnn.pointer);
+            (Deviceptr(0), Some(q))
+        } else {
+            allocations.push(rnn.pointer);
+            bytes += 3 * markov * z_width * 2;
+            dense.push((rnn.pointer, 3 * markov, z_width));
+            (rnn.pointer, None)
+        };
+        let rnn_bias = up.vector("markov_head.rnn_proj.bias", 3 * markov)?;
+        allocations.push(rnn_bias);
+        bytes += 6 * markov;
+        let (fold_weight_raw, fold_bias) = fold(shared, &up, head, hidden, markov)?;
         let rank_vocab = shared.plan.rank_vocab();
-        let fold_weight = keep(fold_weight, rank_vocab * markov * 2);
-        dense.push((fold_weight, rank_vocab, markov));
-        let fold_bias = keep(fold_bias, rank_vocab * 2);
+        let (fold_weight, fold_q) = if use_nvfp4 && markov.is_multiple_of(16) && markov <= 256 {
+            let q = quantize_row(
+                fold_weight_raw,
+                rank_vocab,
+                markov,
+                &mut allocations,
+                &mut bytes,
+                &mut quant_bytes,
+            )?;
+            temp_bf16.push(fold_weight_raw);
+            (Deviceptr(0), Some(q))
+        } else {
+            allocations.push(fold_weight_raw);
+            bytes += rank_vocab * markov * 2;
+            dense.push((fold_weight_raw, rank_vocab, markov));
+            (fold_weight_raw, None)
+        };
+        allocations.push(fold_bias);
+        bytes += rank_vocab * 2;
+        let head_q = if use_nvfp4 && hidden.is_multiple_of(64) {
+            match shared.bf16_rows(head, rank_vocab, hidden) {
+                Ok(head_bf16) => Some(quantize_tiled(
+                    head_bf16,
+                    rank_vocab,
+                    hidden,
+                    &mut allocations,
+                    &mut bytes,
+                    &mut quant_bytes,
+                )?),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if quant_bytes > 0 {
+            cuda.synchronize()?;
+            let temp_refs: Vec<&Deviceptr> = temp_bf16.iter().collect();
+            cuda.free_buffers(&temp_refs);
+            eprintln!(
+                "[inkling] rank {rank}: drafter NVFP4 quantized: {:.1} MB",
+                quant_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
         Ok(Self {
             kernels,
             layers,
@@ -663,14 +935,19 @@ impl DraftModel {
             norm,
             markov_embed,
             rnn_weight,
+            rnn_q,
             rnn_bias,
             fold_weight,
+            fold_q,
             fold_bias,
             markov_norm,
             tap_layers,
+            taps,
+            fusion_rows,
             embed_table: shared.weights.get(embed_table).pointer,
             embed_norm: shared.weights.get(embed_norm).pointer,
             head,
+            head_q,
             block: mtp.block_size,
             hidden,
             heads,
@@ -865,7 +1142,11 @@ impl DraftState {
         let rank_vocab = shared.plan.rank_vocab();
         let world = shared.exchange.world();
         let tap_rows = shared.prefill_chunk.max(rows);
-        let parts = rank_vocab.div_ceil(BLOCK as usize * LOGIT_PER_THREAD);
+        let parts = if model.fold_q.is_some() {
+            rank_vocab.div_ceil(BLOCK as usize)
+        } else {
+            rank_vocab.div_ceil(BLOCK as usize * LOGIT_PER_THREAD)
+        };
         let mut layout = Layout { bytes: 0 };
         let f = std::mem::size_of::<f32>();
         let rings: Vec<(Option<(Region, Region)>, usize)> = model
@@ -887,15 +1168,15 @@ impl DraftState {
                 (
                     (!in_lane).then(|| {
                         (
-                            layout.take(ring * kv_width * f),
-                            layout.take(ring * kv_width * f),
+                            layout.take(ring * kv_width * 2),
+                            layout.take(ring * kv_width * 2),
                         )
                     }),
                     ring,
                 )
             })
             .collect();
-        let taps = layout.take(tap_rows * TAPS * hidden * 2);
+        let taps = layout.take(tap_rows * model.taps * hidden * 2);
         let fused = layout.take(INJECT_ROWS * hidden * f);
         let context_keys = layout.take(INJECT_ROWS * kv_width * f);
         let context_values = layout.take(INJECT_ROWS * kv_width * f);
@@ -947,7 +1228,8 @@ impl DraftState {
             sink: TapSink {
                 capture: model.kernels.capture,
                 taps: at(taps),
-                layers: model.tap_layers,
+                layers: model.tap_layers.clone(),
+                per_row: model.taps,
                 rows: tap_rows,
             },
             fused: at(fused),
@@ -989,7 +1271,7 @@ impl DraftState {
 
     /// Where the walks leave this sequence's taps.
     pub(super) fn sink(&self) -> TapSink {
-        self.sink
+        self.sink.clone()
     }
 
     /// Forget the context: the next prompt injects from position zero. The rings keep their
@@ -1056,7 +1338,7 @@ impl DraftState {
         }
         let hidden = model.hidden;
         let kv_width = model.kv_heads * HEAD_DIM;
-        let tap_row = TAPS * hidden * 2;
+        let tap_row = model.taps * hidden * 2;
         let kernels = &model.kernels;
         let run = |result: Result<(), String>| result.map_err(device_error);
         for (index, layer) in model.layers.iter().enumerate() {
@@ -1071,11 +1353,11 @@ impl DraftState {
                     (BLOCK, 1, 1),
                     &[
                         self.sink.taps.offset(at * tap_row).0,
-                        model.alpha.offset(index * TAPS * 2).0,
+                        model.alpha.offset(index * model.taps * 2).0,
                         layer.fusion_norm.0,
                         self.fused.0,
                         hidden as u64,
-                        TAPS as u64,
+                        model.taps as u64,
                         bits(model.eps),
                     ],
                 ))?;
@@ -1084,26 +1366,38 @@ impl DraftState {
                 } else {
                     shared.prefill_walk
                 };
-                project(
-                    shared,
-                    walk,
-                    layer.context_key,
-                    self.fused,
-                    self.context_keys,
-                    kv_width,
-                    hidden,
-                    take,
-                )?;
-                project(
-                    shared,
-                    walk,
-                    layer.context_value,
-                    self.fused,
-                    self.context_values,
-                    kv_width,
-                    hidden,
-                    take,
-                )?;
+                if walk == PrefillWalk::Chunk && take <= BATCH_ROWS {
+                    run(shared.gemv_fused(
+                        &[
+                            (layer.context_key, self.context_keys, kv_width),
+                            (layer.context_value, self.context_values, kv_width),
+                        ],
+                        self.fused,
+                        hidden,
+                        take,
+                    ))?;
+                } else {
+                    project(
+                        shared,
+                        walk,
+                        layer.context_key,
+                        self.fused,
+                        self.context_keys,
+                        kv_width,
+                        hidden,
+                        take,
+                    )?;
+                    project(
+                        shared,
+                        walk,
+                        layer.context_value,
+                        self.fused,
+                        self.context_values,
+                        kv_width,
+                        hidden,
+                        take,
+                    )?;
+                }
                 run(shared.launch(
                     kernels.context,
                     (model.kv_heads as u32, take as u32, 1),
@@ -1130,11 +1424,14 @@ impl DraftState {
             (BLOCK, 1, 1),
             &[
                 self.sink.taps.offset((rows - 1) * tap_row).0,
-                model.alpha.offset((FUSION_ROWS - 1) * TAPS * 2).0,
+                model
+                    .alpha
+                    .offset((model.fusion_rows - 1) * model.taps * 2)
+                    .0,
                 model.markov_norm.0,
                 self.feature.0,
                 hidden as u64,
-                TAPS as u64,
+                model.taps as u64,
                 bits(model.eps),
             ],
         ))?;
@@ -1166,6 +1463,8 @@ impl DraftState {
         anchor: u32,
         depth: usize,
         noise: Option<(f32, u64)>,
+        early_stop: bool,
+        mut keep_going: impl FnMut(&[f32]) -> bool,
     ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
         if depth == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -1220,6 +1519,75 @@ impl DraftState {
         let elementwise = |entry: Bound, args: &[u64], count: usize| {
             shared.launch(entry, (flat(count), 1, 1), (ELEMENT_BLOCK, 1, 1), args)
         };
+        let nvfp4_gemv = |w: Nvfp4Tiled,
+                          input: Deviceptr,
+                          out: Deviceptr,
+                          rows_out: usize,
+                          cols: usize,
+                          batch: usize,
+                          rt_per_warp: u32| {
+            // Microbenchmarked with IKD_TC_K_CHUNK=512 on sm_121a: 64 threads (2 warps/block)
+            // wins across out (16.2 us), down (23.6 us), and rnn (16.6 us); 256 threads with
+            // rt_per_warp=2 wins on LM head (1140 us, preserving L1 cache).
+            let block_threads: u32 = if rt_per_warp >= 2 { BLOCK } else { 64 };
+            let warps = (block_threads / 32) as usize;
+            let rows_per_block = warps * 16 * if rt_per_warp >= 2 { 2 } else { 1 };
+            shared.launch(
+                kernels.nvfp4_gemv,
+                (rows_out.div_ceil(rows_per_block) as u32, 1, 1),
+                (block_threads, 1, 1),
+                &[
+                    w.codes.0,
+                    w.scales.0,
+                    w.row_scale.0,
+                    input.0,
+                    out.0,
+                    rows_out as u64,
+                    cols as u64,
+                    batch as u64,
+                    u64::from(rt_per_warp),
+                ],
+            )
+        };
+        let nvfp4_gemv3 = |m0: (Nvfp4Tiled, Deviceptr, usize),
+                           m1: (Nvfp4Tiled, Deviceptr, usize),
+                           m2: Option<(Nvfp4Tiled, Deviceptr, usize)>,
+                           input: Deviceptr,
+                           cols: usize,
+                           batch: usize| {
+            let nrt0 = m0.2.div_ceil(16);
+            let nrt1 = m1.2.div_ceil(16);
+            let (c2, s2, rs2, o2, r2) = match m2 {
+                Some((w, o, r)) => (w.codes.0, w.scales.0, w.row_scale.0, o.0, r),
+                None => (0, 0, 0, 0, 0),
+            };
+            let nrt2 = r2.div_ceil(16);
+            shared.launch(
+                kernels.nvfp4_gemv3,
+                ((nrt0 + nrt1 + nrt2).div_ceil(8) as u32, 1, 1),
+                (BLOCK, 1, 1),
+                &[
+                    m0.0.codes.0,
+                    m0.0.scales.0,
+                    m0.0.row_scale.0,
+                    m0.1.0,
+                    m0.2 as u64,
+                    m1.0.codes.0,
+                    m1.0.scales.0,
+                    m1.0.row_scale.0,
+                    m1.1.0,
+                    m1.2 as u64,
+                    c2,
+                    s2,
+                    rs2,
+                    o2,
+                    r2 as u64,
+                    input.0,
+                    cols as u64,
+                    batch as u64,
+                ],
+            )
+        };
 
         // Row 0: the anchor's normed embedding, which only the rank that owns the id holds.
         match (anchor as usize).checked_sub(first_id) {
@@ -1255,12 +1623,26 @@ impl DraftState {
                 rows,
                 hidden,
             ))?;
-            for (weight, out, width) in [
-                (layer.query, self.queries, q_width),
-                (layer.key, self.keys, kv_width),
-                (layer.value, self.values, kv_width),
-            ] {
-                run(shared.gemv_batch(weight, self.normed, out, width, hidden, rows, 1))?;
+            if let (Some(qq), Some(kq), Some(vq)) = (layer.query_q, layer.key_q, layer.value_q) {
+                run(nvfp4_gemv3(
+                    (qq, self.queries, q_width),
+                    (kq, self.keys, kv_width),
+                    Some((vq, self.values, kv_width)),
+                    self.normed,
+                    hidden,
+                    rows,
+                ))?;
+            } else {
+                run(shared.gemv_fused(
+                    &[
+                        (layer.query, self.queries, q_width),
+                        (layer.key, self.keys, kv_width),
+                        (layer.value, self.values, kv_width),
+                    ],
+                    self.normed,
+                    hidden,
+                    rows,
+                ))?;
             }
             run(norm(
                 self.queries,
@@ -1306,14 +1688,25 @@ impl DraftState {
                 .window
                 .map_or(0, |window| position.saturating_sub(window));
             let group_queries = (heads / kv_heads) * rows;
-            run(shared.launch(
-                kernels.attention_part,
-                (kv_heads as u32, ATTENTION_CHUNKS as u32, 1),
+            let span_total = position.saturating_sub(lowest) + rows;
+            let (attn_kernel, attn_block, chunks) = if group_queries <= 24 {
+                let chunks = if span_total >= 8192 {
+                    ATTENTION_CHUNKS
+                } else {
+                    span_total.div_ceil(128).clamp(1, 12)
+                };
+                (kernels.attention_part_tc, 256u32, chunks)
+            } else {
                 (
+                    kernels.attention_part,
                     (group_queries.div_ceil(ATTENTION_QUERIES) * 32) as u32,
-                    1,
-                    1,
-                ),
+                    ATTENTION_CHUNKS,
+                )
+            };
+            run(shared.launch(
+                attn_kernel,
+                (kv_heads as u32, chunks as u32, 1),
+                (attn_block, 1, 1),
                 &[
                     self.queries.0,
                     key_ring.0,
@@ -1340,7 +1733,7 @@ impl DraftState {
                     self.attention.0,
                     heads as u64,
                     HEAD_DIM as u64,
-                    ATTENTION_CHUNKS as u64,
+                    chunks as u64,
                 ],
             ))?;
             run(elementwise(
@@ -1348,15 +1741,19 @@ impl DraftState {
                 &[self.attention.0, (rows * q_width) as u64],
                 rows * q_width,
             ))?;
-            run(shared.gemv_batch(
-                layer.out,
-                self.attention,
-                self.delta,
-                hidden,
-                q_width,
-                rows,
-                1,
-            ))?;
+            if let Some(oq) = layer.out_q {
+                run(nvfp4_gemv(oq, self.attention, self.delta, hidden, q_width, rows, 1))?;
+            } else {
+                run(shared.gemv_batch(
+                    layer.out,
+                    self.attention,
+                    self.delta,
+                    hidden,
+                    q_width,
+                    rows,
+                    1,
+                ))?;
+            }
             exchange_sum(shared, self.delta, rows * hidden)?;
             run(elementwise(
                 kernels.add_round,
@@ -1365,14 +1762,36 @@ impl DraftState {
             ))?;
             run(norm(self.block, layer.post_norm, self.normed, rows, hidden))?;
             let inner = model.intermediate;
-            run(shared.gemv_batch(layer.gate, self.normed, self.gate, inner, hidden, rows, 1))?;
-            run(shared.gemv_batch(layer.up, self.normed, self.up, inner, hidden, rows, 1))?;
+            if let (Some(gq), Some(uq)) = (layer.gate_q, layer.up_q) {
+                run(nvfp4_gemv3(
+                    (gq, self.gate, inner),
+                    (uq, self.up, inner),
+                    None,
+                    self.normed,
+                    hidden,
+                    rows,
+                ))?;
+            } else {
+                run(shared.gemv_fused(
+                    &[
+                        (layer.gate, self.gate, inner),
+                        (layer.up, self.up, inner),
+                    ],
+                    self.normed,
+                    hidden,
+                    rows,
+                ))?;
+            }
             run(elementwise(
                 kernels.swiglu,
                 &[self.gate.0, self.up.0, self.gate.0, (rows * inner) as u64],
                 rows * inner,
             ))?;
-            run(shared.gemv_batch(layer.down, self.gate, self.delta, hidden, inner, rows, 1))?;
+            if let Some(dq) = layer.down_q {
+                run(nvfp4_gemv(dq, self.gate, self.delta, hidden, inner, rows, 1))?;
+            } else {
+                run(shared.gemv_batch(layer.down, self.gate, self.delta, hidden, inner, rows, 1))?;
+            }
             exchange_sum(shared, self.delta, rows * hidden)?;
             run(elementwise(
                 kernels.add_round,
@@ -1382,15 +1801,27 @@ impl DraftState {
         }
         run(norm(self.block, model.norm, self.normed, rows, hidden))?;
         // The base logits of rows 1..=depth: this rank's slice of the head.
-        run(shared.gemv_batch(
-            model.head,
-            self.normed.offset(hidden * f),
-            self.base,
-            rank_vocab,
-            hidden,
-            depth,
-            1,
-        ))?;
+        if let Some(hq) = model.head_q {
+            run(nvfp4_gemv(
+                hq,
+                self.normed.offset(hidden * f),
+                self.base,
+                rank_vocab,
+                hidden,
+                depth,
+                2,
+            ))?;
+        } else {
+            run(shared.gemv_batch(
+                model.head,
+                self.normed.offset(hidden * f),
+                self.base,
+                rank_vocab,
+                hidden,
+                depth,
+                1,
+            ))?;
+        }
 
         let markov = model.rank;
         let z_width = 2 * markov + 2 * hidden;
@@ -1400,6 +1831,15 @@ impl DraftState {
         let (inv_t, seed) = noise.filter(|(inv_t, _)| *inv_t > 0.0).unwrap_or((0.0, 0));
         let noisy = inv_t > 0.0;
         run(shared.cuda.memset_d8_async(self.state, 0, markov * f))?;
+        let early_stop = early_stop
+            && !matches!(
+                std::env::var("SPARKFLASH_INKLING_DRAFT_EARLY_STOP").ok().as_deref(),
+                Some("off" | "0")
+            );
+        let mut drafted = 0usize;
+        let mut stopped_early = false;
+        let mut probs_so_far = Vec::with_capacity(depth);
+        let mut conf_word = [0u8; 4];
         for step in 0..depth {
             run(shared.launch(
                 kernels.markov_input,
@@ -1422,13 +1862,25 @@ impl DraftState {
                     u64::from(noisy),
                 ],
             ))?;
-            run(shared.gemv(
-                model.rnn_weight,
-                self.z,
-                self.projected,
-                3 * markov,
-                z_width,
-            ))?;
+            if let Some(rq) = model.rnn_q {
+                run(nvfp4_gemv(
+                    rq,
+                    self.z,
+                    self.projected,
+                    3 * markov,
+                    z_width,
+                    1,
+                    1,
+                ))?;
+            } else {
+                run(shared.gemv(
+                    model.rnn_weight,
+                    self.z,
+                    self.projected,
+                    3 * markov,
+                    z_width,
+                ))?;
+            }
             run(shared.launch(
                 kernels.markov_gates,
                 (1, 1, 1),
@@ -1441,35 +1893,63 @@ impl DraftState {
                     markov as u64,
                 ],
             ))?;
-            run(shared.gemv(
-                model.fold_weight,
-                self.latent,
-                self.product,
-                rank_vocab,
-                markov,
-            ))?;
-            run(shared.launch(
-                kernels.markov_logits,
-                (self.parts as u32, 1, 1),
-                (BLOCK, 1, 1),
-                &[
-                    self.base.offset(step * rank_vocab * f).0,
-                    self.product.0,
-                    model.fold_bias.0,
-                    rank_vocab as u64,
-                    first_id as u64,
-                    valid as u64,
-                    bits(cap),
-                    self.part_values.0,
-                    self.part_ids.0,
-                    self.part_sums.0,
-                    bits(inv_t),
-                    seed,
-                    // The draft of step `step` lands after the anchor and the drafts before it.
-                    (position + 1 + step) as u64,
-                    self.part_scores.0,
-                ],
-            ))?;
+            if let Some(fq) = model.fold_q {
+                run(shared.launch(
+                    kernels.nvfp4_markov_logits,
+                    (self.parts as u32, 1, 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        fq.codes.0,
+                        fq.scales.0,
+                        fq.row_scale.0,
+                        self.latent.0,
+                        self.base.offset(step * rank_vocab * f).0,
+                        model.fold_bias.0,
+                        rank_vocab as u64,
+                        markov as u64,
+                        first_id as u64,
+                        valid as u64,
+                        bits(cap),
+                        self.part_values.0,
+                        self.part_ids.0,
+                        self.part_sums.0,
+                        bits(inv_t),
+                        seed,
+                        (position + 1 + step) as u64,
+                        self.part_scores.0,
+                    ],
+                ))?;
+            } else {
+                run(shared.gemv(
+                    model.fold_weight,
+                    self.latent,
+                    self.product,
+                    rank_vocab,
+                    markov,
+                ))?;
+                run(shared.launch(
+                    kernels.markov_logits,
+                    (self.parts as u32, 1, 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        self.base.offset(step * rank_vocab * f).0,
+                        self.product.0,
+                        model.fold_bias.0,
+                        rank_vocab as u64,
+                        first_id as u64,
+                        valid as u64,
+                        bits(cap),
+                        self.part_values.0,
+                        self.part_ids.0,
+                        self.part_sums.0,
+                        bits(inv_t),
+                        seed,
+                        // The draft of step `step` lands after the anchor and the drafts before it.
+                        (position + 1 + step) as u64,
+                        self.part_scores.0,
+                    ],
+                ))?;
+            }
             run(shared.launch(
                 kernels.markov_local,
                 (1, 1, 1),
@@ -1486,24 +1966,52 @@ impl DraftState {
                 ],
             ))?;
             exchange_sum(shared, self.slots, world * PICK_SLOT)?;
+            drafted = step + 1;
+            if early_stop && drafted < depth {
+                run(shared.launch(
+                    kernels.markov_last,
+                    (1, 1, 1),
+                    (32, 1, 1),
+                    &[
+                        self.slots.0,
+                        world as u64,
+                        self.tokens.0,
+                        drafted as u64,
+                        self.confidence.0,
+                        u64::from(noisy),
+                    ],
+                ))?;
+                run(shared.cuda.synchronize())?;
+                run(shared.exchange.check_device())?;
+                run(shared
+                    .cuda
+                    .copy_dtoh(&mut conf_word, &self.confidence.offset(drafted * 4)))?;
+                probs_so_far.push(f32::from_le_bytes(conf_word));
+                if !keep_going(&probs_so_far) {
+                    stopped_early = true;
+                    break;
+                }
+            }
         }
-        run(shared.launch(
-            kernels.markov_last,
-            (1, 1, 1),
-            (32, 1, 1),
-            &[
-                self.slots.0,
-                world as u64,
-                self.tokens.0,
-                depth as u64,
-                self.confidence.0,
-                u64::from(noisy),
-            ],
-        ))?;
-        run(shared.cuda.synchronize())?;
-        run(shared.exchange.check_device())?;
+        if !stopped_early {
+            run(shared.launch(
+                kernels.markov_last,
+                (1, 1, 1),
+                (32, 1, 1),
+                &[
+                    self.slots.0,
+                    world as u64,
+                    self.tokens.0,
+                    drafted as u64,
+                    self.confidence.0,
+                    u64::from(noisy),
+                ],
+            ))?;
+            run(shared.cuda.synchronize())?;
+            run(shared.exchange.check_device())?;
+        }
         // Word 0 of each is the anchor's, which no step picks.
-        let mut bytes = vec![0u8; (depth + 1) * 4];
+        let mut bytes = vec![0u8; (drafted + 1) * 4];
         run(shared.cuda.copy_dtoh(&mut bytes, &self.tokens))?;
         let drafts: Vec<u32> = bytes
             .as_chunks::<4>()
@@ -1517,14 +2025,18 @@ impl DraftState {
                 "the drafter picked {bad}, past the {valid} ids it may draft"
             )));
         }
-        run(shared.cuda.copy_dtoh(&mut bytes, &self.confidence))?;
-        let confidence: Vec<f32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .skip(1)
-            .map(|word| f32::from_le_bytes(*word))
-            .collect();
+        let confidence: Vec<f32> = if stopped_early {
+            probs_so_far
+        } else {
+            run(shared.cuda.copy_dtoh(&mut bytes, &self.confidence))?;
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .skip(1)
+                .map(|word| f32::from_le_bytes(*word))
+                .collect()
+        };
         if let Some(bad) = confidence.iter().find(|p| !(0.0..=1.0).contains(*p)) {
             return Err(device_error(format!(
                 "the drafter gave a pick the probability {bad}"

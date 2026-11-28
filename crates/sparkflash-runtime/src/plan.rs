@@ -528,7 +528,11 @@ pub fn plan_layer_folding(
     for role in folded {
         match role {
             StepRole::Compression | StepRole::Indexer => {}
-            StepRole::Attention | StepRole::Ffn | StepRole::Residual | StepRole::Side => {
+            StepRole::Attention
+            | StepRole::Ffn
+            | StepRole::Residual
+            | StepRole::Side
+            | StepRole::Message => {
                 return Err(format!(
                     "a {role:?} step does not fold into another part: only the attention's \
                      compression and indexer run inside its step"
@@ -545,9 +549,11 @@ pub fn plan_layer_folding(
     for (role, part) in step.roles() {
         let framed = match role {
             StepRole::Attention | StepRole::Ffn => true,
-            StepRole::Compression | StepRole::Indexer | StepRole::Residual | StepRole::Side => {
-                runs.contains(&role)
-            }
+            StepRole::Compression
+            | StepRole::Indexer
+            | StepRole::Residual
+            | StepRole::Side
+            | StepRole::Message => runs.contains(&role),
         };
         if !framed {
             return Err(format!(
@@ -568,7 +574,7 @@ pub fn plan_layer_folding(
         match role {
             StepRole::Residual => layer.residual = Some(part),
             StepRole::Compression | StepRole::Indexer => before.push((role, part)),
-            StepRole::Side | StepRole::Attention | StepRole::Ffn => {
+            StepRole::Side | StepRole::Attention | StepRole::Ffn | StepRole::Message => {
                 layer.branches.push((role, part));
             }
         }
@@ -773,6 +779,16 @@ impl<H: PlanHost> PlanWalk<H> {
         self.host.logits(&scratch, first, count)
     }
 
+    /// The greedy pick of `count` rows of the last walk from row `first`, chosen on the device:
+    /// what a drafter's verify reads when every member takes its argmax.
+    ///
+    /// # Errors
+    /// As [`PlanHost::choices`].
+    pub fn choices(&self, first: usize, count: usize) -> Result<Vec<u32>, BackendError> {
+        let scratch = self.scratch()?;
+        self.host.choices(&scratch, first, count)
+    }
+
     fn scratch(&self) -> Result<MutexGuard<'_, H::Scratch>, BackendError> {
         self.scratch
             .lock()
@@ -971,6 +987,7 @@ mod tests {
             ffn: PartKind::Moe,
             residual: Some(PartKind::HyperConnection),
             sides: vec![PartKind::Engram],
+            message: Vec::new(),
         }
     }
 
@@ -1035,6 +1052,7 @@ mod tests {
             ffn: PartKind::DenseMlp,
             residual: None,
             sides: Vec::new(),
+            message: Vec::new(),
         };
         let layer = plan_layer(&step, &[]).unwrap();
         assert_eq!(layer.residual, None);

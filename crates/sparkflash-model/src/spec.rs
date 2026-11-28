@@ -267,6 +267,27 @@ impl Speculator {
         self.policy.as_ref().is_some_and(DepthPolicy::is_adaptive)
     }
 
+    /// Updates the underlying policy's modelled step cost (no-op when no policy is attached).
+    pub fn set_cost(&mut self, cost: crate::speculation::StepCost) {
+        if let Some(policy) = self.policy.as_mut() {
+            policy.set_cost(cost);
+        }
+    }
+
+    /// Whether drafting another token past `confidence` can still increase [Self::depth], given
+    /// `room` drafts remaining in the context.
+    #[must_use]
+    pub fn should_continue(&self, confidence: &[f32], room: usize) -> bool {
+        let limit = room.min(self.max_depth);
+        if confidence.len() >= limit {
+            return false;
+        }
+        match self.policy.as_ref() {
+            Some(policy) => policy.should_continue(confidence),
+            None => true,
+        }
+    }
+
     /// What this sequence's drafts have been worth so far.
     ///
     /// A request reports its own counts, so a serving adapter resets the speculator when it

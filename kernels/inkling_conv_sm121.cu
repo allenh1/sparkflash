@@ -452,6 +452,53 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
 // inkling_residual_row's, the same additions in the same order. A row wider than
 // INKLING_RESIDUAL_HELD a thread takes inkling_residual_row itself.
 #define INKLING_RESIDUAL_HELD 32
+#define INKLING_RESIDUAL_HELD_SMALL 10
+
+template <int kHeld>
+__device__ __forceinline__ void inkling_residual_stats_held(
+    const float* __restrict__ source,
+    const float* __restrict__ query,
+    int hidden,
+    float eps,
+    float* scratch,
+    float* inverse_out,
+    float* score_out) {
+    float held_query[kHeld];
+#pragma unroll
+    for (int k = 0; k < kHeld; ++k) {
+        const int index = threadIdx.x + k * INKLING_BLOCK;
+        held_query[k] = index < hidden ? query[index] : 0.0f;
+    }
+    OPT_PDL_WAIT();
+    float held[kHeld];
+#pragma unroll
+    for (int k = 0; k < kHeld; ++k) {
+        const int index = threadIdx.x + k * INKLING_BLOCK;
+        held[k] = index < hidden ? source[index] : 0.0f;
+    }
+    float squares = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kHeld; ++k) {
+        if (threadIdx.x + k * INKLING_BLOCK < hidden) {
+            squares = __fadd_rn(squares, __fmul_rn(held[k], held[k]));
+        }
+    }
+    const float total = inkling_conv_block_sum(squares, scratch);
+    __syncthreads();
+    const float mean = __fdiv_rn(total, (float)hidden);
+    const float inverse = __fdiv_rn(1.0f, sqrtf(__fadd_rn(mean, eps)));
+    float dot = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kHeld; ++k) {
+        if (threadIdx.x + k * INKLING_BLOCK < hidden) {
+            dot = __fadd_rn(dot, __fmul_rn(held_query[k], __fmul_rn(held[k], inverse)));
+        }
+    }
+    const float reduced = inkling_conv_block_sum(dot, scratch);
+    *inverse_out = inverse;
+    *score_out = __fmul_rn(reduced, 1.0f / sqrtf((float)hidden));
+}
+
 extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residual_stats(
     const float* __restrict__ summaries,
     const float* __restrict__ partial,
@@ -485,43 +532,12 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     if (hidden > INKLING_RESIDUAL_HELD * INKLING_BLOCK) {
         OPT_PDL_WAIT();
         inkling_residual_row(source, query, hidden, eps, scratch, &inverse, &score);
+    } else if (hidden <= INKLING_RESIDUAL_HELD_SMALL * INKLING_BLOCK) {
+        inkling_residual_stats_held<INKLING_RESIDUAL_HELD_SMALL>(
+            source, query, hidden, eps, scratch, &inverse, &score);
     } else {
-        // Predicated, not a break: every load of a pass is in flight at once.
-        float held_query[INKLING_RESIDUAL_HELD];
-#pragma unroll
-        for (int k = 0; k < INKLING_RESIDUAL_HELD; ++k) {
-            const int index = threadIdx.x + k * INKLING_BLOCK;
-            held_query[k] = index < hidden ? query[index] : 0.0f;
-        }
-        OPT_PDL_WAIT();
-        float held[INKLING_RESIDUAL_HELD];
-#pragma unroll
-        for (int k = 0; k < INKLING_RESIDUAL_HELD; ++k) {
-            const int index = threadIdx.x + k * INKLING_BLOCK;
-            held[k] = index < hidden ? source[index] : 0.0f;
-        }
-        float squares = 0.0f;
-#pragma unroll
-        for (int k = 0; k < INKLING_RESIDUAL_HELD; ++k) {
-            if (threadIdx.x + k * INKLING_BLOCK < hidden) {
-                squares = __fadd_rn(squares, __fmul_rn(held[k], held[k]));
-            }
-        }
-        const float total = inkling_conv_block_sum(squares, scratch);
-        // Every warp has read the first sum before any writes the second into the same scratch:
-        // the dot pass no longer waits on loads that kept the two apart.
-        __syncthreads();
-        const float mean = __fdiv_rn(total, (float)hidden);
-        inverse = __fdiv_rn(1.0f, sqrtf(__fadd_rn(mean, eps)));
-        float dot = 0.0f;
-#pragma unroll
-        for (int k = 0; k < INKLING_RESIDUAL_HELD; ++k) {
-            if (threadIdx.x + k * INKLING_BLOCK < hidden) {
-                dot = __fadd_rn(dot, __fmul_rn(held_query[k], __fmul_rn(held[k], inverse)));
-            }
-        }
-        const float reduced = inkling_conv_block_sum(dot, scratch);
-        score = __fmul_rn(reduced, 1.0f / sqrtf((float)hidden));
+        inkling_residual_stats_held<INKLING_RESIDUAL_HELD>(
+            source, query, hidden, eps, scratch, &inverse, &score);
     }
     if (threadIdx.x == 0) {
         float* cell =
@@ -579,6 +595,341 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     }
 }
 
+// Exact bit-for-bit twin of q4e_block_sum (kernels/q4e_common_sm121.cuh) over INKLING_BLOCK
+// (256) threads, using 2 barriers + warp shuffles instead of 9 barriers so fused/small RMSNorm
+// matches q4e_rmsnorm_rows in every bit at lower latency.
+__device__ __forceinline__ float inkling_rmsnorm_block_sum(float value, float* scratch) {
+    const int thread = threadIdx.x;
+    scratch[thread] = value;
+    __syncthreads();
+    if (thread < 32) {
+        const float a = scratch[thread] + scratch[thread + 128];
+        const float b = scratch[thread + 64] + scratch[thread + 192];
+        const float c = scratch[thread + 32] + scratch[thread + 160];
+        const float d = scratch[thread + 96] + scratch[thread + 224];
+        float v = (a + b) + (c + d);
+        v += __shfl_down_sync(0xffffffffu, v, 16);
+        v += __shfl_down_sync(0xffffffffu, v, 8);
+        v += __shfl_down_sync(0xffffffffu, v, 4);
+        v += __shfl_down_sync(0xffffffffu, v, 2);
+        v += __shfl_down_sync(0xffffffffu, v, 1);
+        if (thread == 0) {
+            scratch[0] = v;
+        }
+    }
+    __syncthreads();
+    return scratch[0];
+}
+
+// Fused inkling_block_residual_mix + q4e_rmsnorm_rows for hidden <= 10 * INKLING_BLOCK (2560):
+// grid (nq, sequence_rows), INKLING_BLOCK threads. Preloads BF16 norm gains before OPT_PDL_WAIT(),
+// mixes summaries + partial directly into registers, computes the exact q4e_rmsnorm_rows reduction
+// tree, and writes normalized output(s) to out0/out1/out2 without materializing scratch.rows.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residual_mix_norm(
+    const float* __restrict__ summaries,
+    const float* __restrict__ partial,
+    const float* __restrict__ stats,
+    const __nv_bfloat16* __restrict__ w0,
+    const __nv_bfloat16* __restrict__ w1,
+    const __nv_bfloat16* __restrict__ w2,
+    float* __restrict__ out0,
+    float* __restrict__ out1,
+    float* __restrict__ out2,
+    int blocks,
+    int hidden,
+    int nq,
+    float eps,
+    int summary_stride) {
+    OPT_PDL_LAUNCH();
+    const int query_index = blockIdx.x;
+    const int sequence_row = blockIdx.y;
+    if (query_index >= nq || blocks < 0 || blocks > INKLING_MAX_BLOCKS || hidden <= 0 ||
+        hidden > INKLING_RESIDUAL_HELD_SMALL * INKLING_BLOCK) {
+        OPT_PDL_WAIT();
+        return;
+    }
+    const __nv_bfloat16* weight =
+        query_index == 0 ? w0 : (query_index == 1 ? w1 : w2);
+    float* out =
+        query_index == 0 ? out0 : (query_index == 1 ? out1 : out2);
+    float gains[INKLING_RESIDUAL_HELD_SMALL];
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int offset = threadIdx.x + k * INKLING_BLOCK;
+        if (offset < hidden) {
+            gains[k] = __bfloat162float(weight[offset]);
+        }
+    }
+    OPT_PDL_WAIT();
+    summaries += (uint64_t)sequence_row * summary_stride;
+    if (partial != nullptr) {
+        partial += (uint64_t)sequence_row * hidden;
+    }
+    out += (uint64_t)sequence_row * hidden;
+    const int rows = blocks + (partial != nullptr ? 1 : 0);
+    if (rows <= 0) {
+        return;
+    }
+    __shared__ float inv_norm[INKLING_MAX_BLOCKS + 1];
+    __shared__ float scores[INKLING_MAX_BLOCKS + 1];
+    __shared__ float probabilities[INKLING_MAX_BLOCKS + 1];
+    __shared__ float scratch[INKLING_BLOCK];
+    if ((int)threadIdx.x < rows) {
+        const float* cell =
+            stats + (((uint64_t)sequence_row * nq + query_index) * (INKLING_MAX_BLOCKS + 1) +
+                     threadIdx.x) * 2;
+        inv_norm[threadIdx.x] = cell[0];
+        scores[threadIdx.x] = cell[1];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        inkling_residual_softmax(scores, probabilities, rows);
+    }
+    __syncthreads();
+    float held[INKLING_RESIDUAL_HELD_SMALL];
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int offset = threadIdx.x + k * INKLING_BLOCK;
+        if (offset < hidden) {
+            const float value = inkling_residual_mix(
+                summaries, partial, probabilities, inv_norm, blocks, hidden, offset);
+            held[k] = value;
+            sum += value * value;
+        }
+    }
+    const float mean = inkling_rmsnorm_block_sum(sum, scratch) / hidden;
+    const float scale = rsqrtf(mean + eps);
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int offset = threadIdx.x + k * INKLING_BLOCK;
+        if (offset < hidden) {
+            out[offset] = held[k] * scale * gains[k];
+        }
+    }
+}
+
+// Lean 1- or 3-stream RMSNorm for hidden <= 10 * INKLING_BLOCK (2560):
+// grid (streams, rows), INKLING_BLOCK threads. Uses ~32 registers instead of q4e_rmsnorm_rows's
+// 124, preloads BF16 gains before OPT_PDL_WAIT(), and matches q4e_rmsnorm_rows bit-for-bit.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_rmsnorm3_small(
+    const float* x0,
+    const float* x1,
+    const float* x2,
+    const __nv_bfloat16* __restrict__ w0,
+    const __nv_bfloat16* __restrict__ w1,
+    const __nv_bfloat16* __restrict__ w2,
+    float* out0,
+    float* out1,
+    float* out2,
+    int hidden,
+    float eps,
+    int streams) {
+    OPT_PDL_LAUNCH();
+    const int stream = blockIdx.x;
+    const int row = blockIdx.y;
+    if (stream >= streams || hidden <= 0 ||
+        hidden > INKLING_RESIDUAL_HELD_SMALL * INKLING_BLOCK) {
+        OPT_PDL_WAIT();
+        return;
+    }
+    const __nv_bfloat16* weight =
+        stream == 0 ? w0 : (stream == 1 ? w1 : w2);
+    const float* src =
+        (stream == 0 ? x0 : (stream == 1 ? x1 : x2)) + (uint64_t)row * hidden;
+    float* dst =
+        (stream == 0 ? out0 : (stream == 1 ? out1 : out2)) + (uint64_t)row * hidden;
+    float gains[INKLING_RESIDUAL_HELD_SMALL];
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int offset = threadIdx.x + k * INKLING_BLOCK;
+        if (offset < hidden) {
+            gains[k] = __bfloat162float(weight[offset]);
+        }
+    }
+    OPT_PDL_WAIT();
+    float held[INKLING_RESIDUAL_HELD_SMALL];
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int offset = threadIdx.x + k * INKLING_BLOCK;
+        if (offset < hidden) {
+            held[k] = src[offset];
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int offset = threadIdx.x + k * INKLING_BLOCK;
+        if (offset < hidden) {
+            sum += held[k] * held[k];
+        }
+    }
+    __shared__ float scratch[INKLING_BLOCK];
+    const float mean = inkling_rmsnorm_block_sum(sum, scratch) / hidden;
+    const float scale = rsqrtf(mean + eps);
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int offset = threadIdx.x + k * INKLING_BLOCK;
+        if (offset < hidden) {
+            dst[offset] = held[k] * scale * gains[k];
+        }
+    }
+}
+
+// Single-launch fused BlockResidual + RmsNorm for small stack depth (blocks <= 4) and
+// hidden <= INKLING_RESIDUAL_HELD_SMALL * INKLING_BLOCK (2560):
+// grid (queries_count, rows, 1), INKLING_BLOCK threads.
+// Preloads query[k] and BF16 norm gain[k] before OPT_PDL_WAIT(), holds partial[k] in registers
+// so partial is read once, and matches block_residual_stats + block_residual_mix_norm bit-for-bit.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residual_small_norm(
+    const float* __restrict__ summaries,
+    const float* __restrict__ partial,
+    const float* __restrict__ queries,
+    const __nv_bfloat16* __restrict__ w0,
+    const __nv_bfloat16* __restrict__ w1,
+    const __nv_bfloat16* __restrict__ w2,
+    float* __restrict__ out0,
+    float* __restrict__ out1,
+    float* __restrict__ out2,
+    int blocks,
+    int hidden,
+    int queries_count,
+    float eps,
+    int summary_stride) {
+    OPT_PDL_LAUNCH();
+    const int query_index = blockIdx.x;
+    const int sequence_row = blockIdx.y;
+    if (query_index >= queries_count || blocks < 0 || blocks > INKLING_MAX_BLOCKS || hidden <= 0 ||
+        hidden > INKLING_RESIDUAL_HELD_SMALL * INKLING_BLOCK) {
+        OPT_PDL_WAIT();
+        return;
+    }
+    const float* query = queries + (uint64_t)query_index * hidden;
+    const __nv_bfloat16* weight = query_index == 0 ? w0 : (query_index == 1 ? w1 : w2);
+    float held_q[INKLING_RESIDUAL_HELD_SMALL];
+    float gains[INKLING_RESIDUAL_HELD_SMALL];
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int idx = threadIdx.x + k * INKLING_BLOCK;
+        held_q[k] = idx < hidden ? query[idx] : 0.0f;
+        if (idx < hidden) {
+            gains[k] = __bfloat162float(weight[idx]);
+        }
+    }
+    OPT_PDL_WAIT();
+    summaries += (uint64_t)sequence_row * summary_stride;
+    if (partial != nullptr) {
+        partial += (uint64_t)sequence_row * hidden;
+    }
+    const int rows = blocks + (partial != nullptr ? 1 : 0);
+    if (rows <= 0) {
+        return;
+    }
+    __shared__ float inv_norm[INKLING_MAX_BLOCKS + 1];
+    __shared__ float scores[INKLING_MAX_BLOCKS + 1];
+    __shared__ float probabilities[INKLING_MAX_BLOCKS + 1];
+    __shared__ float scratch[INKLING_BLOCK];
+    const float inv_sqrt_h = 1.0f / sqrtf((float)hidden);
+
+    for (int r = 0; r < blocks; ++r) {
+        const float* src = summaries + (uint64_t)r * hidden;
+        float held[INKLING_RESIDUAL_HELD_SMALL];
+        float sq = 0.0f;
+#pragma unroll
+        for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+            const int idx = threadIdx.x + k * INKLING_BLOCK;
+            const float v = idx < hidden ? src[idx] : 0.0f;
+            held[k] = v;
+            if (idx < hidden) {
+                sq = __fadd_rn(sq, __fmul_rn(v, v));
+            }
+        }
+        float* sq_buf = scratch + (r & 1) * 16;
+        float* dot_buf = sq_buf + 8;
+        const float tot = inkling_conv_block_sum(sq, sq_buf);
+        const float inv = __fdiv_rn(1.0f, sqrtf(__fadd_rn(__fdiv_rn(tot, (float)hidden), eps)));
+        float dot = 0.0f;
+#pragma unroll
+        for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+            if ((int)threadIdx.x + k * INKLING_BLOCK < hidden) {
+                dot = __fadd_rn(dot, __fmul_rn(held_q[k], __fmul_rn(held[k], inv)));
+            }
+        }
+        const float red = inkling_conv_block_sum(dot, dot_buf);
+        if (threadIdx.x == 0) {
+            inv_norm[r] = inv;
+            scores[r] = __fmul_rn(red, inv_sqrt_h);
+        }
+    }
+
+    float held_p[INKLING_RESIDUAL_HELD_SMALL];
+    if (partial != nullptr) {
+        float sq = 0.0f;
+#pragma unroll
+        for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+            const int idx = threadIdx.x + k * INKLING_BLOCK;
+            const float v = idx < hidden ? partial[idx] : 0.0f;
+            held_p[k] = v;
+            if (idx < hidden) {
+                sq = __fadd_rn(sq, __fmul_rn(v, v));
+            }
+        }
+        float* sq_buf = scratch + (blocks & 1) * 16;
+        float* dot_buf = sq_buf + 8;
+        const float tot = inkling_conv_block_sum(sq, sq_buf);
+        const float inv = __fdiv_rn(1.0f, sqrtf(__fadd_rn(__fdiv_rn(tot, (float)hidden), eps)));
+        float dot = 0.0f;
+#pragma unroll
+        for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+            if ((int)threadIdx.x + k * INKLING_BLOCK < hidden) {
+                dot = __fadd_rn(dot, __fmul_rn(held_q[k], __fmul_rn(held_p[k], inv)));
+            }
+        }
+        const float red = inkling_conv_block_sum(dot, dot_buf);
+        if (threadIdx.x == 0) {
+            inv_norm[blocks] = inv;
+            scores[blocks] = __fmul_rn(red, inv_sqrt_h);
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        inkling_residual_softmax(scores, probabilities, rows);
+    }
+    __syncthreads();
+
+    float* dst = (query_index == 0 ? out0 : (query_index == 1 ? out1 : out2)) +
+                 (uint64_t)sequence_row * hidden;
+    float mixed_held[INKLING_RESIDUAL_HELD_SMALL];
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int idx = threadIdx.x + k * INKLING_BLOCK;
+        if (idx < hidden) {
+            float m = 0.0f;
+            for (int r = 0; r < blocks; ++r) {
+                m = __fadd_rn(
+                    m, __fmul_rn(probabilities[r],
+                                 __fmul_rn(summaries[(uint64_t)r * hidden + idx], inv_norm[r])));
+            }
+            if (partial != nullptr) {
+                m = __fadd_rn(m, __fmul_rn(probabilities[blocks],
+                                           __fmul_rn(held_p[k], inv_norm[blocks])));
+            }
+            mixed_held[k] = m;
+            sum += m * m;
+        }
+    }
+    const float mean = inkling_rmsnorm_block_sum(sum, scratch) / hidden;
+    const float scale = rsqrtf(mean + eps);
+#pragma unroll
+    for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+        const int idx = threadIdx.x + k * INKLING_BLOCK;
+        if (idx < hidden) {
+            dst[idx] = mixed_held[k] * scale * gains[k];
+        }
+    }
+}
+
 // The chunk walk's block residual: one block a sequence row for all of a call's queries, and the
 // next call's scores against the summary rows carried forward.
 //
@@ -627,7 +978,7 @@ __device__ __forceinline__ float inkling_chain_warps_total(const float* slots) {
     return total;
 }
 
-template <int NQ, int NEXT>
+template <int NQ, int NEXT, bool FUSE_NORM = false>
 __device__ __forceinline__ void inkling_block_residual_chain_body(
     const float* __restrict__ summaries,
     const float* __restrict__ partial,
@@ -640,7 +991,13 @@ __device__ __forceinline__ void inkling_block_residual_chain_body(
     float eps,
     int summary_stride,
     int carried,
-    int carry_stride) {
+    int carry_stride,
+    const __nv_bfloat16* __restrict__ w0 = nullptr,
+    const __nv_bfloat16* __restrict__ w1 = nullptr,
+    const __nv_bfloat16* __restrict__ w2 = nullptr,
+    float* __restrict__ out0 = nullptr,
+    float* __restrict__ out1 = nullptr,
+    float* __restrict__ out2 = nullptr) {
     static_assert(NQ >= 1 && NQ <= INKLING_CHAIN_QUERIES && NEXT >= 0 &&
                       NEXT <= INKLING_CHAIN_QUERIES,
                   "a call scores one to three queries and the next zero to three");
@@ -650,11 +1007,24 @@ __device__ __forceinline__ void inkling_block_residual_chain_body(
         carry_stride < (INKLING_MAX_BLOCKS + 1) * (1 + INKLING_CHAIN_QUERIES)) {
         return;
     }
+    if constexpr (FUSE_NORM) {
+        if (hidden > INKLING_RESIDUAL_HELD_SMALL * INKLING_BLOCK) {
+            return;
+        }
+    }
     summaries += (uint64_t)sequence_row * summary_stride;
     if (partial != nullptr) {
         partial += (uint64_t)sequence_row * hidden;
     }
-    out += (uint64_t)sequence_row * NQ * hidden;
+    if constexpr (!FUSE_NORM) {
+        out += (uint64_t)sequence_row * NQ * hidden;
+    } else {
+        out0 += (uint64_t)sequence_row * hidden;
+        if constexpr (NQ > 1) {
+            out1 += (uint64_t)sequence_row * hidden;
+            out2 += (uint64_t)sequence_row * hidden;
+        }
+    }
     carry += (uint64_t)sequence_row * carry_stride;
     const int rows = blocks + (partial != nullptr ? 1 : 0);
     if (rows <= 0) {
@@ -668,6 +1038,7 @@ __device__ __forceinline__ void inkling_block_residual_chain_body(
     __shared__ float square_slots[INKLING_CHAIN_WARPS];
     __shared__ float dot_slots[NQ][INKLING_CHAIN_WARPS];
     __shared__ float next_slots[(NEXT > 0 ? NEXT : 1) * INKLING_CHAIN_SUMMARIES][INKLING_CHAIN_WARPS];
+    __shared__ float norm_scratch[FUSE_NORM ? INKLING_BLOCK : 1];
 
     if ((int)threadIdx.x < carried) {
         inv_norm[threadIdx.x] = carry[threadIdx.x];
@@ -679,14 +1050,37 @@ __device__ __forceinline__ void inkling_block_residual_chain_body(
     }
     const float scale = 1.0f / sqrtf((float)hidden);
 
+    // Hold partial in registers when hidden <= INKLING_RESIDUAL_HELD_SMALL * INKLING_BLOCK
+    // (2560, covering Inkling-2-Mini's 2304): avoids reading partial three times from global memory.
+    const bool hold_partial =
+        (partial != nullptr) && (hidden <= INKLING_RESIDUAL_HELD_SMALL * INKLING_BLOCK);
+    float held_p[INKLING_RESIDUAL_HELD_SMALL];
+    if (hold_partial) {
+#pragma unroll
+        for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+            const int index = threadIdx.x + k * INKLING_BLOCK;
+            held_p[k] = index < hidden ? partial[index] : 0.0f;
+        }
+    }
+
     // The statistics of the rows not handed over, as inkling_residual_row forms them, every
     // query's dot reduced at once.
     for (int row = carried; row < rows; ++row) {
+        const bool is_partial = (row == blocks) && hold_partial;
         const float* source = row < blocks ? summaries + (uint64_t)row * hidden : partial;
         float squares = 0.0f;
-        for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
-            const float value = source[index];
-            squares = __fadd_rn(squares, __fmul_rn(value, value));
+        if (is_partial) {
+#pragma unroll
+            for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+                if ((int)threadIdx.x + k * INKLING_BLOCK < hidden) {
+                    squares = __fadd_rn(squares, __fmul_rn(held_p[k], held_p[k]));
+                }
+            }
+        } else {
+            for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
+                const float value = source[index];
+                squares = __fadd_rn(squares, __fmul_rn(value, value));
+            }
         }
         squares = inkling_chain_warp_sum(squares);
         if (lane == 0u) {
@@ -700,13 +1094,29 @@ __device__ __forceinline__ void inkling_block_residual_chain_body(
         for (int query = 0; query < NQ; ++query) {
             dots[query] = 0.0f;
         }
-        for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
-            const float value = source[index];
+        if (is_partial) {
 #pragma unroll
-            for (int query = 0; query < NQ; ++query) {
-                dots[query] =
-                    __fadd_rn(dots[query], __fmul_rn(queries[(uint64_t)query * hidden + index],
-                                                     __fmul_rn(value, inverse)));
+            for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+                const int index = threadIdx.x + k * INKLING_BLOCK;
+                if (index < hidden) {
+                    const float scaled = __fmul_rn(held_p[k], inverse);
+#pragma unroll
+                    for (int query = 0; query < NQ; ++query) {
+                        dots[query] = __fadd_rn(
+                            dots[query],
+                            __fmul_rn(queries[(uint64_t)query * hidden + index], scaled));
+                    }
+                }
+            }
+        } else {
+            for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
+                const float value = source[index];
+#pragma unroll
+                for (int query = 0; query < NQ; ++query) {
+                    dots[query] = __fadd_rn(
+                        dots[query], __fmul_rn(queries[(uint64_t)query * hidden + index],
+                                               __fmul_rn(value, inverse)));
+                }
             }
         }
 #pragma unroll
@@ -741,45 +1151,118 @@ __device__ __forceinline__ void inkling_block_residual_chain_body(
             next_dots[query][row] = 0.0f;
         }
     }
-    for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
-        float mixed[NQ];
-        float next_query[NEXT > 0 ? NEXT : 1];
+    if constexpr (FUSE_NORM) {
+        float held_out[NQ][INKLING_RESIDUAL_HELD_SMALL];
+        float norm_sum[NQ];
 #pragma unroll
         for (int query = 0; query < NQ; ++query) {
-            mixed[query] = 0.0f;
+            norm_sum[query] = 0.0f;
         }
 #pragma unroll
-        for (int query = 0; query < NEXT; ++query) {
-            next_query[query] = next_queries[(uint64_t)query * hidden + index];
-        }
-#pragma unroll
-        for (int row = 0; row < INKLING_CHAIN_SUMMARIES; ++row) {
-            if (row < blocks) {
-                const float value =
-                    __fmul_rn(summaries[(uint64_t)row * hidden + index], inv_norm[row]);
+        for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+            const int index = threadIdx.x + k * INKLING_BLOCK;
+            if (index < hidden) {
+                float mixed[NQ];
+                float next_query[NEXT > 0 ? NEXT : 1];
 #pragma unroll
                 for (int query = 0; query < NQ; ++query) {
-                    mixed[query] =
-                        __fadd_rn(mixed[query], __fmul_rn(probabilities[query][row], value));
+                    mixed[query] = 0.0f;
                 }
 #pragma unroll
                 for (int query = 0; query < NEXT; ++query) {
-                    next_dots[query][row] =
-                        __fadd_rn(next_dots[query][row], __fmul_rn(next_query[query], value));
+                    next_query[query] = next_queries[(uint64_t)query * hidden + index];
+                }
+#pragma unroll
+                for (int row = 0; row < INKLING_CHAIN_SUMMARIES; ++row) {
+                    if (row < blocks) {
+                        const float value =
+                            __fmul_rn(summaries[(uint64_t)row * hidden + index], inv_norm[row]);
+#pragma unroll
+                        for (int query = 0; query < NQ; ++query) {
+                            mixed[query] = __fadd_rn(
+                                mixed[query], __fmul_rn(probabilities[query][row], value));
+                        }
+#pragma unroll
+                        for (int query = 0; query < NEXT; ++query) {
+                            next_dots[query][row] = __fadd_rn(
+                                next_dots[query][row], __fmul_rn(next_query[query], value));
+                        }
+                    }
+                }
+                if (partial != nullptr) {
+                    const float value = __fmul_rn(held_p[k], inv_norm[blocks]);
+#pragma unroll
+                    for (int query = 0; query < NQ; ++query) {
+                        mixed[query] = __fadd_rn(
+                            mixed[query], __fmul_rn(probabilities[query][blocks], value));
+                    }
+                }
+#pragma unroll
+                for (int query = 0; query < NQ; ++query) {
+                    held_out[query][k] = mixed[query];
+                    norm_sum[query] += mixed[query] * mixed[query];
                 }
             }
         }
-        if (partial != nullptr) {
-            const float value = __fmul_rn(partial[index], inv_norm[blocks]);
-#pragma unroll
-            for (int query = 0; query < NQ; ++query) {
-                mixed[query] =
-                    __fadd_rn(mixed[query], __fmul_rn(probabilities[query][blocks], value));
-            }
-        }
+        const __nv_bfloat16* ws[3] = {w0, w1, w2};
+        float* outs[3] = {out0, out1, out2};
 #pragma unroll
         for (int query = 0; query < NQ; ++query) {
-            out[(uint64_t)query * hidden + index] = mixed[query];
+            const float nmean = inkling_rmsnorm_block_sum(norm_sum[query], norm_scratch) / hidden;
+            const float nscale = rsqrtf(nmean + eps);
+            const __nv_bfloat16* wq = ws[query];
+            float* oq = outs[query];
+#pragma unroll
+            for (int k = 0; k < INKLING_RESIDUAL_HELD_SMALL; ++k) {
+                const int index = threadIdx.x + k * INKLING_BLOCK;
+                if (index < hidden) {
+                    oq[index] = held_out[query][k] * nscale * __bfloat162float(wq[index]);
+                }
+            }
+        }
+    } else {
+        int k_idx = 0;
+        for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK, ++k_idx) {
+            float mixed[NQ];
+            float next_query[NEXT > 0 ? NEXT : 1];
+#pragma unroll
+            for (int query = 0; query < NQ; ++query) {
+                mixed[query] = 0.0f;
+            }
+#pragma unroll
+            for (int query = 0; query < NEXT; ++query) {
+                next_query[query] = next_queries[(uint64_t)query * hidden + index];
+            }
+#pragma unroll
+            for (int row = 0; row < INKLING_CHAIN_SUMMARIES; ++row) {
+                if (row < blocks) {
+                    const float value =
+                        __fmul_rn(summaries[(uint64_t)row * hidden + index], inv_norm[row]);
+#pragma unroll
+                    for (int query = 0; query < NQ; ++query) {
+                        mixed[query] =
+                            __fadd_rn(mixed[query], __fmul_rn(probabilities[query][row], value));
+                    }
+#pragma unroll
+                    for (int query = 0; query < NEXT; ++query) {
+                        next_dots[query][row] =
+                            __fadd_rn(next_dots[query][row], __fmul_rn(next_query[query], value));
+                    }
+                }
+            }
+            if (partial != nullptr) {
+                const float pv = hold_partial ? held_p[k_idx] : partial[index];
+                const float value = __fmul_rn(pv, inv_norm[blocks]);
+#pragma unroll
+                for (int query = 0; query < NQ; ++query) {
+                    mixed[query] =
+                        __fadd_rn(mixed[query], __fmul_rn(probabilities[query][blocks], value));
+                }
+            }
+#pragma unroll
+            for (int query = 0; query < NQ; ++query) {
+                out[(uint64_t)query * hidden + index] = mixed[query];
+            }
         }
     }
     if constexpr (NEXT > 0) {
@@ -818,9 +1301,23 @@ __device__ __forceinline__ void inkling_block_residual_chain_body(
             float* __restrict__ carry, const float* __restrict__ next_queries, int blocks,        \
             int hidden, float eps, int summary_stride, int carried, int carry_stride) {           \
         OPT_PDL_ENTRY();                                                                          \
-        inkling_block_residual_chain_body<NQ, NEXT>(summaries, partial, queries, out, carry,      \
-                                                    next_queries, blocks, hidden, eps,            \
-                                                    summary_stride, carried, carry_stride);       \
+        inkling_block_residual_chain_body<NQ, NEXT, false>(                                       \
+            summaries, partial, queries, out, carry, next_queries, blocks, hidden, eps,           \
+            summary_stride, carried, carry_stride);                                               \
+    }                                                                                             \
+    extern "C" __global__ void __launch_bounds__(INKLING_BLOCK)                                   \
+        inkling_block_residual_chain_norm_q##NQ##_n##NEXT(                                        \
+            const float* __restrict__ summaries, const float* __restrict__ partial,               \
+            const float* __restrict__ queries, float* __restrict__ carry,                         \
+            const float* __restrict__ next_queries, const __nv_bfloat16* __restrict__ w0,         \
+            const __nv_bfloat16* __restrict__ w1, const __nv_bfloat16* __restrict__ w2,           \
+            float* __restrict__ out0, float* __restrict__ out1, float* __restrict__ out2,         \
+            int blocks, int hidden, float eps, int summary_stride, int carried,                   \
+            int carry_stride) {                                                                   \
+        OPT_PDL_ENTRY();                                                                          \
+        inkling_block_residual_chain_body<NQ, NEXT, true>(                                        \
+            summaries, partial, queries, nullptr, carry, next_queries, blocks, hidden, eps,       \
+            summary_stride, carried, carry_stride, w0, w1, w2, out0, out1, out2);                 \
     }
 
 // The pairs Inkling-2-Small's walk makes: a sliding layer's attention (one query) and a full
@@ -888,4 +1385,483 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_conv_history
     inkling_conv_history_move(reinterpret_cast<const float*>(entry[0]) + (uint64_t)row * channels,
                               reinterpret_cast<float*>(entry[1]), channels, kernel - 1, 0,
                               blockIdx.x * INKLING_BLOCK + threadIdx.x, gridDim.x * INKLING_BLOCK);
+}
+
+// One decode step of the static short convolution fused with residual addition:
+// residual[c] = __fadd_rn(residual[c], conv_out[c]), exact bits of inkling_short_conv_decode
+// followed by inkling_residual_add.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_decode_add(
+    const float* __restrict__ x,
+    const __nv_bfloat16* __restrict__ taps,
+    float* __restrict__ state,
+    float* __restrict__ residual,
+    int channels,
+    int kernel) {
+    OPT_PDL_ENTRY();
+    if (kernel < 1 || kernel > INKLING_MAX_KERNEL) {
+        return;
+    }
+    const float scale = 1.0f / sqrtf((float)(kernel + 1));
+    const int history = kernel - 1;
+    for (int channel = blockIdx.x * INKLING_BLOCK + threadIdx.x; channel < channels;
+         channel += gridDim.x * INKLING_BLOCK) {
+        const float current = x[channel];
+        float convolution = 0.0f;
+        for (int tap = 0; tap < history; ++tap) {
+            convolution = __fadd_rn(
+                convolution,
+                __fmul_rn(__bfloat162float(taps[(uint64_t)channel * kernel + tap]),
+                          state[(uint64_t)channel * history + tap]));
+        }
+        convolution = __fadd_rn(
+            convolution,
+            __fmul_rn(__bfloat162float(taps[(uint64_t)channel * kernel + history]), current));
+        const float out_val = __fmul_rn(__fadd_rn(convolution, current), scale);
+        residual[channel] = __fadd_rn(residual[channel], out_val);
+        for (int tap = 0; tap + 1 < history; ++tap) {
+            state[(uint64_t)channel * history + tap] =
+                state[(uint64_t)channel * history + tap + 1];
+        }
+        if (history > 0) {
+            state[(uint64_t)channel * history + history - 1] = current;
+        }
+    }
+}
+
+static __device__ __noinline__ void inkling_short_conv_segment_generic(
+    const float* __restrict__ input,
+    const __nv_bfloat16* __restrict__ taps,
+    const float* __restrict__ state,
+    float* __restrict__ tail,
+    float* __restrict__ out,
+    float* __restrict__ residual,
+    int rows,
+    int channels,
+    int kernel,
+    float scale) {
+    const int history = kernel - 1;
+    for (int channel = blockIdx.x * INKLING_BLOCK + threadIdx.x; channel < channels;
+         channel += gridDim.x * INKLING_BLOCK) {
+        float h[INKLING_MAX_KERNEL];
+        float w[INKLING_MAX_KERNEL];
+        for (int tap = 0; tap < kernel; ++tap) {
+            w[tap] = __bfloat162float(taps[(uint64_t)channel * kernel + tap]);
+        }
+        for (int tap = 0; tap < history; ++tap) {
+            const float hv = state[(uint64_t)channel * history + tap];
+            h[tap] = hv;
+            tail[(uint64_t)tap * channels + channel] = hv;
+        }
+        for (int r = 0; r < rows; ++r) {
+            const float current = input[(uint64_t)r * channels + channel];
+            tail[(uint64_t)(history + r) * channels + channel] = current;
+            float convolution = 0.0f;
+            for (int tap = 0; tap < history; ++tap) {
+                convolution = __fadd_rn(convolution, __fmul_rn(w[tap], h[tap]));
+            }
+            convolution = __fadd_rn(convolution, __fmul_rn(w[history], current));
+            const float val = __fmul_rn(__fadd_rn(convolution, current), scale);
+            if (residual != nullptr) {
+                residual[(uint64_t)r * channels + channel] =
+                    __fadd_rn(residual[(uint64_t)r * channels + channel], val);
+            } else {
+                out[(uint64_t)r * channels + channel] = val;
+            }
+            for (int tap = 0; tap + 1 < history; ++tap) {
+                h[tap] = h[tap + 1];
+            }
+            if (history > 0) {
+                h[history - 1] = current;
+            }
+        }
+    }
+}
+
+// Fused verify-segment static short convolution: loads channel-major history from `state`,
+// writes row-major history + segment inputs into `tail` (for settle/conv_restore), and writes
+// either `out` (when `residual == nullptr`) or `residual += conv_out` (when `residual != nullptr`).
+// Exact bits of conv_history_copy + copy_dtod + inkling_short_conv (+ inkling_residual_add).
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_segment(
+    const float* __restrict__ input,
+    const __nv_bfloat16* __restrict__ taps,
+    const float* __restrict__ state,
+    float* __restrict__ tail,
+    float* __restrict__ out,
+    float* __restrict__ residual,
+    int rows,
+    int channels,
+    int kernel) {
+    OPT_PDL_ENTRY();
+    if (kernel < 1 || kernel > INKLING_MAX_KERNEL || rows <= 0 || channels <= 0) {
+        return;
+    }
+    const float scale = 1.0f / sqrtf((float)(kernel + 1));
+    if (kernel == 4) {
+        const int ch0 = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+        const int step = (int)gridDim.x * (int)blockDim.x;
+        for (int channel = ch0; channel < channels; channel += step) {
+            const uint2 tw = __ldg(reinterpret_cast<const uint2*>(taps + (uint64_t)channel * 4));
+            const float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&tw.x));
+            const float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&tw.y));
+            const float w0 = w01.x, w1 = w01.y, w2 = w23.x, w3 = w23.y;
+            const uint64_t sbase = (uint64_t)channel * 3;
+            float h0 = state[sbase + 0];
+            float h1 = state[sbase + 1];
+            float h2 = state[sbase + 2];
+            tail[(uint64_t)0 * channels + channel] = h0;
+            tail[(uint64_t)1 * channels + channel] = h1;
+            tail[(uint64_t)2 * channels + channel] = h2;
+            for (int r = 0; r < rows; ++r) {
+                const float current = input[(uint64_t)r * channels + channel];
+                tail[(uint64_t)(3 + r) * channels + channel] = current;
+                float convolution = __fmul_rn(w0, h0);
+                convolution = __fadd_rn(convolution, __fmul_rn(w1, h1));
+                convolution = __fadd_rn(convolution, __fmul_rn(w2, h2));
+                convolution = __fadd_rn(convolution, __fmul_rn(w3, current));
+                const float val = __fmul_rn(__fadd_rn(convolution, current), scale);
+                if (residual != nullptr) {
+                    residual[(uint64_t)r * channels + channel] =
+                        __fadd_rn(residual[(uint64_t)r * channels + channel], val);
+                } else {
+                    out[(uint64_t)r * channels + channel] = val;
+                }
+                h0 = h1;
+                h1 = h2;
+                h2 = current;
+            }
+        }
+        return;
+    }
+    inkling_short_conv_segment_generic(input, taps, state, tail, out, residual, rows, channels,
+                                       kernel, scale);
+}
+
+// Fused sliding-layer Key + Value decode short convolution + BF16 KV cache store in one launch:
+// replaces inkling_short_conv_decode(Key) + inkling_short_conv_decode(Value) + inkling_kv_store.
+// Exact bits of those three launches.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_kv_decode(
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
+    const __nv_bfloat16* __restrict__ k_taps,
+    const __nv_bfloat16* __restrict__ v_taps,
+    float* __restrict__ k_state,
+    float* __restrict__ v_state,
+    __nv_bfloat16* __restrict__ key_cache,
+    __nv_bfloat16* __restrict__ value_cache,
+    int slot,
+    int channels,
+    int kernel) {
+    OPT_PDL_ENTRY();
+    if (kernel < 1 || kernel > INKLING_MAX_KERNEL || channels <= 0) {
+        return;
+    }
+    const float scale = 1.0f / sqrtf((float)(kernel + 1));
+    const int history = kernel - 1;
+    const uint64_t dst_base = (uint64_t)slot * channels;
+    for (int channel = blockIdx.x * INKLING_BLOCK + threadIdx.x; channel < channels;
+         channel += gridDim.x * INKLING_BLOCK) {
+        // Key
+        const float cur_k = k_in[channel];
+        float conv_k = 0.0f;
+        for (int tap = 0; tap < history; ++tap) {
+            conv_k = __fadd_rn(
+                conv_k,
+                __fmul_rn(__bfloat162float(k_taps[(uint64_t)channel * kernel + tap]),
+                          k_state[(uint64_t)channel * history + tap]));
+        }
+        conv_k = __fadd_rn(
+            conv_k, __fmul_rn(__bfloat162float(k_taps[(uint64_t)channel * kernel + history]), cur_k));
+        key_cache[dst_base + channel] = __float2bfloat16_rn(__fmul_rn(__fadd_rn(conv_k, cur_k), scale));
+        for (int tap = 0; tap + 1 < history; ++tap) {
+            k_state[(uint64_t)channel * history + tap] =
+                k_state[(uint64_t)channel * history + tap + 1];
+        }
+        if (history > 0) {
+            k_state[(uint64_t)channel * history + history - 1] = cur_k;
+        }
+        // Value
+        const float cur_v = v_in[channel];
+        float conv_v = 0.0f;
+        for (int tap = 0; tap < history; ++tap) {
+            conv_v = __fadd_rn(
+                conv_v,
+                __fmul_rn(__bfloat162float(v_taps[(uint64_t)channel * kernel + tap]),
+                          v_state[(uint64_t)channel * history + tap]));
+        }
+        conv_v = __fadd_rn(
+            conv_v, __fmul_rn(__bfloat162float(v_taps[(uint64_t)channel * kernel + history]), cur_v));
+        value_cache[dst_base + channel] =
+            __float2bfloat16_rn(__fmul_rn(__fadd_rn(conv_v, cur_v), scale));
+        for (int tap = 0; tap + 1 < history; ++tap) {
+            v_state[(uint64_t)channel * history + tap] =
+                v_state[(uint64_t)channel * history + tap + 1];
+        }
+        if (history > 0) {
+            v_state[(uint64_t)channel * history + history - 1] = cur_v;
+        }
+    }
+}
+
+// Fused sliding-layer Key + Value verify-segment short convolution + tail write + BF16 KV cache
+// store in one launch: replaces short_conv_segment(Key) + short_conv_segment(Value) + kv_store.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_kv_segment(
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
+    const __nv_bfloat16* __restrict__ k_taps,
+    const __nv_bfloat16* __restrict__ v_taps,
+    const float* __restrict__ k_state,
+    const float* __restrict__ v_state,
+    float* __restrict__ k_tail,
+    float* __restrict__ v_tail,
+    __nv_bfloat16* __restrict__ key_cache,
+    __nv_bfloat16* __restrict__ value_cache,
+    int rows,
+    int position,
+    int channels,
+    int cache_rows,
+    int kernel) {
+    OPT_PDL_ENTRY();
+    if (kernel < 1 || kernel > INKLING_MAX_KERNEL || rows <= 0 || channels <= 0) {
+        return;
+    }
+    const float scale = 1.0f / sqrtf((float)(kernel + 1));
+    if (kernel == 4) {
+        const int ch0 = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+        const int step = (int)gridDim.x * (int)blockDim.x;
+        for (int channel = ch0; channel < channels; channel += step) {
+            const uint2 ktw = __ldg(reinterpret_cast<const uint2*>(k_taps + (uint64_t)channel * 4));
+            const float2 wk01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ktw.x));
+            const float2 wk23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ktw.y));
+            const uint2 vtw = __ldg(reinterpret_cast<const uint2*>(v_taps + (uint64_t)channel * 4));
+            const float2 wv01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&vtw.x));
+            const float2 wv23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&vtw.y));
+            const float wk0 = wk01.x, wk1 = wk01.y, wk2 = wk23.x, wk3 = wk23.y;
+            const float wv0 = wv01.x, wv1 = wv01.y, wv2 = wv23.x, wv3 = wv23.y;
+            const uint64_t sbase = (uint64_t)channel * 3;
+            float hk0 = k_state[sbase + 0];
+            float hk1 = k_state[sbase + 1];
+            float hk2 = k_state[sbase + 2];
+            float hv0 = v_state[sbase + 0];
+            float hv1 = v_state[sbase + 1];
+            float hv2 = v_state[sbase + 2];
+            k_tail[(uint64_t)0 * channels + channel] = hk0;
+            k_tail[(uint64_t)1 * channels + channel] = hk1;
+            k_tail[(uint64_t)2 * channels + channel] = hk2;
+            v_tail[(uint64_t)0 * channels + channel] = hv0;
+            v_tail[(uint64_t)1 * channels + channel] = hv1;
+            v_tail[(uint64_t)2 * channels + channel] = hv2;
+            for (int r = 0; r < rows; ++r) {
+                const float cur_k = k_in[(uint64_t)r * channels + channel];
+                const float cur_v = v_in[(uint64_t)r * channels + channel];
+                k_tail[(uint64_t)(3 + r) * channels + channel] = cur_k;
+                v_tail[(uint64_t)(3 + r) * channels + channel] = cur_v;
+                float conv_k = __fmul_rn(wk0, hk0);
+                conv_k = __fadd_rn(conv_k, __fmul_rn(wk1, hk1));
+                conv_k = __fadd_rn(conv_k, __fmul_rn(wk2, hk2));
+                conv_k = __fadd_rn(conv_k, __fmul_rn(wk3, cur_k));
+                float conv_v = __fmul_rn(wv0, hv0);
+                conv_v = __fadd_rn(conv_v, __fmul_rn(wv1, hv1));
+                conv_v = __fadd_rn(conv_v, __fmul_rn(wv2, hv2));
+                conv_v = __fadd_rn(conv_v, __fmul_rn(wv3, cur_v));
+                const int slot = cache_rows > 0 ? (position + r) % cache_rows : (position + r);
+                key_cache[(uint64_t)slot * channels + channel] =
+                    __float2bfloat16_rn(__fmul_rn(__fadd_rn(conv_k, cur_k), scale));
+                value_cache[(uint64_t)slot * channels + channel] =
+                    __float2bfloat16_rn(__fmul_rn(__fadd_rn(conv_v, cur_v), scale));
+                hk0 = hk1;
+                hk1 = hk2;
+                hk2 = cur_k;
+                hv0 = hv1;
+                hv1 = hv2;
+                hv2 = cur_v;
+            }
+        }
+        return;
+    }
+    const int history = kernel - 1;
+    for (int channel = blockIdx.x * INKLING_BLOCK + threadIdx.x; channel < channels;
+         channel += gridDim.x * INKLING_BLOCK) {
+        float hk[INKLING_MAX_KERNEL], wk[INKLING_MAX_KERNEL];
+        float hv[INKLING_MAX_KERNEL], wv[INKLING_MAX_KERNEL];
+        for (int tap = 0; tap < kernel; ++tap) {
+            wk[tap] = __bfloat162float(k_taps[(uint64_t)channel * kernel + tap]);
+            wv[tap] = __bfloat162float(v_taps[(uint64_t)channel * kernel + tap]);
+        }
+        for (int tap = 0; tap < history; ++tap) {
+            const float xk = k_state[(uint64_t)channel * history + tap];
+            const float xv = v_state[(uint64_t)channel * history + tap];
+            hk[tap] = xk;
+            hv[tap] = xv;
+            k_tail[(uint64_t)tap * channels + channel] = xk;
+            v_tail[(uint64_t)tap * channels + channel] = xv;
+        }
+        for (int r = 0; r < rows; ++r) {
+            const float cur_k = k_in[(uint64_t)r * channels + channel];
+            const float cur_v = v_in[(uint64_t)r * channels + channel];
+            k_tail[(uint64_t)(history + r) * channels + channel] = cur_k;
+            v_tail[(uint64_t)(history + r) * channels + channel] = cur_v;
+            float conv_k = 0.0f;
+            float conv_v = 0.0f;
+            for (int tap = 0; tap < history; ++tap) {
+                conv_k = __fadd_rn(conv_k, __fmul_rn(wk[tap], hk[tap]));
+                conv_v = __fadd_rn(conv_v, __fmul_rn(wv[tap], hv[tap]));
+            }
+            conv_k = __fadd_rn(conv_k, __fmul_rn(wk[history], cur_k));
+            conv_v = __fadd_rn(conv_v, __fmul_rn(wv[history], cur_v));
+            const int slot = cache_rows > 0 ? (position + r) % cache_rows : (position + r);
+            key_cache[(uint64_t)slot * channels + channel] =
+                __float2bfloat16_rn(__fmul_rn(__fadd_rn(conv_k, cur_k), scale));
+            value_cache[(uint64_t)slot * channels + channel] =
+                __float2bfloat16_rn(__fmul_rn(__fadd_rn(conv_v, cur_v), scale));
+            for (int tap = 0; tap + 1 < history; ++tap) {
+                hk[tap] = hk[tap + 1];
+                hv[tap] = hv[tap + 1];
+            }
+            if (history > 0) {
+                hk[history - 1] = cur_k;
+                hv[history - 1] = cur_v;
+            }
+        }
+    }
+}
+
+#define INKLING_CONV_CHUNK_TILE 64
+
+// Streaming chunk static short convolution fused with residual add (kernel == 4):
+// grid (ceil(channels / 256), ceil(rows / 64)), 256 threads. Each thread holds its channel's
+// 4 taps and 3-sample sliding window in registers across up to 64 consecutive rows (4x fewer
+// input reads, zero delta_conv/mixed_conv traffic, zero residual_add launch). If `state_out`
+// is non-null (single-tile chunk, gridDim.y == 1), writes the updated history to `state_out`.
+// Exact bit-for-bit match with conv_history_copy + inkling_short_conv + inkling_residual_add.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_chunk_add(
+    const float* __restrict__ input,
+    const __nv_bfloat16* __restrict__ taps,
+    const float* __restrict__ state_in,
+    float* __restrict__ state_out,
+    float* __restrict__ residual,
+    int rows,
+    int channels) {
+    OPT_PDL_ENTRY();
+    const int r0 = (int)blockIdx.y * INKLING_CONV_CHUNK_TILE;
+    if (r0 >= rows || channels <= 0) {
+        return;
+    }
+    const int r_end = r0 + INKLING_CONV_CHUNK_TILE < rows ? r0 + INKLING_CONV_CHUNK_TILE : rows;
+    const float scale = 1.0f / sqrtf(5.0f);
+    for (int channel = blockIdx.x * INKLING_BLOCK + threadIdx.x; channel < channels;
+         channel += gridDim.x * INKLING_BLOCK) {
+        const uint64_t tbase = (uint64_t)channel * 4;
+        const float w0 = __bfloat162float(taps[tbase + 0]);
+        const float w1 = __bfloat162float(taps[tbase + 1]);
+        const float w2 = __bfloat162float(taps[tbase + 2]);
+        const float w3 = __bfloat162float(taps[tbase + 3]);
+        const uint64_t sbase = (uint64_t)channel * 3;
+        float h0 = r0 - 3 < 0 ? state_in[sbase + (r0 - 3 + 3)]
+                              : input[(uint64_t)(r0 - 3) * channels + channel];
+        float h1 = r0 - 2 < 0 ? state_in[sbase + (r0 - 2 + 3)]
+                              : input[(uint64_t)(r0 - 2) * channels + channel];
+        float h2 = r0 - 1 < 0 ? state_in[sbase + (r0 - 1 + 3)]
+                              : input[(uint64_t)(r0 - 1) * channels + channel];
+        for (int r = r0; r < r_end; ++r) {
+            const uint64_t off = (uint64_t)r * channels + channel;
+            const float current = input[off];
+            float convolution = __fmul_rn(w0, h0);
+            convolution = __fadd_rn(convolution, __fmul_rn(w1, h1));
+            convolution = __fadd_rn(convolution, __fmul_rn(w2, h2));
+            convolution = __fadd_rn(convolution, __fmul_rn(w3, current));
+            const float val = __fmul_rn(__fadd_rn(convolution, current), scale);
+            residual[off] = __fadd_rn(residual[off], val);
+            h0 = h1;
+            h1 = h2;
+            h2 = current;
+        }
+        if (state_out != nullptr && r_end == rows) {
+            state_out[sbase + 0] = h0;
+            state_out[sbase + 1] = h1;
+            state_out[sbase + 2] = h2;
+        }
+    }
+}
+
+// Streaming chunk sliding-layer Key + Value static short convolution fused with BF16 KV cache
+// store (kernel == 4): grid (ceil(channels / 256), ceil(rows / 64)), 256 threads.
+// Exact bit-for-bit match with conv_history_copy + short_conv(K) + short_conv(V) + kv_store.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_kv_chunk(
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
+    const __nv_bfloat16* __restrict__ k_taps,
+    const __nv_bfloat16* __restrict__ v_taps,
+    const float* __restrict__ k_state_in,
+    const float* __restrict__ v_state_in,
+    float* __restrict__ k_state_out,
+    float* __restrict__ v_state_out,
+    __nv_bfloat16* __restrict__ key_cache,
+    __nv_bfloat16* __restrict__ value_cache,
+    int rows,
+    int position,
+    int channels,
+    int cache_rows) {
+    OPT_PDL_ENTRY();
+    const int r0 = (int)blockIdx.y * INKLING_CONV_CHUNK_TILE;
+    if (r0 >= rows || channels <= 0) {
+        return;
+    }
+    const int r_end = r0 + INKLING_CONV_CHUNK_TILE < rows ? r0 + INKLING_CONV_CHUNK_TILE : rows;
+    const float scale = 1.0f / sqrtf(5.0f);
+    for (int channel = blockIdx.x * INKLING_BLOCK + threadIdx.x; channel < channels;
+         channel += gridDim.x * INKLING_BLOCK) {
+        const uint64_t tbase = (uint64_t)channel * 4;
+        const float wk0 = __bfloat162float(k_taps[tbase + 0]);
+        const float wk1 = __bfloat162float(k_taps[tbase + 1]);
+        const float wk2 = __bfloat162float(k_taps[tbase + 2]);
+        const float wk3 = __bfloat162float(k_taps[tbase + 3]);
+        const float wv0 = __bfloat162float(v_taps[tbase + 0]);
+        const float wv1 = __bfloat162float(v_taps[tbase + 1]);
+        const float wv2 = __bfloat162float(v_taps[tbase + 2]);
+        const float wv3 = __bfloat162float(v_taps[tbase + 3]);
+        const uint64_t sbase = (uint64_t)channel * 3;
+        float hk0 = r0 - 3 < 0 ? k_state_in[sbase + (r0 - 3 + 3)]
+                               : k_in[(uint64_t)(r0 - 3) * channels + channel];
+        float hk1 = r0 - 2 < 0 ? k_state_in[sbase + (r0 - 2 + 3)]
+                               : k_in[(uint64_t)(r0 - 2) * channels + channel];
+        float hk2 = r0 - 1 < 0 ? k_state_in[sbase + (r0 - 1 + 3)]
+                               : k_in[(uint64_t)(r0 - 1) * channels + channel];
+        float hv0 = r0 - 3 < 0 ? v_state_in[sbase + (r0 - 3 + 3)]
+                               : v_in[(uint64_t)(r0 - 3) * channels + channel];
+        float hv1 = r0 - 2 < 0 ? v_state_in[sbase + (r0 - 2 + 3)]
+                               : v_in[(uint64_t)(r0 - 2) * channels + channel];
+        float hv2 = r0 - 1 < 0 ? v_state_in[sbase + (r0 - 1 + 3)]
+                               : v_in[(uint64_t)(r0 - 1) * channels + channel];
+        for (int r = r0; r < r_end; ++r) {
+            const uint64_t off = (uint64_t)r * channels + channel;
+            const float cur_k = k_in[off];
+            const float cur_v = v_in[off];
+            float conv_k = __fmul_rn(wk0, hk0);
+            conv_k = __fadd_rn(conv_k, __fmul_rn(wk1, hk1));
+            conv_k = __fadd_rn(conv_k, __fmul_rn(wk2, hk2));
+            conv_k = __fadd_rn(conv_k, __fmul_rn(wk3, cur_k));
+            float conv_v = __fmul_rn(wv0, hv0);
+            conv_v = __fadd_rn(conv_v, __fmul_rn(wv1, hv1));
+            conv_v = __fadd_rn(conv_v, __fmul_rn(wv2, hv2));
+            conv_v = __fadd_rn(conv_v, __fmul_rn(wv3, cur_v));
+            const int slot = cache_rows > 0 ? (position + r) % cache_rows : (position + r);
+            const uint64_t dst = (uint64_t)slot * channels + channel;
+            key_cache[dst] = __float2bfloat16_rn(__fmul_rn(__fadd_rn(conv_k, cur_k), scale));
+            value_cache[dst] = __float2bfloat16_rn(__fmul_rn(__fadd_rn(conv_v, cur_v), scale));
+            hk0 = hk1;
+            hk1 = hk2;
+            hk2 = cur_k;
+            hv0 = hv1;
+            hv1 = hv2;
+            hv2 = cur_v;
+        }
+        if (k_state_out != nullptr && r_end == rows) {
+            k_state_out[sbase + 0] = hk0;
+            k_state_out[sbase + 1] = hk1;
+            k_state_out[sbase + 2] = hk2;
+            v_state_out[sbase + 0] = hv0;
+            v_state_out[sbase + 1] = hv1;
+            v_state_out[sbase + 2] = hv2;
+        }
+    }
 }

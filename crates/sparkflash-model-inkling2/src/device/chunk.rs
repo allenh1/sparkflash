@@ -297,6 +297,15 @@ pub(super) fn band_mix(
     scratch: &Scratch,
     rows: usize,
 ) -> Result<(), BackendError> {
+    band_mix_with(shared, scratch, scratch.scales, rows)
+}
+
+fn band_mix_with(
+    shared: &Shared,
+    scratch: &Scratch,
+    scales: Deviceptr,
+    rows: usize,
+) -> Result<(), BackendError> {
     let out = BandOut::of(shared, scratch, rows);
     let (indices, owner_experts, owners) = if out.gathers {
         (
@@ -315,7 +324,7 @@ pub(super) fn band_mix(
             &[
                 out.mix.0,
                 out.down.0,
-                scratch.scales.0,
+                scales.0,
                 rows as u64,
                 shared.config.num_experts_per_tok as u64,
                 out.width as u64,
@@ -383,6 +392,7 @@ pub(super) fn run_steered_band(
     down: &Step,
     input: Deviceptr,
     rows: usize,
+    plan_ready: bool,
 ) -> Result<(), BackendError> {
     let config = &shared.config;
     let schedule = &shared.plan.layers()[layer];
@@ -398,35 +408,47 @@ pub(super) fn run_steered_band(
             .map_or(Deviceptr(0), |index| shared.weights.get(*index).pointer)
     };
     let scale_2 = shared.experts[layer].as_ref();
-    let planned = rows >= PLANNED_BAND_ROWS;
+    let all_local = first == 0 && owned == config.n_routed_experts;
+    let planned_from = if all_local && owned <= 128 {
+        2
+    } else {
+        PLANNED_BAND_ROWS
+    };
+    let planned = rows >= planned_from;
     let max_items = owned.min(slots);
-    if planned {
+    if planned && !plan_ready {
         // The shares, and this rank's local id a slot (-1 for another rank's), then the plan: one
         // item an expert this rank holds, its slots in ascending order; another rank's slots are
-        // left out, and their zero shares keep the mix off their rows.
-        shared
-            .launch(
-                shared.kernels.band_shares,
-                (
-                    u32::try_from(slots.div_ceil(SHARES_BLOCK as usize)).unwrap_or(u32::MAX),
-                    1,
-                    1,
-                ),
-                (SHARES_BLOCK, 1, 1),
-                &[
-                    scratch.indices.0,
-                    scratch.shares.0,
-                    scratch.scales.0,
-                    slots as u64,
-                    first as u64,
-                    owned as u64,
-                    scratch.local.0,
-                ],
-            )
-            .map_err(device_error)?;
+        // left out, and their zero shares keep the mix off their rows. At TP=1 all experts are
+        // local, so `scratch.indices` is already rank-local and `band_shares` is skipped.
+        let plan_ids = if all_local {
+            scratch.indices.0
+        } else {
+            shared
+                .launch(
+                    shared.kernels.band_shares,
+                    (
+                        u32::try_from(slots.div_ceil(SHARES_BLOCK as usize)).unwrap_or(u32::MAX),
+                        1,
+                        1,
+                    ),
+                    (SHARES_BLOCK, 1, 1),
+                    &[
+                        scratch.indices.0,
+                        scratch.shares.0,
+                        scratch.scales.0,
+                        slots as u64,
+                        first as u64,
+                        owned as u64,
+                        scratch.local.0,
+                    ],
+                )
+                .map_err(device_error)?;
+            scratch.local.0
+        };
         // One item an expert, whatever its slot count.
         let plan = MoePlanCall::items(
-            scratch.local.0,
+            plan_ids,
             scratch.plan.0,
             (scratch.items.0, scratch.item_count.0),
             (slots, owned, top_k),
@@ -447,12 +469,21 @@ pub(super) fn run_steered_band(
                       outputs: usize,
                       columns: usize,
                       row_slots: usize,
-                      factor: Option<Deviceptr>|
+                      factor: Option<Deviceptr>,
+                      swiglu_caps: Option<(f32, f32)>|
      -> Result<(), BackendError> {
         let (band, items, tail) = match schedule.experts {
             ExpertBody::NvFp4 => (
-                shared.kernels.expert_nvfp4_band,
-                shared.kernels.expert_nvfp4_items,
+                if swiglu_caps.is_some() {
+                    shared.kernels.expert_nvfp4_band_swiglu
+                } else {
+                    shared.kernels.expert_nvfp4_band
+                },
+                if swiglu_caps.is_some() {
+                    shared.kernels.expert_nvfp4_items_swiglu
+                } else {
+                    shared.kernels.expert_nvfp4_items
+                },
                 factor
                     .ok_or_else(|| {
                         device_error(format!(
@@ -462,8 +493,16 @@ pub(super) fn run_steered_band(
                     .0,
             ),
             ExpertBody::MxFp8 => (
-                shared.kernels.expert_mxfp8_band,
-                shared.kernels.expert_mxfp8_items,
+                if swiglu_caps.is_some() {
+                    shared.kernels.expert_mxfp8_band_swiglu
+                } else {
+                    shared.kernels.expert_mxfp8_band
+                },
+                if swiglu_caps.is_some() {
+                    shared.kernels.expert_mxfp8_items_swiglu
+                } else {
+                    shared.kernels.expert_mxfp8_items
+                },
                 MXFP8_BLOCK as u64,
             ),
             ExpertBody::Bf16 => {
@@ -479,6 +518,34 @@ pub(super) fn run_steered_band(
             )));
         }
         if planned {
+            if let Some((gate_cap, up_cap)) = swiglu_caps {
+                return shared
+                    .launch(
+                        items,
+                        (
+                            pair_grid(outputs),
+                            u32::try_from(max_items).map_err(device_error)?,
+                            1,
+                        ),
+                        (ELEMENT_BLOCK, 1, 1),
+                        &[
+                            weight(step, 0).0,
+                            weight(step, 1).0,
+                            input.0,
+                            out.0,
+                            outputs as u64,
+                            columns as u64,
+                            tail,
+                            scratch.plan.0,
+                            scratch.items.0,
+                            scratch.item_count.0,
+                            row_slots as u64,
+                            bits(gate_cap),
+                            bits(up_cap),
+                        ],
+                    )
+                    .map_err(device_error);
+            }
             return shared
                 .launch(
                     items,
@@ -500,6 +567,34 @@ pub(super) fn run_steered_band(
                         scratch.items.0,
                         scratch.item_count.0,
                         row_slots as u64,
+                    ],
+                )
+                .map_err(device_error);
+        }
+        if let Some((gate_cap, up_cap)) = swiglu_caps {
+            return shared
+                .launch(
+                    band,
+                    (
+                        outputs.div_ceil(BAND_ROWS) as u32,
+                        u32::try_from(slots).map_err(device_error)?,
+                        1,
+                    ),
+                    (ELEMENT_BLOCK, 1, 1),
+                    &[
+                        weight(step, 0).0,
+                        weight(step, 1).0,
+                        input.0,
+                        out.0,
+                        outputs as u64,
+                        columns as u64,
+                        tail,
+                        scratch.indices.0,
+                        first as u64,
+                        owned as u64,
+                        row_slots as u64,
+                        bits(gate_cap),
+                        bits(up_cap),
                     ],
                 )
                 .map_err(device_error);
@@ -529,18 +624,8 @@ pub(super) fn run_steered_band(
             )
             .map_err(device_error)
     };
-    projection(
-        gate_up,
-        input,
-        scratch.band,
-        2 * intermediate,
-        hidden,
-        top_k,
-        scale_2.map(|scale| scale.device_gate_up),
-    )?;
-    // Every slot's activation, owned or not: a slot another rank holds reads a stale band row,
-    // and its share below is zero. Under the row split it is this rank's run of every slot's
-    // columns, which the gather joins into whole rows before the down projection.
+    // Fused gate_up + softcapped SwiGLU writes activated slots directly, skipping the separate
+    // inkling_softcapped_swiglu launch and halving gate_up global stores.
     let out = BandOut::of(shared, scratch, rows);
     let activated = if out.gathers {
         scratch
@@ -549,24 +634,19 @@ pub(super) fn run_steered_band(
     } else {
         scratch.activation
     };
-    shared
-        .launch(
-            shared.kernels.swiglu,
-            (
-                flat(intermediate),
-                u32::try_from(slots).map_err(device_error)?,
-                1,
-            ),
-            (ELEMENT_BLOCK, 1, 1),
-            &[
-                scratch.band.0,
-                activated.0,
-                intermediate as u64,
-                bits(config.mlp_gate_softcap as f32),
-                bits(config.mlp_up_softcap as f32),
-            ],
-        )
-        .map_err(device_error)?;
+    projection(
+        gate_up,
+        input,
+        activated,
+        2 * intermediate,
+        hidden,
+        top_k,
+        scale_2.map(|scale| scale.device_gate_up),
+        Some((
+            config.mlp_gate_softcap as f32,
+            config.mlp_up_softcap as f32,
+        )),
+    )?;
     if out.gathers {
         gather_runs(
             shared,
@@ -585,7 +665,11 @@ pub(super) fn run_steered_band(
         shape.columns,
         1,
         scale_2.map(|scale| scale.device_down),
+        None,
     )?;
+    if all_local {
+        return band_mix_with(shared, scratch, scratch.shares, rows);
+    }
     if planned {
         return band_mix(shared, scratch, rows);
     }
@@ -650,6 +734,16 @@ pub(super) fn project(
     if route_bf16(policy, width, inner, rows) == Route::Wide {
         return shared
             .wide(weight, input, out, width, inner, rows)
+            .map_err(device_error);
+    }
+    if walk == PrefillWalk::Tensor
+        && rows > BATCH_ROWS
+        && width > 0
+        && width <= 32
+        && inner.is_multiple_of(8)
+    {
+        return shared
+            .skinny(weight, input, out, width, inner, rows)
             .map_err(device_error);
     }
     // The whole groups of eight in one launch along the grid's y, then the remainder: each group
@@ -883,6 +977,54 @@ impl ResidualChain {
         }
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn residual_norm(
+        &mut self,
+        shared: &Shared,
+        summaries: Deviceptr,
+        partial: Deviceptr,
+        queries: Deviceptr,
+        count: usize,
+        weights: [Deviceptr; 3],
+        outs: [Deviceptr; 3],
+        carry: Deviceptr,
+        blocks: usize,
+        rows: usize,
+        summary_stride: usize,
+    ) -> Result<(), String> {
+        let carried = match self.carried {
+            Some((scored, over)) if scored == queries => over.min(blocks),
+            _ => 0,
+        };
+        let in_order = self.calls.get(self.next) == Some(&(queries, count));
+        let next = if in_order {
+            self.calls.get(self.next + 1).copied()
+        } else {
+            None
+        };
+        shared.block_residual_chain_norm(
+            summaries,
+            partial,
+            queries,
+            carry,
+            next,
+            weights,
+            outs,
+            blocks,
+            count,
+            carried,
+            rows,
+            summary_stride,
+        )?;
+        if in_order {
+            self.next += 1;
+        }
+        if let Some((queries, _)) = next {
+            self.carried = Some((queries, blocks));
+        }
+        Ok(())
+    }
 }
 
 /// The chunk schedule's steps, run by the walk that [ChunkRun::begin] opened.
@@ -983,6 +1125,12 @@ pub(super) struct ChunkRun {
     /// Whether this layer's band already gathered its mix rows into `mixed` (run_band_halves),
     /// which is then what its ExpertDelta collective would have done.
     band_gathered: bool,
+    /// How many summary blocks the prelude left, on a looped release's first pass.
+    loop_blocks: Option<usize>,
+    /// First summary block of the previous pass (`num_pre_loop_blocks + 1`) and how many summary
+    /// rows it left for `inkling_cross_pass` to read directly from `chunk.summaries`.
+    loop_prev_start: usize,
+    loop_prev_count: usize,
 }
 
 impl ChunkRun {
@@ -1086,13 +1234,34 @@ impl ChunkRun {
                 .iter()
                 .zip(&offsets)
                 .filter_map(|(segment, &first)| {
-                    segment.taps.map(|sink| (sink, first, segment.rows))
+                    segment.taps.clone().map(|sink| (sink, first, segment.rows))
                 })
                 .collect(),
             _ => taps.map(|sink| (sink, 0, rows)).into_iter().collect(),
         };
         let chain = (shared.residual_chain && rows > RESIDUAL_SPLIT_PAIRS)
             .then(|| ResidualChain::new(schedule, &shared.weights));
+        // Pre-upload the per-row tau scale table before any GPU kernels are queued, avoiding a
+        // pageable HtoD stream drain mid-walk at the first full layer.
+        let uploaded_tau = if matches!(sequences, Rows::Segments(_) | Rows::Chunk(_)) {
+            if let Some(rule) = schedule
+                .layers()
+                .iter()
+                .map(|layer| layer.tau)
+                .find(|&rule| rule != TauRule::One)
+            {
+                let taus: Vec<f32> = row_positions.iter().map(|&at| rule.at(at)).collect();
+                shared
+                    .cuda
+                    .copy_htod(&chunk.scratch.taus, &row_bytes(&taus))
+                    .map_err(device_error)?;
+                Some(rule)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(Self {
             shared: Arc::clone(shared),
             sequences,
@@ -1107,11 +1276,14 @@ impl ChunkRun {
             offsets,
             sinks,
             chain,
-            uploaded_tau: None,
+            uploaded_tau,
             blocks: 0,
             cursor: 0,
             previous_conv: None,
             band_gathered: false,
+            loop_blocks: None,
+            loop_prev_start: 0,
+            loop_prev_count: 0,
         })
     }
 
@@ -1137,24 +1309,45 @@ impl ChunkRun {
                     // rows with the zeros the other ranks contribute.
                     let rank_vocab = plan.rank_vocab();
                     let first = plan.tp().rank() * rank_vocab;
-                    run(shared
-                        .cuda
-                        .memset_d8_async(scratch.x, 0, rows * hidden * std::mem::size_of::<f32>())
-                        .map_err(|error| error.to_string()))?;
                     let embed =
                         Embed::new(shared.kernels.embed, weight(step.weights[0]), hidden, 1)?;
-                    for (row, token) in tokens.iter().enumerate() {
-                        let Some(local) = (*token as usize)
-                            .checked_sub(first)
-                            .filter(|local| *local < rank_vocab)
-                        else {
-                            continue;
-                        };
-                        embed.row(
-                            shared,
-                            scratch.x.offset(row * embed.width() * 4),
-                            local as u32,
-                        )?;
+                    if rows > 1
+                        && rows <= MAX_GRID_Y as usize
+                        && first == 0
+                        && shared.config.num_experts_per_tok >= 1
+                        && tokens.iter().all(|&token| (token as usize) < rank_vocab)
+                    {
+                        let mut bytes = Vec::with_capacity(rows * 4);
+                        for &token in tokens {
+                            bytes.extend_from_slice(&token.to_le_bytes());
+                        }
+                        run(shared
+                            .cuda
+                            .copy_htod(&scratch.local, &bytes)
+                            .map_err(|error| error.to_string()))?;
+                        embed.rows(shared, scratch.x, scratch.local, rows)?;
+                    } else {
+                        run(shared
+                            .cuda
+                            .memset_d8_async(
+                                scratch.x,
+                                0,
+                                rows * hidden * std::mem::size_of::<f32>(),
+                            )
+                            .map_err(|error| error.to_string()))?;
+                        for (row, token) in tokens.iter().enumerate() {
+                            let Some(local) = (*token as usize)
+                                .checked_sub(first)
+                                .filter(|local| *local < rank_vocab)
+                            else {
+                                continue;
+                            };
+                            embed.row(
+                                shared,
+                                scratch.x.offset(row * embed.width() * 4),
+                                local as u32,
+                            )?;
+                        }
                     }
                 }
                 (Op::Collective(Collective::EmbeddingRow), _) => {
@@ -1242,6 +1435,39 @@ impl ChunkRun {
             .get(index)
             .ok_or_else(|| device_error(format!("the chunk schedule has no layer {index}")))?;
         let to = to.min(layer.steps.len());
+        // A looped release restarts each pass after the first from the prelude's stream, exactly
+        // as the row walk does. A verify's rows carry one message each: the summaries and the
+        // gate are per row.
+        if from == 0
+            && let Some(loop_plan) = config.loop_plan
+            && layer.stored == loop_plan.core_start
+        {
+            let byte = hidden * std::mem::size_of::<f32>();
+            if layer.pass == 0 {
+                run(shared
+                    .cuda
+                    .copy_dtod(&scratch.loop_saved, &scratch.x, rows * byte)
+                    .map_err(|error| error.to_string()))?;
+                self.loop_blocks = Some(blocks);
+            } else {
+                let depth = self.loop_blocks.unwrap_or(0);
+                let start = depth + 1;
+                self.loop_prev_start = start;
+                self.loop_prev_count = blocks.saturating_sub(start);
+                run(shared
+                    .cuda
+                    .copy_dtod(&scratch.loop_prev_hidden, &scratch.x, rows * byte)
+                    .map_err(|error| error.to_string()))?;
+                run(shared
+                    .cuda
+                    .copy_dtod(&scratch.x, &scratch.loop_saved, rows * byte)
+                    .map_err(|error| error.to_string()))?;
+                blocks = depth;
+                if let Some(chain) = chain.as_mut() {
+                    chain.carried = None;
+                }
+            }
+        }
         // A layer's per-row scale table: null for a layer that does not scale (its kernels take the
         // scalar `tau`, 1 at every position), otherwise the rule's factor at each row's position.
         // The full layers share one rule, so the table goes up once a walk: an upload from pageable
@@ -1263,14 +1489,14 @@ impl ChunkRun {
 
         if from == 0 {
             // The drafter's taps of this layer: every row's stream as the layer starts on it.
-            for &(sink, first, count) in sinks {
+            for (sink, first, count) in sinks {
                 if let Some(slot) = sink.slot(layer.index) {
                     sink.capture(
                         shared,
                         scratch
                             .x
-                            .offset(first * hidden * std::mem::size_of::<f32>()),
-                        count,
+                            .offset(*first * hidden * std::mem::size_of::<f32>()),
+                        *count,
                         slot,
                     )?;
                 }
@@ -1284,6 +1510,98 @@ impl ChunkRun {
             match (step.op, step.target) {
                 (Op::BlockResidual, Target::Input(ResidualInput::Attention)) => {
                     let queries = weight(step.weights[0]);
+                    if hidden <= RESIDUAL_NORM_MAX_HIDDEN && !trace_on() {
+                        if sliding {
+                            if let Some(norm_step) = layer.steps.get(cursor + 1)
+                                && norm_step.op == Op::RmsNorm
+                                && norm_step.target == Target::Norm(NormRole::Attention)
+                            {
+                                let ws = [weight(norm_step.weights[0]), Deviceptr(0), Deviceptr(0)];
+                                let outs = [scratch.q_in, Deviceptr(0), Deviceptr(0)];
+                                if let Some(chain) = chain.as_mut() {
+                                    run(chain.residual_norm(
+                                        shared,
+                                        chunk.summaries,
+                                        scratch.x,
+                                        queries,
+                                        1,
+                                        ws,
+                                        outs,
+                                        scratch.residual_stats,
+                                        blocks,
+                                        rows,
+                                        summary_stride,
+                                    ))?;
+                                } else {
+                                    run(shared.block_residual_norm(
+                                        chunk.summaries,
+                                        scratch.x,
+                                        queries,
+                                        scratch.residual_stats,
+                                        ws,
+                                        outs,
+                                        blocks,
+                                        1,
+                                        rows,
+                                        summary_stride,
+                                    ))?;
+                                }
+                                cursor += 2;
+                                continue;
+                            }
+                        } else if let Some([n_q, n_k, n_v]) =
+                            layer.steps.get(cursor + 1..cursor + 4)
+                            && matches!(
+                                (
+                                    (n_q.op, n_q.target),
+                                    (n_k.op, n_k.target),
+                                    (n_v.op, n_v.target),
+                                ),
+                                (
+                                    (Op::RmsNorm, Target::Norm(NormRole::Query)),
+                                    (Op::RmsNorm, Target::Norm(NormRole::Key)),
+                                    (Op::RmsNorm, Target::Norm(NormRole::Value)),
+                                )
+                            )
+                        {
+                            let ws = [
+                                weight(n_q.weights[0]),
+                                weight(n_k.weights[0]),
+                                weight(n_v.weights[0]),
+                            ];
+                            let outs = [scratch.q_in, scratch.k_in, scratch.v_in];
+                            if let Some(chain) = chain.as_mut() {
+                                run(chain.residual_norm(
+                                    shared,
+                                    chunk.summaries,
+                                    scratch.x,
+                                    queries,
+                                    3,
+                                    ws,
+                                    outs,
+                                    scratch.residual_stats,
+                                    blocks,
+                                    rows,
+                                    summary_stride,
+                                ))?;
+                            } else {
+                                run(shared.block_residual_norm(
+                                    chunk.summaries,
+                                    scratch.x,
+                                    queries,
+                                    scratch.residual_stats,
+                                    ws,
+                                    outs,
+                                    blocks,
+                                    3,
+                                    rows,
+                                    summary_stride,
+                                ))?;
+                            }
+                            cursor += 4;
+                            continue;
+                        }
+                    }
                     residual(
                         shared,
                         chunk,
@@ -1298,24 +1616,218 @@ impl ChunkRun {
                         rows,
                     )?;
                 }
+                (Op::MessageRead, _) => {
+                    run(shared.cross_pass(
+                        chunk.summaries,
+                        scratch.loop_prev_hidden,
+                        scratch.loop_messages,
+                        rows,
+                        self.loop_prev_start,
+                        self.loop_prev_count,
+                        summary_stride,
+                    ))?;
+                }
+                (Op::MessageGate(stream), _) => {
+                    let loop_plan = config.loop_plan.ok_or_else(|| {
+                        device_error(format!(
+                            "layer {index}: a message gate on a single-pass release"
+                        ))
+                    })?;
+                    let stored = layer.stored;
+                    let core = stored.saturating_sub(loop_plan.core_start);
+                    if matches!(stream, MessageStream::Query) {
+                        if let Some([g_q, n_q, g_k, n_k, g_v, n_v]) =
+                            layer.steps.get(cursor..cursor + 6)
+                        {
+                            if matches!(
+                                (
+                                    (g_q.op, g_q.target),
+                                    (n_q.op, n_q.target),
+                                    (g_k.op, g_k.target),
+                                    (n_k.op, n_k.target),
+                                    (g_v.op, g_v.target),
+                                    (n_v.op, n_v.target),
+                                ),
+                                (
+                                    (Op::MessageGate(MessageStream::Query), _),
+                                    (Op::RmsNorm, Target::Norm(NormRole::Query)),
+                                    (Op::MessageGate(MessageStream::Key), _),
+                                    (Op::RmsNorm, Target::Norm(NormRole::Key)),
+                                    (Op::MessageGate(MessageStream::Value), _),
+                                    (Op::RmsNorm, Target::Norm(NormRole::Value)),
+                                )
+                            ) {
+                                let src_stride = if sliding { hidden } else { 3 * hidden };
+                                let src_shifts = if sliding {
+                                    [0, 0, 0]
+                                } else {
+                                    [0, hidden, 2 * hidden]
+                                };
+                                let msg_shifts = [
+                                    (core * 4 + MessageStream::Query.index()) * hidden,
+                                    (core * 4 + MessageStream::Key.index()) * hidden,
+                                    (core * 4 + MessageStream::Value.index()) * hidden,
+                                ];
+                                run(shared.message_gate3(
+                                    scratch.rows,
+                                    [scratch.q_in, scratch.k_in, scratch.v_in],
+                                    scratch.loop_messages,
+                                    scratch.loop_gate_partials,
+                                    stored,
+                                    rows,
+                                    src_stride,
+                                    src_shifts,
+                                    hidden,
+                                    [0, 0, 0],
+                                    loop_plan.core_len() * 4 * hidden,
+                                    msg_shifts,
+                                    walk == PrefillWalk::Tensor,
+                                ))?;
+                                let w_q = weight(n_q.weights[0]);
+                                let w_k = weight(n_k.weights[0]);
+                                let w_v = weight(n_v.weights[0]);
+                                if hidden <= RESIDUAL_NORM_MAX_HIDDEN {
+                                    run(shared.rmsnorm3_small(
+                                        [scratch.q_in, scratch.k_in, scratch.v_in],
+                                        [w_q, w_k, w_v],
+                                        [scratch.q_in, scratch.k_in, scratch.v_in],
+                                        rows,
+                                        hidden,
+                                        3,
+                                    ))?;
+                                    cursor += 6;
+                                    continue;
+                                }
+                                let slab_bytes = (rows * hidden * std::mem::size_of::<f32>()) as u64;
+                                let gap_qk = scratch.k_in.0.saturating_sub(scratch.q_in.0);
+                                let gap_kv = scratch.v_in.0.saturating_sub(scratch.k_in.0);
+                                if w_q.0 == w_k.0
+                                    && w_k.0 == w_v.0
+                                    && scratch.k_in.0 == scratch.q_in.0 + slab_bytes
+                                    && scratch.v_in.0 == scratch.k_in.0 + slab_bytes
+                                {
+                                    run(shared.rmsnorm_rows(
+                                        scratch.q_in,
+                                        w_q,
+                                        scratch.q_in,
+                                        3 * rows,
+                                        hidden,
+                                        hidden,
+                                        hidden,
+                                    ))?;
+                                } else if rows == 1
+                                    && w_q.0 == w_k.0
+                                    && w_k.0 == w_v.0
+                                    && gap_qk > 0
+                                    && gap_qk == gap_kv
+                                    && gap_qk % 4 == 0
+                                {
+                                    let stride = (gap_qk / 4) as usize;
+                                    run(shared.rmsnorm_rows(
+                                        scratch.q_in,
+                                        w_q,
+                                        scratch.q_in,
+                                        3,
+                                        hidden,
+                                        stride,
+                                        stride,
+                                    ))?;
+                                } else {
+                                    run(shared.rmsnorm_rows(
+                                        scratch.q_in,
+                                        w_q,
+                                        scratch.q_in,
+                                        rows,
+                                        hidden,
+                                        hidden,
+                                        hidden,
+                                    ))?;
+                                    run(shared.rmsnorm_rows(
+                                        scratch.k_in,
+                                        w_k,
+                                        scratch.k_in,
+                                        rows,
+                                        hidden,
+                                        hidden,
+                                        hidden,
+                                    ))?;
+                                    run(shared.rmsnorm_rows(
+                                        scratch.v_in,
+                                        w_v,
+                                        scratch.v_in,
+                                        rows,
+                                        hidden,
+                                        hidden,
+                                        hidden,
+                                    ))?;
+                                }
+                                cursor += 6;
+                                continue;
+                            }
+                        }
+                    }
+                    // BlockResidual(Mlp) always writes 1 row per sequence row (stride `hidden`).
+                    // BlockResidual(Attention) writes 1 row on a sliding layer and 3 on a full
+                    // layer. Writing directly into `q_in`/`k_in`/`v_in` preserves `scratch.rows`
+                    // so sliding layers can gate query, key and value independently from row 0.
+                    let (src_stride, src_shift, dst) = match stream {
+                        MessageStream::Mlp => (hidden, 0, scratch.q_in),
+                        MessageStream::Query => (
+                            if sliding { hidden } else { 3 * hidden },
+                            0,
+                            scratch.q_in,
+                        ),
+                        MessageStream::Key => (
+                            if sliding { hidden } else { 3 * hidden },
+                            if sliding { 0 } else { hidden },
+                            scratch.k_in,
+                        ),
+                        MessageStream::Value => (
+                            if sliding { hidden } else { 3 * hidden },
+                            if sliding { 0 } else { 2 * hidden },
+                            scratch.v_in,
+                        ),
+                    };
+                    run(shared.message_gate(
+                        scratch.rows,
+                        dst,
+                        scratch.loop_messages,
+                        scratch.loop_gate_partials,
+                        stored,
+                        stream,
+                        rows,
+                        src_stride,
+                        src_shift,
+                        hidden,
+                        0,
+                        loop_plan.core_len() * 4 * hidden,
+                        (core * 4 + stream.index()) * hidden,
+                        walk == PrefillWalk::Tensor,
+                    ))?;
+                }
                 (Op::RmsNorm, Target::Norm(role)) => {
                     let gain = weight(step.weights[0]);
-                    let (source, destination, src_stride) = match (role, sliding) {
-                        (NormRole::Stream, _) => (scratch.x, scratch.q_in, hidden),
-                        (NormRole::Attention, _) => (scratch.rows, scratch.q_in, hidden),
-                        (NormRole::Query, false) => (scratch.rows, scratch.q_in, 3 * hidden),
-                        (NormRole::Key, false) => (
+                    let gated = layer.pass > 0;
+                    let (source, destination, src_stride) = match (role, sliding, gated) {
+                        (NormRole::Stream, _, _) => (scratch.x, scratch.q_in, hidden),
+                        (NormRole::Attention, _, false) => (scratch.rows, scratch.q_in, hidden),
+                        (NormRole::Query, _, true) => (scratch.q_in, scratch.q_in, hidden),
+                        (NormRole::Key, _, true) => (scratch.k_in, scratch.k_in, hidden),
+                        (NormRole::Value, _, true) => (scratch.v_in, scratch.v_in, hidden),
+                        (NormRole::Mlp, _, true) => (scratch.q_in, scratch.q_in, hidden),
+                        (NormRole::Query, false, false) => (scratch.rows, scratch.q_in, 3 * hidden),
+                        (NormRole::Key, false, false) => (
                             scratch.rows.offset(hidden * std::mem::size_of::<f32>()),
                             scratch.k_in,
                             3 * hidden,
                         ),
-                        (NormRole::Value, false) => (
+                        (NormRole::Value, false, false) => (
                             scratch.rows.offset(2 * hidden * std::mem::size_of::<f32>()),
                             scratch.v_in,
                             3 * hidden,
                         ),
-                        (NormRole::Mlp, _) => (scratch.rows, scratch.q_in, hidden),
-                        (other, _) => {
+                        (NormRole::Mlp, _, false) => (scratch.rows, scratch.q_in, hidden),
+                        (other, _, _) => {
                             return Err(device_error(format!(
                                 "layer {index}: norm role {other:?} is not an input norm"
                             )));
@@ -1339,19 +1851,20 @@ impl ChunkRun {
                     // A projection's inner width is the width its weight multiplies: the stream
                     // for every projection but the attention output's, which contracts the heads.
                     let attention_width = heads * head_dim;
+                    let separate_kv = !sliding || layer.pass > 0;
                     let io = |projection: Projection| match projection {
                         Projection::Query => Ok((scratch.q_in, scratch.q, attention_width, hidden)),
                         Projection::Gate => {
                             Ok((scratch.q_in, scratch.gate, attention_width, hidden))
                         }
                         Projection::Key => Ok((
-                            if sliding { scratch.q_in } else { scratch.k_in },
+                            if separate_kv { scratch.k_in } else { scratch.q_in },
                             scratch.k,
                             kv_width,
                             hidden,
                         )),
                         Projection::Value => Ok((
-                            if sliding { scratch.q_in } else { scratch.v_in },
+                            if separate_kv { scratch.v_in } else { scratch.q_in },
                             scratch.v,
                             kv_width,
                             hidden,
@@ -1378,10 +1891,69 @@ impl ChunkRun {
                     // projections are two launches rather than six. Each row's sums are its own
                     // launch's bits (Shared::gemv_fused).
                     if walk == PrefillWalk::Chunk && rows <= BATCH_ROWS {
-                        let mut parts = [(Deviceptr(0), Deviceptr(0), 0usize); GEMV_FUSED];
+                        if separate_kv && matches!(projection, Projection::Query) {
+                            if let Some([s_q, s_k, s_v, s_r, s_g, s_s]) =
+                                layer.steps.get(cursor..cursor + 6)
+                            {
+                                if matches!(
+                                    (
+                                        (s_q.op, s_q.target),
+                                        (s_k.op, s_k.target),
+                                        (s_v.op, s_v.target),
+                                        (s_r.op, s_r.target),
+                                        (s_g.op, s_g.target),
+                                        (s_s.op, s_s.target),
+                                    ),
+                                    (
+                                        (Op::Gemv, Target::Project(Projection::Query)),
+                                        (Op::Gemv, Target::Project(Projection::Key)),
+                                        (Op::Gemv, Target::Project(Projection::Value)),
+                                        (Op::Gemv, Target::Project(Projection::Relative)),
+                                        (Op::Gemv, Target::Project(Projection::Gate)),
+                                        (Op::Gemv, Target::Project(Projection::Sink)),
+                                    )
+                                ) {
+                                    let (in_k, out_k, width_k, inner_k) = io(Projection::Key)?;
+                                    let (in_v, out_v, width_v, inner_v) = io(Projection::Value)?;
+                                    let (_, out_r, width_r, _) = io(Projection::Relative)?;
+                                    let (_, out_g, width_g, _) = io(Projection::Gate)?;
+                                    let (_, out_s, width_s, _) = io(Projection::Sink)?;
+                                    let q_parts = [
+                                        (weight(s_q.weights[0]), out, width),
+                                        (weight(s_r.weights[0]), out_r, width_r),
+                                        (weight(s_g.weights[0]), out_g, width_g),
+                                        (weight(s_s.weights[0]), out_s, width_s),
+                                    ];
+                                    run(shared.gemv_fused(&q_parts, input, inner, rows))?;
+                                    project(
+                                        shared,
+                                        walk,
+                                        weight(s_k.weights[0]),
+                                        in_k,
+                                        out_k,
+                                        width_k,
+                                        inner_k,
+                                        rows,
+                                    )?;
+                                    project(
+                                        shared,
+                                        walk,
+                                        weight(s_v.weights[0]),
+                                        in_v,
+                                        out_v,
+                                        width_v,
+                                        inner_v,
+                                        rows,
+                                    )?;
+                                    cursor += 6;
+                                    continue;
+                                }
+                            }
+                        }
+                        let mut parts = [(Deviceptr(0), Deviceptr(0), 0usize); GEMV_FUSED_PACKED];
                         parts[0] = (matrix, out, width);
                         let mut fused = 1;
-                        while fused < GEMV_FUSED {
+                        while fused < GEMV_FUSED_PACKED {
                             let Some(next) = layer.steps.get(cursor + fused) else {
                                 break;
                             };
@@ -1402,12 +1974,166 @@ impl ChunkRun {
                             continue;
                         }
                     }
-                    project(shared, walk, matrix, input, out, width, inner, rows)?;
+                    if walk == PrefillWalk::Tensor
+                        && matches!(projection, Projection::AttentionOut)
+                        && route_bf16(Some(WidePolicy::INKLING_TENSOR), width, inner, rows)
+                            == Route::Wide
+                    {
+                        // Attention output is already exact BF16 widened to f32, so its remainder
+                        // plane is identically zero and head-only MMA produces the exact same bits
+                        // at half the tensor-core work.
+                        run(shared.wide_bf16a(matrix, input, out, width, inner, rows))?;
+                    } else {
+                        project(shared, walk, matrix, input, out, width, inner, rows)?;
+                    }
                     if index == 0 && matches!(projection, Projection::AttentionOut) {
                         probe(shared, "chunk attention_out", out, rows, width)?;
                     }
                 }
                 (Op::ShortConv, Target::Conv(slot)) => {
+                    // Fuse sliding-layer [ShortConv(Key), ShortConv(Value), KvStore] into one
+                    // launch (eliminating 2 launches/layer and intermediate k_next/v_next traffic).
+                    if matches!(slot, ConvSlot::Key) {
+                        if let Some([s_k, s_v, s_kv]) = layer.steps.get(cursor..cursor + 3) {
+                            if matches!(
+                                (
+                                    (s_k.op, s_k.target),
+                                    (s_v.op, s_v.target),
+                                    s_kv.op,
+                                ),
+                                (
+                                    (Op::ShortConv, Target::Conv(ConvSlot::Key)),
+                                    (Op::ShortConv, Target::Conv(ConvSlot::Value)),
+                                    Op::KvStore,
+                                )
+                            ) {
+                                let k_taps = weight(s_k.weights[0]);
+                                let v_taps = weight(s_v.weights[0]);
+                                let byte = std::mem::size_of::<f32>();
+                                match &sequences {
+                                    Rows::Lanes(states) => {
+                                        for (row, state) in states.iter().enumerate() {
+                                            let at = row * kv_width * byte;
+                                            let slot_pos = if sliding {
+                                                state.position % cache_rows.max(1)
+                                            } else {
+                                                state.position
+                                            };
+                                            run(shared.launch(
+                                                shared.kernels.short_conv_kv_decode,
+                                                (flat(kv_width), 1, 1),
+                                                (ELEMENT_BLOCK, 1, 1),
+                                                &[
+                                                    scratch.k.offset(at).0,
+                                                    scratch.v.offset(at).0,
+                                                    k_taps.0,
+                                                    v_taps.0,
+                                                    state.conv[index][0].0,
+                                                    state.conv[index][1].0,
+                                                    state.keys[index].0,
+                                                    state.values[index].0,
+                                                    slot_pos as u64,
+                                                    kv_width as u64,
+                                                    shared.kernel_width() as u64,
+                                                ],
+                                            ))?;
+                                        }
+                                        previous_conv = Some(ConvSlot::Value);
+                                        cursor += 3;
+                                        continue;
+                                    }
+                                    Rows::Segments(segments) => {
+                                        for (segment, &first) in segments.iter().zip(offsets) {
+                                            let at = first * kv_width * byte;
+                                            let state = &segment.state;
+                                            run(shared.launch(
+                                                shared.kernels.short_conv_kv_segment,
+                                                (flat(kv_width), 1, 1),
+                                                (ELEMENT_BLOCK, 1, 1),
+                                                &[
+                                                    scratch.k.offset(at).0,
+                                                    scratch.v.offset(at).0,
+                                                    k_taps.0,
+                                                    v_taps.0,
+                                                    state.conv[index][0].0,
+                                                    state.conv[index][1].0,
+                                                    segment.tails.at(index, 0).0,
+                                                    segment.tails.at(index, 1).0,
+                                                    state.keys[index].0,
+                                                    state.values[index].0,
+                                                    segment.rows as u64,
+                                                    state.position as u64,
+                                                    kv_width as u64,
+                                                    if sliding { cache_rows as u64 } else { 0 },
+                                                    shared.kernel_width() as u64,
+                                                ],
+                                            ))?;
+                                        }
+                                        previous_conv = Some(ConvSlot::Value);
+                                        cursor += 3;
+                                        continue;
+                                    }
+                                    Rows::Chunk(state) => {
+                                        if shared.kernel_width() == 4 {
+                                            let tiles = rows.div_ceil(CONV_CHUNK_TILE) as u32;
+                                            let k_out = if tiles == 1 {
+                                                state.conv[index][0].0
+                                            } else {
+                                                0
+                                            };
+                                            let v_out = if tiles == 1 {
+                                                state.conv[index][1].0
+                                            } else {
+                                                0
+                                            };
+                                            run(shared.launch(
+                                                shared.kernels.short_conv_kv_chunk,
+                                                (flat(kv_width), tiles, 1),
+                                                (ELEMENT_BLOCK, 1, 1),
+                                                &[
+                                                    scratch.k.0,
+                                                    scratch.v.0,
+                                                    k_taps.0,
+                                                    v_taps.0,
+                                                    state.conv[index][0].0,
+                                                    state.conv[index][1].0,
+                                                    k_out,
+                                                    v_out,
+                                                    state.keys[index].0,
+                                                    state.values[index].0,
+                                                    rows as u64,
+                                                    position as u64,
+                                                    kv_width as u64,
+                                                    if sliding { cache_rows as u64 } else { 0 },
+                                                ],
+                                            ))?;
+                                            if tiles > 1 {
+                                                run(shared.conv_history(
+                                                    scratch.k.offset(
+                                                        (rows - history) * kv_width * byte,
+                                                    ),
+                                                    state.conv[index][0],
+                                                    kv_width,
+                                                    false,
+                                                ))?;
+                                                run(shared.conv_history(
+                                                    scratch.v.offset(
+                                                        (rows - history) * kv_width * byte,
+                                                    ),
+                                                    state.conv[index][1],
+                                                    kv_width,
+                                                    false,
+                                                ))?;
+                                            }
+                                            previous_conv = Some(ConvSlot::Value);
+                                            cursor += 3;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let taps = weight(step.weights[0]);
                     let (input, out, channels) = match slot {
                         ConvSlot::Key => (scratch.k, scratch.k_next, kv_width),
@@ -1416,8 +2142,51 @@ impl ChunkRun {
                         ConvSlot::Mlp => (scratch.mixed, scratch.mixed_conv, hidden),
                     };
                     let slot_index = conv_slot(slot);
+                    let fuse_add = !trace_on()
+                        && matches!(slot, ConvSlot::Attention | ConvSlot::Mlp)
+                        && matches!(
+                            layer.steps.get(cursor + 1),
+                            Some(next) if next.op == Op::ResidualAdd
+                        );
                     match &sequences {
                         Rows::Chunk(state) => {
+                            if fuse_add && shared.kernel_width() == 4 {
+                                let tiles = rows.div_ceil(CONV_CHUNK_TILE) as u32;
+                                let state_out = if tiles == 1 {
+                                    state.conv[index][slot_index].0
+                                } else {
+                                    0
+                                };
+                                run(shared.launch(
+                                    shared.kernels.short_conv_chunk_add,
+                                    (flat(channels), tiles, 1),
+                                    (ELEMENT_BLOCK, 1, 1),
+                                    &[
+                                        input.0,
+                                        taps.0,
+                                        state.conv[index][slot_index].0,
+                                        state_out,
+                                        scratch.x.0,
+                                        rows as u64,
+                                        channels as u64,
+                                    ],
+                                ))?;
+                                if tiles > 1 {
+                                    run(shared.conv_history(
+                                        input.offset(
+                                            (rows - history)
+                                                * channels
+                                                * std::mem::size_of::<f32>(),
+                                        ),
+                                        state.conv[index][slot_index],
+                                        channels,
+                                        false,
+                                    ))?;
+                                }
+                                previous_conv = None;
+                                cursor += 2;
+                                continue;
+                            }
                             // The seam: this slot's history in the row layout the chunk reads,
                             // and the tail this launch leaves back in the layout the next decode
                             // step reads.
@@ -1448,19 +2217,36 @@ impl ChunkRun {
                             ))?;
                         }
                         Rows::Segments(segments) => {
+                            let byte = std::mem::size_of::<f32>();
                             for (segment, &first) in segments.iter().zip(offsets) {
                                 let tail = segment.tails.at(index, slot_index);
-                                segment_input(
-                                    shared, chunk, segment, index, slot_index, first, channels,
-                                )?;
-                                run(shared.short_conv_rows(
-                                    tail,
-                                    taps,
-                                    out.offset(first * channels * std::mem::size_of::<f32>()),
-                                    segment.rows,
-                                    channels,
-                                    history,
+                                let at = first * channels * byte;
+                                let residual_ptr = if fuse_add {
+                                    scratch.x.offset(at).0
+                                } else {
+                                    0
+                                };
+                                run(shared.launch(
+                                    shared.kernels.short_conv_segment,
+                                    (flat(channels), 1, 1),
+                                    (ELEMENT_BLOCK, 1, 1),
+                                    &[
+                                        input.offset(at).0,
+                                        taps.0,
+                                        segment.state.conv[index][slot_index].0,
+                                        tail.0,
+                                        out.offset(at).0,
+                                        residual_ptr,
+                                        segment.rows as u64,
+                                        channels as u64,
+                                        shared.kernel_width() as u64,
+                                    ],
                                 ))?;
+                            }
+                            if fuse_add {
+                                previous_conv = None;
+                                cursor += 2;
+                                continue;
                             }
                         }
                         Rows::Lanes(states) => {
@@ -1468,19 +2254,40 @@ impl ChunkRun {
                             // it, so each row takes the decode step's launch on its lane's state.
                             for (row, state) in states.iter().enumerate() {
                                 let at = row * channels * std::mem::size_of::<f32>();
-                                run(shared.launch(
-                                    shared.kernels.short_conv,
-                                    (flat(channels), 1, 1),
-                                    (ELEMENT_BLOCK, 1, 1),
-                                    &[
-                                        input.offset(at).0,
-                                        taps.0,
-                                        state.conv[index][slot_index].0,
-                                        out.offset(at).0,
-                                        channels as u64,
-                                        shared.kernel_width() as u64,
-                                    ],
-                                ))?;
+                                if fuse_add {
+                                    run(shared.launch(
+                                        shared.kernels.short_conv_decode_add,
+                                        (flat(channels), 1, 1),
+                                        (ELEMENT_BLOCK, 1, 1),
+                                        &[
+                                            input.offset(at).0,
+                                            taps.0,
+                                            state.conv[index][slot_index].0,
+                                            scratch.x.offset(at).0,
+                                            channels as u64,
+                                            shared.kernel_width() as u64,
+                                        ],
+                                    ))?;
+                                } else {
+                                    run(shared.launch(
+                                        shared.kernels.short_conv,
+                                        (flat(channels), 1, 1),
+                                        (ELEMENT_BLOCK, 1, 1),
+                                        &[
+                                            input.offset(at).0,
+                                            taps.0,
+                                            state.conv[index][slot_index].0,
+                                            out.offset(at).0,
+                                            channels as u64,
+                                            shared.kernel_width() as u64,
+                                        ],
+                                    ))?;
+                                }
+                            }
+                            if fuse_add {
+                                previous_conv = None;
+                                cursor += 2;
+                                continue;
                             }
                         }
                     }
@@ -1684,6 +2491,33 @@ impl ChunkRun {
                             let halves = split.map(|(rows, _)| rows).zip(Some(
                                 &mut half as &mut dyn FnMut(usize, usize) -> Result<(), String>,
                             ));
+                            let direct_bf16_out = split.is_none()
+                                && !trace_on()
+                                && walk == PrefillWalk::Tensor
+                                && shared.attention_mma_direct_f32(groups)
+                                && hidden.is_multiple_of(32)
+                                && (heads * head_dim).is_multiple_of(64)
+                                && matches!(
+                                    layer.steps.get(cursor + 1..cursor + 3),
+                                    Some([widen, proj])
+                                        if widen.op == Op::Widen
+                                            && matches!(
+                                                (proj.op, proj.target),
+                                                (Op::Gemv, Target::Project(Projection::AttentionOut))
+                                            )
+                                );
+                            let fuse_widen = !direct_bf16_out
+                                && split.is_none()
+                                && shared.attention_mma_direct_f32(groups)
+                                && matches!(
+                                    layer.steps.get(cursor + 1),
+                                    Some(next) if next.op == Op::Widen
+                                );
+                            let (out_bf16, out_f32) = if fuse_widen {
+                                (Deviceptr(0), scratch.attn)
+                            } else {
+                                (scratch.attn_bf16, Deviceptr(0))
+                            };
                             run(shared.attention_chunk(
                                 scratch,
                                 index,
@@ -1696,7 +2530,8 @@ impl ChunkRun {
                                 bank,
                                 scratch.sink,
                                 clips,
-                                scratch.attn_bf16,
+                                out_bf16,
+                                out_f32,
                                 taus,
                                 rows,
                                 position,
@@ -1715,6 +2550,23 @@ impl ChunkRun {
                                 cursor += 4;
                                 continue;
                             }
+                            if direct_bf16_out {
+                                let proj_weight = weight(layer.steps[cursor + 2].weights[0]);
+                                run(shared.dense_bf16_mma(
+                                    proj_weight,
+                                    scratch.attn_bf16,
+                                    scratch.delta,
+                                    hidden,
+                                    heads * head_dim,
+                                    rows,
+                                ))?;
+                                cursor += 3;
+                                continue;
+                            }
+                            if fuse_widen {
+                                cursor += 2;
+                                continue;
+                            }
                         }
                         Rows::Segments(segments) => {
                             // Each segment's rows as its verify alone runs them: the decode
@@ -1723,6 +2575,19 @@ impl ChunkRun {
                             let taus = tau_table(layer.tau)?;
                             let byte = std::mem::size_of::<f32>();
                             let query_width = heads * head_dim;
+                            let window = if sliding { layer.window } else { 0 };
+                            let fuse_widen = matches!(
+                                layer.steps.get(cursor + 1),
+                                Some(next) if next.op == Op::Widen
+                            ) && segments.iter().all(|segment| {
+                                shared.attention_direct_f32(
+                                    scratch,
+                                    sliding,
+                                    groups,
+                                    window,
+                                    segment.rows,
+                                )
+                            });
                             for (segment, &first) in segments.iter().zip(offsets) {
                                 let state = &segment.state;
                                 let at = state.position;
@@ -1731,7 +2596,15 @@ impl ChunkRun {
                                 } else {
                                     taus.offset(first * byte)
                                 };
-                                run(shared.attention_rows(
+                                let (out_bf16, out_f32) = if fuse_widen {
+                                    (Deviceptr(0), scratch.attn.offset(first * query_width * byte))
+                                } else {
+                                    (
+                                        scratch.attn_bf16.offset(first * query_width * 2),
+                                        Deviceptr(0),
+                                    )
+                                };
+                                run(shared.attention_rows_f32(
                                     scratch,
                                     index,
                                     scratch.q.offset(first * query_width * byte),
@@ -1743,17 +2616,22 @@ impl ChunkRun {
                                     bank,
                                     scratch.sink.offset(first * heads * byte),
                                     clips,
-                                    scratch.attn_bf16.offset(first * query_width * 2),
+                                    out_bf16,
+                                    out_f32,
                                     segment_taus,
                                     segment.rows,
                                     at,
                                     kv_heads,
                                     groups,
-                                    if sliding { layer.window } else { 0 },
+                                    window,
                                     if sliding { cache_rows } else { 0 },
                                     layer.rel_extent,
                                     layer.tau.at(at),
                                 ))?;
+                            }
+                            if fuse_widen {
+                                cursor += 2;
+                                continue;
                             }
                         }
                         Rows::Lanes(states) => {
@@ -1762,9 +2640,30 @@ impl ChunkRun {
                             // so the pass a key falls in is the one its decode step would use.
                             let byte = std::mem::size_of::<f32>();
                             let query_width = heads * head_dim;
+                            let window = if sliding { layer.window } else { 0 };
+                            let fuse_widen = matches!(
+                                layer.steps.get(cursor + 1),
+                                Some(next) if next.op == Op::Widen
+                            ) && states.iter().all(|state| {
+                                shared.attention_direct_f32(
+                                    &state.scratch,
+                                    sliding,
+                                    groups,
+                                    window,
+                                    1,
+                                )
+                            });
                             for (row, state) in states.iter().enumerate() {
                                 let at = state.position;
-                                run(shared.attention_rows(
+                                let (out_bf16, out_f32) = if fuse_widen {
+                                    (Deviceptr(0), scratch.attn.offset(row * query_width * byte))
+                                } else {
+                                    (
+                                        scratch.attn_bf16.offset(row * query_width * 2),
+                                        Deviceptr(0),
+                                    )
+                                };
+                                run(shared.attention_rows_f32(
                                     &state.scratch,
                                     index,
                                     scratch.q.offset(row * query_width * byte),
@@ -1776,17 +2675,22 @@ impl ChunkRun {
                                     bank,
                                     scratch.sink.offset(row * heads * byte),
                                     clips,
-                                    scratch.attn_bf16.offset(row * query_width * 2),
+                                    out_bf16,
+                                    out_f32,
                                     Deviceptr(0),
                                     1,
                                     at,
                                     plan.rank_kv_heads(),
                                     groups,
-                                    if sliding { layer.window } else { 0 },
+                                    window,
                                     if sliding { cache_rows } else { 0 },
                                     layer.rel_extent,
                                     layer.tau.at(at),
                                 ))?;
+                            }
+                            if fuse_widen {
+                                cursor += 2;
+                                continue;
                             }
                         }
                     }
@@ -1861,6 +2765,48 @@ impl ChunkRun {
                 }
                 (Op::BlockResidual, Target::Input(ResidualInput::Mlp)) => {
                     let queries = weight(step.weights[0]);
+                    if hidden <= RESIDUAL_NORM_MAX_HIDDEN
+                        && !trace_on()
+                        && let Some(norm_step) = layer.steps.get(cursor + 1)
+                        && norm_step.op == Op::RmsNorm
+                        && norm_step.target == Target::Norm(NormRole::Mlp)
+                    {
+                        let ws = [weight(norm_step.weights[0]), Deviceptr(0), Deviceptr(0)];
+                        let outs = [scratch.q_in, Deviceptr(0), Deviceptr(0)];
+                        if let Some(chain) = chain.as_mut() {
+                            run(chain.residual_norm(
+                                shared,
+                                chunk.summaries,
+                                scratch.x,
+                                queries,
+                                1,
+                                ws,
+                                outs,
+                                scratch.residual_stats,
+                                blocks,
+                                rows,
+                                summary_stride,
+                            ))?;
+                        } else {
+                            run(shared.block_residual_norm(
+                                chunk.summaries,
+                                scratch.x,
+                                queries,
+                                scratch.residual_stats,
+                                ws,
+                                outs,
+                                blocks,
+                                1,
+                                rows,
+                                summary_stride,
+                            ))?;
+                        }
+                        if index == 0 {
+                            probe(shared, "chunk mlp_norm", scratch.q_in, rows, hidden)?;
+                        }
+                        cursor += 2;
+                        continue;
+                    }
                     residual(
                         shared,
                         chunk,
@@ -1877,6 +2823,49 @@ impl ChunkRun {
                 }
                 (Op::Router, _) => {
                     let bias = weight(step.weights[0]);
+                    let (first_exp, owned_exp) = shared.plan.expert_range();
+                    let all_local = first_exp == 0 && owned_exp == config.n_routed_experts;
+                    let fuse_router_plan = !trace_on()
+                        && all_local
+                        && (2..=8).contains(&rows)
+                        && owned_exp <= 128
+                        && config.num_experts_per_tok <= 16
+                        && layer.experts != ExpertBody::Bf16
+                        && walk != PrefillWalk::Tensor
+                        && matches!(
+                            layer.steps.get(cursor + 1),
+                            Some(next)
+                                if (next.op, next.target)
+                                    == (Op::ExpertGateUp, Target::Band(BandOp::GateUp))
+                        );
+                    if fuse_router_plan {
+                        let gate_up = &layer.steps[cursor + 1];
+                        let down = &layer.steps[cursor + 3];
+                        let max_items = owned_exp.min(rows * config.num_experts_per_tok);
+                        run(shared.router_plan_small(
+                            scratch.router_logits,
+                            bias,
+                            scratch.indices,
+                            scratch.shares,
+                            scratch.plan,
+                            scratch.items,
+                            scratch.item_count,
+                            rows,
+                            max_items,
+                        ))?;
+                        run_steered_band(
+                            shared,
+                            scratch,
+                            layer.index,
+                            gate_up,
+                            down,
+                            scratch.q_in,
+                            rows,
+                            true,
+                        )?;
+                        cursor += 5;
+                        continue;
+                    }
                     run(shared.router_rows(
                         scratch.router_logits,
                         bias,
@@ -1967,7 +2956,20 @@ impl ChunkRun {
 
     /// The epilogue over the answered rows and their logits read back: a chunk's last row, every
     /// lane's or every segment's row. The caller moves its sequences' positions on.
-    pub(super) fn finish(mut self) -> Result<Vec<Vec<f32>>, BackendError> {
+    pub(super) fn finish(self) -> Result<Vec<Vec<f32>>, BackendError> {
+        self.finish_inner(false).map(|(rows, _)| rows)
+    }
+
+    /// Greedy-only epilogue: computes softcapped BF16 argmax directly on the device and copies
+    /// back only one `u32` token id per answered row instead of the full vocabulary.
+    pub(super) fn finish_picks(self) -> Result<Vec<u32>, BackendError> {
+        self.finish_inner(true).map(|(_, picks)| picks)
+    }
+
+    fn finish_inner(
+        mut self,
+        argmax_only: bool,
+    ) -> Result<(Vec<Vec<f32>>, Vec<u32>), BackendError> {
         let mut chain = self.chain.take();
         let blocks = self.blocks;
         let shared: &Shared = &self.shared;
@@ -1994,11 +2996,47 @@ impl ChunkRun {
         let padded = rank_vocab * shared.exchange.world();
         let unpadded = config.unpadded_vocab_size.min(padded).max(1);
         let mut output_queries: Option<Deviceptr> = None;
-        for step in schedule.epilogue() {
+        let epilogue = schedule.epilogue();
+        let mut ei = 0usize;
+        while ei < epilogue.len() {
+            let step = &epilogue[ei];
             match (step.op, step.target) {
                 (Op::BlockResidual, Target::Input(ResidualInput::Output)) => {
                     let queries = weight(step.weights[0]);
                     output_queries = Some(queries);
+                    if chain.is_none()
+                        && hidden <= RESIDUAL_NORM_MAX_HIDDEN
+                        && answers == rows
+                        && let Some(norm_step) = epilogue.get(ei + 1)
+                        && norm_step.op == Op::RmsNorm
+                        && norm_step.target == Target::Norm(NormRole::Final)
+                    {
+                        let gain = weight(norm_step.weights[0]);
+                        run(shared.block_residual_norm(
+                            chunk.summaries.offset(first * summary_stride * byte),
+                            scratch.x.offset(first * hidden * byte),
+                            queries,
+                            scratch
+                                .residual_stats
+                                .offset(first * RESIDUAL_STATS_ROW * byte),
+                            [gain, Deviceptr(0), Deviceptr(0)],
+                            [scratch.final_row, Deviceptr(0), Deviceptr(0)],
+                            blocks,
+                            1,
+                            answers,
+                            summary_stride,
+                        ))?;
+                        for (sink, first_row, count) in sinks {
+                            sink.capture(
+                                shared,
+                                scratch.final_row.offset(*first_row * hidden * byte),
+                                *count,
+                                sink.final_slot(),
+                            )?;
+                        }
+                        ei += 2;
+                        continue;
+                    }
                     residual(
                         shared,
                         chunk,
@@ -2022,14 +3060,14 @@ impl ChunkRun {
                         answers,
                         hidden,
                     ))?;
-                    if let Some(&(sink, _, _)) = sinks.first() {
+                    if let Some((sink, _, _)) = sinks.first() {
                         if answers == rows {
-                            for &(sink, first, count) in sinks {
+                            for (sink, first, count) in sinks {
                                 sink.capture(
                                     shared,
-                                    scratch.final_row.offset(first * hidden * byte),
-                                    count,
-                                    FINAL_TAP,
+                                    scratch.final_row.offset(*first * hidden * byte),
+                                    *count,
+                                    sink.final_slot(),
                                 )?;
                             }
                         } else {
@@ -2053,7 +3091,7 @@ impl ChunkRun {
                                 rows,
                             )?;
                             run(shared.rmsnorm(scratch.q_in, gain, scratch.q_in, rows, hidden))?;
-                            sink.capture(shared, scratch.q_in, rows, FINAL_TAP)?;
+                            sink.capture(shared, scratch.q_in, rows, sink.final_slot())?;
                         }
                     }
                 }
@@ -2084,32 +3122,76 @@ impl ChunkRun {
                     }
                 }
                 (Op::Collective(Collective::LogitSlice), _) => {
-                    // A row's slices gather into that row's padded vocabulary, which is the layout
-                    // the softcap trims; one gather a row keeps each round the decode step's width.
-                    for answer in 0..answers {
-                        exchange_gather(
-                            shared,
-                            scratch.logits.offset(answer * rank_vocab * byte),
-                            scratch.logits_full.offset(answer * padded * byte),
-                            rank_vocab,
-                        )?;
+                    // On TP=1 `scratch.logits` already holds the full vocabulary; avoid copying
+                    // `answers * rank_vocab` floats to `logits_full`.
+                    if shared.exchange.world() > 1 {
+                        for answer in 0..answers {
+                            exchange_gather(
+                                shared,
+                                scratch.logits.offset(answer * rank_vocab * byte),
+                                scratch.logits_full.offset(answer * padded * byte),
+                                rank_vocab,
+                            )?;
+                        }
                     }
                 }
                 (Op::Collective(_), _) => {}
                 (Op::LogitSoftcap, _) => {
-                    run(shared.launch(
-                        shared.kernels.logit_softcap,
-                        (flat(unpadded), answers as u32, 1),
-                        (ELEMENT_BLOCK, 1, 1),
-                        &[
-                            scratch.logits_full.0,
-                            scratch.logits_bf16.0,
-                            answers as u64,
-                            padded as u64,
-                            unpadded as u64,
-                            bits(config.final_logit_softcap.unwrap_or(0.0) as f32),
-                        ],
-                    ))?;
+                    let logits_in = if shared.exchange.world() == 1 {
+                        scratch.logits
+                    } else {
+                        scratch.logits_full
+                    };
+                    let cap = bits(config.final_logit_softcap.unwrap_or(0.0) as f32);
+                    if argmax_only {
+                        let parts = unpadded.div_ceil(ELEMENT_BLOCK as usize * 8);
+                        let part_ids_off = (answers * parts * 4).next_multiple_of(16);
+                        let picks_off = (part_ids_off + answers * parts * 4).next_multiple_of(16);
+                        let part_vals = scratch.logits_bf16;
+                        let part_ids = scratch.logits_bf16.offset(part_ids_off);
+                        let picks_ptr = scratch.logits_bf16.offset(picks_off);
+                        run(shared.launch(
+                            shared.kernels.logit_softcap_argmax_part,
+                            (parts as u32, answers as u32, 1),
+                            (ELEMENT_BLOCK, 1, 1),
+                            &[
+                                logits_in.0,
+                                part_vals.0,
+                                part_ids.0,
+                                answers as u64,
+                                padded as u64,
+                                unpadded as u64,
+                                cap,
+                                parts as u64,
+                            ],
+                        ))?;
+                        run(shared.launch(
+                            shared.kernels.logit_softcap_argmax_reduce,
+                            (answers as u32, 1, 1),
+                            (ELEMENT_BLOCK, 1, 1),
+                            &[
+                                part_vals.0,
+                                part_ids.0,
+                                picks_ptr.0,
+                                answers as u64,
+                                parts as u64,
+                            ],
+                        ))?;
+                    } else {
+                        run(shared.launch(
+                            shared.kernels.logit_softcap,
+                            (flat(unpadded), answers as u32, 1),
+                            (ELEMENT_BLOCK, 1, 1),
+                            &[
+                                logits_in.0,
+                                scratch.logits_bf16.0,
+                                answers as u64,
+                                padded as u64,
+                                unpadded as u64,
+                                cap,
+                            ],
+                        ))?;
+                    }
                 }
                 (op, target) => {
                     return Err(device_error(format!(
@@ -2117,23 +3199,48 @@ impl ChunkRun {
                     )));
                 }
             }
+            ei += 1;
         }
 
         run(shared.cuda.synchronize().map_err(|error| error.to_string()))?;
         // As the decode step: a doorbell round that was given up is reported before a read-back.
         run(shared.exchange.check_device())?;
+        if argmax_only {
+            let parts = unpadded.div_ceil(ELEMENT_BLOCK as usize * 8);
+            let part_ids_off = (answers * parts * 4).next_multiple_of(16);
+            let picks_off = (part_ids_off + answers * parts * 4).next_multiple_of(16);
+            let mut bytes = vec![0u8; answers * 4];
+            run(shared
+                .cuda
+                .copy_dtoh(&mut bytes, &scratch.logits_bf16.offset(picks_off))
+                .map_err(|error| error.to_string()))?;
+            let picks: Vec<u32> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
+                .collect();
+            return Ok((Vec::new(), picks));
+        }
         let mut bytes = vec![0u8; answers * unpadded * 2];
         run(shared
             .cuda
             .copy_dtoh(&mut bytes, &scratch.logits_bf16)
             .map_err(|error| error.to_string()))?;
-        let values: Vec<f32> = bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair)))
-            .collect();
-        Ok(values.chunks(unpadded).map(<[f32]>::to_vec).collect())
+        let row_bytes = unpadded * 2;
+        let mut out = Vec::with_capacity(answers);
+        for chunk in bytes.chunks_exact(row_bytes) {
+            let mut row = Vec::with_capacity(unpadded);
+            row.extend(
+                chunk
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair))),
+            );
+            out.push(row);
+        }
+        Ok((out, Vec::new()))
     }
 }
 
@@ -2243,44 +3350,72 @@ fn run_band_mma(
     }
     let slots = rows * top_k;
     let elements = rows * hidden;
-    let items = grouped::items(slots, owned);
-    shared
-        .launch(
-            shared.kernels.band_shares,
-            (
-                u32::try_from(slots.div_ceil(SHARES_BLOCK as usize)).unwrap_or(u32::MAX),
-                1,
-                1,
-            ),
-            (SHARES_BLOCK, 1, 1),
-            &[
-                scratch.indices.0,
-                scratch.shares.0,
-                scratch.scales.0,
-                slots as u64,
-                first as u64,
-                owned as u64,
-                scratch.local.0,
-            ],
-        )
-        .map_err(device_error)?;
-    // The expert input's two bf16 planes go in the band buffer, which the pair walk's f32
-    // gate/up rows need and this walk does not.
-    shared
-        .launch(
-            shared.kernels.split_bf16,
-            (
-                (elements / 2)
-                    .div_ceil(grouped::THREADS as usize)
-                    .clamp(1, 4096) as u32,
-                1,
-                1,
-            ),
-            (grouped::THREADS, 1, 1),
-            &[scratch.q_in.0, scratch.band.0, elements as u64],
-        )
-        .map_err(device_error)?;
+    let all_local = first == 0 && owned == config.n_routed_experts;
     let out = BandOut::of(shared, scratch, rows);
+    let skip_band_shares = all_local && !out.gathers;
+    if !skip_band_shares {
+        shared
+            .launch(
+                shared.kernels.band_shares,
+                (
+                    u32::try_from(slots.div_ceil(SHARES_BLOCK as usize)).unwrap_or(u32::MAX),
+                    1,
+                    1,
+                ),
+                (SHARES_BLOCK, 1, 1),
+                &[
+                    scratch.indices.0,
+                    scratch.shares.0,
+                    scratch.scales.0,
+                    slots as u64,
+                    first as u64,
+                    owned as u64,
+                    scratch.local.0,
+                ],
+            )
+            .map_err(device_error)?;
+    }
+    let use_moe_64 = !out.gathers
+        && shared.planes == ActivationPlanes::Both
+        && rows >= 128
+        && hidden.is_multiple_of(grouped::K_STAGE)
+        && intermediate.is_multiple_of(grouped::GATE_UP_COLUMNS)
+        && down.rows.is_multiple_of(grouped::DOWN_COLUMNS)
+        && down.columns.is_multiple_of(grouped::K_STAGE);
+    // The expert input's two planes go in the band buffer, which the pair walk's f32
+    // gate/up rows need and this walk does not. NVFP4 BM=64 uses 2-plane FP16 (hardware E2M1x2
+    // decode, zero SMEM LUT); MXFP8 and the fallback BM=32 paths use 2-plane BF16.
+    if use_moe_64 && !mx8 {
+        shared
+            .launch(
+                shared.kernels.split_f16,
+                (
+                    (elements / 4)
+                        .div_ceil(grouped::THREADS as usize)
+                        .clamp(1, 4096) as u32,
+                    1,
+                    1,
+                ),
+                (grouped::THREADS, 1, 1),
+                &[scratch.q_in.0, scratch.band.0, elements as u64],
+            )
+            .map_err(device_error)?;
+    } else {
+        shared
+            .launch(
+                shared.kernels.split_bf16,
+                (
+                    (elements / 2)
+                        .div_ceil(grouped::THREADS as usize)
+                        .clamp(1, 4096) as u32,
+                    1,
+                    1,
+                ),
+                (grouped::THREADS, 1, 1),
+                &[scratch.q_in.0, scratch.band.0, elements as u64],
+            )
+            .map_err(device_error)?;
+    }
     if out.gathers
         && rows >= OVERLAP_ROWS
         && let Some(overlap) = shared.overlap.as_ref()
@@ -2300,13 +3435,28 @@ fn run_band_mma(
         run_band_halves(shared, scratch, &band, &overlap, rows)?;
         return Ok(true);
     }
+    let item_rows = if use_moe_64 {
+        MOE_64_ROWS
+    } else {
+        grouped::ITEM_ROWS
+    };
+    let items = if use_moe_64 {
+        slots.div_ceil(MOE_64_ROWS) + owned
+    } else {
+        grouped::items(slots, owned)
+    };
+    let plan_ids = if skip_band_shares {
+        scratch.indices.0
+    } else {
+        scratch.local.0
+    };
     // Another rank's slot is left out; its share is zero, so the mix skips its row.
     let plan = MoePlanCall::items(
-        scratch.local.0,
+        plan_ids,
         scratch.plan.0,
         (scratch.items.0, scratch.item_count.0),
         (slots, owned, top_k),
-        grouped::ITEM_ROWS,
+        item_rows,
         items,
     );
     let (grid, block) = MoePlanCall::launch();
@@ -2314,7 +3464,7 @@ fn run_band_mma(
         .launch(shared.kernels.moe_plan, grid, block, &plan.args())
         .map_err(device_error)?;
     let grid_items = u32::try_from(items).map_err(device_error)?;
-    // The SwiGLU rows' two bf16 planes fill the activation buffer's f32 rows exactly. Under the
+    // The SwiGLU rows' two planes fill the activation buffer's f32 rows exactly. Under the
     // row split they are this rank's run of every slot's columns, its planes together, so the
     // gather moves them as planes * slots rows of a run each (the head-only operand writes and
     // moves one plane).
@@ -2325,9 +3475,18 @@ fn run_band_mma(
     } else {
         scratch.activation
     };
+    let gate_up_launch = if use_moe_64 {
+        if mx8 {
+            shared.kernels.moe_gate_up_mx8_64
+        } else {
+            shared.kernels.moe_gate_up_64
+        }
+    } else {
+        gate_up_kernel
+    };
     shared
         .launch(
-            gate_up_kernel,
+            gate_up_launch,
             (
                 (intermediate / grouped::GATE_UP_COLUMNS) as u32,
                 grid_items,
@@ -2392,7 +3551,13 @@ fn run_band_mma(
             .launch(kernel, grid, (grouped::THREADS, 1, 1), &args)
             .map_err(device_error)?;
     } else {
-        let kernel = if mx8 {
+        let kernel = if use_moe_64 {
+            if mx8 {
+                shared.kernels.moe_down_mx8_64
+            } else {
+                shared.kernels.moe_down_64
+            }
+        } else if mx8 {
             shared.kernels.moe_down_mx8
         } else {
             shared.kernels.moe_down
@@ -2404,7 +3569,11 @@ fn run_band_mma(
             .map_err(device_error)?;
     }
     // The mix is local; the exchange that follows it completes the sum over the ranks.
-    band_mix(shared, scratch, rows)?;
+    if skip_band_shares {
+        band_mix_with(shared, scratch, scratch.shares, rows)?;
+    } else {
+        band_mix(shared, scratch, rows)?;
+    }
     Ok(false)
 }
 
@@ -2788,6 +3957,7 @@ fn run_band_chunk(
             down,
             scratch.q_in,
             rows,
+            false,
         );
     }
 

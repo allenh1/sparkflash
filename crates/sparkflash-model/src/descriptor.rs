@@ -107,6 +107,12 @@ pub const INKLING2_SMALL_ID: &str = "thinkingmachines/Inkling-2-Small";
 /// The control-plane weight selector for Inkling-2-Small (NVFP4).
 pub const INKLING2_SMALL_WEIGHTS_ID: &str = "inkling2-small-nvfp4";
 
+/// The served id of the Inkling-2-Mini checkpoint.
+pub const INKLING2_MINI_ID: &str = "thinkingmachines/Inkling-2-Mini";
+
+/// The control-plane weight selector for Inkling-2-Mini (NVFP4/MXFP8).
+pub const INKLING2_MINI_WEIGHTS_ID: &str = "inkling2-mini-nvfp4";
+
 /// The context window of the released Inkling-2-Small checkpoint.
 pub const INKLING2_CONTEXT_TOKENS: usize = 1_048_576;
 
@@ -132,6 +138,7 @@ pub const WEIGHT_IDS: &[&str] = &[
     GLM53_FLASH_WEIGHTS_ID,
     DORY1_0_4B_BF16_WEIGHTS_ID,
     INKLING2_SMALL_WEIGHTS_ID,
+    INKLING2_MINI_WEIGHTS_ID,
 ];
 
 /// The maximum context window of the released model.
@@ -287,6 +294,26 @@ impl ModelDescriptor {
         }
     }
 
+    /// The released thinkingmachines/Inkling-2-Mini descriptor.
+    ///
+    /// The looped release keeps Small's window and vocabulary and adds the shared core and the
+    /// message path; its shape is read from the checkpoint, so this descriptor states only the
+    /// identity and the capabilities it serves.
+    #[must_use]
+    pub fn inkling2_mini() -> Self {
+        Self {
+            id: INKLING2_MINI_ID.to_owned(),
+            family: "inkling2".to_owned(),
+            model_type: "inkling2_loop".to_owned(),
+            label: "Inkling".to_owned(),
+            weights_id: INKLING2_MINI_WEIGHTS_ID.to_owned(),
+            context_tokens: INKLING2_CONTEXT_TOKENS,
+            max_output_tokens: INKLING2_MAX_OUTPUT_TOKENS,
+            vocab_size: INKLING2_VOCAB_SIZE,
+            capabilities: Capabilities::ALL_WITH_VISION,
+        }
+    }
+
     /// The released zai-org/GLM-5.3-Flash descriptor.
     ///
     /// The vision tower is in the checkpoint but is not loaded, so vision is not declared. The
@@ -399,6 +426,7 @@ pub static MODELS: LazyLock<Vec<ModelDescriptor>> = LazyLock::new(|| {
         ModelDescriptor::glm53_flash(),
         ModelDescriptor::dory1_0_4b_bf16(),
         ModelDescriptor::inkling2_small(),
+        ModelDescriptor::inkling2_mini(),
     ]
 });
 

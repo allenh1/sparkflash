@@ -742,7 +742,8 @@ impl Pack {
             // The Inkling pack's host reference is the initial serving path; its device arm is
             // gated by the same catalogue once it lands.
             Some(pack)
-                if pack.has_weights(sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID) =>
+                if pack.has_weights(sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID)
+                    || pack.has_weights(sparkflash_model::descriptor::INKLING2_MINI_WEIGHTS_ID) =>
             {
                 return Vec::new();
             }
@@ -769,6 +770,10 @@ impl Pack {
 
     /// Whether this pack is Inkling-2-Small, whose `--rank` device group is its own path.
     pub(super) fn is_inkling(self) -> bool {
+        // The looped release shares the arm's group path; its text stack is the same.
+        if self.has_weights(sparkflash_model::descriptor::INKLING2_MINI_WEIGHTS_ID) {
+            return true;
+        }
         self.has_weights(sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID)
     }
 

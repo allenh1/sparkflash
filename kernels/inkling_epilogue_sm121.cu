@@ -152,6 +152,128 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_logit_so
     }
 }
 
+// Device-side softcapped greedy argmax stage 1: computes the exact same BF16-rounded softcapped
+// logit as inkling_logit_softcap and reduces each block's (max_val, min_id) to part_values/part_ids.
+// Grid: (ceil(unpadded_vocab / (INKLING_EPI_BLOCK * 8)), rows, 1), Block: INKLING_EPI_BLOCK (256).
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_logit_softcap_argmax_part(
+    const float* __restrict__ logits,
+    float* __restrict__ part_values,
+    unsigned int* __restrict__ part_ids,
+    int rows,
+    int padded_vocab,
+    int unpadded_vocab,
+    float cap,
+    int parts) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.y;
+    const int part = blockIdx.x;
+    if (row >= rows || part >= parts || unpadded_vocab > padded_vocab) {
+        return;
+    }
+    const float* source = logits + (uint64_t)row * padded_vocab;
+    const int start = part * INKLING_EPI_BLOCK * 8;
+    float best = -INFINITY;
+    unsigned int best_id = 0xFFFFFFFFu;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int entry = start + i * INKLING_EPI_BLOCK + (int)threadIdx.x;
+        if (entry < unpadded_vocab) {
+            const float raw = source[entry];
+            const float v =
+                __bfloat162float(__float2bfloat16_rn(cap > 0.0f ? cap * inkling_tanh(raw / cap) : raw));
+            const unsigned int uid = (unsigned int)entry;
+            if (v > best || (v == best && uid < best_id)) {
+                best = v;
+                best_id = uid;
+            }
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float ov = __shfl_xor_sync(0xFFFFFFFFu, best, offset);
+        const unsigned int oi = __shfl_xor_sync(0xFFFFFFFFu, best_id, offset);
+        if (ov > best || (ov == best && oi < best_id)) {
+            best = ov;
+            best_id = oi;
+        }
+    }
+    __shared__ float s_val[INKLING_EPI_BLOCK / 32];
+    __shared__ unsigned int s_id[INKLING_EPI_BLOCK / 32];
+    if ((threadIdx.x & 31) == 0) {
+        s_val[threadIdx.x >> 5] = best;
+        s_id[threadIdx.x >> 5] = best_id;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float b = s_val[0];
+        unsigned int bi = s_id[0];
+#pragma unroll
+        for (int w = 1; w < INKLING_EPI_BLOCK / 32; ++w) {
+            if (s_val[w] > b || (s_val[w] == b && s_id[w] < bi)) {
+                b = s_val[w];
+                bi = s_id[w];
+            }
+        }
+        part_values[(uint64_t)row * parts + part] = b;
+        part_ids[(uint64_t)row * parts + part] = bi;
+    }
+}
+
+// Device-side softcapped greedy argmax stage 2: reduces parts -> picks[row].
+// Grid: (rows, 1, 1), Block: INKLING_EPI_BLOCK (256).
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_logit_softcap_argmax_reduce(
+    const float* __restrict__ part_values,
+    const unsigned int* __restrict__ part_ids,
+    unsigned int* __restrict__ picks,
+    int rows,
+    int parts) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.x;
+    if (row >= rows || parts <= 0) {
+        return;
+    }
+    const float* pv = part_values + (uint64_t)row * parts;
+    const unsigned int* pi = part_ids + (uint64_t)row * parts;
+    float best = -INFINITY;
+    unsigned int best_id = 0xFFFFFFFFu;
+    for (int p = threadIdx.x; p < parts; p += INKLING_EPI_BLOCK) {
+        const float v = pv[p];
+        const unsigned int id = pi[p];
+        if (v > best || (v == best && id < best_id)) {
+            best = v;
+            best_id = id;
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float ov = __shfl_xor_sync(0xFFFFFFFFu, best, offset);
+        const unsigned int oi = __shfl_xor_sync(0xFFFFFFFFu, best_id, offset);
+        if (ov > best || (ov == best && oi < best_id)) {
+            best = ov;
+            best_id = oi;
+        }
+    }
+    __shared__ float s_val[INKLING_EPI_BLOCK / 32];
+    __shared__ unsigned int s_id[INKLING_EPI_BLOCK / 32];
+    if ((threadIdx.x & 31) == 0) {
+        s_val[threadIdx.x >> 5] = best;
+        s_id[threadIdx.x >> 5] = best_id;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float b = s_val[0];
+        unsigned int bi = s_id[0];
+#pragma unroll
+        for (int w = 1; w < INKLING_EPI_BLOCK / 32; ++w) {
+            if (s_val[w] > b || (s_val[w] == b && s_id[w] < bi)) {
+                b = s_val[w];
+                bi = s_id[w];
+            }
+        }
+        picks[row] = bi;
+    }
+}
+
 // The mean absolute error of one E2M1 round trip at a candidate scale.
 __device__ __forceinline__ float inkling_four_over_six_error(float value, float scale,
                                                              unsigned int lane) {
@@ -253,9 +375,10 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_expert_m
     const int* __restrict__ indices,
     int owner_experts,
     int owners) {
-    OPT_PDL_ENTRY();
+    OPT_PDL_LAUNCH();
     const int row = blockIdx.y;
     if (row >= rows || slots <= 0 || width <= 0) {
+        OPT_PDL_WAIT();
         return;
     }
     const float* band = partials + (uint64_t)row * slots * width;
@@ -263,8 +386,38 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_expert_m
     const int* picks = indices != nullptr ? indices + (uint64_t)row * slots : nullptr;
     const bool grouped = owners > 0 && owner_experts > 0 && picks != nullptr;
     float* target = out + (uint64_t)row * width;
-    for (int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; column < width;
-         column += gridDim.x * INKLING_EPI_BLOCK) {
+    if (!grouped && slots == 8 && (width & 3) == 0 && (((uintptr_t)band & 15u) == 0u) &&
+        (((uintptr_t)target & 15u) == 0u)) {
+        float s[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            s[k] = shares[k];
+        }
+        OPT_PDL_WAIT();
+        const int width4 = width >> 2;
+        const float4* band4 = reinterpret_cast<const float4*>(band);
+        float4* target4 = reinterpret_cast<float4*>(target);
+        for (int col4 = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; col4 < width4;
+             col4 += (int)gridDim.x * (int)blockDim.x) {
+            float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const float sh = s[k];
+                if (sh != 0.0f) {
+                    const float4 p = band4[(uint64_t)k * width4 + col4];
+                    v0 = __fadd_rn(v0, __fmul_rn(sh, p.x));
+                    v1 = __fadd_rn(v1, __fmul_rn(sh, p.y));
+                    v2 = __fadd_rn(v2, __fmul_rn(sh, p.z));
+                    v3 = __fadd_rn(v3, __fmul_rn(sh, p.w));
+                }
+            }
+            target4[col4] = make_float4(v0, v1, v2, v3);
+        }
+        return;
+    }
+    OPT_PDL_WAIT();
+    for (int column = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; column < width;
+         column += (int)gridDim.x * (int)blockDim.x) {
         float total = 0.0f;
         for (int owner = 0; owner < (grouped ? owners : 1); ++owner) {
             float value = 0.0f;

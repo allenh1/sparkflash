@@ -376,3 +376,159 @@ fn four_converted_ranks_answer_like_one_rank() {
         compare(&format!("tp4/rank{rank}"), &reference.logits, logits);
     }
 }
+
+#[test]
+fn the_looped_fixture_walks_every_application_without_a_refusal() {
+    if !backend_available() {
+        return;
+    }
+    // The looped release's device walk against the f32 host reference on the same fixture: the
+    // applications, the per-pass caches, the prelude rewind and the message path.
+    let config = Inkling2Config::tiny_looped();
+    let source = Arc::new(tiny_source(&config));
+    let host = Inkling2HostBackend::open(
+        sparkflash_model_inkling2::descriptor(),
+        config.clone(),
+        Arc::clone(&source) as Arc<dyn sparkflash_weights::WeightSource>,
+        16,
+    )
+    .expect("the looped host reference opens");
+    let device = InklingDeviceBackend::open(
+        sparkflash_model_inkling2::descriptor(),
+        config.clone(),
+        source as Arc<dyn sparkflash_weights::WeightSource>,
+        16,
+    )
+    .expect("the looped device arm opens");
+    let mut session = device.open_session().expect("a device session");
+    session.set_sampling(greedy());
+    let first = session
+        .prefill(&[3, 7, 11])
+        .expect("the looped device prompt");
+    assert_eq!(first.logits.len(), config.unpadded_vocab_size);
+    assert!(first.logits.iter().all(|value| value.is_finite()));
+    let next = first.next_token.expect("a next token");
+    let second = session.decode(next).expect("the looped device decode");
+    assert!(second.logits.iter().all(|value| value.is_finite()));
+
+    let mut host_session = host.open_session().expect("a host session");
+    host_session.set_sampling(greedy());
+    let host_first = host_session.prefill(&[3, 7, 11]).expect("the host prompt");
+    let scale = |row: &[f32]| {
+        row.iter()
+            .fold(0.0f32, |largest, value| largest.max(value.abs()))
+    };
+    let largest = scale(&host_first.logits).max(scale(&first.logits));
+    for (device, host) in first.logits.iter().zip(&host_first.logits) {
+        let difference = (device - host).abs();
+        assert!(
+            difference <= RELATIVE_TOLERANCE * largest,
+            "looped device vs host: {difference} of {largest}"
+        );
+    }
+    assert_eq!(
+        first.next_token, host_first.next_token,
+        "the looped walks rank the vocabulary differently"
+    );
+}
+
+/// Looped chunked prefill (including `rows > 8` so the chained residual runs and multiple core
+/// block summaries so `inkling_cross_pass` reads `summaries[row][start_block..]` across rows) and
+/// fused lanes agree with the f32 host reference and with each lane decoding solo bit for bit.
+#[test]
+fn looped_chunk_and_fused_lanes_match_solo_and_host() {
+    if !backend_available() {
+        return;
+    }
+    let mut config = Inkling2Config::tiny_looped();
+    // Block boundary every layer so pass 0 appends multiple summaries in the core (`count > 0`),
+    // exercising `inkling_cross_pass` reading `summaries[row][start_block..]` over multi-row chunks.
+    config.n_layers_per_attn_res_block = 1;
+    let source = Arc::new(tiny_source(&config));
+    let host = Inkling2HostBackend::open(
+        sparkflash_model_inkling2::descriptor(),
+        config.clone(),
+        Arc::clone(&source) as Arc<dyn sparkflash_weights::WeightSource>,
+        32,
+    )
+    .expect("the looped host reference opens");
+    let device = InklingDeviceBackend::open(
+        sparkflash_model_inkling2::descriptor(),
+        config.clone(),
+        Arc::clone(&source) as Arc<dyn sparkflash_weights::WeightSource>,
+        32,
+    )
+    .expect("the looped device arm opens");
+
+    // 10 tokens (> RESIDUAL_SPLIT_PAIRS = 8) so `ResidualChain` runs across loop pass rewinds.
+    let long_prompt = [3u32, 7, 11, 5, 2, 9, 4, 8, 1, 6];
+    let mut host_session = host.open_session().expect("a host session");
+    let mut device_session = device.open_session().expect("a device session");
+    host_session.set_sampling(greedy());
+    device_session.set_sampling(greedy());
+    let host_out = host_session.prefill(&long_prompt).expect("host prefill");
+    let dev_out = device_session.prefill(&long_prompt).expect("device prefill");
+    compare("looped chunk prefill", &host_out.logits, &dev_out.logits);
+
+    let next = host_out.next_token.expect("next token");
+    let host_dec = host_session.decode(next).expect("host decode");
+    let dev_dec = device_session.decode(next).expect("device decode");
+    compare("looped decode after chunk", &host_dec.logits, &dev_dec.logits);
+
+    // Three fused lanes at different positions on the looped model must match solo decode bit-exact.
+    let prompts: [&[u32]; 3] = [&[3, 7, 11], &[5, 2], &[2, 9, 4, 8, 1]];
+    let steps = 3usize;
+    let mut solo: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut fed: Vec<Vec<u32>> = Vec::new();
+    for prompt in prompts {
+        let mut session = device.open_session().expect("solo looped session");
+        session.set_sampling(greedy());
+        let first = session.prefill(prompt).expect("solo looped prefill");
+        let mut rows = vec![first.logits.clone()];
+        let mut tokens = Vec::new();
+        let mut next = first.next_token.expect("a next token");
+        for _ in 0..steps {
+            tokens.push(next);
+            let output = session.decode(next).expect("solo looped decode");
+            next = output.next_token.expect("a next token");
+            rows.push(output.logits);
+        }
+        solo.push(rows);
+        fed.push(tokens);
+    }
+
+    let lanes = sparkflash_runtime::Runtime::new(device.walk_arm().expect("looped walk"), 0)
+        .expect("looped runtime opens");
+    let mut slots = Vec::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        let mut slot = lanes.open_slot().expect("a looped lane");
+        lanes.set_sampling(&mut slot, greedy());
+        let first = lanes
+            .prefill_slot(&mut slot, prompt)
+            .expect("the looped lane's prompt");
+        assert_eq!(first.logits, solo[index][0], "looped lane {index} prompt");
+        slots.push(slot);
+    }
+    for step in 0..steps {
+        let mut members: Vec<_> = slots
+            .drain(..)
+            .enumerate()
+            .map(|(index, slot)| (slot, fed[index][step]))
+            .collect();
+        let outputs = lanes.step_slots(&mut members).expect("looped fused step");
+        for (index, output) in outputs.iter().enumerate() {
+            let expected = &solo[index][step + 1];
+            let differ = output
+                .logits
+                .iter()
+                .zip(expected)
+                .filter(|(left, right)| left.to_bits() != right.to_bits())
+                .count();
+            assert_eq!(
+                differ, 0,
+                "looped step {step}, lane {index}: {differ} logits differ from solo decode"
+            );
+        }
+        slots = members.into_iter().map(|(slot, _)| slot).collect();
+    }
+}

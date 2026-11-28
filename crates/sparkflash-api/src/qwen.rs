@@ -34,8 +34,8 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use crate::engine::{
-    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, InferenceEngine,
-    MissingCapability,
+    next_tool_call_id, Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest,
+    FinishReason, InferenceEngine, MissingCapability,
 };
 use crate::telemetry_types::{DeepSeekSparkRequestStats, OpenAiUsageWithCache};
 use crate::tool_block::{Block, BlockSplitter, CALL_CLOSE, CALL_OPEN};
@@ -435,7 +435,7 @@ fn qwen_engine_event(event: QwenEvent) -> EngineEvent {
             arguments,
         } => EngineEvent::ToolCallDelta {
             index,
-            id: Some(format!("call_{index}")),
+            id: Some(next_tool_call_id()),
             name: Some(name),
             arguments_delta: arguments,
         },

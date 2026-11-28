@@ -34,8 +34,8 @@ use futures::stream::BoxStream;
 use serde_json::{Map, Value};
 
 use crate::engine::{
-    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, InferenceEngine,
-    MissingCapability,
+    next_tool_call_id, Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest,
+    FinishReason, InferenceEngine, MissingCapability,
 };
 use crate::telemetry_types::{DeepSeekSparkRequestStats, OpenAiUsageWithCache};
 use crate::tool_block::{Block, BlockSplitter, CALL_CLOSE, CALL_OPEN};
@@ -346,7 +346,7 @@ fn glm_engine_event(event: GlmEvent) -> EngineEvent {
             arguments,
         } => EngineEvent::ToolCallDelta {
             index,
-            id: Some(format!("call_{index}")),
+            id: Some(next_tool_call_id()),
             name: Some(name),
             arguments_delta: arguments,
         },
@@ -478,7 +478,10 @@ mod tests {
         assert_eq!(content, "Looking.\n\n");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, 0);
-        assert_eq!(calls[0].1.as_deref(), Some("call_0"));
+        assert!(calls[0]
+            .1
+            .as_deref()
+            .is_some_and(|id| id.starts_with("call_")));
         assert_eq!(calls[0].2.as_deref(), Some("read"));
         assert_eq!(calls[0].3, r#"{"path":"src/lib.rs"}"#);
         assert_eq!(finish, Some(FinishReason::ToolCalls));

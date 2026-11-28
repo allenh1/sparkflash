@@ -663,6 +663,7 @@ struct PackedKernels {
     unpack: Bound,
     gemv: Bound,
     gemv4: Bound,
+    gemv6: Bound,
 }
 
 impl PackedKernels {
@@ -673,6 +674,7 @@ impl PackedKernels {
             unpack: self.unpack.kernel(),
             gemv: self.gemv.kernel(),
             gemv4: self.gemv4.kernel(),
+            gemv6: self.gemv6.kernel(),
         }
     }
 }
@@ -862,6 +864,7 @@ impl Kernels {
             unpack: token("q4e_unpack_bf16", Precision::Bf16)?,
             gemv: token("q4e_gemv_packed", Precision::Bf16)?,
             gemv4: token("q4e_gemv4_packed", Precision::Bf16)?,
+            gemv6: token("q4e_gemv6_packed", Precision::Bf16)?,
         };
         Ok(Self {
             moe,

@@ -341,16 +341,24 @@ impl WalkArm for Rank<'_> {
 const ENGINE_LABEL: &str = "the tick group";
 
 /// Loads this rank's share of the DSpark drafter from `checkpoint` when the rank drafts with it
-/// (SPARKFLASH_INKLING_DRAFT=dspark), and answers the boot line's note of it.
+/// (either `SPARKFLASH_INKLING_DRAFT=dspark` or unset on a checkpoint that carries
+/// `mtp.safetensors`), and answers the boot line's note of it.
 fn load_drafter(
     device: &mut InklingDeviceBackend,
     checkpoint: &Path,
     group: &GroupOptions,
 ) -> Result<String, String> {
-    if !device.wants_drafter() {
+    let bytes = if device.wants_drafter() {
+        device.load_drafter(checkpoint)
+    } else if !InklingDeviceBackend::draft_env_set()
+        && device.plan().config().mtp.is_some()
+        && checkpoint.join(crate::device::DRAFT_FILE).is_file()
+    {
+        device.enable_default_drafter(checkpoint)
+    } else {
         return Ok(String::new());
     }
-    let bytes = device.load_drafter(checkpoint).map_err(|error| {
+    .map_err(|error| {
         format!(
             "TP{}/rank{}: the DSpark drafter: {error} (set {}=off to step without it)",
             group.world,

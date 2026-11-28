@@ -1384,6 +1384,11 @@ fn geometry_for(
                 ));
             }
         },
+        // The loop's message parts carry the schedule in their facts and no geometry of their
+        // own: the checkpoint's shape is the gate rank and the hidden width, which the
+        // description already states on the instance. They are unresolved until a body exists,
+        // and the scan names them as having no part kind rather than guessing one.
+        Part::LoopMessageGate | Part::CrossPassAttention => {}
         Part::GqaAttention => match &attention.kind {
             AttentionKind::Gqa { kv_heads, .. } | AttentionKind::Inkling { kv_heads } => {
                 let heads = split(tp, attention.heads, TpAxis::Heads, 1)?;
@@ -1450,7 +1455,7 @@ fn geometry_for(
             geometry.head_dim = attention.head_dim;
             geometry.window = inkling.rel_extent;
         }
-        Part::ShortConv => {
+        Part::ShortConv | Part::DynamicShortConv => {
             let inkling = architecture.inkling.as_ref().ok_or_else(|| {
                 PlanError::Invalid("a short-convolution part on a non-Inkling layer".to_owned())
             })?;

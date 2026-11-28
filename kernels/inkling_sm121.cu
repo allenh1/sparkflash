@@ -33,6 +33,7 @@
 #include "inkling_conv_sm121.cu"
 #include "inkling_draft_sm121.cu"
 #include "inkling_epilogue_sm121.cu"
+#include "inkling_message_sm121.cu"
 #include "inkling_moe_sm121.cu"
 #include "inkling_vision_sm121.cu"
 #include "opt_exchange_sm121.cuh"

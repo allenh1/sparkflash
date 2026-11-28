@@ -400,12 +400,16 @@ impl Architecture {
             | Part::GqaAttention
             | Part::GdnScan
             | Part::KdaScan => Some(self.quantization.dense_format),
+            Part::DynamicShortConv | Part::LoopMessageGate => Some(WeightFormat::Bf16),
+            Part::CrossPassAttention => Some(WeightFormat::F32),
             _ => None,
         }
     }
 
     fn language_block(&self, layer: &Layer) -> Block {
-        let step = LayerStep::from_layer(layer);
+        // The step carries the loop's message parts, so the block and the execution plan read
+        // one order: the message retrieval and its gate land immediately before the attention.
+        let step = LayerStep::from_architecture(self, layer);
         let facts = self.layer_facts(layer);
         let parts = step
             .roles()
@@ -641,6 +645,30 @@ impl Architecture {
                 moe.clamp.map_or(FactValue::Null, FactValue::Float),
             );
         }
+        if let Some(plan) = self.loop_plan()
+            && (plan.core_start..plan.core_end).contains(&layer.index)
+        {
+            facts.insert(
+                "loop_passes".to_owned(),
+                FactValue::Integer(plan.passes as i64),
+            );
+            facts.insert(
+                "loop_gate_rank".to_owned(),
+                FactValue::Integer(plan.gate_rank as i64),
+            );
+            facts.insert(
+                "loop_streams".to_owned(),
+                FactValue::Integer(plan.streams as i64),
+            );
+            facts.insert(
+                "loop_core_start".to_owned(),
+                FactValue::Integer(plan.core_start as i64),
+            );
+            facts.insert(
+                "loop_core_end".to_owned(),
+                FactValue::Integer(plan.core_end as i64),
+            );
+        }
         facts
     }
 
@@ -671,6 +699,10 @@ impl Architecture {
                 Ffn::Moe(moe) => vec![moe.routed_experts, moe.intermediate, self.hidden_size],
                 Ffn::Dense(_) => Vec::new(),
             },
+            Part::LoopMessageGate => self
+                .loop_plan()
+                .map_or_else(Vec::new, |plan| vec![plan.gate_rank, 2 * self.hidden_size]),
+            Part::CrossPassAttention => vec![self.hidden_size],
             _ => Vec::new(),
         };
         shape_from(dims)

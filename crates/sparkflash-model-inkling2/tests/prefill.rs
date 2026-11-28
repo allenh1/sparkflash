@@ -125,6 +125,17 @@ fn download_bf16(cuda: &Cuda, pointer: &Deviceptr, count: usize) -> Vec<f32> {
         .collect()
 }
 
+fn download_f32(cuda: &Cuda, pointer: &Deviceptr, count: usize) -> Vec<f32> {
+    let mut bytes = vec![0u8; count * 4];
+    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|quad| f32::from_le_bytes(*quad))
+        .collect()
+}
+
 fn round_bf16(values: &[f32]) -> Vec<f32> {
     values
         .iter()
@@ -898,6 +909,260 @@ fn the_tensor_core_prompt_attention_is_the_exact_walk_within_a_bf16_step() {
     }
 }
 
+/// The specialized groups==3 tensor-core prompt walk (`inkling_attn_mma_g3`) is the exact prefill
+/// walk to within one BF16 step, and its fused f32 output matches the widened BF16 output bit for
+/// bit.
+#[test]
+fn the_g3_tensor_core_prompt_attention_is_the_exact_walk_within_a_bf16_step() {
+    let Some(cuda) = open() else { return };
+    let cases = [
+        MmaCase {
+            label: "g3 full, sinks, per-row tau, band inside the keys, non-mult-64",
+            rows: 77,
+            first_position: 70,
+            window: 0,
+            cache_rows: 0,
+            d_rel: 8,
+            rel_extent: 40,
+            sinks: true,
+            tau_rows: true,
+        },
+        MmaCase {
+            label: "g3 full from position zero, no sink, d_rel 16",
+            rows: 130,
+            first_position: 0,
+            window: 0,
+            cache_rows: 0,
+            d_rel: 16,
+            rel_extent: 1024,
+            sinks: false,
+            tau_rows: false,
+        },
+        MmaCase {
+            label: "g3 sliding ring past wrap, sinks, d_rel 16",
+            rows: 73,
+            first_position: 100,
+            window: 96,
+            cache_rows: 128,
+            d_rel: 16,
+            rel_extent: 96,
+            sinks: true,
+            tau_rows: true,
+        },
+        MmaCase {
+            label: "g3 no relative state, single partial block",
+            rows: 21,
+            first_position: 5,
+            window: 0,
+            cache_rows: 0,
+            d_rel: 0,
+            rel_extent: 16,
+            sinks: true,
+            tau_rows: false,
+        },
+    ];
+    let g3_heads = 6usize;
+    let g3_kv = 2usize;
+    let q_width = g3_heads * HEAD_DIM;
+    let kv_width = g3_kv * HEAD_DIM;
+    let (_m, mma_g3) = cuda
+        .load_named_shared(inkling_cubin(), "inkling_attn_mma_g3", 98_560)
+        .expect("load inkling_attn_mma_g3");
+    for (index, case) in cases.iter().enumerate() {
+        let rows = case.rows;
+        let d_rel = case.d_rel;
+        let last = case.first_position + rows - 1;
+        let cache = if case.cache_rows > 0 {
+            case.cache_rows
+        } else {
+            last + 1
+        };
+        let mut rng = Lcg::new(0x7e46_0000 + index as u64);
+        let q: Vec<f32> = rng.values(rows * q_width).iter().map(|v| 4.0 * v).collect();
+        let gate: Vec<f32> = rng.values(rows * q_width);
+        let rel: Vec<f32> = rng
+            .values(rows * g3_heads * d_rel)
+            .iter()
+            .map(|v| 3.0 * v)
+            .collect();
+        let sink: Vec<f32> = rng
+            .values(rows * g3_heads)
+            .iter()
+            .map(|v| 2.0 * v)
+            .collect();
+        let keys: Vec<f32> = rng
+            .values(cache * kv_width)
+            .iter()
+            .map(|v| 2.0 * v)
+            .collect();
+        let values: Vec<f32> = rng.values(cache * kv_width);
+        let bank: Vec<f32> = rng.values(d_rel * case.rel_extent);
+        let q_scale: Vec<f32> = rng
+            .values(g3_heads * HEAD_DIM)
+            .iter()
+            .map(|v| 1.0 + 0.5 * v)
+            .collect();
+        let rel_scale: Vec<f32> = rng.values(g3_heads * d_rel);
+        let taus: Vec<f32> = rng.values(rows).iter().map(|v| 1.2 + 0.4 * v).collect();
+        let tau = 1.1f32;
+
+        let q_device = upload::<f32>(&cuda, &q);
+        let gate_device = upload::<f32>(&cuda, &gate);
+        let rel_device = upload::<f32>(&cuda, &rel);
+        let sink_device = if case.sinks {
+            upload::<f32>(&cuda, &sink)
+        } else {
+            Deviceptr(0)
+        };
+        let keys_device = upload_bf16(&cuda, &keys);
+        let values_device = upload_bf16(&cuda, &values);
+        let bank_device = upload_bf16(&cuda, &bank);
+        let q_scale_device = upload::<f32>(&cuda, &q_scale);
+        let rel_scale_device = upload::<f32>(&cuda, &rel_scale);
+        let taus_device = if case.tau_rows {
+            upload::<f32>(&cuda, &taus)
+        } else {
+            Deviceptr(0)
+        };
+        let exact_out = upload_bf16(&cuda, &vec![0f32; rows * q_width]);
+        let mma_out = upload_bf16(&cuda, &vec![0f32; rows * q_width]);
+        let mma_out_f32 = upload::<f32>(&cuda, &vec![0f32; rows * q_width]);
+
+        cuda.launch(
+            kernel(&cuda, "inkling_attn_prefill"),
+            (g3_heads as u32, rows as u32, 1),
+            (32, 1, 1),
+            &[
+                q_device.0,
+                gate_device.0,
+                keys_device.0,
+                values_device.0,
+                rel_device.0,
+                bank_device.0,
+                sink_device.0,
+                q_scale_device.0,
+                0,
+                rel_scale_device.0,
+                exact_out.0,
+                u(g3_heads),
+                u(g3_kv),
+                u(HEAD_DIM),
+                u(3),
+                u(rows),
+                u(case.first_position),
+                u(case.window),
+                u(case.cache_rows),
+                u(case.rel_extent),
+                u(d_rel),
+                f(QK_CLIP),
+                f(REL_CLIP),
+                f(tau),
+                u(VALUE_NORM as usize),
+                f(EPS),
+                taus_device.0,
+            ],
+        )
+        .expect("attn_prefill launch");
+
+        let q_ready = upload::<f32>(&cuda, &vec![0f32; rows * q_width]);
+        let rel_ready = upload::<f32>(&cuda, &vec![0f32; rows * g3_heads * 16]);
+        cuda.launch(
+            kernel(&cuda, "inkling_attn_prepare"),
+            (g3_heads as u32, rows as u32, 1),
+            (32, 1, 1),
+            &[
+                q_device.0,
+                rel_device.0,
+                q_scale_device.0,
+                rel_scale_device.0,
+                q_ready.0,
+                rel_ready.0,
+                u(g3_heads),
+                u(HEAD_DIM),
+                u(rows),
+                u(d_rel),
+                f(QK_CLIP),
+                f(REL_CLIP),
+                f(tau),
+                taus_device.0,
+            ],
+        )
+        .expect("attn_prepare launch");
+
+        let scale_first = if case.window > 0 {
+            (case.first_position + 1).saturating_sub(case.window)
+        } else {
+            0
+        };
+        let span = last + 1 - scale_first;
+        let stride = span + 40;
+        let gains = upload::<f32>(&cuda, &vec![0f32; g3_kv * stride]);
+        let scales = upload::<f32>(&cuda, &vec![0f32; g3_kv * stride]);
+        cuda.launch(
+            kernel(&cuda, "inkling_attn_key_scales"),
+            (span.div_ceil(16) as u32, g3_kv as u32, 1),
+            (128, 1, 1),
+            &[
+                keys_device.0,
+                values_device.0,
+                0,
+                gains.0,
+                scales.0,
+                u(g3_kv),
+                u(HEAD_DIM),
+                u(case.cache_rows),
+                f(QK_CLIP),
+                u(VALUE_NORM as usize),
+                f(EPS),
+                u(scale_first),
+                u(span),
+                u(stride),
+            ],
+        )
+        .expect("attn_key_scales launch");
+
+        cuda.launch(
+            mma_g3,
+            (rows.div_ceil(64) as u32, g3_kv as u32, 1),
+            (384, 1, 1),
+            &[
+                q_ready.0,
+                keys_device.0,
+                values_device.0,
+                rel_ready.0,
+                bank_device.0,
+                sink_device.0,
+                gains.0,
+                scales.0,
+                gate_device.0,
+                mma_out.0,
+                mma_out_f32.0,
+                u(g3_heads),
+                u(g3_kv),
+                u(rows),
+                u(case.first_position),
+                u(case.window),
+                u(case.cache_rows),
+                u(case.rel_extent),
+                u(d_rel),
+                u(scale_first),
+                u(stride),
+            ],
+        )
+        .expect("attn_mma_g3 launch");
+
+        let exact = download_bf16(&cuda, &exact_out, rows * q_width);
+        let tensor = download_bf16(&cuda, &mma_out, rows * q_width);
+        let tensor_f32 = download::<f32>(&cuda, &mma_out_f32, rows * q_width);
+        assert_within_a_bf16_step(case.label, &exact, &tensor, q_width);
+        assert_eq!(
+            tensor, tensor_f32,
+            "{}: out_f32 matches widened out bit-for-bit",
+            case.label
+        );
+    }
+}
+
 /// The BF16-step comparison the fast walks are held to: every output within one BF16 step of the
 /// exact walk's (or a floor far under any value that matters, for outputs that round near zero),
 /// and most of them its very bits.
@@ -1207,5 +1472,363 @@ fn the_split_key_decode_attention_is_the_exact_mix_within_a_bf16_step() {
     ];
     for (index, case) in cases.iter().enumerate() {
         run_split_case(&cuda, case, 0x5b17_0000 + index as u64);
+    }
+}
+
+/// The tensor-core split-KV full decode attention matches the exact walk within one BF16 step
+/// and produces bit-identical outputs for row 0 whether launched solo (`rows = 1`) or in a
+/// multi-row verify batch (`rows = 6`).
+#[test]
+fn the_tc_decode_attention_matches_exact_and_is_row_count_invariant() {
+    let Some(cuda) = open() else { return };
+    let heads = 6usize;
+    let kv_heads = 2usize;
+    let first_position = 4100usize;
+    let rows = 6usize;
+    let d_rel = 16usize;
+    let rel_extent = 1024usize;
+    let macro_keys = 2048usize;
+    let q_width = heads * HEAD_DIM;
+    let kv_width = kv_heads * HEAD_DIM;
+    let last = first_position + rows - 1;
+    let cache = last + 1;
+    let mut rng = Lcg::new(0x7c_dec0_0001);
+    let q: Vec<f32> = rng.values(rows * q_width).iter().map(|v| 3.0 * v).collect();
+    let gate: Vec<f32> = rng.values(rows * q_width);
+    let rel: Vec<f32> = rng
+        .values(rows * heads * d_rel)
+        .iter()
+        .map(|v| 2.0 * v)
+        .collect();
+    let sink: Vec<f32> = rng.values(rows * heads).iter().map(|v| 1.5 * v).collect();
+    let keys: Vec<f32> = rng
+        .values(cache * kv_width)
+        .iter()
+        .map(|v| 1.5 * v)
+        .collect();
+    let values: Vec<f32> = rng.values(cache * kv_width);
+    let bank: Vec<f32> = rng.values(d_rel * rel_extent);
+    let q_scale: Vec<f32> = rng
+        .values(heads * HEAD_DIM)
+        .iter()
+        .map(|v| 1.0 + 0.4 * v)
+        .collect();
+    let rel_scale: Vec<f32> = rng.values(heads * d_rel);
+    let taus: Vec<f32> = rng.values(rows).iter().map(|v| 1.1 + 0.3 * v).collect();
+
+    let q_device = upload::<f32>(&cuda, &q);
+    let gate_device = upload::<f32>(&cuda, &gate);
+    let rel_device = upload::<f32>(&cuda, &rel);
+    let sink_device = upload::<f32>(&cuda, &sink);
+    let keys_device = upload_bf16(&cuda, &keys);
+    let values_device = upload_bf16(&cuda, &values);
+    let bank_device = upload_bf16(&cuda, &bank);
+    let q_scale_device = upload::<f32>(&cuda, &q_scale);
+    let rel_scale_device = upload::<f32>(&cuda, &rel_scale);
+    let taus_device = upload::<f32>(&cuda, &taus);
+
+    let exact_out = upload_bf16(&cuda, &vec![0f32; rows * q_width]);
+    cuda.launch(
+        kernel(&cuda, "inkling_attn_prefill"),
+        (heads as u32, rows as u32, 1),
+        (32, 1, 1),
+        &[
+            q_device.0,
+            gate_device.0,
+            keys_device.0,
+            values_device.0,
+            rel_device.0,
+            bank_device.0,
+            sink_device.0,
+            q_scale_device.0,
+            0,
+            rel_scale_device.0,
+            exact_out.0,
+            u(heads),
+            u(kv_heads),
+            u(HEAD_DIM),
+            u(heads / kv_heads),
+            u(rows),
+            u(first_position),
+            0,
+            0,
+            u(rel_extent),
+            u(d_rel),
+            f(QK_CLIP),
+            f(REL_CLIP),
+            f(1.0),
+            u(VALUE_NORM as usize),
+            f(EPS),
+            taus_device.0,
+        ],
+    )
+    .expect("attn_prefill launch");
+
+    let stride = cache + 16;
+    let gains = upload::<f32>(&cuda, &vec![0f32; kv_heads * stride]);
+    let scales = upload::<f32>(&cuda, &vec![0f32; kv_heads * stride]);
+    cuda.launch(
+        kernel(&cuda, "inkling_attn_key_scales"),
+        (cache.div_ceil(16) as u32, kv_heads as u32, 1),
+        (128, 1, 1),
+        &[
+            keys_device.0,
+            values_device.0,
+            0,
+            gains.0,
+            scales.0,
+            u(kv_heads),
+            u(HEAD_DIM),
+            0,
+            f(QK_CLIP),
+            u(VALUE_NORM as usize),
+            f(EPS),
+            0,
+            u(cache),
+            u(stride),
+        ],
+    )
+    .expect("attn_key_scales launch");
+
+    let (_m, tc) = cuda
+        .load_named_shared(inkling_cubin(), "inkling_attn_scored_part_g3_tc", 49_920)
+        .expect("load inkling_attn_scored_part_g3_tc");
+    let merge = kernel(&cuda, "inkling_attn_merge_f32");
+    let part_stride = cache.div_ceil(macro_keys);
+    let parts_multi = upload::<f32>(&cuda, &vec![0f32; rows * heads * part_stride * (2 + HEAD_DIM)]);
+    let tc_out_multi_bf16 = upload_bf16(&cuda, &vec![0f32; rows * q_width]);
+    let tc_out_multi_f32 = upload::<f32>(&cuda, &vec![0f32; rows * q_width]);
+    cuda.launch(
+        tc,
+        (kv_heads as u32, part_stride as u32, 1),
+        (256, 1, 1),
+        &[
+            q_device.0,
+            keys_device.0,
+            values_device.0,
+            rel_device.0,
+            bank_device.0,
+            q_scale_device.0,
+            0,
+            rel_scale_device.0,
+            gains.0,
+            scales.0,
+            parts_multi.0,
+            u(heads),
+            u(kv_heads),
+            u(HEAD_DIM),
+            u(heads / kv_heads),
+            u(rows),
+            u(first_position),
+            0,
+            u(rel_extent),
+            u(d_rel),
+            f(QK_CLIP),
+            f(REL_CLIP),
+            f(1.0),
+            taus_device.0,
+            u(VALUE_NORM as usize),
+            0,
+            u(stride),
+            u(macro_keys),
+            u(part_stride),
+        ],
+    )
+    .expect("attn_scored_part_g3_tc multi launch");
+    cuda.launch(
+        merge,
+        (heads as u32, rows as u32, 1),
+        (HEAD_DIM as u32, 1, 1),
+        &[
+            gate_device.0,
+            sink_device.0,
+            parts_multi.0,
+            tc_out_multi_bf16.0,
+            tc_out_multi_f32.0,
+            u(heads),
+            u(HEAD_DIM),
+            u(rows),
+            u(first_position),
+            0,
+            u(part_stride),
+            u(macro_keys),
+        ],
+    )
+    .expect("attn_merge_f32 multi launch");
+
+    let parts_solo = upload::<f32>(&cuda, &vec![0f32; heads * part_stride * (2 + HEAD_DIM)]);
+    let tc_out_solo_bf16 = upload_bf16(&cuda, &vec![0f32; q_width]);
+    let tc_out_solo_f32 = upload::<f32>(&cuda, &vec![0f32; q_width]);
+    cuda.launch(
+        tc,
+        (kv_heads as u32, (first_position + 1).div_ceil(macro_keys) as u32, 1),
+        (256, 1, 1),
+        &[
+            q_device.0,
+            keys_device.0,
+            values_device.0,
+            rel_device.0,
+            bank_device.0,
+            q_scale_device.0,
+            0,
+            rel_scale_device.0,
+            gains.0,
+            scales.0,
+            parts_solo.0,
+            u(heads),
+            u(kv_heads),
+            u(HEAD_DIM),
+            u(heads / kv_heads),
+            1,
+            u(first_position),
+            0,
+            u(rel_extent),
+            u(d_rel),
+            f(QK_CLIP),
+            f(REL_CLIP),
+            f(1.0),
+            taus_device.0,
+            u(VALUE_NORM as usize),
+            0,
+            u(stride),
+            u(macro_keys),
+            u(part_stride),
+        ],
+    )
+    .expect("attn_scored_part_g3_tc solo launch");
+    cuda.launch(
+        merge,
+        (heads as u32, 1, 1),
+        (HEAD_DIM as u32, 1, 1),
+        &[
+            gate_device.0,
+            sink_device.0,
+            parts_solo.0,
+            tc_out_solo_bf16.0,
+            tc_out_solo_f32.0,
+            u(heads),
+            u(HEAD_DIM),
+            1,
+            u(first_position),
+            0,
+            u(part_stride),
+            u(macro_keys),
+        ],
+    )
+    .expect("attn_merge_f32 solo launch");
+
+    let exact = download_bf16(&cuda, &exact_out, rows * q_width);
+    let multi = download_bf16(&cuda, &tc_out_multi_bf16, rows * q_width);
+    let solo = download_bf16(&cuda, &tc_out_solo_bf16, q_width);
+    assert_within_a_bf16_step("tc decode full attention", &exact, &multi, q_width);
+    assert_eq!(
+        solo,
+        &multi[..q_width],
+        "tc decode row 0 must be bit-identical between solo (rows=1) and multi (rows=6)"
+    );
+}
+
+/// The single-launch fused `inkling_block_residual_small_norm` produces the exact same bits as
+/// `inkling_block_residual_stats` + `inkling_block_residual_mix_norm`.
+#[test]
+fn the_small_block_residual_norm_is_bit_exact() {
+    let Some(cuda) = open() else { return };
+    let hidden = 2304usize;
+    let max_blocks = 8usize;
+    let summary_stride = max_blocks * hidden;
+    let max_rows = 6usize;
+    let mut rng = Lcg::new(0x5a11_7e57);
+    let summaries = upload::<f32>(&cuda, &rng.values(max_rows * summary_stride));
+    let partial = upload::<f32>(&cuda, &rng.values(max_rows * hidden));
+    let queries = upload::<f32>(&cuda, &rng.values(3 * hidden));
+    let w0 = upload_bf16(&cuda, &rng.values(hidden));
+    let w1 = upload_bf16(&cuda, &rng.values(hidden));
+    let w2 = upload_bf16(&cuda, &rng.values(hidden));
+    let stats = upload::<f32>(&cuda, &vec![0f32; max_rows * 3 * 17 * 2]);
+    let ref0 = upload::<f32>(&cuda, &vec![0f32; max_rows * hidden]);
+    let ref1 = upload::<f32>(&cuda, &vec![0f32; max_rows * hidden]);
+    let ref2 = upload::<f32>(&cuda, &vec![0f32; max_rows * hidden]);
+    let out0 = upload::<f32>(&cuda, &vec![0f32; max_rows * hidden]);
+    let out1 = upload::<f32>(&cuda, &vec![0f32; max_rows * hidden]);
+    let out2 = upload::<f32>(&cuda, &vec![0f32; max_rows * hidden]);
+    let k_stats = kernel(&cuda, "inkling_block_residual_stats");
+    let k_mix_norm = kernel(&cuda, "inkling_block_residual_mix_norm");
+    let k_small_norm = kernel(&cuda, "inkling_block_residual_small_norm");
+
+    for &(rows, blocks, nq) in &[(1, 0, 1), (1, 2, 1), (1, 4, 3), (6, 1, 1), (6, 4, 3)] {
+        cuda.launch(
+            k_stats,
+            ((blocks + 1) as u32, nq as u32, rows as u32),
+            (256, 1, 1),
+            &[
+                summaries.0,
+                partial.0,
+                queries.0,
+                stats.0,
+                u(blocks),
+                u(hidden),
+                u(nq),
+                f(EPS),
+                u(summary_stride),
+            ],
+        )
+        .expect("block_residual_stats");
+        cuda.launch(
+            k_mix_norm,
+            (nq as u32, rows as u32, 1),
+            (256, 1, 1),
+            &[
+                summaries.0,
+                partial.0,
+                stats.0,
+                w0.0,
+                w1.0,
+                w2.0,
+                ref0.0,
+                ref1.0,
+                ref2.0,
+                u(blocks),
+                u(hidden),
+                u(nq),
+                f(EPS),
+                u(summary_stride),
+            ],
+        )
+        .expect("block_residual_mix_norm");
+        cuda.launch(
+            k_small_norm,
+            (nq as u32, rows as u32, 1),
+            (256, 1, 1),
+            &[
+                summaries.0,
+                partial.0,
+                queries.0,
+                w0.0,
+                w1.0,
+                w2.0,
+                out0.0,
+                out1.0,
+                out2.0,
+                u(blocks),
+                u(hidden),
+                u(nq),
+                f(EPS),
+                u(summary_stride),
+            ],
+        )
+        .expect("block_residual_small_norm");
+        for (idx, (r, o)) in [(&ref0, &out0), (&ref1, &out1), (&ref2, &out2)]
+            .iter()
+            .take(nq)
+            .enumerate()
+        {
+            let rb = download_f32(&cuda, r, rows * hidden);
+            let ob = download_f32(&cuda, o, rows * hidden);
+            assert_eq!(
+                rb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ob.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "small_norm mismatch for rows={rows} blocks={blocks} nq={nq} stream={idx}"
+            );
+        }
     }
 }

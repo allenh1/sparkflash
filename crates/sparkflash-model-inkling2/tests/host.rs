@@ -181,3 +181,42 @@ fn the_descriptor_is_the_inkling_pack() {
     assert_eq!(descriptor.family, "inkling2");
     assert_eq!(descriptor.model_type, "inkling2");
 }
+
+#[test]
+fn the_looped_fixture_runs_its_core_twice_with_per_pass_caches() {
+    let config = Inkling2Config::tiny_looped();
+    let plan = config.loop_plan.expect("the loop schedule");
+    assert_eq!((plan.core_start, plan.core_end, plan.passes), (2, 4, 2));
+    assert_eq!(
+        config.cache_slots(),
+        config.num_hidden_layers + plan.core_len()
+    );
+    let source = Arc::new(tiny_source(&config));
+    let backend = Inkling2HostBackend::open(
+        sparkflash_model_inkling2::descriptor(),
+        config.clone(),
+        source.clone(),
+        32,
+    )
+    .expect("the looped fixture opens");
+    let mut session = backend.open_session().expect("a session");
+    let looped = session.prefill(&[1, 2, 3]).expect("the looped prompt runs");
+    assert!(looped.logits.iter().all(|value| value.is_finite()));
+
+    // The same weights with one pass: the extra pass must change the answer, or the schedule is
+    // not running the core again.
+    let mut single = config.clone();
+    single.loop_plan.as_mut().expect("the schedule").passes = 1;
+    let backend =
+        Inkling2HostBackend::open(sparkflash_model_inkling2::descriptor(), single, source, 32)
+            .expect("the one-pass fixture opens");
+    let mut session = backend.open_session().expect("a session");
+    let once = session
+        .prefill(&[1, 2, 3])
+        .expect("the one-pass prompt runs");
+    assert!(once.logits.iter().all(|value| value.is_finite()));
+    assert!(
+        looped.logits != once.logits,
+        "the second pass left the logits unchanged"
+    );
+}

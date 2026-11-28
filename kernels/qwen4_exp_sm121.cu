@@ -743,6 +743,130 @@ extern "C" __global__ void q4e_gemv4_packed(
     }
 }
 
+// Where q4e_gemv6_packed's row `global_row` of six matrices stacked lands.
+__device__ __forceinline__ void q4e_gemv6_packed_locate(
+    int global_row, const unsigned char* const (&w)[6], const unsigned int* const (&offsets)[6],
+    const unsigned int* const (&entries)[6], float* const (&y)[6], const int (&r)[6], int columns,
+    unsigned long long row_bytes, Q4ePackedRow* row, float** out, int* local_row,
+    int* out_rows) {
+    const int r01 = r[0] + r[1];
+    const int r012 = r01 + r[2];
+    const int r0123 = r012 + r[3];
+    const int r01234 = r0123 + r[4];
+    if (global_row < r[0]) {
+        *local_row = global_row;
+        *out_rows = r[0];
+        *out = y[0];
+        *row = q4e_packed_row(w[0], offsets[0], entries[0], *local_row, columns, row_bytes);
+    } else if (global_row < r01) {
+        *local_row = global_row - r[0];
+        *out_rows = r[1];
+        *out = y[1];
+        *row = q4e_packed_row(w[1], offsets[1], entries[1], *local_row, columns, row_bytes);
+    } else if (global_row < r012) {
+        *local_row = global_row - r01;
+        *out_rows = r[2];
+        *out = y[2];
+        *row = q4e_packed_row(w[2], offsets[2], entries[2], *local_row, columns, row_bytes);
+    } else if (global_row < r0123) {
+        *local_row = global_row - r012;
+        *out_rows = r[3];
+        *out = y[3];
+        *row = q4e_packed_row(w[3], offsets[3], entries[3], *local_row, columns, row_bytes);
+    } else if (global_row < r01234) {
+        *local_row = global_row - r0123;
+        *out_rows = r[4];
+        *out = y[4];
+        *row = q4e_packed_row(w[4], offsets[4], entries[4], *local_row, columns, row_bytes);
+    } else {
+        *local_row = global_row - r01234;
+        *out_rows = r[5];
+        *out = y[5];
+        *row = q4e_packed_row(w[5], offsets[5], entries[5], *local_row, columns, row_bytes);
+    }
+}
+
+// Six packed matrices reading the same x in one launch (e.g. Inkling sliding-layer
+// Q/K/V/Rel/Gate/Sink): bit-exact identical to separate q4e_gemv_packed launches.
+extern "C" __global__ void q4e_gemv6_packed(
+    const unsigned char* __restrict__ w0, const unsigned char* __restrict__ w1,
+    const unsigned char* __restrict__ w2, const unsigned char* __restrict__ w3,
+    const unsigned char* __restrict__ w4, const unsigned char* __restrict__ w5,
+    const unsigned int* __restrict__ o0, const unsigned int* __restrict__ o1,
+    const unsigned int* __restrict__ o2, const unsigned int* __restrict__ o3,
+    const unsigned int* __restrict__ o4, const unsigned int* __restrict__ o5,
+    const unsigned int* __restrict__ e0, const unsigned int* __restrict__ e1,
+    const unsigned int* __restrict__ e2, const unsigned int* __restrict__ e3,
+    const unsigned int* __restrict__ e4, const unsigned int* __restrict__ e5,
+    const float* __restrict__ x, float* __restrict__ y0, float* __restrict__ y1,
+    float* __restrict__ y2, float* __restrict__ y3, float* __restrict__ y4,
+    float* __restrict__ y5, int r0, int r1, int r2, int r3, int r4, int r5, int columns,
+    int batch, unsigned long long row_bytes) {
+    OPT_PDL_ENTRY();
+    const unsigned char* const w[6] = {w0, w1, w2, w3, w4, w5};
+    const unsigned int* const offsets[6] = {o0, o1, o2, o3, o4, o5};
+    const unsigned int* const entries[6] = {e0, e1, e2, e3, e4, e5};
+    float* const y[6] = {y0, y1, y2, y3, y4, y5};
+    const int r[6] = {r0, r1, r2, r3, r4, r5};
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int stride = gridDim.x * warps;
+    const int total_rows = r0 + r1 + r2 + r3 + r4 + r5;
+    if (batch <= 1) {
+        for (int global_row = blockIdx.x * warps + warp; global_row < total_rows;
+             global_row += stride) {
+            Q4ePackedRow row;
+            float* out;
+            int local_row;
+            int out_rows;
+            q4e_gemv6_packed_locate(global_row, w, offsets, entries, y, r, columns, row_bytes,
+                                    &row, &out, &local_row, &out_rows);
+            float total = q4e_packed_row_dot(row, x, columns, lane);
+            total = q4e_warp_sum(total);
+            if (lane == 0) {
+                out[local_row] = total;
+            }
+        }
+        return;
+    }
+    if (batch > Q4E_MAX_BATCH) {
+        return;
+    }
+    for (int item = blockIdx.x * warps + warp; item < ((total_rows + 1) / 2) * 2;
+         item += stride) {
+        const int global_row = (item >> 1) * 2;
+        const Q4eBatchHalf half = q4e_batch_half(batch, item & 1);
+        const bool second = global_row + 1 < total_rows;
+        Q4ePackedRow pair[2];
+        float* out[2];
+        int local_row[2];
+        int out_rows[2];
+        q4e_gemv6_packed_locate(global_row, w, offsets, entries, y, r, columns, row_bytes,
+                                &pair[0], &out[0], &local_row[0], &out_rows[0]);
+        q4e_gemv6_packed_locate(second ? global_row + 1 : global_row, w, offsets, entries, y, r,
+                                columns, row_bytes, &pair[1], &out[1], &local_row[1],
+                                &out_rows[1]);
+        float totals[2][Q4E_HALF_BATCH];
+        const float* __restrict__ xh = x + (unsigned long long)half.first * columns;
+        q4e_packed_rows_dot_batch<2, Q4E_HALF_BATCH>(pair, xh, columns, lane, half.count, totals);
+#pragma unroll
+        for (int t = 0; t < Q4E_HALF_BATCH; ++t) {
+            if (t < half.count) {
+                const float first_sum = q4e_warp_sum(totals[0][t]);
+                const float second_sum = q4e_warp_sum(totals[1][t]);
+                const unsigned long long token = (unsigned long long)(half.first + t);
+                if (lane == 0) {
+                    out[0][token * out_rows[0] + local_row[0]] = first_sum;
+                    if (second) {
+                        out[1][token * out_rows[1] + local_row[1]] = second_sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Packs `rows` BF16 rows (columns a multiple of 256) a warp a row. With `packed` null it only
 // counts: counts[row] = the row's escapes. Otherwise it writes the packed rows `row_bytes` apart
 // and each row's escapes from entries[offsets[row]] on, in walk order. Offsets and counts are the
@@ -1429,17 +1553,6 @@ extern "C" __global__ void q4e_shared_gate_up(
 // 4608, Qwen's 5120, GLM's 7168) measured as fast or faster held. Both walks give the same bits.
 #define Q4E_NORM_ROWS_HELD_MIN 2048
 
-// One group's RMSNorm: dst[i] = src[i] * rsqrt(mean(src^2) + eps) * (zero_centred ? 1 + w : w)
-// for i < group, the gain w = weight[weight_per_group ? i : (weight_start + i) % width]. The
-// caller has run OPT_PDL_LAUNCH; this waits on the previous grid once it has what it can read
-// before it.
-//
-// A thread loads its gains (constant weights) before the previous grid has finished, then holds
-// its values from the sum to the scaling, so a decode norm pays one cold weight load overlapped
-// with the kernel before it instead of a dependent one an element. The arithmetic is the unheld
-// walk's: the same sum in the same order, the same block tree, the same products. `hold` false,
-// or a group wider than Q4E_NORM_HELD a thread, takes the unheld walk. src and dst may be the same
-// row.
 __device__ __forceinline__ void q4e_rmsnorm_group(const float* src,
                                                   const __nv_bfloat16* __restrict__ weight,
                                                   float* dst, int weight_start, int width,
@@ -1505,8 +1618,9 @@ __device__ __forceinline__ void q4e_rmsnorm_group(const float* src,
 extern "C" __global__ void q4e_rmsnorm(const float* x, const __nv_bfloat16* __restrict__ weight,
                                        float* out, int width, int group, float eps,
                                        int zero_centred, int weight_per_group) {
-    // The row it normalises was written by the previous grid: wait for it before the loads.
-    OPT_PDL_ENTRY();
+    // Split PDL: let dependents launch and preload constant weights before OPT_PDL_WAIT() inside
+    // q4e_rmsnorm_group.
+    OPT_PDL_LAUNCH();
     const int start = blockIdx.x * group;
     __shared__ float scratch[Q4E_BLOCK];
     q4e_rmsnorm_group(x + start, weight, out + start, start, width, group, eps, zero_centred,
@@ -1522,8 +1636,9 @@ extern "C" __global__ void q4e_rmsnorm_rows(const float* x, const __nv_bfloat16*
                                             float* out, int width, int group, float eps,
                                             int zero_centred, int weight_per_group,
                                             int src_stride, int dst_stride) {
-    // The rows it normalises were written by the previous grid: wait for them before the loads.
-    OPT_PDL_ENTRY();
+    // Split PDL: let dependents launch and preload constant weights before OPT_PDL_WAIT() inside
+    // q4e_rmsnorm_group.
+    OPT_PDL_LAUNCH();
     const int row = blockIdx.y;
     const int group_start = blockIdx.x * group;
     __shared__ float scratch[Q4E_BLOCK];

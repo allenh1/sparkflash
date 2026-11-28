@@ -45,6 +45,8 @@ pub enum Role {
     Mtp,
     /// The vision tower.
     Vision,
+    /// The loop's message path: its controllers and the cross-pass query banks.
+    Loop,
 }
 
 /// How a rank file divides the routed experts among the ranks.
@@ -265,6 +267,45 @@ impl InklingTensorPlan {
                 vec![hidden],
                 Role::BlockResidual,
             );
+        }
+        if let Some(loop_plan) = config.loop_plan {
+            // The loop's message path: four gates a core layer (query, key, value and MLP; the
+            // checkpoint spells the query stream `attn`) and the two cross-pass query banks.
+            // modeling_inkling2_loop.py:81-99 and :147-176.
+            for layer in loop_plan.core_start..loop_plan.core_end {
+                for stream in ["attn", "k", "v", "mlp"] {
+                    let prefix = format!("model.llm.layers.{layer}.controllers.{stream}");
+                    plan.push(
+                        &format!("{prefix}.down_weight"),
+                        DType::BF16,
+                        vec![loop_plan.gate_rank, 2 * hidden],
+                        Role::Loop,
+                    );
+                    plan.push(
+                        &format!("{prefix}.forget_weight"),
+                        DType::BF16,
+                        vec![hidden, loop_plan.gate_rank],
+                        Role::Loop,
+                    );
+                    plan.push(
+                        &format!("{prefix}.gain_weight"),
+                        DType::BF16,
+                        vec![hidden, loop_plan.gate_rank],
+                        Role::Loop,
+                    );
+                }
+            }
+            for bank in [
+                "model.llm.middle_cycle_cross_pass_queries",
+                "model.llm.middle_cycle_cross_pass_kv_queries",
+            ] {
+                plan.push(
+                    bank,
+                    DType::F32,
+                    vec![2 * loop_plan.core_len(), hidden],
+                    Role::Loop,
+                );
+            }
         }
 
         for layer in 0..config.num_hidden_layers {

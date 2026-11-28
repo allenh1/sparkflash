@@ -141,10 +141,12 @@ pub struct Kernels {
     pub gemv: Kernel,
     /// The four-row GEMV.
     pub gemv4: Kernel,
+    /// The six-matrix fused GEMV.
+    pub gemv6: Kernel,
 }
 
 impl Kernels {
-    /// Loads the four kernels.
+    /// Loads the five kernels.
     ///
     /// # Errors
     /// A build without the image, or a missing symbol.
@@ -159,6 +161,7 @@ impl Kernels {
             unpack: named("q4e_unpack_bf16")?,
             gemv: named("q4e_gemv_packed")?,
             gemv4: named("q4e_gemv4_packed")?,
+            gemv6: named("q4e_gemv6_packed")?,
         })
     }
 }
@@ -174,6 +177,8 @@ const ALIGN: usize = 16;
 const MIN_SCRATCH: usize = 1 << 20;
 /// The matrices one `q4e_gemv4_packed` launch stacks.
 pub const FUSED: usize = 4;
+/// The matrices one `q4e_gemv6_packed` launch stacks.
+pub const FUSED6: usize = 6;
 
 /// The steps q4e_row_dot_bf16 walks a lane through over a row of `columns`: quads, then perhaps
 /// a pair, then single chunks.
@@ -373,6 +378,45 @@ pub fn gemv4(
     args[5 * FUSED + 1] = columns as u64;
     args[5 * FUSED + 2] = batch as u64;
     args[5 * FUSED + 3] = parts[0].0.row_bytes as u64;
+    let total: usize = parts.iter().map(|(_, _, rows)| rows).sum();
+    Ok(Call {
+        grid: (grid(total), 1, 1),
+        block: (BLOCK, 1, 1),
+        args,
+    })
+}
+
+/// `q4e_gemv6_packed`: up to [FUSED6] packed matrices over one input as one launch,
+/// bit-identical to separate `q4e_gemv_packed` launches. `parts` holds (matrix, output, rows).
+///
+/// # Errors
+/// No parts or more than [FUSED6], or a launch a matrix does not admit.
+pub fn gemv6(
+    parts: &[(Packed<Walk>, Deviceptr, usize)],
+    input: Deviceptr,
+    columns: usize,
+    batch: usize,
+) -> Result<Call<34>, String> {
+    if parts.is_empty() || parts.len() > FUSED6 {
+        return Err(format!(
+            "a 6-way fused projection takes 1 to {FUSED6} matrices, not {}",
+            parts.len()
+        ));
+    }
+    // (w0..w5, o0..o5, e0..e5, x, y0..y5, r0..r5, columns, batch, row_bytes)
+    let mut args = [0u64; 5 * FUSED6 + 4];
+    for (slot, (packed, output, rows)) in parts.iter().enumerate() {
+        packed.admits(*rows, columns, input)?;
+        args[slot] = packed.pointer.0;
+        args[FUSED6 + slot] = packed.offsets.0;
+        args[2 * FUSED6 + slot] = packed.entries.0;
+        args[3 * FUSED6 + 1 + slot] = output.0;
+        args[4 * FUSED6 + 1 + slot] = *rows as u64;
+    }
+    args[3 * FUSED6] = input.0;
+    args[5 * FUSED6 + 1] = columns as u64;
+    args[5 * FUSED6 + 2] = batch as u64;
+    args[5 * FUSED6 + 3] = parts[0].0.row_bytes as u64;
     let total: usize = parts.iter().map(|(_, _, rows)| rows).sum();
     Ok(Call {
         grid: (grid(total), 1, 1),
