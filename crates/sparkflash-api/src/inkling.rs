@@ -43,8 +43,8 @@ use futures::stream::BoxStream;
 use serde_json::Value;
 
 use crate::engine::{
-    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, InferenceEngine,
-    MissingCapability,
+    next_tool_call_id, Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest,
+    FinishReason, InferenceEngine, MissingCapability,
 };
 use crate::telemetry_types::{DeepSeekSparkRequestStats, OpenAiUsageWithCache};
 
@@ -414,7 +414,7 @@ fn inkling_engine_event(event: InklingEvent) -> EngineEvent {
             arguments,
         } => EngineEvent::ToolCallDelta {
             index,
-            id: Some(format!("call_{index}")),
+            id: Some(next_tool_call_id()),
             name: Some(name),
             arguments_delta: arguments,
         },
@@ -574,5 +574,40 @@ mod tests {
             })
             .collect();
         assert_eq!(raw, pieces.concat());
+    }
+
+    #[test]
+    fn every_response_gets_a_fresh_tool_call_id() {
+        use crate::engine::MockEngine;
+
+        let pieces = [
+            "<|message_model|>read<|content_invoke_tool_json|>",
+            r#"{"name":"read","args":{"path":"src/lib.rs"}}<|end_message|>"#,
+        ];
+        let id = || {
+            let engine = MockEngine::new("inkling")
+                .content(&pieces)
+                .with_finish_reason(FinishReason::Stop);
+            let engine = InklingResponseEngine::new(Arc::new(engine));
+            let request = crate::engine::test_request("inkling", true);
+            let events = futures::executor::block_on(engine.generate(request).collect::<Vec<_>>());
+            events
+                .into_iter()
+                .find_map(|event| match event {
+                    EngineEvent::ToolCallDelta { id, .. } => id,
+                    _ => None,
+                })
+                .expect("the adapter names its tool call")
+        };
+        let first = id();
+        let second = id();
+        assert!(
+            first.starts_with("call_"),
+            "ids keep the OpenAI prefix: {first}"
+        );
+        assert_ne!(
+            first, second,
+            "a later response must not reuse an earlier call id"
+        );
     }
 }

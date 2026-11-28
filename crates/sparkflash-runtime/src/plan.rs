@@ -779,6 +779,16 @@ impl<H: PlanHost> PlanWalk<H> {
         self.host.logits(&scratch, first, count)
     }
 
+    /// The greedy pick of `count` rows of the last walk from row `first`, chosen on the device:
+    /// what a drafter's verify reads when every member takes its argmax.
+    ///
+    /// # Errors
+    /// As [`PlanHost::choices`].
+    pub fn choices(&self, first: usize, count: usize) -> Result<Vec<u32>, BackendError> {
+        let scratch = self.scratch()?;
+        self.host.choices(&scratch, first, count)
+    }
+
     fn scratch(&self) -> Result<MutexGuard<'_, H::Scratch>, BackendError> {
         self.scratch
             .lock()

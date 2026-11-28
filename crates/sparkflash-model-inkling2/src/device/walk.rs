@@ -256,6 +256,8 @@ struct Open {
 pub struct InklingScratch {
     open: RefCell<Option<Open>>,
     left: RefCell<Vec<(usize, Vec<f32>)>>,
+    /// Device-computed greedy argmax picks for greedy-only verify passes.
+    left_picks: RefCell<Vec<(usize, u32)>>,
     /// The rows one lane step and one prompt chunk walk in, shared by every sequence: the engine
     /// steps one pass at a time, so a buffer a lane - about 0.7 MiB a row - is lent rather than
     /// held per lane.
@@ -696,6 +698,7 @@ impl PlanHost for InklingHost {
             .map_err(|error| BackendError::new(DEVICE, error))?;
         if window.number == 0 {
             scratch.left.borrow_mut().clear();
+            scratch.left_picks.borrow_mut().clear();
         }
         let run = match window.pass.kind {
             PassKind::Bulk { .. } => self.prompt_run(scratch, segments)?,
@@ -732,8 +735,28 @@ impl PlanHost for InklingHost {
             .open
             .take()
             .ok_or_else(|| BackendError::new(DEVICE, "a tail ran outside a window"))?;
-        let mut left = scratch.left.borrow_mut();
         let first = open.first;
+        let greedy_verify = matches!(pass.kind, PassKind::Verify { .. })
+            && self.shared.config.unpadded_vocab_size >= 256
+            && segments
+                .iter()
+                .all(|(seq, _)| seq.sampler.takes_argmax(&seq.sampling));
+        if greedy_verify
+            && let Run::Chunk(run) = open.run
+        {
+            let picks = run.finish_picks()?;
+            for (seq, ids) in segments.iter_mut() {
+                seq.lane.session.state.position += ids.len();
+            }
+            scratch.left_picks.borrow_mut().extend(
+                picks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(row, pick)| (first + row, pick)),
+            );
+            return Ok(());
+        }
+        let mut left = scratch.left.borrow_mut();
         let answered = match open.run {
             Run::Row(run) => vec![run.finish()?],
             Run::Chunk(run) => run.finish()?,
@@ -881,6 +904,21 @@ impl PlanHost for InklingHost {
         first: usize,
         count: usize,
     ) -> Result<Vec<u32>, BackendError> {
+        let left_picks = scratch.left_picks.borrow();
+        if !left_picks.is_empty() {
+            let mut picks = Vec::with_capacity(count);
+            for row in first..first + count {
+                let (_, pick) = left_picks.iter().find(|(at, _)| *at == row).ok_or_else(|| {
+                    BackendError::new(
+                        DEVICE,
+                        format!("row {row} of the last walk left no pick for a head"),
+                    )
+                })?;
+                picks.push(*pick);
+            }
+            return Ok(picks);
+        }
+        drop(left_picks);
         (first..first + count)
             .map(|row| self.logits(scratch, row, 1).map(|logits| argmax(&logits)))
             .collect()
@@ -1088,19 +1126,30 @@ impl Drafter<InklingWalk> for InklingDrafter {
             segments,
             Pass::verify(rows, OutputConstraint::new(&[], rows)),
         )?;
+        let greedy_only = walk.host().shared.config.unpadded_vocab_size >= 256
+            && segments
+                .iter()
+                .all(|segment| segment.seq.sampler.takes_argmax(&segment.seq.sampling));
         let width = walk.host().logits_width();
         let mut first = 0;
         let mut steps = Vec::with_capacity(segments.len());
         for segment in segments.iter_mut() {
             let count = segment.rows.len();
-            let logits = walk.logits(first, count)?;
-            first += count;
-            let rows = logits.chunks(width).map(<[f32]>::to_vec).collect();
             let seq = &mut *segment.seq;
-            let step = seq
-                .lane
-                .session
-                .close(count - 1, rows, &mut seq.sampler, &seq.sampling)?;
+            let step = if greedy_only {
+                let picks = walk.choices(first, count)?;
+                first += count;
+                seq.lane
+                    .session
+                    .close_picks(count - 1, picks, &mut seq.sampler)?
+            } else {
+                let logits = walk.logits(first, count)?;
+                first += count;
+                let rows = logits.chunks(width).map(<[f32]>::to_vec).collect();
+                seq.lane
+                    .session
+                    .close(count - 1, rows, &mut seq.sampler, &seq.sampling)?
+            };
             steps.push(step);
         }
         Ok(steps)

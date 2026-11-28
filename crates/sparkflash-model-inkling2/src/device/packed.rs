@@ -69,6 +69,11 @@ fn dense_slots(plans: &[&InklingDevicePlan]) -> (BTreeSet<usize>, Option<usize>)
 ///
 /// # Errors
 /// A driver failure, or a matrix whose packed rows do not unpack to its BF16 rows.
+/// Dense BF16 budget below which keeping the unpacked BF16 rows beside the packed walk copy
+/// ([Placement::Beside]) eliminates all prefill `q4e_unpack_bf16` launches without crowding out
+/// long-context KV caches (Inkling-2-Mini's dense set is ~2.2 GiB; Inkling-2-Small's is >10 GiB).
+const BESIDE_PACK_LIMIT_BYTES: usize = 3 * 1024 * 1024 * 1024;
+
 pub(super) fn pack_dense(
     cuda: &Cuda,
     kernels: &Kernels,
@@ -76,9 +81,8 @@ pub(super) fn pack_dense(
     weights: &Weights,
     form: Form,
 ) -> Result<PackedSet, String> {
-    let mut dense = PackedSet::new(form, Placement::InPlace);
     if form == Form::Checkpoint || plans.is_empty() {
-        return Ok(dense);
+        return Ok(PackedSet::new(form, Placement::InPlace));
     }
     let served = plans[0].served();
     let (slots, head) = dense_slots(plans);
@@ -86,6 +90,7 @@ pub(super) fn pack_dense(
     // The scratch holds the widest matrix but the head as BF16 (what a prompt tile unpacks) and
     // is what the load packs through, a group of rows at a time.
     let mut scratch_bytes = 0usize;
+    let mut total_bf16_bytes = 0usize;
     for index in slots {
         let spec = served.rank_spec_at(index);
         let slot = weights.get(index);
@@ -95,11 +100,18 @@ pub(super) fn pack_dense(
         if spec.dtype != DType::BF16 || slot.bytes != rows * columns * 2 {
             continue;
         }
+        total_bf16_bytes += slot.bytes;
         if Some(index) != head && packable(rows, columns) {
             scratch_bytes = scratch_bytes.max(rows * columns * 2);
         }
         candidates.push((slot.pointer, rows, columns));
     }
+    let placement = if total_bf16_bytes <= BESIDE_PACK_LIMIT_BYTES {
+        Placement::Beside
+    } else {
+        Placement::InPlace
+    };
+    let mut dense = PackedSet::new(form, placement);
     dense.pack(cuda, &kernels.packed, &candidates, scratch_bytes)?;
     Ok(dense)
 }
@@ -138,6 +150,19 @@ impl Shared {
     ) -> Result<(), String> {
         let call = packed::gemv4(parts, input, columns, batch)?;
         self.launch_call(self.kernels.packed.gemv4, &call)
+    }
+
+    /// Up to six packed matrices over `batch` rows, as one launch (e.g. sliding-layer
+    /// Q/K/V/Rel/Gate/Sink). `parts` holds (matrix, output, rows).
+    pub(super) fn gemv6_packed(
+        &self,
+        parts: &[(Packed<Walk>, Deviceptr, usize)],
+        input: Deviceptr,
+        columns: usize,
+        batch: usize,
+    ) -> Result<(), String> {
+        let call = packed::gemv6(parts, input, columns, batch)?;
+        self.launch_call(self.kernels.packed.gemv6, &call)
     }
 
     /// The BF16 rows a prompt tile reads for `weight`: the matrix itself, or a packed matrix's

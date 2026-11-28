@@ -119,6 +119,11 @@ const RESIDUAL_SPLIT_PAIRS: usize = 8;
 /// (`inkling_block_residual_chain_*`, [RESIDUAL_CHAIN_ENV]) carries its scores through the same
 /// rows, a walk taking one form or the other.
 const RESIDUAL_STATS_ROW: usize = 3 * RESIDUAL_ROWS * 2;
+/// Widest hidden size handled by the register-held small RMSNorm / fused block-residual-norm
+/// kernels (`INKLING_RESIDUAL_HELD_SMALL * INKLING_BLOCK`).
+const RESIDUAL_NORM_MAX_HIDDEN: usize = 10 * ELEMENT_BLOCK as usize;
+/// Deepest summary stack for the single-launch fused `inkling_block_residual_small_norm` kernel.
+const RESIDUAL_SMALL_MAX_BLOCKS: usize = 4;
 /// The summary rows the chained form holds (`INKLING_CHAIN_SUMMARIES`): a thread keeps the next
 /// call's dots a summary row in registers through its whole pass.
 const RESIDUAL_CHAIN_SUMMARIES: usize = 8;
@@ -132,6 +137,17 @@ const RESIDUAL_CHAIN_PAIRS: [(usize, usize, &str); 6] = [
     (3, 1, "inkling_block_residual_chain_q3_n1"),
     (3, 3, "inkling_block_residual_chain_q3_n3"),
 ];
+
+const RESIDUAL_CHAIN_NORM_PAIRS: [(usize, usize, &str); 6] = [
+    (1, 0, "inkling_block_residual_chain_norm_q1_n0"),
+    (1, 1, "inkling_block_residual_chain_norm_q1_n1"),
+    (1, 3, "inkling_block_residual_chain_norm_q1_n3"),
+    (3, 0, "inkling_block_residual_chain_norm_q3_n0"),
+    (3, 1, "inkling_block_residual_chain_norm_q3_n1"),
+    (3, 3, "inkling_block_residual_chain_norm_q3_n3"),
+];
+
+const CONV_CHUNK_TILE: usize = 64;
 /// The threads the serial attention body runs: one warp a head.
 const ATTENTION_BLOCK: u32 = 32;
 /// The threads a block of the split walk's key-scale and score launches runs
@@ -182,6 +198,20 @@ const WINDOW_THREADS: u32 = 512;
 const WINDOW_GROUPS: usize = 6;
 const WINDOW_HEAD_DIM: usize = 128;
 const WINDOW_SHARED: u32 = 75_920;
+const WINDOW_G3_SHARED: u32 = 71_248;
+const WINDOW_G3_R1_THREADS: u32 = 512;
+const SCORED_G3_MULTI_SHARED: u32 = 82_816;
+const SCORED_G3_MULTI_K2_SHARED: u32 = 95_296;
+const SCORED_G3_MULTI_K2_MIN_KEYS: usize = 8192;
+const SCORED_G3_MULTI_THREADS: u32 = 512;
+const SCORED_G3_MULTI_MAX_ROWS: usize = 8;
+const SCORED_G3_TC_SHARED: u32 = 49_920;
+const SCORED_G3_TC_THREADS: u32 = 256;
+const SCORED_G3_TC_MIN_KEYS: usize = 24_576;
+const SCORED_G3_TC_MACRO_KEYS: usize = 2048;
+const WINDOW_G3_TC_MACRO_KEYS: usize = 64;
+const WINDOW_G3_MULTI_SHARED: u32 = 95_456;
+const WINDOW_G3_MULTI_THREADS: u32 = 512;
 /// The scores one decode split-walk pass may hold across its heads: ~175k keys, so a sliding
 /// layer is one pass and a full layer at a million positions a handful.
 const SCORE_BUDGET: usize = 1 << 21;
@@ -554,6 +584,13 @@ impl AttentionWalk {
 /// a warp's bias tile (INKLING_MMA_REL_STRIDE) and the opt-in ceiling on one block's dynamic
 /// shared memory on sm_121.
 const MMA_Q: usize = 16;
+const MMA_G3_Q: usize = 64;
+const MMA_G3_THREADS: u32 = 384;
+const MMA_G3_SHARED: u32 = 98_560;
+const MOE_64_ROWS: usize = 64;
+const MOE_F16_64_SHARED: u32 = 42_240;
+const MOE_MX8_64_SHARED: u32 = 50_432;
+const DENSE_BF16_SHARED: u32 = 98_304;
 const MMA_KEYS: usize = 32;
 const MMA_HEAD_DIM: usize = 128;
 const MMA_D_REL: usize = 16;
@@ -726,6 +763,7 @@ fn grid_blocks(items: usize, per_block: usize) -> u32 {
 /// The blocks a dense GEMV takes: the kernel strides rows over its warps times the grid's blocks.
 /// The matrices `q4e_gemv4_bf16` stacks in one launch.
 const GEMV_FUSED: usize = 4;
+const GEMV_FUSED_PACKED: usize = 6;
 
 fn gemv_grid(rows: usize) -> u32 {
     let warps = (TOKEN_BLOCK / 32) as usize;
@@ -815,13 +853,19 @@ struct Kernels {
     /// then the softmax and the mix.
     block_residual_stats: Bound,
     block_residual_mix: Bound,
+    block_residual_mix_norm: Bound,
+    block_residual_small_norm: Bound,
+    rmsnorm3_small: Bound,
     /// The chunk walk's chained form: one block a row for every query, the stack read once; one
     /// entry a pair of [RESIDUAL_CHAIN_PAIRS], in its order.
     block_residual_chain: Vec<Bound>,
+    /// The same chained form fused with post-residual RMSNorm for hidden <= RESIDUAL_NORM_MAX_HIDDEN.
+    block_residual_chain_norm: Vec<Bound>,
     short_conv: Bound,
     short_conv_dynamic: Bound,
     kv_store: Bound,
     router: Router,
+    router_plan_small: Bound,
     expert_nvfp4: Bound,
     expert_mxfp8: Bound,
     /// A chunk's projections of one expert over every pair that chose it, a weight run decoded
@@ -830,11 +874,15 @@ struct Kernels {
     expert_mxfp8_pairs: Bound,
     /// The decode band's projections, reading the router's choice on the device.
     expert_nvfp4_band: Bound,
+    expert_nvfp4_band_swiglu: Bound,
     expert_mxfp8_band: Bound,
+    expert_mxfp8_band_swiglu: Bound,
     /// A band of a few rows over moe_plan's items: the pair walk, an expert read once for every
     /// slot that picked it, with the plan made on the device.
     expert_nvfp4_items: Bound,
+    expert_nvfp4_items_swiglu: Bound,
     expert_mxfp8_items: Bound,
+    expert_mxfp8_items_swiglu: Bound,
     /// The decode band's mix shares: the router's weight for an owned slot, zero otherwise.
     band_shares: Bound,
     /// The device leg's sum: this rank's partial and every peer's slot, ascending rank from zero.
@@ -846,11 +894,19 @@ struct Kernels {
     join_pieces: Bound,
     residual_add: Bound,
     logit_softcap: Bound,
+    logit_softcap_argmax_part: Bound,
+    logit_softcap_argmax_reduce: Bound,
     widen: Bound,
     /// The reordered tiled GEMM the `gemm` walk's projections take.
     gemm: Bound,
     /// The tensor-core wide tile the `tensor` walk's projections take (GLM's prefill image).
     wide: Bound,
+    /// Head-only wide tile for already-BF16 activations (`Projection::AttentionOut` after widen).
+    wide_bf16a: Bound,
+    /// Pure BF16 x BF16 -> F32 dense MMA reading BF16 activations directly (`scratch.attn_bf16`).
+    dense_bf16_mma: Bound,
+    /// Skinny BF16 projections (`outs <= 32`, e.g. 24-head attention sink).
+    skinny: [Bound; 4],
     /// The `tensor` walk's NVFP4 routed experts, Qwen's grouped W4A16 MMA (its prefill image):
     /// the activation split into bf16 head and remainder planes, the gate_up pass with the
     /// interleaved rows and softcapped SwiGLU, and the down pass as Qwen runs it.
@@ -863,6 +919,12 @@ struct Kernels {
     /// The two down passes over the row split's gathered activation runs, unjoined.
     moe_down_runs: Bound,
     moe_down_runs_mx8: Bound,
+    /// High-occupancy BM=64 grouped MoE prefill passes (FP16 MMA for NVFP4, BF16 MMA for MXFP8).
+    split_f16: Bound,
+    moe_gate_up_64: Bound,
+    moe_down_64: Bound,
+    moe_gate_up_mx8_64: Bound,
+    moe_down_mx8_64: Bound,
     /// The shared routed-expert plan (kernels/moe_plan_sm121.cu): the chunk's slots sorted by
     /// this rank's expert into the items the MMA passes walk.
     moe_plan: Bound,
@@ -878,16 +940,39 @@ struct Kernels {
     /// one launch.
     attention_part: Bound,
     attention_scored: Bound,
+    attention_scored_g3_multi: Bound,
+    attention_scored_g3_multi_k2: Bound,
+    attention_scored_g3_tc: Bound,
     attention_merge: Bound,
+    attention_merge_f32: Bound,
     /// A sliding layer's split-key walk in one launch: a cluster a (KV head, row), a block a run.
     attention_window: Bound,
+    /// Specialised groups==3 sliding-window attention (4-run cluster, multi-row, and 1-run).
+    attention_window_g3: Bound,
+    attention_window_g3_multi: Bound,
+    attention_window_g3_r1: Bound,
+    attention_window_g3_tc: Bound,
     /// The tensor-core prompt walk: each row's query side as the exact walks compute it, then the
     /// shared MMA body over it. `attention_mma` is loaded only when the walk runs
     /// ([AttentionWalk::fast]), sized to the rank's group.
     attention_prepare: Bound,
     attention_mma: Option<Bound>,
+    /// High-occupancy groups==3, head_dim==128 tensor-core prompt attention (64 Q rows x 64 keys).
+    attention_mma_g3: Option<Bound>,
     /// The static short convolution over a chunk, reading its taps across the chunk's rows.
     short_conv_rows: Bound,
+    /// Streaming chunk static short conv fused with residual add (kernel == 4).
+    short_conv_chunk_add: Bound,
+    /// Fused decode short convolution + residual add (`x += conv_out`).
+    short_conv_decode_add: Bound,
+    /// Fused verify-segment short convolution (history load + tail write + conv + optional add).
+    short_conv_segment: Bound,
+    /// Streaming chunk sliding-layer Key + Value static short conv fused with BF16 KV store (kernel == 4).
+    short_conv_kv_chunk: Bound,
+    /// Fused sliding-layer Key + Value decode short conv + BF16 KV store.
+    short_conv_kv_decode: Bound,
+    /// Fused sliding-layer Key + Value verify-segment short conv + tail write + BF16 KV store.
+    short_conv_kv_segment: Bound,
     /// The dynamic (static taps plus a per-row projection) short convolution over a chunk.
     short_conv_dynamic_rows: Bound,
     /// Append a chunk's rows to their summary stacks.
@@ -899,8 +984,17 @@ struct Kernels {
     conv_restore: Bound,
     /// The loop's cross-pass read: one block a (row, core layer, stream) query.
     cross_pass: Bound,
-    /// The loop's two-tanh gate over one stream's residual row.
-    message_gate: Bound,
+    /// Multi-SM BF16 loop message gate: split-K down projection and coalesced up/mix (1-stream).
+    message_gate_down_bf16: Bound,
+    message_gate_up_bf16: Bound,
+    /// Multi-SM BF16 loop message gate batched across all 3 attention streams (Q/K/V).
+    message_gate_down3_bf16: Bound,
+    message_gate_up3_bf16: Bound,
+    /// Tensor-core BF16 MMA loop message gate for prefill chunks (1-stream and 3-stream).
+    message_gate_down_mma: Bound,
+    message_gate_up_mma: Bound,
+    message_gate_down3_mma: Bound,
+    message_gate_up3_mma: Bound,
 }
 
 impl Kernels {
@@ -966,12 +1060,68 @@ impl Kernels {
             Precision::Bf16,
             WIDE_SHARED,
         )?;
+        let wide_bf16a = shared(
+            Image::GlmPrefill,
+            prefill,
+            "glm_prefill_bf16_wide_bf16a",
+            Precision::Bf16,
+            WIDE_SHARED,
+        )?;
         let window = shared(
             Image::Inkling,
             inkling,
             "inkling_attn_window",
             Precision::Bf16,
             WINDOW_SHARED,
+        )?;
+        let window_g3 = shared(
+            Image::Inkling,
+            inkling,
+            "inkling_attn_window_g3",
+            Precision::Bf16,
+            WINDOW_G3_SHARED,
+        )?;
+        let window_g3_multi = shared(
+            Image::Inkling,
+            inkling,
+            "inkling_attn_window_g3_multi",
+            Precision::Bf16,
+            WINDOW_G3_MULTI_SHARED,
+        )?;
+        let window_g3_r1 = shared(
+            Image::Inkling,
+            inkling,
+            "inkling_attn_window_g3_r1",
+            Precision::Bf16,
+            WINDOW_G3_SHARED,
+        )?;
+        let window_g3_tc = shared(
+            Image::Inkling,
+            inkling,
+            "inkling_attn_window_g3_tc",
+            Precision::Bf16,
+            SCORED_G3_TC_SHARED,
+        )?;
+        let scored_g3_multi = shared(
+            Image::Inkling,
+            inkling,
+            "inkling_attn_scored_part_g3_multi",
+            Precision::Bf16,
+            SCORED_G3_MULTI_SHARED,
+        )?;
+        let scored_g3_multi_k2 = shared(
+            Image::Inkling,
+            inkling,
+            "inkling_attn_scored_part_g3_multi_k2",
+            Precision::Bf16,
+            SCORED_G3_MULTI_K2_SHARED,
+        )?;
+        let scored_g3_tc = shared(
+            Image::Inkling,
+            inkling,
+            "inkling_attn_scored_part_g3_tc",
+            Precision::Bf16,
+            SCORED_G3_TC_SHARED,
         )?;
         let attention_mma = match mma_shared {
             Some(bytes) => Some(shared(
@@ -980,6 +1130,16 @@ impl Kernels {
                 "inkling_attn_mma",
                 Precision::Bf16,
                 bytes,
+            )?),
+            None => None,
+        };
+        let attention_mma_g3 = match mma_shared {
+            Some(_) => Some(shared(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_mma_g3",
+                Precision::Bf16,
+                MMA_G3_SHARED,
             )?),
             None => None,
         };
@@ -992,6 +1152,40 @@ impl Kernels {
         };
         Ok(Self {
             wide,
+            wide_bf16a,
+            dense_bf16_mma: shared(
+                Image::Inkling,
+                inkling,
+                "inkling_dense_bf16_mma",
+                Precision::Bf16,
+                DENSE_BF16_SHARED,
+            )?,
+            skinny: [
+                load(
+                    Image::GlmPrefill,
+                    prefill,
+                    "glm_prefill_skinny_bf16_1",
+                    Precision::Bf16,
+                )?,
+                load(
+                    Image::GlmPrefill,
+                    prefill,
+                    "glm_prefill_skinny_bf16_2",
+                    Precision::Bf16,
+                )?,
+                load(
+                    Image::GlmPrefill,
+                    prefill,
+                    "glm_prefill_skinny_bf16_3",
+                    Precision::Bf16,
+                )?,
+                load(
+                    Image::GlmPrefill,
+                    prefill,
+                    "glm_prefill_skinny_bf16_4",
+                    Precision::Bf16,
+                )?,
+            ],
             split_bf16: load(
                 Image::Qwen4Prefill,
                 experts,
@@ -1055,6 +1249,40 @@ impl Kernels {
                 planes.pick("q4p_moe_down_runs_mx8", "q4p_moe_down_runs_mx8_head"),
                 Precision::MxFp8,
             )?,
+            split_f16: load(
+                Image::Inkling,
+                inkling,
+                "inkling_split_f16",
+                Precision::NvFp4,
+            )?,
+            moe_gate_up_64: shared(
+                Image::Inkling,
+                inkling,
+                "inkling_moe_gate_up_f16_64",
+                Precision::NvFp4,
+                MOE_F16_64_SHARED,
+            )?,
+            moe_down_64: shared(
+                Image::Inkling,
+                inkling,
+                "inkling_moe_down_f16_64",
+                Precision::NvFp4,
+                MOE_F16_64_SHARED,
+            )?,
+            moe_gate_up_mx8_64: shared(
+                Image::Inkling,
+                inkling,
+                "inkling_moe_gate_up_mx8_64",
+                Precision::MxFp8,
+                MOE_MX8_64_SHARED,
+            )?,
+            moe_down_mx8_64: shared(
+                Image::Inkling,
+                inkling,
+                "inkling_moe_down_mx8_64",
+                Precision::MxFp8,
+                MOE_MX8_64_SHARED,
+            )?,
             moe_plan: load(Image::MoePlan, moe_plan, "moe_plan", Precision::Bf16)?,
             embed: load(Image::Qwen4Exp, token, "q4e_embed", Precision::Bf16)?,
             norm: Norm::new(
@@ -1087,7 +1315,29 @@ impl Kernels {
                 "inkling_block_residual_mix",
                 Precision::Bf16,
             )?,
+            block_residual_mix_norm: load(
+                Image::Inkling,
+                inkling,
+                "inkling_block_residual_mix_norm",
+                Precision::Bf16,
+            )?,
+            block_residual_small_norm: load(
+                Image::Inkling,
+                inkling,
+                "inkling_block_residual_small_norm",
+                Precision::Bf16,
+            )?,
+            rmsnorm3_small: load(
+                Image::Inkling,
+                inkling,
+                "inkling_rmsnorm3_small",
+                Precision::Bf16,
+            )?,
             block_residual_chain: RESIDUAL_CHAIN_PAIRS
+                .iter()
+                .map(|&(_, _, name)| load(Image::Inkling, inkling, name, Precision::Bf16))
+                .collect::<Result<_, _>>()?,
+            block_residual_chain_norm: RESIDUAL_CHAIN_NORM_PAIRS
                 .iter()
                 .map(|&(_, _, name)| load(Image::Inkling, inkling, name, Precision::Bf16))
                 .collect::<Result<_, _>>()?,
@@ -1110,6 +1360,12 @@ impl Kernels {
                 "inkling_router_topk",
                 Precision::F32,
             )?)?,
+            router_plan_small: load(
+                Image::Inkling,
+                inkling,
+                "inkling_router_plan_small",
+                Precision::F32,
+            )?,
             expert_nvfp4: load(
                 Image::Inkling,
                 inkling,
@@ -1140,10 +1396,22 @@ impl Kernels {
                 "inkling_nvfp4_expert_band",
                 Precision::NvFp4,
             )?,
+            expert_nvfp4_band_swiglu: load(
+                Image::Inkling,
+                inkling,
+                "inkling_nvfp4_expert_band_swiglu",
+                Precision::NvFp4,
+            )?,
             expert_mxfp8_band: load(
                 Image::Inkling,
                 inkling,
                 "inkling_mxfp8_expert_band",
+                Precision::MxFp8,
+            )?,
+            expert_mxfp8_band_swiglu: load(
+                Image::Inkling,
+                inkling,
+                "inkling_mxfp8_expert_band_swiglu",
                 Precision::MxFp8,
             )?,
             expert_nvfp4_items: load(
@@ -1152,10 +1420,22 @@ impl Kernels {
                 "inkling_nvfp4_expert_items",
                 Precision::NvFp4,
             )?,
+            expert_nvfp4_items_swiglu: load(
+                Image::Inkling,
+                inkling,
+                "inkling_nvfp4_expert_items_swiglu",
+                Precision::NvFp4,
+            )?,
             expert_mxfp8_items: load(
                 Image::Inkling,
                 inkling,
                 "inkling_mxfp8_expert_items",
+                Precision::MxFp8,
+            )?,
+            expert_mxfp8_items_swiglu: load(
+                Image::Inkling,
+                inkling,
+                "inkling_mxfp8_expert_items_swiglu",
                 Precision::MxFp8,
             )?,
             band_shares: load(
@@ -1195,6 +1475,18 @@ impl Kernels {
                 "inkling_logit_softcap",
                 Precision::Bf16,
             )?,
+            logit_softcap_argmax_part: load(
+                Image::Inkling,
+                inkling,
+                "inkling_logit_softcap_argmax_part",
+                Precision::Bf16,
+            )?,
+            logit_softcap_argmax_reduce: load(
+                Image::Inkling,
+                inkling,
+                "inkling_logit_softcap_argmax_reduce",
+                Precision::Bf16,
+            )?,
             widen: load(Image::Inkling, inkling, "inkling_widen_f32", Precision::F32)?,
             gemm: load(Image::Qwen4Exp, token, "q4e_gemm_bf16", Precision::Bf16)?,
             attention_prefill: load(
@@ -1228,13 +1520,26 @@ impl Kernels {
                 "inkling_attn_scored_part",
                 Precision::Bf16,
             )?,
+            attention_scored_g3_multi: scored_g3_multi,
+            attention_scored_g3_multi_k2: scored_g3_multi_k2,
+            attention_scored_g3_tc: scored_g3_tc,
             attention_merge: load(
                 Image::Inkling,
                 inkling,
                 "inkling_attn_merge",
                 Precision::Bf16,
             )?,
+            attention_merge_f32: load(
+                Image::Inkling,
+                inkling,
+                "inkling_attn_merge_f32",
+                Precision::Bf16,
+            )?,
             attention_window: window,
+            attention_window_g3: window_g3,
+            attention_window_g3_multi: window_g3_multi,
+            attention_window_g3_r1: window_g3_r1,
+            attention_window_g3_tc: window_g3_tc,
             attention_prepare: load(
                 Image::Inkling,
                 inkling,
@@ -1242,10 +1547,47 @@ impl Kernels {
                 Precision::Bf16,
             )?,
             attention_mma,
+            attention_mma_g3,
             short_conv_rows: load(
                 Image::Inkling,
                 inkling,
                 "inkling_short_conv",
+                Precision::Bf16,
+            )?,
+            short_conv_chunk_add: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv_chunk_add",
+                Precision::Bf16,
+            )?,
+            short_conv_decode_add: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv_decode_add",
+                Precision::Bf16,
+            )?,
+            short_conv_segment: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv_segment",
+                Precision::Bf16,
+            )?,
+            short_conv_kv_chunk: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv_kv_chunk",
+                Precision::Bf16,
+            )?,
+            short_conv_kv_decode: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv_kv_decode",
+                Precision::Bf16,
+            )?,
+            short_conv_kv_segment: load(
+                Image::Inkling,
+                inkling,
+                "inkling_short_conv_kv_segment",
                 Precision::Bf16,
             )?,
             short_conv_dynamic_rows: load(
@@ -1278,11 +1620,53 @@ impl Kernels {
                 "inkling_cross_pass",
                 Precision::F32,
             )?,
-            message_gate: load(
+            message_gate_down_bf16: load(
                 Image::Inkling,
                 inkling,
-                "inkling_message_gate",
-                Precision::F32,
+                "inkling_message_gate_down_bf16",
+                Precision::Bf16,
+            )?,
+            message_gate_up_bf16: load(
+                Image::Inkling,
+                inkling,
+                "inkling_message_gate_up_bf16",
+                Precision::Bf16,
+            )?,
+            message_gate_down3_bf16: load(
+                Image::Inkling,
+                inkling,
+                "inkling_message_gate_down3_bf16",
+                Precision::Bf16,
+            )?,
+            message_gate_up3_bf16: load(
+                Image::Inkling,
+                inkling,
+                "inkling_message_gate_up3_bf16",
+                Precision::Bf16,
+            )?,
+            message_gate_down_mma: load(
+                Image::Inkling,
+                inkling,
+                "inkling_message_gate_down_mma",
+                Precision::Bf16,
+            )?,
+            message_gate_up_mma: load(
+                Image::Inkling,
+                inkling,
+                "inkling_message_gate_up_mma",
+                Precision::Bf16,
+            )?,
+            message_gate_down3_mma: load(
+                Image::Inkling,
+                inkling,
+                "inkling_message_gate_down3_mma",
+                Precision::Bf16,
+            )?,
+            message_gate_up3_mma: load(
+                Image::Inkling,
+                inkling,
+                "inkling_message_gate_up3_mma",
+                Precision::Bf16,
             )?,
         })
     }
@@ -1681,9 +2065,9 @@ impl Shared {
         columns: usize,
         batch: usize,
     ) -> Result<(), String> {
-        if parts.is_empty() || parts.len() > GEMV_FUSED {
+        if parts.is_empty() || parts.len() > GEMV_FUSED_PACKED {
             return Err(format!(
-                "a fused projection takes 1 to {GEMV_FUSED} matrices, not {}",
+                "a fused projection takes 1 to {GEMV_FUSED_PACKED} matrices, not {}",
                 parts.len()
             ));
         }
@@ -1692,14 +2076,16 @@ impl Shared {
                 "a fused projection carries 1 to {BATCH_ROWS} rows, not {batch}"
             ));
         }
-        // (w0..w3, x, y0..y3, r0..r3, columns, batch): an absent slot is a null matrix of no rows.
-        // Packed matrices take the packed launch; a group that mixes the two forms goes out a
-        // matrix at a time, which is the same bits.
+        // Packed matrices take the 4- or 6-way packed launch; an unpacked group splits into
+        // chunks of at most GEMV_FUSED (4) on q4e_gemv4_bf16.
         let packed: Vec<_> = parts
             .iter()
             .filter_map(|(weight, out, rows)| Some((self.dense.get(*weight)?, *out, *rows)))
             .collect();
         if packed.len() == parts.len() {
+            if packed.len() > GEMV_FUSED {
+                return self.gemv6_packed(&packed, input, columns, batch);
+            }
             return self.gemv4_packed(&packed, input, columns, batch);
         }
         if !packed.is_empty() {
@@ -1708,22 +2094,25 @@ impl Shared {
             }
             return Ok(());
         }
-        let mut args = [0u64; 3 * GEMV_FUSED + 3];
-        for (slot, (weight, out, rows)) in parts.iter().enumerate() {
-            args[slot] = weight.0;
-            args[GEMV_FUSED + 1 + slot] = out.0;
-            args[2 * GEMV_FUSED + 1 + slot] = *rows as u64;
+        for chunk in parts.chunks(GEMV_FUSED) {
+            let mut args = [0u64; 3 * GEMV_FUSED + 3];
+            for (slot, (weight, out, rows)) in chunk.iter().enumerate() {
+                args[slot] = weight.0;
+                args[GEMV_FUSED + 1 + slot] = out.0;
+                args[2 * GEMV_FUSED + 1 + slot] = *rows as u64;
+            }
+            args[GEMV_FUSED] = input.0;
+            args[3 * GEMV_FUSED + 1] = columns as u64;
+            args[3 * GEMV_FUSED + 2] = batch as u64;
+            let total: usize = chunk.iter().map(|(_, _, rows)| rows).sum();
+            self.launch(
+                self.kernels.gemv4,
+                (gemv_grid(total), 1, 1),
+                (TOKEN_BLOCK, 1, 1),
+                &args,
+            )?;
         }
-        args[GEMV_FUSED] = input.0;
-        args[3 * GEMV_FUSED + 1] = columns as u64;
-        args[3 * GEMV_FUSED + 2] = batch as u64;
-        let total: usize = parts.iter().map(|(_, _, rows)| rows).sum();
-        self.launch(
-            self.kernels.gemv4,
-            (gemv_grid(total), 1, 1),
-            (TOKEN_BLOCK, 1, 1),
-            &args,
-        )
+        Ok(())
     }
 
     /// One dense BF16 projection of `batch` rows, through the row kernel's own batched walk.
@@ -1785,7 +2174,79 @@ impl Shared {
         self.launch(self.kernels.wide, tile.grid, tile.block, &tile.args)
     }
 
-    /// One RMSNorm of one row.
+    /// Head-only wide tile (`glm_prefill_bf16_wide_bf16a`) for activations whose values are
+    /// already exact BF16 (remainder plane identically zero, e.g. `Projection::AttentionOut`).
+    fn wide_bf16a(
+        &self,
+        weight: Deviceptr,
+        input: Deviceptr,
+        out: Deviceptr,
+        width: usize,
+        inner: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let weight = self.bf16_rows(weight, width, inner)?;
+        let tile = WideTile::call(weight.0, input.0, out.0, width, inner, rows)?;
+        self.launch(self.kernels.wide_bf16a, tile.grid, tile.block, &tile.args)
+    }
+
+    /// Pure BF16-input dense MMA (`inkling_dense_bf16_mma`) reading BF16 activations directly.
+    fn dense_bf16_mma(
+        &self,
+        weight: Deviceptr,
+        input_bf16: Deviceptr,
+        out: Deviceptr,
+        width: usize,
+        inner: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let weight = self.bf16_rows(weight, width, inner)?;
+        let grid = (width.div_ceil(256) as u32, rows.div_ceil(128) as u32, 1);
+        self.launch(
+            self.kernels.dense_bf16_mma,
+            grid,
+            (256, 1, 1),
+            &[
+                weight.0,
+                input_bf16.0,
+                out.0,
+                width as u64,
+                inner as u64,
+                rows as u64,
+            ],
+        )
+    }
+
+    /// Skinny BF16 projection (`glm_prefill_skinny_bf16_1..4`) for `1..=32` output columns
+    /// over an inner width that is a multiple of 8 (e.g. 24-head attention sink).
+    fn skinny(
+        &self,
+        weight: Deviceptr,
+        input: Deviceptr,
+        out: Deviceptr,
+        width: usize,
+        inner: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let weight = self.bf16_rows(weight, width, inner)?;
+        let jt = width.div_ceil(8).clamp(1, 4) - 1;
+        let grid_x = u32::try_from(rows.div_ceil(16)).unwrap_or(u32::MAX);
+        self.launch(
+            self.kernels.skinny[jt],
+            (grid_x, 1, 1),
+            (256, 1, 1),
+            &[
+                weight.0,
+                input.0,
+                out.0,
+                width as u64,
+                inner as u64,
+                rows as u64,
+            ],
+        )
+    }
+
+    /// One RMSNorm of one or more contiguous rows.
     fn rmsnorm(
         &self,
         input: Deviceptr,
@@ -1794,6 +2255,16 @@ impl Shared {
         rows: usize,
         width: usize,
     ) -> Result<(), String> {
+        if width > 0 && width <= RESIDUAL_NORM_MAX_HIDDEN {
+            return self.rmsnorm3_small(
+                [input, Deviceptr(0), Deviceptr(0)],
+                [weight, Deviceptr(0), Deviceptr(0)],
+                [out, Deviceptr(0), Deviceptr(0)],
+                rows,
+                width,
+                1,
+            );
+        }
         let norm = RmsNorm::new(
             input.0,
             weight.0,
@@ -1805,6 +2276,128 @@ impl Shared {
             .norm
             .run(self, norm, rows)
             .map_err(|error| error.to_string())
+    }
+
+    /// Lean 1- or 3-stream RMSNorm for contiguous rows with `hidden <= RESIDUAL_NORM_MAX_HIDDEN`,
+    /// bit-identical to `q4e_rmsnorm_rows`.
+    #[allow(clippy::too_many_arguments)]
+    fn rmsnorm3_small(
+        &self,
+        inputs: [Deviceptr; 3],
+        weights: [Deviceptr; 3],
+        outs: [Deviceptr; 3],
+        rows: usize,
+        hidden: usize,
+        streams: usize,
+    ) -> Result<(), String> {
+        let eps = bits(self.config.architecture.norm_epsilon as f32);
+        self.launch(
+            self.kernels.rmsnorm3_small,
+            (streams as u32, rows as u32, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                inputs[0].0,
+                inputs[1].0,
+                inputs[2].0,
+                weights[0].0,
+                weights[1].0,
+                weights[2].0,
+                outs[0].0,
+                outs[1].0,
+                outs[2].0,
+                hidden as u64,
+                eps,
+                streams as u64,
+            ],
+        )
+    }
+
+    /// Fused block-attention residual + RMSNorm for `rows * queries_count <= RESIDUAL_SPLIT_PAIRS`
+    /// and `hidden <= RESIDUAL_NORM_MAX_HIDDEN`: replaces `block_residual_stats` +
+    /// `block_residual_mix` + 1 or 3 `rmsnorm_rows` launches with 2 launches.
+    #[allow(clippy::too_many_arguments)]
+    fn block_residual_norm(
+        &self,
+        summaries: Deviceptr,
+        partial: Deviceptr,
+        queries: Deviceptr,
+        stats: Deviceptr,
+        weights: [Deviceptr; 3],
+        outs: [Deviceptr; 3],
+        blocks: usize,
+        queries_count: usize,
+        rows: usize,
+        summary_stride: usize,
+    ) -> Result<(), String> {
+        let stack = blocks + 1;
+        if stack > RESIDUAL_ROWS {
+            return Err(format!(
+                "the block residual reads {stack} rows, more than the {RESIDUAL_ROWS} its \
+                 kernels hold"
+            ));
+        }
+        let hidden = self.hidden();
+        let eps = bits(self.config.architecture.norm_epsilon as f32);
+        if blocks <= RESIDUAL_SMALL_MAX_BLOCKS && hidden <= RESIDUAL_NORM_MAX_HIDDEN {
+            return self.launch(
+                self.kernels.block_residual_small_norm,
+                (queries_count as u32, rows as u32, 1),
+                (ELEMENT_BLOCK, 1, 1),
+                &[
+                    summaries.0,
+                    partial.0,
+                    queries.0,
+                    weights[0].0,
+                    weights[1].0,
+                    weights[2].0,
+                    outs[0].0,
+                    outs[1].0,
+                    outs[2].0,
+                    blocks as u64,
+                    hidden as u64,
+                    queries_count as u64,
+                    eps,
+                    summary_stride as u64,
+                ],
+            );
+        }
+        self.launch(
+            self.kernels.block_residual_stats,
+            (stack as u32, queries_count as u32, rows as u32),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                summaries.0,
+                partial.0,
+                queries.0,
+                stats.0,
+                blocks as u64,
+                hidden as u64,
+                queries_count as u64,
+                eps,
+                summary_stride as u64,
+            ],
+        )?;
+        self.launch(
+            self.kernels.block_residual_mix_norm,
+            (queries_count as u32, rows as u32, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                summaries.0,
+                partial.0,
+                stats.0,
+                weights[0].0,
+                weights[1].0,
+                weights[2].0,
+                outs[0].0,
+                outs[1].0,
+                outs[2].0,
+                blocks as u64,
+                hidden as u64,
+                queries_count as u64,
+                eps,
+                summary_stride as u64,
+            ],
+        )
     }
 
     /// The block-attention residual over the summary stack plus the current stream.
@@ -1947,6 +2540,7 @@ impl Shared {
         source: Deviceptr,
         destination: Deviceptr,
         message: Deviceptr,
+        partials: Deviceptr,
         stored: usize,
         stream: MessageStream,
         rows: usize,
@@ -1956,6 +2550,7 @@ impl Shared {
         destination_shift: usize,
         message_stride: usize,
         message_shift: usize,
+        use_mma: bool,
     ) -> Result<(), String> {
         let plan = self
             .config
@@ -1971,28 +2566,278 @@ impl Shared {
             .and_then(Option::as_ref)
             .ok_or_else(|| format!("layer {stored} has no loop controllers"))?;
         let hidden = self.hidden();
+        let rank = plan.gate_rank;
         let eps = bits(self.config.architecture.norm_epsilon as f32);
         let (down, forget, gain) = gates[stream.index()];
+        if use_mma
+            && rows >= 32
+            && hidden.is_multiple_of(32)
+            && rank > 0
+            && rank <= 64
+            && rank.is_multiple_of(8)
+            && source_stride.is_multiple_of(4)
+            && source_shift.is_multiple_of(4)
+            && message_stride.is_multiple_of(4)
+            && message_shift.is_multiple_of(4)
+            && destination_stride.is_multiple_of(2)
+            && destination_shift.is_multiple_of(2)
+        {
+            let mma_tiles = rows.div_ceil(64) as u32;
+            self.launch(
+                self.kernels.message_gate_down_mma,
+                (1, mma_tiles, 1),
+                (256, 1, 1),
+                &[
+                    source.0,
+                    message.0,
+                    down.0,
+                    partials.0,
+                    hidden as u64,
+                    rank as u64,
+                    rows as u64,
+                    eps,
+                    source_stride as u64,
+                    source_shift as u64,
+                    message_stride as u64,
+                    message_shift as u64,
+                ],
+            )?;
+            return self.launch(
+                self.kernels.message_gate_up_mma,
+                (hidden.div_ceil(128) as u32, 1, mma_tiles),
+                (256, 1, 1),
+                &[
+                    source.0,
+                    destination.0,
+                    message.0,
+                    forget.0,
+                    gain.0,
+                    partials.0,
+                    hidden as u64,
+                    rank as u64,
+                    rows as u64,
+                    source_stride as u64,
+                    source_shift as u64,
+                    destination_stride as u64,
+                    destination_shift as u64,
+                    message_stride as u64,
+                    message_shift as u64,
+                ],
+            );
+        }
+        let row_tiles = rows.div_ceil(8) as u32;
         self.launch(
-            self.kernels.message_gate,
-            (rows as u32, 1, 1),
-            (MESSAGE_BLOCK, 1, 1),
+            self.kernels.message_gate_down_bf16,
+            (rank.div_ceil(2) as u32, 2, row_tiles),
+            (128, 1, 1),
+            &[
+                source.0,
+                message.0,
+                down.0,
+                partials.0,
+                hidden as u64,
+                rank as u64,
+                rows as u64,
+                eps,
+                source_stride as u64,
+                source_shift as u64,
+                message_stride as u64,
+                message_shift as u64,
+            ],
+        )?;
+        self.launch(
+            self.kernels.message_gate_up_bf16,
+            (hidden.div_ceil(32) as u32, 1, row_tiles),
+            (256, 1, 1),
             &[
                 source.0,
                 destination.0,
                 message.0,
-                down.0,
                 forget.0,
                 gain.0,
+                partials.0,
                 hidden as u64,
-                plan.gate_rank as u64,
-                eps,
+                rank as u64,
+                rows as u64,
                 source_stride as u64,
                 source_shift as u64,
                 destination_stride as u64,
                 destination_shift as u64,
                 message_stride as u64,
                 message_shift as u64,
+            ],
+        )
+    }
+
+    /// All three attention loop gates (Query, Key, Value) batched into one down + one up launch.
+    #[allow(clippy::too_many_arguments)]
+    fn message_gate3(
+        &self,
+        source: Deviceptr,
+        dsts: [Deviceptr; 3],
+        message: Deviceptr,
+        partials: Deviceptr,
+        stored: usize,
+        rows: usize,
+        source_stride: usize,
+        source_shifts: [usize; 3],
+        destination_stride: usize,
+        destination_shifts: [usize; 3],
+        message_stride: usize,
+        message_shifts: [usize; 3],
+        use_mma: bool,
+    ) -> Result<(), String> {
+        let plan = self
+            .config
+            .loop_plan
+            .ok_or_else(|| "a message gate on a single-pass release".to_owned())?;
+        let device = self
+            .loop_device
+            .as_ref()
+            .ok_or_else(|| "the loop controllers are not resident".to_owned())?;
+        let gates = device
+            .gates
+            .get(stored)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("layer {stored} has no loop controllers"))?;
+        let hidden = self.hidden();
+        let rank = plan.gate_rank;
+        let eps = bits(self.config.architecture.norm_epsilon as f32);
+        let (d0, f0, g0) = gates[MessageStream::Query.index()];
+        let (d1, f1, g1) = gates[MessageStream::Key.index()];
+        let (d2, f2, g2) = gates[MessageStream::Value.index()];
+        if use_mma
+            && rows >= 32
+            && hidden.is_multiple_of(32)
+            && rank > 0
+            && rank <= 64
+            && rank.is_multiple_of(8)
+            && source_stride.is_multiple_of(4)
+            && source_shifts.iter().all(|s| s.is_multiple_of(4))
+            && message_stride.is_multiple_of(4)
+            && message_shifts.iter().all(|s| s.is_multiple_of(4))
+            && destination_stride.is_multiple_of(2)
+            && destination_shifts.iter().all(|s| s.is_multiple_of(2))
+        {
+            let mma_tiles = rows.div_ceil(64) as u32;
+            self.launch(
+                self.kernels.message_gate_down3_mma,
+                (3, mma_tiles, 1),
+                (256, 1, 1),
+                &[
+                    source.0,
+                    message.0,
+                    d0.0,
+                    d1.0,
+                    d2.0,
+                    partials.0,
+                    hidden as u64,
+                    rank as u64,
+                    rows as u64,
+                    eps,
+                    source_stride as u64,
+                    source_shifts[0] as u64,
+                    source_shifts[1] as u64,
+                    source_shifts[2] as u64,
+                    message_stride as u64,
+                    message_shifts[0] as u64,
+                    message_shifts[1] as u64,
+                    message_shifts[2] as u64,
+                ],
+            )?;
+            return self.launch(
+                self.kernels.message_gate_up3_mma,
+                (hidden.div_ceil(128) as u32, 3, mma_tiles),
+                (256, 1, 1),
+                &[
+                    source.0,
+                    dsts[0].0,
+                    dsts[1].0,
+                    dsts[2].0,
+                    message.0,
+                    f0.0,
+                    f1.0,
+                    f2.0,
+                    g0.0,
+                    g1.0,
+                    g2.0,
+                    partials.0,
+                    hidden as u64,
+                    rank as u64,
+                    rows as u64,
+                    source_stride as u64,
+                    source_shifts[0] as u64,
+                    source_shifts[1] as u64,
+                    source_shifts[2] as u64,
+                    destination_stride as u64,
+                    destination_shifts[0] as u64,
+                    destination_shifts[1] as u64,
+                    destination_shifts[2] as u64,
+                    message_stride as u64,
+                    message_shifts[0] as u64,
+                    message_shifts[1] as u64,
+                    message_shifts[2] as u64,
+                ],
+            );
+        }
+        let row_tiles = rows.div_ceil(8) as u32;
+        self.launch(
+            self.kernels.message_gate_down3_bf16,
+            (rank.div_ceil(4) as u32, 6, row_tiles),
+            (128, 1, 1),
+            &[
+                source.0,
+                message.0,
+                d0.0,
+                d1.0,
+                d2.0,
+                partials.0,
+                hidden as u64,
+                rank as u64,
+                rows as u64,
+                eps,
+                source_stride as u64,
+                source_shifts[0] as u64,
+                source_shifts[1] as u64,
+                source_shifts[2] as u64,
+                message_stride as u64,
+                message_shifts[0] as u64,
+                message_shifts[1] as u64,
+                message_shifts[2] as u64,
+            ],
+        )?;
+        self.launch(
+            self.kernels.message_gate_up3_bf16,
+            (hidden.div_ceil(32) as u32, 3, row_tiles),
+            (256, 1, 1),
+            &[
+                source.0,
+                dsts[0].0,
+                dsts[1].0,
+                dsts[2].0,
+                message.0,
+                f0.0,
+                f1.0,
+                f2.0,
+                g0.0,
+                g1.0,
+                g2.0,
+                partials.0,
+                hidden as u64,
+                rank as u64,
+                rows as u64,
+                source_stride as u64,
+                source_shifts[0] as u64,
+                source_shifts[1] as u64,
+                source_shifts[2] as u64,
+                destination_stride as u64,
+                destination_shifts[0] as u64,
+                destination_shifts[1] as u64,
+                destination_shifts[2] as u64,
+                message_stride as u64,
+                message_shifts[0] as u64,
+                message_shifts[1] as u64,
+                message_shifts[2] as u64,
             ],
         )
     }
@@ -2054,6 +2899,62 @@ impl Shared {
         )
     }
 
+    /// Chained block residual fused with post-residual RMSNorm (`inkling_block_residual_chain_norm_*`)
+    /// for `hidden <= RESIDUAL_NORM_MAX_HIDDEN`, avoiding materializing `scratch.rows` and skipping
+    /// the standalone RMSNorm launch.
+    #[allow(clippy::too_many_arguments)]
+    fn block_residual_chain_norm(
+        &self,
+        summaries: Deviceptr,
+        partial: Deviceptr,
+        queries: Deviceptr,
+        carry: Deviceptr,
+        next: Option<(Deviceptr, usize)>,
+        weights: [Deviceptr; 3],
+        outs: [Deviceptr; 3],
+        blocks: usize,
+        queries_count: usize,
+        carried: usize,
+        rows: usize,
+        summary_stride: usize,
+    ) -> Result<(), String> {
+        let next_count = next.map_or(0, |(_, count)| count);
+        let entry = RESIDUAL_CHAIN_NORM_PAIRS
+            .iter()
+            .position(|&(queries, next, _)| (queries, next) == (queries_count, next_count))
+            .filter(|_| blocks <= RESIDUAL_CHAIN_SUMMARIES && carried <= blocks)
+            .ok_or_else(|| {
+                format!(
+                    "the fused chained block residual reads {blocks} summary rows ({carried} carried) \
+                     for {queries_count} queries and scores {next_count}"
+                )
+            })?;
+        self.launch(
+            self.kernels.block_residual_chain_norm[entry],
+            (rows as u32, 1, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                summaries.0,
+                partial.0,
+                queries.0,
+                carry.0,
+                next.map_or(0, |(queries, _)| queries.0),
+                weights[0].0,
+                weights[1].0,
+                weights[2].0,
+                outs[0].0,
+                outs[1].0,
+                outs[2].0,
+                blocks as u64,
+                self.hidden() as u64,
+                bits(self.config.architecture.norm_epsilon as f32),
+                summary_stride as u64,
+                carried as u64,
+                RESIDUAL_STATS_ROW as u64,
+            ],
+        )
+    }
+
     /// A dense BF16 projection over a chunk: the token image's tensor-core tile.
     ///
     /// The tile is 64 output rows by QG_TOKENS (128) tokens, so a chunk of at most that many
@@ -2099,6 +3000,20 @@ impl Shared {
         src_stride: usize,
         dst_stride: usize,
     ) -> Result<(), String> {
+        if width > 0
+            && width <= RESIDUAL_NORM_MAX_HIDDEN
+            && src_stride == width
+            && dst_stride == width
+        {
+            return self.rmsnorm3_small(
+                [input, Deviceptr(0), Deviceptr(0)],
+                [weight, Deviceptr(0), Deviceptr(0)],
+                [out, Deviceptr(0), Deviceptr(0)],
+                rows,
+                width,
+                1,
+            );
+        }
         let norm = RmsNorm::new(
             input.0,
             weight.0,
@@ -2218,6 +3133,31 @@ impl Shared {
     /// `tau` on every row. `layer` is the schedule's layer, for [AttentionWalk::Check]'s line;
     /// `tables` are a full layer's [KeyTables], which take the rows' entries here whichever walk
     /// runs.
+    fn attention_direct_f32(
+        &self,
+        scratch: &Scratch,
+        sliding: bool,
+        groups: usize,
+        window: usize,
+        rows: usize,
+    ) -> bool {
+        if self.attention != AttentionWalk::Fast
+            || scratch.parts.is_none()
+            || groups > SCORE_GROUPS
+            || rows > scratch.attention_rows
+        {
+            return false;
+        }
+        if sliding {
+            groups == 3
+                && window > 0
+                && window <= WINDOW_RUNS * PART_KEYS
+                && self.config.head_dim == WINDOW_HEAD_DIM
+        } else {
+            window == 0
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attention_rows(
         &self,
@@ -2243,10 +3183,7 @@ impl Shared {
         rel_extent: usize,
         tau: f32,
     ) -> Result<(), String> {
-        if let Some(tables) = tables {
-            self.store_key_tables(tables, keys, values, rows, first_position, kv_heads)?;
-        }
-        self.attention_walk(
+        self.attention_rows_f32(
             scratch,
             layer,
             queries,
@@ -2259,6 +3196,62 @@ impl Shared {
             sink,
             clip,
             out,
+            Deviceptr(0),
+            taus,
+            rows,
+            first_position,
+            kv_heads,
+            groups,
+            window,
+            cache_rows,
+            rel_extent,
+            tau,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_rows_f32(
+        &self,
+        scratch: &Scratch,
+        layer: usize,
+        queries: Deviceptr,
+        gate: Deviceptr,
+        keys: Deviceptr,
+        values: Deviceptr,
+        tables: Option<KeyTables>,
+        relative: Deviceptr,
+        bank: Deviceptr,
+        sink: Deviceptr,
+        clip: ClipScales,
+        out: Deviceptr,
+        out_f32: Deviceptr,
+        taus: Deviceptr,
+        rows: usize,
+        first_position: usize,
+        kv_heads: usize,
+        groups: usize,
+        window: usize,
+        cache_rows: usize,
+        rel_extent: usize,
+        tau: f32,
+    ) -> Result<(), String> {
+        if let Some(tables) = tables {
+            self.store_key_tables(tables, keys, values, rows, first_position, kv_heads)?;
+        }
+        self.attention_walk_f32(
+            scratch,
+            layer,
+            queries,
+            gate,
+            keys,
+            values,
+            tables,
+            relative,
+            bank,
+            sink,
+            clip,
+            out,
+            out_f32,
             taus,
             rows,
             first_position,
@@ -2298,6 +3291,58 @@ impl Shared {
         rel_extent: usize,
         tau: f32,
     ) -> Result<(), String> {
+        self.attention_walk_f32(
+            scratch,
+            layer,
+            queries,
+            gate,
+            keys,
+            values,
+            tables,
+            relative,
+            bank,
+            sink,
+            clip,
+            out,
+            Deviceptr(0),
+            taus,
+            rows,
+            first_position,
+            kv_heads,
+            groups,
+            window,
+            cache_rows,
+            rel_extent,
+            tau,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_walk_f32(
+        &self,
+        scratch: &Scratch,
+        layer: usize,
+        queries: Deviceptr,
+        gate: Deviceptr,
+        keys: Deviceptr,
+        values: Deviceptr,
+        tables: Option<KeyTables>,
+        relative: Deviceptr,
+        bank: Deviceptr,
+        sink: Deviceptr,
+        clip: ClipScales,
+        out: Deviceptr,
+        out_f32: Deviceptr,
+        taus: Deviceptr,
+        rows: usize,
+        first_position: usize,
+        kv_heads: usize,
+        groups: usize,
+        window: usize,
+        cache_rows: usize,
+        rel_extent: usize,
+        tau: f32,
+    ) -> Result<(), String> {
         let config = &self.config;
         let heads = self.heads();
         if self.attention.split() && groups <= SCORE_GROUPS && rows <= scratch.attention_rows {
@@ -2314,6 +3359,7 @@ impl Shared {
                 sink,
                 clip,
                 out,
+                out_f32,
                 taus,
                 rows,
                 first_position,
@@ -2361,6 +3407,15 @@ impl Shared {
         )
     }
 
+    /// Whether the tensor-core prompt walk can write f32 directly (fusing `Op::Widen`).
+    fn attention_mma_direct_f32(&self, groups: usize) -> bool {
+        self.attention == AttentionWalk::Fast
+            && groups == 3
+            && self.config.head_dim == MMA_HEAD_DIM
+            && self.config.d_rel <= MMA_D_REL
+            && self.kernels.attention_mma_g3.is_some()
+    }
+
     /// A prompt chunk's attention ([Self::attention_rows]'s arguments, `layer` the schedule's
     /// layer for [AttentionWalk::Check]'s line): the tensor-core walk under [AttentionWalk::Fast],
     /// the exact walk otherwise, and under [AttentionWalk::Check] the exact walk's output with the
@@ -2382,6 +3437,7 @@ impl Shared {
         sink: Deviceptr,
         clip: ClipScales,
         out: Deviceptr,
+        out_f32: Deviceptr,
         taus: Deviceptr,
         rows: usize,
         first_position: usize,
@@ -2403,7 +3459,10 @@ impl Shared {
         if let Some(tables) = tables {
             self.store_key_tables(tables, keys, values, rows, first_position, kv_heads)?;
         }
-        let tensor = |into: Deviceptr, halves: Option<AttentionHalves<'h>>| -> Result<(), String> {
+        let tensor = |into: Deviceptr,
+                      into_f32: Deviceptr,
+                      halves: Option<AttentionHalves<'h>>|
+         -> Result<(), String> {
             let mma = scratch.mma.as_ref().ok_or_else(|| {
                 format!("a {rows}-row chunk arena holds no tensor-core attention buffers")
             })?;
@@ -2419,6 +3478,7 @@ impl Shared {
                 sink,
                 clip,
                 into,
+                into_f32,
                 taus,
                 rows,
                 first_position,
@@ -2432,7 +3492,7 @@ impl Shared {
             )
         };
         if self.attention == AttentionWalk::Fast {
-            return tensor(out, halves);
+            return tensor(out, out_f32, halves);
         }
         self.attention_walk(
             scratch,
@@ -2463,7 +3523,7 @@ impl Shared {
         let check = scratch.mma.and_then(|mma| mma.check).ok_or_else(|| {
             "the check walk's arena holds no output beside the exact one".to_owned()
         })?;
-        tensor(check, None)?;
+        tensor(check, Deviceptr(0), None)?;
         self.attention_compare(layer, out, check, rows, first_position)
     }
 
@@ -2491,6 +3551,7 @@ impl Shared {
         sink: Deviceptr,
         clip: ClipScales,
         out: Deviceptr,
+        out_f32: Deviceptr,
         taus: Deviceptr,
         rows: usize,
         first_position: usize,
@@ -2508,6 +3569,10 @@ impl Shared {
             .kernels
             .attention_mma
             .ok_or_else(|| "the tensor-core attention kernel was not loaded".to_owned())?;
+        let use_g3 = groups == 3
+            && config.head_dim == MMA_HEAD_DIM
+            && config.d_rel <= MMA_D_REL
+            && self.kernels.attention_mma_g3.is_some();
         if let Some((split, _)) = halves
             && (split == 0 || split >= rows || !split.is_multiple_of(MMA_Q))
         {
@@ -2517,10 +3582,11 @@ impl Shared {
             ));
         }
         let qk_clip = bits(config.qk_l2_clip_threshold as f32);
+        let prepare_warps = heads.min(8).max(1);
         self.launch(
             self.kernels.attention_prepare,
-            (heads as u32, rows as u32, 1),
-            (32, 1, 1),
+            (heads.div_ceil(prepare_warps) as u32, rows as u32, 1),
+            ((prepare_warps * 32) as u32, 1, 1),
             &[
                 queries.0,
                 relative.0,
@@ -2583,6 +3649,50 @@ impl Shared {
         let body = |first: usize, count: usize| {
             let float = std::mem::size_of::<f32>();
             let query = heads * MMA_HEAD_DIM;
+            if let (true, Some(g3_entry)) = (use_g3, self.kernels.attention_mma_g3) {
+                let out_bf16_ptr = if out.0 == 0 {
+                    0
+                } else {
+                    out.offset(first * query * std::mem::size_of::<u16>()).0
+                };
+                let out_f32_ptr = if out_f32.0 == 0 {
+                    0
+                } else {
+                    out_f32.offset(first * query * float).0
+                };
+                return self.launch(
+                    g3_entry,
+                    (count.div_ceil(MMA_G3_Q) as u32, kv_heads as u32, 1),
+                    (MMA_G3_THREADS, 1, 1),
+                    &[
+                        mma.q.offset(first * query * float).0,
+                        keys.0,
+                        values.0,
+                        mma.rel.offset(first * heads * MMA_D_REL * float).0,
+                        bank.0,
+                        if sink.0 == 0 {
+                            0
+                        } else {
+                            sink.offset(first * heads * float).0
+                        },
+                        gains.0,
+                        scales.0,
+                        gate.offset(first * query * float).0,
+                        out_bf16_ptr,
+                        out_f32_ptr,
+                        heads as u64,
+                        kv_heads as u64,
+                        count as u64,
+                        (first_position + first) as u64,
+                        window as u64,
+                        cache_rows as u64,
+                        rel_extent as u64,
+                        config.d_rel as u64,
+                        scale_first as u64,
+                        scale_stride as u64,
+                    ],
+                );
+            }
             self.launch(
                 entry,
                 (count.div_ceil(MMA_Q) as u32, kv_heads as u32, 1),
@@ -2702,6 +3812,7 @@ impl Shared {
         sink: Deviceptr,
         clip: ClipScales,
         out: Deviceptr,
+        out_f32: Deviceptr,
         taus: Deviceptr,
         rows: usize,
         first_position: usize,
@@ -2749,8 +3860,22 @@ impl Shared {
             && window <= WINDOW_RUNS * PART_KEYS
             && groups <= WINDOW_GROUPS
             && config.head_dim == WINDOW_HEAD_DIM;
-        // Under Fast a windowed layer runs no pass: the window launch is its whole walk.
-        let walked = if windowed && !exact { 0 } else { passes };
+        // Full-attention multi-row shared-KV fast path (groups == 3, rows <= 8, head_dim == 128):
+        // reads K and V from DRAM once across all verify rows in a single pass over 0..widest,
+        // bypassing the 65k pass split and scores buffer completely.
+        let scored_multi = parts.is_some()
+            && !exact
+            && tables.is_some()
+            && window == 0
+            && groups == 3
+            && config.head_dim == WINDOW_HEAD_DIM
+            && (1..=SCORED_G3_MULTI_MAX_ROWS).contains(&rows);
+        // Under Fast a windowed or scored_multi layer runs no split pass.
+        let walked = if (windowed || scored_multi) && !exact {
+            0
+        } else {
+            passes
+        };
         for pass in 0..walked {
             let pass_first = pass * pass_slots;
             let span = (widest - pass_first).min(pass_slots);
@@ -2948,18 +4073,22 @@ impl Shared {
         let Some(parts) = parts else {
             return Ok(());
         };
-        let merged = if self.attention == AttentionWalk::Check {
-            parts
-                .check
-                .ok_or_else(|| "a check arena holds no split-key output buffer".to_owned())?
+        let scored_multi_tc = scored_multi && widest >= SCORED_G3_TC_MIN_KEYS && out_f32.0 != 0;
+        let scored_multi_k2 =
+            scored_multi && !scored_multi_tc && widest >= SCORED_G3_MULTI_K2_MIN_KEYS && out_f32.0 != 0;
+        let merge_run_keys = if scored_multi_tc {
+            SCORED_G3_TC_MACRO_KEYS
+        } else if scored_multi_k2 {
+            2 * PART_KEYS
         } else {
-            out
+            PART_KEYS
         };
-        if windowed {
+        if scored_multi_tc {
+            let tables = tables.expect("scored_multi requires KeyTables");
             self.launch(
-                self.kernels.attention_window,
-                (kv_heads as u32, rows as u32, WINDOW_RUNS as u32),
-                (WINDOW_THREADS, 1, 1),
+                self.kernels.attention_scored_g3_tc,
+                (kv_heads as u32, widest.div_ceil(merge_run_keys) as u32, 1),
+                (SCORED_G3_TC_THREADS, 1, 1),
                 &[
                     queries.0,
                     keys.0,
@@ -2969,16 +4098,15 @@ impl Shared {
                     clip.query.0,
                     0,
                     clip.relative.0,
-                    gate.0,
-                    sink.0,
-                    merged.0,
+                    tables.gains.0,
+                    tables.scales.0,
+                    parts.parts.0,
                     heads as u64,
                     kv_heads as u64,
                     config.head_dim as u64,
                     groups as u64,
                     rows as u64,
                     first_position as u64,
-                    window as u64,
                     cache_rows as u64,
                     rel_extent as u64,
                     config.d_rel as u64,
@@ -2987,7 +4115,235 @@ impl Shared {
                     bits(tau),
                     taus.0,
                     1,
-                    eps,
+                    0,
+                    tables.stride as u64,
+                    merge_run_keys as u64,
+                    parts.stride as u64,
+                ],
+            )?;
+        } else if scored_multi {
+            let tables = tables.expect("scored_multi requires KeyTables");
+            let entry = if scored_multi_k2 {
+                self.kernels.attention_scored_g3_multi_k2
+            } else {
+                self.kernels.attention_scored_g3_multi
+            };
+            self.launch(
+                entry,
+                (kv_heads as u32, widest.div_ceil(merge_run_keys) as u32, 1),
+                (SCORED_G3_MULTI_THREADS, 1, 1),
+                &[
+                    queries.0,
+                    keys.0,
+                    values.0,
+                    relative.0,
+                    bank.0,
+                    clip.query.0,
+                    0,
+                    clip.relative.0,
+                    tables.gains.0,
+                    tables.scales.0,
+                    parts.parts.0,
+                    heads as u64,
+                    kv_heads as u64,
+                    config.head_dim as u64,
+                    groups as u64,
+                    rows as u64,
+                    first_position as u64,
+                    cache_rows as u64,
+                    rel_extent as u64,
+                    config.d_rel as u64,
+                    qk_clip,
+                    bits(config.rel_l2_clip_threshold as f32),
+                    bits(tau),
+                    taus.0,
+                    1,
+                    0,
+                    tables.stride as u64,
+                    parts.stride as u64,
+                ],
+            )?;
+        }
+        let merged = if self.attention == AttentionWalk::Check {
+            parts
+                .check
+                .ok_or_else(|| "a check arena holds no split-key output buffer".to_owned())?
+        } else {
+            out
+        };
+        if windowed {
+            let first_macro = first_slot(first_position) / WINDOW_G3_TC_MACRO_KEYS;
+            let last_macro = last / WINDOW_G3_TC_MACRO_KEYS;
+            let num_macros = last_macro - first_macro + 1;
+            let use_window_tc = !exact
+                && first_position >= window
+                && groups == 3
+                && out_f32.0 != 0
+                && (1..=SCORED_G3_MULTI_MAX_ROWS).contains(&rows)
+                && num_macros <= parts.stride;
+            if use_window_tc {
+                self.launch(
+                    self.kernels.attention_window_g3_tc,
+                    (kv_heads as u32, num_macros as u32, 1),
+                    (SCORED_G3_TC_THREADS, 1, 1),
+                    &[
+                        queries.0,
+                        keys.0,
+                        values.0,
+                        relative.0,
+                        bank.0,
+                        clip.query.0,
+                        0,
+                        clip.relative.0,
+                        parts.parts.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        config.head_dim as u64,
+                        groups as u64,
+                        rows as u64,
+                        first_position as u64,
+                        window as u64,
+                        cache_rows as u64,
+                        rel_extent as u64,
+                        config.d_rel as u64,
+                        qk_clip,
+                        bits(config.rel_l2_clip_threshold as f32),
+                        bits(tau),
+                        taus.0,
+                        1,
+                        eps,
+                        parts.stride as u64,
+                    ],
+                )?;
+                self.launch(
+                    self.kernels.attention_merge_f32,
+                    (heads as u32, rows as u32, 1),
+                    (config.head_dim as u32, 1, 1),
+                    &[
+                        gate.0,
+                        sink.0,
+                        parts.parts.0,
+                        merged.0,
+                        out_f32.0,
+                        heads as u64,
+                        config.head_dim as u64,
+                        rows as u64,
+                        first_position as u64,
+                        window as u64,
+                        parts.stride as u64,
+                        (-(num_macros as i64)) as u64,
+                    ],
+                )?;
+            } else if groups == 3 {
+                let single_run = widest <= PART_KEYS;
+                let (entry, grid, block) = if single_run {
+                    (
+                        self.kernels.attention_window_g3_r1,
+                        (kv_heads as u32, rows as u32, 1),
+                        (WINDOW_G3_R1_THREADS, 1, 1),
+                    )
+                } else if (2..=SCORED_G3_MULTI_MAX_ROWS).contains(&rows) {
+                    (
+                        self.kernels.attention_window_g3_multi,
+                        (kv_heads as u32, 1, WINDOW_RUNS as u32),
+                        (WINDOW_G3_MULTI_THREADS, 1, 1),
+                    )
+                } else {
+                    (
+                        self.kernels.attention_window_g3,
+                        (kv_heads as u32, rows as u32, WINDOW_RUNS as u32),
+                        (WINDOW_THREADS, 1, 1),
+                    )
+                };
+                self.launch(
+                    entry,
+                    grid,
+                    block,
+                    &[
+                        queries.0,
+                        keys.0,
+                        values.0,
+                        relative.0,
+                        bank.0,
+                        clip.query.0,
+                        0,
+                        clip.relative.0,
+                        gate.0,
+                        sink.0,
+                        merged.0,
+                        out_f32.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        config.head_dim as u64,
+                        groups as u64,
+                        rows as u64,
+                        first_position as u64,
+                        window as u64,
+                        cache_rows as u64,
+                        rel_extent as u64,
+                        config.d_rel as u64,
+                        qk_clip,
+                        bits(config.rel_l2_clip_threshold as f32),
+                        bits(tau),
+                        taus.0,
+                        1,
+                        eps,
+                    ],
+                )?;
+            } else {
+                self.launch(
+                    self.kernels.attention_window,
+                    (kv_heads as u32, rows as u32, WINDOW_RUNS as u32),
+                    (WINDOW_THREADS, 1, 1),
+                    &[
+                        queries.0,
+                        keys.0,
+                        values.0,
+                        relative.0,
+                        bank.0,
+                        clip.query.0,
+                        0,
+                        clip.relative.0,
+                        gate.0,
+                        sink.0,
+                        merged.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        config.head_dim as u64,
+                        groups as u64,
+                        rows as u64,
+                        first_position as u64,
+                        window as u64,
+                        cache_rows as u64,
+                        rel_extent as u64,
+                        config.d_rel as u64,
+                        qk_clip,
+                        bits(config.rel_l2_clip_threshold as f32),
+                        bits(tau),
+                        taus.0,
+                        1,
+                        eps,
+                    ],
+                )?;
+            }
+        } else if out_f32.0 != 0 {
+            self.launch(
+                self.kernels.attention_merge_f32,
+                (heads as u32, rows as u32, 1),
+                (config.head_dim as u32, 1, 1),
+                &[
+                    gate.0,
+                    sink.0,
+                    parts.parts.0,
+                    merged.0,
+                    out_f32.0,
+                    heads as u64,
+                    config.head_dim as u64,
+                    rows as u64,
+                    first_position as u64,
+                    window as u64,
+                    parts.stride as u64,
+                    merge_run_keys as u64,
                 ],
             )?;
         } else {
@@ -3013,6 +4369,42 @@ impl Shared {
             self.attention_compare(layer, out, merged, rows, first_position)?;
         }
         Ok(())
+    }
+
+    /// Fused 1-block sigmoid router + expert plan for TP=1 decode/verify (`rows <= 8`,
+    /// `experts <= 128`, `top_k <= 16`).
+    #[allow(clippy::too_many_arguments)]
+    fn router_plan_small(
+        &self,
+        logits: Deviceptr,
+        bias: Deviceptr,
+        indices: Deviceptr,
+        shares: Deviceptr,
+        sorted: Deviceptr,
+        items: Deviceptr,
+        item_count: Deviceptr,
+        rows: usize,
+        max_items: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            self.kernels.router_plan_small,
+            (1, 1, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                logits.0,
+                bias.0,
+                indices.0,
+                shares.0,
+                sorted.0,
+                items.0,
+                item_count.0,
+                rows as u64,
+                self.config.n_routed_experts as u64,
+                self.config.num_experts_per_tok as u64,
+                bits(self.config.route_scale as f32),
+                max_items as u64,
+            ],
+        )
     }
 
     /// The sigmoid router, one block a row.
@@ -3290,7 +4682,11 @@ impl InklingDeviceBackend {
                 ));
             }
         }
-        let depth_policy = depth_policy_from_env(draft, |name| std::env::var(name).ok())?;
+        let depth_policy = depth_policy_with_cost(
+            draft,
+            dspark_step_cost(config.hidden_size, tp.world()),
+            |name| std::env::var(name).ok(),
+        )?;
         let rewind = rewind_request(
             std::env::var(REWIND_ENV).ok().as_deref(),
             std::env::var(OLD_REWIND_ENV).ok().as_deref(),
@@ -3538,7 +4934,11 @@ impl InklingDeviceBackend {
             ));
         }
         let draft = Some((Drafter::Dspark, depth));
-        let policy = depth_policy_from_env(draft, |name| std::env::var(name).ok())?;
+        let policy = depth_policy_with_cost(
+            draft,
+            dspark_step_cost(shared.config.hidden_size, shared.exchange.world()),
+            |name| std::env::var(name).ok(),
+        )?;
         shared.draft = draft;
         shared.depth_policy = policy;
         self.load_drafter(directory)
@@ -4044,9 +5444,9 @@ struct LoopDevice {
 
 /// Read the loop's controller and query tensors off the device and keep them resident.
 ///
-/// The checkpoint stores the controllers BF16 where the producer builds them f32; the read widens
-/// each value once, which is the cast the producer's forward makes on every call. The banks are
-/// already f32. A release with no loop plan has nothing to load and answers `None`.
+/// The cross-pass query banks are f32; the controller matrices (`down_weight`, `forget_weight`,
+/// `gain_weight`) stay in their stored BF16 representation (halving bandwidth and memory) and are
+/// widened on the fly in `inkling_message_gate_*_bf16`. A release with no loop plan answers `None`.
 fn loop_weights(
     cuda: &Cuda,
     plan: &InklingDevicePlan,
@@ -4058,7 +5458,7 @@ fn loop_weights(
     };
     let hidden = config.hidden_size;
     let rank = loop_plan.gate_rank;
-    let read = |name: &str, f32_tensor: bool| -> Result<Vec<f32>, String> {
+    let read_raw = |name: &str| -> Result<Vec<u8>, String> {
         let index = plan
             .served()
             .index_of(name)
@@ -4067,58 +5467,41 @@ fn loop_weights(
         let mut bytes = vec![0u8; slot.bytes];
         cuda.copy_dtoh(&mut bytes, &slot.pointer)
             .map_err(|error| format!("{name}: {error}"))?;
-        Ok(if f32_tensor {
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|word| f32::from_le_bytes(*word))
-                .collect()
-        } else {
-            bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|word| f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16))
-                .collect()
-        })
+        Ok(bytes)
     };
     // One arena holds every loop tensor: each slice is placed on a 256-byte boundary and uploaded
     // in a single HtoD copy, freed once in `Shared::drop`.
     let mut staging: Vec<u8> = Vec::new();
-    let mut stage = |values: &[f32]| -> usize {
+    let mut stage_bytes = |bytes: &[u8]| -> usize {
         let offset = staging.len().next_multiple_of(256);
         staging.resize(offset, 0);
-        staging.reserve(values.len() * 4);
-        for value in values {
-            staging.extend_from_slice(&value.to_le_bytes());
-        }
+        staging.extend_from_slice(bytes);
         offset
     };
-    let queries = read("model.llm.middle_cycle_cross_pass_queries", true)?;
-    let kv_queries = read("model.llm.middle_cycle_cross_pass_kv_queries", true)?;
-    if queries.len() != 2 * loop_plan.core_len() * hidden
-        || kv_queries.len() != 2 * loop_plan.core_len() * hidden
+    let queries = read_raw("model.llm.middle_cycle_cross_pass_queries")?;
+    let kv_queries = read_raw("model.llm.middle_cycle_cross_pass_kv_queries")?;
+    if queries.len() != 2 * loop_plan.core_len() * hidden * 4
+        || kv_queries.len() != 2 * loop_plan.core_len() * hidden * 4
     {
         return Err(format!(
             "the cross-pass banks are not {} rows of {hidden}",
             2 * loop_plan.core_len()
         ));
     }
-    let queries_off = stage(&queries);
-    let kv_off = stage(&kv_queries);
+    let queries_off = stage_bytes(&queries);
+    let kv_off = stage_bytes(&kv_queries);
     let mut gate_offsets: Vec<Option<[(usize, usize, usize); 4]>> =
         vec![None; config.num_hidden_layers];
     for layer in loop_plan.core_start..loop_plan.core_end {
         let mut offsets = Vec::with_capacity(4);
         for stream in ["attn", "k", "v", "mlp"] {
             let prefix = format!("model.llm.layers.{layer}.controllers.{stream}");
-            let down = read(&format!("{prefix}.down_weight"), false)?;
-            let forget = read(&format!("{prefix}.forget_weight"), false)?;
-            let gain = read(&format!("{prefix}.gain_weight"), false)?;
-            if down.len() != rank * 2 * hidden
-                || forget.len() != hidden * rank
-                || gain.len() != hidden * rank
+            let down = read_raw(&format!("{prefix}.down_weight"))?;
+            let forget = read_raw(&format!("{prefix}.forget_weight"))?;
+            let gain = read_raw(&format!("{prefix}.gain_weight"))?;
+            if down.len() != rank * 2 * hidden * 2
+                || forget.len() != hidden * rank * 2
+                || gain.len() != hidden * rank * 2
             {
                 return Err(format!(
                     "layer {layer} stream {stream}: the controller shapes are not the {rank} x \
@@ -4126,7 +5509,11 @@ fn loop_weights(
                     2 * hidden
                 ));
             }
-            offsets.push((stage(&down), stage(&forget), stage(&gain)));
+            offsets.push((
+                stage_bytes(&down),
+                stage_bytes(&forget),
+                stage_bytes(&gain),
+            ));
         }
         gate_offsets[layer] = Some(
             offsets
@@ -4759,6 +6146,8 @@ struct Scratch {
     loop_prev_hidden: Deviceptr,
     /// The four messages of every core layer, \`[core_len][4][hidden]\`, a row at a time.
     loop_messages: Deviceptr,
+    /// Split-K bottleneck partials for `inkling_message_gate_*_bf16`: `[3][rows][2][gate_rank]`.
+    loop_gate_partials: Deviceptr,
     /// The block-attention residual's output: `[rows][nq][hidden]`, three rows a row on a full
     /// layer.
     rows: Deviceptr,
@@ -4910,6 +6299,11 @@ impl Scratch {
         } else {
             take(rows * hidden, 4)
         };
+        let loop_gate_partials = if let Some(plan) = config.loop_plan {
+            take(3 * rows * 2 * plan.gate_rank, 4)
+        } else {
+            take(1, 4)
+        };
         let block_inputs = take(rows * 3 * hidden, 4);
         let residual_stats = take(rows * RESIDUAL_STATS_ROW, 4);
         let normed = take(3 * hidden, 4);
@@ -5000,7 +6394,7 @@ impl Scratch {
             )
         });
         let parts = (split && shared.attention.fast()).then(|| {
-            let stride = shared.context.max(1).div_ceil(PART_KEYS);
+            let stride = shared.context.max(1).div_ceil(PART_KEYS).max(20);
             (
                 take(rows * heads * stride * (2 + head_dim), 4),
                 stride,
@@ -5016,6 +6410,7 @@ impl Scratch {
             loop_saved: at(loop_saved),
             loop_prev_hidden: at(loop_prev_hidden),
             loop_messages: at(loop_messages),
+            loop_gate_partials: at(loop_gate_partials),
             rows: at(block_inputs),
             residual_stats: at(residual_stats),
             normed: at(normed),
@@ -5389,8 +6784,10 @@ struct Round {
     /// The probability the drafter gave each draft it made, the verified ones first: what the
     /// depth policy learns from when the round settles.
     confidence: Vec<f32>,
-    /// Each row's logits.
+    /// Each row's logits (empty when `picks` holds device-computed greedy argmaxes).
     rows: Vec<Vec<f32>>,
+    /// Device-side greedy argmax per verified row when the round ran greedy-only.
+    picks: Option<Vec<u32>>,
     /// The rows the caller has fed: the anchor, then each draft it fed in turn.
     fed: usize,
     /// The sampler as it stood before each draft fed after the anchor, so the last answers can be
@@ -5446,12 +6843,56 @@ const DSPARK_STEP_COST: StepCost = StepCost {
     prior_tokens_per_ms: 1.0 / 21.4,
 };
 
+/// Calibrated DSpark round wall model for Inkling-2-Mini at TP=1 on GB10:
+/// ~23.0 ms fixed base round cost (drafter + anchor dense/LM head), ~17.0 ms per 100k context
+/// tokens (8 full target layers on TC split-KV + 1 full drafter layer KV reads), and ~5.2 ms
+/// marginal cost per verified draft row (deduplicated kPairs=4 fused-SwiGLU MoE + flat TC attn).
+const DSPARK_STEP_COST_MINI: StepCost = StepCost {
+    step_ms: 23.0,
+    row_ms: 4.8,
+    prior_tokens_per_ms: 1.0 / 12.0,
+};
+
+const DSPARK_MINI_KV_MS_PER_100K: f64 = 17.0;
+
+const fn dspark_step_cost(hidden: usize, world: usize) -> StepCost {
+    if hidden <= 2304 && world == 1 {
+        DSPARK_STEP_COST_MINI
+    } else {
+        DSPARK_STEP_COST
+    }
+}
+
+fn dspark_step_cost_at(hidden: usize, world: usize, position: usize) -> StepCost {
+    if hidden <= 2304 && world == 1 {
+        let kv_ms = DSPARK_MINI_KV_MS_PER_100K * (position as f64 / 100_000.0);
+        let step_ms = DSPARK_STEP_COST_MINI.step_ms + kv_ms;
+        let prior_ms_per_tok = 12.0 + kv_ms * 0.55;
+        StepCost {
+            step_ms,
+            row_ms: DSPARK_STEP_COST_MINI.row_ms,
+            prior_tokens_per_ms: 1.0 / prior_ms_per_tok,
+        }
+    } else {
+        DSPARK_STEP_COST
+    }
+}
+
 /// The verify-depth policy a DSpark sequence starts from ([DRAFT_POLICY_ENV],
 /// [DRAFT_MIN_DEPTH_ENV]), over chains of the drafter's `depth`. Only DSpark gives its drafts a
 /// probability, so either switch set for another drafter, or none, is refused rather than ignored,
 /// as is a value outside the switch's domain or a minimum past the depth.
+#[cfg(test)]
 fn depth_policy_from_env(
     draft: Option<(Drafter, usize)>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<DepthPolicy>, String> {
+    depth_policy_with_cost(draft, DSPARK_STEP_COST, lookup)
+}
+
+fn depth_policy_with_cost(
+    draft: Option<(Drafter, usize)>,
+    step_cost: StepCost,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<DepthPolicy>, String> {
     const SWITCHES: [&str; 2] = [DRAFT_POLICY_ENV, DRAFT_MIN_DEPTH_ENV];
@@ -5482,11 +6923,11 @@ fn depth_policy_from_env(
              ({DRAFT_DEPTH_ENV})"
         ));
     }
-    Ok(Some(DepthPolicy::from_speculation(
-        speculation,
-        depth,
-        DSPARK_STEP_COST,
-    )))
+    let mut policy = DepthPolicy::from_speculation(speculation, depth, step_cost);
+    if step_cost == DSPARK_STEP_COST_MINI && speculation.min_depth.is_none() && depth >= 1 {
+        policy = policy.with_min_depth(1);
+    }
+    Ok(Some(policy))
 }
 /// The n-grams prompt lookup matches, longest first.
 const LOOKUP_NGRAMS: (usize, usize) = (2, 4);
@@ -5609,6 +7050,17 @@ impl InklingDeviceSession {
                 "token {token} is not the next draft the last verify holds"
             )));
         };
+        if let Some(picks) = &round.picks {
+            let pick = picks[round.fed];
+            round.fed += 1;
+            round.marks.push(sampler.mark());
+            sampler.record(token);
+            return Ok(StepOutput {
+                logits: Vec::new(),
+                next_token: self.shared.config.next_token(pick),
+                draft: Vec::new(),
+            });
+        }
         let logits = round.rows[round.fed].clone();
         round.fed += 1;
         round.marks.push(sampler.mark());
@@ -5769,6 +7221,11 @@ impl InklingDeviceSession {
                 VerifyBuffer::allocate(&self.shared, rows, &self.state.conv).map_err(Self::fail)?,
             );
         }
+        self.speculator.set_cost(dspark_step_cost_at(
+            self.shared.hidden(),
+            self.shared.exchange.world(),
+            self.state.position,
+        ));
         let (drafts, confidence) = self.draft_chain(token, lookup, sampling)?;
         let room = self.shared.context.saturating_sub(self.state.position + 1);
         let mut chain = self.speculator.chain(&confidence, room);
@@ -5811,10 +7268,51 @@ impl InklingDeviceSession {
             chunk,
             confidence: opening.confidence,
             rows,
+            picks: None,
             fed: 1,
             marks: Vec::new(),
         });
         Ok(self.decoded(opening.anchor, logits, sampler, sampling))
+    }
+
+    /// Greedy-only twin of [Self::close]: takes device-computed argmax token ids directly without
+    /// downloading or storing full-vocabulary logit vectors.
+    fn close_picks(
+        &mut self,
+        depth: usize,
+        picks: Vec<u32>,
+        sampler: &mut Sampler,
+    ) -> Result<StepOutput, BackendError> {
+        let opening = self
+            .opening
+            .take()
+            .ok_or_else(|| Self::fail("a shared walk closed a round nobody opened"))?;
+        let mut chunk = Vec::with_capacity(depth + 1);
+        chunk.push(opening.anchor);
+        chunk.extend_from_slice(&opening.drafts[..depth.min(opening.drafts.len())]);
+        if picks.len() != chunk.len() {
+            return Err(Self::fail(format!(
+                "a walk of {} rows answered {} picks",
+                chunk.len(),
+                picks.len()
+            )));
+        }
+        let first_pick = picks[0];
+        self.round = Some(Round {
+            start: opening.start,
+            chunk,
+            confidence: opening.confidence,
+            rows: Vec::new(),
+            picks: Some(picks),
+            fed: 1,
+            marks: Vec::new(),
+        });
+        sampler.record(opening.anchor);
+        Ok(StepOutput {
+            logits: Vec::new(),
+            next_token: self.shared.config.next_token(first_pick),
+            draft: Vec::new(),
+        })
     }
 
     /// The bookkeeping of one decoded token whose logits a step computed: the penalties'
@@ -5881,7 +7379,17 @@ impl InklingDeviceSession {
                     let (inv_t, seed) = gumbel.draft_noise();
                     (f32::from_bits(inv_t as u32), seed)
                 });
-                drafter.draft(&shared, model, anchor, chain.min(model.max_depth()), noise)
+                let speculator = &self.speculator;
+                let adaptive = speculator.is_adaptive();
+                drafter.draft(
+                    &shared,
+                    model,
+                    anchor,
+                    chain.min(model.max_depth()),
+                    noise,
+                    adaptive,
+                    |probs| speculator.should_continue(probs, room),
+                )
             }
         }
     }
@@ -6318,14 +7826,70 @@ impl RowRun {
                         Projection::Head => Err(device_error("the head is a global step")),
                     };
                     let (input, out, rows, columns) = io(projection)?;
+                    // On pass > 0 and full layers, Key and Value read separate normed rows while
+                    // Query, Relative, Gate and Sink all share `normed`. Group those four into one
+                    // fused GEMV launch and emit Key and Value beside it (3 launches instead of 4).
+                    if separate_kv && matches!(projection, Projection::Query) {
+                        if let Some([s_q, s_k, s_v, s_r, s_g, s_s]) =
+                            schedule.steps.get(cursor..cursor + 6)
+                        {
+                            if matches!(
+                                (
+                                    (s_q.op, s_q.target),
+                                    (s_k.op, s_k.target),
+                                    (s_v.op, s_v.target),
+                                    (s_r.op, s_r.target),
+                                    (s_g.op, s_g.target),
+                                    (s_s.op, s_s.target),
+                                ),
+                                (
+                                    (Op::Gemv, Target::Project(Projection::Query)),
+                                    (Op::Gemv, Target::Project(Projection::Key)),
+                                    (Op::Gemv, Target::Project(Projection::Value)),
+                                    (Op::Gemv, Target::Project(Projection::Relative)),
+                                    (Op::Gemv, Target::Project(Projection::Gate)),
+                                    (Op::Gemv, Target::Project(Projection::Sink)),
+                                )
+                            ) {
+                                let (in_k, out_k, rows_k, cols_k) = io(Projection::Key)?;
+                                let (in_v, out_v, rows_v, cols_v) = io(Projection::Value)?;
+                                let (_, out_r, rows_r, _) = io(Projection::Relative)?;
+                                let (_, out_g, rows_g, _) = io(Projection::Gate)?;
+                                let (_, out_s, rows_s, _) = io(Projection::Sink)?;
+                                let q_parts = [
+                                    (self.weight(s_q.weights[0]), out, rows),
+                                    (self.weight(s_r.weights[0]), out_r, rows_r),
+                                    (self.weight(s_g.weights[0]), out_g, rows_g),
+                                    (self.weight(s_s.weights[0]), out_s, rows_s),
+                                ];
+                                run(shared.gemv_fused(&q_parts, input, columns, 1))?;
+                                run(shared.gemv(
+                                    self.weight(s_k.weights[0]),
+                                    in_k,
+                                    out_k,
+                                    rows_k,
+                                    cols_k,
+                                ))?;
+                                run(shared.gemv(
+                                    self.weight(s_v.weights[0]),
+                                    in_v,
+                                    out_v,
+                                    rows_v,
+                                    cols_v,
+                                ))?;
+                                cursor += 6;
+                                continue;
+                            }
+                        }
+                    }
                     // The projections that follow over the same input go out with this one,
                     // up to four a launch: a sliding layer's six attention projections all
                     // read the one normed row, so they are two launches rather than six. A
                     // fused row's sum is its own launch's bits (Shared::gemv_fused).
-                    let mut parts = [(Deviceptr(0), Deviceptr(0), 0usize); GEMV_FUSED];
+                    let mut parts = [(Deviceptr(0), Deviceptr(0), 0usize); GEMV_FUSED_PACKED];
                     parts[0] = (self.weight(step.weights[0]), out, rows);
                     let mut fused = 1;
-                    while fused < GEMV_FUSED {
+                    while fused < GEMV_FUSED_PACKED {
                         let Some(next) = schedule.steps.get(cursor + fused) else {
                             break;
                         };
@@ -6566,6 +8130,75 @@ impl RowRun {
                     // layers can gate query, key and value independently from `rows[0]`.
                     let stored = schedule.stored;
                     let core = stored.saturating_sub(loop_plan.core_start);
+                    // Batch the three attention message gates (Query, Key, Value) and their
+                    // following RMSNorms: 2 launches for all 3 gates (down3 + up3) instead of 6,
+                    // plus 1 batched 3-row RMSNorm on sliding layers where all 3 share attn_norm.
+                    if matches!(stream, MessageStream::Query) {
+                        if let Some([g_q, n_q, g_k, n_k, g_v, n_v]) =
+                            schedule.steps.get(cursor..cursor + 6)
+                        {
+                            if matches!(
+                                (
+                                    (g_q.op, g_q.target),
+                                    (n_q.op, n_q.target),
+                                    (g_k.op, g_k.target),
+                                    (n_k.op, n_k.target),
+                                    (g_v.op, g_v.target),
+                                    (n_v.op, n_v.target),
+                                ),
+                                (
+                                    (Op::MessageGate(MessageStream::Query), _),
+                                    (Op::RmsNorm, Target::Norm(NormRole::Query)),
+                                    (Op::MessageGate(MessageStream::Key), _),
+                                    (Op::RmsNorm, Target::Norm(NormRole::Key)),
+                                    (Op::MessageGate(MessageStream::Value), _),
+                                    (Op::RmsNorm, Target::Norm(NormRole::Value)),
+                                )
+                            ) {
+                                let src_shifts = if sliding {
+                                    [0, 0, 0]
+                                } else {
+                                    [0, hidden, 2 * hidden]
+                                };
+                                let dst_shifts = [0, hidden, 2 * hidden];
+                                let msg_shifts = [
+                                    (core * 4 + MessageStream::Query.index()) * hidden,
+                                    (core * 4 + MessageStream::Key.index()) * hidden,
+                                    (core * 4 + MessageStream::Value.index()) * hidden,
+                                ];
+                                let normed = self.state.scratch.normed;
+                                run(shared.message_gate3(
+                                    self.state.scratch.rows,
+                                    [normed, normed, normed],
+                                    self.state.scratch.loop_messages,
+                                    self.state.scratch.loop_gate_partials,
+                                    stored,
+                                    1,
+                                    hidden,
+                                    src_shifts,
+                                    hidden,
+                                    dst_shifts,
+                                    loop_plan.core_len() * 4 * hidden,
+                                    msg_shifts,
+                                    false,
+                                ))?;
+                                let w_q = self.weight(n_q.weights[0]);
+                                let w_k = self.weight(n_k.weights[0]);
+                                let w_v = self.weight(n_v.weights[0]);
+                                if w_q.0 == w_k.0 && w_k.0 == w_v.0 {
+                                    run(shared.rmsnorm(normed, w_q, normed, 3, hidden))?;
+                                } else {
+                                    run(shared.rmsnorm(normed, w_q, normed, 1, hidden))?;
+                                    let k_ptr = normed.offset(hidden * 4);
+                                    let v_ptr = normed.offset(2 * hidden * 4);
+                                    run(shared.rmsnorm(k_ptr, w_k, k_ptr, 1, hidden))?;
+                                    run(shared.rmsnorm(v_ptr, w_v, v_ptr, 1, hidden))?;
+                                }
+                                cursor += 6;
+                                continue;
+                            }
+                        }
+                    }
                     let (src_shift, dst_shift) = match stream {
                         MessageStream::Mlp | MessageStream::Query => (0, 0),
                         MessageStream::Key => (if sliding { 0 } else { hidden }, hidden),
@@ -6575,6 +8208,7 @@ impl RowRun {
                         self.state.scratch.rows,
                         self.state.scratch.normed,
                         self.state.scratch.loop_messages,
+                        self.state.scratch.loop_gate_partials,
                         stored,
                         stream,
                         1,
@@ -6584,6 +8218,7 @@ impl RowRun {
                         dst_shift,
                         loop_plan.core_len() * 4 * hidden,
                         (core * 4 + stream.index()) * hidden,
+                        false,
                     ))?;
                 }
                 (Op::Router, _) => {
@@ -7025,7 +8660,7 @@ impl RowRun {
         down: &Step,
     ) -> Result<(), BackendError> {
         let scratch = &self.state.scratch;
-        chunk::run_steered_band(shared, scratch, layer, gate_up, down, scratch.normed, 1)?;
+        chunk::run_steered_band(shared, scratch, layer, gate_up, down, scratch.normed, 1, false)?;
         if trace_on() && layer == 0 && !BandOut::of(shared, scratch, 1).gathers {
             self.rms(shared, "row band", scratch.mixed, shared.config.hidden_size)?;
         }

@@ -1291,6 +1291,7 @@ pub const CATALOGUE: &[PartKernel] = &[
             // (sparkflash_ops::packed): the dense arm reads the same bits from fewer bytes.
             row_dec("q4e_gemv_packed", &[Precision::Bf16]),
             row_dec("q4e_gemv4_packed", &[Precision::Bf16]),
+            row_dec("q4e_gemv6_packed", &[Precision::Bf16]),
             sym("q4e_pack_bf16", &[Precision::Bf16]),
             sym("q4e_unpack_bf16", &[Precision::Bf16]),
             // The K-split fold of the token GEMM: an elementwise reduction of f32 partials to
@@ -1440,10 +1441,20 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("inkling_attn_mix", &[Precision::Bf16]),
             sym("inkling_attn_part", &[Precision::Bf16]),
             sym("inkling_attn_scored_part", &[Precision::Bf16]),
+            sym("inkling_attn_scored_part_g3_multi", &[Precision::Bf16]),
+            sym("inkling_attn_scored_part_g3_multi_k2", &[Precision::Bf16]),
+            sym("inkling_attn_scored_part_g3_tc", &[Precision::Bf16]),
             sym("inkling_attn_merge", &[Precision::Bf16]),
+            sym("inkling_attn_merge_f32", &[Precision::Bf16]),
             sym("inkling_attn_prepare", &[Precision::Bf16]),
             sym("inkling_attn_mma", &[Precision::Bf16]),
+            sym("inkling_attn_mma_g3", &[Precision::Bf16]),
+            sym("inkling_dense_bf16_mma", &[Precision::Bf16]),
             sym("inkling_attn_window", &[Precision::Bf16]),
+            sym("inkling_attn_window_g3", &[Precision::Bf16]),
+            sym("inkling_attn_window_g3_multi", &[Precision::Bf16]),
+            sym("inkling_attn_window_g3_r1", &[Precision::Bf16]),
+            sym("inkling_attn_window_g3_tc", &[Precision::Bf16]),
             sym("inkling_kv_store", &[Precision::Bf16]),
             sym("inkling_summary_push", &[Precision::Bf16]),
             sym("inkling_widen_f32", &[Precision::F32]),
@@ -1456,7 +1467,31 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             sym("inkling_short_conv", &[Precision::Bf16, Precision::F32]),
             sym(
+                "inkling_short_conv_chunk_add",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
                 "inkling_short_conv_decode",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
+                "inkling_short_conv_decode_add",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
+                "inkling_short_conv_kv_chunk",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
+                "inkling_short_conv_kv_decode",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
+                "inkling_short_conv_kv_segment",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
+                "inkling_short_conv_segment",
                 &[Precision::Bf16, Precision::F32],
             ),
             sym(
@@ -1510,10 +1545,19 @@ pub const CATALOGUE: &[PartKernel] = &[
             chain("inkling_block_residual_chain_q3_n0"),
             chain("inkling_block_residual_chain_q3_n1"),
             chain("inkling_block_residual_chain_q3_n3"),
+            chain("inkling_block_residual_chain_norm_q1_n0"),
+            chain("inkling_block_residual_chain_norm_q1_n1"),
+            chain("inkling_block_residual_chain_norm_q1_n3"),
+            chain("inkling_block_residual_chain_norm_q3_n0"),
+            chain("inkling_block_residual_chain_norm_q3_n1"),
+            chain("inkling_block_residual_chain_norm_q3_n3"),
             // The two-launch form, the plain residual add, the row-split join and the exact f32
             // widening.
             sym("inkling_block_residual_stats", &[Precision::Bf16]),
             sym("inkling_block_residual_mix", &[Precision::Bf16]),
+            sym("inkling_block_residual_mix_norm", &[Precision::Bf16]),
+            sym("inkling_block_residual_small_norm", &[Precision::Bf16]),
+            sym("inkling_rmsnorm3_small", &[Precision::Bf16]),
             sym("inkling_residual_add", &[Precision::Bf16]),
             sym("inkling_join_pieces", &[Precision::F32]),
             sym("inkling_widen_f32", &[Precision::F32]),
@@ -1527,12 +1571,22 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::LoopMessageGate,
         Image::Inkling,
-        &[sym(
-            "inkling_message_gate",
-            // The checkpoint stores the controllers BF16 and the loader widens them to the f32
-            // the body runs; the entry names both so the scan's stored format resolves.
-            &[Precision::Bf16, Precision::F32],
-        )],
+        &[
+            sym(
+                "inkling_message_gate",
+                // The checkpoint stores the controllers BF16 and the loader widens them to the f32
+                // the body runs; the entry names both so the scan's stored format resolves.
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym("inkling_message_gate_down_bf16", &[Precision::Bf16, Precision::F32]),
+            sym("inkling_message_gate_up_bf16", &[Precision::Bf16, Precision::F32]),
+            sym("inkling_message_gate_down3_bf16", &[Precision::Bf16, Precision::F32]),
+            sym("inkling_message_gate_up3_bf16", &[Precision::Bf16, Precision::F32]),
+            sym("inkling_message_gate_down_mma", &[Precision::Bf16, Precision::F32]),
+            sym("inkling_message_gate_up_mma", &[Precision::Bf16, Precision::F32]),
+            sym("inkling_message_gate_down3_mma", &[Precision::Bf16, Precision::F32]),
+            sym("inkling_message_gate_up3_mma", &[Precision::Bf16, Precision::F32]),
+        ],
         true,
     ),
     sm121(
@@ -1550,6 +1604,14 @@ pub const CATALOGUE: &[PartKernel] = &[
                 &[Precision::Bf16, Precision::F32],
             ),
             sym("inkling_logit_softcap", &[Precision::Bf16, Precision::F32]),
+            sym(
+                "inkling_logit_softcap_argmax_part",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
+                "inkling_logit_softcap_argmax_reduce",
+                &[Precision::Bf16, Precision::F32],
+            ),
             sym("inkling_band_shares", &[Precision::F32]),
         ],
         true,
@@ -1689,13 +1751,22 @@ pub const CATALOGUE: &[PartKernel] = &[
                 &[Precision::MxFp8, Precision::F32],
             ),
             sym("inkling_router_topk", &[Precision::F32]),
+            sym("inkling_router_plan_small", &[Precision::F32]),
             // The band, pair and item walks over the same stored experts.
             row_all(
                 "inkling_nvfp4_expert_band",
                 &[Precision::NvFp4, Precision::F32],
             ),
             row_all(
+                "inkling_nvfp4_expert_band_swiglu",
+                &[Precision::NvFp4, Precision::F32],
+            ),
+            row_all(
                 "inkling_mxfp8_expert_band",
+                &[Precision::MxFp8, Precision::F32],
+            ),
+            row_all(
+                "inkling_mxfp8_expert_band_swiglu",
                 &[Precision::MxFp8, Precision::F32],
             ),
             row_all(
@@ -1711,9 +1782,29 @@ pub const CATALOGUE: &[PartKernel] = &[
                 &[Precision::NvFp4, Precision::F32],
             ),
             row_all(
+                "inkling_nvfp4_expert_items_swiglu",
+                &[Precision::NvFp4, Precision::F32],
+            ),
+            row_all(
                 "inkling_mxfp8_expert_items",
                 &[Precision::MxFp8, Precision::F32],
             ),
+            row_all(
+                "inkling_mxfp8_expert_items_swiglu",
+                &[Precision::MxFp8, Precision::F32],
+            ),
+            // High-occupancy BM=64 grouped MoE prefill kernels (FP16 MMA for NVFP4, BF16 MMA for MXFP8).
+            sym("inkling_split_f16", &[Precision::NvFp4, Precision::F32]),
+            sym(
+                "inkling_moe_gate_up_f16_64",
+                &[Precision::NvFp4, Precision::F32],
+            ),
+            sym("inkling_moe_down_f16_64", &[Precision::NvFp4, Precision::F32]),
+            sym(
+                "inkling_moe_gate_up_mx8_64",
+                &[Precision::MxFp8, Precision::F32],
+            ),
+            sym("inkling_moe_down_mx8_64", &[Precision::MxFp8, Precision::F32]),
         ],
         false,
     ),
@@ -2349,6 +2440,8 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("q4d_select", &[Precision::Bf16, Precision::Fp8E4M3]),
             // The Inkling drafter's block attention reuses DFlash's span pair.
             sym("q4d_attn_span_chunk", &[Precision::Bf16]),
+            sym("q4d_attn_span_chunk_bf16", &[Precision::Bf16]),
+            sym("q4d_attn_span_chunk_bf16_tc", &[Precision::Bf16]),
             sym("q4d_attn_span_merge", &[Precision::Bf16]),
         ],
         false,
@@ -2416,11 +2509,17 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("inkling_draft_swiglu", &[Precision::F32]),
             sym("inkling_draft_rope", &[Precision::F32]),
             sym("inkling_draft_context", &[Precision::F32]),
+            sym("inkling_draft_context_bf16", &[Precision::F32]),
             sym("inkling_draft_markov_input", &[Precision::F32]),
             sym("inkling_draft_markov_gates", &[Precision::F32]),
             sym("inkling_draft_markov_logits", &[Precision::F32]),
             sym("inkling_draft_markov_local", &[Precision::F32]),
             sym("inkling_draft_markov_last", &[Precision::F32]),
+            sym("inkling_draft_quantize_nvfp4_tiled", &[Precision::NvFp4]),
+            sym("inkling_draft_quantize_nvfp4_row", &[Precision::NvFp4]),
+            sym("inkling_draft_nvfp4_gemv", &[Precision::NvFp4]),
+            sym("inkling_draft_nvfp4_gemv3", &[Precision::NvFp4]),
+            sym("inkling_draft_nvfp4_markov_logits", &[Precision::NvFp4]),
         ],
         false,
     ),
