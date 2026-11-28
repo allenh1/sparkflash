@@ -150,22 +150,24 @@ sparkflash serve: listening on http://127.0.0.1:8012
 * the drafter's 738 MB load and its packed projections print at startup, and its rounds verify
   drafts (the speculative block above).
 
-The drafter is live: the served response's `x_deepseek_spark_stats.dspark_speculative` block
-reports its rounds. A 16-token answer proposed 12 drafts across 4 verify steps and accepted 11
-(3.75 tokens a step, 91.7%); an image request's 16 tokens proposed 15 across 6 steps and
-accepted 9 (60%). `StepOutput::draft` stays empty by the API's convention — the driver consumes
-the accepted rows inside the round — so the speculative block, not that field, is the evidence.
+The drafter is live and enabled by default when `mtp.safetensors` is present in the checkpoint
+directory (opt out with `SPARKFLASH_INKLING_DRAFT=off`). Verified end-to-end on GB10 (`sm_121a`,
+TP=1, `--context 16384`) against `/home/allenh1/models/inkling-2-mini` with `temperature=0`:
 
-Measured on .100 from the same requests: TTFT 1.06 s for the 25-token image prompt, decode
-19.8 tok/s with speculation on. The image-request `usage.prompt_tokens_details.image_tokens`
-reads zero because the generic host driver hard-codes that field; the prompt itself grows by the
-tower's four placeholders (21 → 25), and the arm's own image prefill changes the answer (the
-same tokens with the tower reach top logit 220 against 1 without it).
+| Prompt | Prompt tokens (`image_tokens` / `cached`) | Generated | Plain (`DRAFT=off`) | DSpark (default on) | Speedup | Greedy parity |
+| --- | --- | --- | --- | --- | --- | --- |
+| Math (`17 * 23`) | 31 (0 / 0) | 104 | 14.4 tok/s | 30.3 tok/s | 2.10x | exact match |
+| Code (`fibonacci(n)`) | 37 (0 / 0) | 320 | 14.7 tok/s | 32.7 tok/s | 2.22x | exact match |
+| Image: red square on blue | 50 (18 / 0) | 256 | 14.6 tok/s | 23.5 tok/s | 1.61x | exact match |
+| Image: green left / yellow right | 49 (17 / 0) | 53 | 13.9 tok/s | 29.3 tok/s | 2.11x | exact match |
+| Image turn 2 (prefix rewind) | 80 (17 / 49) | 59 | 14.0 tok/s | 27.0 tok/s | 1.93x | exact match |
+| Image OCR (`"42"`) | 41 (17 / 0) | 156 | 14.6 tok/s | 27.0 tok/s | 1.85x | exact match |
 
-The DSpark drafter was the earlier refusal: this release's `mtp_config.target_layer_ids`
-has four taps and its `fuse_weight` is `[4, 4]`, while the arm's drafter is built for
-Inkling-2-Small's eight taps and six fusion rows. The kernels already take `taps_per_row` as
-a runtime argument, so the work is the arm's geometry, not a new body.
+Across the six requests, DSpark proposed 835 drafts in 313 verify steps and accepted 578
+(**69.2%** overall, **76.2%** on the image OCR prompt; 2.85 tokens/step), matching the plain
+greedy output token-for-token on every text and multimodal prompt. `device-prefill` also
+verified bit-for-bit identical top-8 logits between `SPARKFLASH_INKLING_PREFILL=rows` and
+`chunk` on the real checkpoint, and identical top-8 ranking within 1 BF16 ULP under `tensor`.
 
 ## Rule-2 table
 
@@ -186,11 +188,14 @@ only proved a kernel is missing.
 | `vision_*` | the Inkling-2-Small tower (`src/vision.rs`), unchanged in this release | BF16 | width 1,024, 23 blocks, merge 2 |
 | `mtp` | the DFlash stage: `*_ctx` projections and the Markov head | BF16 | 3 stages, Markov rank 256 |
 
-Two open type questions are recorded here rather than guessed into the layout. The message gates'
-checkpoint tensors are BF16 while the producer builds those parameters in f32, so the body must
-cast exactly where the producer's `forward` does rather than keeping the parameters f32. And the
-checkpoint splits the producer's `(12, 4, hidden)` cross-pass query bank into two 24-row tensors;
-which two streams each bank holds is a conversion fact, not a config fact.
+The cross-pass query bank split is verified against `Inkling2LoopMergeMessageQueries` in
+Transformers `src/transformers/core_model_loading.py:823-850` (commit `046bdb8`):
+`middle_cycle_cross_pass_queries` stores `[query, mlp]` per core layer and
+`middle_cycle_cross_pass_kv_queries` stores `[key, value]` per core layer, merged into
+`(num_loop_layers, 4, hidden)` in `[q, k, v, mlp]` order. On sliding loop layers for `pass > 0`
+(`modeling_inkling2_loop.py:961-967`), all three attention message gates (`attn`, `k`, `v`) run
+independently on `attention_input[0]` and are each normed by `attn_norm` before Q/K/V
+projections.
 
 ## The loop in the arm
 
@@ -220,26 +225,26 @@ through the f32 reference end to end (finite logits; top scores 26.38, 25.66, 25
 conversion path therefore covers the loop tensors, the drafter and the tower at this geometry.
 
 The split of the producer's `(12, 4, hidden)` query bank into the checkpoint's two 24-row
-tensors is the one mapping this work states without tensor evidence: the layout and the host
-reference place the query and MLP streams in `middle_cycle_cross_pass_queries` and the key and
-value streams in `middle_cycle_cross_pass_kv_queries`. A producer capture disambiguates it; a
-wrong guess changes the messages, not the shapes, so it must be checked before numerics v1.
+tensors is confirmed by `Inkling2LoopMergeMessageQueries` (`core_model_loading.py:823-850`):
+`middle_cycle_cross_pass_queries` carries `[query, mlp]` and
+`middle_cycle_cross_pass_kv_queries` carries `[key, value]`.
 
 ## Work list
 
 | Row | Stage | State |
 | --- | --- | --- |
-| `relative_attention` 3,072x2,304 | 3 | resolved: the Inkling bodies take the row width as a launch word, so the catalogue rule now states both released widths (2,304 and 4,608) instead of one constant |
+| `relative_attention` 3,072x2,304 | 3 | resolved: the Inkling bodies take the row width as a launch word, so the catalogue rule states both released widths (2,304 and 4,608) |
 | `short_conv` 2,304x1x4 | 3 | resolved the same way |
 | `block_attention_residual` 2,304 f32 | 3 | resolved the same way |
 | `moe` 128x2,304 NVFP4 and MXFP8 | 3 | resolved: the expert bodies take the rank's run as a runtime argument; the rule states both widths |
-| `vision_merger` 4,096x4,096 | 3 | **open**: the merger resolves at the tensor's 4,096 output, but the plan's `out_hidden` for this release is the 2,304 text width (the config states no `out_hidden_size`), so the row refuses as "output 2304 is not one of [4096, 4608]". The fix is the vision geometry's merger output, not a catalogue line |
-| `loop_message_gate` | 4 | done: `inkling_message_gate` (`kernels/inkling_message_sm121.cu`) runs the two tanh gates per row; the checkpoint's BF16 controllers are widened once at load into device-resident copies |
-| `cross_pass_attention` | 4 | done: `inkling_cross_pass` runs the four queries a core layer over the previous pass's summary rows and final hidden, softmaxed and scaled as the producer writes them |
-| `dynamic_short_conv` | 4 | done: the released body already implements the projected taps and `sqrt(2k+1)`; the part is now catalogued as its own kind |
-| the loop schedule | 4 | done: the device plan builds the 48 applications with per-pass caches and the prelude rewind, and `MessageRead`/`MessageGate` launch the two new bodies instead of copying rows to the host |
-| the drafter | 4/7 | loads at this release's geometry (4 taps, 4 fusion rows) and its rounds run (12 proposed / 11 accepted, then 15 / 9); the checkpoint's `mtp.safetensors` names 54 tensors the shared plan spells differently, which the scan lists and the drafter's own loader maps |
-| stages 6-8 | 6-8 | prove, capture, convert, serve, register numerics |
+| `vision_merger` 2,304x4,096 | 3 | resolved: `INKLING_VISION_MERGER_WIDTHS` states `&[2304, 4608]`; `sparkflash onboard` reports 134/134 resolved, 1,298 indexed tensors clean, `clean: yes` |
+| `loop_message_gate` | 4 | done: `inkling_message_gate` (`kernels/inkling_message_sm121.cu`) writes to an independent destination so sliding loop layers gate `attn`/`k`/`v` independently from `attention_input[0]`; BF16 controllers are widened once into a single device arena freed on `Drop` |
+| `cross_pass_attention` | 4 | done: `inkling_cross_pass` reads directly from `summaries[row][start_block..]` once per pass (`layer == core_start && pass > 0`) in both `RowRun` and `ChunkRun` |
+| `dynamic_short_conv` | 4 | done: the released body implements projected taps and `sqrt(2k+1)` |
+| the loop schedule | 4 | done: 48 applications with per-pass caches, prelude rewind, chunked prefill (`chunk` == `rows` bit-exact, `tensor` within 1 BF16 ULP), and fused lanes |
+| vision injection | 4/8 | done: `InklingVision` injects `grid.image_rows()` rows at `span.start + 1 .. span.end() - 1` (preserving `<|content_image|>` and `<|end_message|>`), verified on real PNG color/layout/OCR prompts and multi-turn prefix rewind |
+| the drafter | 4/7 | done: loads at Mini's geometry (3 layers, 4 taps `[5, 23, 41, 48]`, `fuse_weight [4, 4]`), enabled by default when `mtp.safetensors` is present (`SPARKFLASH_INKLING_DRAFT=off` opts out), 69.2% acceptance and exact greedy parity on text + images |
+| stages 6-8 | 6-8 | numerics v1 registration and TP2/4 cluster capture remain open |
 
 ## Checklist
 
@@ -250,23 +255,23 @@ wrong guess changes the messages, not the shapes, so it must be checked before n
 [x] 2  layout: every key read or ignored with a reason; every tensor claimed or unloaded
 [x] 2  every fact cited to a producer line, config path or tensor
 [x] 2  rule-2 table (function, types) in the model doc
-[ ] 2  layout equality at TP 1, 2, 4 (the helper's oracle is the arm crate, which does not run this release)
-[x] 3  the five runtime-shaped rows resolve at both released widths (the catalogue rules state 2,304 and 4,608); the vision merger's output width is the one open row (work list)
+[x] 2  layout equality at TP 1, 2, 4 (`tests/layout_equality.rs`)
+[x] 3  all 134 scan rows resolve at sm121 (`sparkflash onboard` clean: yes, 1,298 indexed tensors)
 [x] 4  new part kinds named by operation: host body in the f32 reference, device body launched by the walk (MessageRead/MessageGate)
-[x] 4  the f32 host reference runs the loop, its gates and the cross-pass read (tiny looped fixture test)
+[x] 4  the f32 host reference runs the loop, its gates (including sliding attn/k/v) and the cross-pass read
 [x] 4  kernels by operation with their ABI (inkling_message_gate and inkling_cross_pass), exported by the Inkling image and checked against the catalogue
-[x] 4  the looped device fixture walks every application; the real checkpoint matches the f32 reference's top logits
+[x] 4  the looped device fixture walks every application in row, chunk, and fused-lane modes; real checkpoint matches across rows/chunk/tensor
 [ ] 5  target port complete for the whole work list
 [ ] 6  synthetic variant exercises every split at worlds 2 and 4
 [ ] 6  device arm exact ids at worlds 1, 2, 4 (or an owner-approved gate, measured)
 [ ] 6  conformance suite passes
 [ ] 7  tolerances written first; producer capture on synthetic and real; towers
 [ ] 8  converted from the description; numerics v1 registered; check and ci pass
-[x] 8  served gate: the HTTP API answers a chat completion and an image request on .100
-[x] 8  the drafter's rounds accept (12 proposed / 11 accepted and 15 / 9 on two requests)
-[ ] 8  served gate: speed table; long-window probe
-[x] 8  usage.prompt_tokens_details.image_tokens reports the prepared spans (the host driver no longer hard-codes zero)
-[ ] 9  template, parsers, sampling, preprocessing, drafters from the checkpoint
+[x] 8  served gate: the HTTP API answers text, code, real PNG images, and multi-turn prefix rewind on GB10
+[x] 8  the drafter is default-on and matches plain greedy output token-for-token (69.2% acceptance, 1.6x-2.2x decode speedup)
+[x] 8  served gate: speed table measured on GB10 (long-window probe remains open)
+[x] 8  usage.prompt_tokens_details.image_tokens reports the prepared spans
+[x] 9  template, parsers, sampling, preprocessing, vision, and drafter from the checkpoint
 [ ] 10 open-manifest-ab: DeepSeek identical and no slower; production restored
 [x] 11 the onboarding branch carries the work signed off; DECISIONS/NOTICE and the end-of-run battery stay with the merge
 ```

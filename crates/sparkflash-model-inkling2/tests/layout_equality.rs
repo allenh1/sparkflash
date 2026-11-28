@@ -31,6 +31,10 @@ use sparkflash_ops::ArchitectureTensorPlan;
 
 const CONFIG: &str = include_str!("../config/inkling2_small.hf.json");
 const QUANT: &str = include_str!("../config/inkling2_small.hf_quant.json");
+const MINI_CONFIG: &str =
+    include_str!("../../sparkflash-model/tests/data/inkling2_mini_config.json");
+const MINI_QUANT: &str =
+    include_str!("../../sparkflash-model/tests/data/inkling2_mini_quant.json");
 
 type Row = (
     sparkflash_weights::DType,
@@ -96,13 +100,11 @@ fn layout_rows(config: &Inkling2Config, tp: TpPlan) -> BTreeMap<String, Row> {
     rows
 }
 
-#[test]
-fn the_layout_reproduces_the_arms_language_and_vision_plan() {
-    let config = Inkling2Config::from_json(CONFIG, Some(QUANT)).expect("the released config");
+fn assert_layout_matches_arm(config: &Inkling2Config) {
     for world in [1usize, 2, 4] {
         let tp = TpPlan::new(world, 0).expect("a TP plan");
-        let arm = arm_rows(&config, tp);
-        let layout = layout_rows(&config, tp);
+        let arm = arm_rows(config, tp);
+        let layout = layout_rows(config, tp);
 
         let missing: Vec<&String> = arm
             .keys()
@@ -145,4 +147,17 @@ fn the_layout_reproduces_the_arms_language_and_vision_plan() {
             assert_eq!(expected.3, actual.3, "TP{world}: {name} rank run differs");
         }
     }
+}
+
+#[test]
+fn the_layout_reproduces_the_arms_language_and_vision_plan() {
+    let config = Inkling2Config::from_json(CONFIG, Some(QUANT)).expect("the released config");
+    assert_layout_matches_arm(&config);
+}
+
+#[test]
+fn the_mini_layout_reproduces_the_arms_language_and_vision_plan() {
+    let config =
+        Inkling2Config::from_json(MINI_CONFIG, Some(MINI_QUANT)).expect("the mini config");
+    assert_layout_matches_arm(&config);
 }

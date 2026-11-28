@@ -198,9 +198,9 @@ const INKLING_TEXT_WIDTHS: &[usize] = &[2304, 4608];
 const INKLING_HEAD_DIM: usize = 128;
 const INKLING_INTERMEDIATE: usize = 2304;
 
-/// The output widths the Inkling tower's merger is released at: 4,096 for Mini and 4,608 for
+/// The output widths the Inkling tower's merger is released at: 2,304 for Mini and 4,608 for
 /// Small. The merger's row width (1,024) and GELU box (4,096) are shared.
-const INKLING_VISION_MERGER_WIDTHS: &[usize] = &[4096, 4608];
+const INKLING_VISION_MERGER_WIDTHS: &[usize] = &[2304, 4608];
 
 /// The widest short-convolution kernel the body accepts.
 ///

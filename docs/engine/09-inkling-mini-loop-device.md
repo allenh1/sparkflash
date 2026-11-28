@@ -60,17 +60,19 @@ tensors and the drafter).
 
 ## Order of work
 
-1. **Done.** `LayerSchedule { index, stored, pass }` and the plan builder: the plan now holds
-   one schedule an application, per-application caches come from the existing lane memory, and
-   the row path saves the prelude's hidden row and rewinds the summary depth at a pass
-   boundary. Every single-pass device test still passes on .100, and the looped tiny fixture
-   now walks all 48 applications and answers (the messages are the next step).
-2. The row path (`RowRun`): applications, rewind, message ops, gates. Compare with the host
-   reference on the tiny looped fixture.
-3. The prompt path (`ChunkRun`): the same, chunked; the summary slice is per row.
-4. The drafter taps move to application indices.
-5. Run on .100: device vs the host reference on the real checkpoint for a short prompt, then
-   vision and the drafter.
+1. **Done.** `LayerSchedule { index, stored, pass }`, `buffer_plan` over all 48 applications, and
+   `Op::MessageRead` scheduled once per pass at `layer == core_start && pass > 0`.
+2. **Done.** Row path (`RowRun`) and chunk path (`ChunkRun`): `inkling_cross_pass` reads directly
+   from `summaries[row][start_block..]`, `inkling_message_gate` writes to an independent
+   destination so sliding loop layers gate `attn`/`k`/`v` independently from `attention_input[0]`,
+   `ResidualChain::carried` invalidates across pass rewinds, and `LoopDevice` lives in a single
+   freed arena.
+3. **Done.** Drafter taps use application indices `[5, 23, 41, 48]`, `InklingVision` injects image
+   rows at `span.start + 1 .. span.end() - 1`, and `serve` loads both vision and DSpark by default.
+4. **Done.** Verified on GB10 (`sm_121a`, TP=1) with `/home/allenh1/models/inkling-2-mini`:
+   `rows` == `chunk` bit-exact, `tensor` within 1 BF16 ULP, accurate vision/OCR answers with
+   multi-turn prefix rewind, and 6/6 exact greedy parity between DSpark ON (23.5–32.7 tok/s, 69.2%
+   acceptance) and OFF (13.9–14.7 tok/s).
 
 ## Gates
 

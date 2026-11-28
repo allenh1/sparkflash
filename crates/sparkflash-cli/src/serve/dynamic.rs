@@ -412,7 +412,6 @@ fn profile_with(
 pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     let checkpoint = resolve(options)?;
     let on_device = device_family(&checkpoint.architecture.family, &checkpoint.directory);
-    let looped = checkpoint.architecture.family == "inkling2_loop";
     let unresolved = if matches!(
         checkpoint.architecture.family.as_str(),
         "inkling2" | "inkling2_loop"
@@ -885,7 +884,7 @@ fn serve_inkling_host(
     // A looped release runs on the device arm when this build can open one: its message path and
     // its per-pass caches are the arm's, and the f32 reference would take minutes a token. A host
     // with no driver (or a build with no cubin) keeps the reference, which is the same arithmetic.
-    let (backend, engine): (Box<dyn sparkflash_model::ModelBackend>, &str) =
+    let (backend, engine): (Box<dyn sparkflash_model::ModelBackend>, String) =
         if config.loop_plan.is_some() {
             match sparkflash_model_inkling2::device::InklingDeviceBackend::open(
                 descriptor.clone(),
@@ -894,19 +893,57 @@ fn serve_inkling_host(
                 context,
             ) {
                 Ok(mut device) => {
+                    let mut notes = Vec::new();
                     if config.vision.is_some() {
-                        device.load_vision(&*source).map_err(|error| {
+                        let bytes = device.load_vision(&*source).map_err(|error| {
                             format!("--model {}: vision: {error}", checkpoint.model_id)
                         })?;
+                        notes.push(format!("vision ({:.1} MB)", bytes as f64 / 1e6));
                     }
-                    if config.mtp.is_some() && device.wants_drafter() {
-                        device
-                            .load_drafter(&checkpoint.directory)
-                            .map_err(|error| {
-                                format!("--model {}: drafter: {error}", checkpoint.model_id)
-                            })?;
+                    if config.mtp.is_some() {
+                        if device.wants_drafter() {
+                            let bytes =
+                                device.load_drafter(&checkpoint.directory).map_err(|error| {
+                                    format!(
+                                        "--model {}: drafter: {error} (set {}=off to step \
+                                         without it)",
+                                        checkpoint.model_id,
+                                        sparkflash_model_inkling2::device::DRAFT_ENV
+                                    )
+                                })?;
+                            notes.push(format!("DSpark drafter ({:.1} MB)", bytes as f64 / 1e6));
+                        } else if !sparkflash_model_inkling2::device::InklingDeviceBackend::draft_env_set()
+                            && checkpoint
+                                .directory
+                                .join(sparkflash_model_inkling2::device::DRAFT_FILE)
+                                .is_file()
+                        {
+                            let bytes = device
+                                .enable_default_drafter(&checkpoint.directory)
+                                .map_err(|error| {
+                                    format!(
+                                        "--model {}: drafter: {error} (set {}=off to step \
+                                         without it)",
+                                        checkpoint.model_id,
+                                        sparkflash_model_inkling2::device::DRAFT_ENV
+                                    )
+                                })?;
+                            notes.push(format!("DSpark drafter ({:.1} MB)", bytes as f64 / 1e6));
+                        }
                     }
-                    (Box::new(device), "device")
+                    let lanes = options.concurrency.max(1);
+                    device.enable_fusion(lanes).map_err(|error| {
+                        format!("--model {}: {error}", checkpoint.model_id)
+                    })?;
+                    if lanes > 1 {
+                        notes.push(format!("{lanes} fused lanes"));
+                    }
+                    let label = if notes.is_empty() {
+                        "device".to_owned()
+                    } else {
+                        format!("device, {}", notes.join(", "))
+                    };
+                    (Box::new(device), label)
                 }
                 Err(error) => {
                     eprintln!(
@@ -920,7 +957,7 @@ fn serve_inkling_host(
                         context,
                     )
                     .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
-                    (Box::new(backend), "f32 host reference")
+                    (Box::new(backend), "f32 host reference".to_owned())
                 }
             }
         } else {
@@ -931,7 +968,7 @@ fn serve_inkling_host(
                 context,
             )
             .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
-            (Box::new(backend), "f32 host reference")
+            (Box::new(backend), "f32 host reference".to_owned())
         };
     let banner = format!(
         "{} ({}) at TP=1 on {where_from}, context {context}, Inkling {engine}",

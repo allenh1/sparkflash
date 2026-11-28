@@ -634,9 +634,25 @@ impl Inkling2Weights {
             // The block-attention residual is read on a sliding layer too: `attention_input` is the
             // softmax mix over the summary stack, and it is the layer's attention input, not the
             // raw stream. At layer 0 the two coincide because there is no stack yet.
-            let source = gated("attn", &attention_input[0], messages.map(|held| &held.q))?;
-            let x = rms_norm(&source, Some(&norm), config.architecture.norm_epsilon);
-            (x.clone(), x.clone(), x)
+            // On pass > 0 of a looped core (`modeling_inkling2_loop.py:961-967`), a sliding layer
+            // applies three separate message gates (attn/k/v) to `attention_input[0]` and runs the
+            // shared `attn_norm` on each stream.
+            match messages {
+                None => {
+                    let x = rms_norm(&attention_input[0], Some(&norm), config.architecture.norm_epsilon);
+                    (x.clone(), x.clone(), x)
+                }
+                Some(held) => {
+                    let q_source = self.message_gate(layer, "attn", &attention_input[0], &held.q)?;
+                    let k_source = self.message_gate(layer, "k", &attention_input[0], &held.k)?;
+                    let v_source = self.message_gate(layer, "v", &attention_input[0], &held.v)?;
+                    (
+                        rms_norm(&q_source, Some(&norm), config.architecture.norm_epsilon),
+                        rms_norm(&k_source, Some(&norm), config.architecture.norm_epsilon),
+                        rms_norm(&v_source, Some(&norm), config.architecture.norm_epsilon),
+                    )
+                }
+            }
         } else {
             let qn = self.vector(&format!("{prefix}.q_input_norm.weight"))?;
             let kn = self.vector(&format!("{prefix}.k_input_norm.weight"))?;

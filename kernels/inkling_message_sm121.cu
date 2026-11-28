@@ -27,30 +27,38 @@
 //
 // ABI:
 //
-//   inkling_message_gate(values, message, down, forget, gain, hidden, rank, epsilon,
-//                        value_stride, value_shift, message_stride, message_shift)
-//     values    [rows][value_stride] f32, updated in place: row r's hidden slice starts at
-//               `r * value_stride + value_shift` (a chunk's sublayer inputs are interleaved
-//               rows, a decode walk's are contiguous)
-//     message   [rows][message_stride] f32: row r's hidden slice starts at
-//               `r * message_stride + message_shift`
-//     down     [rank][2 * hidden] f32: the concatenated pair to the bottleneck
-//     forget   [hidden][rank] f32: the forget gate
-//     gain     [hidden][rank] f32: the gain gate
-//     rank     at most INKLING_MESSAGE_MAX_RANK (64), the shared-memory bottleneck's bound
+//   inkling_message_gate(source, destination, message, down, forget, gain, hidden, rank, epsilon,
+//                        source_stride, source_shift, destination_stride, destination_shift,
+//                        message_stride, message_shift)
+//     source       [rows][source_stride] f32: row r's hidden slice starts at
+//                  `r * source_stride + source_shift` (a sliding loop layer shares one
+//                  attention_input row across its query, key and value gates, so the gate writes
+//                  to a distinct destination rather than overwriting `source` in place)
+//     destination  [rows][destination_stride] f32: row r's output slice starts at
+//                  `r * destination_stride + destination_shift` (may alias `source` when safe)
+//     message      [rows][message_stride] f32: row r's hidden slice starts at
+//                  `r * message_stride + message_shift`
+//     down         [rank][2 * hidden] f32: the concatenated pair to the bottleneck
+//     forget       [hidden][rank] f32: the forget gate
+//     gain         [hidden][rank] f32: the gain gate
+//     rank         at most INKLING_MESSAGE_MAX_RANK (64), the shared-memory bottleneck's bound
 //
-//   inkling_cross_pass(prev, prev_hidden, queries, kv, out, rows, count, core, hidden,
-//                      epsilon)
-//     prev          [count][rows][hidden] f32: the previous pass's block summaries
-//     prev_hidden   [rows][hidden] f32: the previous pass's final hidden row
-//     queries       [2 * core][hidden] f32: the query and MLP stream bank
-//     kv            [2 * core][hidden] f32: the key and value stream bank
-//     out           [rows][core][4][hidden] f32: four messages a core layer a row
-//     core          the core layers the walk loops
-//     count         the summary rows the previous pass left (at most INKLING_MESSAGE_MAX_STATES)
-//     The state stack is `prev`'s rows and then `prev_hidden`, each unweighted-RMS-normalised.
-//     Stream s of layer l reads bank row `2 * l + s / 2` of `queries` for s in {0, 3} and of
-//     `kv` for s in {1, 2}.
+//   inkling_cross_pass(summaries, prev_hidden, queries, kv, out, rows, start_block, count,
+//                      summary_stride, core, hidden, epsilon)
+//     summaries      [rows][summary_stride] f32: each row's block-summary stack, where block b of
+//                    row r starts at `r * summary_stride + b * hidden` (for rows == 1,
+//                    summary_stride may be 0)
+//     prev_hidden    [rows][hidden] f32: the previous pass's final hidden row
+//     queries        [2 * core][hidden] f32: the query and MLP stream bank
+//     kv             [2 * core][hidden] f32: the key and value stream bank
+//     out            [rows][core][4][hidden] f32: four messages a core layer a row
+//     start_block    first summary block of the previous pass (`num_pre_loop_blocks + 1`)
+//     count          summary rows the previous pass left (at most INKLING_MESSAGE_MAX_STATES - 1)
+//     summary_stride floats between consecutive rows in `summaries`
+//     core           the core layers the walk loops
+//     The state stack is `summaries[row][start_block .. start_block + count]` and then
+//     `prev_hidden[row]`, each unweighted-RMS-normalised. Stream s of layer l reads bank row
+//     `2 * l + (s / 2)` of `queries` for s in {0, 3} and of `kv` for s in {1, 2}.
 
 #include <cstdint>
 
@@ -84,7 +92,8 @@ __device__ __forceinline__ float inkling_message_block_sum(float value, float* s
 
 // The two-tanh gate: one block a row, the bottleneck kept in shared memory.
 extern "C" __global__ void __launch_bounds__(INKLING_MESSAGE_BLOCK) inkling_message_gate(
-    float* __restrict__ values,
+    const float* source,
+    float* destination,
     const float* __restrict__ message,
     const float* __restrict__ down,
     const float* __restrict__ forget,
@@ -92,15 +101,18 @@ extern "C" __global__ void __launch_bounds__(INKLING_MESSAGE_BLOCK) inkling_mess
     int hidden,
     int rank,
     float epsilon,
-    int value_stride,
-    int value_shift,
+    int source_stride,
+    int source_shift,
+    int destination_stride,
+    int destination_shift,
     int message_stride,
     int message_shift) {
     OPT_PDL_ENTRY();
     __shared__ float scratch[INKLING_MESSAGE_BLOCK / 32];
     __shared__ float bottleneck[INKLING_MESSAGE_MAX_RANK];
     const int row = blockIdx.x;
-    float* value = values + (size_t)row * value_stride + value_shift;
+    const float* value = source + (size_t)row * source_stride + source_shift;
+    float* out = destination + (size_t)row * destination_stride + destination_shift;
     const float* msg = message + (size_t)row * message_stride + message_shift;
     if (rank > INKLING_MESSAGE_MAX_RANK) {
         return;
@@ -108,9 +120,9 @@ extern "C" __global__ void __launch_bounds__(INKLING_MESSAGE_BLOCK) inkling_mess
     float squares_value = 0.0f;
     float squares_message = 0.0f;
     for (int index = threadIdx.x; index < hidden; index += INKLING_MESSAGE_BLOCK) {
-        const float source = value[index];
+        const float v = value[index];
         const float other = msg[index];
-        squares_value += source * source;
+        squares_value += v * v;
         squares_message += other * other;
     }
     squares_value = inkling_message_block_sum(squares_value, scratch);
@@ -138,20 +150,22 @@ extern "C" __global__ void __launch_bounds__(INKLING_MESSAGE_BLOCK) inkling_mess
             forget_value += forget_row[column] * bottleneck[column];
             gain_value += gain_row[column] * bottleneck[column];
         }
-        value[index] = (1.0f - tanhf(forget_value)) * value[index]
+        out[index] = (1.0f - tanhf(forget_value)) * value[index]
             + tanhf(gain_value) * msg[index];
     }
 }
 
 // The cross-pass read: one block a (row, core layer, stream) query.
 extern "C" __global__ void __launch_bounds__(INKLING_MESSAGE_BLOCK) inkling_cross_pass(
-    const float* __restrict__ prev,
+    const float* __restrict__ summaries,
     const float* __restrict__ prev_hidden,
     const float* __restrict__ queries,
     const float* __restrict__ kv,
     float* __restrict__ out,
     int rows,
+    int start_block,
     int count,
+    int summary_stride,
     int core,
     int hidden,
     float epsilon) {
@@ -165,19 +179,23 @@ extern "C" __global__ void __launch_bounds__(INKLING_MESSAGE_BLOCK) inkling_cros
     }
     const int query_index = blockIdx.x;
     const int row = blockIdx.y;
+    if (row >= rows) {
+        return;
+    }
     const int layer = query_index >> 2;
     const int stream = query_index & 3;
     const float* bank = (stream == 0 || stream == 3) ? queries : kv;
     const int sub = (stream == 2 || stream == 3) ? 1 : 0;
     const float* query = bank + (size_t)(2 * layer + sub) * hidden;
     const float scale = rsqrtf((float)hidden);
-    const size_t row_bytes = (size_t)hidden;
+    const size_t row_floats = (size_t)hidden;
+    const float* row_summaries = summaries + (size_t)row * summary_stride;
     for (int state = 0; state < states; ++state) {
         const float* values;
         if (state < count) {
-            values = prev + ((size_t)state * rows + row) * row_bytes;
+            values = row_summaries + (size_t)(start_block + state) * row_floats;
         } else {
-            values = prev_hidden + (size_t)row * row_bytes;
+            values = prev_hidden + (size_t)row * row_floats;
         }
         float squares = 0.0f;
         float dot = 0.0f;
@@ -212,13 +230,13 @@ extern "C" __global__ void __launch_bounds__(INKLING_MESSAGE_BLOCK) inkling_cros
         }
     }
     __syncthreads();
-    float* destination = out + ((size_t)row * core * 4 + query_index) * row_bytes;
+    float* destination = out + ((size_t)row * core * 4 + query_index) * row_floats;
     for (int index = threadIdx.x; index < hidden; index += INKLING_MESSAGE_BLOCK) {
         float total = 0.0f;
         for (int state = 0; state < states; ++state) {
             const float* values = state < count
-                ? prev + ((size_t)state * rows + row) * row_bytes
-                : prev_hidden + (size_t)row * row_bytes;
+                ? row_summaries + (size_t)(start_block + state) * row_floats
+                : prev_hidden + (size_t)row * row_floats;
             total += scores[state] * norms[state] * values[index];
         }
         destination[index] = total;

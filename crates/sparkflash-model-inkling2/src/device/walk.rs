@@ -1199,7 +1199,7 @@ impl Vision<InklingWalk> for InklingVision {
         let start = session.state.position;
         let fresh: Vec<&VisionImage> = images
             .iter()
-            .filter(|image| image.span.start >= start)
+            .filter(|image| image.span.end() > start)
             .collect();
         if fresh.is_empty() {
             return Ok(());
@@ -1261,9 +1261,12 @@ impl Vision<InklingWalk> for InklingVision {
         match fill() {
             Ok(()) => {
                 session.images = Some(buffer);
+                // `image.span.start` is the opening `<|content_image|>` delimiter; the
+                // `grid.image_rows()` placeholder tokens occupy `start + 1 .. end - 1`
+                // (`vision.rs:831-840, 932`, `ImageSpan::row`).
                 session.image_spans = fresh
                     .iter()
-                    .map(|image| (image.span.start, image.span.grid.image_rows()))
+                    .map(|image| (image.span.start + 1, image.span.grid.image_rows()))
                     .collect();
                 Ok(())
             }

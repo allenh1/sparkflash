@@ -106,10 +106,6 @@ const ELEMENT_BLOCK: u32 = 256;
 /// The loop message path's block, the `inkling_message_gate`/`inkling_cross_pass` launch width
 /// (the kernels' `INKLING_MESSAGE_BLOCK`).
 const MESSAGE_BLOCK: u32 = 256;
-
-/// The most block summaries one loop pass appends: what the message read copies aside before a
-/// pass restarts. The released core crosses at most two boundaries a pass.
-const LOOP_PREV_MAX: usize = 8;
 /// The rows a block-attention residual reads at most: the summary stack (INKLING_MAX_BLOCKS)
 /// and the current stream.
 const RESIDUAL_ROWS: usize = 17;
@@ -1895,15 +1891,18 @@ impl Shared {
     }
 
     /// The loop's cross-pass read: the four messages of every core layer for `rows` rows, from
-    /// the previous pass's summary rows and final hidden row
-    /// (`modeling_inkling2_loop.py`:147-176).
+    /// the previous pass's summary rows (`summaries[row][start_block .. start_block + count]`)
+    /// and final hidden row (`modeling_inkling2_loop.py`:147-176).
+    #[allow(clippy::too_many_arguments)]
     fn cross_pass(
         &self,
-        prev: Deviceptr,
+        summaries: Deviceptr,
         prev_hidden: Deviceptr,
         out: Deviceptr,
         rows: usize,
+        start_block: usize,
         count: usize,
+        summary_stride: usize,
     ) -> Result<(), String> {
         let plan = self
             .config
@@ -1921,13 +1920,15 @@ impl Shared {
             ((core * 4) as u32, rows as u32, 1),
             (MESSAGE_BLOCK, 1, 1),
             &[
-                prev.0,
+                summaries.0,
                 prev_hidden.0,
                 device.queries.0,
                 device.kv.0,
                 out.0,
                 rows as u64,
+                start_block as u64,
                 count as u64,
+                summary_stride as u64,
                 core as u64,
                 hidden as u64,
                 eps,
@@ -1935,21 +1936,24 @@ impl Shared {
         )
     }
 
-    /// One stream's loop gate over `rows` residual rows, in place.
+    /// One stream's loop gate over `rows` residual rows, writing from `source` to `destination`.
     ///
-    /// `values` is the walk's residual arena: row `r`'s hidden slice starts at
-    /// `r * value_stride + value_shift`. `message` is the [Scratch::loop_messages] arena: row
-    /// `r`'s slice starts at `r * message_stride + message_shift`.
+    /// Row `r`'s hidden slice is read at `r * source_stride + source_shift` and written at
+    /// `r * destination_stride + destination_shift`. `message` is the [Scratch::loop_messages]
+    /// arena: row `r`'s slice starts at `r * message_stride + message_shift`.
     #[allow(clippy::too_many_arguments)]
     fn message_gate(
         &self,
-        values: Deviceptr,
+        source: Deviceptr,
+        destination: Deviceptr,
         message: Deviceptr,
         stored: usize,
         stream: MessageStream,
         rows: usize,
-        value_stride: usize,
-        value_shift: usize,
+        source_stride: usize,
+        source_shift: usize,
+        destination_stride: usize,
+        destination_shift: usize,
         message_stride: usize,
         message_shift: usize,
     ) -> Result<(), String> {
@@ -1974,7 +1978,8 @@ impl Shared {
             (rows as u32, 1, 1),
             (MESSAGE_BLOCK, 1, 1),
             &[
-                values.0,
+                source.0,
+                destination.0,
                 message.0,
                 down.0,
                 forget.0,
@@ -1982,8 +1987,10 @@ impl Shared {
                 hidden as u64,
                 plan.gate_rank as u64,
                 eps,
-                value_stride as u64,
-                value_shift as u64,
+                source_stride as u64,
+                source_shift as u64,
+                destination_stride as u64,
+                destination_shift as u64,
                 message_stride as u64,
                 message_shift as u64,
             ],
@@ -3097,6 +3104,9 @@ impl Drop for Shared {
         pointers.push(self.weights.zeros);
         pointers.push(self.clip_arena);
         pointers.push(self.expert_arena);
+        if let Some(loop_device) = &self.loop_device {
+            pointers.push(loop_device.arena);
+        }
         pointers.extend(self.exchange_slots);
         let refs: Vec<&Deviceptr> = pointers.iter().collect();
         self.cuda.free_buffers(&refs);
@@ -3247,18 +3257,7 @@ impl InklingDeviceBackend {
                 tp.world()
             ));
         }
-        // A looped release's prefill runs one position at a time until the message path has a
-        // chunked form: the gates read and write each row's stream, and the chunk walks are
-        // built for rows that share a launch. The row walk is the same arithmetic a decode step
-        // runs, so this is a speed choice, not a numerics one.
-        let mut prefill_walk = PrefillWalk::from_env()?;
-        if config.loop_plan.is_some() && prefill_walk != PrefillWalk::Rows {
-            eprintln!(
-                "[inkling] the looped release prefills through the row walk until the message \
-                 path has a chunked form ({PREFILL_ENV}=rows)"
-            );
-            prefill_walk = PrefillWalk::Rows;
-        }
+        let prefill_walk = PrefillWalk::from_env()?;
         let mxfp8_walk = Mxfp8Walk::from_env(prefill_walk)?;
         let planes = ActivationPlanes::from_env(prefill_walk)?;
         let dense_form = DenseForm::from_env()?;
@@ -3498,6 +3497,51 @@ impl InklingDeviceBackend {
     #[must_use]
     pub fn wants_drafter(&self) -> bool {
         matches!(self.shared.draft, Some((Drafter::Dspark, _)))
+    }
+
+    /// Whether [DRAFT_ENV] was explicitly set in the process environment (including `off`).
+    #[must_use]
+    pub fn draft_env_set() -> bool {
+        std::env::var(DRAFT_ENV)
+            .ok()
+            .is_some_and(|value| !value.is_empty())
+    }
+
+    /// Enables the checkpoint's DSpark drafter when [DRAFT_ENV] is unset and loads
+    /// [DRAFT_FILE] from `directory`, before any session or lanes open.
+    ///
+    /// # Errors
+    /// A checkpoint without `mtp_config`, an out-of-range [DRAFT_DEPTH_ENV], a session already
+    /// open, or [Self::load_drafter]'s errors.
+    pub fn enable_default_drafter(&mut self, directory: &Path) -> Result<usize, String> {
+        let shared = Arc::get_mut(&mut self.shared)
+            .ok_or("the drafter loads before any session or lanes open on this rank")?;
+        let mtp = shared
+            .config
+            .mtp
+            .as_ref()
+            .ok_or_else(|| "this checkpoint describes no drafter".to_owned())?;
+        let depth = draft_depth_from_env()?;
+        if depth + 1 > shared.prefill_chunk {
+            return Err(format!(
+                "{DRAFT_DEPTH_ENV}={depth} verifies {} rows, wider than the {}-row chunks the \
+                 sliding rings are sized for",
+                depth + 1,
+                shared.prefill_chunk
+            ));
+        }
+        if depth + 1 > mtp.block_size {
+            return Err(format!(
+                "{DRAFT_DEPTH_ENV}={depth}: the DSpark block of {} rows drafts at most {}",
+                mtp.block_size,
+                mtp.block_size.saturating_sub(1)
+            ));
+        }
+        let draft = Some((Drafter::Dspark, depth));
+        let policy = depth_policy_from_env(draft, |name| std::env::var(name).ok())?;
+        shared.draft = draft;
+        shared.depth_policy = policy;
+        self.load_drafter(directory)
     }
 
     /// Loads the DSpark drafter onto this rank from `directory`'s [DRAFT_FILE] (the released
@@ -3987,11 +4031,13 @@ fn widen_clips(
 /// summaries and \`inkling_message_gate\` mixes a message into the running residual, so a pass
 /// boundary and a gate are launches rather than host copies of every row.
 struct LoopDevice {
-    /// The query and MLP streams' bank: \`[2 * core_len][hidden]\`.
+    /// One contiguous allocation holding the query banks and every controller tensor.
+    arena: Deviceptr,
+    /// The query and MLP streams' bank: `[2 * core_len][hidden]`.
     queries: Deviceptr,
-    /// The key and value streams' bank: \`[2 * core_len][hidden]\`.
+    /// The key and value streams' bank: `[2 * core_len][hidden]`.
     kv: Deviceptr,
-    /// One entry a stored layer (\`Some\` on a core layer): the four streams' (down, forget,
+    /// One entry a stored layer (`Some` on a core layer): the four streams' (down, forget,
     /// gain).
     gates: Vec<Option<[(Deviceptr, Deviceptr, Deviceptr); 4]>>,
 }
@@ -4000,7 +4046,7 @@ struct LoopDevice {
 ///
 /// The checkpoint stores the controllers BF16 where the producer builds them f32; the read widens
 /// each value once, which is the cast the producer's forward makes on every call. The banks are
-/// already f32. A release with no loop plan has nothing to load and answers \`None\`.
+/// already f32. A release with no loop plan has nothing to load and answers `None`.
 fn loop_weights(
     cuda: &Cuda,
     plan: &InklingDevicePlan,
@@ -4037,18 +4083,17 @@ fn loop_weights(
                 .collect()
         })
     };
-    // One arena holds every upload: a pointer is an offset into it, the same shape
-    // [expert_scales] uses.
-    let mut cursor = 0usize;
-    let mut upload = |values: &[f32]| -> Result<Deviceptr, String> {
-        let pointer = cuda.alloc(values.len().max(1) * 4, &mut cursor)?;
-        let mut bytes = Vec::with_capacity(values.len() * 4);
+    // One arena holds every loop tensor: each slice is placed on a 256-byte boundary and uploaded
+    // in a single HtoD copy, freed once in `Shared::drop`.
+    let mut staging: Vec<u8> = Vec::new();
+    let mut stage = |values: &[f32]| -> usize {
+        let offset = staging.len().next_multiple_of(256);
+        staging.resize(offset, 0);
+        staging.reserve(values.len() * 4);
         for value in values {
-            bytes.extend_from_slice(&value.to_le_bytes());
+            staging.extend_from_slice(&value.to_le_bytes());
         }
-        cuda.copy_htod(&pointer, &bytes)
-            .map_err(|error| format!("a loop controller upload: {error}"))?;
-        Ok(pointer)
+        offset
     };
     let queries = read("model.llm.middle_cycle_cross_pass_queries", true)?;
     let kv_queries = read("model.llm.middle_cycle_cross_pass_kv_queries", true)?;
@@ -4060,12 +4105,12 @@ fn loop_weights(
             2 * loop_plan.core_len()
         ));
     }
-    let queries = upload(&queries)?;
-    let kv = upload(&kv_queries)?;
-    let mut gates: Vec<Option<[(Deviceptr, Deviceptr, Deviceptr); 4]>> =
+    let queries_off = stage(&queries);
+    let kv_off = stage(&kv_queries);
+    let mut gate_offsets: Vec<Option<[(usize, usize, usize); 4]>> =
         vec![None; config.num_hidden_layers];
     for layer in loop_plan.core_start..loop_plan.core_end {
-        let mut pointers = Vec::with_capacity(4);
+        let mut offsets = Vec::with_capacity(4);
         for stream in ["attn", "k", "v", "mlp"] {
             let prefix = format!("model.llm.layers.{layer}.controllers.{stream}");
             let down = read(&format!("{prefix}.down_weight"), false)?;
@@ -4081,16 +4126,33 @@ fn loop_weights(
                     2 * hidden
                 ));
             }
-            pointers.push((upload(&down)?, upload(&forget)?, upload(&gain)?));
+            offsets.push((stage(&down), stage(&forget), stage(&gain)));
         }
-        gates[layer] = Some(
-            pointers
+        gate_offsets[layer] = Some(
+            offsets
                 .try_into()
                 .map_err(|_| "four loop streams".to_owned())?,
         );
     }
+    let mut total = 0usize;
+    let arena = cuda.alloc(staging.len().max(1), &mut total)?;
+    cuda.copy_htod(&arena, &staging)
+        .map_err(|error| format!("loop controller arena upload: {error}"))?;
     cuda.synchronize()?;
-    Ok(Some(LoopDevice { queries, kv, gates }))
+    let gates = gate_offsets
+        .into_iter()
+        .map(|entry| {
+            entry.map(|streams| {
+                streams.map(|(d, f, g)| (arena.offset(d), arena.offset(f), arena.offset(g)))
+            })
+        })
+        .collect();
+    Ok(Some(LoopDevice {
+        arena,
+        queries: arena.offset(queries_off),
+        kv: arena.offset(kv_off),
+        gates,
+    }))
 }
 
 /// What [expert_scales] lays out: the NVFP4 layers' scales, every grouped-MMA table, the arena
@@ -4693,8 +4755,6 @@ struct Scratch {
     /// restarts from them (\`modeling_inkling2_loop.py\`:1415-1417). Unused by a single-pass
     /// release.
     loop_saved: Deviceptr,
-    /// The previous pass's summary rows the message reads, up to [LOOP_PREV_MAX] blocks.
-    loop_prev: Deviceptr,
     /// The previous pass's final hidden rows the message reads.
     loop_prev_hidden: Deviceptr,
     /// The four messages of every core layer, \`[core_len][4][hidden]\`, a row at a time.
@@ -4844,11 +4904,6 @@ impl Scratch {
         };
         let x = take(rows * hidden, 4);
         let loop_saved = take(rows * hidden, 4);
-        let loop_prev = if config.loop_plan.is_some() {
-            take(LOOP_PREV_MAX * rows * hidden, 4)
-        } else {
-            take(rows * hidden, 4)
-        };
         let loop_prev_hidden = take(rows * hidden, 4);
         let loop_messages = if let Some(plan) = config.loop_plan {
             take(rows * plan.core_len() * 4 * hidden, 4)
@@ -4959,7 +5014,6 @@ impl Scratch {
         Ok(Self {
             x: at(x),
             loop_saved: at(loop_saved),
-            loop_prev: at(loop_prev),
             loop_prev_hidden: at(loop_prev_hidden),
             loop_messages: at(loop_messages),
             rows: at(block_inputs),
@@ -5437,6 +5491,20 @@ fn depth_policy_from_env(
 /// The n-grams prompt lookup matches, longest first.
 const LOOKUP_NGRAMS: (usize, usize) = (2, 4);
 
+/// The draft depth from [DRAFT_DEPTH_ENV], or [DEFAULT_DRAFT_DEPTH] unset.
+fn draft_depth_from_env() -> Result<usize, String> {
+    match std::env::var(DRAFT_DEPTH_ENV).ok().as_deref() {
+        None | Some("") => Ok(DEFAULT_DRAFT_DEPTH),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|depth| (1..=MAX_DRAFT_DEPTH).contains(depth))
+            .ok_or_else(|| {
+                format!("{DRAFT_DEPTH_ENV}={value} is not a depth in 1..={MAX_DRAFT_DEPTH}")
+            }),
+    }
+}
+
 /// The drafter and its depth from [DRAFT_ENV] and [DRAFT_DEPTH_ENV]; a value that is neither is
 /// refused rather than read as off.
 fn draft_from_env() -> Result<Option<(Drafter, usize)>, String> {
@@ -5451,17 +5519,7 @@ fn draft_from_env() -> Result<Option<(Drafter, usize)>, String> {
             ));
         }
     };
-    let depth = match std::env::var(DRAFT_DEPTH_ENV).ok().as_deref() {
-        None | Some("") => DEFAULT_DRAFT_DEPTH,
-        Some(value) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|depth| (1..=MAX_DRAFT_DEPTH).contains(depth))
-            .ok_or_else(|| {
-                format!("{DRAFT_DEPTH_ENV}={value} is not a depth in 1..={MAX_DRAFT_DEPTH}")
-            })?,
-    };
-    Ok(Some((drafter, depth)))
+    Ok(Some((drafter, draft_depth_from_env()?)))
 }
 
 /// Make `buffer` at least `rows` wide with logits for at least `answers` rows: opened on first
@@ -5912,7 +5970,9 @@ struct RowRun {
     /// How many summary blocks the prelude left, when the release loops. Every pass after the
     /// first resets the stack to this length, which is the producer's `block_states` rewind.
     loop_blocks: Option<usize>,
-    /// The previous pass's summary rows, copied aside at a pass boundary for the message read.
+    /// First summary block of the previous pass (`num_pre_loop_blocks + 1`) and how many summary
+    /// rows it left for `inkling_cross_pass` to read directly from `state.summaries`.
+    loop_prev_start: usize,
     loop_prev_count: usize,
 
     /// The convolution the layer ran last, whose output the next residual add reads.
@@ -5942,6 +6002,7 @@ impl RowRun {
             blocks: 0,
             cursor: 0,
             loop_blocks: None,
+            loop_prev_start: 0,
             loop_prev_count: 0,
             previous_conv: None,
         })
@@ -6018,13 +6079,14 @@ impl RowRun {
     /// and its final hidden (`modeling_inkling2_loop.py`:147-176). The read runs on the device
     /// (`inkling_cross_pass`), so the row walk keeps no message copy on the host.
     fn loop_messages(&mut self, shared: &Arc<Shared>) -> Result<(), String> {
-        let count = self.loop_prev_count.min(LOOP_PREV_MAX);
         shared.cross_pass(
-            self.state.scratch.loop_prev,
+            self.state.summaries,
             self.state.scratch.loop_prev_hidden,
             self.state.scratch.loop_messages,
             1,
-            count,
+            self.loop_prev_start,
+            self.loop_prev_count,
+            0,
         )
     }
 
@@ -6068,22 +6130,14 @@ impl RowRun {
                     .map_err(|error| error.to_string()))?;
                 self.loop_blocks = Some(self.blocks);
             } else {
-                // The message reads the previous pass's summaries and its final hidden. Take
-                // them aside before the rewind overwrites the stream; the producer's slice is
-                // `block_states[num_pre_loop_blocks + 1:]` (`:1419`), which drops the
-                // prelude's own summary and the pass's first append.
+                // The message reads the previous pass's summaries directly from `state.summaries`
+                // before any SummaryPush of this pass runs: the producer's slice is
+                // `block_states[num_pre_loop_blocks + 1:]` (`:1400`), which drops the prelude's
+                // summary and the pass's first append.
                 let depth = self.loop_blocks.unwrap_or(0);
                 let start = depth + 1;
-                let count = self.blocks.saturating_sub(start).min(LOOP_PREV_MAX);
-                for block in 0..count {
-                    let source = self.state.summaries.offset((start + block) * bytes);
-                    let destination = self.state.scratch.loop_prev.offset(block * bytes);
-                    run(shared
-                        .cuda
-                        .copy_dtod(&destination, &source, bytes)
-                        .map_err(|error| error.to_string()))?;
-                }
-                self.loop_prev_count = count;
+                self.loop_prev_start = start;
+                self.loop_prev_count = self.blocks.saturating_sub(start);
                 run(shared
                     .cuda
                     .copy_dtod(
@@ -6097,7 +6151,7 @@ impl RowRun {
                     .cuda
                     .copy_dtod(&self.state.scratch.x, &saved, bytes)
                     .map_err(|error| error.to_string()))?;
-                self.blocks = self.loop_blocks.unwrap_or(0);
+                self.blocks = depth;
             }
         }
         if from == 0
@@ -6170,24 +6224,41 @@ impl RowRun {
                 }
                 (Op::RmsNorm, Target::Norm(role)) => {
                     let weight = self.weight(step.weights[0]);
-                    let (source, destination) = match (role, sliding) {
-                        (NormRole::Stream, _) => (self.state.scratch.x, self.state.scratch.normed),
-                        (NormRole::Attention, _) => {
+                    let gated = schedule.pass > 0;
+                    let (source, destination) = match (role, sliding, gated) {
+                        (NormRole::Stream, _, _) => (self.state.scratch.x, self.state.scratch.normed),
+                        (NormRole::Attention, _, false) => {
                             (self.state.scratch.rows, self.state.scratch.normed)
                         }
-                        (NormRole::Query, false) => {
+                        (NormRole::Query, _, true) => {
+                            (self.state.scratch.normed, self.state.scratch.normed)
+                        }
+                        (NormRole::Key, _, true) => (
+                            self.state.scratch.normed.offset(hidden * 4),
+                            self.state.scratch.normed.offset(hidden * 4),
+                        ),
+                        (NormRole::Value, _, true) => (
+                            self.state.scratch.normed.offset(2 * hidden * 4),
+                            self.state.scratch.normed.offset(2 * hidden * 4),
+                        ),
+                        (NormRole::Mlp, _, true) => {
+                            (self.state.scratch.normed, self.state.scratch.normed)
+                        }
+                        (NormRole::Query, false, false) => {
                             (self.state.scratch.rows, self.state.scratch.normed)
                         }
-                        (NormRole::Key, false) => (
+                        (NormRole::Key, false, false) => (
                             self.state.scratch.rows.offset(hidden * 4),
                             self.state.scratch.normed.offset(hidden * 4),
                         ),
-                        (NormRole::Value, false) => (
+                        (NormRole::Value, false, false) => (
                             self.state.scratch.rows.offset(2 * hidden * 4),
                             self.state.scratch.normed.offset(2 * hidden * 4),
                         ),
-                        (NormRole::Mlp, _) => (self.state.scratch.rows, self.state.scratch.normed),
-                        (other, _) => {
+                        (NormRole::Mlp, _, false) => {
+                            (self.state.scratch.rows, self.state.scratch.normed)
+                        }
+                        (other, _, _) => {
                             return Err(device_error(format!(
                                 "layer {layer}: norm role {other:?} is not an input norm"
                             )));
@@ -6200,6 +6271,7 @@ impl RowRun {
                 }
                 (Op::Gemv, Target::Project(projection)) => {
                     let normed = self.state.scratch.normed;
+                    let separate_kv = !sliding || schedule.pass > 0;
                     let io = |projection: Projection| match projection {
                         Projection::Query => {
                             Ok((normed, self.state.scratch.q, heads * head_dim, hidden))
@@ -6208,20 +6280,20 @@ impl RowRun {
                             Ok((normed, self.state.scratch.gate, heads * head_dim, hidden))
                         }
                         Projection::Key => Ok((
-                            if sliding {
-                                normed
-                            } else {
+                            if separate_kv {
                                 normed.offset(hidden * 4)
+                            } else {
+                                normed
                             },
                             self.state.scratch.k,
                             kv_width,
                             hidden,
                         )),
                         Projection::Value => Ok((
-                            if sliding {
-                                normed
-                            } else {
+                            if separate_kv {
                                 normed.offset(2 * hidden * 4)
+                            } else {
+                                normed
                             },
                             self.state.scratch.v,
                             kv_width,
@@ -6490,23 +6562,27 @@ impl RowRun {
                         ))
                     })?;
                     // The controller tensors and the query row are the stored layer's, not the
-                    // application's: a later pass reuses them.
+                    // application's: a later pass reuses them. Write into `normed` so sliding
+                    // layers can gate query, key and value independently from `rows[0]`.
                     let stored = schedule.stored;
                     let core = stored.saturating_sub(loop_plan.core_start);
-                    let shift = match stream {
-                        MessageStream::Mlp | MessageStream::Query => 0,
-                        MessageStream::Key => hidden,
-                        MessageStream::Value => 2 * hidden,
+                    let (src_shift, dst_shift) = match stream {
+                        MessageStream::Mlp | MessageStream::Query => (0, 0),
+                        MessageStream::Key => (if sliding { 0 } else { hidden }, hidden),
+                        MessageStream::Value => (if sliding { 0 } else { 2 * hidden }, 2 * hidden),
                     };
                     run(shared.message_gate(
                         self.state.scratch.rows,
+                        self.state.scratch.normed,
                         self.state.scratch.loop_messages,
                         stored,
                         stream,
                         1,
                         hidden,
-                        shift,
+                        src_shift,
                         hidden,
+                        dst_shift,
+                        loop_plan.core_len() * 4 * hidden,
                         (core * 4 + stream.index()) * hidden,
                     ))?;
                 }

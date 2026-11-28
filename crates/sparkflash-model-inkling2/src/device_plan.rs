@@ -1188,10 +1188,11 @@ impl InklingDevicePlan {
         let mut steps = Vec::with_capacity(32);
         steps.extend(bank_step);
 
-        // A pass after the first reads the previous pass's message before any gate: four learned
-        // queries over the summaries that pass appended and its final hidden
-        // (\`modeling_inkling2_loop.py\`:147-176, 1426).
-        if pass > 0 {
+        // A pass after the first reads the previous pass's message once at the first core layer:
+        // four learned queries per core layer over the summaries that pass appended and its final
+        // hidden (`modeling_inkling2_loop.py`:147-176, 1398-1407). Every later layer of the pass
+        // reads its four messages from the scratch populated here.
+        if pass > 0 && config.loop_plan.is_some_and(|lp| layer == lp.core_start) {
             steps.push(self.step(
                 Op::MessageRead,
                 None,
@@ -1206,7 +1207,7 @@ impl InklingDevicePlan {
             )?);
         }
         // One gate a sublayer input, applied to the block residual's output before the input
-        // norm: \`(1 - tanh(forget)) * source + tanh(gain) * message\`.
+        // norm: `(1 - tanh(forget)) * source + tanh(gain) * message`.
         let gate = |plan: &Self, stream: MessageStream| -> Result<Step, String> {
             let controllers = format!("{prefix}.controllers.{}", stream.controller());
             plan.step(
@@ -1224,27 +1225,48 @@ impl InklingDevicePlan {
             )
         };
 
-        // The attention input norm: one shared norm on a sliding layer, three on a full one.
+        // The attention input norm: one shared norm on a sliding layer on pass 0; three separate
+        // gated streams normed with `attn_norm` on a sliding loop layer for pass > 0
+        // (`modeling_inkling2_loop.py`:961-967); and three distinct norms on a full layer.
         if sliding {
             if pass > 0 {
-                steps.push(gate(self, MessageStream::Query)?);
+                for (role, stream) in [
+                    (NormRole::Query, MessageStream::Query),
+                    (NormRole::Key, MessageStream::Key),
+                    (NormRole::Value, MessageStream::Value),
+                ] {
+                    steps.push(gate(self, stream)?);
+                    steps.push(
+                        self.step(
+                            Op::RmsNorm,
+                            Some(Part::RmsNorm),
+                            Some(Image::TOKEN),
+                            Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
+                            &[&format!("{prefix}.attn_norm.weight")],
+                            rows,
+                            hidden,
+                        )?
+                        .at(Target::Norm(role)),
+                    );
+                }
+            } else {
+                steps.push(
+                    self.step(
+                        Op::RmsNorm,
+                        Some(Part::RmsNorm),
+                        Some(Image::TOKEN),
+                        Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
+                        &[&format!("{prefix}.attn_norm.weight")],
+                        rows,
+                        hidden,
+                    )?
+                    .at(Target::Norm(if layer == 0 {
+                        NormRole::Stream
+                    } else {
+                        NormRole::Attention
+                    })),
+                );
             }
-            steps.push(
-                self.step(
-                    Op::RmsNorm,
-                    Some(Part::RmsNorm),
-                    Some(Image::TOKEN),
-                    Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
-                    &[&format!("{prefix}.attn_norm.weight")],
-                    rows,
-                    hidden,
-                )?
-                .at(Target::Norm(if layer == 0 {
-                    NormRole::Stream
-                } else {
-                    NormRole::Attention
-                })),
-            );
         } else {
             for (name, role, stream) in [
                 ("q_input_norm", NormRole::Query, MessageStream::Query),
@@ -1649,17 +1671,16 @@ impl InklingDevicePlan {
         let rows = self.rows;
         let activation = self.expert_intermediate();
         let history = config.conv_history();
-        let mut blocks = 0usize;
+        let blocks = config
+            .num_hidden_layers
+            .div_ceil(config.n_layers_per_attn_res_block.max(1));
         let mut kv_cache = 0usize;
-        for layer in 0..config.num_hidden_layers {
-            if layer.is_multiple_of(config.n_layers_per_attn_res_block.max(1)) {
-                blocks += 1;
-            }
-            let cache_rows = self.cache_rows(layer);
-            // Two caches (key and value) of BF16 rows.
-            kv_cache = kv_cache.saturating_add(cache_rows * kv_heads * head_dim * 2 * 2);
+        for layer in &self.layers {
+            // Two caches (key and value) of BF16 rows, one per application (so a looped core's
+            // passes each account for their own cache slot).
+            kv_cache = kv_cache.saturating_add(layer.kv_rows * kv_heads * head_dim * 2 * 2);
         }
-        let conv_state = config.num_hidden_layers
+        let conv_state = self.layers.len()
             * (2 * kv_heads * head_dim + 2 * hidden)
             * history
             * std::mem::size_of::<f32>();
@@ -2068,5 +2089,55 @@ mod tests {
             assert!(names[1].ends_with("q_l2_clip.scale"));
             assert!(names[2].ends_with("rel_l2_clip.scale"));
         }
+    }
+
+    #[test]
+    fn every_mini_looped_served_weight_is_read_and_buffers_count_applications() {
+        let config = Inkling2Config::from_json(
+            include_str!("../../sparkflash-model/tests/data/inkling2_mini_config.json"),
+            Some(include_str!(
+                "../../sparkflash-model/tests/data/inkling2_mini_quant.json"
+            )),
+        )
+        .expect("the mini config parses");
+        let tp = TpPlan::new(1, 0).expect("TP1");
+        let plan = InklingDevicePlan::build(&config, tp, Pass::Decode, 1, 4096)
+            .expect("the mini schedule builds");
+        assert_eq!(plan.layers().len(), 48);
+        let served = plan.served();
+        let mut reads = vec![0usize; served.plan().len()];
+        let mut message_reads = 0usize;
+        for step in plan.steps() {
+            if step.op == Op::MessageRead {
+                message_reads += 1;
+            }
+            for index in &step.weights {
+                reads[*index] += 1;
+            }
+        }
+        // MessageRead runs once per pass after pass 0 (3 passes -> 2 reads, not 24).
+        assert_eq!(message_reads, 2);
+        for (index, count) in reads.iter().enumerate() {
+            let name = &served.plan().specs()[index].name;
+            assert!(
+                *count >= 1,
+                "Mini TP1: served tensor {name} is never read by any scheduled step"
+            );
+        }
+        // Buffer accounting must cover all 48 applications (not just 24 stored layers).
+        let buffers = plan.buffers();
+        let kv_heads = plan.rank_kv_heads();
+        let head_dim = config.head_dim;
+        let expected_kv: usize = plan
+            .layers()
+            .iter()
+            .map(|layer| layer.kv_rows * kv_heads * head_dim * 2 * 2)
+            .sum();
+        assert_eq!(buffers.kv_cache, expected_kv);
+        let expected_conv = 48
+            * (2 * kv_heads * head_dim + 2 * config.hidden_size)
+            * config.conv_history()
+            * std::mem::size_of::<f32>();
+        assert_eq!(buffers.conv_state, expected_conv);
     }
 }

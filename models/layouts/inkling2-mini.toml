@@ -1120,16 +1120,15 @@ shape = ["vision_out", "vision_projection"]
 split = "whole"
 
 # mtp.safetensors: the stage's own tensors, named without the backbone's model.llm prefix.
-# The released fusion table is 6 rows of 8 taps ([6, 8]). config.json states neither number, so
-# the shape is the tensor index's header, the same [6, 8] the running drafter reads through its
-# FUSION_ROWS = 6 and TAPS = 8 constants (device/draft.rs:71-75).
+# Mini's fusion table is 4 rows of 4 taps ([4, 4]): 3 draft layers plus the Markov head over
+# `mtp_config.target_layer_ids = [5, 23, 41, 48]` (device/draft.rs:475-478).
 
 [[tensor]]
 name = "fuse_weight"
 part = "mtp"
 role = "mtp"
 dtype = "bf16"
-shape = ["6", "8"]
+shape = ["4", "4"]
 split = "whole"
 
 # mtp.safetensors and mtp_config: one stage per repeat; {stage} is the MTP layer index
@@ -1453,7 +1452,7 @@ part = "loop_message_gate"
 role = "attention"
 dtype = "bf16"
 shape = ["hidden", "loop_gate_rank"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] }
 
@@ -1463,7 +1462,7 @@ part = "loop_message_gate"
 role = "attention"
 dtype = "bf16"
 shape = ["hidden", "loop_gate_rank"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] }
 
@@ -1483,7 +1482,7 @@ part = "loop_message_gate"
 role = "attention"
 dtype = "bf16"
 shape = ["hidden", "loop_gate_rank"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] }
 
@@ -1493,7 +1492,7 @@ part = "loop_message_gate"
 role = "attention"
 dtype = "bf16"
 shape = ["hidden", "loop_gate_rank"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] }
 
@@ -1513,7 +1512,7 @@ part = "loop_message_gate"
 role = "attention"
 dtype = "bf16"
 shape = ["hidden", "loop_gate_rank"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] }
 
@@ -1523,7 +1522,7 @@ part = "loop_message_gate"
 role = "attention"
 dtype = "bf16"
 shape = ["hidden", "loop_gate_rank"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] }
 
@@ -1543,7 +1542,7 @@ part = "loop_message_gate"
 role = "attention"
 dtype = "bf16"
 shape = ["hidden", "loop_gate_rank"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] }
 
@@ -1553,12 +1552,13 @@ part = "loop_message_gate"
 role = "attention"
 dtype = "bf16"
 shape = ["hidden", "loop_gate_rank"]
-split = "rows"
+split = "whole"
 repeat = "layers"
 when = { layers = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17] }
-# modeling_inkling2_loop.py:147-176: learned queries over the previous pass's block summaries.
-# The checkpoint splits the (core layers, 4, hidden) bank into two 24-row tensors; which two
-# streams each holds is a conversion fact this layout states as one bank per stream pair.
+# modeling_inkling2_loop.py:147-176 & core_model_loading.py:823-850
+# (`Inkling2LoopMergeMessageQueries`): learned queries over the previous pass's block summaries.
+# The checkpoint stores `[query, mlp]` per core layer in `middle_cycle_cross_pass_queries` and
+# `[key, value]` per core layer in `middle_cycle_cross_pass_kv_queries`.
 
 [[tensor]]
 name = "model.llm.middle_cycle_cross_pass_queries"

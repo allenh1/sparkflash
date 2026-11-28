@@ -985,7 +985,9 @@ pub(super) struct ChunkRun {
     band_gathered: bool,
     /// How many summary blocks the prelude left, on a looped release's first pass.
     loop_blocks: Option<usize>,
-    /// The previous pass's summary rows, copied aside at a pass boundary.
+    /// First summary block of the previous pass (`num_pre_loop_blocks + 1`) and how many summary
+    /// rows it left for `inkling_cross_pass` to read directly from `chunk.summaries`.
+    loop_prev_start: usize,
     loop_prev_count: usize,
 }
 
@@ -1117,6 +1119,7 @@ impl ChunkRun {
             previous_conv: None,
             band_gathered: false,
             loop_blocks: None,
+            loop_prev_start: 0,
             loop_prev_count: 0,
         })
     }
@@ -1265,18 +1268,8 @@ impl ChunkRun {
             } else {
                 let depth = self.loop_blocks.unwrap_or(0);
                 let start = depth + 1;
-                let count = blocks.saturating_sub(start).min(super::LOOP_PREV_MAX);
-                for block in 0..count {
-                    let source = chunk
-                        .summaries
-                        .offset((start + block) * summary_stride * std::mem::size_of::<f32>());
-                    let destination = scratch.loop_prev.offset(block * rows * byte);
-                    run(shared
-                        .cuda
-                        .copy_dtod(&destination, &source, rows * byte)
-                        .map_err(|error| error.to_string()))?;
-                }
-                self.loop_prev_count = count;
+                self.loop_prev_start = start;
+                self.loop_prev_count = blocks.saturating_sub(start);
                 run(shared
                     .cuda
                     .copy_dtod(&scratch.loop_prev_hidden, &scratch.x, rows * byte)
@@ -1285,7 +1278,10 @@ impl ChunkRun {
                     .cuda
                     .copy_dtod(&scratch.x, &scratch.loop_saved, rows * byte)
                     .map_err(|error| error.to_string()))?;
-                blocks = self.loop_blocks.unwrap_or(0);
+                blocks = depth;
+                if let Some(chain) = chain.as_mut() {
+                    chain.carried = None;
+                }
             }
         }
         // A layer's per-row scale table: null for a layer that does not scale (its kernels take the
@@ -1346,11 +1342,13 @@ impl ChunkRun {
                 }
                 (Op::MessageRead, _) => {
                     run(shared.cross_pass(
-                        scratch.loop_prev,
+                        chunk.summaries,
                         scratch.loop_prev_hidden,
                         scratch.loop_messages,
                         rows,
-                        self.loop_prev_count.min(super::LOOP_PREV_MAX),
+                        self.loop_prev_start,
+                        self.loop_prev_count,
+                        summary_stride,
                     ))?;
                 }
                 (Op::MessageGate(stream), _) => {
@@ -1361,44 +1359,66 @@ impl ChunkRun {
                     })?;
                     let stored = layer.stored;
                     let core = stored.saturating_sub(loop_plan.core_start);
-                    let shift = match stream {
-                        MessageStream::Mlp | MessageStream::Query => 0,
-                        MessageStream::Key => 1,
-                        MessageStream::Value => 2,
+                    // BlockResidual(Mlp) always writes 1 row per sequence row (stride `hidden`).
+                    // BlockResidual(Attention) writes 1 row on a sliding layer and 3 on a full
+                    // layer. Writing directly into `q_in`/`k_in`/`v_in` preserves `scratch.rows`
+                    // so sliding layers can gate query, key and value independently from row 0.
+                    let (src_stride, src_shift, dst) = match stream {
+                        MessageStream::Mlp => (hidden, 0, scratch.q_in),
+                        MessageStream::Query => (
+                            if sliding { hidden } else { 3 * hidden },
+                            0,
+                            scratch.q_in,
+                        ),
+                        MessageStream::Key => (
+                            if sliding { hidden } else { 3 * hidden },
+                            if sliding { 0 } else { hidden },
+                            scratch.k_in,
+                        ),
+                        MessageStream::Value => (
+                            if sliding { hidden } else { 3 * hidden },
+                            if sliding { 0 } else { 2 * hidden },
+                            scratch.v_in,
+                        ),
                     };
-                    // A block residual writes one row a sublayer input on a full layer and one
-                    // row on a sliding layer; the rows are `nq * hidden` apart.
-                    let nq = if layer.sliding { 1 } else { 3 };
                     run(shared.message_gate(
                         scratch.rows,
+                        dst,
                         scratch.loop_messages,
                         stored,
                         stream,
                         rows,
-                        nq * hidden,
-                        shift * hidden,
+                        src_stride,
+                        src_shift,
+                        hidden,
+                        0,
                         loop_plan.core_len() * 4 * hidden,
                         (core * 4 + stream.index()) * hidden,
                     ))?;
                 }
                 (Op::RmsNorm, Target::Norm(role)) => {
                     let gain = weight(step.weights[0]);
-                    let (source, destination, src_stride) = match (role, sliding) {
-                        (NormRole::Stream, _) => (scratch.x, scratch.q_in, hidden),
-                        (NormRole::Attention, _) => (scratch.rows, scratch.q_in, hidden),
-                        (NormRole::Query, false) => (scratch.rows, scratch.q_in, 3 * hidden),
-                        (NormRole::Key, false) => (
+                    let gated = layer.pass > 0;
+                    let (source, destination, src_stride) = match (role, sliding, gated) {
+                        (NormRole::Stream, _, _) => (scratch.x, scratch.q_in, hidden),
+                        (NormRole::Attention, _, false) => (scratch.rows, scratch.q_in, hidden),
+                        (NormRole::Query, _, true) => (scratch.q_in, scratch.q_in, hidden),
+                        (NormRole::Key, _, true) => (scratch.k_in, scratch.k_in, hidden),
+                        (NormRole::Value, _, true) => (scratch.v_in, scratch.v_in, hidden),
+                        (NormRole::Mlp, _, true) => (scratch.q_in, scratch.q_in, hidden),
+                        (NormRole::Query, false, false) => (scratch.rows, scratch.q_in, 3 * hidden),
+                        (NormRole::Key, false, false) => (
                             scratch.rows.offset(hidden * std::mem::size_of::<f32>()),
                             scratch.k_in,
                             3 * hidden,
                         ),
-                        (NormRole::Value, false) => (
+                        (NormRole::Value, false, false) => (
                             scratch.rows.offset(2 * hidden * std::mem::size_of::<f32>()),
                             scratch.v_in,
                             3 * hidden,
                         ),
-                        (NormRole::Mlp, _) => (scratch.rows, scratch.q_in, hidden),
-                        (other, _) => {
+                        (NormRole::Mlp, _, false) => (scratch.rows, scratch.q_in, hidden),
+                        (other, _, _) => {
                             return Err(device_error(format!(
                                 "layer {index}: norm role {other:?} is not an input norm"
                             )));
@@ -1422,19 +1442,20 @@ impl ChunkRun {
                     // A projection's inner width is the width its weight multiplies: the stream
                     // for every projection but the attention output's, which contracts the heads.
                     let attention_width = heads * head_dim;
+                    let separate_kv = !sliding || layer.pass > 0;
                     let io = |projection: Projection| match projection {
                         Projection::Query => Ok((scratch.q_in, scratch.q, attention_width, hidden)),
                         Projection::Gate => {
                             Ok((scratch.q_in, scratch.gate, attention_width, hidden))
                         }
                         Projection::Key => Ok((
-                            if sliding { scratch.q_in } else { scratch.k_in },
+                            if separate_kv { scratch.k_in } else { scratch.q_in },
                             scratch.k,
                             kv_width,
                             hidden,
                         )),
                         Projection::Value => Ok((
-                            if sliding { scratch.q_in } else { scratch.v_in },
+                            if separate_kv { scratch.v_in } else { scratch.q_in },
                             scratch.v,
                             kv_width,
                             hidden,
