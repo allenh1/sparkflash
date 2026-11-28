@@ -726,6 +726,11 @@ impl<W: Walk> Runtime<W> {
         if !images.is_empty() && !W::Vision::PRESENT {
             return Err(BackendError::new("vision", "this arm has no vision path"));
         }
+        // A step that ended on a held draft leaves the drafter's accepted rows pending until
+        // the next round settles them. A prompt that extends the history starts at the
+        // history's end, so fold the round in first: otherwise the drafter's context ends where
+        // the round started and the first chunk injects rows at the wrong position.
+        self.walk.drafter().finish_prompt(&mut slot.seq)?;
         // The history may lag the arm's position: a walk that verified drafts keeps their rows
         // in the sequence while the caller has only been given the anchor's token. A prompt may
         // extend the history only when the state ends exactly where the history does; otherwise
@@ -1773,6 +1778,7 @@ mod tests {
         walks: Mutex<Vec<(PassKind, Vec<usize>)>>,
         headed: Mutex<Vec<usize>>,
         counters: Mutex<Speculation>,
+        finishes: Mutex<usize>,
     }
 
     /// A toy drafting walk: the model's next token is the last row plus one, the drafter
@@ -1797,6 +1803,7 @@ mod tests {
                 walks: Mutex::new(Vec::new()),
                 headed: Mutex::new(Vec::new()),
                 counters: Mutex::new(Speculation::default()),
+                finishes: Mutex::new(0),
             });
             Self {
                 layout: StateLayout::new(vec![Region::Positional {
@@ -1995,6 +2002,11 @@ mod tests {
             })
         }
 
+        fn finish_prompt(&self, _seq: &mut DraftSeq) -> Result<(), BackendError> {
+            *self.shared.finishes.lock().expect("the finish count") += 1;
+            Ok(())
+        }
+
         fn budget(&self, seqs: usize) -> usize {
             // One row a member, so a joint round shares a budget narrower than the chains and a
             // lone member still keeps its own depth.
@@ -2028,6 +2040,28 @@ mod tests {
             .prefill_slot(&mut slot, tokens)
             .expect("the prefill");
         slot.history.clone()
+    }
+
+    #[test]
+    fn a_new_prompt_finishes_the_drafters_pending_round() {
+        let walk = DraftWalk::passing();
+        let finishes = Arc::clone(&walk.shared);
+        let runtime = Runtime::new(walk, 0).expect("the runtime starts");
+        let mut slot = runtime.open_slot().expect("a slot");
+        runtime
+            .prefill_slot(&mut slot, &[1, 2, 3, 4])
+            .expect("the prefill");
+        let before = *finishes.finishes.lock().expect("the finish count");
+        let mut prompt = slot.history.clone();
+        prompt.push(5);
+        runtime
+            .start_prompt_slot(&mut slot, &prompt, &[])
+            .expect("the continuation starts");
+        assert_eq!(
+            *finishes.finishes.lock().expect("the finish count"),
+            before + 1,
+            "the continuation asks the drafter to settle what its last step left open"
+        );
     }
 
     #[test]

@@ -625,6 +625,18 @@ pub trait Drafter<W: Walk + ?Sized> {
         rows: Self::Rows,
     ) -> Result<StepOutput, BackendError>;
 
+    /// Ends the round the last step left open, before a prompt takes the sequence up again.
+    ///
+    /// A drafter that keeps its accepted rows pending until the next round folds them in here,
+    /// so the state ends exactly where the history does and a prompt that extends the history
+    /// starts at the state's own position. The default is a drafter with nothing pending.
+    ///
+    /// # Errors
+    /// A backend failure.
+    fn finish_prompt(&self, _seq: &mut W::Seq) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// The most drafts one walk of `seqs` members verifies in all, for [crate::share_rows].
     /// An arm whose verify refuses more than a fixed row count caps here.
     fn budget(&self, seqs: usize) -> usize;

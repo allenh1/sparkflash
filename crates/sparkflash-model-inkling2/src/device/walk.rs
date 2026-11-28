@@ -1165,6 +1165,12 @@ impl Drafter<InklingWalk> for InklingDrafter {
         Ok(rows)
     }
 
+    /// Folds the last round's accepted rows into the state and the drafter's context before a
+    /// prompt reuses the sequence. The round is still open when the request ends on a held draft.
+    fn finish_prompt(&self, seq: &mut InklingSequence) -> Result<(), BackendError> {
+        seq.lane.session.settle()
+    }
+
     fn budget(&self, seqs: usize) -> usize {
         DRAFT_BUDGET.rows(seqs, self.depth)
     }
